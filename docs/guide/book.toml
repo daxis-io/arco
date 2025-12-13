@@ -1,0 +1,13 @@
+[book]
+title = "Arco User Guide"
+authors = ["Daxis Team"]
+language = "en"
+multilingual = false
+src = "src"
+
+[build]
+build-dir = "../../target/book"
+
+[output.html]
+git-repository-url = "https://github.com/daxis-io/arco"
+edit-url-template = "https://github.com/daxis-io/arco/edit/main/docs/guide/{path}"

@@ -1,0 +1,53 @@
+[package]
+name = "arco-core"
+description = "Core abstractions for Arco: types, storage traits, tenant context, and shared primitives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+full = ["gcp", "aws", "azure"]
+gcp = []
+aws = []
+azure = []
+test-utils = ["dep:proptest", "dep:tempfile"]
+
+[dependencies]
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# IDs
+uuid = { workspace = true }
+ulid = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Bytes
+bytes = { workspace = true }
+
+# Optional test utilities
+proptest = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-test = { workspace = true }

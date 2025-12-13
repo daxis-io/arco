@@ -1,0 +1,9 @@
+# <type>(<scope>): <subject>
+#
+# Types: feat, fix, docs, refactor, test, chore, perf, ci
+# Scopes: core, catalog, flow, api, proto, compactor
+#
+# Body: Explain *what* and *why* (not *how*)
+#
+# Footer: Reference issues, breaking changes
+# Signed-off-by: Your Name <email@example.com>

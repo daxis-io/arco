@@ -1,0 +1,50 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+
+# Environment
+.env
+.env.local
+*.pem
+*.key
+
+# Coverage
+lcov.info
+*.profraw
+*.profdata
+coverage/
+
+# Docs
+/target/book/
+/target/doc/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan

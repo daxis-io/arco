@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package arco.v1;
+
+import "arco/v1/common.proto";
+
+option java_package = "io.daxis.arco.v1";
+option go_package = "github.com/daxis-io/arco/proto/arco/v1";
+
+// Asset represents a data asset in the catalog.
+message Asset {
+  AssetId id = 1;
+  TenantId tenant_id = 2;
+  string name = 3;
+  AssetType asset_type = 4;
+  Timestamp created_at = 5;
+  Timestamp updated_at = 6;
+  map<string, string> properties = 7;
+}
+
+enum AssetType {
+  ASSET_TYPE_UNSPECIFIED = 0;
+  ASSET_TYPE_TABLE = 1;
+  ASSET_TYPE_VIEW = 2;
+  ASSET_TYPE_SOURCE = 3;
+}
+
+// LineageEdge represents a dependency between assets.
+message LineageEdge {
+  AssetId upstream = 1;
+  AssetId downstream = 2;
+  RunId run_id = 3;
+  Timestamp observed_at = 4;
+}

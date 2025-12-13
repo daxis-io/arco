@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package arco.v1;
+
+import "arco/v1/common.proto";
+
+option java_package = "io.daxis.arco.v1";
+option go_package = "github.com/daxis-io/arco/proto/arco/v1";
+
+// Run represents an orchestration run.
+message Run {
+  RunId id = 1;
+  TenantId tenant_id = 2;
+  RunStatus status = 3;
+  Timestamp started_at = 4;
+  Timestamp completed_at = 5;
+}
+
+enum RunStatus {
+  RUN_STATUS_UNSPECIFIED = 0;
+  RUN_STATUS_PENDING = 1;
+  RUN_STATUS_RUNNING = 2;
+  RUN_STATUS_SUCCEEDED = 3;
+  RUN_STATUS_FAILED = 4;
+  RUN_STATUS_CANCELLED = 5;
+}
+
+// Task represents a unit of work in a run.
+message Task {
+  string id = 1;
+  RunId run_id = 2;
+  string name = 3;
+  TaskStatus status = 4;
+  repeated string dependencies = 5;
+}
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_PENDING = 1;
+  TASK_STATUS_RUNNING = 2;
+  TASK_STATUS_SUCCEEDED = 3;
+  TASK_STATUS_FAILED = 4;
+  TASK_STATUS_SKIPPED = 5;
+}

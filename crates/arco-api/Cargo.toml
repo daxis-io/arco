@@ -1,0 +1,54 @@
+[package]
+name = "arco-api"
+description = "HTTP/gRPC composition layer for Arco: authentication, routing, and service wiring"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+full = ["gcp", "aws", "azure"]
+gcp = ["arco-core/gcp", "arco-catalog/gcp", "arco-flow/gcp"]
+aws = ["arco-core/aws", "arco-catalog/aws", "arco-flow/aws"]
+azure = ["arco-core/azure", "arco-catalog/azure", "arco-flow/azure"]
+
+[dependencies]
+arco-core = { path = "../arco-core" }
+arco-catalog = { path = "../arco-catalog" }
+arco-flow = { path = "../arco-flow" }
+arco-proto = { path = "../arco-proto" }
+
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# HTTP
+axum = { workspace = true }
+
+# gRPC
+tonic = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }

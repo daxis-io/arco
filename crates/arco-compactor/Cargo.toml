@@ -1,0 +1,46 @@
+[package]
+name = "arco-compactor"
+description = "Compaction binary for Arco: merges Tier 2 events into Tier 1 snapshots"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "arco-compactor"
+path = "src/main.rs"
+
+[features]
+default = []
+gcp = ["arco-core/gcp", "arco-catalog/gcp"]
+aws = ["arco-core/aws", "arco-catalog/aws"]
+azure = ["arco-core/azure", "arco-catalog/azure"]
+
+[dependencies]
+arco-core = { path = "../arco-core" }
+arco-catalog = { path = "../arco-catalog" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

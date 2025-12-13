@@ -1,0 +1,56 @@
+//! # arco-core
+//!
+//! Core abstractions for the Arco serverless lakehouse infrastructure.
+//!
+//! This crate provides the foundational types and traits used across all Arco components:
+//!
+//! - **Tenant Context**: Multi-tenant isolation primitives
+//! - **Identifiers**: Strongly-typed IDs for assets, runs, and other entities
+//! - **Storage Traits**: Abstract storage interfaces for catalog and orchestration
+//! - **Error Types**: Shared error definitions and result types
+//! - **Serialization Helpers**: Canonical encoding for deterministic snapshots
+//!
+//! ## Crate Boundary
+//!
+//! `arco-core` is the **only** crate allowed to define shared primitives.
+//! All cross-component interaction happens via explicitly versioned contracts
+//! defined in this crate.
+//!
+//! ## Example
+//!
+//! ```rust
+//! use arco_core::prelude::*;
+//!
+//! // Create a tenant context
+//! let tenant = TenantId::new("acme-corp");
+//!
+//! // Generate a unique asset ID
+//! let asset_id = AssetId::generate();
+//! ```
+
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+#![deny(rust_2018_idioms)]
+#![warn(clippy::pedantic)]
+
+pub mod error;
+pub mod id;
+pub mod tenant;
+
+/// Prelude module for convenient imports.
+///
+/// # Example
+///
+/// ```rust
+/// use arco_core::prelude::*;
+/// ```
+pub mod prelude {
+    pub use crate::error::{Error, Result};
+    pub use crate::id::{AssetId, RunId};
+    pub use crate::tenant::TenantId;
+}
+
+// Re-export key types at crate root for ergonomics
+pub use error::{Error, Result};
+pub use id::{AssetId, RunId};
+pub use tenant::TenantId;

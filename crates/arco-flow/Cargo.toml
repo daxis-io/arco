@@ -1,0 +1,57 @@
+[package]
+name = "arco-flow"
+description = "Orchestration engine for Arco: DAG planning, scheduling, state machine, and execution tracking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+full = ["gcp", "aws", "azure"]
+gcp = ["arco-core/gcp"]
+aws = ["arco-core/aws"]
+azure = ["arco-core/azure"]
+test-utils = ["arco-core/test-utils", "dep:proptest", "dep:tempfile"]
+
+[dependencies]
+arco-core = { path = "../arco-core" }
+
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Optional test utilities
+proptest = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "plan_generation"
+harness = false

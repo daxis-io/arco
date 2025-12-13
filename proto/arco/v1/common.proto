@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package arco.v1;
+
+option java_package = "io.daxis.arco.v1";
+option go_package = "github.com/daxis-io/arco/proto/arco/v1";
+
+// TenantId identifies a tenant in the system.
+message TenantId {
+  string value = 1;
+}
+
+// AssetId uniquely identifies an asset (table, view, etc).
+message AssetId {
+  string value = 1;
+}
+
+// RunId uniquely identifies an orchestration run.
+message RunId {
+  string value = 1;
+}
+
+// Timestamp in UTC.
+message Timestamp {
+  int64 seconds = 1;
+  int32 nanos = 2;
+}

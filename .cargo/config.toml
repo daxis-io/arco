@@ -1,0 +1,12 @@
+# Cargo configuration
+
+[alias]
+xtask = "run --package xtask --"
+
+[build]
+# Enable incremental compilation
+incremental = true
+
+[env]
+# Default to backtrace on
+RUST_BACKTRACE = "1"

@@ -155,16 +155,19 @@ dependencies = [
  "chrono",
  "criterion",
  "futures",
+ "hex",
  "object_store",
  "parquet",
  "proptest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
  "tokio-test",
  "tracing",
+ "ulid",
 ]
 
 [[package]]

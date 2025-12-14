@@ -51,11 +51,24 @@
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 
+pub mod asset;
+pub mod lock;
+pub mod manifest;
 pub mod reader;
 pub mod writer;
 
+// Re-export main types at crate root
+pub use asset::{Asset, AssetFormat, AssetKey, AssetKeyError, CreateAssetRequest};
+pub use lock::{DistributedLock, LockGuard, LockInfo};
+pub use manifest::{
+    CatalogManifest, CommitRecord, CoreManifest, ExecutionManifest, GovernanceManifest,
+    LineageManifest, RootManifest,
+};
+
 /// Prelude module for convenient imports.
 pub mod prelude {
+    pub use crate::asset::{Asset, AssetFormat, AssetKey, CreateAssetRequest};
+    pub use crate::manifest::{CatalogManifest, CommitRecord, CoreManifest, RootManifest};
     pub use crate::reader::CatalogReader;
     pub use crate::writer::CatalogWriter;
 }

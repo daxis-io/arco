@@ -52,6 +52,13 @@ object_store = { workspace = true }
 # Time
 chrono = { workspace = true }
 
+# Hashing
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# Identifiers
+ulid = { workspace = true }
+
 # Optional test utilities
 proptest = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }

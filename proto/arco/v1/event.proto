@@ -1,0 +1,109 @@
+// proto/arco/v1/event.proto
+syntax = "proto3";
+package arco.v1;
+
+option java_multiple_files = true;
+option java_package = "com.arco.v1";
+option go_package = "github.com/daxis-io/arco/proto/arco/v1";
+
+import "google/protobuf/timestamp.proto";
+import "arco/v1/common.proto";
+
+// Event envelope for all catalog events (Tier 2 append-only log)
+message CatalogEvent {
+  // Unique event ID (ULID for ordering)
+  string event_id = 1;
+
+  // Event type discriminator
+  string event_type = 2;
+
+  // Schema version for forward compatibility
+  uint32 event_version = 3;
+
+  // Event timestamp (server-side)
+  google.protobuf.Timestamp timestamp = 4;
+
+  // Event source (e.g., "servo", "ui", "profiler")
+  string source = 5;
+
+  // Tenant context
+  TenantId tenant_id = 6;
+
+  // Workspace context (tenant + workspace = primary scope)
+  WorkspaceId workspace_id = 7;
+
+  // Idempotency key (for deduplication)
+  string idempotency_key = 8;
+
+  // Event payload (one of)
+  oneof payload {
+    AssetCreated asset_created = 20;
+    AssetUpdated asset_updated = 21;
+    MaterializationCompleted materialization_completed = 22;
+    LineageRecorded lineage_recorded = 23;
+  }
+}
+
+// Asset creation event
+message AssetCreated {
+  AssetId asset_id = 1;
+  AssetKey asset_key = 2;
+  string location = 3;
+  AssetFormat format = 4;
+  string description = 5;
+  repeated string owners = 6;
+}
+
+// Asset update event
+message AssetUpdated {
+  AssetId asset_id = 1;
+  // Fields that changed (sparse update)
+  optional string location = 2;
+  optional string description = 3;
+  repeated string owners = 4;
+}
+
+// Materialization completion event (high-frequency, Tier 2)
+message MaterializationCompleted {
+  MaterializationId materialization_id = 1;
+  AssetId asset_id = 2;
+  PartitionKey partition_key = 3;
+  RunId run_id = 4;
+  TaskId task_id = 5;
+
+  // Output files
+  repeated FileEntry files = 6;
+
+  // Statistics
+  int64 row_count = 7;
+  int64 byte_size = 8;
+  string schema_hash = 9;
+
+  // Timing
+  google.protobuf.Timestamp started_at = 10;
+  google.protobuf.Timestamp completed_at = 11;
+}
+
+// File entry in materialization output
+message FileEntry {
+  string path = 1;
+  int64 size_bytes = 2;
+  int64 row_count = 3;
+}
+
+// Lineage recording event
+message LineageRecorded {
+  RunId run_id = 1;
+  repeated LineageEdge edges = 2;
+}
+
+// Single lineage edge (source -> target dependency)
+message LineageEdge {
+  AssetId source_asset_id = 1;
+  AssetId target_asset_id = 2;
+  repeated PartitionId source_partitions = 3;
+  repeated PartitionId target_partitions = 4;
+
+  // Hash of dependency specification for change detection
+  string dependency_fingerprint = 5;
+}

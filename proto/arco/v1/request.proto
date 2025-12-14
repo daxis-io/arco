@@ -1,0 +1,32 @@
+// proto/arco/v1/request.proto
+syntax = "proto3";
+package arco.v1;
+
+option java_multiple_files = true;
+option java_package = "com.arco.v1";
+option go_package = "github.com/daxis-io/arco/proto/arco/v1";
+
+import "google/protobuf/timestamp.proto";
+import "arco/v1/common.proto";
+
+// Standard request header for all API calls
+// Per architecture docs: every request carries tenant, workspace, trace, idempotency
+message RequestHeader {
+  // Tenant context for multi-tenant isolation
+  TenantId tenant_id = 1;
+
+  // Workspace context (tenant + workspace = primary scope)
+  // Per unified platform design: all operations scoped to workspace
+  WorkspaceId workspace_id = 2;
+
+  // W3C traceparent for distributed tracing
+  // Format: 00-{trace_id}-{parent_id}-{flags}
+  string trace_parent = 3;
+
+  // Idempotency key for exactly-once semantics
+  // Must be unique per logical operation
+  string idempotency_key = 4;
+
+  // Client request timestamp
+  google.protobuf.Timestamp request_time = 5;
+}

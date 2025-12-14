@@ -1,44 +1,48 @@
+// proto/arco/v1/flow.proto
 syntax = "proto3";
-
 package arco.v1;
 
-import "arco/v1/common.proto";
-
-option java_package = "io.daxis.arco.v1";
+option java_multiple_files = true;
+option java_package = "com.arco.v1";
 option go_package = "github.com/daxis-io/arco/proto/arco/v1";
 
-// Run represents an orchestration run.
-message Run {
+import "google/protobuf/timestamp.proto";
+import "arco/v1/common.proto";
+
+// Run represents an orchestration run (basic definition).
+// See orchestration.proto for full Run message with all fields.
+message FlowRun {
   RunId id = 1;
   TenantId tenant_id = 2;
-  RunStatus status = 3;
-  Timestamp started_at = 4;
-  Timestamp completed_at = 5;
+  WorkspaceId workspace_id = 3;
+  FlowRunStatus status = 4;
+  google.protobuf.Timestamp started_at = 5;
+  google.protobuf.Timestamp completed_at = 6;
 }
 
-enum RunStatus {
-  RUN_STATUS_UNSPECIFIED = 0;
-  RUN_STATUS_PENDING = 1;
-  RUN_STATUS_RUNNING = 2;
-  RUN_STATUS_SUCCEEDED = 3;
-  RUN_STATUS_FAILED = 4;
-  RUN_STATUS_CANCELLED = 5;
+enum FlowRunStatus {
+  FLOW_RUN_STATUS_UNSPECIFIED = 0;
+  FLOW_RUN_STATUS_PENDING = 1;
+  FLOW_RUN_STATUS_RUNNING = 2;
+  FLOW_RUN_STATUS_SUCCEEDED = 3;
+  FLOW_RUN_STATUS_FAILED = 4;
+  FLOW_RUN_STATUS_CANCELLED = 5;
 }
 
-// Task represents a unit of work in a run.
-message Task {
-  string id = 1;
+// FlowTask represents a unit of work in a run.
+message FlowTask {
+  TaskId id = 1;
   RunId run_id = 2;
   string name = 3;
-  TaskStatus status = 4;
-  repeated string dependencies = 5;
+  FlowTaskStatus status = 4;
+  repeated TaskId dependencies = 5;
 }
 
-enum TaskStatus {
-  TASK_STATUS_UNSPECIFIED = 0;
-  TASK_STATUS_PENDING = 1;
-  TASK_STATUS_RUNNING = 2;
-  TASK_STATUS_SUCCEEDED = 3;
-  TASK_STATUS_FAILED = 4;
-  TASK_STATUS_SKIPPED = 5;
+enum FlowTaskStatus {
+  FLOW_TASK_STATUS_UNSPECIFIED = 0;
+  FLOW_TASK_STATUS_PENDING = 1;
+  FLOW_TASK_STATUS_RUNNING = 2;
+  FLOW_TASK_STATUS_SUCCEEDED = 3;
+  FLOW_TASK_STATUS_FAILED = 4;
+  FLOW_TASK_STATUS_SKIPPED = 5;
 }

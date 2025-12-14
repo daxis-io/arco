@@ -1,27 +1,94 @@
+// proto/arco/v1/common.proto
 syntax = "proto3";
-
 package arco.v1;
 
-option java_package = "io.daxis.arco.v1";
+option java_multiple_files = true;
+option java_package = "com.arco.v1";
 option go_package = "github.com/daxis-io/arco/proto/arco/v1";
 
-// TenantId identifies a tenant in the system.
+// google/protobuf/timestamp.proto is imported where needed
+
+// Strongly-typed IDs (string-wrapped for cross-language compat)
 message TenantId {
+  // Tenant identifier, e.g., "acme-corp"
   string value = 1;
 }
 
-// AssetId uniquely identifies an asset (table, view, etc).
+message WorkspaceId {
+  // Workspace identifier within tenant, e.g., "production", "staging"
+  // Per unified platform design: tenant + workspace = primary scoping boundary
+  string value = 1;
+}
+
 message AssetId {
+  // ULID-based asset identifier
   string value = 1;
 }
 
-// RunId uniquely identifies an orchestration run.
 message RunId {
+  // ULID-based run identifier
   string value = 1;
 }
 
-// Timestamp in UTC.
-message Timestamp {
-  int64 seconds = 1;
-  int32 nanos = 2;
+message TaskId {
+  // ULID-based task identifier
+  string value = 1;
+}
+
+message PartitionId {
+  // Derived partition identifier (hash of asset_id + partition_key)
+  string value = 1;
+}
+
+message MaterializationId {
+  // ULID-based materialization identifier
+  string value = 1;
+}
+
+message SnapshotId {
+  // Snapshot version identifier
+  string value = 1;
+}
+
+// Multi-dimensional partition key
+message PartitionKey {
+  // Dimensions sorted alphabetically by key for determinism
+  map<string, ScalarValue> dimensions = 1;
+}
+
+// Scalar value with explicit type for canonical encoding
+message ScalarValue {
+  oneof value {
+    string string_value = 1;    // Arbitrary string (base64url encoded in canonical form)
+    int64 int64_value = 2;      // 64-bit integer
+    bool bool_value = 3;        // Boolean
+    string date_value = 4;      // YYYY-MM-DD format
+    string timestamp_value = 5; // ISO 8601 with micros, UTC (e.g., 2025-01-15T10:30:00.000000Z)
+    NullValue null_value = 6;   // Explicit null
+  }
+}
+
+// Represents null value (used in ScalarValue oneof)
+enum NullValue {
+  // Unspecified null value
+  NULL_VALUE_UNSPECIFIED = 0;
+}
+
+// Asset identifier (namespace + name)
+message AssetKey {
+  // Namespace, e.g., "raw", "staging", "mart"
+  // Pattern: ^[a-z][a-z0-9_]*$
+  string namespace = 1;
+
+  // Asset name within namespace
+  // Pattern: ^[a-z][a-z0-9_]*$
+  string name = 2;
+}
+
+// Asset format
+enum AssetFormat {
+  ASSET_FORMAT_UNSPECIFIED = 0;
+  ASSET_FORMAT_PARQUET = 1;
+  ASSET_FORMAT_DELTA = 2;
+  ASSET_FORMAT_ICEBERG = 3;
 }

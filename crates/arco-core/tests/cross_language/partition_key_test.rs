@@ -90,8 +90,12 @@ fn test_round_trip_all_fixtures() {
         let canonical = pk.canonical_string();
 
         // Parse back (this tests the parse implementation)
-        let parsed = PartitionKey::parse(&canonical)
-            .unwrap_or_else(|e| panic!("case '{}' should parse: {} - error: {e:?}", case.name, canonical));
+        let parsed = PartitionKey::parse(&canonical).unwrap_or_else(|e| {
+            panic!(
+                "case '{}' should parse: {} - error: {e:?}",
+                case.name, canonical
+            )
+        });
 
         // Must produce identical canonical string
         assert_eq!(

@@ -53,7 +53,9 @@ pub mod prelude {
     pub use crate::id::{AssetId, RunId};
     pub use crate::partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
     pub use crate::scoped_storage::ScopedStorage;
-    pub use crate::storage::{MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
+    pub use crate::storage::{
+        MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+    };
     pub use crate::tenant::TenantId;
 }
 

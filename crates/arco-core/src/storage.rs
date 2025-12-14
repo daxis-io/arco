@@ -73,6 +73,7 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// Reads a byte range from an object.
     ///
     /// Returns `Error::InvalidInput` if start > object length.
+    /// Returns `Error::InvalidInput` if end < start.
     /// Clamps end to object length if end > length.
     async fn get_range(&self, path: &str, range: Range<u64>) -> Result<Bytes>;
 
@@ -95,6 +96,10 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// Lists objects with the given prefix.
     ///
     /// Returns empty vec if no objects match.
+    ///
+    /// **Ordering**: Results are returned in arbitrary order that may vary between
+    /// backends and invocations. Callers requiring deterministic order should sort
+    /// the results (e.g., by `path` or `last_modified`).
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
 
     /// Gets object metadata without reading content.
@@ -134,12 +139,9 @@ impl MemoryBackend {
 #[async_trait]
 impl StorageBackend for MemoryBackend {
     async fn get(&self, path: &str) -> Result<Bytes> {
-        let objects = self
-            .objects
-            .read()
-            .map_err(|_| Error::Internal {
-                message: "lock poisoned".into(),
-            })?;
+        let objects = self.objects.read().map_err(|_| Error::Internal {
+            message: "lock poisoned".into(),
+        })?;
 
         objects
             .get(path)
@@ -159,6 +161,11 @@ impl StorageBackend for MemoryBackend {
         }
 
         let end = usize::try_from(range.end).unwrap_or(usize::MAX).min(len);
+        if end < start {
+            return Err(Error::InvalidInput(format!(
+                "range end {end} is before start {start}"
+            )));
+        }
         Ok(data.slice(start..end))
     }
 
@@ -168,12 +175,9 @@ impl StorageBackend for MemoryBackend {
         data: Bytes,
         precondition: WritePrecondition,
     ) -> Result<WriteResult> {
-        let mut objects = self
-            .objects
-            .write()
-            .map_err(|_| Error::Internal {
-                message: "lock poisoned".into(),
-            })?;
+        let mut objects = self.objects.write().map_err(|_| Error::Internal {
+            message: "lock poisoned".into(),
+        })?;
 
         let current = objects.get(path);
 
@@ -212,7 +216,9 @@ impl StorageBackend for MemoryBackend {
         );
         drop(objects);
 
-        Ok(WriteResult::Success { generation: new_gen })
+        Ok(WriteResult::Success {
+            generation: new_gen,
+        })
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
@@ -226,12 +232,9 @@ impl StorageBackend for MemoryBackend {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
-        let objects = self
-            .objects
-            .read()
-            .map_err(|_| Error::Internal {
-                message: "lock poisoned".into(),
-            })?;
+        let objects = self.objects.read().map_err(|_| Error::Internal {
+            message: "lock poisoned".into(),
+        })?;
 
         Ok(objects
             .iter()
@@ -247,12 +250,9 @@ impl StorageBackend for MemoryBackend {
     }
 
     async fn head(&self, path: &str) -> Result<Option<ObjectMeta>> {
-        let objects = self
-            .objects
-            .read()
-            .map_err(|_| Error::Internal {
-                message: "lock poisoned".into(),
-            })?;
+        let objects = self.objects.read().map_err(|_| Error::Internal {
+            message: "lock poisoned".into(),
+        })?;
 
         Ok(objects.get(path).map(|obj| ObjectMeta {
             path: path.to_string(),
@@ -288,7 +288,10 @@ mod tests {
 
         assert!(matches!(result, WriteResult::Success { generation: 1 }));
 
-        let retrieved = backend.get("test/file.txt").await.expect("get should succeed");
+        let retrieved = backend
+            .get("test/file.txt")
+            .await
+            .expect("get should succeed");
         assert_eq!(retrieved, data);
     }
 
@@ -318,11 +321,18 @@ mod tests {
     async fn test_get_range_valid() {
         let backend = MemoryBackend::new();
         backend
-            .put("test.txt", Bytes::from("hello world"), WritePrecondition::None)
+            .put(
+                "test.txt",
+                Bytes::from("hello world"),
+                WritePrecondition::None,
+            )
             .await
             .expect("put should succeed");
 
-        let result = backend.get_range("test.txt", 0..5).await.expect("should succeed");
+        let result = backend
+            .get_range("test.txt", 0..5)
+            .await
+            .expect("should succeed");
         assert_eq!(result, Bytes::from("hello"));
     }
 
@@ -335,7 +345,10 @@ mod tests {
             .expect("put should succeed");
 
         // End beyond length should clamp, not panic
-        let result = backend.get_range("test.txt", 0..100).await.expect("should succeed");
+        let result = backend
+            .get_range("test.txt", 0..100)
+            .await
+            .expect("should succeed");
         assert_eq!(result, Bytes::from("hello"));
     }
 
@@ -349,6 +362,23 @@ mod tests {
 
         // Start beyond length should error, not panic
         let result = backend.get_range("test.txt", 100..200).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_range_invalid_end_before_start() {
+        let backend = MemoryBackend::new();
+        backend
+            .put(
+                "test.txt",
+                Bytes::from("hello world"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("put should succeed");
+
+        // End before start should error, not panic
+        let result = backend.get_range("test.txt", 8..2).await;
         assert!(result.is_err());
     }
 
@@ -376,14 +406,22 @@ mod tests {
 
         // First write with DoesNotExist should succeed
         let result = backend
-            .put("new.txt", Bytes::from("data"), WritePrecondition::DoesNotExist)
+            .put(
+                "new.txt",
+                Bytes::from("data"),
+                WritePrecondition::DoesNotExist,
+            )
             .await
             .expect("should succeed");
         assert!(matches!(result, WriteResult::Success { .. }));
 
         // Second write with DoesNotExist should fail
         let result = backend
-            .put("new.txt", Bytes::from("data2"), WritePrecondition::DoesNotExist)
+            .put(
+                "new.txt",
+                Bytes::from("data2"),
+                WritePrecondition::DoesNotExist,
+            )
             .await
             .expect("should succeed");
         assert!(matches!(result, WriteResult::PreconditionFailed { .. }));

@@ -32,67 +32,95 @@ pub struct ScopedStorage {
 impl ScopedStorage {
     /// Creates a new scoped storage wrapper.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `tenant_id` or `workspace_id` contains invalid characters.
-    /// Valid IDs must be non-empty, contain only alphanumeric characters,
-    /// hyphens, and underscores, and not contain path separators or dots.
+    /// Returns an error if `tenant_id` or `workspace_id` is invalid.
+    /// IDs must be non-empty, ASCII lowercase alphanumeric (plus `-` and `_`),
+    /// and must not contain path separators or other control characters.
     pub fn new(
         backend: Arc<dyn StorageBackend>,
         tenant_id: impl Into<String>,
         workspace_id: impl Into<String>,
-    ) -> Self {
+    ) -> Result<Self> {
         let tenant_id = tenant_id.into();
         let workspace_id = workspace_id.into();
 
-        Self::validate_id(&tenant_id, "tenant_id");
-        Self::validate_id(&workspace_id, "workspace_id");
+        Self::validate_id(&tenant_id, "tenant_id")?;
+        Self::validate_id(&workspace_id, "workspace_id")?;
 
-        Self {
+        Ok(Self {
             backend,
             tenant_id,
             workspace_id,
-        }
+        })
     }
 
     /// Validates an ID for use in paths.
-    fn validate_id(id: &str, field: &str) {
-        assert!(!id.is_empty(), "{field} cannot be empty");
-        assert!(
-            !id.contains('/') && !id.contains('\\'),
-            "{field} cannot contain path separators"
-        );
-        assert!(
-            !id.contains(".."),
-            "{field} cannot contain path traversal sequences"
-        );
-        assert!(
-            !id.contains('\n') && !id.contains('\r'),
-            "{field} cannot contain newlines"
-        );
-        assert!(
-            !id.contains(' '),
-            "{field} cannot contain spaces"
-        );
+    fn validate_id(id: &str, field: &str) -> Result<()> {
+        if id.is_empty() {
+            return Err(Error::InvalidId {
+                message: format!("{field} cannot be empty"),
+            });
+        }
+
+        if id.contains('/') || id.contains('\\') {
+            return Err(Error::InvalidId {
+                message: format!("{field} cannot contain path separators"),
+            });
+        }
+
+        if id.contains('\n') || id.contains('\r') || id.contains('\0') {
+            return Err(Error::InvalidId {
+                message: format!("{field} cannot contain control characters"),
+            });
+        }
+
+        if !id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        {
+            return Err(Error::InvalidId {
+                message: format!(
+                    "{field} contains invalid characters (allowed: a-z, 0-9, '-', '_')"
+                ),
+            });
+        }
+
+        Ok(())
     }
 
     /// Validates a relative path for path traversal attacks.
     fn validate_path(path: &str) -> Result<()> {
-        // Reject URL-encoded path traversal
-        let decoded = path.replace("%2F", "/").replace("%2f", "/");
-
-        // Check for path traversal attempts
-        if decoded.contains("..") {
-            return Err(Error::InvalidInput(format!(
-                "path traversal not allowed: {path}"
-            )));
-        }
-
-        // Check for absolute paths
         if path.starts_with('/') || path.starts_with('\\') {
             return Err(Error::InvalidInput(format!(
                 "absolute paths not allowed: {path}"
             )));
+        }
+
+        if path.contains('\\') {
+            return Err(Error::InvalidInput(format!(
+                "backslashes not allowed in paths: {path}"
+            )));
+        }
+
+        if path.contains('%') {
+            return Err(Error::InvalidInput(format!(
+                "percent-encoding not allowed in paths: {path}"
+            )));
+        }
+
+        if path.contains('\n') || path.contains('\r') || path.contains('\0') {
+            return Err(Error::InvalidInput(format!(
+                "control characters not allowed in paths: {path}"
+            )));
+        }
+
+        for segment in path.split('/') {
+            if segment == "." || segment == ".." {
+                return Err(Error::InvalidInput(format!(
+                    "path traversal not allowed: {path}"
+                )));
+            }
         }
 
         Ok(())
@@ -280,7 +308,7 @@ impl ScopedStorage {
     pub async fn list(&self, prefix: &str) -> Result<Vec<ScopedPath>> {
         Self::validate_path(prefix)?;
         let full_prefix = self.scoped_path(prefix);
-        let scope_prefix = self.scope_prefix();
+        let scope_prefix = format!("{}/", self.scope_prefix());
 
         let metas = self.backend.list(&full_prefix).await?;
 
@@ -289,7 +317,6 @@ impl ScopedStorage {
             .filter_map(|m| {
                 m.path
                     .strip_prefix(&scope_prefix)
-                    .map(|p| p.trim_start_matches('/'))
                     .map(|p| ScopedPath(p.to_string()))
             })
             .collect())
@@ -344,7 +371,7 @@ mod tests {
     #[test]
     fn test_core_paths_match_architecture() {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = ScopedStorage::new(backend, "acme", "production");
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
 
         // Per unified platform design: {tenant}/{workspace}/...
         assert_eq!(
@@ -365,7 +392,7 @@ mod tests {
     #[test]
     fn test_ledger_paths_match_architecture() {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = ScopedStorage::new(backend, "acme", "production");
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
 
         assert_eq!(
             storage.ledger_path("execution", "2025-01-15"),
@@ -384,7 +411,7 @@ mod tests {
     #[test]
     fn test_state_paths_match_architecture() {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = ScopedStorage::new(backend, "acme", "production");
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
 
         assert_eq!(
             storage.state_path("execution", "materializations"),
@@ -399,7 +426,7 @@ mod tests {
     #[test]
     fn test_governance_paths_match_architecture() {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = ScopedStorage::new(backend, "acme", "production");
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
 
         assert_eq!(
             storage.governance_tags_path(),
@@ -416,20 +443,31 @@ mod tests {
         let backend = Arc::new(MemoryBackend::new());
 
         // Same tenant, different workspaces
-        let prod = ScopedStorage::new(backend.clone(), "acme", "production");
-        let staging = ScopedStorage::new(backend.clone(), "acme", "staging");
+        let prod = ScopedStorage::new(backend.clone(), "acme", "production").unwrap();
+        let staging = ScopedStorage::new(backend.clone(), "acme", "staging").unwrap();
 
-        prod.put_raw("test.txt", Bytes::from("prod-data"), WritePrecondition::None)
-            .await
-            .expect("put should succeed");
+        prod.put_raw(
+            "test.txt",
+            Bytes::from("prod-data"),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("put should succeed");
         staging
-            .put_raw("test.txt", Bytes::from("staging-data"), WritePrecondition::None)
+            .put_raw(
+                "test.txt",
+                Bytes::from("staging-data"),
+                WritePrecondition::None,
+            )
             .await
             .expect("put should succeed");
 
         // Each workspace sees only their own data
         let prod_data = prod.get_raw("test.txt").await.expect("get should succeed");
-        let staging_data = staging.get_raw("test.txt").await.expect("get should succeed");
+        let staging_data = staging
+            .get_raw("test.txt")
+            .await
+            .expect("get should succeed");
 
         assert_eq!(prod_data, Bytes::from("prod-data"));
         assert_eq!(staging_data, Bytes::from("staging-data"));
@@ -439,19 +477,30 @@ mod tests {
     async fn test_different_tenants_isolation() {
         let backend = Arc::new(MemoryBackend::new());
 
-        let acme = ScopedStorage::new(backend.clone(), "acme", "production");
-        let globex = ScopedStorage::new(backend.clone(), "globex", "production");
+        let acme = ScopedStorage::new(backend.clone(), "acme", "production").unwrap();
+        let globex = ScopedStorage::new(backend.clone(), "globex", "production").unwrap();
 
-        acme.put_raw("test.txt", Bytes::from("acme-data"), WritePrecondition::None)
-            .await
-            .expect("put should succeed");
+        acme.put_raw(
+            "test.txt",
+            Bytes::from("acme-data"),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("put should succeed");
         globex
-            .put_raw("test.txt", Bytes::from("globex-data"), WritePrecondition::None)
+            .put_raw(
+                "test.txt",
+                Bytes::from("globex-data"),
+                WritePrecondition::None,
+            )
             .await
             .expect("put should succeed");
 
         let acme_data = acme.get_raw("test.txt").await.expect("get should succeed");
-        let globex_data = globex.get_raw("test.txt").await.expect("get should succeed");
+        let globex_data = globex
+            .get_raw("test.txt")
+            .await
+            .expect("get should succeed");
 
         assert_eq!(acme_data, Bytes::from("acme-data"));
         assert_eq!(globex_data, Bytes::from("globex-data"));
@@ -460,7 +509,7 @@ mod tests {
     #[tokio::test]
     async fn test_catalog_path_operations() {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = ScopedStorage::new(backend, "acme", "production");
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
 
         // Write to core manifest path
         let manifest_data = Bytes::from(r#"{"version": 1}"#);
@@ -470,7 +519,10 @@ mod tests {
             .expect("put should succeed");
 
         // Read back
-        let retrieved = storage.get_core_manifest().await.expect("get should succeed");
+        let retrieved = storage
+            .get_core_manifest()
+            .await
+            .expect("get should succeed");
         assert_eq!(retrieved, manifest_data);
     }
 
@@ -484,7 +536,7 @@ mod tests {
         // Attempts to escape the scope boundary via ".." must fail.
 
         let backend = Arc::new(MemoryBackend::new());
-        let storage = ScopedStorage::new(backend, "acme", "production");
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
 
         // Attempt to write outside scope via path traversal
         let traversal_paths = [
@@ -492,6 +544,7 @@ mod tests {
             "../../other_tenant/data.txt",
             "manifests/../../../escape.txt",
             "ledger/execution/..%2F..%2Fsecret.txt", // URL-encoded
+            "ledger/execution/%2e%2e/%2e%2e/secret.txt",
             "ledger/../../../etc/passwd",
         ];
 
@@ -519,21 +572,33 @@ mod tests {
 
         let backend = Arc::new(MemoryBackend::new());
 
-        let acme_prod = ScopedStorage::new(backend.clone(), "acme", "production");
-        let acme_staging = ScopedStorage::new(backend.clone(), "acme", "staging");
-        let globex_prod = ScopedStorage::new(backend.clone(), "globex", "production");
+        let acme_prod = ScopedStorage::new(backend.clone(), "acme", "production").unwrap();
+        let acme_staging = ScopedStorage::new(backend.clone(), "acme", "staging").unwrap();
+        let globex_prod = ScopedStorage::new(backend.clone(), "globex", "production").unwrap();
 
         // Write files to each scope
         acme_prod
-            .put_raw("secret1.txt", Bytes::from("acme-prod"), WritePrecondition::None)
+            .put_raw(
+                "secret1.txt",
+                Bytes::from("acme-prod"),
+                WritePrecondition::None,
+            )
             .await
             .expect("put");
         acme_staging
-            .put_raw("secret2.txt", Bytes::from("acme-staging"), WritePrecondition::None)
+            .put_raw(
+                "secret2.txt",
+                Bytes::from("acme-staging"),
+                WritePrecondition::None,
+            )
             .await
             .expect("put");
         globex_prod
-            .put_raw("secret3.txt", Bytes::from("globex-prod"), WritePrecondition::None)
+            .put_raw(
+                "secret3.txt",
+                Bytes::from("globex-prod"),
+                WritePrecondition::None,
+            )
             .await
             .expect("put");
 
@@ -543,7 +608,11 @@ mod tests {
         let globex_prod_files = globex_prod.list("").await.expect("list");
 
         assert_eq!(acme_prod_files.len(), 1, "acme/prod sees only its file");
-        assert_eq!(acme_staging_files.len(), 1, "acme/staging sees only its file");
+        assert_eq!(
+            acme_staging_files.len(),
+            1,
+            "acme/staging sees only its file"
+        );
         assert_eq!(globex_prod_files.len(), 1, "globex/prod sees only its file");
 
         // Verify correct files visible
@@ -559,13 +628,17 @@ mod tests {
 
         let backend = Arc::new(MemoryBackend::new());
 
-        let acme = ScopedStorage::new(backend.clone(), "acme", "production");
-        let globex = ScopedStorage::new(backend.clone(), "globex", "production");
+        let acme = ScopedStorage::new(backend.clone(), "acme", "production").unwrap();
+        let globex = ScopedStorage::new(backend.clone(), "globex", "production").unwrap();
 
         // Write data under acme scope
-        acme.put_raw("secret.txt", Bytes::from("acme-secret"), WritePrecondition::None)
-            .await
-            .expect("put");
+        acme.put_raw(
+            "secret.txt",
+            Bytes::from("acme-secret"),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("put");
 
         // Verify acme can read its own data
         let acme_data = acme.get_raw("secret.txt").await.expect("should succeed");
@@ -573,10 +646,7 @@ mod tests {
 
         // Globex cannot read acme's data using the same relative path
         let globex_result = globex.get_raw("secret.txt").await;
-        assert!(
-            globex_result.is_err(),
-            "cross-scope read must fail"
-        );
+        assert!(globex_result.is_err(), "cross-scope read must fail");
     }
 
     #[tokio::test]
@@ -585,63 +655,65 @@ mod tests {
 
         let backend = Arc::new(MemoryBackend::new());
 
-        let acme = ScopedStorage::new(backend.clone(), "acme", "production");
-        let globex = ScopedStorage::new(backend.clone(), "globex", "production");
+        let acme = ScopedStorage::new(backend.clone(), "acme", "production").unwrap();
+        let globex = ScopedStorage::new(backend.clone(), "globex", "production").unwrap();
 
         // Write data under acme scope
-        acme.put_raw("important.txt", Bytes::from("critical-data"), WritePrecondition::None)
-            .await
-            .expect("put");
+        acme.put_raw(
+            "important.txt",
+            Bytes::from("critical-data"),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("put");
 
         // Globex tries to delete acme's file using same relative path
         // This is a no-op since globex's path doesn't exist
         let _ = globex.delete("important.txt").await;
 
         // Verify acme's data is still intact
-        let acme_data = acme.get_raw("important.txt").await.expect("should still exist");
+        let acme_data = acme
+            .get_raw("important.txt")
+            .await
+            .expect("should still exist");
         assert_eq!(acme_data, Bytes::from("critical-data"));
     }
 
     #[test]
-    #[should_panic(expected = "cannot be empty")]
-    fn test_empty_tenant_id_panics() {
+    fn test_empty_tenant_id_returns_error() {
         let backend = Arc::new(MemoryBackend::new());
-        ScopedStorage::new(backend, "", "workspace");
+        assert!(ScopedStorage::new(backend, "", "workspace").is_err());
     }
 
     #[test]
-    #[should_panic(expected = "cannot contain path separators")]
-    fn test_tenant_with_slash_panics() {
+    fn test_tenant_with_slash_returns_error() {
         let backend = Arc::new(MemoryBackend::new());
-        ScopedStorage::new(backend, "tenant/evil", "workspace");
+        assert!(ScopedStorage::new(backend, "tenant/evil", "workspace").is_err());
     }
 
     #[test]
-    #[should_panic(expected = "cannot contain path traversal")]
-    fn test_tenant_with_dots_panics() {
+    fn test_tenant_with_dots_returns_error() {
         let backend = Arc::new(MemoryBackend::new());
-        ScopedStorage::new(backend, "tenant..name", "workspace");
+        assert!(ScopedStorage::new(backend, "tenant..name", "workspace").is_err());
     }
 
     #[test]
-    #[should_panic(expected = "cannot contain spaces")]
-    fn test_tenant_with_space_panics() {
+    fn test_tenant_with_space_returns_error() {
         let backend = Arc::new(MemoryBackend::new());
-        ScopedStorage::new(backend, "tenant name", "workspace");
+        assert!(ScopedStorage::new(backend, "tenant name", "workspace").is_err());
     }
 
     #[test]
-    #[should_panic(expected = "cannot contain newlines")]
-    fn test_tenant_with_newline_panics() {
+    fn test_tenant_with_newline_returns_error() {
         let backend = Arc::new(MemoryBackend::new());
-        ScopedStorage::new(backend, "tenant\nname", "workspace");
+        assert!(ScopedStorage::new(backend, "tenant\nname", "workspace").is_err());
     }
 
     #[tokio::test]
     async fn test_valid_relative_paths() {
         // Normal paths should work fine
         let backend = Arc::new(MemoryBackend::new());
-        let storage = ScopedStorage::new(backend, "acme", "production");
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
 
         storage
             .put_raw("file.txt", Bytes::from("data"), WritePrecondition::None)

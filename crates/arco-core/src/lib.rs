@@ -35,6 +35,7 @@
 
 pub mod error;
 pub mod id;
+pub mod observability;
 pub mod tenant;
 
 /// Prelude module for convenient imports.
@@ -53,4 +54,5 @@ pub mod prelude {
 // Re-export key types at crate root for ergonomics
 pub use error::{Error, Result};
 pub use id::{AssetId, RunId};
+pub use observability::{init_logging, LogFormat};
 pub use tenant::TenantId;

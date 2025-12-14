@@ -60,7 +60,8 @@ impl AssetId {
     #[must_use]
     pub fn created_at(&self) -> chrono::DateTime<chrono::Utc> {
         let ms = self.0.timestamp_ms();
-        chrono::DateTime::from_timestamp_millis(ms as i64).unwrap_or_else(chrono::Utc::now)
+        let ms_i64 = i64::try_from(ms).unwrap_or(i64::MAX);
+        chrono::DateTime::from_timestamp_millis(ms_i64).unwrap_or_else(chrono::Utc::now)
     }
 }
 
@@ -113,7 +114,8 @@ impl RunId {
     #[must_use]
     pub fn created_at(&self) -> chrono::DateTime<chrono::Utc> {
         let ms = self.0.timestamp_ms();
-        chrono::DateTime::from_timestamp_millis(ms as i64).unwrap_or_else(chrono::Utc::now)
+        let ms_i64 = i64::try_from(ms).unwrap_or(i64::MAX);
+        chrono::DateTime::from_timestamp_millis(ms_i64).unwrap_or_else(chrono::Utc::now)
     }
 }
 

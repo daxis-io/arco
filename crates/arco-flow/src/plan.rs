@@ -23,7 +23,7 @@ pub struct Plan {
 impl Plan {
     /// Creates a new empty plan.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { tasks: Vec::new() }
     }
 

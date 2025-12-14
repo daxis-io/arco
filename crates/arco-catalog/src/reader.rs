@@ -19,13 +19,13 @@ pub struct CatalogReader {
 impl CatalogReader {
     /// Creates a new catalog reader for the given tenant.
     #[must_use]
-    pub fn new(tenant: TenantId) -> Self {
+    pub const fn new(tenant: TenantId) -> Self {
         Self { tenant }
     }
 
     /// Returns the tenant ID this reader is scoped to.
     #[must_use]
-    pub fn tenant(&self) -> &TenantId {
+    pub const fn tenant(&self) -> &TenantId {
         &self.tenant
     }
 
@@ -34,6 +34,7 @@ impl CatalogReader {
     /// # Errors
     ///
     /// Returns an error if the catalog cannot be read.
+    #[allow(clippy::unused_async)]
     pub async fn list_assets(&self) -> Result<Vec<String>> {
         // TODO: Implement catalog listing
         Ok(Vec::new())

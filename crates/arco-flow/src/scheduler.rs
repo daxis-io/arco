@@ -19,13 +19,13 @@ pub struct Scheduler {
 impl Scheduler {
     /// Creates a new scheduler for the given plan.
     #[must_use]
-    pub fn new(plan: Plan) -> Self {
+    pub const fn new(plan: Plan) -> Self {
         Self { plan }
     }
 
     /// Returns the plan being scheduled.
     #[must_use]
-    pub fn plan(&self) -> &Plan {
+    pub const fn plan(&self) -> &Plan {
         &self.plan
     }
 
@@ -34,6 +34,7 @@ impl Scheduler {
     /// # Errors
     ///
     /// Returns an error if the scheduler cannot execute the plan.
+    #[allow(clippy::unused_async)]
     pub async fn execute(&self) -> Result<Run> {
         let id = RunId::generate();
         let mut run = Run::new(id);

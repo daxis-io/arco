@@ -397,12 +397,13 @@ impl PartitionId {
     /// Derives partition ID from asset ID + partition key.
     ///
     /// The derivation is deterministic: same inputs always produce same ID.
+    /// Uses 128 bits of SHA-256 for collision resistance at high cardinality.
     #[must_use]
     pub fn derive(asset_id: &AssetId, partition_key: &PartitionKey) -> Self {
         let input = format!("{}:{}", asset_id, partition_key.canonical_string());
         let hash = Sha256::digest(input.as_bytes());
-        // Use first 16 hex chars (64 bits) for reasonable uniqueness
-        let short_hash = &hex::encode(hash)[..16];
+        // Use first 32 hex chars (128 bits) for collision resistance
+        let short_hash = &hex::encode(hash)[..32];
         Self(format!("part_{short_hash}"))
     }
 
@@ -593,9 +594,9 @@ mod tests {
 
         let id = PartitionId::derive(&asset_id, &pk);
 
-        // Should start with "part_" and have 16 hex chars
+        // Should start with "part_" and have 32 hex chars (128 bits)
         assert!(id.as_str().starts_with("part_"));
-        assert_eq!(id.as_str().len(), 5 + 16); // "part_" + 16 hex chars
+        assert_eq!(id.as_str().len(), 5 + 32); // "part_" + 32 hex chars
     }
 
     #[test]

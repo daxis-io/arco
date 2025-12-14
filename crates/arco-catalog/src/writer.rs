@@ -20,13 +20,13 @@ pub struct CatalogWriter {
 impl CatalogWriter {
     /// Creates a new catalog writer for the given tenant.
     #[must_use]
-    pub fn new(tenant: TenantId) -> Self {
+    pub const fn new(tenant: TenantId) -> Self {
         Self { tenant }
     }
 
     /// Returns the tenant ID this writer is scoped to.
     #[must_use]
-    pub fn tenant(&self) -> &TenantId {
+    pub const fn tenant(&self) -> &TenantId {
         &self.tenant
     }
 
@@ -37,6 +37,7 @@ impl CatalogWriter {
     /// # Errors
     ///
     /// Returns an error if the asset cannot be registered.
+    #[allow(clippy::unused_async)]
     pub async fn register_asset(&self, _name: &str) -> Result<()> {
         // TODO: Implement asset registration
         Ok(())

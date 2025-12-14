@@ -56,6 +56,6 @@ pub mod prelude {
 // Re-export key types at crate root for ergonomics
 pub use error::{Error, Result};
 pub use id::{AssetId, RunId};
-pub use observability::{init_logging, LogFormat};
+pub use observability::{LogFormat, init_logging};
 pub use partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
 pub use tenant::TenantId;

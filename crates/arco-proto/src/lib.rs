@@ -5,10 +5,14 @@
 
 #![forbid(unsafe_code)]
 #![allow(missing_docs)] // Generated code doesn't have docs
-#![allow(clippy::all)] // Generated code may trigger clippy warnings
 
-// Include generated code - all types are available at crate root
-include!(concat!(env!("OUT_DIR"), "/arco.v1.rs"));
+#[allow(clippy::all, clippy::cargo, clippy::nursery, clippy::pedantic)]
+mod generated {
+    // Include generated code; all types are re-exported at crate root.
+    include!(concat!(env!("OUT_DIR"), "/arco.v1.rs"));
+}
+
+pub use generated::*;
 
 #[cfg(test)]
 mod tests {

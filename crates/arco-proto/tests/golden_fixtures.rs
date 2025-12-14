@@ -60,7 +60,7 @@ fn test_id_types_serde_roundtrip() {
 
 #[test]
 fn test_scalar_value_variants() {
-    use arco_proto::{scalar_value::Value, ScalarValue};
+    use arco_proto::{ScalarValue, scalar_value::Value};
 
     // String value
     let sv = ScalarValue {

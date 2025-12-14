@@ -6,7 +6,7 @@
 
 use std::sync::Once;
 use tracing::Span;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 static INIT: Once = Once::new();
 

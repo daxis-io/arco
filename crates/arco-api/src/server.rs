@@ -29,6 +29,7 @@ impl Server {
     /// # Errors
     ///
     /// Returns an error if the server cannot start.
+    #[allow(clippy::unused_async)]
     pub async fn serve(&self) -> Result<()> {
         tracing::info!(
             http_port = self.config.http_port,

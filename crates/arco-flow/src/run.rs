@@ -45,7 +45,7 @@ impl Run {
 
     /// Returns true if the run is in a terminal state.
     #[must_use]
-    pub fn is_terminal(&self) -> bool {
+    pub const fn is_terminal(&self) -> bool {
         matches!(
             self.state,
             RunState::Succeeded | RunState::Failed | RunState::Cancelled

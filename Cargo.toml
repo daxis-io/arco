@@ -39,6 +39,10 @@ cargo = { level = "warn", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+# Cargo lints: this is a workspace with multiple internal crates; don't require publish-grade metadata.
+cargo_common_metadata = "allow"
+multiple_crate_versions = "allow"
+missing_const_for_fn = "allow"
 # Warnings for common issues
 indexing_slicing = "warn"
 todo = "warn"

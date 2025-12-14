@@ -11,9 +11,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let includes = ["../../proto"];
 
-    // Use basic prost compilation without serde for now
-    // (prost_types::Timestamp doesn't support serde out of the box)
-    prost_build::Config::new().compile_protos(&proto_files, &includes)?;
+    prost_build::Config::new()
+        // Use BTreeMap for deterministic ordering in serde
+        .btree_map(["."])
+        // Add serde derives only to types that don't contain Timestamp
+        // ID types
+        .type_attribute(".arco.v1.TenantId", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".arco.v1.TenantId", "#[serde(rename_all = \"camelCase\")]")
+        .type_attribute(".arco.v1.WorkspaceId", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".arco.v1.WorkspaceId", "#[serde(rename_all = \"camelCase\")]")
+        .type_attribute(".arco.v1.AssetId", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".arco.v1.AssetId", "#[serde(rename_all = \"camelCase\")]")
+        .type_attribute(".arco.v1.RunId", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".arco.v1.RunId", "#[serde(rename_all = \"camelCase\")]")
+        .type_attribute(".arco.v1.TaskId", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".arco.v1.TaskId", "#[serde(rename_all = \"camelCase\")]")
+        .type_attribute(".arco.v1.PartitionId", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".arco.v1.PartitionId", "#[serde(rename_all = \"camelCase\")]")
+        .type_attribute(".arco.v1.MaterializationId", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".arco.v1.MaterializationId", "#[serde(rename_all = \"camelCase\")]")
+        .type_attribute(".arco.v1.SnapshotId", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".arco.v1.SnapshotId", "#[serde(rename_all = \"camelCase\")]")
+        // Core data types
+        .type_attribute(".arco.v1.PartitionKey", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".arco.v1.PartitionKey", "#[serde(rename_all = \"camelCase\")]")
+        .type_attribute(".arco.v1.ScalarValue", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".arco.v1.ScalarValue", "#[serde(rename_all = \"camelCase\")]")
+        .type_attribute(".arco.v1.AssetKey", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".arco.v1.AssetKey", "#[serde(rename_all = \"camelCase\")]")
+        .compile_protos(&proto_files, &includes)?;
 
     // Rerun if proto files change
     for file in &proto_files {

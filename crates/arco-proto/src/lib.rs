@@ -27,7 +27,7 @@ mod tests {
     fn test_partition_key_serialization() {
         use prost::Message;
 
-        let mut dimensions = std::collections::HashMap::new();
+        let mut dimensions = std::collections::BTreeMap::new();
         dimensions.insert(
             "date".to_string(),
             ScalarValue {

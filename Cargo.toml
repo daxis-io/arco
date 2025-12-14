@@ -82,6 +82,7 @@ ulid = { version = "1", features = ["serde"] }
 # Hashing and encoding
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
 
 # Data formats
 parquet = { version = "53", features = ["async"] }

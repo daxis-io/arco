@@ -39,7 +39,7 @@
 //! assert!(canonical.starts_with("date=d:"));
 //! ```
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -184,7 +184,9 @@ impl PartitionKey {
             // Validate key (must start with letter, then alphanumeric/underscore)
             if key.is_empty()
                 || !key.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-                || !key.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                || !key
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
             {
                 return Err(PartitionKeyParseError::InvalidKey(key.to_string()));
             }
@@ -214,9 +216,9 @@ impl PartitionKey {
                 }
                 "s" => {
                     // Decode base64url
-                    let bytes = URL_SAFE_NO_PAD
-                        .decode(value_part)
-                        .map_err(|_| PartitionKeyParseError::InvalidBase64(value_part.to_string()))?;
+                    let bytes = URL_SAFE_NO_PAD.decode(value_part).map_err(|_| {
+                        PartitionKeyParseError::InvalidBase64(value_part.to_string())
+                    })?;
                     let string = String::from_utf8(bytes)
                         .map_err(|_| PartitionKeyParseError::InvalidUtf8(value_part.to_string()))?;
                     ScalarValue::String(string)
@@ -240,6 +242,11 @@ impl PartitionKey {
                 _ => return Err(PartitionKeyParseError::UnknownType(type_prefix.to_string())),
             };
 
+            // Reject duplicate keys
+            if pk.0.contains_key(key) {
+                return Err(PartitionKeyParseError::DuplicateKey(key.to_string()));
+            }
+
             pk.insert(key.to_string(), scalar);
         }
 
@@ -247,24 +254,86 @@ impl PartitionKey {
     }
 }
 
-/// Validates date format (YYYY-MM-DD).
+/// Validates date format (YYYY-MM-DD) with valid ranges.
 fn is_valid_date_format(s: &str) -> bool {
     if s.len() != 10 {
         return false;
     }
     let bytes = s.as_bytes();
-    // SAFETY: We've verified s.len() == 10, so these indices are valid
-    bytes.get(4) == Some(&b'-')
-        && bytes.get(7) == Some(&b'-')
-        && s.get(..4).is_some_and(|y| y.parse::<u16>().is_ok())
-        && s.get(5..7).is_some_and(|m| m.parse::<u8>().is_ok())
-        && s.get(8..).is_some_and(|d| d.parse::<u8>().is_ok())
+    if bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
+        return false;
+    }
+
+    // Parse and validate ranges
+    let _year: u16 = match s.get(..4).and_then(|y| y.parse().ok()) {
+        Some(y) if y >= 1970 => y, // Reasonable minimum year
+        _ => return false,
+    };
+    let month: u8 = match s.get(5..7).and_then(|m| m.parse().ok()) {
+        Some(m) if (1..=12).contains(&m) => m,
+        _ => return false,
+    };
+    let day: u8 = match s.get(8..).and_then(|d| d.parse().ok()) {
+        Some(d) if (1..=31).contains(&d) => d,
+        _ => return false,
+    };
+
+    // Basic month-day validation (not checking leap years for simplicity)
+    match month {
+        2 => day <= 29,
+        4 | 6 | 9 | 11 => day <= 30,
+        _ => true,
+    }
 }
 
 /// Validates timestamp format (YYYY-MM-DDTHH:MM:SS.ffffffZ).
+/// Requires exact microsecond precision ISO 8601 format.
 fn is_valid_timestamp_format(s: &str) -> bool {
-    // Basic length check for ISO 8601 with microseconds
-    s.len() >= 20 && s.ends_with('Z') && s.contains('T')
+    // Expected format: YYYY-MM-DDTHH:MM:SS.ffffffZ (27 chars)
+    if s.len() != 27 || !s.ends_with('Z') {
+        return false;
+    }
+
+    let bytes = s.as_bytes();
+
+    // Check structural characters
+    if bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+        || bytes.get(19) != Some(&b'.')
+    {
+        return false;
+    }
+
+    // Validate date portion
+    let date_part = match s.get(..10) {
+        Some(d) => d,
+        None => return false,
+    };
+    if !is_valid_date_format(date_part) {
+        return false;
+    }
+
+    // Validate time components
+    let _hour: u8 = match s.get(11..13).and_then(|h| h.parse().ok()) {
+        Some(h) if h <= 23 => h,
+        _ => return false,
+    };
+    let _minute: u8 = match s.get(14..16).and_then(|m| m.parse().ok()) {
+        Some(m) if m <= 59 => m,
+        _ => return false,
+    };
+    let _second: u8 = match s.get(17..19).and_then(|s| s.parse().ok()) {
+        Some(s) if s <= 59 => s,
+        _ => return false,
+    };
+
+    // Validate microseconds (6 digits)
+    s.get(20..26)
+        .map(|us| us.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or(false)
 }
 
 /// Errors that can occur when parsing a canonical partition key string.
@@ -292,6 +361,8 @@ pub enum PartitionKeyParseError {
     InvalidTimestamp(String),
     /// Invalid null value (must be "null").
     InvalidNull(String),
+    /// Duplicate key in partition key.
+    DuplicateKey(String),
 }
 
 impl fmt::Display for PartitionKeyParseError {
@@ -308,6 +379,7 @@ impl fmt::Display for PartitionKeyParseError {
             Self::InvalidDate(s) => write!(f, "invalid date value: {s}"),
             Self::InvalidTimestamp(s) => write!(f, "invalid timestamp value: {s}"),
             Self::InvalidNull(s) => write!(f, "invalid null value: {s}"),
+            Self::DuplicateKey(s) => write!(f, "duplicate key in partition key: {s}"),
         }
     }
 }
@@ -524,5 +596,71 @@ mod tests {
         // Should start with "part_" and have 16 hex chars
         assert!(id.as_str().starts_with("part_"));
         assert_eq!(id.as_str().len(), 5 + 16); // "part_" + 16 hex chars
+    }
+
+    #[test]
+    fn test_parse_rejects_duplicate_keys() {
+        let result = PartitionKey::parse("date=d:2025-01-15,date=d:2025-01-16");
+        assert!(matches!(
+            result,
+            Err(PartitionKeyParseError::DuplicateKey(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_rejects_invalid_date_month() {
+        let result = PartitionKey::parse("date=d:2025-13-15");
+        assert!(matches!(
+            result,
+            Err(PartitionKeyParseError::InvalidDate(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_rejects_invalid_date_day() {
+        let result = PartitionKey::parse("date=d:2025-02-30");
+        assert!(matches!(
+            result,
+            Err(PartitionKeyParseError::InvalidDate(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_rejects_invalid_timestamp_format() {
+        // Missing microseconds
+        let result = PartitionKey::parse("ts=t:2025-01-15T10:30:00Z");
+        assert!(matches!(
+            result,
+            Err(PartitionKeyParseError::InvalidTimestamp(_))
+        ));
+
+        // Wrong length
+        let result = PartitionKey::parse("ts=t:2025-01-15T10:30:00.000Z");
+        assert!(matches!(
+            result,
+            Err(PartitionKeyParseError::InvalidTimestamp(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_accepts_valid_timestamp() {
+        let result = PartitionKey::parse("ts=t:2025-01-15T10:30:00.000000Z");
+        assert!(result.is_ok());
+        let pk = result.unwrap();
+        assert_eq!(
+            pk.get("ts"),
+            Some(&ScalarValue::Timestamp(
+                "2025-01-15T10:30:00.000000Z".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_year_before_1970() {
+        let result = PartitionKey::parse("date=d:1969-12-31");
+        assert!(matches!(
+            result,
+            Err(PartitionKeyParseError::InvalidDate(_))
+        ));
     }
 }

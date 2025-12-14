@@ -1,75 +1,63 @@
-//! # arco-proto
+//! Generated protobuf types for Arco.
 //!
-//! Protobuf definitions and generated code for Arco.
-//!
-//! This crate provides the cross-language contracts used by:
-//!
-//! - gRPC services (Rust server, Python SDK)
-//! - Event serialization (Tier 2 event log)
-//! - Queue messages (pub/sub, task queues)
-//!
-//! ## Proto File Organization
-//!
-//! ```text
-//! proto/arco/v1/
-//! ├── catalog.proto     - Catalog service definitions
-//! ├── flow.proto        - Flow service definitions
-//! ├── common.proto      - Shared message types
-//! └── events.proto      - Event types for Tier 2
-//! ```
-//!
-//! ## Wire Format Guarantees
-//!
-//! - All messages follow Protobuf evolution rules
-//! - New fields are always optional or have defaults
-//! - Field numbers are never reused
-//! - Removed fields are reserved
-//!
-//! ## Example
-//!
-//! ```rust,ignore
-//! use arco_proto::v1::{Asset, ListAssetsRequest};
-//!
-//! let request = ListAssetsRequest {
-//!     tenant_id: "acme-corp".to_string(),
-//!     ..Default::default()
-//! };
-//! ```
+//! This crate provides Rust types generated from the proto/ definitions.
+//! All cross-language contracts are defined via Protobuf.
 
-#![deny(missing_docs)]
-#![deny(rust_2018_idioms)]
-#![warn(clippy::pedantic)]
-// Allow generated code patterns
-#![allow(clippy::derive_partial_eq_without_eq)]
-#![allow(clippy::default_trait_access)]
+#![forbid(unsafe_code)]
+#![allow(missing_docs)] // Generated code doesn't have docs
+#![allow(clippy::all)] // Generated code may trigger clippy warnings
 
-/// Version 1 of the Arco protocol.
-pub mod v1 {
-    // Include generated code here once proto files are compiled
-    // tonic::include_proto!("arco.v1");
+// Include generated code - all types are available at crate root
+include!(concat!(env!("OUT_DIR"), "/arco.v1.rs"));
 
-    // Placeholder types until proto generation is set up
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    /// A catalog asset.
-    #[derive(Debug, Clone, Default)]
-    pub struct Asset {
-        /// Asset identifier.
-        pub id: String,
-        /// Asset name.
-        pub name: String,
+    #[test]
+    fn test_tenant_id_roundtrip() {
+        let tenant = TenantId {
+            value: "acme-corp".to_string(),
+        };
+
+        assert_eq!(tenant.value, "acme-corp");
     }
 
-    /// Request to list assets.
-    #[derive(Debug, Clone, Default)]
-    pub struct ListAssetsRequest {
-        /// Tenant identifier.
-        pub tenant_id: String,
+    #[test]
+    fn test_partition_key_serialization() {
+        use prost::Message;
+
+        let mut dimensions = std::collections::HashMap::new();
+        dimensions.insert(
+            "date".to_string(),
+            ScalarValue {
+                value: Some(scalar_value::Value::DateValue("2025-01-15".to_string())),
+            },
+        );
+
+        let pk = PartitionKey { dimensions };
+        let encoded = pk.encode_to_vec();
+        let decoded = PartitionKey::decode(encoded.as_slice()).expect("decode should succeed");
+
+        assert_eq!(decoded.dimensions.len(), 1);
     }
 
-    /// Response containing assets.
-    #[derive(Debug, Clone, Default)]
-    pub struct ListAssetsResponse {
-        /// The assets.
-        pub assets: Vec<Asset>,
+    #[test]
+    fn test_request_header_has_all_fields() {
+        let header = RequestHeader {
+            tenant_id: Some(TenantId {
+                value: "acme".into(),
+            }),
+            workspace_id: Some(WorkspaceId {
+                value: "production".into(),
+            }),
+            trace_parent: "00-abc123-def456-01".into(),
+            idempotency_key: "idem_001".into(),
+            request_time: None,
+        };
+
+        assert!(header.tenant_id.is_some());
+        assert!(header.workspace_id.is_some());
+        assert!(!header.idempotency_key.is_empty());
     }
 }

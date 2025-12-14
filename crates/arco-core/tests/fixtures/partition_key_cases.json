@@ -1,0 +1,142 @@
+[
+  {
+    "name": "single_date",
+    "dimensions": {
+      "date": {"type": "date", "value": "2025-01-15"}
+    },
+    "expected_canonical": "date=d:2025-01-15"
+  },
+  {
+    "name": "single_int",
+    "dimensions": {
+      "count": {"type": "int64", "value": "42"}
+    },
+    "expected_canonical": "count=i:42"
+  },
+  {
+    "name": "single_bool_true",
+    "dimensions": {
+      "active": {"type": "bool", "value": "true"}
+    },
+    "expected_canonical": "active=b:true"
+  },
+  {
+    "name": "single_bool_false",
+    "dimensions": {
+      "active": {"type": "bool", "value": "false"}
+    },
+    "expected_canonical": "active=b:false"
+  },
+  {
+    "name": "single_string_simple",
+    "dimensions": {
+      "name": {"type": "string", "value": "test"}
+    },
+    "expected_canonical": "name=s:dGVzdA"
+  },
+  {
+    "name": "single_string_with_slash",
+    "dimensions": {
+      "path": {"type": "string", "value": "foo/bar"}
+    },
+    "expected_canonical": "path=s:Zm9vL2Jhcg"
+  },
+  {
+    "name": "single_string_with_special_chars",
+    "dimensions": {
+      "query": {"type": "string", "value": "foo/bar?baz=1&x=2"}
+    },
+    "expected_canonical": "query=s:Zm9vL2Jhcj9iYXo9MSZ4PTI"
+  },
+  {
+    "name": "multi_dimension_sorted",
+    "dimensions": {
+      "region": {"type": "string", "value": "us-east"},
+      "date": {"type": "date", "value": "2025-01-15"}
+    },
+    "expected_canonical": "date=d:2025-01-15,region=s:dXMtZWFzdA"
+  },
+  {
+    "name": "multi_dimension_three_keys",
+    "dimensions": {
+      "z_last": {"type": "int64", "value": "3"},
+      "a_first": {"type": "int64", "value": "1"},
+      "m_middle": {"type": "int64", "value": "2"}
+    },
+    "expected_canonical": "a_first=i:1,m_middle=i:2,z_last=i:3"
+  },
+  {
+    "name": "timestamp",
+    "dimensions": {
+      "ts": {"type": "timestamp", "value": "2025-01-15T10:30:00.000000Z"}
+    },
+    "expected_canonical": "ts=t:2025-01-15T10:30:00.000000Z"
+  },
+  {
+    "name": "null_value",
+    "dimensions": {
+      "missing": {"type": "null", "value": "null"}
+    },
+    "expected_canonical": "missing=n:null"
+  },
+  {
+    "name": "empty_string",
+    "dimensions": {
+      "empty": {"type": "string", "value": ""}
+    },
+    "expected_canonical": "empty=s:"
+  },
+  {
+    "name": "unicode_string",
+    "dimensions": {
+      "greeting": {"type": "string", "value": "hello world"}
+    },
+    "expected_canonical": "greeting=s:aGVsbG8gd29ybGQ"
+  },
+  {
+    "name": "path_hostile_all_special",
+    "comment": "Tests ALL path-hostile characters in one value",
+    "dimensions": {
+      "hostile": {"type": "string", "value": "a/b\\c?d=e&f#g%h:i@j!k$l"}
+    },
+    "expected_canonical": "hostile=s:YS9iXGM_ZD1lJmYjZyVoOmlAaiFrJGw"
+  },
+  {
+    "name": "unicode_emoji",
+    "comment": "Unicode emoji - must survive round-trip",
+    "dimensions": {
+      "emoji": {"type": "string", "value": "\ud83c\udf89"}
+    },
+    "expected_canonical": "emoji=s:8J-OiQ"
+  },
+  {
+    "name": "unicode_cjk",
+    "comment": "CJK characters - common in real data",
+    "dimensions": {
+      "name": {"type": "string", "value": "\u65e5\u672c\u8a9e"}
+    },
+    "expected_canonical": "name=s:5pel5pys6Kqe"
+  },
+  {
+    "name": "negative_int",
+    "dimensions": {
+      "delta": {"type": "int64", "value": "-42"}
+    },
+    "expected_canonical": "delta=i:-42"
+  },
+  {
+    "name": "zero_int",
+    "dimensions": {
+      "count": {"type": "int64", "value": "0"}
+    },
+    "expected_canonical": "count=i:0"
+  },
+  {
+    "name": "max_int64",
+    "comment": "Maximum i64 value - edge case",
+    "dimensions": {
+      "big": {"type": "int64", "value": "9223372036854775807"}
+    },
+    "expected_canonical": "big=i:9223372036854775807"
+  }
+]

@@ -67,3 +67,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v1
+
+  proto-check:
+    name: Proto Compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Buf
+        uses: bufbuild/buf-setup-action@v1
+        with:
+          version: '1.28.1'
+
+      - name: Lint protos
+        run: buf lint proto/
+
+      - name: Check breaking changes
+        if: github.event_name == 'pull_request'
+        run: |
+          buf breaking proto/ \
+            --against 'https://github.com/${{ github.repository }}.git#branch=main,subdir=proto'

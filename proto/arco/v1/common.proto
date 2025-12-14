@@ -92,3 +92,21 @@ enum AssetFormat {
   ASSET_FORMAT_DELTA = 2;
   ASSET_FORMAT_ICEBERG = 3;
 }
+
+// File entry for output tracking (used in materializations and task outputs)
+message FileEntry {
+  // Storage path (gs://, s3://, or relative path)
+  string path = 1;
+
+  // File size in bytes
+  int64 size_bytes = 2;
+
+  // Row count (for tabular data)
+  int64 row_count = 3;
+
+  // Content hash (SHA-256, hex-encoded) for integrity verification
+  string content_hash = 4;
+
+  // File format (e.g., "parquet", "json")
+  string format = 5;
+}

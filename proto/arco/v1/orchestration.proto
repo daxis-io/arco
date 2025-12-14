@@ -1,0 +1,257 @@
+// proto/arco/v1/orchestration.proto
+syntax = "proto3";
+package arco.v1;
+
+option java_multiple_files = true;
+option java_package = "com.arco.v1";
+option go_package = "github.com/daxis-io/arco/proto/arco/v1";
+
+import "google/protobuf/timestamp.proto";
+import "arco/v1/common.proto";
+
+// ============================================================================
+// Plan Domain
+// ============================================================================
+
+// A Plan is a deterministic specification of what will execute.
+// Generated from asset definitions and their dependencies.
+// Per orchestration design: same inputs always produce the same plan.
+message Plan {
+  // Unique plan identifier
+  string plan_id = 1;
+
+  // Tenant and workspace scope
+  TenantId tenant_id = 2;
+  WorkspaceId workspace_id = 3;
+
+  // Plan generation timestamp
+  google.protobuf.Timestamp created_at = 4;
+
+  // Plan version for idempotency
+  uint32 version = 5;
+
+  // Hash of all inputs that produced this plan (for cache invalidation)
+  string input_hash = 6;
+
+  // Ordered list of tasks (topologically sorted)
+  repeated TaskSpec tasks = 7;
+
+  // Asset dependency graph (adjacency list)
+  repeated DependencyEdge dependencies = 8;
+}
+
+// Specification for a single task within a plan.
+message TaskSpec {
+  // Unique task identifier within the plan
+  TaskId task_id = 1;
+
+  // Asset this task materializes
+  AssetId asset_id = 2;
+  AssetKey asset_key = 3;
+
+  // Partition key (if partitioned asset)
+  PartitionKey partition_key = 4;
+
+  // Upstream dependencies (task IDs that must complete first)
+  repeated TaskId upstream_task_ids = 5;
+
+  // Execution priority (lower = higher priority)
+  int32 priority = 6;
+
+  // Resource requirements
+  ResourceRequirements resources = 7;
+}
+
+// Resource requirements for task scheduling.
+message ResourceRequirements {
+  // Memory limit in bytes
+  int64 memory_bytes = 1;
+
+  // CPU cores (fractional allowed)
+  double cpu_cores = 2;
+
+  // Maximum execution time in seconds
+  int64 timeout_seconds = 3;
+}
+
+// Edge in the dependency graph.
+message DependencyEdge {
+  // Source task (upstream)
+  TaskId source_task_id = 1;
+
+  // Target task (downstream)
+  TaskId target_task_id = 2;
+}
+
+// ============================================================================
+// Run Domain
+// ============================================================================
+
+// A Run is an execution of a Plan.
+// Captures inputs, outputs, timing, and final status.
+message Run {
+  // Unique run identifier
+  RunId run_id = 1;
+
+  // Plan being executed
+  string plan_id = 2;
+
+  // Tenant and workspace scope
+  TenantId tenant_id = 3;
+  WorkspaceId workspace_id = 4;
+
+  // Run state
+  RunState state = 5;
+
+  // Timestamps
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp started_at = 7;
+  google.protobuf.Timestamp completed_at = 8;
+
+  // Task execution states
+  repeated TaskExecution task_executions = 9;
+
+  // Run-level metadata
+  map<string, string> labels = 10;
+
+  // Trigger information
+  RunTrigger trigger = 11;
+}
+
+// Run state machine states.
+// Per orchestration design: reliable run state management with recovery.
+enum RunState {
+  RUN_STATE_UNSPECIFIED = 0;
+  RUN_STATE_PENDING = 1;     // Created, waiting to start
+  RUN_STATE_RUNNING = 2;     // Actively executing tasks
+  RUN_STATE_SUCCEEDED = 3;   // All tasks completed successfully
+  RUN_STATE_FAILED = 4;      // One or more tasks failed
+  RUN_STATE_CANCELLED = 5;   // Cancelled by user or system
+  RUN_STATE_TIMED_OUT = 6;   // Exceeded maximum duration
+}
+
+// How the run was triggered.
+message RunTrigger {
+  // Trigger type
+  TriggerType type = 1;
+
+  // User who triggered (if manual)
+  string triggered_by = 2;
+
+  // Trigger timestamp
+  google.protobuf.Timestamp triggered_at = 3;
+
+  // Associated schedule name (if scheduled)
+  string schedule_name = 4;
+}
+
+// Trigger type enum.
+enum TriggerType {
+  TRIGGER_TYPE_UNSPECIFIED = 0;
+  TRIGGER_TYPE_MANUAL = 1;      // User-initiated
+  TRIGGER_TYPE_SCHEDULED = 2;   // Cron/schedule-based
+  TRIGGER_TYPE_SENSOR = 3;      // Event-driven (e.g., file arrival)
+  TRIGGER_TYPE_BACKFILL = 4;    // Historical data backfill
+}
+
+// ============================================================================
+// Task Execution Domain
+// ============================================================================
+
+// Execution state for a single task within a run.
+message TaskExecution {
+  // Task being executed
+  TaskId task_id = 1;
+
+  // Execution state
+  TaskState state = 2;
+
+  // Attempt number (1-indexed, increments on retry)
+  int32 attempt = 3;
+
+  // Timestamps
+  google.protobuf.Timestamp queued_at = 4;
+  google.protobuf.Timestamp started_at = 5;
+  google.protobuf.Timestamp completed_at = 6;
+
+  // Worker that executed this task
+  string worker_id = 7;
+
+  // Output reference (if succeeded)
+  TaskOutput output = 8;
+
+  // Error information (if failed)
+  TaskError error = 9;
+
+  // Execution metrics
+  TaskMetrics metrics = 10;
+}
+
+// Task execution state machine.
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_PENDING = 1;      // Waiting for dependencies
+  TASK_STATE_QUEUED = 2;       // Ready, waiting for worker
+  TASK_STATE_RUNNING = 3;      // Actively executing
+  TASK_STATE_SUCCEEDED = 4;    // Completed successfully
+  TASK_STATE_FAILED = 5;       // Failed (may retry)
+  TASK_STATE_SKIPPED = 6;      // Skipped (upstream failed)
+  TASK_STATE_CANCELLED = 7;    // Cancelled
+}
+
+// Task output reference.
+message TaskOutput {
+  // Materialization ID for output tracking
+  MaterializationId materialization_id = 1;
+
+  // Output files
+  repeated FileEntry files = 2;
+
+  // Output statistics
+  int64 row_count = 3;
+  int64 byte_size = 4;
+}
+
+// FileEntry is defined in common.proto
+
+// Task error information.
+message TaskError {
+  // Error category
+  TaskErrorCategory category = 1;
+
+  // Error message
+  string message = 2;
+
+  // Stack trace or detail (truncated)
+  string detail = 3;
+
+  // Whether the error is retryable
+  bool retryable = 4;
+}
+
+// Task error categories.
+enum TaskErrorCategory {
+  TASK_ERROR_CATEGORY_UNSPECIFIED = 0;
+  TASK_ERROR_CATEGORY_USER_CODE = 1;       // Error in user asset code
+  TASK_ERROR_CATEGORY_DATA_QUALITY = 2;    // Schema mismatch, constraint violation
+  TASK_ERROR_CATEGORY_INFRASTRUCTURE = 3;  // Network, storage, timeout
+  TASK_ERROR_CATEGORY_CONFIGURATION = 4;   // Invalid config or missing secrets
+}
+
+// Task execution metrics.
+message TaskMetrics {
+  // Wall clock duration in milliseconds
+  int64 duration_ms = 1;
+
+  // CPU time in milliseconds
+  int64 cpu_time_ms = 2;
+
+  // Peak memory usage in bytes
+  int64 peak_memory_bytes = 3;
+
+  // Bytes read from storage
+  int64 bytes_read = 4;
+
+  // Bytes written to storage
+  int64 bytes_written = 5;
+}

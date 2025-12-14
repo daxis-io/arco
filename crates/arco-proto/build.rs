@@ -7,6 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/arco/v1/event.proto",
         "../../proto/arco/v1/catalog.proto",
         "../../proto/arco/v1/flow.proto",
+        "../../proto/arco/v1/orchestration.proto",
     ];
 
     let includes = ["../../proto"];
@@ -39,6 +40,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .type_attribute(".arco.v1.ScalarValue", "#[serde(rename_all = \"camelCase\")]")
         .type_attribute(".arco.v1.AssetKey", "#[derive(serde::Serialize, serde::Deserialize)]")
         .type_attribute(".arco.v1.AssetKey", "#[serde(rename_all = \"camelCase\")]")
+        // FileEntry for output tracking
+        .type_attribute(".arco.v1.FileEntry", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".arco.v1.FileEntry", "#[serde(rename_all = \"camelCase\")]")
+        // Orchestration types without Timestamp
+        .type_attribute(".arco.v1.ResourceRequirements", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".arco.v1.ResourceRequirements", "#[serde(rename_all = \"camelCase\")]")
+        .type_attribute(".arco.v1.DependencyEdge", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".arco.v1.DependencyEdge", "#[serde(rename_all = \"camelCase\")]")
+        .type_attribute(".arco.v1.TaskMetrics", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".arco.v1.TaskMetrics", "#[serde(rename_all = \"camelCase\")]")
+        .type_attribute(".arco.v1.TaskError", "#[derive(serde::Serialize, serde::Deserialize)]")
+        .type_attribute(".arco.v1.TaskError", "#[serde(rename_all = \"camelCase\")]")
         .compile_protos(&proto_files, &includes)?;
 
     // Rerun if proto files change

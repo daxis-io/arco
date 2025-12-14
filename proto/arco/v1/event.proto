@@ -84,12 +84,7 @@ message MaterializationCompleted {
   google.protobuf.Timestamp completed_at = 11;
 }
 
-// File entry in materialization output
-message FileEntry {
-  string path = 1;
-  int64 size_bytes = 2;
-  int64 row_count = 3;
-}
+// FileEntry is now defined in common.proto
 
 // Lineage recording event
 message LineageRecorded {

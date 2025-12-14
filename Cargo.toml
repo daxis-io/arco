@@ -25,7 +25,7 @@ authors = ["Daxis <engineering@daxis.io>"]
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "deny"
-rust_2018_idioms = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
 trivial_casts = "deny"
 unused_lifetimes = "deny"
 unused_qualifications = "deny"

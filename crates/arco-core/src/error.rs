@@ -44,12 +44,20 @@ pub enum Error {
 
     /// The requested resource was not found.
     #[error("not found: {resource_type} with id {id}")]
-    NotFound {
+    ResourceNotFound {
         /// The type of resource that was not found.
         resource_type: &'static str,
         /// The identifier that was looked up.
         id: String,
     },
+
+    /// A path or object was not found (simple variant for storage).
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    /// Invalid input was provided.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 
     /// A precondition for the operation was not met.
     #[error("precondition failed: {message}")]
@@ -88,10 +96,10 @@ impl Error {
         }
     }
 
-    /// Creates a new not found error.
+    /// Creates a new resource not found error.
     #[must_use]
-    pub fn not_found(resource_type: &'static str, id: impl fmt::Display) -> Self {
-        Self::NotFound {
+    pub fn resource_not_found(resource_type: &'static str, id: impl fmt::Display) -> Self {
+        Self::ResourceNotFound {
             resource_type,
             id: id.to_string(),
         }

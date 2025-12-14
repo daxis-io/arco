@@ -37,6 +37,7 @@ pub mod error;
 pub mod id;
 pub mod observability;
 pub mod partition;
+pub mod storage;
 pub mod tenant;
 
 /// Prelude module for convenient imports.
@@ -50,6 +51,7 @@ pub mod prelude {
     pub use crate::error::{Error, Result};
     pub use crate::id::{AssetId, RunId};
     pub use crate::partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
+    pub use crate::storage::{MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
     pub use crate::tenant::TenantId;
 }
 
@@ -58,4 +60,5 @@ pub use error::{Error, Result};
 pub use id::{AssetId, RunId};
 pub use observability::{LogFormat, init_logging};
 pub use partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
+pub use storage::{MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 pub use tenant::TenantId;

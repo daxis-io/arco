@@ -308,9 +308,8 @@ fn is_valid_timestamp_format(s: &str) -> bool {
     }
 
     // Validate date portion
-    let date_part = match s.get(..10) {
-        Some(d) => d,
-        None => return false,
+    let Some(date_part) = s.get(..10) else {
+        return false;
     };
     if !is_valid_date_format(date_part) {
         return false;
@@ -332,8 +331,7 @@ fn is_valid_timestamp_format(s: &str) -> bool {
 
     // Validate microseconds (6 digits)
     s.get(20..26)
-        .map(|us| us.chars().all(|c| c.is_ascii_digit()))
-        .unwrap_or(false)
+        .is_some_and(|us| us.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Errors that can occur when parsing a canonical partition key string.

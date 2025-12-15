@@ -213,12 +213,12 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
             .await
             .map_err(LockError::Storage)?
         {
-            WriteResult::Success { generation } => {
+            WriteResult::Success { version } => {
                 return Ok(LockGuard {
                     storage: self.storage.clone(),
                     lock_path: self.lock_path.clone(),
                     holder_id: self.holder_id.clone(),
-                    generation,
+                    version,
                     released: false,
                 });
             }
@@ -227,39 +227,49 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
             }
         }
 
-        // Lock exists, check if we can take it over
+        // Lock exists, check if we can take it over.
+        // CRITICAL: Get version FIRST, then read contents. This ensures the
+        // expiry decision is bound to the same version used for CAS.
+        // If another writer takes over between HEAD and GET, we'll either:
+        // - See their non-expired lock → retry normally
+        // - CAS will fail (version changed) → retry
+        let meta = self
+            .storage
+            .head(&self.lock_path)
+            .await
+            .map_err(LockError::Storage)?;
+
+        let Some(meta) = meta else {
+            // Lock disappeared between our DoesNotExist check and now - retry
+            return Err(LockError::AlreadyHeld("race".into()));
+        };
+
         let existing = self.read_lock().await.map_err(LockError::Storage)?;
 
         match existing {
             Some(info) if info.is_expired() => {
-                // Expired lock - try to take it over
-                // Use MatchesGeneration to ensure atomic takeover
-                let meta = self
-                    .storage
-                    .head(&self.lock_path)
-                    .await
-                    .map_err(LockError::Storage)?
-                    .ok_or_else(|| LockError::Storage(Error::NotFound(self.lock_path.clone())))?;
-
+                // Expired lock - try to take it over using version from HEAD above.
+                // This ensures atomicity: if another writer took over after our HEAD,
+                // the CAS will fail and we'll retry.
                 match self
                     .storage
                     .put(
                         &self.lock_path,
                         lock_bytes,
-                        WritePrecondition::MatchesGeneration(meta.generation),
+                        WritePrecondition::MatchesVersion(meta.version),
                     )
                     .await
                     .map_err(LockError::Storage)?
                 {
-                    WriteResult::Success { generation } => Ok(LockGuard {
+                    WriteResult::Success { version } => Ok(LockGuard {
                         storage: self.storage.clone(),
                         lock_path: self.lock_path.clone(),
                         holder_id: self.holder_id.clone(),
-                        generation,
+                        version,
                         released: false,
                     }),
                     WriteResult::PreconditionFailed { .. } => {
-                        // Someone else took it - retry
+                        // Someone else took it or lock changed - retry
                         Err(LockError::AlreadyHeld("unknown".into()))
                     }
                 }
@@ -269,7 +279,7 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
                 Err(LockError::AlreadyHeld(info.holder_id))
             }
             None => {
-                // Lock disappeared - retry from start
+                // Lock disappeared after HEAD - retry from start
                 Err(LockError::AlreadyHeld("race".into()))
             }
         }
@@ -324,7 +334,8 @@ pub struct LockGuard<S: StorageBackend + ?Sized> {
     storage: Arc<S>,
     lock_path: String,
     holder_id: String,
-    generation: i64,
+    /// Opaque version token for CAS operations (multi-cloud compatible).
+    version: String,
     released: bool,
 }
 
@@ -335,10 +346,10 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
         &self.holder_id
     }
 
-    /// Returns the generation at which the lock was acquired.
+    /// Returns the version at which the lock was acquired.
     #[must_use]
-    pub fn generation(&self) -> i64 {
-        self.generation
+    pub fn version(&self) -> &str {
+        &self.version
     }
 
     /// Explicitly releases the lock.
@@ -354,15 +365,48 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
     }
 
     /// Internal release implementation.
+    ///
+    /// Uses CAS to write an expired lock record instead of unconditional delete.
+    /// This prevents deleting a new holder's lock if takeover happened between
+    /// our ownership check and the release operation.
     async fn do_release(&mut self) -> Result<()> {
         if self.released {
             return Ok(());
         }
 
-        // Only release if we still own it
+        // Read current lock to verify ownership
         if let Some(info) = self.read_lock().await? {
             if info.holder_id == self.holder_id {
-                self.storage.delete(&self.lock_path).await?;
+                // Create an expired lock record (releases the lock)
+                let expired_info = LockInfo {
+                    holder_id: self.holder_id.clone(),
+                    expires_at: Utc::now() - chrono::Duration::seconds(1),
+                    acquired_at: info.acquired_at,
+                    operation: None,
+                };
+
+                let expired_bytes =
+                    Bytes::from(serde_json::to_vec(&expired_info).map_err(|e| Error::Internal {
+                        message: format!("serialize expired lock: {e}"),
+                    })?);
+
+                // CAS write with our version - if another holder took over,
+                // this fails and we leave their lock intact.
+                //
+                // On Success: Leave the expired record in place - next acquire
+                // will overwrite it. Deleting here would race: new holder could
+                // acquire between our CAS and delete.
+                //
+                // On PreconditionFailed: Another holder took over - don't touch
+                // their lock. This is expected in takeover scenarios.
+                let _ = self
+                    .storage
+                    .put(
+                        &self.lock_path,
+                        expired_bytes,
+                        WritePrecondition::MatchesVersion(self.version.clone()),
+                    )
+                    .await?;
             }
         }
 
@@ -393,7 +437,7 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
     /// # Errors
     ///
     /// Returns an error if the lock is no longer held by this guard.
-    pub async fn extend(&self, additional_ttl: Duration) -> Result<()> {
+    pub async fn extend(&mut self, additional_ttl: Duration) -> Result<()> {
         let current = self.read_lock().await?;
 
         match current {
@@ -420,11 +464,14 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
                     .put(
                         &self.lock_path,
                         lock_bytes,
-                        WritePrecondition::MatchesGeneration(meta.generation),
+                        WritePrecondition::MatchesVersion(meta.version),
                     )
                     .await?
                 {
-                    WriteResult::Success { .. } => Ok(()),
+                    WriteResult::Success { version } => {
+                        self.version = version;
+                        Ok(())
+                    }
                     WriteResult::PreconditionFailed { .. } => Err(Error::PreconditionFailed {
                         message: "lock modified by another holder".into(),
                     }),
@@ -441,18 +488,47 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
 impl<S: StorageBackend + ?Sized> Drop for LockGuard<S> {
     fn drop(&mut self) {
         if !self.released {
-            // Best-effort async release in destructor
-            // In practice, prefer calling release() explicitly
+            // Best-effort async release in destructor.
+            // In practice, prefer calling release() explicitly.
+            //
+            // Guard against panic when dropped outside a Tokio runtime
+            // (e.g., during shutdown or in non-async contexts).
+            // If no runtime, TTL will handle eventual cleanup.
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                // No runtime available - rely on TTL for cleanup
+                return;
+            };
+
             let storage = self.storage.clone();
             let path = self.lock_path.clone();
             let holder = self.holder_id.clone();
+            let version = self.version.clone();
 
-            tokio::spawn(async move {
-                // Read lock and release if we own it
-                if let Ok(data) = storage.get(&path).await {
-                    if let Ok(info) = serde_json::from_slice::<LockInfo>(&data) {
-                        if info.holder_id == holder {
-                            let _ = storage.delete(&path).await;
+            handle.spawn(async move {
+                // Write expired record via CAS - same approach as do_release().
+                // Avoids race where delete could remove a new holder's lock.
+                if let Ok(Some(meta)) = storage.head(&path).await {
+                    if meta.version == version {
+                        if let Ok(data) = storage.get(&path).await {
+                            if let Ok(info) = serde_json::from_slice::<LockInfo>(&data) {
+                                if info.holder_id == holder {
+                                    let expired = LockInfo {
+                                        holder_id: holder,
+                                        expires_at: Utc::now() - chrono::Duration::seconds(1),
+                                        acquired_at: info.acquired_at,
+                                        operation: None,
+                                    };
+                                    if let Ok(bytes) = serde_json::to_vec(&expired) {
+                                        let _ = storage
+                                            .put(
+                                                &path,
+                                                Bytes::from(bytes),
+                                                WritePrecondition::MatchesVersion(version),
+                                            )
+                                            .await;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -482,11 +558,15 @@ fn rand_jitter() -> u64 {
 }
 
 /// Path constants for lock files.
+///
+/// These align with [`ScopedStorage`](arco_core::ScopedStorage) path helpers.
 pub mod paths {
-    /// Lock file for catalog manifest updates.
-    pub const CATALOG_LOCK: &str = "locks/catalog.lock";
+    /// Lock file for core manifest (Tier 1) operations.
+    ///
+    /// Aligns with `ScopedStorage::core_lock_path()`.
+    pub const CORE_LOCK: &str = "locks/core.lock";
 
-    /// Lock file prefix for asset-level locks.
+    /// Lock file prefix for asset-level locks (future use).
     pub const ASSET_LOCK_PREFIX: &str = "locks/assets/";
 }
 
@@ -611,7 +691,7 @@ mod tests {
         let backend = Arc::new(MemoryBackend::new());
         let lock = DistributedLock::new(backend.clone(), "test.lock");
 
-        let guard = lock
+        let mut guard = lock
             .acquire(Duration::from_secs(1), 1)
             .await
             .expect("acquire");
@@ -629,7 +709,8 @@ mod tests {
 
     #[test]
     fn test_paths() {
-        assert_eq!(paths::CATALOG_LOCK, "locks/catalog.lock");
+        // Core lock aligns with ScopedStorage::core_lock_path()
+        assert_eq!(paths::CORE_LOCK, "locks/core.lock");
         assert!(paths::ASSET_LOCK_PREFIX.starts_with("locks/"));
     }
 }

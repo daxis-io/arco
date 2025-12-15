@@ -5,6 +5,15 @@
 //! - Conditional writes with preconditions
 //! - Object metadata including `last_modified` and `etag`
 //! - Signed URL generation for direct access
+//!
+//! ## Multi-Cloud Compatibility
+//!
+//! The storage version token is an opaque `String` to support different backends:
+//! - GCS: Uses numeric generation (stored as string)
+//! - S3: Uses `ETag` or version ID (already strings)
+//! - Azure: Uses `ETag`
+//!
+//! This abstraction avoids leaking GCS-specific assumptions into the catalog layer.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -17,12 +26,16 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 
 /// Precondition for conditional writes (CAS operations).
+///
+/// The version token is opaque - backends interpret it according to their semantics:
+/// - GCS: Numeric generation as string
+/// - S3: `ETag` or version ID
 #[derive(Debug, Clone)]
 pub enum WritePrecondition {
     /// Write only if object does not exist.
     DoesNotExist,
-    /// Write only if object's generation matches.
-    MatchesGeneration(i64),
+    /// Write only if object's version matches the given token.
+    MatchesVersion(String),
     /// Write unconditionally.
     None,
 }
@@ -30,15 +43,15 @@ pub enum WritePrecondition {
 /// Result of a conditional write.
 #[derive(Debug, Clone)]
 pub enum WriteResult {
-    /// Write succeeded, returns new generation.
+    /// Write succeeded, returns new version token.
     Success {
-        /// The new generation number after the write.
-        generation: i64,
+        /// The new version token after the write.
+        version: String,
     },
-    /// Precondition failed, returns current generation.
+    /// Precondition failed, returns current version token.
     PreconditionFailed {
-        /// The current generation that caused the precondition to fail.
-        current_generation: i64,
+        /// The current version that caused the precondition to fail.
+        current_version: String,
     },
 }
 
@@ -51,8 +64,12 @@ pub struct ObjectMeta {
     pub path: String,
     /// Object size in bytes.
     pub size: u64,
-    /// Object generation (version number for CAS).
-    pub generation: i64,
+    /// Object version token for CAS operations.
+    ///
+    /// This is an opaque string that backends interpret:
+    /// - GCS: Numeric generation as string
+    /// - S3: `ETag` or version ID
+    pub version: String,
     /// Last modification timestamp.
     pub last_modified: Option<DateTime<Utc>>,
     /// Entity tag for cache validation.
@@ -116,6 +133,7 @@ pub trait StorageBackend: Send + Sync + 'static {
 /// In-memory storage backend for testing.
 ///
 /// Thread-safe via `RwLock`. Not suitable for production.
+/// Uses numeric versions internally (stored as strings) to simulate GCS-like behavior.
 #[derive(Debug, Default)]
 pub struct MemoryBackend {
     objects: Arc<RwLock<HashMap<String, StoredObject>>>,
@@ -124,7 +142,8 @@ pub struct MemoryBackend {
 #[derive(Debug, Clone)]
 struct StoredObject {
     data: Bytes,
-    generation: i64,
+    /// Numeric version stored as i64 internally, exposed as String via API.
+    version: i64,
     last_modified: DateTime<Utc>,
 }
 
@@ -185,39 +204,42 @@ impl StorageBackend for MemoryBackend {
             WritePrecondition::DoesNotExist => {
                 if let Some(obj) = current {
                     return Ok(WriteResult::PreconditionFailed {
-                        current_generation: obj.generation,
+                        current_version: obj.version.to_string(),
                     });
                 }
             }
-            WritePrecondition::MatchesGeneration(expected) => match current {
-                Some(obj) if obj.generation != expected => {
-                    return Ok(WriteResult::PreconditionFailed {
-                        current_generation: obj.generation,
-                    });
+            WritePrecondition::MatchesVersion(expected) => {
+                let expected_num: i64 = expected.parse().unwrap_or(-1);
+                match current {
+                    Some(obj) if obj.version != expected_num => {
+                        return Ok(WriteResult::PreconditionFailed {
+                            current_version: obj.version.to_string(),
+                        });
+                    }
+                    None => {
+                        return Ok(WriteResult::PreconditionFailed {
+                            current_version: "0".to_string(),
+                        });
+                    }
+                    _ => {}
                 }
-                None => {
-                    return Ok(WriteResult::PreconditionFailed {
-                        current_generation: 0,
-                    });
-                }
-                _ => {}
-            },
+            }
             WritePrecondition::None => {}
         }
 
-        let new_gen = current.map_or(1, |o| o.generation + 1);
+        let new_version = current.map_or(1, |o| o.version + 1);
         objects.insert(
             path.to_string(),
             StoredObject {
                 data,
-                generation: new_gen,
+                version: new_version,
                 last_modified: Utc::now(),
             },
         );
         drop(objects);
 
         Ok(WriteResult::Success {
-            generation: new_gen,
+            version: new_version.to_string(),
         })
     }
 
@@ -242,9 +264,9 @@ impl StorageBackend for MemoryBackend {
             .map(|(path, obj)| ObjectMeta {
                 path: path.clone(),
                 size: obj.data.len() as u64,
-                generation: obj.generation,
+                version: obj.version.to_string(),
                 last_modified: Some(obj.last_modified),
-                etag: Some(format!("\"{}\"", obj.generation)),
+                etag: Some(format!("\"{}\"", obj.version)),
             })
             .collect())
     }
@@ -257,9 +279,9 @@ impl StorageBackend for MemoryBackend {
         Ok(objects.get(path).map(|obj| ObjectMeta {
             path: path.to_string(),
             size: obj.data.len() as u64,
-            generation: obj.generation,
+            version: obj.version.to_string(),
             last_modified: Some(obj.last_modified),
-            etag: Some(format!("\"{}\"", obj.generation)),
+            etag: Some(format!("\"{}\"", obj.version)),
         }))
     }
 
@@ -286,7 +308,7 @@ mod tests {
             .await
             .expect("put should succeed");
 
-        assert!(matches!(result, WriteResult::Success { generation: 1 }));
+        assert!(matches!(result, WriteResult::Success { ref version } if version == "1"));
 
         let retrieved = backend
             .get("test/file.txt")
@@ -312,7 +334,7 @@ mod tests {
         // Required by architecture contract
         assert_eq!(meta.path, "test.txt");
         assert_eq!(meta.size, 4);
-        assert!(meta.generation > 0);
+        assert!(!meta.version.is_empty(), "must have version");
         assert!(meta.last_modified.is_some(), "must have last_modified");
         assert!(meta.etag.is_some(), "must have etag");
     }
@@ -428,7 +450,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_precondition_matches_generation() {
+    async fn test_precondition_matches_version() {
         let backend = MemoryBackend::new();
 
         // Create object
@@ -436,28 +458,28 @@ mod tests {
             .put("gen.txt", Bytes::from("v1"), WritePrecondition::None)
             .await
             .expect("should succeed");
-        let first_gen = match result {
-            WriteResult::Success { generation } => generation,
+        let first_version = match result {
+            WriteResult::Success { version } => version,
             _ => panic!("expected success"),
         };
 
-        // Update with correct generation should succeed
+        // Update with correct version should succeed
         let result = backend
             .put(
                 "gen.txt",
                 Bytes::from("v2"),
-                WritePrecondition::MatchesGeneration(first_gen),
+                WritePrecondition::MatchesVersion(first_version.clone()),
             )
             .await
             .expect("should succeed");
         assert!(matches!(result, WriteResult::Success { .. }));
 
-        // Update with stale generation should fail
+        // Update with stale version should fail
         let result = backend
             .put(
                 "gen.txt",
                 Bytes::from("v3"),
-                WritePrecondition::MatchesGeneration(first_gen),
+                WritePrecondition::MatchesVersion(first_version),
             )
             .await
             .expect("should succeed");

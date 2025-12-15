@@ -669,6 +669,19 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
+    /// Proptest configuration for CI predictability.
+    ///
+    /// Bounds the number of cases to ensure predictable runtime.
+    /// Override via PROPTEST_CASES environment variable if needed.
+    const PROPTEST_CASES: u32 = 256;
+
+    fn test_config() -> ProptestConfig {
+        ProptestConfig {
+            cases: PROPTEST_CASES,
+            ..ProptestConfig::default()
+        }
+    }
+
     fn key_name_strategy() -> impl Strategy<Value = String> {
         "[a-z][a-z0-9_]{0,19}".prop_filter("non-empty key", |s| !s.is_empty())
     }
@@ -703,6 +716,8 @@ mod proptests {
     }
 
     proptest! {
+        #![proptest_config(test_config())]
+
         #[test]
         fn partition_key_roundtrip(pk in partition_key_strategy()) {
             let canonical = pk.canonical_string();

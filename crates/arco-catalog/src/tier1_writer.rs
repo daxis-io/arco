@@ -5,7 +5,7 @@
 //!
 //! The critical invariants are:
 //! - Only one writer enters the critical section at a time (distributed lock)
-//! - Manifest updates are committed via CAS (`MatchesGeneration`)
+//! - Manifest updates are committed via CAS (`MatchesVersion`)
 //! - Writers retry on CAS conflicts (e.g., if a writer bypasses the lock)
 //! - On-disk manifests are physically multi-file (root + domain manifests)
 
@@ -136,7 +136,7 @@ impl Tier1Writer {
             lineage,
             governance,
             created_at: root.updated_at,
-            updated_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now(),
         })
     }
 
@@ -176,8 +176,8 @@ impl Tier1Writer {
         for attempt in 1..=self.cas_max_retries {
             let root: RootManifest = self.read_json(paths::ROOT_MANIFEST).await?;
 
-            let (core, core_generation): (CoreManifest, i64) = self
-                .read_json_with_generation(&root.core_manifest_path)
+            let (core, core_version): (CoreManifest, String) = self
+                .read_json_with_version(&root.core_manifest_path)
                 .await?;
             let execution: ExecutionManifest =
                 self.read_json(&root.execution_manifest_path).await?;
@@ -190,16 +190,16 @@ impl Tier1Writer {
                 lineage: None,
                 governance: None,
                 created_at: root.updated_at,
-                updated_at: Utc::now().to_rfc3339(),
+                updated_at: Utc::now(),
             };
 
             update_fn(&mut manifest)?;
 
-            let now = Utc::now().to_rfc3339();
-            manifest.core.updated_at.clone_from(&now);
+            let now = Utc::now();
+            manifest.core.updated_at = now;
             manifest.updated_at = now;
 
-            let commit = Self::build_commit_record(&prev_core, &manifest.core)?;
+            let commit = self.build_commit_record(&prev_core, &manifest.core).await?;
             manifest.core.last_commit_id = Some(commit.commit_id.clone());
 
             let core_bytes = json_bytes(&manifest.core)?;
@@ -208,7 +208,7 @@ impl Tier1Writer {
                 .put_raw(
                     &root.core_manifest_path,
                     core_bytes,
-                    WritePrecondition::MatchesGeneration(core_generation),
+                    WritePrecondition::MatchesVersion(core_version),
                 )
                 .await?
             {
@@ -259,7 +259,7 @@ impl Tier1Writer {
         })
     }
 
-    async fn read_json_with_generation<T>(&self, path: &str) -> Result<(T, i64)>
+    async fn read_json_with_version<T>(&self, path: &str) -> Result<(T, String)>
     where
         T: serde::de::DeserializeOwned,
     {
@@ -270,14 +270,36 @@ impl Tier1Writer {
             .ok_or_else(|| Error::NotFound(format!("manifest not found: {path}")))?;
 
         let value = self.read_json(path).await?;
-        Ok((value, meta.generation))
+        Ok((value, meta.version))
     }
 
-    fn build_commit_record(prev: &CoreManifest, next: &CoreManifest) -> Result<CommitRecord> {
+    /// Builds a commit record for an update operation.
+    ///
+    /// If the previous manifest has a `last_commit_id`, this method loads that
+    /// commit record from storage and computes its hash for the tamper-evident chain.
+    async fn build_commit_record(
+        &self,
+        prev: &CoreManifest,
+        next: &CoreManifest,
+    ) -> Result<CommitRecord> {
         let payload_hash = sha256_prefixed(&json_vec(next)?);
-
         let prev_commit_id = prev.last_commit_id.clone();
-        let prev_commit_hash = None;
+
+        // Load and hash previous commit for tamper-evident chain
+        let prev_commit_hash = match &prev_commit_id {
+            Some(id) => {
+                let path = format!("core/commits/{id}.json");
+                match self.storage.get_raw(&path).await {
+                    Ok(bytes) => Some(sha256_prefixed(&bytes)),
+                    Err(Error::NotFound(_)) => {
+                        // First commit or missing record - acceptable edge case
+                        None
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            None => None,
+        };
 
         Ok(CommitRecord {
             commit_id: Ulid::new().to_string(),
@@ -285,7 +307,7 @@ impl Tier1Writer {
             prev_commit_hash,
             operation: "Update".into(),
             payload_hash,
-            created_at: Utc::now().to_rfc3339(),
+            created_at: Utc::now(),
         })
     }
 
@@ -362,7 +384,7 @@ mod tests {
             precondition: WritePrecondition,
         ) -> Result<WriteResult> {
             // Inject a no-op write once to force a CAS conflict.
-            if matches!(precondition, WritePrecondition::MatchesGeneration(_))
+            if matches!(&precondition, WritePrecondition::MatchesVersion(_))
                 && path.ends_with(paths::CORE_MANIFEST)
                 && self.inject_once.swap(false, Ordering::SeqCst)
             {
@@ -469,5 +491,60 @@ mod tests {
         let core: CoreManifest =
             serde_json::from_slice(&storage.get_raw(paths::CORE_MANIFEST).await.unwrap()).unwrap();
         assert_eq!(core.snapshot_version, 1);
+    }
+
+    #[tokio::test]
+    async fn test_commit_chain_has_prev_hash() {
+        // Verifies the tamper-evident audit chain links commits together.
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
+        let writer = Tier1Writer::new(storage.clone());
+
+        writer.initialize().await.unwrap();
+
+        // First update - no previous commit to link
+        let commit1 = writer
+            .update(|manifest| {
+                manifest.core.snapshot_version = 1;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(commit1.prev_commit_id.is_none());
+        assert!(commit1.prev_commit_hash.is_none());
+
+        // Second update - should link to first commit
+        let commit2 = writer
+            .update(|manifest| {
+                manifest.core.snapshot_version = 2;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(commit2.prev_commit_id, Some(commit1.commit_id.clone()));
+        assert!(
+            commit2.prev_commit_hash.is_some(),
+            "second commit must have prev_commit_hash"
+        );
+
+        // Third update - should link to second commit
+        let commit3 = writer
+            .update(|manifest| {
+                manifest.core.snapshot_version = 3;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(commit3.prev_commit_id, Some(commit2.commit_id.clone()));
+        assert!(
+            commit3.prev_commit_hash.is_some(),
+            "third commit must have prev_commit_hash"
+        );
+
+        // Verify chain integrity: commit3.prev_commit_hash should be SHA256 of commit2
+        let commit2_path = format!("core/commits/{}.json", commit2.commit_id);
+        let commit2_bytes = storage.get_raw(&commit2_path).await.unwrap();
+        let expected_hash = format!("sha256:{}", hex::encode(Sha256::digest(&commit2_bytes)));
+        assert_eq!(commit3.prev_commit_hash, Some(expected_hash));
     }
 }

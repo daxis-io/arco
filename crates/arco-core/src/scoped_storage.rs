@@ -1,13 +1,18 @@
 //! Tenant + workspace scoped storage with architecture-aligned path layout.
 //!
 //! This module enforces the documented storage layout for multi-tenant, multi-workspace
-//! catalog operations. All paths are prefixed with `{tenant}/{workspace}/`.
+//! catalog operations. All paths are prefixed with `tenant={tenant}/workspace={workspace}/`.
 //! Per unified platform design: tenant + workspace = primary scoping boundary.
+//!
+//! The key=value path format provides:
+//! - Operational ergonomics (grep-friendly: `tenant=acme` is self-documenting)
+//! - Consistent with Hive partition conventions
+//! - Easy extraction of scope from any path
 //!
 //! # Security
 //!
 //! This module enforces strict path isolation:
-//! - All paths are prefixed with tenant/workspace
+//! - All paths are prefixed with tenant/workspace scope
 //! - Path traversal attempts (`..`) are rejected
 //! - Tenant/workspace IDs are validated at construction
 
@@ -20,7 +25,7 @@ use crate::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult}
 
 /// Tenant + workspace scoped storage wrapper.
 ///
-/// Enforces isolation by prefixing all paths with `{tenant}/{workspace}/`.
+/// Enforces isolation by prefixing all paths with `tenant={tenant}/workspace={workspace}/`.
 /// Path helpers align with the documented catalog storage layout.
 #[derive(Clone)]
 pub struct ScopedStorage {
@@ -147,7 +152,7 @@ impl ScopedStorage {
     // === Path Construction ===
 
     fn scope_prefix(&self) -> String {
-        format!("{}/{}", self.tenant_id, self.workspace_id)
+        format!("tenant={}/workspace={}", self.tenant_id, self.workspace_id)
     }
 
     fn scoped_path(&self, path: &str) -> String {
@@ -155,17 +160,36 @@ impl ScopedStorage {
     }
 
     // === Core Catalog Paths (Tier 1) ===
+    //
+    // Path conventions align with arco-catalog manifest.rs and lock.rs:
+    // - Manifests under `manifests/` (physically multi-file for reduced contention)
+    // - Locks under `locks/` (per lock.rs::paths conventions)
+    // - Snapshots and commits under `core/`
 
-    /// Path to the core catalog manifest.
+    /// Path to the root catalog manifest.
+    ///
+    /// This is the entry point - readers load this first to find domain manifests.
     #[must_use]
-    pub fn core_manifest_path(&self) -> String {
-        self.scoped_path("core/manifest.json")
+    pub fn root_manifest_path(&self) -> String {
+        self.scoped_path("manifests/root.manifest.json")
     }
 
-    /// Path to the distributed lock file.
+    /// Path to the core domain manifest.
+    #[must_use]
+    pub fn core_manifest_path(&self) -> String {
+        self.scoped_path("manifests/core.manifest.json")
+    }
+
+    /// Path to the execution domain manifest.
+    #[must_use]
+    pub fn execution_manifest_path(&self) -> String {
+        self.scoped_path("manifests/execution.manifest.json")
+    }
+
+    /// Path to the distributed lock file for core catalog operations.
     #[must_use]
     pub fn core_lock_path(&self) -> String {
-        self.scoped_path("core/lock.json")
+        self.scoped_path("locks/core.lock")
     }
 
     /// Path to a catalog snapshot directory.
@@ -201,7 +225,13 @@ impl ScopedStorage {
     /// Path to lineage domain manifest.
     #[must_use]
     pub fn lineage_manifest_path(&self) -> String {
-        self.scoped_path("lineage/manifest.json")
+        self.scoped_path("manifests/lineage.manifest.json")
+    }
+
+    /// Path to governance domain manifest.
+    #[must_use]
+    pub fn governance_manifest_path(&self) -> String {
+        self.scoped_path("manifests/governance.manifest.json")
     }
 
     /// Path to lineage edges state.
@@ -373,19 +403,34 @@ mod tests {
         let backend = Arc::new(MemoryBackend::new());
         let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
 
-        // Per unified platform design: {tenant}/{workspace}/...
+        // Per unified platform design: tenant={tenant}/workspace={workspace}/...
+        // Key=value format for operational ergonomics (grep-friendly, self-documenting)
+        // Manifests under manifests/ (aligned with arco-catalog manifest.rs)
+        assert_eq!(
+            storage.root_manifest_path(),
+            "tenant=acme/workspace=production/manifests/root.manifest.json"
+        );
         assert_eq!(
             storage.core_manifest_path(),
-            "acme/production/core/manifest.json"
+            "tenant=acme/workspace=production/manifests/core.manifest.json"
         );
-        assert_eq!(storage.core_lock_path(), "acme/production/core/lock.json");
+        assert_eq!(
+            storage.execution_manifest_path(),
+            "tenant=acme/workspace=production/manifests/execution.manifest.json"
+        );
+        // Locks under locks/ (aligned with arco-catalog lock.rs)
+        assert_eq!(
+            storage.core_lock_path(),
+            "tenant=acme/workspace=production/locks/core.lock"
+        );
+        // Snapshots and commits under core/
         assert_eq!(
             storage.core_snapshot_path(42),
-            "acme/production/core/snapshots/v42/"
+            "tenant=acme/workspace=production/core/snapshots/v42/"
         );
         assert_eq!(
             storage.core_commit_path("commit_abc123"),
-            "acme/production/core/commits/commit_abc123.json"
+            "tenant=acme/workspace=production/core/commits/commit_abc123.json"
         );
     }
 
@@ -396,15 +441,15 @@ mod tests {
 
         assert_eq!(
             storage.ledger_path("execution", "2025-01-15"),
-            "acme/production/ledger/execution/2025-01-15/"
+            "tenant=acme/workspace=production/ledger/execution/2025-01-15/"
         );
         assert_eq!(
             storage.ledger_path("quality", "2025-01-15"),
-            "acme/production/ledger/quality/2025-01-15/"
+            "tenant=acme/workspace=production/ledger/quality/2025-01-15/"
         );
         assert_eq!(
             storage.ledger_path("lineage", "2025-01-15"),
-            "acme/production/ledger/lineage/2025-01-15/"
+            "tenant=acme/workspace=production/ledger/lineage/2025-01-15/"
         );
     }
 
@@ -415,11 +460,11 @@ mod tests {
 
         assert_eq!(
             storage.state_path("execution", "materializations"),
-            "acme/production/state/execution/materializations/"
+            "tenant=acme/workspace=production/state/execution/materializations/"
         );
         assert_eq!(
             storage.state_path("lineage", "edges"),
-            "acme/production/state/lineage/edges/"
+            "tenant=acme/workspace=production/state/lineage/edges/"
         );
     }
 
@@ -430,11 +475,11 @@ mod tests {
 
         assert_eq!(
             storage.governance_tags_path(),
-            "acme/production/governance/tags.parquet"
+            "tenant=acme/workspace=production/governance/tags.parquet"
         );
         assert_eq!(
             storage.governance_owners_path(),
-            "acme/production/governance/owners.parquet"
+            "tenant=acme/workspace=production/governance/owners.parquet"
         );
     }
 

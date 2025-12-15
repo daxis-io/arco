@@ -20,30 +20,46 @@
 //!
 //! ## Storage Layout
 //!
+//! All catalog data is scoped to tenant/workspace isolation boundaries using
+//! key=value path segments (grep-friendly, self-documenting):
+//!
 //! ```text
-//! {tenant_prefix}/
-//! ├── catalog/
-//! │   ├── snapshots/           # Tier 1: Immutable catalog snapshots (Parquet)
-//! │   ├── manifests/           # Tier 1: Manifest files pointing to snapshots
-//! │   └── events/              # Tier 2: Append-only event log
-//! └── compaction/
-//!     └── checkpoints/         # Compaction state
+//! tenant={tenant}/workspace={workspace}/
+//! ├── manifests/                    # Tier 1: Multi-file manifest structure
+//! │   ├── root.manifest.json        # Root manifest (points to domain manifests)
+//! │   ├── core.manifest.json        # Core catalog state (assets, versions)
+//! │   ├── execution.manifest.json   # Execution state (watermarks, compaction)
+//! │   ├── lineage.manifest.json     # Optional: Lineage domain manifest
+//! │   └── governance.manifest.json  # Optional: Governance domain manifest
+//! ├── locks/
+//! │   └── core.lock                 # Distributed lock for Tier 1 operations
+//! ├── core/
+//! │   ├── snapshots/                # Tier 1: Immutable catalog snapshots (Parquet)
+//! │   └── commits/                  # Commit records (audit trail)
+//! └── events/                       # Tier 2: Append-only event log
 //! ```
+//!
+//! The multi-file manifest structure reduces contention by separating domains
+//! (core, execution, lineage, governance) into independent files.
 //!
 //! ## Example
 //!
 //! ```rust,ignore
-//! use arco_catalog::CatalogReader;
-//! use arco_core::TenantId;
+//! use arco_catalog::Tier1Writer;
+//! use arco_core::ScopedStorage;
 //!
-//! let tenant = TenantId::new("acme-corp")?;
-//! let reader = CatalogReader::new(store, tenant);
+//! // Create workspace-scoped storage
+//! let storage = ScopedStorage::new(backend, "acme-corp", "production")?;
 //!
-//! // Discover all assets
-//! let assets = reader.list_assets().await?;
+//! // Initialize catalog manifests (idempotent)
+//! let writer = Tier1Writer::new(storage);
+//! writer.initialize().await?;
 //!
-//! // Get lineage for an asset
-//! let lineage = reader.get_lineage(asset_id).await?;
+//! // Update catalog with CAS semantics
+//! let commit = writer.update(|manifest| {
+//!     manifest.core.snapshot_version = 1;
+//!     Ok(())
+//! }).await?;
 //! ```
 
 #![forbid(unsafe_code)]

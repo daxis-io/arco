@@ -10,8 +10,50 @@ import "google/protobuf/timestamp.proto";
 import "arco/v1/common.proto";
 
 // Event envelope for all catalog events (Tier 2 append-only log)
+//
+// Ordering semantics:
+// - event_id is a ULID providing time-ordered lexicographic sorting
+// - Compactors use event_id as the watermark cursor (no coordination required)
+// - Readers paginate using event_id as cursor (lexical comparison)
+// - Deduplication uses idempotency_key within a time window
+//
+// Clock skew and late-event handling:
+//
+// ULID timestamps embed the local clock time, so clock skew between writers
+// can cause events to appear out-of-order when merged. The system handles this:
+//
+// 1. **Bounded skew assumption**: Writers are expected to have NTP-synced clocks.
+//    Skew beyond a few seconds indicates misconfigured infrastructure.
+//
+// 2. **Watermark lag**: Compactors wait (e.g., 1 minute) before processing events
+//    to allow late-arriving events to settle. The watermark is always the oldest
+//    unprocessed event_id minus the lag window.
+//
+// 3. **Idempotency**: The idempotency_key field allows late events to be
+//    deduplicated if they arrive after the original was already processed.
+//    Compactors maintain a sliding window of processed idempotency keys.
+//
+// 4. **At-least-once delivery**: Events may be written multiple times (retries).
+//    Readers must handle duplicates via idempotency_key.
+//
+// 5. **No reordering guarantee**: Within the watermark lag window, events may
+//    appear in any order. Business logic must be tolerant of this (e.g., use
+//    last-write-wins with timestamp tiebreaker for conflicting updates).
+//
+// For strict ordering requirements, use Tier 1 (CAS-based) operations instead.
 message CatalogEvent {
   // Unique event ID (ULID for ordering)
+  //
+  // ULID provides:
+  // - Lexicographically sortable (natural ordering without coordination)
+  // - Millisecond timestamp prefix (approximate time ordering)
+  // - 80 bits of randomness (collision resistance)
+  //
+  // Clock skew note: ULID timestamps come from the writer's local clock.
+  // Events from different writers may interleave unexpectedly if clocks differ.
+  // See message-level comments for handling strategies.
+  //
+  // This is the cursor for watermarking and pagination.
   string event_id = 1;
 
   // Event type discriminator
@@ -35,9 +77,10 @@ message CatalogEvent {
   // Idempotency key (for deduplication)
   string idempotency_key = 8;
 
-  // Monotonic position for Tier 2 watermark and cursor-based pagination
-  // Assigned at write time; consumers use this as their progress marker
-  uint64 position = 9;
+  // Reserved: was numeric position (removed - use event_id for cursors)
+  // Using ULID event_id avoids coordination and works with multi-writer append.
+  reserved 9;
+  reserved "position";
 
   // Event payload (one of)
   oneof payload {

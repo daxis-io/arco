@@ -12,7 +12,7 @@
 //! # Storage Layout
 //!
 //! ```text
-//! {tenant}/{workspace}/manifests/
+//! tenant={tenant}/workspace={workspace}/manifests/
 //! ├── root.manifest.json        # Root pointer to domain manifests
 //! ├── core.manifest.json        # Tier 1: Assets, schemas (locked writes)
 //! ├── execution.manifest.json   # Tier 2: Materializations (compactor writes)
@@ -20,7 +20,7 @@
 //! └── governance.manifest.json  # Tier 2: Tags, owners
 //! ```
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -54,7 +54,7 @@ pub struct RootManifest {
     pub governance_manifest_path: Option<String>,
 
     /// Last update timestamp.
-    pub updated_at: String,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl RootManifest {
@@ -67,7 +67,7 @@ impl RootManifest {
             execution_manifest_path: "manifests/execution.manifest.json".into(),
             lineage_manifest_path: None,
             governance_manifest_path: None,
-            updated_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now(),
         }
     }
 }
@@ -99,7 +99,7 @@ pub struct CoreManifest {
     pub last_commit_id: Option<String>,
 
     /// Last update timestamp.
-    pub updated_at: String,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl CoreManifest {
@@ -110,7 +110,7 @@ impl CoreManifest {
             snapshot_version: 0,
             snapshot_path: "core/snapshots/v0/".into(),
             last_commit_id: None,
-            updated_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now(),
         }
     }
 
@@ -141,10 +141,10 @@ pub struct ExecutionManifest {
 
     /// Last compaction timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_compaction_at: Option<String>,
+    pub last_compaction_at: Option<DateTime<Utc>>,
 
     /// Last update timestamp.
-    pub updated_at: String,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl ExecutionManifest {
@@ -155,7 +155,7 @@ impl ExecutionManifest {
             watermark_version: 0,
             checkpoint_path: "state/execution/checkpoint.json".into(),
             last_compaction_at: None,
-            updated_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now(),
         }
     }
 }
@@ -179,7 +179,7 @@ pub struct LineageManifest {
     pub edges_path: String,
 
     /// Last update timestamp.
-    pub updated_at: String,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl LineageManifest {
@@ -189,7 +189,7 @@ impl LineageManifest {
         Self {
             snapshot_version: 0,
             edges_path: "state/lineage/edges/".into(),
-            updated_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now(),
         }
     }
 }
@@ -213,7 +213,7 @@ pub struct GovernanceManifest {
     pub base_path: String,
 
     /// Last update timestamp.
-    pub updated_at: String,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl GovernanceManifest {
@@ -223,7 +223,7 @@ impl GovernanceManifest {
         Self {
             snapshot_version: 0,
             base_path: "governance/".into(),
-            updated_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now(),
         }
     }
 }
@@ -264,25 +264,51 @@ pub struct CommitRecord {
     pub payload_hash: String,
 
     /// Commit timestamp.
-    pub created_at: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Canonical hash input for commit records.
+///
+/// Uses a separate struct to ensure stable, unambiguous serialization
+/// for hash computation. JSON serialization with sorted keys provides
+/// a canonical byte representation that avoids the ambiguity of
+/// delimiter-based formats (e.g., colons appearing in sha256: values).
+///
+/// Note: `created_at` is serialized as RFC 3339 string for deterministic hashing.
+#[derive(Serialize)]
+struct CommitHashInput<'a> {
+    commit_id: &'a str,
+    prev_commit_id: Option<&'a str>,
+    prev_commit_hash: Option<&'a str>,
+    operation: &'a str,
+    payload_hash: &'a str,
+    created_at: String,
 }
 
 impl CommitRecord {
     /// Computes the hash of this commit for chain verification.
     ///
     /// The hash includes `prev_commit_hash` to form an unbreakable chain.
+    /// Uses canonical JSON serialization to ensure unambiguous byte encoding.
+    ///
+    /// # Panics
+    ///
+    /// Panics if JSON serialization fails, which cannot occur for the internal
+    /// `CommitHashInput` struct (contains only string references).
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn compute_hash(&self) -> String {
-        let input = format!(
-            "{}:{}:{}:{}:{}:{}",
-            self.commit_id,
-            self.prev_commit_id.as_deref().unwrap_or(""),
-            self.prev_commit_hash.as_deref().unwrap_or(""),
-            self.operation,
-            self.payload_hash,
-            self.created_at,
-        );
-        let hash = Sha256::digest(input.as_bytes());
+        let input = CommitHashInput {
+            commit_id: &self.commit_id,
+            prev_commit_id: self.prev_commit_id.as_deref(),
+            prev_commit_hash: self.prev_commit_hash.as_deref(),
+            operation: &self.operation,
+            payload_hash: &self.payload_hash,
+            created_at: self.created_at.to_rfc3339(),
+        };
+        // serde_json produces deterministic output for this simple struct
+        let bytes = serde_json::to_vec(&input).expect("commit hash input is always serializable");
+        let hash = Sha256::digest(&bytes);
         format!("sha256:{}", hex::encode(hash))
     }
 
@@ -300,7 +326,7 @@ impl CommitRecord {
             prev_commit_hash: Some(prev.compute_hash()),
             operation,
             payload_hash,
-            created_at: Utc::now().to_rfc3339(),
+            created_at: Utc::now(),
         }
     }
 }
@@ -331,24 +357,24 @@ pub struct CatalogManifest {
     pub governance: Option<GovernanceManifest>,
 
     /// Creation timestamp.
-    pub created_at: String,
+    pub created_at: DateTime<Utc>,
 
     /// Last update timestamp.
-    pub updated_at: String,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl CatalogManifest {
     /// Creates a new empty manifest.
     #[must_use]
     pub fn new() -> Self {
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now();
         Self {
             version: 1,
             core: CoreManifest::new(),
             execution: ExecutionManifest::new(),
             lineage: None,
             governance: None,
-            created_at: now.clone(),
+            created_at: now,
             updated_at: now,
         }
     }
@@ -361,7 +387,7 @@ impl CatalogManifest {
 
     /// Updates the manifest timestamp.
     pub fn touch(&mut self) {
-        self.updated_at = Utc::now().to_rfc3339();
+        self.updated_at = Utc::now();
     }
 }
 
@@ -422,7 +448,7 @@ mod tests {
             execution_manifest_path: "manifests/execution.manifest.json".into(),
             lineage_manifest_path: Some("manifests/lineage.manifest.json".into()),
             governance_manifest_path: None,
-            updated_at: "2025-01-15T10:00:00Z".into(),
+            updated_at: Utc::now(),
         };
 
         let json = serde_json::to_string_pretty(&root).expect("serialize");
@@ -453,18 +479,19 @@ mod tests {
     #[test]
     fn test_domain_manifests_independent_serialization() {
         // Each domain manifest serializes independently
+        let now = Utc::now();
         let core = CoreManifest {
             snapshot_version: 42,
             snapshot_path: "core/snapshots/v42/".into(),
             last_commit_id: Some("commit_abc".into()),
-            updated_at: "2025-01-15T10:00:00Z".into(),
+            updated_at: now,
         };
 
         let exec = ExecutionManifest {
             watermark_version: 100,
             checkpoint_path: "state/execution/checkpoint.json".into(),
-            last_compaction_at: Some("2025-01-15T09:55:00Z".into()),
-            updated_at: "2025-01-15T10:00:00Z".into(),
+            last_compaction_at: Some(now),
+            updated_at: now,
         };
 
         // Each can be serialized/deserialized independently
@@ -478,6 +505,12 @@ mod tests {
 
     // === Commit Record Tests (hash chain integrity) ===
 
+    fn parse_timestamp(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s)
+            .expect("valid timestamp")
+            .with_timezone(&Utc)
+    }
+
     #[test]
     fn test_commit_record_hash_chain() {
         let commit1 = CommitRecord {
@@ -486,7 +519,7 @@ mod tests {
             prev_commit_hash: None,
             operation: "InitializeCatalog".into(),
             payload_hash: "sha256:abc123".into(),
-            created_at: "2025-01-15T10:00:00Z".into(),
+            created_at: parse_timestamp("2025-01-15T10:00:00Z"),
         };
 
         let hash1 = commit1.compute_hash();
@@ -502,7 +535,7 @@ mod tests {
             prev_commit_hash: Some(hash1.clone()),
             operation: "CreateAsset".into(),
             payload_hash: "sha256:def456".into(),
-            created_at: "2025-01-15T10:01:00Z".into(),
+            created_at: parse_timestamp("2025-01-15T10:01:00Z"),
         };
 
         let hash2 = commit2.compute_hash();
@@ -512,13 +545,14 @@ mod tests {
     #[test]
     fn test_commit_record_hash_includes_prev() {
         // Two commits with same content but different prev should have different hashes
+        let ts = parse_timestamp("2025-01-15T10:00:00Z");
         let commit_a = CommitRecord {
             commit_id: "commit_X".into(),
             prev_commit_id: Some("commit_A".into()),
             prev_commit_hash: Some("sha256:aaa".into()),
             operation: "CreateAsset".into(),
             payload_hash: "sha256:same".into(),
-            created_at: "2025-01-15T10:00:00Z".into(),
+            created_at: ts,
         };
 
         let commit_b = CommitRecord {
@@ -527,7 +561,7 @@ mod tests {
             prev_commit_hash: Some("sha256:bbb".into()),
             operation: "CreateAsset".into(),
             payload_hash: "sha256:same".into(),
-            created_at: "2025-01-15T10:00:00Z".into(),
+            created_at: ts,
         };
 
         assert_ne!(commit_a.compute_hash(), commit_b.compute_hash());
@@ -574,7 +608,7 @@ mod tests {
             prev_commit_hash: None,
             operation: "InitializeCatalog".into(),
             payload_hash: "sha256:abc123".into(),
-            created_at: "2025-01-15T10:00:00Z".into(),
+            created_at: parse_timestamp("2025-01-15T10:00:00Z"),
         };
 
         let commit2 = CommitRecord::new_successor(

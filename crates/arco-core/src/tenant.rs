@@ -11,7 +11,7 @@
 //! use arco_core::tenant::TenantId;
 //!
 //! let tenant = TenantId::new("acme-corp").unwrap();
-//! assert_eq!(tenant.storage_prefix(), "acme-corp/");
+//! assert_eq!(tenant.storage_prefix(), "tenant=acme-corp/");
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -54,8 +54,8 @@ impl TenantId {
 
     /// Returns the storage prefix for this tenant.
     ///
-    /// Returns just `{tenant_id}/` - the tenant component of storage paths.
-    /// Use with [`ScopedStorage`](crate::ScopedStorage) for full tenant+workspace paths.
+    /// Returns `tenant={tenant_id}/` - the key=value format matching [`ScopedStorage`](crate::ScopedStorage).
+    /// This format provides operational ergonomics (grep-friendly, self-documenting paths).
     ///
     /// # Example
     ///
@@ -63,11 +63,11 @@ impl TenantId {
     /// use arco_core::TenantId;
     ///
     /// let tenant = TenantId::new("acme-corp").unwrap();
-    /// assert_eq!(tenant.storage_prefix(), "acme-corp/");
+    /// assert_eq!(tenant.storage_prefix(), "tenant=acme-corp/");
     /// ```
     #[must_use]
     pub fn storage_prefix(&self) -> String {
-        format!("{}/", self.0)
+        format!("tenant={}/", self.0)
     }
 
     /// Returns the tenant ID as a string slice.
@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn storage_prefix() {
         let tenant = TenantId::new("acme-corp").unwrap();
-        // Aligns with ScopedStorage: {tenant}/{workspace}/... pattern
-        assert_eq!(tenant.storage_prefix(), "acme-corp/");
+        // Aligns with ScopedStorage: tenant={tenant}/workspace={workspace}/... pattern
+        assert_eq!(tenant.storage_prefix(), "tenant=acme-corp/");
     }
 }

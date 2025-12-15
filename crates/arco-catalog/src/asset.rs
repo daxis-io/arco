@@ -88,7 +88,9 @@ impl AssetKey {
     /// Validates a key segment (group or name).
     fn validate_segment(segment: &str, field: &str) -> Result<(), AssetKeyError> {
         if segment.is_empty() {
-            return Err(AssetKeyError::Empty { field: field.into() });
+            return Err(AssetKeyError::Empty {
+                field: field.into(),
+            });
         }
 
         if segment.len() > 128 {
@@ -99,8 +101,14 @@ impl AssetKey {
         }
 
         // Must start with lowercase letter
-        if !segment.chars().next().is_some_and(|c| c.is_ascii_lowercase()) {
-            return Err(AssetKeyError::InvalidStart { field: field.into() });
+        if !segment
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase())
+        {
+            return Err(AssetKeyError::InvalidStart {
+                field: field.into(),
+            });
         }
 
         // Can contain lowercase letters, digits, underscores
@@ -108,7 +116,9 @@ impl AssetKey {
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         {
-            return Err(AssetKeyError::InvalidCharacters { field: field.into() });
+            return Err(AssetKeyError::InvalidCharacters {
+                field: field.into(),
+            });
         }
 
         Ok(())
@@ -356,13 +366,22 @@ mod tests {
     #[test]
     fn test_asset_key_invalid_characters() {
         let result = AssetKey::new("raw-data", "events");
-        assert!(matches!(result, Err(AssetKeyError::InvalidCharacters { .. })));
+        assert!(matches!(
+            result,
+            Err(AssetKeyError::InvalidCharacters { .. })
+        ));
 
         let result = AssetKey::new("raw", "events.v1");
-        assert!(matches!(result, Err(AssetKeyError::InvalidCharacters { .. })));
+        assert!(matches!(
+            result,
+            Err(AssetKeyError::InvalidCharacters { .. })
+        ));
 
         let result = AssetKey::new("raw", "events/sub");
-        assert!(matches!(result, Err(AssetKeyError::InvalidCharacters { .. })));
+        assert!(matches!(
+            result,
+            Err(AssetKeyError::InvalidCharacters { .. })
+        ));
     }
 
     #[test]

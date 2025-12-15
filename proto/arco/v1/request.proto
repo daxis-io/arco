@@ -29,4 +29,8 @@ message RequestHeader {
 
   // Client request timestamp
   google.protobuf.Timestamp request_time = 5;
+
+  // Unique request ID for this attempt (distinct from idempotency_key)
+  // Per unified platform design: unique per request for tracing/debugging
+  string request_id = 6;
 }

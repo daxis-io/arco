@@ -58,10 +58,12 @@ mod tests {
             trace_parent: "00-abc123-def456-01".into(),
             idempotency_key: "idem_001".into(),
             request_time: None,
+            request_id: "req_12345".into(),
         };
 
         assert!(header.tenant_id.is_some());
         assert!(header.workspace_id.is_some());
         assert!(!header.idempotency_key.is_empty());
+        assert!(!header.request_id.is_empty());
     }
 }

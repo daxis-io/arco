@@ -55,6 +55,7 @@ pub mod asset;
 pub mod lock;
 pub mod manifest;
 pub mod reader;
+pub mod tier1_writer;
 pub mod writer;
 
 // Re-export main types at crate root
@@ -64,11 +65,13 @@ pub use manifest::{
     CatalogManifest, CommitRecord, CoreManifest, ExecutionManifest, GovernanceManifest,
     LineageManifest, RootManifest,
 };
+pub use tier1_writer::Tier1Writer;
 
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::asset::{Asset, AssetFormat, AssetKey, CreateAssetRequest};
     pub use crate::manifest::{CatalogManifest, CommitRecord, CoreManifest, RootManifest};
     pub use crate::reader::CatalogReader;
+    pub use crate::tier1_writer::Tier1Writer;
     pub use crate::writer::CatalogWriter;
 }

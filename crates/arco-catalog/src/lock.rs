@@ -76,7 +76,8 @@ impl LockInfo {
         let now = Utc::now();
         Self {
             holder_id: holder_id.into(),
-            expires_at: now + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::seconds(30)),
+            expires_at: now
+                + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::seconds(30)),
             acquired_at: now,
             operation: None,
         }
@@ -104,13 +105,25 @@ impl LockInfo {
 /// A distributed lock backed by object storage.
 ///
 /// Uses CAS operations to ensure only one writer can hold the lock at a time.
-pub struct DistributedLock<S: StorageBackend> {
+pub struct DistributedLock<S: StorageBackend + ?Sized> {
     storage: Arc<S>,
     lock_path: String,
     holder_id: String,
 }
 
-impl<S: StorageBackend> DistributedLock<S> {
+// Manual Clone implementation to avoid requiring S: Clone
+// (Arc<S> can be cloned regardless of whether S is Clone)
+impl<S: StorageBackend + ?Sized> Clone for DistributedLock<S> {
+    fn clone(&self) -> Self {
+        Self {
+            storage: Arc::clone(&self.storage),
+            lock_path: self.lock_path.clone(),
+            holder_id: self.holder_id.clone(),
+        }
+    }
+}
+
+impl<S: StorageBackend + ?Sized> DistributedLock<S> {
     /// Creates a new distributed lock.
     ///
     /// Each lock instance gets a unique holder ID for identification.
@@ -134,11 +147,7 @@ impl<S: StorageBackend> DistributedLock<S> {
     /// # Errors
     ///
     /// Returns an error if the lock could not be acquired after all retries.
-    pub async fn acquire(
-        &self,
-        ttl: Duration,
-        max_retries: u32,
-    ) -> Result<LockGuard<S>> {
+    pub async fn acquire(&self, ttl: Duration, max_retries: u32) -> Result<LockGuard<S>> {
         self.acquire_with_operation(ttl, max_retries, None).await
     }
 
@@ -163,9 +172,7 @@ impl<S: StorageBackend> DistributedLock<S> {
                     attempts += 1;
                     if attempts >= max_retries {
                         return Err(Error::PreconditionFailed {
-                            message: format!(
-                                "lock held by {holder} after {max_retries} retries",
-                            ),
+                            message: format!("lock held by {holder} after {max_retries} retries",),
                         });
                     }
 
@@ -190,15 +197,19 @@ impl<S: StorageBackend> DistributedLock<S> {
         let mut lock_info = LockInfo::new(&self.holder_id, ttl);
         lock_info.operation = operation;
 
-        let lock_bytes = Bytes::from(
-            serde_json::to_vec(&lock_info).map_err(|e| LockError::Storage(Error::Internal {
+        let lock_bytes = Bytes::from(serde_json::to_vec(&lock_info).map_err(|e| {
+            LockError::Storage(Error::Internal {
                 message: format!("serialize lock: {e}"),
-            }))?,
-        );
+            })
+        })?);
 
         match self
             .storage
-            .put(&self.lock_path, lock_bytes.clone(), WritePrecondition::DoesNotExist)
+            .put(
+                &self.lock_path,
+                lock_bytes.clone(),
+                WritePrecondition::DoesNotExist,
+            )
             .await
             .map_err(LockError::Storage)?
         {
@@ -268,9 +279,10 @@ impl<S: StorageBackend> DistributedLock<S> {
     async fn read_lock(&self) -> Result<Option<LockInfo>> {
         match self.storage.get(&self.lock_path).await {
             Ok(data) => {
-                let info: LockInfo = serde_json::from_slice(&data).map_err(|e| Error::Internal {
-                    message: format!("parse lock: {e}"),
-                })?;
+                let info: LockInfo =
+                    serde_json::from_slice(&data).map_err(|e| Error::Internal {
+                        message: format!("parse lock: {e}"),
+                    })?;
                 Ok(Some(info))
             }
             Err(Error::NotFound(_)) => Ok(None),
@@ -308,7 +320,7 @@ impl<S: StorageBackend> DistributedLock<S> {
 /// RAII guard for a held lock.
 ///
 /// The lock is automatically released when the guard is dropped.
-pub struct LockGuard<S: StorageBackend> {
+pub struct LockGuard<S: StorageBackend + ?Sized> {
     storage: Arc<S>,
     lock_path: String,
     holder_id: String,
@@ -316,7 +328,7 @@ pub struct LockGuard<S: StorageBackend> {
     released: bool,
 }
 
-impl<S: StorageBackend> LockGuard<S> {
+impl<S: StorageBackend + ?Sized> LockGuard<S> {
     /// Returns the holder ID for this lock.
     #[must_use]
     pub fn holder_id(&self) -> &str {
@@ -362,9 +374,10 @@ impl<S: StorageBackend> LockGuard<S> {
     async fn read_lock(&self) -> Result<Option<LockInfo>> {
         match self.storage.get(&self.lock_path).await {
             Ok(data) => {
-                let info: LockInfo = serde_json::from_slice(&data).map_err(|e| Error::Internal {
-                    message: format!("parse lock: {e}"),
-                })?;
+                let info: LockInfo =
+                    serde_json::from_slice(&data).map_err(|e| Error::Internal {
+                        message: format!("parse lock: {e}"),
+                    })?;
                 Ok(Some(info))
             }
             Err(Error::NotFound(_)) => Ok(None),
@@ -390,11 +403,10 @@ impl<S: StorageBackend> LockGuard<S> {
                     + chrono::Duration::from_std(additional_ttl)
                         .unwrap_or(chrono::Duration::seconds(30));
 
-                let lock_bytes = Bytes::from(
-                    serde_json::to_vec(&new_info).map_err(|e| Error::Internal {
+                let lock_bytes =
+                    Bytes::from(serde_json::to_vec(&new_info).map_err(|e| Error::Internal {
                         message: format!("serialize lock: {e}"),
-                    })?,
-                );
+                    })?);
 
                 // Use CAS to ensure we still own it
                 let meta = self
@@ -413,11 +425,9 @@ impl<S: StorageBackend> LockGuard<S> {
                     .await?
                 {
                     WriteResult::Success { .. } => Ok(()),
-                    WriteResult::PreconditionFailed { .. } => Err(
-                        Error::PreconditionFailed {
-                            message: "lock modified by another holder".into(),
-                        },
-                    ),
+                    WriteResult::PreconditionFailed { .. } => Err(Error::PreconditionFailed {
+                        message: "lock modified by another holder".into(),
+                    }),
                 }
             }
             Some(_) => Err(Error::PreconditionFailed {
@@ -428,7 +438,7 @@ impl<S: StorageBackend> LockGuard<S> {
     }
 }
 
-impl<S: StorageBackend> Drop for LockGuard<S> {
+impl<S: StorageBackend + ?Sized> Drop for LockGuard<S> {
     fn drop(&mut self) {
         if !self.released {
             // Best-effort async release in destructor
@@ -490,7 +500,10 @@ mod tests {
         let backend = Arc::new(MemoryBackend::new());
         let lock = DistributedLock::new(backend.clone(), "test.lock");
 
-        let guard = lock.acquire(Duration::from_secs(30), 5).await.expect("acquire");
+        let guard = lock
+            .acquire(Duration::from_secs(30), 5)
+            .await
+            .expect("acquire");
         assert!(!guard.holder_id().is_empty());
 
         guard.release().await.expect("release");
@@ -506,7 +519,10 @@ mod tests {
         let lock2 = DistributedLock::new(backend.clone(), "test.lock");
 
         // First lock succeeds
-        let _guard1 = lock1.acquire(Duration::from_secs(30), 1).await.expect("acquire1");
+        let _guard1 = lock1
+            .acquire(Duration::from_secs(30), 1)
+            .await
+            .expect("acquire1");
 
         // Second lock fails (only 1 retry, short timeout)
         let result = lock2.acquire(Duration::from_millis(100), 1).await;
@@ -520,13 +536,19 @@ mod tests {
         let lock2 = DistributedLock::new(backend.clone(), "test.lock");
 
         // Acquire with very short TTL
-        let guard1 = lock1.acquire(Duration::from_millis(1), 1).await.expect("acquire1");
+        let guard1 = lock1
+            .acquire(Duration::from_millis(1), 1)
+            .await
+            .expect("acquire1");
 
         // Let it expire
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         // Second lock should succeed by taking over expired lock
-        let guard2 = lock2.acquire(Duration::from_secs(30), 1).await.expect("acquire2");
+        let guard2 = lock2
+            .acquire(Duration::from_secs(30), 1)
+            .await
+            .expect("acquire2");
 
         // Different holders
         assert_ne!(guard1.holder_id(), guard2.holder_id());
@@ -556,7 +578,10 @@ mod tests {
         let backend = Arc::new(MemoryBackend::new());
         let lock = DistributedLock::new(backend.clone(), "test.lock");
 
-        let _guard = lock.acquire(Duration::from_secs(30), 1).await.expect("acquire");
+        let _guard = lock
+            .acquire(Duration::from_secs(30), 1)
+            .await
+            .expect("acquire");
         assert!(lock.is_locked().await.expect("check"));
 
         lock.force_break().await.expect("break");
@@ -586,7 +611,10 @@ mod tests {
         let backend = Arc::new(MemoryBackend::new());
         let lock = DistributedLock::new(backend.clone(), "test.lock");
 
-        let guard = lock.acquire(Duration::from_secs(1), 1).await.expect("acquire");
+        let guard = lock
+            .acquire(Duration::from_secs(1), 1)
+            .await
+            .expect("acquire");
 
         // Extend by 30 seconds
         guard.extend(Duration::from_secs(30)).await.expect("extend");

@@ -62,3 +62,4 @@ tempfile = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true }
 tokio-test = { workspace = true }
+proptest = { workspace = true }

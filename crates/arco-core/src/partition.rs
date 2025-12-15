@@ -663,3 +663,83 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn key_name_strategy() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9_]{0,19}".prop_filter("non-empty key", |s| !s.is_empty())
+    }
+
+    fn date_strategy() -> impl Strategy<Value = String> {
+        (1970u16..2100, 1u8..=12, 1u8..=28).prop_map(|(year, month, day)| {
+            format!("{year:04}-{month:02}-{day:02}")
+        })
+    }
+
+    fn timestamp_strategy() -> impl Strategy<Value = String> {
+        (1970u16..2100, 1u8..=12, 1u8..=28, 0u8..24, 0u8..60, 0u8..60, 0u32..1_000_000)
+            .prop_map(|(year, month, day, hour, minute, second, micros)| {
+                format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{micros:06}Z")
+            })
+    }
+
+    fn scalar_value_strategy() -> impl Strategy<Value = ScalarValue> {
+        prop_oneof![
+            any::<String>().prop_map(ScalarValue::String),
+            any::<i64>().prop_map(ScalarValue::Int64),
+            any::<bool>().prop_map(ScalarValue::Boolean),
+            date_strategy().prop_map(ScalarValue::Date),
+            timestamp_strategy().prop_map(ScalarValue::Timestamp),
+            Just(ScalarValue::Null),
+        ]
+    }
+
+    fn partition_key_strategy() -> impl Strategy<Value = PartitionKey> {
+        prop::collection::btree_map(key_name_strategy(), scalar_value_strategy(), 0..=5)
+            .prop_map(|map| PartitionKey(map))
+    }
+
+    proptest! {
+        #[test]
+        fn partition_key_roundtrip(pk in partition_key_strategy()) {
+            let canonical = pk.canonical_string();
+            let parsed = PartitionKey::parse(&canonical)
+                .expect("canonical string should always be parseable");
+            prop_assert_eq!(pk, parsed, "roundtrip failed for canonical: {}", canonical);
+        }
+
+        #[test]
+        fn canonical_string_deterministic(pk in partition_key_strategy()) {
+            let s1 = pk.canonical_string();
+            let s2 = pk.canonical_string();
+            prop_assert_eq!(s1, s2);
+        }
+
+        #[test]
+        fn canonical_string_url_safe(pk in partition_key_strategy()) {
+            let canonical = pk.canonical_string();
+            for segment in canonical.split(',') {
+                if let Some((_key, value)) = segment.split_once('=') {
+                    let after_colon = value.split_once(':').map(|(_, v)| v).unwrap_or(value);
+                    prop_assert!(!after_colon.contains('/'), "URL-unsafe '/' in value: {}", value);
+                    prop_assert!(!after_colon.contains('?'), "URL-unsafe '?' in value: {}", value);
+                    prop_assert!(!after_colon.contains('&'), "URL-unsafe '&' in value: {}", value);
+                    prop_assert!(!after_colon.contains(' '), "URL-unsafe space in value: {}", value);
+                }
+            }
+        }
+
+        #[test]
+        fn partition_id_deterministic(pk in partition_key_strategy()) {
+            let asset_id = AssetId::generate();
+            let id1 = PartitionId::derive(&asset_id, &pk);
+            let id2 = PartitionId::derive(&asset_id, &pk);
+            prop_assert!(id1.as_str().starts_with("part_"));
+            prop_assert_eq!(id1.as_str().len(), 5 + 32);
+            prop_assert_eq!(id1, id2);
+        }
+    }
+}

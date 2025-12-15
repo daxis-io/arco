@@ -216,6 +216,7 @@ dependencies = [
  "chrono",
  "criterion",
  "futures",
+ "petgraph",
  "proptest",
  "serde",
  "serde_json",

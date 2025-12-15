@@ -88,6 +88,9 @@ sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 
+# Graph algorithms
+petgraph = "0.7"
+
 # Data formats
 parquet = { version = "53", features = ["async"] }
 arrow = { version = "53", features = ["chrono-tz"] }

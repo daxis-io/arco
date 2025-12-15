@@ -39,8 +39,13 @@
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 
-// Internal modules - not exposed in public API
-pub(crate) mod dag;
+// Internal modules - not exposed in public API.
+//
+// Note: This module is intentionally unused in early batches (it will be wired
+// into `PlanBuilder` in the next steps). Keep the crate CI-clean under
+// `cargo clippy -- -D warnings` until then.
+#[allow(dead_code)]
+mod dag;
 
 pub mod error;
 pub mod plan;

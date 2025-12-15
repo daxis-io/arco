@@ -5,7 +5,7 @@
 //! - Task execution ordering
 //! - Topological sorting for deterministic plan generation
 //!
-//! **Note:** This module is `pub(crate)` to preserve freedom to change internals.
+//! **Note:** This module is internal to `arco-flow` to preserve freedom to change internals.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
@@ -28,7 +28,7 @@ use crate::error::{Error, Result};
 /// **API Note:** Methods accepting node references take `NodeIndex` for
 /// type safety and to avoid String/&str coercion issues.
 #[derive(Debug, Clone)]
-pub(crate) struct Dag<T>
+pub struct Dag<T>
 where
     T: Clone + Eq + Hash + Display,
 {
@@ -46,7 +46,7 @@ where
 {
     /// Creates a new empty DAG.
     #[must_use]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             graph: DiGraph::new(),
             index_map: HashMap::new(),
@@ -56,14 +56,14 @@ where
 
     /// Returns the number of nodes in the DAG.
     #[must_use]
-    pub(crate) fn node_count(&self) -> usize {
+    pub fn node_count(&self) -> usize {
         self.graph.node_count()
     }
 
     /// Returns the number of edges in the DAG.
     #[must_use]
     #[allow(dead_code)]
-    pub(crate) fn edge_count(&self) -> usize {
+    pub fn edge_count(&self) -> usize {
         self.graph.edge_count()
     }
 
@@ -71,7 +71,7 @@ where
     ///
     /// If the node already exists, this is a no-op.
     /// Returns the node index for use with other methods.
-    pub(crate) fn add_node(&mut self, value: T) -> NodeIndex {
+    pub fn add_node(&mut self, value: T) -> NodeIndex {
         if let Some(&idx) = self.index_map.get(&value) {
             return idx;
         }
@@ -88,23 +88,20 @@ where
     /// # Errors
     ///
     /// Returns an error if either node index is invalid.
-    pub(crate) fn add_edge(&mut self, from: NodeIndex, to: NodeIndex) -> Result<()> {
+    pub fn add_edge(&mut self, from: NodeIndex, to: NodeIndex) -> Result<()> {
         // Use node_weight() instead of indexing to avoid clippy::indexing_slicing
-        let from_node = self
+        self
             .graph
             .node_weight(from)
             .ok_or_else(|| Error::DagNodeNotFound {
                 node: format!("index {}", from.index()),
             })?;
-        let to_node = self
+        self
             .graph
             .node_weight(to)
             .ok_or_else(|| Error::DagNodeNotFound {
                 node: format!("index {}", to.index()),
             })?;
-
-        // Validate nodes exist (the node_weight calls above do this)
-        let _ = (from_node, to_node);
 
         self.graph.add_edge(from, to, ());
         Ok(())
@@ -119,7 +116,7 @@ where
     /// # Errors
     ///
     /// Returns an error if the graph contains a cycle.
-    pub(crate) fn toposort(&self) -> Result<Vec<T>> {
+    pub fn toposort(&self) -> Result<Vec<T>> {
         let node_count = self.graph.node_count();
         if node_count == 0 {
             return Ok(Vec::new());
@@ -181,13 +178,13 @@ where
 
         // Cycle detection: if we didn't visit all nodes, there's a cycle
         if result.len() != node_count {
-            // Find a node still with non-zero in-degree to report
-            let cycle_node = in_degree
+            // Find a node still with non-zero in-degree to report (deterministic).
+            let cycle_node = self
+                .insertion_order
                 .iter()
-                .find(|&(_, deg)| *deg > 0)
-                .and_then(|(idx, _)| self.graph.node_weight(*idx))
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "unknown".into());
+                .find(|&&idx| in_degree.get(&idx).copied().unwrap_or(0) > 0)
+                .and_then(|&idx| self.graph.node_weight(idx))
+                .map_or_else(|| "unknown".to_string(), ToString::to_string);
 
             return Err(Error::CycleDetected {
                 cycle: vec![cycle_node],
@@ -204,7 +201,7 @@ where
     /// # Errors
     ///
     /// Returns an error if the node index is invalid.
-    pub(crate) fn upstream(&self, node: NodeIndex) -> Result<Vec<T>> {
+    pub fn upstream(&self, node: NodeIndex) -> Result<Vec<T>> {
         // Validate node exists
         self.graph
             .node_weight(node)
@@ -238,7 +235,7 @@ where
     /// # Errors
     ///
     /// Returns an error if the node index is invalid.
-    pub(crate) fn downstream(&self, node: NodeIndex) -> Result<Vec<T>> {
+    pub fn downstream(&self, node: NodeIndex) -> Result<Vec<T>> {
         // Validate node exists
         self.graph
             .node_weight(node)
@@ -269,7 +266,7 @@ where
     ///
     /// Results are sorted by insertion order for determinism.
     #[must_use]
-    pub(crate) fn roots(&self) -> Vec<T> {
+    pub fn roots(&self) -> Vec<T> {
         let mut root_indices: Vec<NodeIndex> = self
             .graph
             .node_indices()
@@ -300,7 +297,7 @@ where
     /// Results are sorted by insertion order for determinism.
     #[must_use]
     #[allow(dead_code)]
-    pub(crate) fn leaves(&self) -> Vec<T> {
+    pub fn leaves(&self) -> Vec<T> {
         let mut leaf_indices: Vec<NodeIndex> = self
             .graph
             .node_indices()
@@ -329,14 +326,14 @@ where
     /// Returns true if the node exists in the DAG.
     #[must_use]
     #[allow(dead_code)]
-    pub(crate) fn contains(&self, node: &T) -> bool {
+    pub fn contains(&self, node: &T) -> bool {
         self.index_map.contains_key(node)
     }
 
     /// Returns the node index for a value, if it exists.
     #[must_use]
     #[allow(dead_code)]
-    pub(crate) fn get_index(&self, value: &T) -> Option<NodeIndex> {
+    pub fn get_index(&self, value: &T) -> Option<NodeIndex> {
         self.index_map.get(value).copied()
     }
 }

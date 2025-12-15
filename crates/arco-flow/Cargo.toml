@@ -43,9 +43,17 @@ tracing = { workspace = true }
 
 # Time
 chrono = { workspace = true }
+humantime-serde = { workspace = true }
 
 # Graph algorithms
 petgraph = { workspace = true }
+
+# Hashing and encoding
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# IDs
+ulid = { workspace = true }
 
 # Optional test utilities
 proptest = { workspace = true, optional = true }

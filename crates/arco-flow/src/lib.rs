@@ -39,12 +39,14 @@
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 
+pub mod error;
 pub mod plan;
 pub mod run;
 pub mod scheduler;
 
 /// Prelude module for convenient imports.
 pub mod prelude {
+    pub use crate::error::{Error, Result};
     pub use crate::plan::Plan;
     pub use crate::run::Run;
     pub use crate::scheduler::Scheduler;

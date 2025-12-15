@@ -1,5 +1,7 @@
 //! Error types for the orchestration domain.
 
+use arco_core::{RunId, TaskId};
+
 /// The result type used throughout arco-flow.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -17,14 +19,14 @@ pub enum Error {
     #[error("task not found: {task_id}")]
     TaskNotFound {
         /// The task ID that was not found.
-        task_id: String,
+        task_id: TaskId,
     },
 
     /// A run was not found.
     #[error("run not found: {run_id}")]
     RunNotFound {
         /// The run ID that was not found.
-        run_id: String,
+        run_id: RunId,
     },
 
     /// An invalid state transition was attempted.
@@ -127,7 +129,7 @@ mod tests {
     #[test]
     fn task_error_display() {
         let err = Error::TaskNotFound {
-            task_id: "01HYXYZ".into(),
+            task_id: TaskId::generate(),
         };
         assert!(err.to_string().contains("task not found"));
     }

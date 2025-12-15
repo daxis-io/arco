@@ -87,7 +87,7 @@ impl FromStr for AssetId {
 ///
 /// Runs represent a single execution of a pipeline or asset computation.
 /// Each run captures inputs, outputs, and execution metadata for lineage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RunId(Ulid);
 
@@ -141,7 +141,7 @@ impl FromStr for RunId {
 ///
 /// Tasks are individual units of work that materialize a single asset
 /// (or asset partition) within an orchestration run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TaskId(Ulid);
 
@@ -195,7 +195,7 @@ impl FromStr for TaskId {
 ///
 /// Materializations represent a single successful execution of an asset
 /// or asset partition, capturing the output files and metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct MaterializationId(Ulid);
 

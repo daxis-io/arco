@@ -39,6 +39,9 @@
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 
+// Internal modules - not exposed in public API
+pub(crate) mod dag;
+
 pub mod error;
 pub mod plan;
 pub mod run;

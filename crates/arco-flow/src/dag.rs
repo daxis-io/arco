@@ -11,9 +11,9 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
 use std::hash::Hash;
 
+use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
-use petgraph::Direction;
 
 use crate::error::{Error, Result};
 
@@ -56,6 +56,7 @@ where
 
     /// Returns the number of nodes in the DAG.
     #[must_use]
+    #[allow(dead_code)]
     pub fn node_count(&self) -> usize {
         self.graph.node_count()
     }
@@ -90,14 +91,12 @@ where
     /// Returns an error if either node index is invalid.
     pub fn add_edge(&mut self, from: NodeIndex, to: NodeIndex) -> Result<()> {
         // Use node_weight() instead of indexing to avoid clippy::indexing_slicing
-        self
-            .graph
+        self.graph
             .node_weight(from)
             .ok_or_else(|| Error::DagNodeNotFound {
                 node: format!("index {}", from.index()),
             })?;
-        self
-            .graph
+        self.graph
             .node_weight(to)
             .ok_or_else(|| Error::DagNodeNotFound {
                 node: format!("index {}", to.index()),
@@ -201,6 +200,7 @@ where
     /// # Errors
     ///
     /// Returns an error if the node index is invalid.
+    #[allow(dead_code)]
     pub fn upstream(&self, node: NodeIndex) -> Result<Vec<T>> {
         // Validate node exists
         self.graph
@@ -235,6 +235,7 @@ where
     /// # Errors
     ///
     /// Returns an error if the node index is invalid.
+    #[allow(dead_code)]
     pub fn downstream(&self, node: NodeIndex) -> Result<Vec<T>> {
         // Validate node exists
         self.graph
@@ -266,6 +267,7 @@ where
     ///
     /// Results are sorted by insertion order for determinism.
     #[must_use]
+    #[allow(dead_code)]
     pub fn roots(&self) -> Vec<T> {
         let mut root_indices: Vec<NodeIndex> = self
             .graph

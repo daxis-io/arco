@@ -254,17 +254,21 @@ impl PlanBuilder {
             id_to_idx.insert(task.task_id, idx);
         }
         for task in &self.tasks {
-            let to_idx = id_to_idx.get(&task.task_id).copied().ok_or_else(|| {
-                Error::DagNodeNotFound {
-                    node: task.task_id.to_string(),
-                }
-            })?;
+            let to_idx =
+                id_to_idx
+                    .get(&task.task_id)
+                    .copied()
+                    .ok_or_else(|| Error::DagNodeNotFound {
+                        node: task.task_id.to_string(),
+                    })?;
             for dep_id in &task.upstream_task_ids {
-                let from_idx = id_to_idx.get(dep_id).copied().ok_or_else(|| {
-                    Error::DagNodeNotFound {
-                        node: dep_id.to_string(),
-                    }
-                })?;
+                let from_idx =
+                    id_to_idx
+                        .get(dep_id)
+                        .copied()
+                        .ok_or_else(|| Error::DagNodeNotFound {
+                            node: dep_id.to_string(),
+                        })?;
                 dag.add_edge(from_idx, to_idx)?;
             }
         }
@@ -275,9 +279,11 @@ impl PlanBuilder {
         // Compute stages: stage = max(upstream stages) + 1, roots have stage 0
         let mut stages: HashMap<TaskId, u32> = HashMap::new();
         for id in &sorted_ids {
-            let task = self.tasks.iter().find(|t| &t.task_id == id).ok_or_else(|| {
-                Error::TaskNotFound { task_id: *id }
-            })?;
+            let task = self
+                .tasks
+                .iter()
+                .find(|t| &t.task_id == id)
+                .ok_or_else(|| Error::TaskNotFound { task_id: *id })?;
             let stage = if task.upstream_task_ids.is_empty() {
                 0
             } else {
@@ -285,8 +291,7 @@ impl PlanBuilder {
                     .iter()
                     .filter_map(|dep| stages.get(dep))
                     .max()
-                    .map(|max_stage| max_stage + 1)
-                    .unwrap_or(0)
+                    .map_or(0, |max_stage| max_stage + 1)
             };
             stages.insert(*id, stage);
         }

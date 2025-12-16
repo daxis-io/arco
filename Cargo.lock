@@ -213,6 +213,7 @@ version = "0.1.0"
 dependencies = [
  "arco-core",
  "async-trait",
+ "bytes",
  "chrono",
  "criterion",
  "futures",

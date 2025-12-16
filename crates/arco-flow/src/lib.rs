@@ -43,14 +43,21 @@
 pub(crate) mod dag;
 
 pub mod error;
+pub mod events;
+pub mod outbox;
 pub mod plan;
 pub mod run;
+pub mod runner;
 pub mod scheduler;
+pub mod task;
 
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::error::{Error, Result};
-    pub use crate::plan::Plan;
-    pub use crate::run::Run;
+    pub use crate::outbox::{EventSink, InMemoryOutbox, LedgerWriter};
+    pub use crate::plan::{Plan, PlanBuilder, TaskSpec};
+    pub use crate::run::{Run, RunState};
+    pub use crate::runner::{RunContext, Runner, TaskResult};
     pub use crate::scheduler::Scheduler;
+    pub use crate::task::{TaskExecution, TaskState};
 }

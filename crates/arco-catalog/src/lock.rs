@@ -386,8 +386,10 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
                 };
 
                 let expired_bytes =
-                    Bytes::from(serde_json::to_vec(&expired_info).map_err(|e| Error::Internal {
-                        message: format!("serialize expired lock: {e}"),
+                    Bytes::from(serde_json::to_vec(&expired_info).map_err(|e| {
+                        Error::Internal {
+                            message: format!("serialize expired lock: {e}"),
+                        }
                     })?);
 
                 // CAS write with our version - if another holder took over,

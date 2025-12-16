@@ -61,6 +61,15 @@ pub enum Error {
         message: String,
     },
 
+    /// Plan exceeds configured guardrails.
+    #[error("plan too large: {task_count} tasks (max {max_tasks})")]
+    PlanTooLarge {
+        /// Number of tasks in the attempted plan.
+        task_count: usize,
+        /// Maximum allowed tasks.
+        max_tasks: usize,
+    },
+
     /// Task execution failed.
     #[error("task execution failed: {message}")]
     TaskExecutionFailed {

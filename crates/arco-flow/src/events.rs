@@ -15,12 +15,26 @@
 //! - `datacontenttype`: Content type of data ("application/json")
 //! - `data`: The actual event payload
 //!
+//! ## Why ULID for Event IDs
+//!
+//! We use [ULID](https://github.com/ulid/spec) instead of UUID v4 for event identifiers because:
+//! - **Lexicographically sortable**: ULIDs sort chronologically when compared as strings
+//! - **Timestamp-based**: The first 48 bits encode millisecond precision time
+//! - **Monotonic**: ULIDs generated in the same millisecond are monotonically increasing
+//! - **Compatible**: Same 128-bit space as UUID, works with existing infrastructure
+//!
+//! These properties enable efficient event ordering without relying on separate timestamp
+//! fields, which is critical for the Tier 2 append-only ledger where lexicographic file
+//! ordering must equal chronological ordering.
+//!
 //! ## Idempotency
 //!
 //! Events include an `idempotency_key` for deduplication. For the same logical
 //! event (e.g., task completion), use a deterministic key derived from the
 //! event's identity (`run_id`, `task_id`, `attempt`). Different envelope instances
 //! with the same idempotency key represent the same logical event.
+
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -297,6 +311,20 @@ pub enum ExecutionEventData {
         attempt: u32,
     },
 
+    /// A retry has been scheduled for a failed task.
+    TaskRetryScheduled {
+        /// Run identifier.
+        run_id: RunId,
+        /// Task identifier.
+        task_id: TaskId,
+        /// Failed attempt number.
+        attempt: u32,
+        /// When the retry is eligible to run again.
+        retry_at: DateTime<Utc>,
+        /// Backoff delay in milliseconds.
+        backoff_ms: i64,
+    },
+
     /// A task has been retried.
     TaskRetried {
         /// Run identifier.
@@ -344,6 +372,7 @@ impl ExecutionEventData {
             Self::TaskCompleted { .. } => "task_completed",
             Self::TaskOutput { .. } => "task_output",
             Self::TaskFailed { .. } => "task_failed",
+            Self::TaskRetryScheduled { .. } => "task_retry_scheduled",
             Self::TaskRetried { .. } => "task_retried",
             Self::TaskHeartbeat { .. } => "task_heartbeat",
             Self::TaskMetricsRecorded { .. } => "task_metrics_recorded",
@@ -395,6 +424,12 @@ impl ExecutionEventData {
                 attempt,
                 ..
             } => Some(format!("task_failed:{run_id}:{task_id}:{attempt}")),
+            Self::TaskRetryScheduled {
+                run_id,
+                task_id,
+                attempt,
+                ..
+            } => Some(format!("task_retry_scheduled:{run_id}:{task_id}:{attempt}")),
             Self::TaskRetried {
                 run_id,
                 task_id,
@@ -420,6 +455,7 @@ impl ExecutionEventData {
             | Self::TaskCompleted { run_id, .. }
             | Self::TaskOutput { run_id, .. }
             | Self::TaskFailed { run_id, .. }
+            | Self::TaskRetryScheduled { run_id, .. }
             | Self::TaskRetried { run_id, .. }
             | Self::TaskHeartbeat { run_id, .. }
             | Self::TaskMetricsRecorded { run_id, .. } => Some(run_id),
@@ -436,6 +472,7 @@ impl ExecutionEventData {
             | Self::TaskCompleted { task_id, .. }
             | Self::TaskOutput { task_id, .. }
             | Self::TaskFailed { task_id, .. }
+            | Self::TaskRetryScheduled { task_id, .. }
             | Self::TaskRetried { task_id, .. }
             | Self::TaskHeartbeat { task_id, .. }
             | Self::TaskMetricsRecorded { task_id, .. } => Some(task_id),
@@ -623,6 +660,54 @@ impl EventBuilder {
         )
     }
 
+    /// Creates a `TaskRetryScheduled` event envelope.
+    #[must_use]
+    pub fn task_retry_scheduled(
+        tenant_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        run_id: RunId,
+        task_id: TaskId,
+        attempt: u32,
+        retry_at: DateTime<Utc>,
+        backoff: Duration,
+    ) -> EventEnvelope {
+        let backoff_ms = i64::try_from(backoff.as_millis()).unwrap_or(i64::MAX);
+
+        EventEnvelope::new(
+            tenant_id,
+            workspace_id,
+            ExecutionEventData::TaskRetryScheduled {
+                run_id,
+                task_id,
+                attempt,
+                retry_at,
+                backoff_ms,
+            },
+        )
+    }
+
+    /// Creates a `TaskRetried` event envelope.
+    #[must_use]
+    pub fn task_retried(
+        tenant_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        run_id: RunId,
+        task_id: TaskId,
+        previous_attempt: u32,
+        new_attempt: u32,
+    ) -> EventEnvelope {
+        EventEnvelope::new(
+            tenant_id,
+            workspace_id,
+            ExecutionEventData::TaskRetried {
+                run_id,
+                task_id,
+                previous_attempt,
+                new_attempt,
+            },
+        )
+    }
+
     /// Creates a `TaskOutput` event envelope.
     #[must_use]
     pub fn task_output(
@@ -701,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn event_envelope_serializes_cloudevents_format() {
+    fn event_envelope_serializes_cloudevents_format() -> serde_json::Result<()> {
         let run_id = RunId::generate();
         let envelope = EventEnvelope::new(
             "tenant",
@@ -712,17 +797,19 @@ mod tests {
             },
         );
 
-        let json = serde_json::to_string(&envelope).unwrap();
+        let json = serde_json::to_string(&envelope)?;
 
         assert!(json.contains("\"specversion\":\"1.0\""));
         assert!(json.contains("\"type\":\"arco.flow.run_started\""));
         assert!(json.contains("\"source\":"));
         assert!(json.contains("\"id\":"));
         assert!(json.contains("\"data\":"));
+
+        Ok(())
     }
 
     #[test]
-    fn run_started_event_serializes() {
+    fn run_started_event_serializes() -> serde_json::Result<()> {
         let envelope = EventEnvelope::new(
             "tenant",
             "workspace",
@@ -732,12 +819,14 @@ mod tests {
             },
         );
 
-        let json = serde_json::to_string(&envelope).unwrap();
+        let json = serde_json::to_string(&envelope)?;
         assert!(json.contains("run_started"));
+
+        Ok(())
     }
 
     #[test]
-    fn task_completed_event_serializes() {
+    fn task_completed_event_serializes() -> serde_json::Result<()> {
         let envelope = EventEnvelope::new(
             "tenant",
             "workspace",
@@ -749,8 +838,10 @@ mod tests {
             },
         );
 
-        let json = serde_json::to_string(&envelope).unwrap();
+        let json = serde_json::to_string(&envelope)?;
         assert!(json.contains("task_completed"));
+
+        Ok(())
     }
 
     #[test]
@@ -785,20 +876,22 @@ mod tests {
     }
 
     #[test]
-    fn run_started_envelope_serializes() {
+    fn run_started_envelope_serializes() -> serde_json::Result<()> {
         let envelope =
             EventBuilder::run_started("tenant", "workspace", RunId::generate(), "plan-123");
 
-        let json = serde_json::to_string(&envelope).unwrap();
+        let json = serde_json::to_string(&envelope)?;
 
         assert!(json.contains("\"specversion\":\"1.0\""));
         assert!(json.contains("\"type\":\"arco.flow.run_started\""));
         assert!(json.contains("/arco/flow/tenant/workspace"));
         assert!(json.contains("run_started"));
+
+        Ok(())
     }
 
     #[test]
-    fn task_completed_envelope_serializes() {
+    fn task_completed_envelope_serializes() -> serde_json::Result<()> {
         let envelope = EventBuilder::task_completed(
             "tenant",
             "workspace",
@@ -808,11 +901,13 @@ mod tests {
             1,
         );
 
-        let json = serde_json::to_string(&envelope).unwrap();
+        let json = serde_json::to_string(&envelope)?;
 
         assert!(json.contains("\"specversion\":\"1.0\""));
         assert!(json.contains("\"type\":\"arco.flow.task_completed\""));
         assert!(json.contains("\"SUCCEEDED\""));
+
+        Ok(())
     }
 
     #[test]
@@ -837,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn envelopes_roundtrip_through_json() {
+    fn envelopes_roundtrip_through_json() -> serde_json::Result<()> {
         let envelope = EventBuilder::run_completed(
             "tenant",
             "workspace",
@@ -849,12 +944,14 @@ mod tests {
             0,
         );
 
-        let json = serde_json::to_string(&envelope).unwrap();
-        let parsed: EventEnvelope = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&envelope)?;
+        let parsed: EventEnvelope = serde_json::from_str(&json)?;
 
         assert_eq!(envelope.id, parsed.id);
         assert_eq!(envelope.event_type, parsed.event_type);
         assert_eq!(envelope.specversion, parsed.specversion);
+
+        Ok(())
     }
 
     #[test]

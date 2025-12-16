@@ -250,19 +250,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn asset_id_roundtrip() {
+    fn asset_id_roundtrip() -> Result<()> {
         let id = AssetId::generate();
         let s = id.to_string();
-        let parsed: AssetId = s.parse().unwrap();
+        let parsed: AssetId = s.parse()?;
         assert_eq!(id, parsed);
+        Ok(())
     }
 
     #[test]
-    fn run_id_roundtrip() {
+    fn run_id_roundtrip() -> Result<()> {
         let id = RunId::generate();
         let s = id.to_string();
-        let parsed: RunId = s.parse().unwrap();
+        let parsed: RunId = s.parse()?;
         assert_eq!(id, parsed);
+        Ok(())
     }
 
     #[test]
@@ -279,19 +281,21 @@ mod tests {
     }
 
     #[test]
-    fn task_id_roundtrip() {
+    fn task_id_roundtrip() -> Result<()> {
         let id = TaskId::generate();
         let s = id.to_string();
-        let parsed: TaskId = s.parse().unwrap();
+        let parsed: TaskId = s.parse()?;
         assert_eq!(id, parsed);
+        Ok(())
     }
 
     #[test]
-    fn materialization_id_roundtrip() {
+    fn materialization_id_roundtrip() -> Result<()> {
         let id = MaterializationId::generate();
         let s = id.to_string();
-        let parsed: MaterializationId = s.parse().unwrap();
+        let parsed: MaterializationId = s.parse()?;
         assert_eq!(id, parsed);
+        Ok(())
     }
 
     #[test]

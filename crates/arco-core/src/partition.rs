@@ -452,7 +452,13 @@ mod tests {
         let canonical = pk.canonical_string();
 
         // Must not contain URL-unsafe characters in the value part
-        let value_part = canonical.split('=').nth(1).unwrap();
+        let value_part = match canonical.split_once('=') {
+            Some((_key, value)) => value,
+            None => {
+                assert!(false, "canonical string should contain '=': {canonical}");
+                ""
+            }
+        };
         assert!(!value_part.contains('/'));
         assert!(!value_part.contains('?'));
         assert!(!value_part.contains('&'));
@@ -542,7 +548,13 @@ mod tests {
         pk.insert("empty", ScalarValue::Null);
 
         let canonical = pk.canonical_string();
-        let parsed = PartitionKey::parse(&canonical).expect("should parse");
+        let parsed = match PartitionKey::parse(&canonical) {
+            Ok(value) => value,
+            Err(err) => {
+                assert!(false, "partition key should roundtrip: {err}");
+                return;
+            }
+        };
 
         assert_eq!(pk, parsed);
     }
@@ -642,16 +654,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_accepts_valid_timestamp() {
-        let result = PartitionKey::parse("ts=t:2025-01-15T10:30:00.000000Z");
-        assert!(result.is_ok());
-        let pk = result.unwrap();
+    fn test_parse_accepts_valid_timestamp() -> Result<(), PartitionKeyParseError> {
+        let pk = PartitionKey::parse("ts=t:2025-01-15T10:30:00.000000Z")?;
         assert_eq!(
             pk.get("ts"),
             Some(&ScalarValue::Timestamp(
                 "2025-01-15T10:30:00.000000Z".into()
             ))
         );
+        Ok(())
     }
 
     #[test]
@@ -672,7 +683,7 @@ mod proptests {
     /// Proptest configuration for CI predictability.
     ///
     /// Bounds the number of cases to ensure predictable runtime.
-    /// Override via PROPTEST_CASES environment variable if needed.
+    /// Override via `PROPTEST_CASES` environment variable if needed.
     const PROPTEST_CASES: u32 = 256;
 
     fn test_config() -> ProptestConfig {
@@ -687,15 +698,24 @@ mod proptests {
     }
 
     fn date_strategy() -> impl Strategy<Value = String> {
-        (1970u16..2100, 1u8..=12, 1u8..=28).prop_map(|(year, month, day)| {
-            format!("{year:04}-{month:02}-{day:02}")
-        })
+        (1970u16..2100, 1u8..=12, 1u8..=28)
+            .prop_map(|(year, month, day)| format!("{year:04}-{month:02}-{day:02}"))
     }
 
     fn timestamp_strategy() -> impl Strategy<Value = String> {
-        (1970u16..2100, 1u8..=12, 1u8..=28, 0u8..24, 0u8..60, 0u8..60, 0u32..1_000_000)
+        (
+            1970u16..2100,
+            1u8..=12,
+            1u8..=28,
+            0u8..24,
+            0u8..60,
+            0u8..60,
+            0u32..1_000_000,
+        )
             .prop_map(|(year, month, day, hour, minute, second, micros)| {
-                format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{micros:06}Z")
+                format!(
+                    "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{micros:06}Z"
+                )
             })
     }
 
@@ -712,7 +732,7 @@ mod proptests {
 
     fn partition_key_strategy() -> impl Strategy<Value = PartitionKey> {
         prop::collection::btree_map(key_name_strategy(), scalar_value_strategy(), 0..=5)
-            .prop_map(|map| PartitionKey(map))
+            .prop_map(PartitionKey)
     }
 
     proptest! {
@@ -721,8 +741,16 @@ mod proptests {
         #[test]
         fn partition_key_roundtrip(pk in partition_key_strategy()) {
             let canonical = pk.canonical_string();
-            let parsed = PartitionKey::parse(&canonical)
-                .expect("canonical string should always be parseable");
+            let parsed = match PartitionKey::parse(&canonical) {
+                Ok(value) => value,
+                Err(err) => {
+                    prop_assert!(
+                        false,
+                        "canonical string should always be parseable: {err} (canonical: {canonical})"
+                    );
+                    PartitionKey::new()
+                }
+            };
             prop_assert_eq!(pk, parsed, "roundtrip failed for canonical: {}", canonical);
         }
 
@@ -738,7 +766,7 @@ mod proptests {
             let canonical = pk.canonical_string();
             for segment in canonical.split(',') {
                 if let Some((_key, value)) = segment.split_once('=') {
-                    let after_colon = value.split_once(':').map(|(_, v)| v).unwrap_or(value);
+                    let after_colon = value.split_once(':').map_or(value, |(_, v)| v);
                     prop_assert!(!after_colon.contains('/'), "URL-unsafe '/' in value: {}", value);
                     prop_assert!(!after_colon.contains('?'), "URL-unsafe '?' in value: {}", value);
                     prop_assert!(!after_colon.contains('&'), "URL-unsafe '&' in value: {}", value);

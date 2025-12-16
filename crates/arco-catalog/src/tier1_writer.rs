@@ -351,6 +351,13 @@ mod tests {
 
     use arco_core::storage::{MemoryBackend, ObjectMeta};
     use std::ops::Range;
+    use serde::de::DeserializeOwned;
+
+    fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+        serde_json::from_slice(bytes).map_err(|e| Error::Serialization {
+            message: format!("failed to parse json: {e}"),
+        })
+    }
 
     #[derive(Debug)]
     struct HookedBackend {
@@ -416,44 +423,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_initialize_catalog_creates_required_files() {
+    async fn test_initialize_catalog_creates_required_files() -> Result<()> {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
         let writer = Tier1Writer::new(storage.clone());
 
-        writer.initialize().await.unwrap();
+        writer.initialize().await?;
 
-        let root: RootManifest =
-            serde_json::from_slice(&storage.get_raw(paths::ROOT_MANIFEST).await.unwrap()).unwrap();
+        let root_bytes = storage.get_raw(paths::ROOT_MANIFEST).await?;
+        let root: RootManifest = parse_json(&root_bytes)?;
         assert_eq!(root.version, 1);
 
-        let core: CoreManifest =
-            serde_json::from_slice(&storage.get_raw(paths::CORE_MANIFEST).await.unwrap()).unwrap();
+        let core_bytes = storage.get_raw(paths::CORE_MANIFEST).await?;
+        let core: CoreManifest = parse_json(&core_bytes)?;
         assert_eq!(core.snapshot_version, 0);
 
-        let exec: ExecutionManifest =
-            serde_json::from_slice(&storage.get_raw(paths::EXECUTION_MANIFEST).await.unwrap())
-                .unwrap();
+        let exec_bytes = storage.get_raw(paths::EXECUTION_MANIFEST).await?;
+        let exec: ExecutionManifest = parse_json(&exec_bytes)?;
         assert_eq!(exec.watermark_version, 0);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_initialize_idempotent() {
+    async fn test_initialize_idempotent() -> Result<()> {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
         let writer = Tier1Writer::new(storage);
 
-        writer.initialize().await.unwrap();
-        writer.initialize().await.unwrap();
+        writer.initialize().await?;
+        writer.initialize().await?;
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_update_with_cas() {
+    async fn test_update_with_cas() -> Result<()> {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
         let writer = Tier1Writer::new(storage.clone());
 
-        writer.initialize().await.unwrap();
+        writer.initialize().await?;
 
         let commit = writer
             .update(|manifest| {
@@ -462,23 +472,25 @@ mod tests {
                 Ok(())
             })
             .await
-            .unwrap();
+            ?;
 
         assert_eq!(commit.operation, "Update");
 
-        let core: CoreManifest =
-            serde_json::from_slice(&storage.get_raw(paths::CORE_MANIFEST).await.unwrap()).unwrap();
+        let core_bytes = storage.get_raw(paths::CORE_MANIFEST).await?;
+        let core: CoreManifest = parse_json(&core_bytes)?;
         assert_eq!(core.snapshot_version, 1);
         assert_eq!(core.snapshot_path, "core/snapshots/v1/");
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_cas_conflict_retries_and_succeeds() {
+    async fn test_cas_conflict_retries_and_succeeds() -> Result<()> {
         let backend = Arc::new(HookedBackend::new());
-        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
         let writer = Tier1Writer::new(storage.clone()).with_cas_retries(5);
 
-        writer.initialize().await.unwrap();
+        writer.initialize().await?;
 
         writer
             .update(|manifest| {
@@ -486,21 +498,23 @@ mod tests {
                 Ok(())
             })
             .await
-            .unwrap();
+            ?;
 
-        let core: CoreManifest =
-            serde_json::from_slice(&storage.get_raw(paths::CORE_MANIFEST).await.unwrap()).unwrap();
+        let core_bytes = storage.get_raw(paths::CORE_MANIFEST).await?;
+        let core: CoreManifest = parse_json(&core_bytes)?;
         assert_eq!(core.snapshot_version, 1);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_commit_chain_has_prev_hash() {
+    async fn test_commit_chain_has_prev_hash() -> Result<()> {
         // Verifies the tamper-evident audit chain links commits together.
         let backend = Arc::new(MemoryBackend::new());
-        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
         let writer = Tier1Writer::new(storage.clone());
 
-        writer.initialize().await.unwrap();
+        writer.initialize().await?;
 
         // First update - no previous commit to link
         let commit1 = writer
@@ -509,7 +523,7 @@ mod tests {
                 Ok(())
             })
             .await
-            .unwrap();
+            ?;
         assert!(commit1.prev_commit_id.is_none());
         assert!(commit1.prev_commit_hash.is_none());
 
@@ -520,7 +534,7 @@ mod tests {
                 Ok(())
             })
             .await
-            .unwrap();
+            ?;
         assert_eq!(commit2.prev_commit_id, Some(commit1.commit_id.clone()));
         assert!(
             commit2.prev_commit_hash.is_some(),
@@ -534,7 +548,7 @@ mod tests {
                 Ok(())
             })
             .await
-            .unwrap();
+            ?;
         assert_eq!(commit3.prev_commit_id, Some(commit2.commit_id.clone()));
         assert!(
             commit3.prev_commit_hash.is_some(),
@@ -543,8 +557,10 @@ mod tests {
 
         // Verify chain integrity: commit3.prev_commit_hash should be SHA256 of commit2
         let commit2_path = format!("core/commits/{}.json", commit2.commit_id);
-        let commit2_bytes = storage.get_raw(&commit2_path).await.unwrap();
+        let commit2_bytes = storage.get_raw(&commit2_path).await?;
         let expected_hash = format!("sha256:{}", hex::encode(Sha256::digest(&commit2_bytes)));
         assert_eq!(commit3.prev_commit_hash, Some(expected_hash));
+
+        Ok(())
     }
 }

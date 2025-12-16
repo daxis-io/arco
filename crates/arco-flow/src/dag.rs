@@ -354,108 +354,131 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_dag_has_no_nodes() {
+    fn empty_dag_has_no_nodes() -> Result<()> {
         let dag: Dag<String> = Dag::new();
         assert_eq!(dag.node_count(), 0);
-        assert!(dag.toposort().unwrap().is_empty());
+        assert!(dag.toposort()?.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn single_node_dag() {
+    fn single_node_dag() -> Result<()> {
         let mut dag: Dag<String> = Dag::new();
         dag.add_node("a".into());
-        let sorted = dag.toposort().unwrap();
+        let sorted = dag.toposort()?;
         assert_eq!(sorted, vec!["a".to_string()]);
+        Ok(())
     }
 
     #[test]
-    fn linear_dag_sorts_correctly() {
+    fn linear_dag_sorts_correctly() -> Result<()> {
         let mut dag: Dag<String> = Dag::new();
         let a = dag.add_node("a".into());
         let b = dag.add_node("b".into());
         let c = dag.add_node("c".into());
-        dag.add_edge(a, b).unwrap(); // a -> b
-        dag.add_edge(b, c).unwrap(); // b -> c
+        dag.add_edge(a, b)?; // a -> b
+        dag.add_edge(b, c)?; // b -> c
 
-        let sorted = dag.toposort().unwrap();
+        let sorted = dag.toposort()?;
         // a must come before b, b must come before c
-        let pos_a = sorted.iter().position(|x| x == "a").unwrap();
-        let pos_b = sorted.iter().position(|x| x == "b").unwrap();
-        let pos_c = sorted.iter().position(|x| x == "c").unwrap();
+        let pos_a = sorted
+            .iter()
+            .position(|x| x == "a")
+            .ok_or_else(|| Error::PlanGenerationFailed {
+                message: "missing node a in toposort output".into(),
+            })?;
+        let pos_b = sorted
+            .iter()
+            .position(|x| x == "b")
+            .ok_or_else(|| Error::PlanGenerationFailed {
+                message: "missing node b in toposort output".into(),
+            })?;
+        let pos_c = sorted
+            .iter()
+            .position(|x| x == "c")
+            .ok_or_else(|| Error::PlanGenerationFailed {
+                message: "missing node c in toposort output".into(),
+            })?;
         assert!(pos_a < pos_b);
         assert!(pos_b < pos_c);
+        Ok(())
     }
 
     #[test]
-    fn dag_detects_cycle() {
+    fn dag_detects_cycle() -> Result<()> {
         let mut dag: Dag<String> = Dag::new();
         let a = dag.add_node("a".into());
         let b = dag.add_node("b".into());
-        dag.add_edge(a, b).unwrap();
-        dag.add_edge(b, a).unwrap(); // Creates cycle
+        dag.add_edge(a, b)?;
+        dag.add_edge(b, a)?; // Creates cycle
 
         let result = dag.toposort();
         assert!(matches!(result, Err(Error::CycleDetected { .. })));
+        Ok(())
     }
 
     #[test]
-    fn dag_returns_upstream_dependencies_in_insertion_order() {
+    fn dag_returns_upstream_dependencies_in_insertion_order() -> Result<()> {
         let mut dag: Dag<String> = Dag::new();
         let a = dag.add_node("a".into());
         let b = dag.add_node("b".into());
         let c = dag.add_node("c".into());
-        dag.add_edge(a, c).unwrap(); // a -> c
-        dag.add_edge(b, c).unwrap(); // b -> c
+        dag.add_edge(a, c)?; // a -> c
+        dag.add_edge(b, c)?; // b -> c
 
-        let upstream = dag.upstream(c).unwrap();
+        let upstream = dag.upstream(c)?;
         // Exact ordering: a was inserted before b
         assert_eq!(upstream, vec!["a".to_string(), "b".to_string()]);
+        Ok(())
     }
 
     #[test]
-    fn dag_returns_downstream_dependents_in_insertion_order() {
+    fn dag_returns_downstream_dependents_in_insertion_order() -> Result<()> {
         let mut dag: Dag<String> = Dag::new();
         let a = dag.add_node("a".into());
         let b = dag.add_node("b".into());
         let c = dag.add_node("c".into());
-        dag.add_edge(a, b).unwrap();
-        dag.add_edge(a, c).unwrap();
+        dag.add_edge(a, b)?;
+        dag.add_edge(a, c)?;
 
-        let downstream = dag.downstream(a).unwrap();
+        let downstream = dag.downstream(a)?;
         // Exact ordering: b was inserted before c
         assert_eq!(downstream, vec!["b".to_string(), "c".to_string()]);
+        Ok(())
     }
 
     #[test]
-    fn roots_returns_nodes_in_insertion_order() {
+    fn roots_returns_nodes_in_insertion_order() -> Result<()> {
         let mut dag: Dag<String> = Dag::new();
         let _c = dag.add_node("c".into());
         let a = dag.add_node("a".into());
         let b = dag.add_node("b".into());
-        dag.add_edge(a, _c).unwrap();
-        dag.add_edge(b, _c).unwrap();
+        dag.add_edge(a, _c)?;
+        dag.add_edge(b, _c)?;
 
         let roots = dag.roots();
         // Insertion order: a, b (c has incoming edges so not a root)
         assert_eq!(roots, vec!["a".to_string(), "b".to_string()]);
+        Ok(())
     }
 
     #[test]
-    fn leaves_returns_nodes_in_insertion_order() {
+    fn leaves_returns_nodes_in_insertion_order() -> Result<()> {
         let mut dag: Dag<String> = Dag::new();
         let a = dag.add_node("a".into());
         let c = dag.add_node("c".into());
         let b = dag.add_node("b".into());
-        dag.add_edge(a, b).unwrap();
-        dag.add_edge(a, c).unwrap();
+        dag.add_edge(a, b)?;
+        dag.add_edge(a, c)?;
 
         let leaves = dag.leaves();
         // Insertion order: c, b (a has outgoing edges so not a leaf)
         assert_eq!(leaves, vec!["c".to_string(), "b".to_string()]);
+        Ok(())
     }
 
     #[test]
-    fn toposort_is_deterministic_with_multiple_roots() {
+    fn toposort_is_deterministic_with_multiple_roots() -> Result<()> {
         // When multiple valid orderings exist, toposort should be deterministic
         // by using insertion order as the tie-breaker
         let mut dag: Dag<String> = Dag::new();
@@ -464,22 +487,23 @@ mod tests {
         let c = dag.add_node("c".into());
         let d = dag.add_node("d".into());
         // a and b are independent roots, c depends on a, d depends on b
-        dag.add_edge(a, c).unwrap();
-        dag.add_edge(b, d).unwrap();
+        dag.add_edge(a, c)?;
+        dag.add_edge(b, d)?;
 
         // Run toposort multiple times, should always get same result
-        let sorted1 = dag.toposort().unwrap();
-        let sorted2 = dag.toposort().unwrap();
-        let sorted3 = dag.toposort().unwrap();
+        let sorted1 = dag.toposort()?;
+        let sorted2 = dag.toposort()?;
+        let sorted3 = dag.toposort()?;
 
         assert_eq!(sorted1, sorted2);
         assert_eq!(sorted2, sorted3);
         // Exact expected order based on insertion order tie-breaking
         assert_eq!(sorted1, vec!["a", "b", "c", "d"]);
+        Ok(())
     }
 
     #[test]
-    fn toposort_determinism_independent_of_insertion_permutation() {
+    fn toposort_determinism_independent_of_insertion_permutation() -> Result<()> {
         // Build the same DAG structure with different insertion orders
         // The toposort result should respect the insertion order of THAT dag
         // but the overall algorithm must be deterministic given an insertion order
@@ -493,9 +517,9 @@ mod tests {
         let b1 = dag1.add_node("b".into());
         let c1 = dag1.add_node("c".into());
         let d1 = dag1.add_node("d".into());
-        dag1.add_edge(a1, c1).unwrap();
-        dag1.add_edge(b1, c1).unwrap();
-        dag1.add_edge(c1, d1).unwrap();
+        dag1.add_edge(a1, c1)?;
+        dag1.add_edge(b1, c1)?;
+        dag1.add_edge(c1, d1)?;
 
         // Build with order: b, a, c, d (swapped a and b)
         let mut dag2: Dag<String> = Dag::new();
@@ -503,12 +527,12 @@ mod tests {
         let a2 = dag2.add_node("a".into());
         let c2 = dag2.add_node("c".into());
         let d2 = dag2.add_node("d".into());
-        dag2.add_edge(a2, c2).unwrap();
-        dag2.add_edge(b2, c2).unwrap();
-        dag2.add_edge(c2, d2).unwrap();
+        dag2.add_edge(a2, c2)?;
+        dag2.add_edge(b2, c2)?;
+        dag2.add_edge(c2, d2)?;
 
-        let sorted1 = dag1.toposort().unwrap();
-        let sorted2 = dag2.toposort().unwrap();
+        let sorted1 = dag1.toposort()?;
+        let sorted2 = dag2.toposort()?;
 
         // Both should be valid topological orderings
         // dag1: insertion order a,b,c,d -> expect [a, b, c, d]
@@ -517,7 +541,9 @@ mod tests {
         assert_eq!(sorted2, vec!["b", "a", "c", "d"]);
 
         // Each dag's toposort should be stable across multiple calls
-        assert_eq!(dag1.toposort().unwrap(), sorted1);
-        assert_eq!(dag2.toposort().unwrap(), sorted2);
+        assert_eq!(dag1.toposort()?, sorted1);
+        assert_eq!(dag2.toposort()?, sorted2);
+
+        Ok(())
     }
 }

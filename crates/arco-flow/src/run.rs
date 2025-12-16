@@ -6,6 +6,20 @@
 //! - **Outputs**: What data was produced
 //! - **Timing**: When each task started and completed
 //! - **State**: Current status and any errors
+//!
+//! ## Event Replay
+//!
+//! Runs are designed to be rebuilt from the Tier 2 ledger by replaying execution events:
+//!
+//! 1. Load all events for a run stream (e.g., `run:{run_id}`).
+//! 2. Sort by `sequence` (the total order within the run). If `sequence` is absent, fall back to
+//!    a stable tie-breaker such as `(time, id)`.
+//! 3. Deduplicate by `idempotency_key` for durable transitions (run/task lifecycle events).
+//! 4. Apply events to an in-memory `Run` + per-task `TaskExecution` using the same state machine
+//!    validation (`can_transition_to`) to guarantee consistency.
+//!
+//! High-frequency events such as heartbeats and metrics are intentionally not deduplicated via
+//! deterministic idempotency keys; consumers should treat them as "last write wins" observations.
 
 use std::collections::HashMap;
 
@@ -265,6 +279,7 @@ impl Run {
     /// # Errors
     ///
     /// Returns an error if the transition is invalid.
+    #[tracing::instrument(skip(self), fields(run_id = %self.id, from = %self.state, to = %target))]
     pub fn transition_to(&mut self, target: RunState) -> Result<()> {
         if !self.state.can_transition_to(target) {
             return Err(Error::InvalidStateTransition {
@@ -371,7 +386,7 @@ impl Run {
     pub fn ready_tasks(&self, plan: &Plan) -> Vec<TaskId> {
         self.task_executions
             .iter()
-            .filter(|exec| exec.state == TaskState::Pending)
+            .filter(|exec| matches!(exec.state, TaskState::Pending | TaskState::Ready))
             .filter(|exec| {
                 plan.get_task(&exec.task_id).is_some_and(|spec| {
                     spec.upstream_task_ids.iter().all(|dep_id| {
@@ -424,7 +439,7 @@ mod tests {
     use arco_core::AssetId;
 
     #[test]
-    fn run_initializes_from_plan() {
+    fn run_initializes_from_plan() -> Result<()> {
         let task_id = TaskId::generate();
         let plan = PlanBuilder::new("tenant", "workspace")
             .add_task(TaskSpec {
@@ -437,15 +452,21 @@ mod tests {
                 priority: 0,
                 resources: ResourceRequirements::default(),
             })
-            .build()
-            .unwrap();
+            .build()?;
 
         let run = Run::from_plan(&plan, RunTrigger::manual("user@example.com"));
 
         assert_eq!(run.state, RunState::Pending);
         assert_eq!(run.tenant_id, "tenant");
         assert_eq!(run.task_executions.len(), 1);
-        assert_eq!(run.get_task(&task_id).unwrap().state, TaskState::Pending);
+        assert_eq!(
+            run.get_task(&task_id)
+                .ok_or(Error::TaskNotFound { task_id })?
+                .state,
+            TaskState::Pending
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -456,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn run_tracks_task_progress() {
+    fn run_tracks_task_progress() -> Result<()> {
         let task_id = TaskId::generate();
         let plan = PlanBuilder::new("tenant", "workspace")
             .add_task(TaskSpec {
@@ -469,41 +490,30 @@ mod tests {
                 priority: 0,
                 resources: ResourceRequirements::default(),
             })
-            .build()
-            .unwrap();
+            .build()?;
 
         let mut run = Run::from_plan(&plan, RunTrigger::manual("user"));
 
         assert_eq!(run.tasks_pending(), 1);
         assert_eq!(run.tasks_succeeded(), 0);
 
-        run.get_task_mut(&task_id)
-            .unwrap()
-            .transition_to(TaskState::Ready)
-            .unwrap();
-        run.get_task_mut(&task_id)
-            .unwrap()
-            .transition_to(TaskState::Queued)
-            .unwrap();
-        run.get_task_mut(&task_id)
-            .unwrap()
-            .transition_to(TaskState::Dispatched)
-            .unwrap();
-        run.get_task_mut(&task_id)
-            .unwrap()
-            .transition_to(TaskState::Running)
-            .unwrap();
-        run.get_task_mut(&task_id)
-            .unwrap()
-            .transition_to(TaskState::Succeeded)
-            .unwrap();
+        let exec = run
+            .get_task_mut(&task_id)
+            .ok_or(Error::TaskNotFound { task_id })?;
+        exec.transition_to(TaskState::Ready)?;
+        exec.transition_to(TaskState::Queued)?;
+        exec.transition_to(TaskState::Dispatched)?;
+        exec.transition_to(TaskState::Running)?;
+        exec.transition_to(TaskState::Succeeded)?;
 
         assert_eq!(run.tasks_pending(), 0);
         assert_eq!(run.tasks_succeeded(), 1);
+
+        Ok(())
     }
 
     #[test]
-    fn run_ready_tasks_respects_dependencies() {
+    fn run_ready_tasks_respects_dependencies() -> Result<()> {
         let task_a = TaskId::generate();
         let task_b = TaskId::generate();
 
@@ -528,8 +538,7 @@ mod tests {
                 priority: 0,
                 resources: ResourceRequirements::default(),
             })
-            .build()
-            .unwrap();
+            .build()?;
 
         let mut run = Run::from_plan(&plan, RunTrigger::manual("user"));
 
@@ -539,35 +548,25 @@ mod tests {
         assert!(ready.contains(&task_a));
 
         // Mark task_a as succeeded
-        run.get_task_mut(&task_a)
-            .unwrap()
-            .transition_to(TaskState::Ready)
-            .unwrap();
-        run.get_task_mut(&task_a)
-            .unwrap()
-            .transition_to(TaskState::Queued)
-            .unwrap();
-        run.get_task_mut(&task_a)
-            .unwrap()
-            .transition_to(TaskState::Dispatched)
-            .unwrap();
-        run.get_task_mut(&task_a)
-            .unwrap()
-            .transition_to(TaskState::Running)
-            .unwrap();
-        run.get_task_mut(&task_a)
-            .unwrap()
-            .transition_to(TaskState::Succeeded)
-            .unwrap();
+        let exec = run
+            .get_task_mut(&task_a)
+            .ok_or(Error::TaskNotFound { task_id: task_a })?;
+        exec.transition_to(TaskState::Ready)?;
+        exec.transition_to(TaskState::Queued)?;
+        exec.transition_to(TaskState::Dispatched)?;
+        exec.transition_to(TaskState::Running)?;
+        exec.transition_to(TaskState::Succeeded)?;
 
         // Now task_b should be ready
         let ready = run.ready_tasks(&plan);
         assert_eq!(ready.len(), 1);
         assert!(ready.contains(&task_b));
+
+        Ok(())
     }
 
     #[test]
-    fn run_compute_final_state() {
+    fn run_compute_final_state() -> Result<()> {
         let task_id = TaskId::generate();
         let plan = PlanBuilder::new("tenant", "workspace")
             .add_task(TaskSpec {
@@ -580,32 +579,21 @@ mod tests {
                 priority: 0,
                 resources: ResourceRequirements::default(),
             })
-            .build()
-            .unwrap();
+            .build()?;
 
         let mut run = Run::from_plan(&plan, RunTrigger::manual("user"));
 
-        run.get_task_mut(&task_id)
-            .unwrap()
-            .transition_to(TaskState::Ready)
-            .unwrap();
-        run.get_task_mut(&task_id)
-            .unwrap()
-            .transition_to(TaskState::Queued)
-            .unwrap();
-        run.get_task_mut(&task_id)
-            .unwrap()
-            .transition_to(TaskState::Dispatched)
-            .unwrap();
-        run.get_task_mut(&task_id)
-            .unwrap()
-            .transition_to(TaskState::Running)
-            .unwrap();
-        run.get_task_mut(&task_id)
-            .unwrap()
-            .transition_to(TaskState::Succeeded)
-            .unwrap();
+        let exec = run
+            .get_task_mut(&task_id)
+            .ok_or(Error::TaskNotFound { task_id })?;
+        exec.transition_to(TaskState::Ready)?;
+        exec.transition_to(TaskState::Queued)?;
+        exec.transition_to(TaskState::Dispatched)?;
+        exec.transition_to(TaskState::Running)?;
+        exec.transition_to(TaskState::Succeeded)?;
 
         assert_eq!(run.compute_final_state(), RunState::Succeeded);
+
+        Ok(())
     }
 }

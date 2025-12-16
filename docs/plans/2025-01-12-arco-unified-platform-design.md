@@ -50,7 +50,7 @@ This document defines the end-to-end architecture for Arco, a unified data platf
 | **Workspace** | Logical environment within a tenant (dev, staging, prod). | Servo |
 | **Asset** | A data product definition—code + schema + dependencies + checks. The unit of orchestration and cataloging. | Servo (definition), Catalog (metadata) |
 | **AssetKey** | Canonical identifier: `{namespace}.{name}` (e.g., `analytics.orders_daily`). | Both (shared) |
-| **AssetId** | Stable UUID assigned at first deploy. Survives renames. | Both (shared) |
+| **AssetId** | Stable ULID assigned at first deploy. Survives renames. | Both (shared) |
 | **Dataset** | The physical data an asset produces. One asset → one dataset (1:1). | Catalog |
 | **Partition** | A subset of a dataset defined by partition key dimensions (e.g., `{date: "2025-01-15", tenant: "acme"}`). | Both |
 | **PartitionId** | Stable identifier: `hash(asset_id + canonical_partition_key)`. | Both (shared) |
@@ -122,13 +122,13 @@ impl AssetKey {
     }
 }
 
-/// AssetId: Stable UUID, assigned once at first deploy, never changes
+/// AssetId: Stable ULID, assigned once at first deploy, never changes
 /// Survives renames of AssetKey
-pub struct AssetId(Uuid);
+pub struct AssetId(Ulid);
 
 impl AssetId {
     pub fn new() -> Self {
-        Self(Uuid::now_v7())  // Time-ordered for indexing
+        Self(Ulid::new())  // Time-ordered for indexing
     }
 }
 
@@ -293,7 +293,7 @@ The storage architecture uses a **two-tier write model**:
 **Important**: Object storage doesn't support multiple writers appending to the same file. So our "append-only log" is actually a **directory of immutable event files**:
 
 ```
-ledger/execution/
+ledger/execution/2025-01-15/
   2025-01-15T10:00:00Z-servo-run-abc123.json    # Writer 1
   2025-01-15T10:00:05Z-servo-run-def456.json    # Writer 2
   2025-01-15T10:00:07Z-profiler-xyz789.json     # Writer 3
@@ -325,11 +325,11 @@ gs://bucket/{tenant}/{workspace}/
 │   ├── catalog/                       # Core catalog events (low vol)
 │   │   └── {ulid}.json                # TableCreated, SchemaChanged
 │   ├── execution/                     # Materialization events (high vol)
-│   │   └── {timestamp}-{uuid}.json    # MaterializationCompleted
+│   │   └── {date}/{timestamp}-{uuid}.json    # MaterializationCompleted
 │   ├── quality/                       # Check result events
-│   │   └── {timestamp}-{uuid}.json    # CheckExecuted
+│   │   └── {date}/{timestamp}-{uuid}.json    # CheckExecuted
 │   └── lineage/                       # Lineage events
-│       └── {timestamp}-{uuid}.json    # LineageRecorded
+│       └── {date}/{timestamp}-{uuid}.json    # LineageRecorded
 │
 ├── state/                             # Compacted Parquet (read-optimized)
 │   ├── catalog/                       # Core catalog state
@@ -383,7 +383,7 @@ gs://bucket/{tenant}/{workspace}/
 **Tier 2: Execution / Quality / Lineage (Eventual)**
 
 ```
-1. Writer appends to ledger/{domain}/{timestamp}-{uuid}.json
+1. Writer appends to ledger/{domain}/{date}/{timestamp}-{uuid}.json
 2. ACK immediately (fire-and-forget)
 3. Compactor wakes every ~10s (GCS notification / timer)
 4. Compactor: list events since watermark → sort → fold → write Parquet
@@ -1003,7 +1003,7 @@ For fields that could be written by either system:
      │                │                │                │
      │ 2. Write event to ledger        │                │
      │ (fire-and-forget)               │                │
-     │ ledger/execution/{ts}-{uuid}.json               │
+     │ ledger/execution/{date}/{ts}-{uuid}.json               │
      │───────────────►│                │                │
      │                │                │                │
      │ 3. ACK to caller (immediate)    │                │
@@ -1181,9 +1181,9 @@ interface ExplainAssetResponse {
 With the ledger + compactor model, events are written as JSON files to GCS:
 
 ```
-ledger/execution/{timestamp}-{uuid}.json
-ledger/quality/{timestamp}-{uuid}.json
-ledger/lineage/{timestamp}-{uuid}.json
+ledger/execution/{date}/{timestamp}-{uuid}.json
+ledger/quality/{date}/{timestamp}-{uuid}.json
+ledger/lineage/{date}/{timestamp}-{uuid}.json
 ```
 
 #### Event Envelope (CloudEvents-compatible JSON)
@@ -1223,7 +1223,7 @@ interface LedgerEvent {
 
 ```typescript
 // Event: MaterializationCompleted
-// Written to: ledger/execution/{timestamp}-{uuid}.json
+// Written to: ledger/execution/{date}/{timestamp}-{uuid}.json
 interface MaterializationCompleted {
   type: "materialization_completed";
   materialization_id: string;    // ULID - primary key for idempotency
@@ -1254,7 +1254,7 @@ interface FileEntry {
 }
 
 // Event: LineageRecorded
-// Written to: ledger/lineage/{timestamp}-{uuid}.json
+// Written to: ledger/lineage/{date}/{timestamp}-{uuid}.json
 interface LineageRecorded {
   type: "lineage_recorded";
   run_id: string;

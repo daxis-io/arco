@@ -69,7 +69,7 @@ thiserror = "2"
 anyhow = "1"
 
 # Logging and tracing
-tracing = "0.1"
+tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Async utilities

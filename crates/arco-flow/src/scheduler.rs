@@ -7,8 +7,12 @@
 //! - **Fault tolerance**: Failed tasks skip downstream, continue independent branches
 
 use std::collections::HashSet;
+use std::time::Duration;
 
-use arco_core::TaskId;
+use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
+
+use arco_core::{RunId, TaskId};
 
 use crate::error::{Error, Result};
 use crate::events::EventBuilder;
@@ -16,7 +20,7 @@ use crate::outbox::EventSink;
 use crate::plan::{Plan, TaskSpec};
 use crate::run::{Run, RunState, RunTrigger};
 use crate::runner::TaskResult;
-use crate::task::TaskState;
+use crate::task::{TaskError, TaskErrorCategory, TaskState};
 
 /// Scheduler configuration.
 #[derive(Debug, Clone)]
@@ -25,6 +29,8 @@ pub struct SchedulerConfig {
     pub max_parallelism: usize,
     /// Whether to continue on task failure (skip downstream only).
     pub continue_on_failure: bool,
+    /// Retry policy for retryable failures.
+    pub retry_policy: RetryPolicy,
 }
 
 impl Default for SchedulerConfig {
@@ -32,8 +38,77 @@ impl Default for SchedulerConfig {
         Self {
             max_parallelism: 10,
             continue_on_failure: true,
+            retry_policy: RetryPolicy::default(),
         }
     }
+}
+
+/// Retry policy for task failures.
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    /// Whether retries are enabled for retryable errors.
+    pub enabled: bool,
+    /// Base backoff used for the first retry.
+    pub base_backoff: Duration,
+    /// Maximum backoff cap.
+    pub max_backoff: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_backoff: Duration::from_secs(5),
+            max_backoff: Duration::from_secs(5 * 60),
+        }
+    }
+}
+
+impl RetryPolicy {
+    fn backoff_for(&self, run_id: RunId, task_id: TaskId, attempt: u32) -> Duration {
+        if !self.enabled {
+            return Duration::ZERO;
+        }
+
+        let exponent = attempt.saturating_sub(1).min(31);
+        let factor = 1u32 << exponent;
+
+        let exponential = self
+            .base_backoff
+            .checked_mul(factor)
+            .unwrap_or(self.max_backoff)
+            .min(self.max_backoff);
+
+        deterministic_full_jitter(run_id, task_id, attempt, exponential)
+    }
+}
+
+fn deterministic_full_jitter(
+    run_id: RunId,
+    task_id: TaskId,
+    attempt: u32,
+    max_delay: Duration,
+) -> Duration {
+    let max_ms = u64::try_from(max_delay.as_millis()).unwrap_or(u64::MAX);
+    if max_ms == 0 {
+        return Duration::ZERO;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(run_id.to_string());
+    hasher.update(task_id.to_string());
+    hasher.update(attempt.to_le_bytes());
+
+    let digest = hasher.finalize();
+    let value = digest.get(..8).map_or(0, |bytes| {
+        let mut prefix = [0u8; 8];
+        prefix.copy_from_slice(bytes);
+        u64::from_le_bytes(prefix)
+    });
+
+    let range = max_ms.saturating_add(1);
+    let jitter_ms = if range == 0 { value } else { value % range };
+    Duration::from_millis(jitter_ms)
 }
 
 /// Scheduler for executing plans.
@@ -79,6 +154,15 @@ impl Scheduler {
 
     /// Creates a new run from the plan.
     #[must_use]
+    #[tracing::instrument(
+        skip(self, outbox),
+        fields(
+            tenant_id = %self.plan.tenant_id,
+            workspace_id = %self.plan.workspace_id,
+            plan_id = %self.plan.plan_id,
+            trigger_type = %trigger.trigger_type
+        )
+    )]
     pub fn create_run(&self, trigger: RunTrigger, outbox: &mut impl EventSink) -> Run {
         let mut run = Run::from_plan(&self.plan, trigger);
 
@@ -98,10 +182,11 @@ impl Scheduler {
     /// Returns tasks that are ready to execute.
     ///
     /// A task is ready if:
-    /// - It is in Pending state
+    /// - It is in Pending or Ready state
     /// - All its upstream dependencies have Succeeded
     /// - We haven't exceeded `max_parallelism` (considering queued/running tasks)
     #[must_use]
+    #[tracing::instrument(skip(self, run), fields(run_id = %run.id))]
     pub fn get_ready_tasks(&self, run: &Run) -> Vec<&TaskSpec> {
         let running_count = run.tasks_running() + run.tasks_queued();
         let available_slots = self.config.max_parallelism.saturating_sub(running_count);
@@ -137,6 +222,7 @@ impl Scheduler {
     /// # Errors
     ///
     /// Returns an error if `task_id` is not present in the run.
+    #[tracing::instrument(skip(self, run, outbox), fields(run_id = %run.id, task_id = %task_id))]
     pub fn process_task_completion(
         &self,
         run: &mut Run,
@@ -206,6 +292,7 @@ impl Scheduler {
     /// # Errors
     ///
     /// Returns an error if the task is not ready to queue.
+    #[tracing::instrument(skip(self, run, outbox), fields(run_id = %run.id, task_id = %task_id))]
     pub fn queue_task(
         &self,
         run: &mut Run,
@@ -220,7 +307,7 @@ impl Scheduler {
                 .ok_or(Error::TaskNotFound { task_id: *task_id })?;
 
             // Enforce dependency readiness before queueing.
-            if exec.state == TaskState::Pending && !is_ready {
+            if matches!(exec.state, TaskState::Pending | TaskState::Ready) && !is_ready {
                 return Err(Error::InvalidStateTransition {
                     from: exec.state.to_string(),
                     to: TaskState::Queued.to_string(),
@@ -250,6 +337,10 @@ impl Scheduler {
     /// # Errors
     ///
     /// Returns an error if the task is not in queued state.
+    #[tracing::instrument(
+        skip(self, run, outbox),
+        fields(run_id = %run.id, task_id = %task_id, worker_id = %worker_id)
+    )]
     pub fn start_task(
         &self,
         run: &mut Run,
@@ -320,6 +411,7 @@ impl Scheduler {
     /// # Errors
     ///
     /// Returns an error if the run is not in Pending state.
+    #[tracing::instrument(skip(self, run, outbox), fields(run_id = %run.id))]
     pub fn start_run(&self, run: &mut Run, outbox: &mut impl EventSink) -> Result<()> {
         run.transition_to(RunState::Running)?;
 
@@ -342,6 +434,10 @@ impl Scheduler {
     /// # Errors
     ///
     /// Returns an error if the transition is invalid.
+    #[tracing::instrument(
+        skip(self, run, outbox),
+        fields(run_id = %run.id, final_state = %final_state)
+    )]
     pub fn complete_run(
         &self,
         run: &mut Run,
@@ -373,6 +469,7 @@ impl Scheduler {
     /// # Errors
     ///
     /// Returns an error if the run cannot be cancelled.
+    #[tracing::instrument(skip(self, run, outbox), fields(run_id = %run.id))]
     pub fn cancel_run(&self, run: &mut Run, outbox: &mut impl EventSink) -> Result<()> {
         if run.state != RunState::Cancelling {
             run.transition_to(RunState::Cancelling)?;
@@ -433,6 +530,10 @@ impl Scheduler {
     /// # Errors
     ///
     /// Returns an error if the task does not exist or the transition is invalid.
+    #[tracing::instrument(
+        skip(self, run, outbox, result),
+        fields(run_id = %run.id, task_id = %task_id)
+    )]
     pub fn record_task_result(
         &self,
         run: &mut Run,
@@ -445,7 +546,7 @@ impl Scheduler {
                 Self::record_task_success(run, task_id, output, outbox)?;
             }
             TaskResult::Failed(error) => {
-                Self::record_task_failure(run, task_id, error, outbox)?;
+                self.record_task_failure(run, task_id, error, outbox)?;
             }
             TaskResult::Cancelled => {
                 Self::record_task_cancelled(run, task_id, outbox)?;
@@ -504,18 +605,35 @@ impl Scheduler {
     }
 
     fn record_task_failure(
+        &self,
         run: &mut Run,
         task_id: &TaskId,
-        error: crate::task::TaskError,
+        error: TaskError,
         outbox: &mut impl EventSink,
     ) -> Result<()> {
-        let attempt = {
+        let run_id = run.id;
+        let (attempt, retry_at, backoff) = {
             let exec = run
                 .get_task_mut(task_id)
                 .ok_or(Error::TaskNotFound { task_id: *task_id })?;
             let attempt = exec.attempt;
             exec.fail(error.clone())?;
-            attempt
+            if self.config.retry_policy.enabled && error.retryable && exec.can_retry() {
+                let now = Utc::now();
+                let backoff = self
+                    .config
+                    .retry_policy
+                    .backoff_for(run_id, *task_id, attempt);
+                let retry_at =
+                    now + chrono::Duration::from_std(backoff).unwrap_or(chrono::Duration::MAX);
+
+                exec.transition_to(TaskState::RetryWait)?;
+                exec.retry_at = Some(retry_at);
+
+                (attempt, Some(retry_at), Some(backoff))
+            } else {
+                (attempt, None, None)
+            }
         };
 
         emit_sequenced(
@@ -543,6 +661,22 @@ impl Scheduler {
                 attempt,
             ),
         );
+
+        if let (Some(retry_at), Some(backoff)) = (retry_at, backoff) {
+            emit_sequenced(
+                run,
+                outbox,
+                EventBuilder::task_retry_scheduled(
+                    &run.tenant_id,
+                    &run.workspace_id,
+                    run.id,
+                    *task_id,
+                    attempt,
+                    retry_at,
+                    backoff,
+                ),
+            );
+        }
 
         Ok(())
     }
@@ -584,6 +718,7 @@ impl Scheduler {
     /// # Errors
     ///
     /// Returns an error if the completion transition is invalid.
+    #[tracing::instrument(skip(self, run, outbox), fields(run_id = %run.id))]
     pub fn maybe_complete_run(
         &self,
         run: &mut Run,
@@ -594,6 +729,189 @@ impl Scheduler {
         };
         self.complete_run(run, final_state, outbox)?;
         Ok(Some(final_state))
+    }
+
+    /// Advances any tasks whose retry backoff has elapsed.
+    ///
+    /// Returns the task IDs that transitioned from `RetryWait` to `Ready`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a task transition is invalid.
+    pub fn process_retries(
+        &self,
+        run: &mut Run,
+        outbox: &mut impl EventSink,
+    ) -> Result<Vec<TaskId>> {
+        self.process_retries_at(run, outbox, Utc::now())
+    }
+
+    /// Advances any tasks whose retry backoff has elapsed at a given time.
+    ///
+    /// This is useful for tests and deterministic simulations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a task transition is invalid.
+    #[tracing::instrument(skip(self, run, outbox), fields(run_id = %run.id, now = %now))]
+    pub fn process_retries_at(
+        &self,
+        run: &mut Run,
+        outbox: &mut impl EventSink,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<TaskId>> {
+        let mut transitioned = Vec::new();
+
+        for spec in &self.plan.tasks {
+            let task_id = spec.task_id;
+            let due = run
+                .get_task(&task_id)
+                .is_some_and(|exec| exec.is_retry_due_at(now));
+
+            if !due {
+                continue;
+            }
+
+            let (previous_attempt, new_attempt) = {
+                let exec = run
+                    .get_task_mut(&task_id)
+                    .ok_or(Error::TaskNotFound { task_id })?;
+
+                let previous_attempt = exec.attempt;
+                exec.transition_to(TaskState::Ready)?;
+                let new_attempt = exec.attempt;
+
+                (previous_attempt, new_attempt)
+            };
+
+            emit_sequenced(
+                run,
+                outbox,
+                EventBuilder::task_retried(
+                    &run.tenant_id,
+                    &run.workspace_id,
+                    run.id,
+                    task_id,
+                    previous_attempt,
+                    new_attempt,
+                ),
+            );
+
+            transitioned.push(task_id);
+        }
+
+        Ok(transitioned)
+    }
+
+    /// Records a heartbeat for a running task.
+    ///
+    /// Heartbeats for non-running tasks are ignored (late/duplicate heartbeats are expected in
+    /// distributed systems).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task does not exist.
+    #[tracing::instrument(skip(self, run, outbox), fields(run_id = %run.id, task_id = %task_id))]
+    pub fn record_task_heartbeat(
+        &self,
+        run: &mut Run,
+        task_id: &TaskId,
+        outbox: &mut impl EventSink,
+    ) -> Result<()> {
+        self.record_task_heartbeat_at(run, task_id, outbox, Utc::now())
+    }
+
+    /// Records a heartbeat for a running task at a given time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task does not exist.
+    #[tracing::instrument(
+        skip(self, run, outbox),
+        fields(run_id = %run.id, task_id = %task_id, now = %now)
+    )]
+    pub fn record_task_heartbeat_at(
+        &self,
+        run: &mut Run,
+        task_id: &TaskId,
+        outbox: &mut impl EventSink,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let attempt = {
+            let exec = run
+                .get_task_mut(task_id)
+                .ok_or(Error::TaskNotFound { task_id: *task_id })?;
+
+            if !matches!(exec.state, TaskState::Running | TaskState::Dispatched) {
+                return Ok(());
+            }
+
+            exec.record_heartbeat_at(now);
+            exec.attempt
+        };
+
+        emit_sequenced(
+            run,
+            outbox,
+            EventBuilder::task_heartbeat(
+                &run.tenant_id,
+                &run.workspace_id,
+                run.id,
+                *task_id,
+                attempt,
+            ),
+        );
+
+        Ok(())
+    }
+
+    /// Detects tasks with stale heartbeats and marks them failed (retrying if configured).
+    ///
+    /// Returns task IDs that were marked stale.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a task transition is invalid.
+    #[tracing::instrument(skip(self, run, outbox), fields(run_id = %run.id))]
+    pub fn process_stale_heartbeats(
+        &self,
+        run: &mut Run,
+        outbox: &mut impl EventSink,
+    ) -> Result<Vec<TaskId>> {
+        self.process_stale_heartbeats_at(run, outbox, Utc::now())
+    }
+
+    /// Detects stale heartbeats at a given time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a task transition is invalid.
+    #[tracing::instrument(skip(self, run, outbox), fields(run_id = %run.id, now = %now))]
+    pub fn process_stale_heartbeats_at(
+        &self,
+        run: &mut Run,
+        outbox: &mut impl EventSink,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<TaskId>> {
+        let mut stale = Vec::new();
+
+        for spec in &self.plan.tasks {
+            let task_id = spec.task_id;
+            let is_stale = run
+                .get_task(&task_id)
+                .is_some_and(|exec| exec.is_heartbeat_stale_at(now));
+
+            if !is_stale {
+                continue;
+            }
+
+            let error = TaskError::new(TaskErrorCategory::Infrastructure, "heartbeat timeout");
+            self.record_task_failure(run, &task_id, error, outbox)?;
+            self.process_task_completion(run, &task_id, outbox)?;
+            stale.push(task_id);
+        }
+
+        Ok(stale)
     }
 }
 
@@ -610,7 +928,7 @@ mod tests {
     use arco_core::AssetId;
 
     #[test]
-    fn scheduler_creates_run_from_plan() {
+    fn scheduler_creates_run_from_plan() -> Result<()> {
         let task_id = TaskId::generate();
         let plan = PlanBuilder::new("tenant", "workspace")
             .add_task(TaskSpec {
@@ -623,8 +941,7 @@ mod tests {
                 priority: 0,
                 resources: ResourceRequirements::default(),
             })
-            .build()
-            .unwrap();
+            .build()?;
 
         let scheduler = Scheduler::new(plan);
         let mut outbox = InMemoryOutbox::new();
@@ -634,10 +951,12 @@ mod tests {
         assert_eq!(run.task_executions.len(), 1);
         assert_eq!(outbox.events().len(), 1);
         assert_eq!(outbox.events()[0].sequence, Some(1));
+
+        Ok(())
     }
 
     #[test]
-    fn scheduler_returns_ready_tasks() {
+    fn scheduler_returns_ready_tasks() -> Result<()> {
         let task_a = TaskId::generate();
         let task_b = TaskId::generate();
 
@@ -662,8 +981,7 @@ mod tests {
                 priority: 0,
                 resources: ResourceRequirements::default(),
             })
-            .build()
-            .unwrap();
+            .build()?;
 
         let scheduler = Scheduler::new(plan);
         let mut outbox = InMemoryOutbox::new();
@@ -672,10 +990,12 @@ mod tests {
         let ready = scheduler.get_ready_tasks(&run);
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].task_id, task_a);
+
+        Ok(())
     }
 
     #[test]
-    fn scheduler_skips_downstream_on_failure() {
+    fn scheduler_skips_downstream_on_failure() -> Result<()> {
         let task_a = TaskId::generate();
         let task_b = TaskId::generate();
 
@@ -700,45 +1020,40 @@ mod tests {
                 priority: 0,
                 resources: ResourceRequirements::default(),
             })
-            .build()
-            .unwrap();
+            .build()?;
 
         let scheduler = Scheduler::new(plan);
         let mut outbox = InMemoryOutbox::new();
         let mut run = scheduler.create_run(RunTrigger::manual("user"), &mut outbox);
 
-        scheduler.start_run(&mut run, &mut outbox).unwrap();
+        scheduler.start_run(&mut run, &mut outbox)?;
 
         // Fail task_a and cascade skip.
-        scheduler
-            .queue_task(&mut run, &task_a, &mut outbox)
-            .unwrap();
-        scheduler
-            .start_task(&mut run, &task_a, "worker-1", &mut outbox)
-            .unwrap();
+        scheduler.queue_task(&mut run, &task_a, &mut outbox)?;
+        scheduler.start_task(&mut run, &task_a, "worker-1", &mut outbox)?;
 
-        scheduler
-            .record_task_result(
-                &mut run,
-                &task_a,
-                TaskResult::Failed(crate::task::TaskError::new(
-                    crate::task::TaskErrorCategory::UserCode,
-                    "test failure",
-                )),
-                &mut outbox,
-            )
-            .unwrap();
+        scheduler.record_task_result(
+            &mut run,
+            &task_a,
+            TaskResult::Failed(TaskError::new(TaskErrorCategory::UserCode, "test failure")),
+            &mut outbox,
+        )?;
 
-        let task_b_state = run.get_task(&task_b).unwrap().state;
+        let task_b_state = run
+            .get_task(&task_b)
+            .ok_or(Error::TaskNotFound { task_id: task_b })?
+            .state;
         assert_eq!(task_b_state, TaskState::Skipped);
 
-        let completed = scheduler.maybe_complete_run(&mut run, &mut outbox).unwrap();
+        let completed = scheduler.maybe_complete_run(&mut run, &mut outbox)?;
         assert_eq!(completed, Some(RunState::Failed));
         assert_eq!(run.state, RunState::Failed);
+
+        Ok(())
     }
 
     #[test]
-    fn scheduler_prioritizes_lower_priority_values() {
+    fn scheduler_prioritizes_lower_priority_values() -> Result<()> {
         let task_low = TaskId::generate();
         let task_high = TaskId::generate();
 
@@ -763,8 +1078,7 @@ mod tests {
                 priority: 0,
                 resources: ResourceRequirements::default(),
             })
-            .build()
-            .unwrap();
+            .build()?;
 
         let scheduler = Scheduler::new(plan);
         let mut outbox = InMemoryOutbox::new();
@@ -774,10 +1088,12 @@ mod tests {
         assert_eq!(ready.len(), 2);
         assert_eq!(ready[0].task_id, task_high);
         assert_eq!(ready[1].task_id, task_low);
+
+        Ok(())
     }
 
     #[test]
-    fn scheduler_respects_max_parallelism() {
+    fn scheduler_respects_max_parallelism() -> Result<()> {
         let tasks: Vec<_> = (0..5)
             .map(|_| TaskSpec {
                 task_id: TaskId::generate(),
@@ -795,11 +1111,12 @@ mod tests {
         for task in tasks {
             builder = builder.add_task(task);
         }
-        let plan = builder.build().unwrap();
+        let plan = builder.build()?;
 
         let config = SchedulerConfig {
             max_parallelism: 2,
             continue_on_failure: true,
+            retry_policy: RetryPolicy::default(),
         };
         let scheduler = Scheduler::with_config(plan, config);
         let mut outbox = InMemoryOutbox::new();
@@ -807,10 +1124,12 @@ mod tests {
 
         let ready = scheduler.get_ready_tasks(&run);
         assert_eq!(ready.len(), 2);
+
+        Ok(())
     }
 
     #[test]
-    fn scheduler_run_lifecycle() {
+    fn scheduler_run_lifecycle() -> Result<()> {
         let task_id = TaskId::generate();
         let plan = PlanBuilder::new("tenant", "workspace")
             .add_task(TaskSpec {
@@ -823,44 +1142,39 @@ mod tests {
                 priority: 0,
                 resources: ResourceRequirements::default(),
             })
-            .build()
-            .unwrap();
+            .build()?;
 
         let scheduler = Scheduler::new(plan);
         let mut outbox = InMemoryOutbox::new();
         let mut run = scheduler.create_run(RunTrigger::manual("user"), &mut outbox);
 
-        scheduler.start_run(&mut run, &mut outbox).unwrap();
+        scheduler.start_run(&mut run, &mut outbox)?;
         assert_eq!(run.state, RunState::Running);
 
-        scheduler
-            .queue_task(&mut run, &task_id, &mut outbox)
-            .unwrap();
-        scheduler
-            .start_task(&mut run, &task_id, "worker-1", &mut outbox)
-            .unwrap();
+        scheduler.queue_task(&mut run, &task_id, &mut outbox)?;
+        scheduler.start_task(&mut run, &task_id, "worker-1", &mut outbox)?;
 
-        scheduler
-            .record_task_result(
-                &mut run,
-                &task_id,
-                TaskResult::Succeeded(crate::task::TaskOutput {
-                    materialization_id: arco_core::MaterializationId::generate(),
-                    files: vec![],
-                    row_count: 0,
-                    byte_size: 0,
-                }),
-                &mut outbox,
-            )
-            .unwrap();
+        scheduler.record_task_result(
+            &mut run,
+            &task_id,
+            TaskResult::Succeeded(crate::task::TaskOutput {
+                materialization_id: arco_core::MaterializationId::generate(),
+                files: vec![],
+                row_count: 0,
+                byte_size: 0,
+            }),
+            &mut outbox,
+        )?;
 
-        let final_state = scheduler.maybe_complete_run(&mut run, &mut outbox).unwrap();
+        let final_state = scheduler.maybe_complete_run(&mut run, &mut outbox)?;
         assert_eq!(final_state, Some(RunState::Succeeded));
         assert_eq!(run.state, RunState::Succeeded);
+
+        Ok(())
     }
 
     #[test]
-    fn scheduler_cancel_run() {
+    fn scheduler_cancel_run() -> Result<()> {
         let task_a = TaskId::generate();
         let task_b = TaskId::generate();
 
@@ -885,18 +1199,29 @@ mod tests {
                 priority: 0,
                 resources: ResourceRequirements::default(),
             })
-            .build()
-            .unwrap();
+            .build()?;
 
         let scheduler = Scheduler::new(plan);
         let mut outbox = InMemoryOutbox::new();
         let mut run = scheduler.create_run(RunTrigger::manual("user"), &mut outbox);
 
-        scheduler.start_run(&mut run, &mut outbox).unwrap();
-        scheduler.cancel_run(&mut run, &mut outbox).unwrap();
+        scheduler.start_run(&mut run, &mut outbox)?;
+        scheduler.cancel_run(&mut run, &mut outbox)?;
 
         assert_eq!(run.state, RunState::Cancelled);
-        assert_eq!(run.get_task(&task_a).unwrap().state, TaskState::Cancelled);
-        assert_eq!(run.get_task(&task_b).unwrap().state, TaskState::Cancelled);
+        assert_eq!(
+            run.get_task(&task_a)
+                .ok_or(Error::TaskNotFound { task_id: task_a })?
+                .state,
+            TaskState::Cancelled
+        );
+        assert_eq!(
+            run.get_task(&task_b)
+                .ok_or(Error::TaskNotFound { task_id: task_b })?
+                .state,
+            TaskState::Cancelled
+        );
+
+        Ok(())
     }
 }

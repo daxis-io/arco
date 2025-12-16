@@ -20,6 +20,9 @@ use arco_core::{AssetId, TaskId};
 use crate::dag::Dag;
 use crate::error::{Error, Result};
 
+/// Production guardrail: hard cap on tasks per plan.
+const MAX_TASKS_PER_PLAN: usize = 10_000;
+
 /// Asset identifier (namespace + name).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -229,7 +232,22 @@ impl PlanBuilder {
     /// Returns an error if:
     /// - Dependencies reference non-existent tasks
     /// - The dependency graph contains cycles
+    #[tracing::instrument(
+        skip(self),
+        fields(
+            tenant_id = %self.tenant_id,
+            workspace_id = %self.workspace_id,
+            task_count = self.tasks.len()
+        )
+    )]
     pub fn build(mut self) -> Result<Plan> {
+        if self.tasks.len() > MAX_TASKS_PER_PLAN {
+            return Err(Error::PlanTooLarge {
+                task_count: self.tasks.len(),
+                max_tasks: MAX_TASKS_PER_PLAN,
+            });
+        }
+
         // Collect all task IDs
         let task_ids: HashSet<_> = self.tasks.iter().map(|t| t.task_id).collect();
 
@@ -340,10 +358,60 @@ impl PlanBuilder {
     }
 }
 
-/// Computes SHA-256 fingerprint of the plan spec.
+/// Structural representation of a task for fingerprinting.
+///
+/// This excludes nondeterministic IDs (`task_id`, `asset_id`) and uses
+/// `asset_key` for dependency references, ensuring the fingerprint is
+/// stable across plan regenerations with the same structure.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StructuralTaskSpec {
+    asset_key: AssetKey,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    partition_key: Option<BTreeMap<String, String>>,
+    upstream_asset_keys: Vec<String>,
+    stage: u32,
+    priority: i32,
+    resources: ResourceRequirements,
+}
+
+/// Computes SHA-256 fingerprint of the plan spec using structural properties only.
+///
+/// The fingerprint excludes nondeterministic IDs (`task_id`, `asset_id`) and uses
+/// `asset_key` for dependency references. This ensures the same logical plan
+/// produces the same fingerprint regardless of generated IDs.
 fn compute_fingerprint(tasks: &[TaskSpec]) -> Result<String> {
-    let json = serde_json::to_string(tasks).map_err(|e| Error::Serialization {
-        message: format!("failed to serialize tasks: {e}"),
+    // Build task_id -> asset_key mapping for dependency resolution
+    let id_to_key: HashMap<TaskId, String> = tasks
+        .iter()
+        .map(|t| (t.task_id, t.asset_key.qualified_name()))
+        .collect();
+
+    // Convert to structural representation
+    let structural: Vec<StructuralTaskSpec> = tasks
+        .iter()
+        .map(|t| {
+            let mut upstream_keys: Vec<String> = t
+                .upstream_task_ids
+                .iter()
+                .filter_map(|id| id_to_key.get(id).cloned())
+                .collect();
+            // Sort for determinism
+            upstream_keys.sort();
+
+            StructuralTaskSpec {
+                asset_key: t.asset_key.clone(),
+                partition_key: t.partition_key.clone(),
+                upstream_asset_keys: upstream_keys,
+                stage: t.stage,
+                priority: t.priority,
+                resources: t.resources.clone(),
+            }
+        })
+        .collect();
+
+    let json = serde_json::to_string(&structural).map_err(|e| Error::Serialization {
+        message: format!("failed to serialize structural tasks: {e}"),
     })?;
 
     let hash = Sha256::digest(json.as_bytes());
@@ -355,7 +423,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plan_builder_creates_valid_plan() {
+    fn plan_builder_creates_valid_plan() -> Result<()> {
         let plan = PlanBuilder::new("tenant", "workspace")
             .add_task(TaskSpec {
                 task_id: TaskId::generate(),
@@ -367,17 +435,18 @@ mod tests {
                 priority: 0,
                 resources: ResourceRequirements::default(),
             })
-            .build()
-            .unwrap();
+            .build()?;
 
         assert_eq!(plan.tenant_id, "tenant");
         assert_eq!(plan.workspace_id, "workspace");
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.tasks[0].stage, 0);
+
+        Ok(())
     }
 
     #[test]
-    fn plan_fingerprint_is_deterministic() {
+    fn plan_fingerprint_is_deterministic() -> Result<()> {
         let task_id = TaskId::generate();
         let asset_id = AssetId::generate();
 
@@ -394,15 +463,15 @@ mod tests {
 
         let plan1 = PlanBuilder::new("tenant", "workspace")
             .add_task(task.clone())
-            .build()
-            .unwrap();
+            .build()?;
 
         let plan2 = PlanBuilder::new("tenant", "workspace")
             .add_task(task)
-            .build()
-            .unwrap();
+            .build()?;
 
         assert_eq!(plan1.fingerprint, plan2.fingerprint);
+
+        Ok(())
     }
 
     #[test]
@@ -424,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_sorts_tasks_topologically() {
+    fn plan_sorts_tasks_topologically() -> Result<()> {
         let task_a = TaskId::generate();
         let task_b = TaskId::generate();
         let task_c = TaskId::generate();
@@ -461,21 +530,49 @@ mod tests {
                 priority: 0,
                 resources: ResourceRequirements::default(),
             })
-            .build()
-            .unwrap();
+            .build()?;
 
         // Verify topological order
-        let pos_a = plan.tasks.iter().position(|t| t.task_id == task_a).unwrap();
-        let pos_b = plan.tasks.iter().position(|t| t.task_id == task_b).unwrap();
-        let pos_c = plan.tasks.iter().position(|t| t.task_id == task_c).unwrap();
+        let pos_a = plan
+            .tasks
+            .iter()
+            .position(|t| t.task_id == task_a)
+            .ok_or(Error::TaskNotFound { task_id: task_a })?;
+        let pos_b = plan
+            .tasks
+            .iter()
+            .position(|t| t.task_id == task_b)
+            .ok_or(Error::TaskNotFound { task_id: task_b })?;
+        let pos_c = plan
+            .tasks
+            .iter()
+            .position(|t| t.task_id == task_c)
+            .ok_or(Error::TaskNotFound { task_id: task_c })?;
 
         assert!(pos_a < pos_b, "task_a should come before task_b");
         assert!(pos_b < pos_c, "task_b should come before task_c");
 
         // Verify stages were computed
-        assert_eq!(plan.task(task_a).unwrap().stage, 0);
-        assert_eq!(plan.task(task_b).unwrap().stage, 1);
-        assert_eq!(plan.task(task_c).unwrap().stage, 2);
+        assert_eq!(
+            plan.task(task_a)
+                .ok_or(Error::TaskNotFound { task_id: task_a })?
+                .stage,
+            0
+        );
+        assert_eq!(
+            plan.task(task_b)
+                .ok_or(Error::TaskNotFound { task_id: task_b })?
+                .stage,
+            1
+        );
+        assert_eq!(
+            plan.task(task_c)
+                .ok_or(Error::TaskNotFound { task_id: task_c })?
+                .stage,
+            2
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -510,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_builder_computes_stages() {
+    fn plan_builder_computes_stages() -> Result<()> {
         let task_a = TaskId::generate();
         let task_b = TaskId::generate();
         let task_c = TaskId::generate();
@@ -547,8 +644,7 @@ mod tests {
                 priority: 0,
                 resources: ResourceRequirements::default(),
             })
-            .build()
-            .unwrap();
+            .build()?;
 
         // Find tasks by ID and verify stages
         let stage_a = plan.task(task_a).map(|t| t.stage);
@@ -558,5 +654,120 @@ mod tests {
         assert_eq!(stage_a, Some(0)); // Root
         assert_eq!(stage_b, Some(1)); // Depends on stage 0
         assert_eq!(stage_c, Some(2)); // Depends on stage 1
+
+        Ok(())
+    }
+
+    #[test]
+    fn plan_builder_enforces_task_cap() {
+        let mut builder = PlanBuilder::new("tenant", "workspace");
+
+        for _ in 0..(MAX_TASKS_PER_PLAN + 1) {
+            builder = builder.add_task(TaskSpec {
+                task_id: TaskId::generate(),
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("raw", "events"),
+                partition_key: None,
+                upstream_task_ids: vec![],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            });
+        }
+
+        let result = builder.build();
+        assert!(matches!(
+            result,
+            Err(Error::PlanTooLarge {
+                task_count,
+                max_tasks
+            }) if task_count == MAX_TASKS_PER_PLAN + 1 && max_tasks == MAX_TASKS_PER_PLAN
+        ));
+    }
+
+    #[test]
+    fn plan_fingerprint_is_structural() -> Result<()> {
+        // Plan 1: DAG with a -> b -> c
+        let task_a1 = TaskId::generate();
+        let task_b1 = TaskId::generate();
+        let task_c1 = TaskId::generate();
+
+        let plan1 = PlanBuilder::new("tenant", "workspace")
+            .add_task(TaskSpec {
+                task_id: task_a1,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("raw", "events"),
+                partition_key: None,
+                upstream_task_ids: vec![],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            })
+            .add_task(TaskSpec {
+                task_id: task_b1,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("staging", "cleaned"),
+                partition_key: None,
+                upstream_task_ids: vec![task_a1],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            })
+            .add_task(TaskSpec {
+                task_id: task_c1,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("mart", "report"),
+                partition_key: None,
+                upstream_task_ids: vec![task_b1],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            })
+            .build()?;
+
+        // Plan 2: Same structure, completely different IDs
+        let task_a2 = TaskId::generate();
+        let task_b2 = TaskId::generate();
+        let task_c2 = TaskId::generate();
+
+        let plan2 = PlanBuilder::new("tenant", "workspace")
+            .add_task(TaskSpec {
+                task_id: task_a2,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("raw", "events"),
+                partition_key: None,
+                upstream_task_ids: vec![],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            })
+            .add_task(TaskSpec {
+                task_id: task_b2,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("staging", "cleaned"),
+                partition_key: None,
+                upstream_task_ids: vec![task_a2],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            })
+            .add_task(TaskSpec {
+                task_id: task_c2,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("mart", "report"),
+                partition_key: None,
+                upstream_task_ids: vec![task_b2],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            })
+            .build()?;
+
+        // Same structure = same fingerprint, even with different IDs
+        assert_eq!(plan1.fingerprint, plan2.fingerprint);
+        // But different plan IDs (generated)
+        assert_ne!(plan1.plan_id, plan2.plan_id);
+
+        Ok(())
     }
 }

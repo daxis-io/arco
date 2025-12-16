@@ -127,7 +127,7 @@ impl TaskState {
             Self::Pending => matches!(target, Self::Ready | Self::Skipped | Self::Cancelled),
             Self::Ready => matches!(target, Self::Queued | Self::Cancelled),
             Self::Queued => matches!(target, Self::Dispatched | Self::Cancelled),
-            Self::Dispatched => matches!(target, Self::Running | Self::Cancelled),
+            Self::Dispatched => matches!(target, Self::Running | Self::Failed | Self::Cancelled),
             Self::Running => {
                 matches!(target, Self::Succeeded | Self::Failed | Self::Cancelled)
             }
@@ -145,7 +145,7 @@ impl TaskState {
             Self::Pending => vec![Self::Ready, Self::Skipped, Self::Cancelled],
             Self::Ready => vec![Self::Queued, Self::Cancelled],
             Self::Queued => vec![Self::Dispatched, Self::Cancelled],
-            Self::Dispatched => vec![Self::Running, Self::Cancelled],
+            Self::Dispatched => vec![Self::Running, Self::Failed, Self::Cancelled],
             Self::Running => vec![Self::Succeeded, Self::Failed, Self::Cancelled],
             Self::Failed => vec![Self::RetryWait, Self::Cancelled],
             Self::RetryWait => vec![Self::Ready, Self::Cancelled],
@@ -324,6 +324,11 @@ pub struct TaskExecution {
     /// When execution completed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    /// When a retry is eligible to run again.
+    ///
+    /// Set when transitioning into `RetryWait`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_at: Option<DateTime<Utc>>,
     /// Last heartbeat from worker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_heartbeat: Option<DateTime<Utc>>,
@@ -361,6 +366,7 @@ impl TaskExecution {
             dispatched_at: None,
             started_at: None,
             completed_at: None,
+            retry_at: None,
             last_heartbeat: None,
             heartbeat_timeout: default_heartbeat_timeout(),
             worker_id: None,
@@ -398,7 +404,12 @@ impl TaskExecution {
 
     /// Records a heartbeat from the worker.
     pub fn record_heartbeat(&mut self) {
-        self.last_heartbeat = Some(Utc::now());
+        self.record_heartbeat_at(Utc::now());
+    }
+
+    /// Records a heartbeat from the worker at a given time.
+    pub fn record_heartbeat_at(&mut self, now: DateTime<Utc>) {
+        self.last_heartbeat = Some(now);
     }
 
     /// Returns true if the heartbeat is stale (exceeded timeout).
@@ -409,16 +420,32 @@ impl TaskExecution {
     /// - OR the last heartbeat exceeds the timeout
     #[must_use]
     pub fn is_heartbeat_stale(&self) -> bool {
+        self.is_heartbeat_stale_at(Utc::now())
+    }
+
+    /// Returns true if the heartbeat is stale (exceeded timeout) at a given time.
+    #[must_use]
+    pub fn is_heartbeat_stale_at(&self, now: DateTime<Utc>) -> bool {
         if !matches!(self.state, TaskState::Running | TaskState::Dispatched) {
             return false;
         }
 
         self.last_heartbeat.is_none_or(|last| {
-            let elapsed = Utc::now().signed_duration_since(last);
+            let elapsed = now.signed_duration_since(last);
             elapsed
                 > chrono::Duration::from_std(self.heartbeat_timeout)
                     .unwrap_or(chrono::Duration::MAX)
         })
+    }
+
+    /// Returns true if a retry wait has expired at a given time.
+    #[must_use]
+    pub fn is_retry_due_at(&self, now: DateTime<Utc>) -> bool {
+        if self.state != TaskState::RetryWait {
+            return false;
+        }
+
+        self.retry_at.is_none_or(|retry_at| now >= retry_at)
     }
 
     /// Transitions to a new state.
@@ -426,6 +453,10 @@ impl TaskExecution {
     /// # Errors
     ///
     /// Returns an error if the transition is invalid.
+    #[tracing::instrument(
+        skip(self),
+        fields(task_id = %self.task_id, from = %self.state, to = %target, attempt = self.attempt)
+    )]
     pub fn transition_to(&mut self, target: TaskState) -> Result<()> {
         if !self.state.can_transition_to(target) {
             return Err(Error::InvalidStateTransition {
@@ -458,6 +489,16 @@ impl TaskExecution {
                 // On retry, increment attempt counter
                 if self.state == TaskState::RetryWait {
                     self.attempt += 1;
+                    self.queued_at = None;
+                    self.dispatched_at = None;
+                    self.started_at = None;
+                    self.completed_at = None;
+                    self.last_heartbeat = None;
+                    self.worker_id = None;
+                    self.output = None;
+                    self.error = None;
+                    self.metrics = TaskMetrics::default();
+                    self.retry_at = None;
                 }
             }
             TaskState::Succeeded
@@ -482,6 +523,7 @@ impl TaskExecution {
     ///
     /// Returns an error if the transition is invalid.
     pub fn succeed(&mut self, output: TaskOutput) -> Result<()> {
+        self.error = None;
         self.output = Some(output);
         self.transition_to(TaskState::Succeeded)
     }
@@ -493,6 +535,7 @@ impl TaskExecution {
     /// Returns an error if the transition is invalid.
     pub fn fail(&mut self, error: TaskError) -> Result<()> {
         self.error = Some(error);
+        self.output = None;
         self.transition_to(TaskState::Failed)
     }
 
@@ -544,6 +587,7 @@ mod tests {
 
         let state = TaskState::Dispatched;
         assert!(state.can_transition_to(TaskState::Running));
+        assert!(state.can_transition_to(TaskState::Failed));
         assert!(state.can_transition_to(TaskState::Cancelled));
         assert!(!state.can_transition_to(TaskState::Succeeded));
     }
@@ -558,26 +602,28 @@ mod tests {
     }
 
     #[test]
-    fn task_execution_state_machine() {
+    fn task_execution_state_machine() -> Result<()> {
         let task_id = TaskId::generate();
         let mut exec = TaskExecution::new(task_id);
 
         assert_eq!(exec.state, TaskState::Planned);
 
-        exec.transition_to(TaskState::Pending).unwrap();
-        exec.transition_to(TaskState::Ready).unwrap();
-        exec.transition_to(TaskState::Queued).unwrap();
+        exec.transition_to(TaskState::Pending)?;
+        exec.transition_to(TaskState::Ready)?;
+        exec.transition_to(TaskState::Queued)?;
         assert!(exec.queued_at.is_some());
 
-        exec.transition_to(TaskState::Dispatched).unwrap();
+        exec.transition_to(TaskState::Dispatched)?;
         assert!(exec.dispatched_at.is_some());
 
-        exec.transition_to(TaskState::Running).unwrap();
+        exec.transition_to(TaskState::Running)?;
         assert!(exec.started_at.is_some());
 
-        exec.transition_to(TaskState::Succeeded).unwrap();
+        exec.transition_to(TaskState::Succeeded)?;
         assert_eq!(exec.state, TaskState::Succeeded);
         assert!(exec.completed_at.is_some());
+
+        Ok(())
     }
 
     #[test]
@@ -591,16 +637,16 @@ mod tests {
     }
 
     #[test]
-    fn task_execution_heartbeat() {
+    fn task_execution_heartbeat() -> Result<()> {
         let task_id = TaskId::generate();
         let mut exec = TaskExecution::new(task_id).with_heartbeat_timeout(Duration::from_secs(30));
 
         // Progress to running state
-        exec.transition_to(TaskState::Pending).unwrap();
-        exec.transition_to(TaskState::Ready).unwrap();
-        exec.transition_to(TaskState::Queued).unwrap();
-        exec.transition_to(TaskState::Dispatched).unwrap();
-        exec.transition_to(TaskState::Running).unwrap();
+        exec.transition_to(TaskState::Pending)?;
+        exec.transition_to(TaskState::Ready)?;
+        exec.transition_to(TaskState::Queued)?;
+        exec.transition_to(TaskState::Dispatched)?;
+        exec.transition_to(TaskState::Running)?;
 
         // Initial heartbeat is set when transitioning to Running
         assert!(exec.last_heartbeat.is_some());
@@ -609,5 +655,7 @@ mod tests {
         // Record new heartbeat
         exec.record_heartbeat();
         assert!(!exec.is_heartbeat_stale());
+
+        Ok(())
     }
 }

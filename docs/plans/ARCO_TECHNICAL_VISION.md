@@ -1197,7 +1197,7 @@ These architectural decisions are locked and should not be revisited without str
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| **ID Strategy** | Stable UUIDs | Names can change; IDs should not |
+| **ID Strategy** | Stable ULIDs | Names can change; IDs should not |
 | **Manifest Granularity** | 4 domain manifests | Reduces write contention |
 | **Security Posture (MVP)** | Posture A (broad metadata) | Pragmatic start |
 | **Security Architecture** | Designed for Posture B | Future-proof for existence privacy |

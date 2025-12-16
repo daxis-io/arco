@@ -1,0 +1,25 @@
+[package]
+name = "arco-test-utils"
+version = "0.1.0"
+edition = "2024"
+description = "Shared test utilities for Arco integration tests"
+publish = false
+
+[dependencies]
+arco-core = { path = "../arco-core" }
+arco-catalog = { path = "../arco-catalog" }
+arco-flow = { path = "../arco-flow" }
+
+tokio = { workspace = true, features = ["full", "test-util"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

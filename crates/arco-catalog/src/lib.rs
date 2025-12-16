@@ -68,6 +68,8 @@
 #![warn(clippy::pedantic)]
 
 pub mod asset;
+pub mod error;
+pub mod event_writer;
 pub mod lock;
 pub mod manifest;
 pub mod reader;
@@ -75,6 +77,8 @@ pub mod tier1_writer;
 pub mod writer;
 
 // Re-export main types at crate root
+pub use error::{CatalogError, Result};
+pub use event_writer::EventWriter;
 pub use asset::{Asset, AssetFormat, AssetKey, AssetKeyError, CreateAssetRequest};
 pub use lock::{DistributedLock, LockGuard, LockInfo};
 pub use manifest::{

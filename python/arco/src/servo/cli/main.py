@@ -1,19 +1,212 @@
-"""Servo CLI entrypoint."""
+"""Main CLI entry point using Typer.
+
+This module defines the top-level CLI commands:
+- servo deploy: Deploy assets to Servo
+- servo run: Trigger asset runs
+- servo status: Check run status
+- servo validate: Validate asset definitions
+- servo init: Initialize a new project
+"""
 from __future__ import annotations
 
+from pathlib import Path  # noqa: TC003 - Typer requires runtime access
+from typing import Annotated
+
 import typer
+from rich.console import Console
 
 from servo import __version__
 
-app = typer.Typer(help="Arco Servo CLI", no_args_is_help=True)
+app = typer.Typer(
+    name="servo",
+    help="Servo - Data orchestration CLI",
+    no_args_is_help=True,
+)
+console = Console()
+err_console = Console(stderr=True)
+
+
+def version_callback(value: bool) -> None:
+    """Print version and exit."""
+    if value:
+        console.print(f"servo {__version__}")
+        raise typer.Exit()
 
 
 @app.callback()
-def main() -> None:
-    """Arco Servo CLI."""
+def main(
+    version: Annotated[  # noqa: ARG001
+        bool | None,
+        typer.Option(
+            "--version", "-V",
+            callback=version_callback,
+            is_eager=True,
+            help="Show version and exit.",
+        ),
+    ] = None,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="Enable verbose output."),
+    ] = False,
+) -> None:
+    """Servo - Data orchestration CLI.
+
+    Use 'servo COMMAND --help' for information on specific commands.
+    """
+    if verbose:
+        import structlog  # noqa: PLC0415
+
+        structlog.configure(
+            wrapper_class=structlog.make_filtering_bound_logger(10),  # DEBUG
+        )
 
 
 @app.command()
-def version() -> None:
-    """Print the installed SDK version."""
-    typer.echo(__version__)
+def deploy(
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Generate manifest without deploying."),
+    ] = False,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Write manifest to file."),
+    ] = None,
+    workspace: Annotated[
+        str | None,
+        typer.Option("--workspace", "-w", help="Override workspace ID."),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Output raw JSON."),
+    ] = False,
+) -> None:
+    """Deploy assets to Servo.
+
+    Scans the current project for @asset-decorated functions and deploys
+    them to the specified workspace.
+
+    Examples:
+        servo deploy --dry-run
+
+        servo deploy --output manifest.json
+
+        servo deploy --workspace production
+    """
+    from servo.cli.commands.deploy import run_deploy  # noqa: PLC0415
+
+    run_deploy(
+        dry_run=dry_run,
+        output=output,
+        workspace=workspace,
+        json_output=json_output,
+    )
+
+
+@app.command()
+def run(
+    asset: Annotated[str, typer.Argument(help="Asset key to run (namespace.name).")],
+    partition: Annotated[
+        list[str] | None,
+        typer.Option("--partition", "-p", help="Partition value (key=value)."),
+    ] = None,
+    wait: Annotated[
+        bool,
+        typer.Option("--wait/--no-wait", help="Wait for completion."),
+    ] = False,
+    timeout: Annotated[
+        int,
+        typer.Option("--timeout", "-t", help="Timeout in seconds (with --wait)."),
+    ] = 3600,
+) -> None:
+    """Trigger an asset run.
+
+    Examples:
+        servo run raw.events
+
+        servo run staging.users --partition date=2025-01-15
+
+        servo run mart.metrics --wait
+    """
+    from servo.cli.commands.run import run_asset  # noqa: PLC0415
+
+    run_asset(
+        asset=asset,
+        partitions=partition or [],
+        wait=wait,
+        timeout=timeout,
+    )
+
+
+@app.command()
+def status(
+    run_id: Annotated[
+        str | None,
+        typer.Argument(help="Run ID to check."),
+    ] = None,
+    watch: Annotated[
+        bool,
+        typer.Option("--watch", help="Watch status in real-time."),
+    ] = False,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-n", help="Number of recent runs to show."),
+    ] = 10,
+) -> None:
+    """Check run status.
+
+    Without arguments, shows recent runs.
+
+    Examples:
+        servo status
+
+        servo status 01HX9ABC... --watch
+
+        servo status --limit 20
+    """
+    from servo.cli.commands.status import show_status  # noqa: PLC0415
+
+    show_status(run_id=run_id, watch=watch, limit=limit)
+
+
+@app.command()
+def validate() -> None:
+    """Validate asset definitions.
+
+    Discovers assets and validates:
+    - No duplicate asset keys
+    - All dependencies exist
+    - Partition configurations are valid
+    - Check definitions are valid
+
+    Examples:
+        servo validate
+    """
+    from servo.cli.commands.validate import run_validate  # noqa: PLC0415
+
+    run_validate()
+
+
+@app.command()
+def init(
+    name: Annotated[str, typer.Argument(help="Project name.")],
+    template: Annotated[
+        str,
+        typer.Option("--template", "-t", help="Template to use."),
+    ] = "basic",
+) -> None:
+    """Initialize a new Servo project.
+
+    Creates project structure with example assets.
+
+    Examples:
+        servo init my-project
+
+        servo init my-project --template advanced
+    """
+    from servo.cli.commands.init import run_init  # noqa: PLC0415
+
+    run_init(name=name, template=template)
+
+
+if __name__ == "__main__":
+    app()

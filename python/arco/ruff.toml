@@ -25,7 +25,6 @@ select = [
 
 ignore = [
     "D100", "D104", "D105", "D107",  # Missing docstrings (handled at package level)
-    "ANN101", "ANN102",              # Missing self/cls annotations
     "PLR0913",                       # Too many arguments (decorators need many)
     "S101",                          # Assert allowed in tests
 ]

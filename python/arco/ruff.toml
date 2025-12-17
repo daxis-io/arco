@@ -30,7 +30,7 @@ ignore = [
 ]
 
 [lint.per-file-ignores]
-"tests/**/*.py" = ["D", "ANN", "S101", "PLR2004"]
+"tests/**/*.py" = ["D", "ANN", "S101", "PLR2004", "PLC0415"]
 "src/servo/cli/*.py" = ["PLR0913"]
 
 [lint.pydocstyle]

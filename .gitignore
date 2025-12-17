@@ -48,3 +48,4 @@ coverage/
 *.tfstate
 *.tfstate.backup
 *.tfplan
+docs/plans/

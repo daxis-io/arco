@@ -63,7 +63,7 @@ pub struct LedgerWriter {
 }
 
 impl LedgerWriter {
-    /// Creates a new ledger writer for the given domain (e.g. "execution").
+    /// Creates a new ledger writer for the given domain (e.g. "executions").
     #[must_use]
     pub fn new(storage: ScopedStorage, domain: impl Into<String>) -> Self {
         Self {
@@ -160,7 +160,7 @@ mod tests {
     async fn ledger_writer_writes_events_under_domain_date_prefix() -> Result<()> {
         let backend = Arc::new(MemoryBackend::new());
         let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
-        let writer = LedgerWriter::new(storage.clone(), "execution");
+        let writer = LedgerWriter::new(storage.clone(), "executions");
 
         let run_id = RunId::generate();
         let mut event =
@@ -174,7 +174,7 @@ mod tests {
         let event_time = chrono::DateTime::from_timestamp_millis(ms_i64).unwrap_or_else(Utc::now);
         let date = event_time.format("%Y-%m-%d").to_string();
 
-        let path = format!("ledger/flow/execution/{date}/01ARZ3NDEKTSV4RRFFQ69G5FAV.json");
+        let path = format!("ledger/flow/executions/{date}/01ARZ3NDEKTSV4RRFFQ69G5FAV.json");
         let data = storage.get_raw(&path).await?;
         let parsed: EventEnvelope =
             serde_json::from_slice(&data).map_err(|e| Error::Serialization {

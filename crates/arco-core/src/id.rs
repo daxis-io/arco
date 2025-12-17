@@ -1,9 +1,8 @@
 //! Strongly-typed identifiers for Arco entities.
 //!
-//! All identifiers in Arco are:
-//! - **Strongly typed**: Prevents mixing up different ID types at compile time
-//! - **Lexicographically sortable**: ULIDs encode creation time and sort naturally
-//! - **Globally unique**: No coordination required for generation
+//! Arco uses different identifier formats based on the entity requirements:
+//! - **Stable entity IDs** (e.g., assets): UUID v7 (stable identity, time-sortable)
+//! - **Ordered log IDs** (e.g., runs, tasks): ULID (lexicographically sortable)
 //!
 //! # Example
 //!
@@ -21,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 use ulid::Ulid;
+use uuid::Uuid;
 
 use crate::error::{Error, Result};
 
@@ -30,38 +30,42 @@ use crate::error::{Error, Result};
 /// representing tables, views, or other data artifacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct AssetId(Ulid);
+pub struct AssetId(Uuid);
 
 impl AssetId {
     /// Generates a new unique asset ID.
     ///
-    /// Uses ULID generation which is:
-    /// - Lexicographically sortable by creation time
+    /// Uses UUID v7 generation which is:
+    /// - Stable across renames
+    /// - Time-sortable (creation-time ordered)
     /// - Globally unique without coordination
-    /// - URL-safe and case-insensitive
     #[must_use]
     pub fn generate() -> Self {
-        Self(Ulid::new())
+        Self(Uuid::now_v7())
     }
 
-    /// Creates an asset ID from a raw ULID.
+    /// Creates an asset ID from a raw UUID.
     #[must_use]
-    pub const fn from_ulid(ulid: Ulid) -> Self {
-        Self(ulid)
+    pub const fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
     }
 
-    /// Returns the underlying ULID.
+    /// Returns the underlying UUID.
     #[must_use]
-    pub const fn as_ulid(&self) -> Ulid {
+    pub const fn as_uuid(&self) -> Uuid {
         self.0
     }
 
     /// Returns the creation timestamp encoded in the ID.
     #[must_use]
     pub fn created_at(&self) -> chrono::DateTime<chrono::Utc> {
-        let ms = self.0.timestamp_ms();
-        let ms_i64 = i64::try_from(ms).unwrap_or(i64::MAX);
-        chrono::DateTime::from_timestamp_millis(ms_i64).unwrap_or_else(chrono::Utc::now)
+        let Some(ts) = self.0.get_timestamp() else {
+            return chrono::Utc::now();
+        };
+
+        let (seconds, nanos) = ts.to_unix();
+        let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
+        chrono::DateTime::from_timestamp(seconds, nanos).unwrap_or_else(chrono::Utc::now)
     }
 }
 
@@ -75,11 +79,9 @@ impl FromStr for AssetId {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        Ulid::from_string(s)
-            .map(Self)
-            .map_err(|e| Error::InvalidId {
-                message: format!("invalid asset ID '{s}': {e}"),
-            })
+        Uuid::parse_str(s).map(Self).map_err(|e| Error::InvalidId {
+            message: format!("invalid asset ID '{s}': {e}"),
+        })
     }
 }
 
@@ -245,6 +247,60 @@ impl FromStr for MaterializationId {
     }
 }
 
+/// A unique identifier for a Tier 2 ledger event.
+///
+/// Event IDs are ULIDs to preserve chronological ordering when comparing as strings
+/// (critical for lexicographic watermarking and file naming).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EventId(Ulid);
+
+impl EventId {
+    /// Generates a new unique event ID.
+    #[must_use]
+    pub fn generate() -> Self {
+        Self(Ulid::new())
+    }
+
+    /// Creates an event ID from a raw ULID.
+    #[must_use]
+    pub const fn from_ulid(ulid: Ulid) -> Self {
+        Self(ulid)
+    }
+
+    /// Returns the underlying ULID.
+    #[must_use]
+    pub const fn as_ulid(&self) -> Ulid {
+        self.0
+    }
+
+    /// Returns the creation timestamp encoded in the ID.
+    #[must_use]
+    pub fn created_at(&self) -> chrono::DateTime<chrono::Utc> {
+        let ms = self.0.timestamp_ms();
+        let ms_i64 = i64::try_from(ms).unwrap_or(i64::MAX);
+        chrono::DateTime::from_timestamp_millis(ms_i64).unwrap_or_else(chrono::Utc::now)
+    }
+}
+
+impl fmt::Display for EventId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for EventId {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Ulid::from_string(s)
+            .map(Self)
+            .map_err(|e| Error::InvalidId {
+                message: format!("invalid event ID '{s}': {e}"),
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,7 +332,7 @@ mod tests {
 
     #[test]
     fn invalid_id_returns_error() {
-        let result: Result<AssetId> = "not-a-valid-ulid".parse();
+        let result: Result<AssetId> = "not-a-valid-uuid".parse();
         assert!(result.is_err());
     }
 
@@ -310,5 +366,14 @@ mod tests {
         let id1 = MaterializationId::generate();
         let id2 = MaterializationId::generate();
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn event_id_roundtrip() -> Result<()> {
+        let id = EventId::generate();
+        let s = id.to_string();
+        let parsed: EventId = s.parse()?;
+        assert_eq!(id, parsed);
+        Ok(())
     }
 }

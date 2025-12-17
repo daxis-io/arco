@@ -21,10 +21,12 @@ use std::time::Duration;
 use tokio::sync::Barrier;
 
 use arco_catalog::{Compactor, EventWriter, MaterializationRecord, Tier1Writer};
-use arco_core::Result as CoreResult;
 use arco_core::scoped_storage::ScopedStorage;
 use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+};
+use arco_core::{
+    CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths, EventId, Result as CoreResult,
 };
 use arco_test_utils::{StorageOp, TracingMemoryBackend};
 
@@ -34,6 +36,11 @@ struct MaterializationCompleted {
     asset_id: String,
     row_count: i64,
     byte_size: i64,
+}
+
+impl CatalogEventPayload for MaterializationCompleted {
+    const EVENT_TYPE: &'static str = "materialization.completed";
+    const EVENT_VERSION: u32 = 1;
 }
 
 fn records_from_batches(batches: &[RecordBatch]) -> Vec<MaterializationRecord> {
@@ -147,7 +154,7 @@ impl BarrierBackend {
     }
 
     fn is_execution_manifest_path(path: &str) -> bool {
-        path.ends_with("/manifests/execution.manifest.json")
+        path.ends_with("/manifests/executions.manifest.json")
     }
 }
 
@@ -211,20 +218,23 @@ async fn tier2_append_compact_read_loop() {
     };
 
     let event_id = event_writer
-        .append("execution", &event)
+        .append(CatalogDomain::Executions, &event)
         .await
         .expect("append");
 
-    assert!(!event_id.is_empty());
+    assert!(!event_id.to_string().is_empty());
 
     // 3. Verify event in ledger
-    let ledger_files = storage.list("ledger/execution/").await.expect("list");
+    let ledger_files = storage
+        .list(&CatalogPaths::ledger_dir(CatalogDomain::Executions))
+        .await
+        .expect("list");
     assert!(!ledger_files.is_empty());
 
     // 4. Compact
     let compactor = Compactor::new(storage.clone());
     let result = compactor
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact");
 
@@ -233,11 +243,11 @@ async fn tier2_append_compact_read_loop() {
 
     // 5. Verify watermark updated
     let manifest = writer.read_manifest().await.expect("read");
-    assert!(manifest.execution.watermark_version > 0);
+    assert!(manifest.executions.watermark_version > 0);
 
     // 6. Read snapshot via manifest pointer (Invariant 4 compliance)
     let snapshot_path = manifest
-        .execution
+        .executions
         .snapshot_path
         .as_ref()
         .expect("snapshot_path");
@@ -282,54 +292,54 @@ async fn tier2_out_of_order_processing() {
 
     let event_writer = EventWriter::new(storage.clone());
 
-    let id_low = "01ARZ3NDEKTSV4RRFFQ69G5FAA";
-    let id_mid = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
-    let id_high = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
+    let id_low: EventId = "01ARZ3NDEKTSV4RRFFQ69G5FAA".parse().expect("event id");
+    let id_mid: EventId = "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().expect("event id");
+    let id_high: EventId = "01ARZ3NDEKTSV4RRFFQ69G5FAZ".parse().expect("event id");
 
     // Write newest first, then oldest, then middle (out-of-order arrival).
     event_writer
         .append_with_id(
-            "execution",
+            CatalogDomain::Executions,
             &MaterializationRecord {
                 materialization_id: "mat_001".into(),
                 asset_id: "asset_abc".into(),
                 row_count: 300,
                 byte_size: 3000,
             },
-            id_high,
+            &id_high,
         )
         .await
         .expect("append high");
     event_writer
         .append_with_id(
-            "execution",
+            CatalogDomain::Executions,
             &MaterializationRecord {
                 materialization_id: "mat_001".into(),
                 asset_id: "asset_abc".into(),
                 row_count: 100,
                 byte_size: 1000,
             },
-            id_low,
+            &id_low,
         )
         .await
         .expect("append low");
     event_writer
         .append_with_id(
-            "execution",
+            CatalogDomain::Executions,
             &MaterializationRecord {
                 materialization_id: "mat_001".into(),
                 asset_id: "asset_abc".into(),
                 row_count: 200,
                 byte_size: 2000,
             },
-            id_mid,
+            &id_mid,
         )
         .await
         .expect("append mid");
 
     let compactor = Compactor::new(storage.clone());
     let result = compactor
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact");
     assert_eq!(result.events_processed, 3);
@@ -337,12 +347,12 @@ async fn tier2_out_of_order_processing() {
     let manifest = tier1.read_manifest().await.expect("read");
     let expected_watermark = format!("{id_high}.json");
     assert_eq!(
-        manifest.execution.watermark_event_id.as_deref(),
+        manifest.executions.watermark_event_id.as_deref(),
         Some(expected_watermark.as_str()),
         "watermark should track max filename, not arrival order"
     );
 
-    let snapshot_path = manifest.execution.snapshot_path.expect("snapshot_path");
+    let snapshot_path = manifest.executions.snapshot_path.expect("snapshot_path");
     let records = read_snapshot_records(&storage, &snapshot_path).await;
     assert_eq!(records.len(), 1, "upsert semantics: one key");
     assert_eq!(
@@ -367,19 +377,22 @@ async fn tier2_idempotent_events() {
         byte_size: 50000,
     };
 
-    let event_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let event_id: EventId = "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().expect("event id");
 
     // Write same event 10 times (DoesNotExist prevents overwrites)
     // Per exit criteria: "Idempotency verified (10x)"
     for _ in 0..10 {
         event_writer
-            .append_with_id("execution", &event, event_id)
+            .append_with_id(CatalogDomain::Executions, &event, &event_id)
             .await
             .expect("append");
     }
 
     // Should only have one file (DoesNotExist precondition)
-    let files = storage.list("ledger/execution/").await.expect("list");
+    let files = storage
+        .list(&CatalogPaths::ledger_dir(CatalogDomain::Executions))
+        .await
+        .expect("list");
     assert_eq!(
         files.len(),
         1,
@@ -389,14 +402,14 @@ async fn tier2_idempotent_events() {
     // Compact should process only one event
     let compactor = Compactor::new(storage.clone());
     let result = compactor
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact");
     assert_eq!(result.events_processed, 1);
 
     // Read Parquet and verify only 1 row (no duplicates in output)
     let manifest = writer.read_manifest().await.expect("read");
-    let snapshot_path = manifest.execution.snapshot_path.expect("snapshot_path");
+    let snapshot_path = manifest.executions.snapshot_path.expect("snapshot_path");
     let parquet_data = storage.get_raw(&snapshot_path).await.expect("read");
     let reader = ParquetRecordBatchReaderBuilder::try_new(parquet_data)
         .expect("valid parquet")
@@ -430,18 +443,18 @@ async fn tier2_incremental_compaction() {
             byte_size: 50000,
         };
         event_writer
-            .append("execution", &event)
+            .append(CatalogDomain::Executions, &event)
             .await
             .expect("append");
     }
 
     let r1 = compactor
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact1");
     assert_eq!(r1.events_processed, 3);
     let manifest1 = writer.read_manifest().await.expect("read");
-    let snapshot_path1 = manifest1.execution.snapshot_path.expect("snapshot_path");
+    let snapshot_path1 = manifest1.executions.snapshot_path.expect("snapshot_path");
     let records1 = read_snapshot_records(&storage, &snapshot_path1).await;
     assert_eq!(records1.len(), 3, "snapshot should contain full state");
 
@@ -454,22 +467,22 @@ async fn tier2_incremental_compaction() {
             byte_size: 50000,
         };
         event_writer
-            .append("execution", &event)
+            .append(CatalogDomain::Executions, &event)
             .await
             .expect("append");
     }
 
     let r2 = compactor
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact2");
     assert_eq!(r2.events_processed, 2, "only new events");
 
     // Verify watermark incremented
     let manifest2 = writer.read_manifest().await.expect("read");
-    assert!(manifest2.execution.watermark_version >= 2);
+    assert!(manifest2.executions.watermark_version >= 2);
 
-    let snapshot_path2 = manifest2.execution.snapshot_path.expect("snapshot_path");
+    let snapshot_path2 = manifest2.executions.snapshot_path.expect("snapshot_path");
     let records2 = read_snapshot_records(&storage, &snapshot_path2).await;
     assert_eq!(
         records2.len(),
@@ -487,45 +500,49 @@ async fn tier2_crash_recovery() {
     tier1.initialize().await.expect("init");
 
     let event_writer = EventWriter::new(storage.clone());
-    let id1 = "01ARZ3NDEKTSV4RRFFQ69G5FAA";
-    let id2 = "01ARZ3NDEKTSV4RRFFQ69G5FAZ";
+    let id1: EventId = "01ARZ3NDEKTSV4RRFFQ69G5FAA".parse().expect("event id");
+    let id2: EventId = "01ARZ3NDEKTSV4RRFFQ69G5FAZ".parse().expect("event id");
 
     event_writer
         .append_with_id(
-            "execution",
+            CatalogDomain::Executions,
             &MaterializationRecord {
                 materialization_id: "mat_001".into(),
                 asset_id: "asset_abc".into(),
                 row_count: 100,
                 byte_size: 5000,
             },
-            id1,
+            &id1,
         )
         .await
         .expect("append1");
     event_writer
         .append_with_id(
-            "execution",
+            CatalogDomain::Executions,
             &MaterializationRecord {
                 materialization_id: "mat_002".into(),
                 asset_id: "asset_xyz".into(),
                 row_count: 200,
                 byte_size: 9000,
             },
-            id2,
+            &id2,
         )
         .await
         .expect("append2");
 
     let manifest_before = tier1.read_manifest().await.expect("read");
     assert!(
-        manifest_before.execution.snapshot_path.is_none(),
+        manifest_before.executions.snapshot_path.is_none(),
         "precondition: no published snapshot yet"
     );
 
     // Simulate a crash after snapshot write but before manifest CAS: snapshot exists, manifest not updated.
-    let snapshot_version = manifest_before.execution.snapshot_version + 1;
-    let snapshot_path = format!("state/execution/snapshot_v{snapshot_version}_{id2}.parquet");
+    let snapshot_version = manifest_before.executions.snapshot_version + 1;
+    let snapshot_path = CatalogPaths::state_snapshot(
+        CatalogDomain::Executions,
+        snapshot_version,
+        &id2.to_string(),
+    );
     let bytes = parquet_bytes(&[
         MaterializationRecord {
             materialization_id: "mat_001".into(),
@@ -551,7 +568,7 @@ async fn tier2_crash_recovery() {
 
     let compactor = Compactor::new(storage.clone());
     let result = compactor
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("recover compaction");
     assert_eq!(
@@ -561,7 +578,7 @@ async fn tier2_crash_recovery() {
 
     let manifest_after = tier1.read_manifest().await.expect("read");
     assert_eq!(
-        manifest_after.execution.snapshot_path.as_deref(),
+        manifest_after.executions.snapshot_path.as_deref(),
         Some(snapshot_path.as_str())
     );
 
@@ -578,16 +595,17 @@ async fn tier2_concurrent_compactor_race() {
     tier1.initialize().await.expect("init");
 
     let event_writer = EventWriter::new(storage.clone());
+    let event_id: EventId = "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().expect("event id");
     event_writer
         .append_with_id(
-            "execution",
+            CatalogDomain::Executions,
             &MaterializationRecord {
                 materialization_id: "mat_001".into(),
                 asset_id: "asset_abc".into(),
                 row_count: 100,
                 byte_size: 5000,
             },
-            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            &event_id,
         )
         .await
         .expect("append");
@@ -596,19 +614,34 @@ async fn tier2_concurrent_compactor_race() {
     let compactor2 = Compactor::new(storage.clone());
 
     let (r1, r2) = tokio::join!(
-        compactor1.compact_domain("execution"),
-        compactor2.compact_domain("execution")
+        compactor1.compact_domain(CatalogDomain::Executions),
+        compactor2.compact_domain(CatalogDomain::Executions)
     );
 
-    let ok = usize::from(r1.is_ok()) + usize::from(r2.is_ok());
-    let cas_failed = match (r1, r2) {
-        (Ok(_), Err(arco_catalog::CatalogError::CasFailed { .. }))
-        | (Err(arco_catalog::CatalogError::CasFailed { .. }), Ok(_)) => true,
-        _ => false,
-    };
+    let r1 = r1.expect("compactor1");
+    let r2 = r2.expect("compactor2");
 
-    assert_eq!(ok, 1, "exactly one compactor should win the CAS race");
-    assert!(cas_failed, "loser should return CatalogError::CasFailed");
+    let expected_watermark = format!("{event_id}.json");
+    assert_eq!(r1.new_watermark, expected_watermark);
+    assert_eq!(r2.new_watermark, expected_watermark);
+
+    assert_eq!(
+        r1.events_processed + r2.events_processed,
+        1,
+        "exactly one compactor should process the event"
+    );
+
+    let manifest_after = tier1.read_manifest().await.expect("read manifest");
+    let expected_snapshot_path =
+        CatalogPaths::state_snapshot(CatalogDomain::Executions, 1, &event_id.to_string());
+    assert_eq!(
+        manifest_after.executions.snapshot_path.as_deref(),
+        Some(expected_snapshot_path.as_str())
+    );
+
+    let records = read_snapshot_records(&storage, &expected_snapshot_path).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].materialization_id, "mat_001");
 }
 
 #[tokio::test]
@@ -623,7 +656,7 @@ async fn tier2_workspace_isolation() {
     let tier1_b = Tier1Writer::new(storage_b.clone());
     tier1_b.initialize().await.expect("init b");
 
-    let event_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let event_id: EventId = "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().expect("event id");
     let event = MaterializationRecord {
         materialization_id: "mat_001".into(),
         asset_id: "asset_abc".into(),
@@ -632,18 +665,18 @@ async fn tier2_workspace_isolation() {
     };
 
     EventWriter::new(storage_a.clone())
-        .append_with_id("execution", &event, event_id)
+        .append_with_id(CatalogDomain::Executions, &event, &event_id)
         .await
         .expect("append a");
     EventWriter::new(storage_b.clone())
-        .append_with_id("execution", &event, event_id)
+        .append_with_id(CatalogDomain::Executions, &event, &event_id)
         .await
         .expect("append b");
 
     // Each workspace sees only its own ledger.
     assert_eq!(
         storage_a
-            .list("ledger/execution/")
+            .list(&CatalogPaths::ledger_dir(CatalogDomain::Executions))
             .await
             .expect("list a")
             .len(),
@@ -651,7 +684,7 @@ async fn tier2_workspace_isolation() {
     );
     assert_eq!(
         storage_b
-            .list("ledger/execution/")
+            .list(&CatalogPaths::ledger_dir(CatalogDomain::Executions))
             .await
             .expect("list b")
             .len(),
@@ -659,24 +692,24 @@ async fn tier2_workspace_isolation() {
     );
 
     Compactor::new(storage_a.clone())
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact a");
 
     let manifest_a = tier1_a.read_manifest().await.expect("read a");
     let manifest_b = tier1_b.read_manifest().await.expect("read b");
-    assert!(manifest_a.execution.snapshot_path.is_some());
+    assert!(manifest_a.executions.snapshot_path.is_some());
     assert!(
-        manifest_b.execution.snapshot_path.is_none(),
+        manifest_b.executions.snapshot_path.is_none(),
         "compacting workspace A must not publish a snapshot for workspace B"
     );
 
     Compactor::new(storage_b.clone())
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact b");
     let manifest_b2 = tier1_b.read_manifest().await.expect("read b2");
-    assert!(manifest_b2.execution.snapshot_path.is_some());
+    assert!(manifest_b2.executions.snapshot_path.is_some());
 }
 
 #[tokio::test]
@@ -690,55 +723,58 @@ async fn tier2_derived_current_pointers() {
     let event_writer = EventWriter::new(storage.clone());
     event_writer
         .append_with_id(
-            "execution",
+            CatalogDomain::Executions,
             &MaterializationRecord {
                 materialization_id: "mat_001".into(),
                 asset_id: "asset_abc".into(),
                 row_count: 100,
                 byte_size: 5000,
             },
-            "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+            &"01ARZ3NDEKTSV4RRFFQ69G5FAA".parse().expect("event id"),
         )
         .await
         .expect("append1");
 
     let compactor = Compactor::new(storage.clone());
     compactor
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact1");
 
     let manifest1 = tier1.read_manifest().await.expect("read1");
-    let snapshot1 = manifest1.execution.snapshot_path.expect("snapshot1");
-    let version1 = manifest1.execution.snapshot_version;
+    let snapshot1 = manifest1.executions.snapshot_path.expect("snapshot1");
+    let version1 = manifest1.executions.snapshot_version;
 
     event_writer
         .append_with_id(
-            "execution",
+            CatalogDomain::Executions,
             &MaterializationRecord {
                 materialization_id: "mat_002".into(),
                 asset_id: "asset_xyz".into(),
                 row_count: 200,
                 byte_size: 9000,
             },
-            "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+            &"01ARZ3NDEKTSV4RRFFQ69G5FAZ".parse().expect("event id"),
         )
         .await
         .expect("append2");
 
     compactor
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact2");
 
     let manifest2 = tier1.read_manifest().await.expect("read2");
-    let snapshot2 = manifest2.execution.snapshot_path.expect("snapshot2");
-    let version2 = manifest2.execution.snapshot_version;
+    let snapshot2 = manifest2.executions.snapshot_path.expect("snapshot2");
+    let version2 = manifest2.executions.snapshot_version;
 
     assert!(version2 > version1);
     assert_ne!(snapshot1, snapshot2);
 
-    let state_files = storage.list("state/execution/").await.expect("list state");
+    let state_files = storage
+        .list(&CatalogPaths::state_dir(CatalogDomain::Executions))
+        .await
+        .expect("list state");
     let parquet_files = state_files
         .iter()
         .filter(|p| p.as_str().ends_with(".parquet"))
@@ -769,61 +805,61 @@ async fn tier2_snapshot_does_not_shrink_across_compactions() {
 
     event_writer
         .append_with_id(
-            "execution",
+            CatalogDomain::Executions,
             &MaterializationRecord {
                 materialization_id: "mat_001".into(),
                 asset_id: "asset_abc".into(),
                 row_count: 100,
                 byte_size: 5000,
             },
-            "01ARZ3NDEKTSV4RRFFQ69G5FAA",
+            &"01ARZ3NDEKTSV4RRFFQ69G5FAA".parse().expect("event id"),
         )
         .await
         .expect("append mat_001 v1");
     event_writer
         .append_with_id(
-            "execution",
+            CatalogDomain::Executions,
             &MaterializationRecord {
                 materialization_id: "mat_002".into(),
                 asset_id: "asset_xyz".into(),
                 row_count: 200,
                 byte_size: 9000,
             },
-            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            &"01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().expect("event id"),
         )
         .await
         .expect("append mat_002");
 
     compactor
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact1");
     let manifest1 = tier1.read_manifest().await.expect("read1");
-    let snapshot1 = manifest1.execution.snapshot_path.expect("snapshot1");
+    let snapshot1 = manifest1.executions.snapshot_path.expect("snapshot1");
     let records1 = read_snapshot_records(&storage, &snapshot1).await;
     assert_eq!(records1.len(), 2);
 
     // Update mat_001 only (newer ULID).
     event_writer
         .append_with_id(
-            "execution",
+            CatalogDomain::Executions,
             &MaterializationRecord {
                 materialization_id: "mat_001".into(),
                 asset_id: "asset_abc".into(),
                 row_count: 999,
                 byte_size: 9999,
             },
-            "01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+            &"01ARZ3NDEKTSV4RRFFQ69G5FAZ".parse().expect("event id"),
         )
         .await
         .expect("append mat_001 v2");
 
     compactor
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact2");
     let manifest2 = tier1.read_manifest().await.expect("read2");
-    let snapshot2 = manifest2.execution.snapshot_path.expect("snapshot2");
+    let snapshot2 = manifest2.executions.snapshot_path.expect("snapshot2");
     let records2 = read_snapshot_records(&storage, &snapshot2).await;
 
     assert_eq!(
@@ -851,7 +887,10 @@ async fn tier2_compactor_sole_parquet_writer() {
     writer.initialize().await.expect("init");
 
     // Before: no Parquet
-    let before = storage.list("state/execution/").await.unwrap_or_default();
+    let before = storage
+        .list(&CatalogPaths::state_dir(CatalogDomain::Executions))
+        .await
+        .unwrap_or_default();
     assert!(before.is_empty());
 
     // Write events (EventWriter only writes JSON)
@@ -864,23 +903,29 @@ async fn tier2_compactor_sole_parquet_writer() {
             byte_size: 50000,
         };
         event_writer
-            .append("execution", &event)
+            .append(CatalogDomain::Executions, &event)
             .await
             .expect("append");
     }
 
     // Still no Parquet
-    let after_write = storage.list("state/execution/").await.unwrap_or_default();
+    let after_write = storage
+        .list(&CatalogPaths::state_dir(CatalogDomain::Executions))
+        .await
+        .unwrap_or_default();
     assert!(after_write.is_empty(), "EventWriter must not write Parquet");
 
     // After compaction: Parquet exists
     let compactor = Compactor::new(storage.clone());
     compactor
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact");
 
-    let after_compact = storage.list("state/execution/").await.expect("list");
+    let after_compact = storage
+        .list(&CatalogPaths::state_dir(CatalogDomain::Executions))
+        .await
+        .expect("list");
     assert!(
         !after_compact.is_empty(),
         "Compactor is the sole Parquet writer"
@@ -905,9 +950,9 @@ async fn invariant1_append_only_ingest() {
         row_count: 100,
         byte_size: 5000,
     };
-    let id = "FIXED_EVENT_ID_12345678901";
+    let id: EventId = "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().expect("event id");
     event_writer
-        .append_with_id("execution", &event1, id)
+        .append_with_id(CatalogDomain::Executions, &event1, &id)
         .await
         .expect("first write");
 
@@ -920,19 +965,23 @@ async fn invariant1_append_only_ingest() {
     };
     // This should NOT overwrite - DoesNotExist precondition prevents it
     event_writer
-        .append_with_id("execution", &event2, id)
+        .append_with_id(CatalogDomain::Executions, &event2, &id)
         .await
         .expect("duplicate handled gracefully");
 
     // Read back and verify original content preserved
-    let files = storage.list("ledger/execution/").await.expect("list");
+    let files = storage
+        .list(&CatalogPaths::ledger_dir(CatalogDomain::Executions))
+        .await
+        .expect("list");
     assert_eq!(files.len(), 1);
 
     let data = storage.get_raw(files[0].as_str()).await.expect("read");
-    let parsed: MaterializationRecord = serde_json::from_slice(&data).expect("parse");
+    let parsed: CatalogEvent<MaterializationRecord> = serde_json::from_slice(&data).expect("parse");
+    parsed.validate().expect("valid envelope");
 
     assert_eq!(
-        parsed.materialization_id, "mat_001",
+        parsed.payload.materialization_id, "mat_001",
         "INVARIANT 1: Original event preserved, not overwritten"
     );
 }
@@ -952,7 +1001,7 @@ async fn invariant2_compactor_sole_parquet_writer() {
     let event_writer = EventWriter::new(storage.clone());
     event_writer
         .append(
-            "execution",
+            CatalogDomain::Executions,
             &MaterializationRecord {
                 materialization_id: "mat_001".into(),
                 asset_id: "asset_abc".into(),
@@ -964,7 +1013,10 @@ async fn invariant2_compactor_sole_parquet_writer() {
         .expect("append");
 
     // INVARIANT 2: No Parquet until compactor runs
-    let before_compact = storage.list("state/execution/").await.unwrap_or_default();
+    let before_compact = storage
+        .list(&CatalogPaths::state_dir(CatalogDomain::Executions))
+        .await
+        .unwrap_or_default();
     assert!(
         before_compact.is_empty(),
         "INVARIANT 2: Only Compactor writes to state/"
@@ -973,11 +1025,14 @@ async fn invariant2_compactor_sole_parquet_writer() {
     // Compactor creates Parquet
     let compactor = Compactor::new(storage.clone());
     compactor
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact");
 
-    let after_compact = storage.list("state/execution/").await.expect("list");
+    let after_compact = storage
+        .list(&CatalogPaths::state_dir(CatalogDomain::Executions))
+        .await
+        .expect("list");
     assert!(
         !after_compact.is_empty(),
         "INVARIANT 2: Compactor creates Parquet"
@@ -1004,20 +1059,20 @@ async fn invariant3_idempotent_compaction() {
             byte_size: i64::from(i) * 5000,
         };
         event_writer
-            .append("execution", &event)
+            .append(CatalogDomain::Executions, &event)
             .await
             .expect("append");
     }
 
     let compactor = Compactor::new(storage.clone());
     compactor
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact");
 
     // Read Parquet and verify only 1 row (dedupe by primary key)
     let manifest = tier1.read_manifest().await.expect("read");
-    let snapshot_path = manifest.execution.snapshot_path.expect("snapshot_path");
+    let snapshot_path = manifest.executions.snapshot_path.expect("snapshot_path");
     let parquet_data = storage.get_raw(&snapshot_path).await.expect("read");
     let reader = ParquetRecordBatchReaderBuilder::try_new(parquet_data)
         .expect("parquet")
@@ -1044,7 +1099,7 @@ async fn invariant4_atomic_publish() {
     // Before compaction: no snapshot_path
     let manifest_before = tier1.read_manifest().await.expect("read");
     assert!(
-        manifest_before.execution.snapshot_path.is_none(),
+        manifest_before.executions.snapshot_path.is_none(),
         "INVARIANT 4: No snapshot before compaction"
     );
 
@@ -1052,7 +1107,7 @@ async fn invariant4_atomic_publish() {
     let event_writer = EventWriter::new(storage.clone());
     event_writer
         .append(
-            "execution",
+            CatalogDomain::Executions,
             &MaterializationRecord {
                 materialization_id: "mat_001".into(),
                 asset_id: "asset_abc".into(),
@@ -1065,19 +1120,19 @@ async fn invariant4_atomic_publish() {
 
     let compactor = Compactor::new(storage.clone());
     compactor
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact");
 
     // After compaction: snapshot_path is set (atomic visibility gate)
     let manifest_after = tier1.read_manifest().await.expect("read");
     assert!(
-        manifest_after.execution.snapshot_path.is_some(),
+        manifest_after.executions.snapshot_path.is_some(),
         "INVARIANT 4: snapshot_path set after CAS succeeds"
     );
 
     // Verify the path actually exists
-    let snapshot_path = manifest_after.execution.snapshot_path.unwrap();
+    let snapshot_path = manifest_after.executions.snapshot_path.unwrap();
     let snapshot_data = storage
         .get_raw(&snapshot_path)
         .await
@@ -1106,14 +1161,14 @@ async fn invariant5_readers_never_need_ledger() {
             byte_size: 50000,
         };
         event_writer
-            .append("execution", &event)
+            .append(CatalogDomain::Executions, &event)
             .await
             .expect("append");
     }
 
     let compactor = Compactor::new(storage.clone());
     compactor
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact");
 
@@ -1121,7 +1176,7 @@ async fn invariant5_readers_never_need_ledger() {
     backend.clear_operations();
 
     let manifest = tier1.read_manifest().await.expect("read");
-    let snapshot_path = manifest.execution.snapshot_path.expect("snapshot_path");
+    let snapshot_path = manifest.executions.snapshot_path.expect("snapshot_path");
     let _snapshot = storage
         .get_raw(&snapshot_path)
         .await
@@ -1164,7 +1219,7 @@ async fn invariant6_listing_dependency_documented() {
             byte_size: 50000,
         };
         event_writer
-            .append("execution", &event)
+            .append(CatalogDomain::Executions, &event)
             .await
             .expect("append");
     }
@@ -1173,7 +1228,7 @@ async fn invariant6_listing_dependency_documented() {
 
     let compactor = Compactor::new(storage.clone());
     compactor
-        .compact_domain("execution")
+        .compact_domain(CatalogDomain::Executions)
         .await
         .expect("compact");
 

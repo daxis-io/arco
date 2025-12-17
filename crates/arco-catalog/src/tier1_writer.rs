@@ -16,14 +16,14 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
-use arco_core::ScopedStorage;
 use arco_core::error::{Error, Result};
 use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
+use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
 
 use crate::lock::{DEFAULT_LOCK_TTL, DEFAULT_MAX_RETRIES, DistributedLock};
 use crate::manifest::{
-    CatalogManifest, CommitRecord, CoreManifest, ExecutionManifest, GovernanceManifest,
-    LineageManifest, RootManifest, paths,
+    CatalogDomainManifest, CatalogManifest, CommitRecord, ExecutionsManifest, LineageManifest,
+    RootManifest, SearchManifest,
 };
 
 /// Maximum CAS retries for manifest writes.
@@ -46,11 +46,11 @@ pub struct Tier1Writer {
 impl Tier1Writer {
     /// Creates a new Tier 1 writer for the given scope.
     ///
-    /// The lock path is derived from [`ScopedStorage::core_lock_path`].
+    /// The lock path is derived from [`ScopedStorage::lock`].
     #[must_use]
     pub fn new(storage: ScopedStorage) -> Self {
         let backend = storage.backend().clone();
-        let lock_path = storage.core_lock_path();
+        let lock_path = storage.lock(CatalogDomain::Catalog);
         let lock = DistributedLock::new(backend, lock_path);
 
         Self {
@@ -80,9 +80,11 @@ impl Tier1Writer {
     /// Initializes the catalog manifests (idempotent).
     ///
     /// Creates:
-    /// - `manifests/root.manifest.json`
-    /// - `manifests/core.manifest.json`
-    /// - `manifests/execution.manifest.json`
+    /// - `manifests/root.manifest.json` (entry point)
+    /// - `manifests/catalog.manifest.json`
+    /// - `manifests/lineage.manifest.json`
+    /// - `manifests/executions.manifest.json`
+    /// - `manifests/search.manifest.json`
     ///
     /// # Errors
     ///
@@ -97,12 +99,18 @@ impl Tier1Writer {
             )
             .await?;
 
-        let root = RootManifest::new();
-        self.ensure_json_exists(paths::ROOT_MANIFEST, &root).await?;
-
-        self.ensure_json_exists(paths::CORE_MANIFEST, &CoreManifest::new())
+        let mut root = RootManifest::new();
+        root.normalize_paths();
+        self.ensure_json_exists(CatalogPaths::ROOT_MANIFEST, &root)
             .await?;
-        self.ensure_json_exists(paths::EXECUTION_MANIFEST, &ExecutionManifest::new())
+
+        self.ensure_json_exists(&root.catalog_manifest_path, &CatalogDomainManifest::new())
+            .await?;
+        self.ensure_json_exists(&root.lineage_manifest_path, &LineageManifest::new())
+            .await?;
+        self.ensure_json_exists(&root.executions_manifest_path, &ExecutionsManifest::new())
+            .await?;
+        self.ensure_json_exists(&root.search_manifest_path, &SearchManifest::new())
             .await?;
 
         guard.release().await
@@ -114,27 +122,20 @@ impl Tier1Writer {
     ///
     /// Returns an error if any required manifest is missing or cannot be parsed.
     pub async fn read_manifest(&self) -> Result<CatalogManifest> {
-        let root: RootManifest = self.read_json(paths::ROOT_MANIFEST).await?;
-        let core: CoreManifest = self.read_json(&root.core_manifest_path).await?;
-        let execution: ExecutionManifest = self.read_json(&root.execution_manifest_path).await?;
+        let mut root: RootManifest = self.read_json(CatalogPaths::ROOT_MANIFEST).await?;
+        root.normalize_paths();
 
-        let lineage: Option<LineageManifest> = match root.lineage_manifest_path.as_deref() {
-            Some(path) => Some(self.read_json(path).await?),
-            None => None,
-        };
-
-        let governance: Option<GovernanceManifest> = match root.governance_manifest_path.as_deref()
-        {
-            Some(path) => Some(self.read_json(path).await?),
-            None => None,
-        };
+        let catalog: CatalogDomainManifest = self.read_json(&root.catalog_manifest_path).await?;
+        let lineage: LineageManifest = self.read_json(&root.lineage_manifest_path).await?;
+        let executions: ExecutionsManifest = self.read_json(&root.executions_manifest_path).await?;
+        let search: SearchManifest = self.read_json(&root.search_manifest_path).await?;
 
         Ok(CatalogManifest {
             version: root.version,
-            core,
-            execution,
+            catalog,
             lineage,
-            governance,
+            executions,
+            search,
             created_at: root.updated_at,
             updated_at: Utc::now(),
         })
@@ -151,7 +152,7 @@ impl Tier1Writer {
     /// if the CAS update fails after all retries.
     pub async fn update<F>(&self, mut update_fn: F) -> Result<CommitRecord>
     where
-        F: FnMut(&mut CatalogManifest) -> Result<()>,
+        F: FnMut(&mut CatalogDomainManifest) -> Result<()>,
     {
         let guard = self
             .lock
@@ -171,44 +172,31 @@ impl Tier1Writer {
 
     async fn update_inner<F>(&self, update_fn: &mut F) -> Result<CommitRecord>
     where
-        F: FnMut(&mut CatalogManifest) -> Result<()>,
+        F: FnMut(&mut CatalogDomainManifest) -> Result<()>,
     {
         for attempt in 1..=self.cas_max_retries {
-            let root: RootManifest = self.read_json(paths::ROOT_MANIFEST).await?;
+            let mut root: RootManifest = self.read_json(CatalogPaths::ROOT_MANIFEST).await?;
+            root.normalize_paths();
 
-            let (core, core_version): (CoreManifest, String) = self
-                .read_json_with_version(&root.core_manifest_path)
+            let (mut catalog, catalog_version): (CatalogDomainManifest, String) = self
+                .read_json_with_version(&root.catalog_manifest_path)
                 .await?;
-            let execution: ExecutionManifest =
-                self.read_json(&root.execution_manifest_path).await?;
+            let prev_catalog = catalog.clone();
 
-            let prev_core = core.clone();
-            let mut manifest = CatalogManifest {
-                version: root.version,
-                core,
-                execution,
-                lineage: None,
-                governance: None,
-                created_at: root.updated_at,
-                updated_at: Utc::now(),
-            };
+            update_fn(&mut catalog)?;
 
-            update_fn(&mut manifest)?;
+            catalog.updated_at = Utc::now();
 
-            let now = Utc::now();
-            manifest.core.updated_at = now;
-            manifest.updated_at = now;
+            let commit = self.build_commit_record(&prev_catalog, &catalog).await?;
+            catalog.last_commit_id = Some(commit.commit_id.clone());
 
-            let commit = self.build_commit_record(&prev_core, &manifest.core).await?;
-            manifest.core.last_commit_id = Some(commit.commit_id.clone());
-
-            let core_bytes = json_bytes(&manifest.core)?;
+            let catalog_bytes = json_bytes(&catalog)?;
             match self
                 .storage
                 .put_raw(
-                    &root.core_manifest_path,
-                    core_bytes,
-                    WritePrecondition::MatchesVersion(core_version),
+                    &root.catalog_manifest_path,
+                    catalog_bytes,
+                    WritePrecondition::MatchesVersion(catalog_version),
                 )
                 .await?
             {
@@ -279,8 +267,8 @@ impl Tier1Writer {
     /// commit record from storage and computes its hash for the tamper-evident chain.
     async fn build_commit_record(
         &self,
-        prev: &CoreManifest,
-        next: &CoreManifest,
+        prev: &CatalogDomainManifest,
+        next: &CatalogDomainManifest,
     ) -> Result<CommitRecord> {
         let payload_hash = sha256_prefixed(&json_vec(next)?);
         let prev_commit_id = prev.last_commit_id.clone();
@@ -288,7 +276,7 @@ impl Tier1Writer {
         // Load and hash previous commit for tamper-evident chain
         let prev_commit_hash = match &prev_commit_id {
             Some(id) => {
-                let path = format!("core/commits/{id}.json");
+                let path = CatalogPaths::commit(CatalogDomain::Catalog, id);
                 match self.storage.get_raw(&path).await {
                     Ok(bytes) => Some(sha256_prefixed(&bytes)),
                     Err(Error::NotFound(_)) => {
@@ -312,7 +300,7 @@ impl Tier1Writer {
     }
 
     async fn persist_commit_record(&self, commit: &CommitRecord) -> Result<()> {
-        let path = format!("core/commits/{}.json", commit.commit_id);
+        let path = CatalogPaths::commit(CatalogDomain::Catalog, &commit.commit_id);
         let bytes = json_bytes(commit)?;
         match self
             .storage
@@ -392,7 +380,7 @@ mod tests {
         ) -> Result<WriteResult> {
             // Inject a no-op write once to force a CAS conflict.
             if matches!(&precondition, WritePrecondition::MatchesVersion(_))
-                && path.ends_with(paths::CORE_MANIFEST)
+                && path.ends_with(&CatalogPaths::domain_manifest(CatalogDomain::Catalog))
                 && self.inject_once.swap(false, Ordering::SeqCst)
             {
                 let current = self.inner.get(path).await?;
@@ -430,17 +418,26 @@ mod tests {
 
         writer.initialize().await?;
 
-        let root_bytes = storage.get_raw(paths::ROOT_MANIFEST).await?;
-        let root: RootManifest = parse_json(&root_bytes)?;
+        let root_bytes = storage.get_raw(CatalogPaths::ROOT_MANIFEST).await?;
+        let mut root: RootManifest = parse_json(&root_bytes)?;
+        root.normalize_paths();
         assert_eq!(root.version, 1);
 
-        let core_bytes = storage.get_raw(paths::CORE_MANIFEST).await?;
-        let core: CoreManifest = parse_json(&core_bytes)?;
-        assert_eq!(core.snapshot_version, 0);
+        let catalog_bytes = storage.get_raw(&root.catalog_manifest_path).await?;
+        let catalog: CatalogDomainManifest = parse_json(&catalog_bytes)?;
+        assert_eq!(catalog.snapshot_version, 0);
 
-        let exec_bytes = storage.get_raw(paths::EXECUTION_MANIFEST).await?;
-        let exec: ExecutionManifest = parse_json(&exec_bytes)?;
+        let lineage_bytes = storage.get_raw(&root.lineage_manifest_path).await?;
+        let lineage: LineageManifest = parse_json(&lineage_bytes)?;
+        assert_eq!(lineage.snapshot_version, 0);
+
+        let exec_bytes = storage.get_raw(&root.executions_manifest_path).await?;
+        let exec: ExecutionsManifest = parse_json(&exec_bytes)?;
         assert_eq!(exec.watermark_version, 0);
+
+        let search_bytes = storage.get_raw(&root.search_manifest_path).await?;
+        let search: SearchManifest = parse_json(&search_bytes)?;
+        assert_eq!(search.snapshot_version, 0);
 
         Ok(())
     }
@@ -467,18 +464,23 @@ mod tests {
 
         let commit = writer
             .update(|manifest| {
-                manifest.core.snapshot_version = 1;
-                manifest.core.snapshot_path = "core/snapshots/v1/".into();
+                manifest.snapshot_version = 1;
+                manifest.snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1);
                 Ok(())
             })
             .await?;
 
         assert_eq!(commit.operation, "Update");
 
-        let core_bytes = storage.get_raw(paths::CORE_MANIFEST).await?;
-        let core: CoreManifest = parse_json(&core_bytes)?;
+        let core_bytes = storage
+            .get_raw(&CatalogPaths::domain_manifest(CatalogDomain::Catalog))
+            .await?;
+        let core: CatalogDomainManifest = parse_json(&core_bytes)?;
         assert_eq!(core.snapshot_version, 1);
-        assert_eq!(core.snapshot_path, "core/snapshots/v1/");
+        assert_eq!(
+            core.snapshot_path,
+            CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1)
+        );
 
         Ok(())
     }
@@ -493,13 +495,15 @@ mod tests {
 
         writer
             .update(|manifest| {
-                manifest.core.snapshot_version += 1;
+                manifest.snapshot_version += 1;
                 Ok(())
             })
             .await?;
 
-        let core_bytes = storage.get_raw(paths::CORE_MANIFEST).await?;
-        let core: CoreManifest = parse_json(&core_bytes)?;
+        let core_bytes = storage
+            .get_raw(&CatalogPaths::domain_manifest(CatalogDomain::Catalog))
+            .await?;
+        let core: CatalogDomainManifest = parse_json(&core_bytes)?;
         assert_eq!(core.snapshot_version, 1);
 
         Ok(())
@@ -517,7 +521,7 @@ mod tests {
         // First update - no previous commit to link
         let commit1 = writer
             .update(|manifest| {
-                manifest.core.snapshot_version = 1;
+                manifest.snapshot_version = 1;
                 Ok(())
             })
             .await?;
@@ -527,7 +531,7 @@ mod tests {
         // Second update - should link to first commit
         let commit2 = writer
             .update(|manifest| {
-                manifest.core.snapshot_version = 2;
+                manifest.snapshot_version = 2;
                 Ok(())
             })
             .await?;
@@ -540,7 +544,7 @@ mod tests {
         // Third update - should link to second commit
         let commit3 = writer
             .update(|manifest| {
-                manifest.core.snapshot_version = 3;
+                manifest.snapshot_version = 3;
                 Ok(())
             })
             .await?;
@@ -551,7 +555,7 @@ mod tests {
         );
 
         // Verify chain integrity: commit3.prev_commit_hash should be SHA256 of commit2
-        let commit2_path = format!("core/commits/{}.json", commit2.commit_id);
+        let commit2_path = CatalogPaths::commit(CatalogDomain::Catalog, &commit2.commit_id);
         let commit2_bytes = storage.get_raw(&commit2_path).await?;
         let expected_hash = format!("sha256:{}", hex::encode(Sha256::digest(&commit2_bytes)));
         assert_eq!(commit3.prev_commit_hash, Some(expected_hash));

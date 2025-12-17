@@ -5,10 +5,15 @@
 //! INVARIANT 4: Publish is atomic (manifest CAS).
 //!
 //! It reads from `ledger/`, writes to `state/`, and updates the watermark atomically via CAS.
+//!
+//! NOTE: This MVP compactor writes full Parquet snapshots (no incremental/delta files). That
+//! makes each compaction `O(total_records)` I/O and CPU. This is acceptable for early workloads,
+//! but should evolve toward incremental compaction as catalog size grows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use arrow::array::Array;
 use arrow::array::{Int64Array, StringArray};
@@ -23,9 +28,10 @@ use serde::{Deserialize, Serialize};
 
 use arco_core::scoped_storage::ScopedStorage;
 use arco_core::storage::WritePrecondition;
+use arco_core::{CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths};
 
 use crate::error::{CatalogError, Result};
-use crate::manifest::ExecutionManifest;
+use crate::manifest::{ExecutionsManifest, RootManifest};
 
 /// Result of a compaction operation.
 #[derive(Debug, Clone)]
@@ -38,18 +44,99 @@ pub struct CompactionResult {
     pub new_watermark: String,
 }
 
+/// Policy for handling unknown or unsupported event envelopes during compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownEventPolicy {
+    /// Fail the compaction when an unknown event is encountered.
+    Reject,
+    /// Copy the event into quarantine and continue.
+    Quarantine,
+}
+
+/// Policy for handling late/out-of-order events (events at or before the watermark).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LateEventPolicy {
+    /// Skip late events (no logging).
+    Skip,
+    /// Skip late events, but log a warning (recommended default until sequencing exists).
+    Log,
+    /// Copy late events into quarantine and continue.
+    Quarantine,
+}
+
+fn cas_backoff(base: Duration, max: Duration, attempt: u32) -> Duration {
+    // Exponential backoff with small random jitter to avoid thundering herds.
+    // Clamp the exponent to avoid overflow and unbounded waits.
+    let exp = 2u32.saturating_pow(attempt.saturating_sub(1).min(16));
+    let backoff = base.saturating_mul(exp);
+    let jitter = Duration::from_millis(rand_jitter_ms(50));
+    backoff.saturating_add(jitter).min(max)
+}
+
+fn rand_jitter_ms(max_exclusive: u64) -> u64 {
+    if max_exclusive == 0 {
+        return 0;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    u64::from(nanos) % max_exclusive
+}
+
 /// Compacts Tier 2 ledger events into Parquet snapshots.
 ///
 /// INVARIANT: Compactor is the SOLE writer of `state/` Parquet files.
 pub struct Compactor {
     storage: ScopedStorage,
+    cas_max_retries: u32,
+    cas_backoff_base: Duration,
+    cas_backoff_max: Duration,
+    unknown_event_policy: UnknownEventPolicy,
+    late_event_policy: LateEventPolicy,
 }
 
 impl Compactor {
     /// Creates a new compactor.
     #[must_use]
     pub fn new(storage: ScopedStorage) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            cas_max_retries: 10,
+            cas_backoff_base: Duration::from_millis(50),
+            cas_backoff_max: Duration::from_secs(2),
+            unknown_event_policy: UnknownEventPolicy::Reject,
+            late_event_policy: LateEventPolicy::Log,
+        }
+    }
+
+    /// Sets the maximum CAS retries for the manifest update publish.
+    #[must_use]
+    pub const fn with_cas_retries(mut self, max_retries: u32) -> Self {
+        self.cas_max_retries = if max_retries == 0 { 1 } else { max_retries };
+        self
+    }
+
+    /// Sets the CAS retry backoff window.
+    #[must_use]
+    pub const fn with_cas_backoff(mut self, base: Duration, max: Duration) -> Self {
+        self.cas_backoff_base = base;
+        self.cas_backoff_max = max;
+        self
+    }
+
+    /// Sets the policy for unknown or unsupported events.
+    #[must_use]
+    pub const fn with_unknown_event_policy(mut self, policy: UnknownEventPolicy) -> Self {
+        self.unknown_event_policy = policy;
+        self
+    }
+
+    /// Sets the policy for late/out-of-order events.
+    #[must_use]
+    pub const fn with_late_event_policy(mut self, policy: LateEventPolicy) -> Self {
+        self.late_event_policy = policy;
+        self
     }
 
     /// Compacts a domain, reading events since watermark and writing Parquet.
@@ -63,47 +150,104 @@ impl Compactor {
     /// # Errors
     ///
     /// Returns an error if reading ledger or writing state fails.
-    /// Returns `CatalogError::CasFailed` if another compactor won the race.
+    /// Returns `CatalogError::CasFailed` only if the manifest publish loses the CAS race after
+    /// exhausting retries.
     #[allow(clippy::too_many_lines)]
-    pub async fn compact_domain(&self, domain: &str) -> Result<CompactionResult> {
+    pub async fn compact_domain(&self, domain: CatalogDomain) -> Result<CompactionResult> {
+        if domain != CatalogDomain::Executions {
+            return Err(CatalogError::InvariantViolation {
+                message: format!("compaction not implemented for domain: {domain}"),
+            });
+        }
+
+        for attempt in 1..=self.cas_max_retries {
+            match self.compact_domain_once(domain).await {
+                Ok(result) => return Ok(result),
+                Err(CatalogError::CasFailed { .. }) if attempt < self.cas_max_retries => {
+                    let backoff = cas_backoff(self.cas_backoff_base, self.cas_backoff_max, attempt);
+                    let backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX);
+                    tracing::info!(attempt, backoff_ms, "compactor lost CAS race, retrying");
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(CatalogError::CasFailed {
+            message: format!(
+                "manifest update lost CAS race after {} retries",
+                self.cas_max_retries
+            ),
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn compact_domain_once(&self, domain: CatalogDomain) -> Result<CompactionResult> {
         // 1. Read current manifest + its version for CAS
-        let (manifest, current_version) = self.read_manifest_with_version().await?;
+        let (root, manifest, current_version) = self.read_manifest_with_version().await?;
 
         let watermark_event_id = manifest.watermark_event_id.clone();
+        let last_compaction_at = manifest.last_compaction_at;
 
-        // 2. List ledger events
-        let prefix = format!("ledger/{domain}/");
-        let scoped_paths = self
-            .storage
-            .list(&prefix)
-            .await
-            .map_err(|e| CatalogError::Storage {
-                message: format!("failed to list events: {e}"),
-            })?;
+        // 2. List ledger events (with metadata for late-event detection)
+        let prefix = CatalogPaths::ledger_dir(domain);
+        let mut metas =
+            self.storage
+                .list_meta(&prefix)
+                .await
+                .map_err(|e| CatalogError::Storage {
+                    message: format!("failed to list events: {e}"),
+                })?;
 
-        // Convert ScopedPath to path strings for processing
-        let mut files: Vec<String> = scoped_paths.into_iter().map(|p| p.to_string()).collect();
+        metas.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
 
-        // CRITICAL: Sort explicitly - object store list() order is NOT guaranteed
-        files.sort();
+        // 3. Partition events into:
+        // - events after watermark (eligible for compaction)
+        // - late events (<= watermark but newly written since last_compaction_at)
+        let mut events_to_process: Vec<String> = Vec::new();
+        let mut late_events: Vec<String> = Vec::new();
 
-        // 3. Filter to events after watermark
-        // Watermark is stored as exact filename (including .json) for correct comparison
-        let events_to_process: Vec<_> = files
-            .into_iter()
-            .filter(|path| {
-                // Compare exact filenames (both include .json)
-                let filename = path.rsplit('/').next().unwrap_or("");
-                // If no watermark, process all events; otherwise, only events after watermark
-                #[allow(clippy::option_if_let_else)]
-                match &watermark_event_id {
-                    Some(watermark) => filename > watermark.as_str(),
-                    None => true,
+        for meta in metas {
+            let path = meta.path.as_str();
+            let filename = path.rsplit('/').next().unwrap_or("");
+
+            let is_after_watermark = watermark_event_id
+                .as_deref()
+                .is_none_or(|watermark| filename > watermark);
+
+            if is_after_watermark {
+                events_to_process.push(path.to_string());
+                continue;
+            }
+
+            // Late arrival detection: object was modified after last compaction.
+            if let (Some(last_compaction_at), Some(last_modified)) =
+                (last_compaction_at, meta.last_modified)
+            {
+                if last_modified > last_compaction_at {
+                    late_events.push(path.to_string());
                 }
-            })
-            .collect();
+            }
+        }
+
+        self.handle_late_events(domain, &late_events).await?;
 
         if events_to_process.is_empty() {
+            // No new events to compact. If we saw late events, advance `last_compaction_at`
+            // to avoid repeatedly re-quarantining/re-logging the same files.
+            if !late_events.is_empty() {
+                let now = Utc::now();
+                let mut new_manifest = manifest.clone();
+                new_manifest.last_compaction_at = Some(now);
+                new_manifest.updated_at = now;
+                self.publish_manifest(
+                    &root.executions_manifest_path,
+                    &new_manifest,
+                    &current_version,
+                )
+                .await?;
+            }
+
             return Ok(CompactionResult {
                 events_processed: 0,
                 parquet_files_written: 0,
@@ -111,9 +255,14 @@ impl Compactor {
             });
         }
 
-        // 4. Read, parse, and DEDUPE events by idempotency_key
-        // Architecture: "Compactor dedupes by idempotency_key during fold"
-        // Use HashMap keyed by primary key (materialization_id) for upsert semantics
+        // CRITICAL: Store exact filename (including .json) as watermark.
+        let last_event_id = events_to_process
+            .last()
+            .and_then(|p| p.rsplit('/').next())
+            .unwrap_or("")
+            .to_string();
+
+        // 4. Read, parse, and dedupe events by idempotency_key; upsert by primary key.
         let mut records_by_key: HashMap<String, MaterializationRecord> = HashMap::new();
         if let Some(snapshot_path) = manifest.snapshot_path.as_deref() {
             let existing = self.read_snapshot_records(snapshot_path).await?;
@@ -121,10 +270,17 @@ impl Compactor {
                 records_by_key.insert(record.materialization_id.clone(), record);
             }
         }
-        let mut last_event_file = String::new();
+
+        let mut seen_idempotency_keys: HashSet<String> = HashSet::new();
+        let mut events_applied: usize = 0;
+        let mut events_deduped: usize = 0;
+        let mut events_quarantined: usize = 0;
+
+        let expected_type = <MaterializationRecord as CatalogEventPayload>::EVENT_TYPE;
+        let expected_version = <MaterializationRecord as CatalogEventPayload>::EVENT_VERSION;
 
         for file_path in &events_to_process {
-            let filename = file_path.rsplit('/').next().unwrap_or("").to_string();
+            let filename = file_path.rsplit('/').next().unwrap_or("");
 
             let data =
                 self.storage
@@ -134,97 +290,284 @@ impl Compactor {
                         message: format!("failed to read event: {e}"),
                     })?;
 
-            let event: MaterializationRecord =
-                serde_json::from_slice(&data).map_err(|e| CatalogError::Serialization {
-                    message: format!("failed to parse event '{file_path}': {e}"),
-                })?;
-            // DEDUPE: Use materialization_id as primary key (upsert semantics)
-            // Later events overwrite earlier ones for the same key
-            records_by_key.insert(event.materialization_id.clone(), event);
+            // Prefer the enveloped format (ADR-004), but accept legacy raw payloads for migration.
+            let parsed_envelope = serde_json::from_slice::<CatalogEvent<serde_json::Value>>(&data);
 
-            // Track watermark as the last processed file name
-            if filename > last_event_file {
-                last_event_file = filename;
+            let (event_type, event_version, idempotency_key, record): (
+                String,
+                u32,
+                String,
+                MaterializationRecord,
+            ) = if let Ok(envelope) = parsed_envelope {
+                if let Err(e) = envelope.validate() {
+                    match self.unknown_event_policy {
+                        UnknownEventPolicy::Reject => {
+                            return Err(CatalogError::InvariantViolation {
+                                message: format!("invalid event envelope in '{file_path}': {e}"),
+                            });
+                        }
+                        UnknownEventPolicy::Quarantine => {
+                            self.quarantine_event_bytes(
+                                domain,
+                                filename,
+                                data.clone(),
+                                "invalid_envelope",
+                            )
+                            .await?;
+                            events_quarantined += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                let record: MaterializationRecord = match serde_json::from_value(envelope.payload) {
+                    Ok(record) => record,
+                    Err(e) => match self.unknown_event_policy {
+                        UnknownEventPolicy::Reject => {
+                            return Err(CatalogError::Serialization {
+                                message: format!(
+                                    "failed to parse event payload '{file_path}': {e}"
+                                ),
+                            });
+                        }
+                        UnknownEventPolicy::Quarantine => {
+                            self.quarantine_event_bytes(
+                                domain,
+                                filename,
+                                data.clone(),
+                                "invalid_payload",
+                            )
+                            .await?;
+                            events_quarantined += 1;
+                            continue;
+                        }
+                    },
+                };
+                (
+                    envelope.event_type,
+                    envelope.event_version,
+                    envelope.idempotency_key,
+                    record,
+                )
+            } else {
+                // Legacy payload format (raw MaterializationRecord JSON).
+                let record: MaterializationRecord = match serde_json::from_slice(&data) {
+                    Ok(record) => record,
+                    Err(e) => match self.unknown_event_policy {
+                        UnknownEventPolicy::Reject => {
+                            return Err(CatalogError::Serialization {
+                                message: format!("failed to parse legacy event '{file_path}': {e}"),
+                            });
+                        }
+                        UnknownEventPolicy::Quarantine => {
+                            self.quarantine_event_bytes(
+                                domain,
+                                filename,
+                                data.clone(),
+                                "unparseable_legacy_event",
+                            )
+                            .await?;
+                            events_quarantined += 1;
+                            continue;
+                        }
+                    },
+                };
+
+                let idempotency_key = CatalogEvent::<()>::generate_idempotency_key(
+                    expected_type,
+                    expected_version,
+                    &record,
+                )
+                .map_err(|e| CatalogError::Serialization {
+                    message: format!("failed to generate idempotency key for '{file_path}': {e}"),
+                })?;
+
+                (
+                    expected_type.to_string(),
+                    expected_version,
+                    idempotency_key,
+                    record,
+                )
+            };
+
+            if event_type != expected_type || event_version != expected_version {
+                match self.unknown_event_policy {
+                    UnknownEventPolicy::Reject => {
+                        return Err(CatalogError::InvariantViolation {
+                            message: format!(
+                                "unsupported event in '{file_path}': type='{event_type}' version={event_version}"
+                            ),
+                        });
+                    }
+                    UnknownEventPolicy::Quarantine => {
+                        self.quarantine_event_bytes(
+                            domain,
+                            filename,
+                            data.clone(),
+                            "unsupported_event",
+                        )
+                        .await?;
+                        events_quarantined += 1;
+                        continue;
+                    }
+                }
             }
+
+            // DEDUPE: ignore duplicate deliveries by idempotency_key within this fold.
+            if !seen_idempotency_keys.insert(idempotency_key) {
+                events_deduped += 1;
+                continue;
+            }
+
+            // UPSERT: materialization_id is the primary key; later events overwrite earlier state.
+            records_by_key.insert(record.materialization_id.clone(), record);
+            events_applied += 1;
         }
 
-        // Convert deduped map to vec for Parquet write (sort for determinism)
-        let mut records: Vec<_> = records_by_key.into_values().collect();
-        records.sort_by(|a, b| a.materialization_id.cmp(&b.materialization_id));
-        // CRITICAL: Store exact filename (including .json) as watermark
-        let last_event_id = last_event_file;
-
-        // 5. Write Parquet file
-        // INVARIANT 4: Parquet is written BEFORE manifest update (atomic publish)
-        let (parquet_files_written, new_snapshot_path, new_snapshot_version) = if records.is_empty()
+        // 5. Write Parquet snapshot BEFORE manifest update (atomic publish).
+        let (parquet_files_written, new_snapshot_path, new_snapshot_version) = if events_applied > 0
         {
-            return Err(CatalogError::InvariantViolation {
-                message: "compactor produced empty snapshot while processing events".to_string(),
-            });
-        } else {
+            let mut records: Vec<_> = records_by_key.into_values().collect();
+            records.sort_by(|a, b| a.materialization_id.cmp(&b.materialization_id));
+
             let snapshot_version = manifest.snapshot_version + 1;
             let snapshot_id = last_event_id
                 .strip_suffix(".json")
                 .unwrap_or(&last_event_id);
-            let path = format!("state/{domain}/snapshot_v{snapshot_version}_{snapshot_id}.parquet");
+            let path = CatalogPaths::state_snapshot(domain, snapshot_version, snapshot_id);
 
             let wrote_new = self.write_parquet(&path, &records).await?;
-            let files_written = usize::from(wrote_new);
-
-            (files_written, Some(path), snapshot_version)
+            (usize::from(wrote_new), Some(path), snapshot_version)
+        } else {
+            (0, manifest.snapshot_path.clone(), manifest.snapshot_version)
         };
 
-        // 6. Update watermark in manifest with CAS (ARCHITECTURE-CRITICAL)
-        // INVARIANT 4: snapshot_path makes the new Parquet visible atomically
-        let new_watermark_version = manifest.watermark_version + 1;
-
+        let now = Utc::now();
         let mut new_manifest = manifest.clone();
-        new_manifest.watermark_version = new_watermark_version;
+        new_manifest.watermark_version = manifest.watermark_version + 1;
         new_manifest.watermark_event_id = Some(last_event_id.clone());
-        new_manifest.snapshot_path = new_snapshot_path; // Atomic visibility gate
+        new_manifest.snapshot_path = new_snapshot_path;
         new_manifest.snapshot_version = new_snapshot_version;
-        new_manifest.last_compaction_at = Some(Utc::now());
+        new_manifest.last_compaction_at = Some(now);
         new_manifest.compaction.total_events_compacted += events_to_process.len() as u64;
         new_manifest.compaction.total_files_written += parquet_files_written as u64;
-        new_manifest.updated_at = Utc::now();
+        new_manifest.updated_at = now;
 
-        let execution_json =
-            serde_json::to_vec_pretty(&new_manifest).map_err(|e| CatalogError::Serialization {
-                message: format!("failed to serialize manifest: {e}"),
-            })?;
+        self.publish_manifest(
+            &root.executions_manifest_path,
+            &new_manifest,
+            &current_version,
+        )
+        .await?;
 
-        // CRITICAL: Use CAS to ensure atomic publish semantics
-        // If another compactor updated the manifest, this will fail and we retry
-        let result = self
-            .storage
-            .put_raw(
-                "manifests/execution.manifest.json",
-                Bytes::from(execution_json),
-                WritePrecondition::MatchesVersion(current_version),
-            )
-            .await
-            .map_err(|e| CatalogError::Storage {
-                message: format!("failed to write manifest: {e}"),
-            })?;
-
-        // Check if CAS succeeded
-        match result {
-            arco_core::storage::WriteResult::Success { .. } => {
-                // Success - compaction is now visible
-            }
-            arco_core::storage::WriteResult::PreconditionFailed { .. } => {
-                // Another compactor won the race
-                return Err(CatalogError::CasFailed {
-                    message: "manifest updated by another compactor".to_string(),
-                });
-            }
-        }
+        tracing::info!(
+            events_processed = events_to_process.len(),
+            events_applied,
+            events_deduped,
+            events_quarantined,
+            late_events = late_events.len(),
+            "compaction completed"
+        );
 
         Ok(CompactionResult {
             events_processed: events_to_process.len(),
             parquet_files_written,
             new_watermark: last_event_id,
         })
+    }
+
+    async fn publish_manifest(
+        &self,
+        path: &str,
+        manifest: &ExecutionsManifest,
+        current_version: &str,
+    ) -> Result<()> {
+        let execution_json =
+            serde_json::to_vec_pretty(manifest).map_err(|e| CatalogError::Serialization {
+                message: format!("failed to serialize manifest: {e}"),
+            })?;
+
+        let result = self
+            .storage
+            .put_raw(
+                path,
+                Bytes::from(execution_json),
+                WritePrecondition::MatchesVersion(current_version.to_string()),
+            )
+            .await
+            .map_err(|e| CatalogError::Storage {
+                message: format!("failed to write manifest: {e}"),
+            })?;
+
+        match result {
+            arco_core::storage::WriteResult::Success { .. } => Ok(()),
+            arco_core::storage::WriteResult::PreconditionFailed { .. } => {
+                Err(CatalogError::CasFailed {
+                    message: "manifest updated by another compactor".to_string(),
+                })
+            }
+        }
+    }
+
+    async fn handle_late_events(&self, domain: CatalogDomain, paths: &[String]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        match self.late_event_policy {
+            LateEventPolicy::Skip => Ok(()),
+            LateEventPolicy::Log => {
+                tracing::warn!(
+                    late_events = paths.len(),
+                    metric = "arco_compactor_late_events_total",
+                    "late events detected (arrived at or before watermark); skipping per policy"
+                );
+                Ok(())
+            }
+            LateEventPolicy::Quarantine => {
+                for path in paths {
+                    let filename = path.rsplit('/').next().unwrap_or("");
+                    let data =
+                        self.storage
+                            .get_raw(path)
+                            .await
+                            .map_err(|e| CatalogError::Storage {
+                                message: format!("failed to read late event: {e}"),
+                            })?;
+                    self.quarantine_event_bytes(domain, filename, data, "late_event")
+                        .await?;
+                }
+                tracing::warn!(
+                    late_events = paths.len(),
+                    metric = "arco_compactor_late_events_total",
+                    "late events quarantined"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    async fn quarantine_event_bytes(
+        &self,
+        domain: CatalogDomain,
+        filename: &str,
+        data: Bytes,
+        reason: &str,
+    ) -> Result<()> {
+        let path = CatalogPaths::quarantine_event(domain, filename);
+
+        let result = self
+            .storage
+            .put_raw(&path, data, WritePrecondition::DoesNotExist)
+            .await
+            .map_err(|e| CatalogError::Storage {
+                message: format!("failed to quarantine event ({reason}): {e}"),
+            })?;
+
+        match result {
+            arco_core::storage::WriteResult::Success { .. }
+            | arco_core::storage::WriteResult::PreconditionFailed { .. } => Ok(()),
+        }
     }
 
     /// Reads all records from an existing Parquet snapshot.
@@ -391,38 +734,54 @@ impl Compactor {
     }
 
     /// Reads the execution manifest with its current version for CAS.
-    async fn read_manifest_with_version(&self) -> Result<(ExecutionManifest, String)> {
-        let manifest_path = "manifests/execution.manifest.json";
+    async fn read_manifest_with_version(
+        &self,
+    ) -> Result<(RootManifest, ExecutionsManifest, String)> {
+        let mut root: RootManifest = self
+            .storage
+            .get_raw(CatalogPaths::ROOT_MANIFEST)
+            .await
+            .map_err(|e| CatalogError::Storage {
+                message: format!("failed to read root manifest: {e}"),
+            })
+            .and_then(|data| {
+                serde_json::from_slice(&data).map_err(|e| CatalogError::Serialization {
+                    message: format!("failed to parse root manifest: {e}"),
+                })
+            })?;
+        root.normalize_paths();
+
+        let manifest_path = root.executions_manifest_path.clone();
 
         // First, get metadata to retrieve version
-        let meta =
-            self.storage
-                .head_raw(manifest_path)
-                .await
-                .map_err(|e| CatalogError::Storage {
-                    message: format!("failed to read manifest metadata: {e}"),
-                })?;
+        let meta = self
+            .storage
+            .head_raw(&manifest_path)
+            .await
+            .map_err(|e| CatalogError::Storage {
+                message: format!("failed to read manifest metadata: {e}"),
+            })?
+            .ok_or_else(|| CatalogError::NotFound {
+                message: format!("manifest not found: {manifest_path}"),
+            })?;
 
-        // If manifest doesn't exist, return default with version "0"
-        let version = meta
-            .as_ref()
-            .map_or_else(|| "0".to_string(), |m| m.version.clone());
+        let version = meta.version.clone();
 
         // Read the content
         let data =
             self.storage
-                .get_raw(manifest_path)
+                .get_raw(&manifest_path)
                 .await
                 .map_err(|e| CatalogError::Storage {
                     message: format!("failed to read manifest: {e}"),
                 })?;
 
-        let manifest: ExecutionManifest =
+        let manifest: ExecutionsManifest =
             serde_json::from_slice(&data).map_err(|e| CatalogError::Serialization {
                 message: format!("failed to parse manifest: {e}"),
             })?;
 
-        Ok((manifest, version))
+        Ok((root, manifest, version))
     }
 }
 
@@ -441,12 +800,22 @@ pub struct MaterializationRecord {
     pub byte_size: i64,
 }
 
+impl CatalogEventPayload for MaterializationRecord {
+    const EVENT_TYPE: &'static str = "materialization.completed";
+    const EVENT_VERSION: u32 = 1;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::EventWriter;
     use crate::Tier1Writer;
-    use arco_core::storage::MemoryBackend;
+    use arco_core::EventId;
+    use arco_core::storage::{
+        MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+    };
+    use std::ops::Range;
+    use tokio::sync::Barrier;
 
     #[tokio::test]
     async fn compact_empty_ledger_is_noop() {
@@ -459,7 +828,7 @@ mod tests {
 
         let compactor = Compactor::new(storage);
         let result = compactor
-            .compact_domain("execution")
+            .compact_domain(CatalogDomain::Executions)
             .await
             .expect("compact");
 
@@ -485,14 +854,14 @@ mod tests {
                 byte_size: 50000,
             };
             event_writer
-                .append("execution", &event)
+                .append(CatalogDomain::Executions, &event)
                 .await
                 .expect("append");
         }
 
         let compactor = Compactor::new(storage);
         let result = compactor
-            .compact_domain("execution")
+            .compact_domain(CatalogDomain::Executions)
             .await
             .expect("compact");
 
@@ -521,12 +890,12 @@ mod tests {
                 byte_size: 50000,
             };
             event_writer
-                .append("execution", &event)
+                .append(CatalogDomain::Executions, &event)
                 .await
                 .expect("append");
         }
         let result1 = compactor
-            .compact_domain("execution")
+            .compact_domain(CatalogDomain::Executions)
             .await
             .expect("compact1");
         assert_eq!(result1.events_processed, 3);
@@ -540,18 +909,295 @@ mod tests {
                 byte_size: 50000,
             };
             event_writer
-                .append("execution", &event)
+                .append(CatalogDomain::Executions, &event)
                 .await
                 .expect("append");
         }
         let result2 = compactor
-            .compact_domain("execution")
+            .compact_domain(CatalogDomain::Executions)
             .await
             .expect("compact2");
 
         assert_eq!(
             result2.events_processed, 2,
             "only new events since watermark"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_event_version_is_rejected_by_default() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage =
+            ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+
+        let tier1_writer = Tier1Writer::new(storage.clone());
+        tier1_writer.initialize().await.expect("init");
+
+        let event_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let ledger_path = CatalogPaths::ledger_event(CatalogDomain::Executions, event_id);
+
+        let envelope = CatalogEvent {
+            event_type: <MaterializationRecord as CatalogEventPayload>::EVENT_TYPE.to_string(),
+            event_version: 999,
+            idempotency_key: "test:key".to_string(),
+            occurred_at: Utc::now(),
+            source: "test".to_string(),
+            trace_id: None,
+            sequence_position: None,
+            payload: serde_json::json!({
+                "materialization_id": "mat_001",
+                "asset_id": "asset_abc",
+                "row_count": 1,
+                "byte_size": 1
+            }),
+        };
+
+        storage
+            .put_raw(
+                &ledger_path,
+                Bytes::from(serde_json::to_vec(&envelope).expect("serialize")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write");
+
+        let compactor = Compactor::new(storage);
+        let result = compactor.compact_domain(CatalogDomain::Executions).await;
+        assert!(
+            matches!(result, Err(CatalogError::InvariantViolation { .. })),
+            "unknown event_version should be rejected by default"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_event_version_can_be_quarantined() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage =
+            ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+
+        let tier1_writer = Tier1Writer::new(storage.clone());
+        tier1_writer.initialize().await.expect("init");
+
+        let event_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let ledger_path = CatalogPaths::ledger_event(CatalogDomain::Executions, event_id);
+
+        let envelope = CatalogEvent {
+            event_type: <MaterializationRecord as CatalogEventPayload>::EVENT_TYPE.to_string(),
+            event_version: 999,
+            idempotency_key: "test:key".to_string(),
+            occurred_at: Utc::now(),
+            source: "test".to_string(),
+            trace_id: None,
+            sequence_position: None,
+            payload: serde_json::json!({
+                "materialization_id": "mat_001",
+                "asset_id": "asset_abc",
+                "row_count": 1,
+                "byte_size": 1
+            }),
+        };
+
+        storage
+            .put_raw(
+                &ledger_path,
+                Bytes::from(serde_json::to_vec(&envelope).expect("serialize")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write");
+
+        let compactor = Compactor::new(storage.clone())
+            .with_unknown_event_policy(UnknownEventPolicy::Quarantine);
+        let result = compactor
+            .compact_domain(CatalogDomain::Executions)
+            .await
+            .expect("compact");
+        assert_eq!(result.events_processed, 1);
+        assert_eq!(result.parquet_files_written, 0);
+
+        let quarantined = storage
+            .list(&CatalogPaths::quarantine_dir(CatalogDomain::Executions))
+            .await
+            .expect("list quarantine");
+        assert_eq!(quarantined.len(), 1);
+        assert!(
+            quarantined[0]
+                .as_str()
+                .ends_with(&format!("{event_id}.json")),
+            "quarantine should preserve original filename"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_event_is_quarantined() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage =
+            ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+
+        let tier1_writer = Tier1Writer::new(storage.clone());
+        tier1_writer.initialize().await.expect("init");
+
+        let event_writer = EventWriter::new(storage.clone());
+        let id_high: EventId = "01ARZ3NDEKTSV4RRFFQ69G5FAZ".parse().expect("event id");
+        let id_mid: EventId = "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().expect("event id");
+
+        // First compaction establishes a watermark at `id_high`.
+        event_writer
+            .append_with_id(
+                CatalogDomain::Executions,
+                &MaterializationRecord {
+                    materialization_id: "mat_001".into(),
+                    asset_id: "asset_abc".into(),
+                    row_count: 300,
+                    byte_size: 3000,
+                },
+                &id_high,
+            )
+            .await
+            .expect("append high");
+
+        let compactor =
+            Compactor::new(storage.clone()).with_late_event_policy(LateEventPolicy::Quarantine);
+        compactor
+            .compact_domain(CatalogDomain::Executions)
+            .await
+            .expect("compact");
+
+        // Late arrival: a new event whose filename sorts at/before the watermark.
+        event_writer
+            .append_with_id(
+                CatalogDomain::Executions,
+                &MaterializationRecord {
+                    materialization_id: "mat_002".into(),
+                    asset_id: "asset_xyz".into(),
+                    row_count: 100,
+                    byte_size: 1000,
+                },
+                &id_mid,
+            )
+            .await
+            .expect("append mid (late)");
+
+        let result = compactor
+            .compact_domain(CatalogDomain::Executions)
+            .await
+            .expect("compact late");
+        assert_eq!(result.events_processed, 0);
+        assert_eq!(result.parquet_files_written, 0);
+        assert_eq!(result.new_watermark, format!("{id_high}.json"));
+
+        let quarantined = storage
+            .list(&CatalogPaths::quarantine_dir(CatalogDomain::Executions))
+            .await
+            .expect("list quarantine");
+        assert_eq!(quarantined.len(), 1);
+        assert!(quarantined[0].as_str().ends_with(&format!("{id_mid}.json")));
+    }
+
+    #[derive(Debug)]
+    struct BarrierBackend {
+        inner: Arc<MemoryBackend>,
+        cas_barrier: Arc<Barrier>,
+    }
+
+    impl BarrierBackend {
+        fn new(parties: usize) -> Self {
+            Self {
+                inner: Arc::new(MemoryBackend::new()),
+                cas_barrier: Arc::new(Barrier::new(parties)),
+            }
+        }
+
+        fn is_executions_manifest_path(path: &str) -> bool {
+            path.ends_with("/manifests/executions.manifest.json")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for BarrierBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            if Self::is_executions_manifest_path(path)
+                && matches!(precondition, WritePrecondition::MatchesVersion(_))
+            {
+                self.cas_barrier.wait().await;
+            }
+
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_compactors_retry_on_cas_conflict() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(BarrierBackend::new(2));
+        let storage =
+            ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+
+        let tier1_writer = Tier1Writer::new(storage.clone());
+        tier1_writer.initialize().await.expect("init");
+
+        let event_writer = EventWriter::new(storage.clone());
+        let event_id: EventId = "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().expect("event id");
+        event_writer
+            .append_with_id(
+                CatalogDomain::Executions,
+                &MaterializationRecord {
+                    materialization_id: "mat_001".into(),
+                    asset_id: "asset_abc".into(),
+                    row_count: 100,
+                    byte_size: 5000,
+                },
+                &event_id,
+            )
+            .await
+            .expect("append");
+
+        let compactor_a = Compactor::new(storage.clone())
+            .with_cas_retries(5)
+            .with_cas_backoff(Duration::from_millis(1), Duration::from_millis(1));
+        let compactor_b = Compactor::new(storage.clone())
+            .with_cas_retries(5)
+            .with_cas_backoff(Duration::from_millis(1), Duration::from_millis(1));
+
+        let (r1, r2) = tokio::join!(
+            compactor_a.compact_domain(CatalogDomain::Executions),
+            compactor_b.compact_domain(CatalogDomain::Executions)
+        );
+        let r1 = r1.expect("compactor A");
+        let r2 = r2.expect("compactor B");
+
+        assert_eq!(
+            r1.events_processed + r2.events_processed,
+            1,
+            "exactly one compactor should publish the snapshot; the other should retry and no-op"
         );
     }
 }

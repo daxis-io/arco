@@ -33,6 +33,8 @@
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 
+pub mod catalog_event;
+pub mod catalog_paths;
 pub mod error;
 pub mod id;
 pub mod observability;
@@ -49,8 +51,10 @@ pub mod tenant;
 /// use arco_core::prelude::*;
 /// ```
 pub mod prelude {
+    pub use crate::catalog_event::{CatalogEvent, CatalogEventPayload};
+    pub use crate::catalog_paths::{CatalogDomain, CatalogPaths};
     pub use crate::error::{Error, Result};
-    pub use crate::id::{AssetId, MaterializationId, RunId, TaskId};
+    pub use crate::id::{AssetId, EventId, MaterializationId, RunId, TaskId};
     pub use crate::partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
     pub use crate::scoped_storage::ScopedStorage;
     pub use crate::storage::{
@@ -60,8 +64,10 @@ pub mod prelude {
 }
 
 // Re-export key types at crate root for ergonomics
+pub use catalog_event::{CatalogEvent, CatalogEventPayload};
+pub use catalog_paths::{CatalogDomain, CatalogPaths};
 pub use error::{Error, Result};
-pub use id::{AssetId, MaterializationId, RunId, TaskId};
+pub use id::{AssetId, EventId, MaterializationId, RunId, TaskId};
 pub use observability::{LogFormat, init_logging};
 pub use partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
 pub use scoped_storage::ScopedStorage;

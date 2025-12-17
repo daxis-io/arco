@@ -2,6 +2,7 @@
 # https://embarkstudios.github.io/cargo-deny/
 #
 # Run with: cargo deny check
+# Version: cargo-deny 0.18+
 
 [graph]
 targets = [
@@ -15,14 +16,14 @@ all-features = true
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "deny"
-notice = "warn"
+# In cargo-deny 0.18+, all advisories are denied by default.
+# Use "workspace" to only fail on direct workspace dependencies.
+unmaintained = "workspace"
+# Use ignore = [] to ignore specific advisories if needed
 ignore = []
 
 [licenses]
-unlicensed = "deny"
+# All licenses not in 'allow' are denied by default (cargo-deny 0.18+)
 allow = [
     "MIT",
     "Apache-2.0",
@@ -33,12 +34,14 @@ allow = [
     "Zlib",
     "0BSD",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
-    "MPL-2.0",
 ]
-copyleft = "deny"
 confidence-threshold = 0.93
 exceptions = []
+
+# Workspace crates are private (not published) - exempt from license checks
+[licenses.private]
+ignore = true
+registries = []
 
 [[licenses.clarify]]
 name = "ring"
@@ -47,7 +50,8 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# Allow wildcards for workspace path dependencies (standard for monorepos)
+wildcards = "allow"
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"

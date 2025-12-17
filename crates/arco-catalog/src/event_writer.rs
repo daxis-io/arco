@@ -9,13 +9,17 @@
 //! File naming uses ULID `event_id` ONLY (no timestamp prefix) for idempotent writes.
 //! ULID's embedded timestamp ensures lexicographic ordering = chronological ordering.
 //! NOTE: Production should use micro-batched segments to avoid "too many small files".
+//!
+//! Ledger payloads are wrapped in the [`arco_core::CatalogEvent`] envelope (ADR-004) to
+//! support schema evolution and deduplication during compaction.
 
 use bytes::Bytes;
+use chrono::Utc;
 use serde::Serialize;
-use ulid::Ulid;
 
 use arco_core::scoped_storage::ScopedStorage;
 use arco_core::storage::WritePrecondition;
+use arco_core::{CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths, EventId};
 
 use crate::error::{CatalogError, Result};
 
@@ -33,13 +37,24 @@ use crate::error::{CatalogError, Result};
 /// 3. ULID's embedded timestamp maintains lexicographic = chronological ordering
 pub struct EventWriter {
     storage: ScopedStorage,
+    source: String,
 }
 
 impl EventWriter {
     /// Creates a new event writer.
     #[must_use]
     pub fn new(storage: ScopedStorage) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            source: "arco-catalog".to_string(),
+        }
+    }
+
+    /// Sets the `source` field written into the event envelope (ADR-004).
+    #[must_use]
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = source.into();
+        self
     }
 
     /// Appends an event to the ledger with an auto-generated ID.
@@ -49,8 +64,12 @@ impl EventWriter {
     /// # Errors
     ///
     /// Returns an error if serialization or storage fails.
-    pub async fn append<T: Serialize + Sync>(&self, domain: &str, event: &T) -> Result<String> {
-        let event_id = Ulid::new().to_string();
+    pub async fn append<T: CatalogEventPayload + Serialize + Sync>(
+        &self,
+        domain: CatalogDomain,
+        event: &T,
+    ) -> Result<EventId> {
+        let event_id = EventId::generate();
         self.append_with_id(domain, event, &event_id).await?;
         Ok(event_id)
     }
@@ -67,18 +86,44 @@ impl EventWriter {
     /// # Errors
     ///
     /// Returns an error if serialization or storage fails (NOT for duplicates).
-    pub async fn append_with_id<T: Serialize + Sync>(
+    pub async fn append_with_id<T: CatalogEventPayload + Serialize + Sync>(
         &self,
-        domain: &str,
+        domain: CatalogDomain,
         event: &T,
-        event_id: &str,
+        event_id: &EventId,
     ) -> Result<()> {
+        let event_type = T::EVENT_TYPE;
+        let event_version = T::EVENT_VERSION;
+        let idempotency_key =
+            CatalogEvent::<()>::generate_idempotency_key(event_type, event_version, event)
+                .map_err(|e| CatalogError::Serialization {
+                    message: format!("failed to generate idempotency key: {e}"),
+                })?;
+
+        let envelope = CatalogEvent {
+            event_type: event_type.to_string(),
+            event_version,
+            idempotency_key,
+            occurred_at: Utc::now(),
+            source: self.source.clone(),
+            trace_id: None,
+            sequence_position: None,
+            payload: event,
+        };
+
+        envelope
+            .validate()
+            .map_err(|e| CatalogError::InvariantViolation {
+                message: format!("invalid event envelope: {e}"),
+            })?;
+
         // CRITICAL: Use event_id ONLY (no timestamp prefix) for idempotent writes
         // ULID's embedded timestamp ensures lexicographic = chronological ordering
-        let path = format!("ledger/{domain}/{event_id}.json");
-        let json = serde_json::to_vec_pretty(event).map_err(|e| CatalogError::Serialization {
-            message: format!("failed to serialize event: {e}"),
-        })?;
+        let path = CatalogPaths::ledger_event(domain, &event_id.to_string());
+        let json =
+            serde_json::to_vec_pretty(&envelope).map_err(|e| CatalogError::Serialization {
+                message: format!("failed to serialize event: {e}"),
+            })?;
 
         // CRITICAL: Use DoesNotExist for true append-only semantics
         let result = self
@@ -94,7 +139,7 @@ impl EventWriter {
             arco_core::storage::WriteResult::Success { .. } => Ok(()),
             arco_core::storage::WriteResult::PreconditionFailed { .. } => {
                 // Duplicate delivery - this is OK, compactor will dedupe
-                tracing::debug!(event_id, "duplicate event delivery (already exists)");
+                tracing::debug!(event_id = %event_id, "duplicate event delivery (already exists)");
                 Ok(())
             }
         }
@@ -108,8 +153,8 @@ impl EventWriter {
     /// # Errors
     ///
     /// Returns an error if listing fails.
-    pub async fn list_events(&self, domain: &str) -> Result<Vec<String>> {
-        let prefix = format!("ledger/{domain}/");
+    pub async fn list_events(&self, domain: CatalogDomain) -> Result<Vec<String>> {
+        let prefix = CatalogPaths::ledger_dir(domain);
         // ScopedStorage.list() returns Vec<ScopedPath> - relative paths
         let mut files: Vec<_> = self
             .storage
@@ -155,6 +200,11 @@ mod tests {
         value: i32,
     }
 
+    impl CatalogEventPayload for TestEvent {
+        const EVENT_TYPE: &'static str = "test.event";
+        const EVENT_VERSION: u32 = 1;
+    }
+
     #[tokio::test]
     async fn append_event_creates_ledger_file() {
         let backend = Arc::new(MemoryBackend::new());
@@ -164,13 +214,31 @@ mod tests {
         let writer = EventWriter::new(storage.clone());
         let event = TestEvent { value: 42 };
 
-        let event_id = writer.append("execution", &event).await.expect("append");
+        let event_id = writer
+            .append(CatalogDomain::Executions, &event)
+            .await
+            .expect("append");
 
         // Verify file exists in ledger
-        let files = writer.list_events("execution").await.expect("list");
+        let files = writer
+            .list_events(CatalogDomain::Executions)
+            .await
+            .expect("list");
         assert_eq!(files.len(), 1);
         let file = files.first().expect("exactly one file");
-        assert!(file.contains(&event_id), "file should contain event ID");
+        assert!(
+            file.contains(&event_id.to_string()),
+            "file should contain event ID"
+        );
+
+        let data = storage.get_raw(file).await.expect("read event");
+        let stored: CatalogEvent<TestEvent> = serde_json::from_slice(&data).expect("parse");
+        stored.validate().expect("valid envelope");
+        assert_eq!(stored.event_type, "test.event");
+        assert_eq!(stored.event_version, 1);
+        assert!(!stored.idempotency_key.is_empty());
+        assert_eq!(stored.source, "arco-catalog");
+        assert_eq!(stored.payload.value, 42);
     }
 
     #[tokio::test]
@@ -182,31 +250,36 @@ mod tests {
         let writer = EventWriter::new(storage.clone());
         let event1 = TestEvent { value: 42 };
         let event2 = TestEvent { value: 99 };
-        let fixed_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let fixed_id: EventId = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+            .parse()
+            .expect("valid event id");
 
         // First write succeeds
         writer
-            .append_with_id("execution", &event1, fixed_id)
+            .append_with_id(CatalogDomain::Executions, &event1, &fixed_id)
             .await
             .expect("first");
 
         // Second write with same ID returns Ok but doesn't overwrite
         // (DoesNotExist precondition fails, but we handle gracefully)
         writer
-            .append_with_id("execution", &event2, fixed_id)
+            .append_with_id(CatalogDomain::Executions, &event2, &fixed_id)
             .await
             .expect("second should succeed (duplicate handled)");
 
         // Should still only have one file (DoesNotExist prevented overwrite)
-        let files = storage.list("ledger/execution/").await.expect("list");
+        let files = storage
+            .list(&CatalogPaths::ledger_dir(CatalogDomain::Executions))
+            .await
+            .expect("list");
         assert_eq!(files.len(), 1, "append-only: no duplicates created");
 
         // Original value preserved (not overwritten)
         let file = files.first().expect("exactly one file");
         let data = storage.get_raw(file.as_str()).await.expect("read");
-        let parsed: TestEvent = serde_json::from_slice(&data).expect("parse");
+        let stored: CatalogEvent<TestEvent> = serde_json::from_slice(&data).expect("parse");
         assert_eq!(
-            parsed.value, 42,
+            stored.payload.value, 42,
             "original event preserved, not overwritten"
         );
     }
@@ -222,11 +295,17 @@ mod tests {
         // Write 5 events
         for i in 0..5 {
             let event = TestEvent { value: i };
-            let _id = writer.append("execution", &event).await.expect("append");
+            let _id = writer
+                .append(CatalogDomain::Executions, &event)
+                .await
+                .expect("append");
         }
 
         // List files - EventWriter.list_events() sorts explicitly
-        let files = writer.list_events("execution").await.expect("list");
+        let files = writer
+            .list_events(CatalogDomain::Executions)
+            .await
+            .expect("list");
 
         // Verify ordering is maintained
         assert_eq!(files.len(), 5);

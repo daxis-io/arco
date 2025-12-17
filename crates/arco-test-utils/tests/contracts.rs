@@ -66,26 +66,42 @@ fn contract_plan_fingerprint_survives_serialization() {
     assert_eq!(plan.fingerprint, deserialized.fingerprint);
 }
 
-/// Contract: IDs are URL-safe (alphanumeric only).
+/// Contract: IDs follow ADR-002 format requirements.
+///
+/// Per ADR-002:
+/// - **Entity IDs** (AssetId): UUID v7 format (stable identity, time-sortable)
+/// - **Ordered log IDs** (RunId, TaskId): ULID format (lexicographically sortable, alphanumeric)
 #[test]
 fn contract_ids_are_url_safe() {
+    // ULID-based IDs should be URL-safe alphanumeric (26 chars)
     let task_id = TaskId::generate();
-    let asset_id = AssetId::generate();
     let run_id = RunId::generate();
 
-    let ids = [
-        task_id.to_string(),
-        asset_id.to_string(),
-        run_id.to_string(),
-    ];
-
-    for id in ids {
+    for (name, id) in [
+        ("TaskId", task_id.to_string()),
+        ("RunId", run_id.to_string()),
+    ] {
         assert!(
             id.chars().all(|c| c.is_ascii_alphanumeric()),
-            "ID {id} contains non-URL-safe characters",
+            "{name} {id} contains non-URL-safe characters (should be ULID format)",
         );
-        assert_eq!(id.len(), 26, "ULID should be 26 characters");
+        assert_eq!(id.len(), 26, "{name} should be 26 characters (ULID format)");
     }
+
+    // UUID v7-based IDs (AssetId) have hyphens but are still URL-safe when used in paths
+    let asset_id = AssetId::generate();
+    let asset_str = asset_id.to_string();
+    assert!(
+        asset_str
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-'),
+        "AssetId {asset_str} contains invalid characters (should be UUID v7 format)",
+    );
+    assert_eq!(
+        asset_str.len(),
+        36,
+        "AssetId should be 36 characters (UUID v7 format with hyphens)"
+    );
 }
 
 /// Contract: Event envelope follows our CatalogEvent spec (per unified design).

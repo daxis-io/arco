@@ -563,10 +563,8 @@ fn rand_jitter() -> u64 {
 ///
 /// These align with [`ScopedStorage`](arco_core::ScopedStorage) path helpers.
 pub mod paths {
-    /// Lock file for core manifest (Tier 1) operations.
-    ///
-    /// Aligns with `ScopedStorage::core_lock_path()`.
-    pub const CORE_LOCK: &str = "locks/core.lock";
+    /// Lock file for the catalog domain (Tier 1) operations.
+    pub const CATALOG_LOCK: &str = "locks/catalog.lock.json";
 
     /// Lock file prefix for asset-level locks (future use).
     pub const ASSET_LOCK_PREFIX: &str = "locks/assets/";
@@ -711,8 +709,7 @@ mod tests {
 
     #[test]
     fn test_paths() {
-        // Core lock aligns with ScopedStorage::core_lock_path()
-        assert_eq!(paths::CORE_LOCK, "locks/core.lock");
+        assert_eq!(paths::CATALOG_LOCK, "locks/catalog.lock.json");
         assert!(paths::ASSET_LOCK_PREFIX.starts_with("locks/"));
     }
 }

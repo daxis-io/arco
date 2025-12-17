@@ -20,6 +20,7 @@ use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::catalog_paths::{CatalogDomain, CatalogPaths};
 use crate::error::{Error, Result};
 use crate::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 
@@ -32,6 +33,21 @@ pub struct ScopedStorage {
     backend: Arc<dyn StorageBackend>,
     tenant_id: String,
     workspace_id: String,
+}
+
+/// Metadata about an object relative to a tenant/workspace scope.
+#[derive(Debug, Clone)]
+pub struct ScopedObjectMeta {
+    /// Object path relative to the scope (no `tenant=.../workspace=.../` prefix).
+    pub path: ScopedPath,
+    /// Object size in bytes.
+    pub size: u64,
+    /// Object version token for CAS operations.
+    pub version: String,
+    /// Last modification timestamp, if provided by the backend.
+    pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
+    /// Entity tag for cache validation.
+    pub etag: Option<String>,
 }
 
 impl ScopedStorage {
@@ -159,47 +175,75 @@ impl ScopedStorage {
         format!("{}/{}", self.scope_prefix(), path)
     }
 
-    // === Core Catalog Paths (Tier 1) ===
+    // =========================================================================
+    // LEGACY PATH HELPERS (deprecated per ADR-003)
     //
-    // Path conventions align with arco-catalog manifest.rs and lock.rs:
-    // - Manifests under `manifests/` (physically multi-file for reduced contention)
-    // - Locks under `locks/` (per lock.rs::paths conventions)
-    // - Snapshots and commits under `core/`
+    // These methods use old domain naming conventions (core, execution, governance).
+    // Use the canonical methods below (manifest, lock, snapshot_dir, etc.) instead.
+    //
+    // Deprecation timeline:
+    // - v0.1.x: Deprecated with warnings
+    // - v0.2.x: Removed
+    // =========================================================================
 
     /// Path to the root catalog manifest.
     ///
     /// This is the entry point - readers load this first to find domain manifests.
     #[must_use]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use `manifest_root()` instead. See ADR-003 for canonical domain naming."
+    )]
     pub fn root_manifest_path(&self) -> String {
         self.scoped_path("manifests/root.manifest.json")
     }
 
     /// Path to the core domain manifest.
     #[must_use]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use `manifest(CatalogDomain::Catalog)` instead. See ADR-003 for canonical domain naming."
+    )]
     pub fn core_manifest_path(&self) -> String {
         self.scoped_path("manifests/core.manifest.json")
     }
 
     /// Path to the execution domain manifest.
     #[must_use]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use `manifest(CatalogDomain::Executions)` instead. See ADR-003 for canonical domain naming."
+    )]
     pub fn execution_manifest_path(&self) -> String {
         self.scoped_path("manifests/execution.manifest.json")
     }
 
     /// Path to the distributed lock file for core catalog operations.
     #[must_use]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use `lock(CatalogDomain::Catalog)` instead. See ADR-003 for canonical domain naming."
+    )]
     pub fn core_lock_path(&self) -> String {
         self.scoped_path("locks/core.lock")
     }
 
     /// Path to a catalog snapshot directory.
     #[must_use]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use `snapshot_dir(CatalogDomain::Catalog, version)` instead. See ADR-003/ADR-005 for canonical paths."
+    )]
     pub fn core_snapshot_path(&self, version: u64) -> String {
         self.scoped_path(&format!("core/snapshots/v{version}/"))
     }
 
     /// Path to a specific commit record.
     #[must_use]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use `commit(CatalogDomain::Catalog, commit_id)` instead. See ADR-003/ADR-005 for canonical paths."
+    )]
     pub fn core_commit_path(&self, commit_id: &str) -> String {
         self.scoped_path(&format!("core/commits/{commit_id}.json"))
     }
@@ -208,6 +252,10 @@ impl ScopedStorage {
 
     /// Path to event log partition (domain/date).
     #[must_use]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use `ledger_dir(CatalogDomain)` or `ledger_event(CatalogDomain, event_id)` instead. See ADR-005 for canonical paths."
+    )]
     pub fn ledger_path(&self, domain: &str, date: &str) -> String {
         self.scoped_path(&format!("ledger/{domain}/{date}/"))
     }
@@ -216,6 +264,10 @@ impl ScopedStorage {
 
     /// Path to compacted state table.
     #[must_use]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use `state_dir(CatalogDomain)` or `state_snapshot(CatalogDomain, version, ulid)` instead. See ADR-005 for canonical paths."
+    )]
     pub fn state_path(&self, domain: &str, table: &str) -> String {
         self.scoped_path(&format!("state/{domain}/{table}/"))
     }
@@ -224,18 +276,30 @@ impl ScopedStorage {
 
     /// Path to lineage domain manifest.
     #[must_use]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use `manifest(CatalogDomain::Lineage)` instead. See ADR-003 for canonical domain naming."
+    )]
     pub fn lineage_manifest_path(&self) -> String {
         self.scoped_path("manifests/lineage.manifest.json")
     }
 
     /// Path to governance domain manifest.
     #[must_use]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use `manifest(CatalogDomain::Search)` instead. 'governance' is now 'search'. See ADR-003."
+    )]
     pub fn governance_manifest_path(&self) -> String {
         self.scoped_path("manifests/governance.manifest.json")
     }
 
     /// Path to lineage edges state.
     #[must_use]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use `state_dir(CatalogDomain::Lineage)` instead. See ADR-005 for canonical paths."
+    )]
     pub fn lineage_edges_path(&self) -> String {
         self.scoped_path("state/lineage/edges/")
     }
@@ -244,14 +308,91 @@ impl ScopedStorage {
 
     /// Path to governance tags table.
     #[must_use]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use `state_dir(CatalogDomain::Search)` instead. 'governance' is now 'search'. See ADR-003."
+    )]
     pub fn governance_tags_path(&self) -> String {
         self.scoped_path("governance/tags.parquet")
     }
 
     /// Path to governance owners table.
     #[must_use]
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use `state_dir(CatalogDomain::Search)` instead. 'governance' is now 'search'. See ADR-003."
+    )]
     pub fn governance_owners_path(&self) -> String {
         self.scoped_path("governance/owners.parquet")
+    }
+
+    // =========================================================================
+    // Canonical Path Methods (per ADR-003, ADR-005)
+    //
+    // These methods use CatalogPaths for consistency. Use these over the
+    // legacy methods above when writing new code.
+    // =========================================================================
+
+    /// Path to the root manifest (canonical).
+    ///
+    /// This is the entry point for all readers per ADR-005.
+    #[must_use]
+    pub fn manifest_root(&self) -> String {
+        self.scoped_path(CatalogPaths::ROOT_MANIFEST)
+    }
+
+    /// Path to a domain manifest (canonical).
+    #[must_use]
+    pub fn manifest(&self, domain: CatalogDomain) -> String {
+        self.scoped_path(&CatalogPaths::domain_manifest(domain))
+    }
+
+    /// Path to a domain lock file (canonical).
+    #[must_use]
+    pub fn lock(&self, domain: CatalogDomain) -> String {
+        self.scoped_path(&CatalogPaths::domain_lock(domain))
+    }
+
+    /// Path to a commit record (canonical).
+    #[must_use]
+    pub fn commit(&self, domain: CatalogDomain, commit_id: &str) -> String {
+        self.scoped_path(&CatalogPaths::commit(domain, commit_id))
+    }
+
+    /// Path to a Tier-1 snapshot directory (canonical).
+    #[must_use]
+    pub fn snapshot_dir(&self, domain: CatalogDomain, version: u64) -> String {
+        self.scoped_path(&CatalogPaths::snapshot_dir(domain, version))
+    }
+
+    /// Path to a Tier-1 snapshot file (canonical).
+    #[must_use]
+    pub fn snapshot_file(&self, domain: CatalogDomain, version: u64, filename: &str) -> String {
+        self.scoped_path(&CatalogPaths::snapshot_file(domain, version, filename))
+    }
+
+    /// Path to a Tier-2 ledger event (canonical).
+    #[must_use]
+    pub fn ledger_event(&self, domain: CatalogDomain, event_id: &str) -> String {
+        self.scoped_path(&CatalogPaths::ledger_event(domain, event_id))
+    }
+
+    /// Path to a Tier-2 ledger directory (canonical).
+    #[must_use]
+    pub fn ledger_dir(&self, domain: CatalogDomain) -> String {
+        self.scoped_path(&CatalogPaths::ledger_dir(domain))
+    }
+
+    /// Path to a Tier-2 state snapshot (canonical).
+    #[must_use]
+    pub fn state_snapshot(&self, domain: CatalogDomain, version: u64, ulid: &str) -> String {
+        self.scoped_path(&CatalogPaths::state_snapshot(domain, version, ulid))
+    }
+
+    /// Path to a Tier-2 state directory (canonical).
+    #[must_use]
+    pub fn state_dir(&self, domain: CatalogDomain) -> String {
+        self.scoped_path(&CatalogPaths::state_dir(domain))
     }
 
     // === High-Level Operations ===
@@ -261,6 +402,11 @@ impl ScopedStorage {
     /// # Errors
     ///
     /// Returns an error if the manifest is not found or a storage error occurs.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use canonical methods with CatalogDomain::Catalog. See ADR-003."
+    )]
+    #[allow(deprecated)]
     pub async fn get_core_manifest(&self) -> Result<Bytes> {
         self.backend.get(&self.core_manifest_path()).await
     }
@@ -270,6 +416,11 @@ impl ScopedStorage {
     /// # Errors
     ///
     /// Returns an error if a storage error occurs.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use canonical methods with CatalogDomain::Catalog. See ADR-003."
+    )]
+    #[allow(deprecated)]
     pub async fn put_core_manifest(
         &self,
         data: Bytes,
@@ -285,6 +436,11 @@ impl ScopedStorage {
     /// # Errors
     ///
     /// Returns an error if a storage error occurs.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use canonical methods with CatalogDomain::Catalog. See ADR-003."
+    )]
+    #[allow(deprecated)]
     pub async fn head_core_manifest(&self) -> Result<Option<ObjectMeta>> {
         self.backend.head(&self.core_manifest_path()).await
     }
@@ -352,6 +508,36 @@ impl ScopedStorage {
             .collect())
     }
 
+    /// Lists objects and returns metadata at a scope-relative prefix.
+    ///
+    /// Returned paths are relative to the scope and may be safely passed back to
+    /// other `ScopedStorage` methods (e.g., `get_raw`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the prefix contains traversal sequences or listing fails.
+    pub async fn list_meta(&self, prefix: &str) -> Result<Vec<ScopedObjectMeta>> {
+        Self::validate_path(prefix)?;
+        let full_prefix = self.scoped_path(prefix);
+        let scope_prefix = format!("{}/", self.scope_prefix());
+
+        let metas = self.backend.list(&full_prefix).await?;
+        Ok(metas
+            .into_iter()
+            .filter_map(|m| {
+                m.path
+                    .strip_prefix(&scope_prefix)
+                    .map(|relative| ScopedObjectMeta {
+                        path: ScopedPath(relative.to_string()),
+                        size: m.size,
+                        version: m.version,
+                        last_modified: m.last_modified,
+                        etag: m.etag,
+                    })
+            })
+            .collect())
+    }
+
     /// Gets metadata at a scope-relative path.
     ///
     /// # Errors
@@ -398,14 +584,18 @@ mod tests {
     use super::*;
     use crate::storage::MemoryBackend;
 
+    // =========================================================================
+    // Legacy Path Tests (backwards compatibility during migration)
+    // These tests verify deprecated methods still work correctly.
+    // =========================================================================
+
     #[test]
-    fn test_core_paths_match_architecture() {
+    #[allow(deprecated)]
+    fn test_legacy_core_paths() {
         let backend = Arc::new(MemoryBackend::new());
         let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
 
-        // Per unified platform design: tenant={tenant}/workspace={workspace}/...
-        // Key=value format for operational ergonomics (grep-friendly, self-documenting)
-        // Manifests under manifests/ (aligned with arco-catalog manifest.rs)
+        // Legacy paths still work (for backwards compatibility during migration)
         assert_eq!(
             storage.root_manifest_path(),
             "tenant=acme/workspace=production/manifests/root.manifest.json"
@@ -418,12 +608,10 @@ mod tests {
             storage.execution_manifest_path(),
             "tenant=acme/workspace=production/manifests/execution.manifest.json"
         );
-        // Locks under locks/ (aligned with arco-catalog lock.rs)
         assert_eq!(
             storage.core_lock_path(),
             "tenant=acme/workspace=production/locks/core.lock"
         );
-        // Snapshots and commits under core/
         assert_eq!(
             storage.core_snapshot_path(42),
             "tenant=acme/workspace=production/core/snapshots/v42/"
@@ -435,7 +623,8 @@ mod tests {
     }
 
     #[test]
-    fn test_ledger_paths_match_architecture() {
+    #[allow(deprecated)]
+    fn test_legacy_ledger_paths() {
         let backend = Arc::new(MemoryBackend::new());
         let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
 
@@ -454,7 +643,8 @@ mod tests {
     }
 
     #[test]
-    fn test_state_paths_match_architecture() {
+    #[allow(deprecated)]
+    fn test_legacy_state_paths() {
         let backend = Arc::new(MemoryBackend::new());
         let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
 
@@ -469,7 +659,8 @@ mod tests {
     }
 
     #[test]
-    fn test_governance_paths_match_architecture() {
+    #[allow(deprecated)]
+    fn test_legacy_governance_paths() {
         let backend = Arc::new(MemoryBackend::new());
         let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
 
@@ -552,11 +743,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_catalog_path_operations() {
+    #[allow(deprecated)]
+    async fn test_legacy_catalog_path_operations() {
         let backend = Arc::new(MemoryBackend::new());
         let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
 
-        // Write to core manifest path
+        // Write to core manifest path (legacy method, testing backwards compatibility)
         let manifest_data = Bytes::from(r#"{"version": 1}"#);
         storage
             .put_core_manifest(manifest_data.clone(), WritePrecondition::None)
@@ -767,5 +959,96 @@ mod tests {
 
         let data = storage.get_raw("file.txt").await.expect("get");
         assert_eq!(data, Bytes::from("data"));
+    }
+
+    // =========================================================================
+    // Canonical Path Tests (ADR-003, ADR-005)
+    // =========================================================================
+
+    #[test]
+    fn test_canonical_manifest_paths() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
+
+        assert_eq!(
+            storage.manifest_root(),
+            "tenant=acme/workspace=production/manifests/root.manifest.json"
+        );
+        assert_eq!(
+            storage.manifest(CatalogDomain::Catalog),
+            "tenant=acme/workspace=production/manifests/catalog.manifest.json"
+        );
+        assert_eq!(
+            storage.manifest(CatalogDomain::Lineage),
+            "tenant=acme/workspace=production/manifests/lineage.manifest.json"
+        );
+        assert_eq!(
+            storage.manifest(CatalogDomain::Executions),
+            "tenant=acme/workspace=production/manifests/executions.manifest.json"
+        );
+        assert_eq!(
+            storage.manifest(CatalogDomain::Search),
+            "tenant=acme/workspace=production/manifests/search.manifest.json"
+        );
+    }
+
+    #[test]
+    fn test_canonical_lock_paths() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
+
+        assert_eq!(
+            storage.lock(CatalogDomain::Catalog),
+            "tenant=acme/workspace=production/locks/catalog.lock.json"
+        );
+        assert_eq!(
+            storage.lock(CatalogDomain::Lineage),
+            "tenant=acme/workspace=production/locks/lineage.lock.json"
+        );
+    }
+
+    #[test]
+    fn test_canonical_snapshot_paths() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
+
+        assert_eq!(
+            storage.snapshot_dir(CatalogDomain::Catalog, 42),
+            "tenant=acme/workspace=production/snapshots/catalog/v42/"
+        );
+        assert_eq!(
+            storage.snapshot_file(CatalogDomain::Catalog, 42, "namespaces.parquet"),
+            "tenant=acme/workspace=production/snapshots/catalog/v42/namespaces.parquet"
+        );
+    }
+
+    #[test]
+    fn test_canonical_ledger_paths() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
+
+        assert_eq!(
+            storage.ledger_dir(CatalogDomain::Executions),
+            "tenant=acme/workspace=production/ledger/executions/"
+        );
+        assert_eq!(
+            storage.ledger_event(CatalogDomain::Executions, "01ARZ3NDEK"),
+            "tenant=acme/workspace=production/ledger/executions/01ARZ3NDEK.json"
+        );
+    }
+
+    #[test]
+    fn test_canonical_state_paths() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
+
+        assert_eq!(
+            storage.state_dir(CatalogDomain::Executions),
+            "tenant=acme/workspace=production/state/executions/"
+        );
+        assert_eq!(
+            storage.state_snapshot(CatalogDomain::Executions, 1, "01ARZ3NDEK"),
+            "tenant=acme/workspace=production/state/executions/snapshot_v1_01ARZ3NDEK.parquet"
+        );
     }
 }

@@ -75,7 +75,7 @@ async fn test_many_concurrent_updates() {
 
                 writer
                     .update(|manifest| {
-                        manifest.core.snapshot_version += 1;
+                        manifest.snapshot_version += 1;
                         Ok(())
                     })
                     .await
@@ -98,7 +98,7 @@ async fn test_many_concurrent_updates() {
 
     let final_manifest = writer.read_manifest().await.unwrap();
     assert_eq!(
-        final_manifest.core.snapshot_version,
+        final_manifest.catalog.snapshot_version,
         u64::from(num_writers),
         "version should equal number of updates"
     );
@@ -119,7 +119,7 @@ async fn test_loser_can_retry() {
 
     writer1
         .update(|m| {
-            m.core.snapshot_version = 1;
+            m.snapshot_version = 1;
             Ok(())
         })
         .await
@@ -127,12 +127,12 @@ async fn test_loser_can_retry() {
 
     writer2
         .update(|m| {
-            m.core.snapshot_version = 2;
+            m.snapshot_version = 2;
             Ok(())
         })
         .await
         .unwrap();
 
     let final_manifest = writer1.read_manifest().await.unwrap();
-    assert_eq!(final_manifest.core.snapshot_version, 2);
+    assert_eq!(final_manifest.catalog.snapshot_version, 2);
 }

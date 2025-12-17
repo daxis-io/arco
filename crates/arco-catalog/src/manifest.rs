@@ -2,10 +2,10 @@
 //!
 //! The catalog uses separate manifest files to reduce contention:
 //! - `root.manifest.json`: Pointers to domain manifests
-//! - `core.manifest.json`: Tier 1 (assets, schemas) - locked writes
-//! - `execution.manifest.json`: Tier 2 (materializations) - compactor writes
-//! - `lineage.manifest.json`: Tier 2 (dependency edges)
-//! - `governance.manifest.json`: Tier 2 (tags, owners)
+//! - `catalog.manifest.json`: Tier 1 (namespaces, tables, columns) - locked writes
+//! - `lineage.manifest.json`: Tier 1 (dependency edges) - locked writes
+//! - `executions.manifest.json`: Tier 2 (execution state) - compactor writes
+//! - `search.manifest.json`: Tier 1 (token postings) - locked writes
 //!
 //! Each domain manifest is a separate file that can be updated independently.
 //!
@@ -14,12 +14,13 @@
 //! ```text
 //! tenant={tenant}/workspace={workspace}/manifests/
 //! ├── root.manifest.json        # Root pointer to domain manifests
-//! ├── core.manifest.json        # Tier 1: Assets, schemas (locked writes)
-//! ├── execution.manifest.json   # Tier 2: Materializations (compactor writes)
-//! ├── lineage.manifest.json     # Tier 2: Dependency edges
-//! └── governance.manifest.json  # Tier 2: Tags, owners
+//! ├── catalog.manifest.json     # Tier 1: Catalog state (locked writes)
+//! ├── lineage.manifest.json     # Tier 1: Lineage state (locked writes)
+//! ├── executions.manifest.json  # Tier 2: Execution state (compactor writes)
+//! └── search.manifest.json      # Tier 1: Search state (locked writes)
 //! ```
 
+use arco_core::{CatalogDomain, CatalogPaths};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,19 +40,24 @@ pub struct RootManifest {
     /// Manifest schema version.
     pub version: u32,
 
-    /// Path to core domain manifest (required).
-    pub core_manifest_path: String,
+    /// Path to catalog domain manifest.
+    #[serde(alias = "coreManifestPath")]
+    pub catalog_manifest_path: String,
 
-    /// Path to execution domain manifest (required).
-    pub execution_manifest_path: String,
+    /// Path to lineage domain manifest.
+    #[serde(default = "RootManifest::default_lineage_manifest_path")]
+    pub lineage_manifest_path: String,
 
-    /// Path to lineage domain manifest (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lineage_manifest_path: Option<String>,
+    /// Path to executions domain manifest.
+    #[serde(alias = "executionManifestPath")]
+    pub executions_manifest_path: String,
 
-    /// Path to governance domain manifest (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub governance_manifest_path: Option<String>,
+    /// Path to search domain manifest.
+    #[serde(
+        default = "RootManifest::default_search_manifest_path",
+        alias = "governanceManifestPath"
+    )]
+    pub search_manifest_path: String,
 
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
@@ -63,12 +69,42 @@ impl RootManifest {
     pub fn new() -> Self {
         Self {
             version: 1,
-            core_manifest_path: "manifests/core.manifest.json".into(),
-            execution_manifest_path: "manifests/execution.manifest.json".into(),
-            lineage_manifest_path: None,
-            governance_manifest_path: None,
+            catalog_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Catalog),
+            lineage_manifest_path: Self::default_lineage_manifest_path(),
+            executions_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Executions),
+            search_manifest_path: Self::default_search_manifest_path(),
             updated_at: Utc::now(),
         }
+    }
+
+    fn default_lineage_manifest_path() -> String {
+        CatalogPaths::domain_manifest(CatalogDomain::Lineage)
+    }
+
+    fn default_search_manifest_path() -> String {
+        CatalogPaths::domain_manifest(CatalogDomain::Search)
+    }
+
+    /// Normalizes legacy manifest paths to canonical paths.
+    ///
+    /// Supports migrations from older domain names (e.g., `core` → `catalog`).
+    pub fn normalize_paths(&mut self) {
+        self.catalog_manifest_path = Self::normalize_manifest_path(&self.catalog_manifest_path);
+        self.lineage_manifest_path = Self::normalize_manifest_path(&self.lineage_manifest_path);
+        self.executions_manifest_path =
+            Self::normalize_manifest_path(&self.executions_manifest_path);
+        self.search_manifest_path = Self::normalize_manifest_path(&self.search_manifest_path);
+    }
+
+    fn normalize_manifest_path(path: &str) -> String {
+        let Some(domain) = path
+            .strip_prefix("manifests/")
+            .and_then(|p| p.strip_suffix(".manifest.json"))
+        else {
+            return path.to_string();
+        };
+
+        CatalogPaths::domain_manifest_str(domain)
     }
 }
 
@@ -82,12 +118,12 @@ impl Default for RootManifest {
 // Domain Manifests (each is a separate file)
 // ============================================================================
 
-/// Core catalog manifest (Tier 1) - separate file.
+/// Catalog domain manifest (Tier 1) - separate file.
 ///
 /// Written via locking protocol. Contains assets, schemas.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CoreManifest {
+pub struct CatalogDomainManifest {
     /// Current snapshot version.
     pub snapshot_version: u64,
 
@@ -102,13 +138,13 @@ pub struct CoreManifest {
     pub updated_at: DateTime<Utc>,
 }
 
-impl CoreManifest {
-    /// Creates a new core manifest.
+impl CatalogDomainManifest {
+    /// Creates a new catalog domain manifest.
     #[must_use]
     pub fn new() -> Self {
         Self {
             snapshot_version: 0,
-            snapshot_path: "core/snapshots/v0/".into(),
+            snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 0),
             last_commit_id: None,
             updated_at: Utc::now(),
         }
@@ -121,11 +157,14 @@ impl CoreManifest {
     }
 }
 
-impl Default for CoreManifest {
+impl Default for CatalogDomainManifest {
     fn default() -> Self {
         Self::new()
     }
 }
+
+/// Backwards-compatible alias for older naming.
+pub type CoreManifest = CatalogDomainManifest;
 
 /// Metadata about compaction operations.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -139,7 +178,7 @@ pub struct CompactionMetadata {
     pub total_files_written: u64,
 }
 
-/// Execution manifest (Tier 2) - separate file.
+/// Executions manifest (Tier 2) - separate file.
 ///
 /// Written ONLY by compactor. Contains materializations, partitions.
 ///
@@ -147,7 +186,7 @@ pub struct CompactionMetadata {
 /// snapshot. A snapshot isn't visible until manifest CAS succeeds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExecutionManifest {
+pub struct ExecutionsManifest {
     /// Watermark version (last compacted event).
     pub watermark_version: u64,
 
@@ -188,13 +227,16 @@ pub struct ExecutionManifest {
     pub updated_at: DateTime<Utc>,
 }
 
-impl ExecutionManifest {
-    /// Creates a new execution manifest.
+impl ExecutionsManifest {
+    /// Creates a new executions manifest.
     #[must_use]
     pub fn new() -> Self {
         Self {
             watermark_version: 0,
-            checkpoint_path: "state/execution/checkpoint.json".into(),
+            checkpoint_path: format!(
+                "{}checkpoint.json",
+                CatalogPaths::state_dir(CatalogDomain::Executions)
+            ),
             snapshot_path: None,
             snapshot_version: 0,
             watermark_event_id: None,
@@ -206,13 +248,16 @@ impl ExecutionManifest {
     }
 }
 
-impl Default for ExecutionManifest {
+impl Default for ExecutionsManifest {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Lineage manifest (Tier 2) - separate file.
+/// Backwards-compatible alias for older naming.
+pub type ExecutionManifest = ExecutionsManifest;
+
+/// Lineage manifest (Tier 1) - separate file.
 ///
 /// Contains dependency edges between assets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,7 +279,7 @@ impl LineageManifest {
     pub fn new() -> Self {
         Self {
             snapshot_version: 0,
-            edges_path: "state/lineage/edges/".into(),
+            edges_path: CatalogPaths::snapshot_dir(CatalogDomain::Lineage, 0),
             updated_at: Utc::now(),
         }
     }
@@ -246,39 +291,42 @@ impl Default for LineageManifest {
     }
 }
 
-/// Governance manifest (Tier 2) - separate file.
+/// Search manifest (Tier 1) - separate file.
 ///
-/// Contains tags, owners, access policies.
+/// Contains derived search state (e.g., token postings).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GovernanceManifest {
+pub struct SearchManifest {
     /// Snapshot version.
     pub snapshot_version: u64,
 
-    /// Path to governance Parquet files.
+    /// Path to search Parquet files.
     pub base_path: String,
 
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
 }
 
-impl GovernanceManifest {
-    /// Creates a new governance manifest.
+impl SearchManifest {
+    /// Creates a new search manifest.
     #[must_use]
     pub fn new() -> Self {
         Self {
             snapshot_version: 0,
-            base_path: "governance/".into(),
+            base_path: CatalogPaths::snapshot_dir(CatalogDomain::Search, 0),
             updated_at: Utc::now(),
         }
     }
 }
 
-impl Default for GovernanceManifest {
+impl Default for SearchManifest {
     fn default() -> Self {
         Self::new()
     }
 }
+
+/// Backwards-compatible alias for older naming.
+pub type GovernanceManifest = SearchManifest;
 
 // ============================================================================
 // Commit Record (hash chain for audit trail)
@@ -390,17 +438,17 @@ pub struct CatalogManifest {
     /// Manifest schema version.
     pub version: u32,
 
-    /// Core domain (assets, schemas).
-    pub core: CoreManifest,
+    /// Catalog domain (namespaces, tables, columns).
+    pub catalog: CatalogDomainManifest,
 
-    /// Execution domain (materializations).
-    pub execution: ExecutionManifest,
+    /// Executions domain (Tier 2 materializations and execution state).
+    pub executions: ExecutionsManifest,
 
-    /// Lineage domain (optional).
-    pub lineage: Option<LineageManifest>,
+    /// Lineage domain.
+    pub lineage: LineageManifest,
 
-    /// Governance domain (optional).
-    pub governance: Option<GovernanceManifest>,
+    /// Search domain.
+    pub search: SearchManifest,
 
     /// Creation timestamp.
     pub created_at: DateTime<Utc>,
@@ -416,19 +464,19 @@ impl CatalogManifest {
         let now = Utc::now();
         Self {
             version: 1,
-            core: CoreManifest::new(),
-            execution: ExecutionManifest::new(),
-            lineage: None,
-            governance: None,
+            catalog: CatalogDomainManifest::new(),
+            executions: ExecutionsManifest::new(),
+            lineage: LineageManifest::new(),
+            search: SearchManifest::new(),
             created_at: now,
             updated_at: now,
         }
     }
 
-    /// Returns the next core snapshot version.
+    /// Returns the next catalog snapshot version.
     #[must_use]
-    pub fn next_core_version(&self) -> u64 {
-        self.core.snapshot_version + 1
+    pub fn next_catalog_version(&self) -> u64 {
+        self.catalog.snapshot_version + 1
     }
 
     /// Updates the manifest timestamp.
@@ -443,28 +491,6 @@ impl Default for CatalogManifest {
     }
 }
 
-// ============================================================================
-// Manifest Paths
-// ============================================================================
-
-/// Standard manifest file names.
-pub mod paths {
-    /// Root manifest file name.
-    pub const ROOT_MANIFEST: &str = "manifests/root.manifest.json";
-
-    /// Core domain manifest file name.
-    pub const CORE_MANIFEST: &str = "manifests/core.manifest.json";
-
-    /// Execution domain manifest file name.
-    pub const EXECUTION_MANIFEST: &str = "manifests/execution.manifest.json";
-
-    /// Lineage domain manifest file name.
-    pub const LINEAGE_MANIFEST: &str = "manifests/lineage.manifest.json";
-
-    /// Governance domain manifest file name.
-    pub const GOVERNANCE_MANIFEST: &str = "manifests/governance.manifest.json";
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,31 +503,72 @@ mod tests {
 
         // Root should only have paths, not embedded content
         assert_eq!(root.version, 1);
-        assert_eq!(root.core_manifest_path, "manifests/core.manifest.json");
         assert_eq!(
-            root.execution_manifest_path,
-            "manifests/execution.manifest.json"
+            root.catalog_manifest_path,
+            CatalogPaths::domain_manifest(CatalogDomain::Catalog)
         );
-        assert!(root.lineage_manifest_path.is_none());
-        assert!(root.governance_manifest_path.is_none());
+        assert_eq!(
+            root.lineage_manifest_path,
+            CatalogPaths::domain_manifest(CatalogDomain::Lineage)
+        );
+        assert_eq!(
+            root.executions_manifest_path,
+            CatalogPaths::domain_manifest(CatalogDomain::Executions)
+        );
+        assert_eq!(
+            root.search_manifest_path,
+            CatalogPaths::domain_manifest(CatalogDomain::Search)
+        );
     }
 
     #[test]
     fn test_root_manifest_roundtrip() {
         let root = RootManifest {
             version: 1,
-            core_manifest_path: "manifests/core.manifest.json".into(),
-            execution_manifest_path: "manifests/execution.manifest.json".into(),
-            lineage_manifest_path: Some("manifests/lineage.manifest.json".into()),
-            governance_manifest_path: None,
+            catalog_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Catalog),
+            lineage_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Lineage),
+            executions_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Executions),
+            search_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Search),
             updated_at: Utc::now(),
         };
 
         let json = serde_json::to_string_pretty(&root).expect("serialize");
         let parsed: RootManifest = serde_json::from_str(&json).expect("parse");
 
-        assert_eq!(parsed.core_manifest_path, root.core_manifest_path);
-        assert!(parsed.lineage_manifest_path.is_some());
+        assert_eq!(parsed.catalog_manifest_path, root.catalog_manifest_path);
+    }
+
+    #[test]
+    fn test_root_manifest_accepts_legacy_fields() {
+        let now = Utc::now();
+        let legacy = serde_json::json!({
+          "version": 1,
+          "coreManifestPath": "manifests/core.manifest.json",
+          "executionManifestPath": "manifests/execution.manifest.json",
+          "updatedAt": now,
+        });
+
+        let parsed: RootManifest =
+            serde_json::from_value(legacy).expect("legacy root manifest should parse");
+
+        assert_eq!(
+            parsed.catalog_manifest_path, "manifests/core.manifest.json",
+            "legacy field should map to catalog_manifest_path"
+        );
+        assert_eq!(
+            parsed.executions_manifest_path, "manifests/execution.manifest.json",
+            "legacy field should map to executions_manifest_path"
+        );
+        assert_eq!(
+            parsed.lineage_manifest_path,
+            CatalogPaths::domain_manifest(CatalogDomain::Lineage),
+            "missing lineage path should default"
+        );
+        assert_eq!(
+            parsed.search_manifest_path,
+            CatalogPaths::domain_manifest(CatalogDomain::Search),
+            "missing search path should default"
+        );
     }
 
     // === Domain Manifest Tests (each domain is separate file) ===
@@ -528,16 +595,19 @@ mod tests {
         let now = Utc::now();
         let core = CoreManifest {
             snapshot_version: 42,
-            snapshot_path: "core/snapshots/v42/".into(),
+            snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 42),
             last_commit_id: Some("commit_abc".into()),
             updated_at: now,
         };
 
         let exec = ExecutionManifest {
             watermark_version: 100,
-            checkpoint_path: "state/execution/checkpoint.json".into(),
+            checkpoint_path: format!(
+                "{}checkpoint.json",
+                CatalogPaths::state_dir(CatalogDomain::Executions)
+            ),
             snapshot_path: Some(
-                "state/execution/snapshot_v5_01ARZ3NDEKTSV4RRFFQ69G5FAV.parquet".into(),
+                "state/executions/snapshot_v5_01ARZ3NDEKTSV4RRFFQ69G5FAV.parquet".into(),
             ),
             snapshot_version: 5,
             watermark_event_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV.json".into()),
@@ -555,8 +625,8 @@ mod tests {
         let exec_json = serde_json::to_string(&exec).expect("exec");
 
         // They are separate - updating one doesn't touch the other
-        assert!(!core_json.contains("watermark"));
-        assert!(!exec_json.contains("snapshot_version"));
+        assert!(!core_json.contains("watermarkVersion"));
+        assert!(!exec_json.contains("lastCommitId"));
     }
 
     // === Commit Record Tests (hash chain integrity) ===
@@ -626,34 +696,30 @@ mod tests {
     #[test]
     fn test_next_version() {
         let mut manifest = CatalogManifest::new();
-        assert_eq!(manifest.next_core_version(), 1);
+        assert_eq!(manifest.next_catalog_version(), 1);
 
-        manifest.core.snapshot_version = 5;
-        assert_eq!(manifest.next_core_version(), 6);
-    }
-
-    #[test]
-    fn test_manifest_paths() {
-        assert_eq!(paths::ROOT_MANIFEST, "manifests/root.manifest.json");
-        assert_eq!(paths::CORE_MANIFEST, "manifests/core.manifest.json");
-        assert_eq!(
-            paths::EXECUTION_MANIFEST,
-            "manifests/execution.manifest.json"
-        );
+        manifest.catalog.snapshot_version = 5;
+        assert_eq!(manifest.next_catalog_version(), 6);
     }
 
     #[test]
     fn test_lineage_manifest_structure() {
         let lineage = LineageManifest::new();
         assert_eq!(lineage.snapshot_version, 0);
-        assert_eq!(lineage.edges_path, "state/lineage/edges/");
+        assert_eq!(
+            lineage.edges_path,
+            CatalogPaths::snapshot_dir(CatalogDomain::Lineage, 0)
+        );
     }
 
     #[test]
     fn test_governance_manifest_structure() {
         let gov = GovernanceManifest::new();
         assert_eq!(gov.snapshot_version, 0);
-        assert_eq!(gov.base_path, "governance/");
+        assert_eq!(
+            gov.base_path,
+            CatalogPaths::snapshot_dir(CatalogDomain::Search, 0)
+        );
     }
 
     #[test]

@@ -27,20 +27,22 @@
 //! tenant={tenant}/workspace={workspace}/
 //! ├── manifests/                    # Tier 1: Multi-file manifest structure
 //! │   ├── root.manifest.json        # Root manifest (points to domain manifests)
-//! │   ├── core.manifest.json        # Core catalog state (assets, versions)
-//! │   ├── execution.manifest.json   # Execution state (watermarks, compaction)
-//! │   ├── lineage.manifest.json     # Optional: Lineage domain manifest
-//! │   └── governance.manifest.json  # Optional: Governance domain manifest
+//! │   ├── catalog.manifest.json     # Catalog state (locked writes)
+//! │   ├── lineage.manifest.json     # Lineage state (locked writes)
+//! │   ├── executions.manifest.json  # Execution state (compactor writes)
+//! │   └── search.manifest.json      # Search state (locked writes)
 //! ├── locks/
-//! │   └── core.lock                 # Distributed lock for Tier 1 operations
-//! ├── core/
-//! │   ├── snapshots/                # Tier 1: Immutable catalog snapshots (Parquet)
-//! │   └── commits/                  # Commit records (audit trail)
+//! │   ├── catalog.lock.json         # Distributed lock per domain
+//! │   ├── lineage.lock.json
+//! │   ├── executions.lock.json
+//! │   └── search.lock.json
+//! ├── commits/                      # Tier 1 audit chain (per domain)
+//! ├── snapshots/                    # Tier 1: Immutable snapshots (Parquet)
 //! └── ledger/                       # Tier 2: Append-only event log
 //! ```
 //!
 //! The multi-file manifest structure reduces contention by separating domains
-//! (core, execution, lineage, governance) into independent files.
+//! (catalog, lineage, executions, search) into independent files.
 //!
 //! ## Example
 //!
@@ -57,7 +59,7 @@
 //!
 //! // Update catalog with CAS semantics
 //! let commit = writer.update(|manifest| {
-//!     manifest.core.snapshot_version = 1;
+//!     manifest.snapshot_version = 1;
 //!     Ok(())
 //! }).await?;
 //! ```
@@ -85,15 +87,16 @@ pub use error::{CatalogError, Result};
 pub use event_writer::EventWriter;
 pub use lock::{DistributedLock, LockGuard, LockInfo};
 pub use manifest::{
-    CatalogManifest, CommitRecord, CompactionMetadata, CoreManifest, ExecutionManifest,
-    GovernanceManifest, LineageManifest, RootManifest,
+    CatalogDomainManifest, CatalogManifest, CommitRecord, CompactionMetadata, CoreManifest,
+    ExecutionManifest, ExecutionsManifest, GovernanceManifest, LineageManifest, RootManifest,
+    SearchManifest,
 };
 pub use tier1_writer::Tier1Writer;
 
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::asset::{Asset, AssetFormat, AssetKey, CreateAssetRequest};
-    pub use crate::manifest::{CatalogManifest, CommitRecord, CoreManifest, RootManifest};
+    pub use crate::manifest::{CatalogDomainManifest, CatalogManifest, CommitRecord, RootManifest};
     pub use crate::reader::CatalogReader;
     pub use crate::tier1_writer::Tier1Writer;
     pub use crate::writer::CatalogWriter;

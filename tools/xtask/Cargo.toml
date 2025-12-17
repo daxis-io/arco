@@ -9,3 +9,5 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 walkdir = "2"
 toml = "0.8"
+semver = "1"
+serde_yaml = "0.9"

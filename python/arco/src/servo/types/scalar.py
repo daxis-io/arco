@@ -73,8 +73,7 @@ class ScalarValue:
                 "See: canonical serialization rules in design docs."
             )
         if isinstance(v, datetime):
-            if v.tzinfo is None:
-                v = v.replace(tzinfo=UTC)
+            v = v.replace(tzinfo=UTC) if v.tzinfo is None else v.astimezone(UTC)
             # ISO 8601 with milliseconds and Z suffix
             iso = v.strftime("%Y-%m-%dT%H:%M:%S.") + f"{v.microsecond // 1000:03d}Z"
             return cls(kind="timestamp", value=iso)

@@ -11,11 +11,19 @@ import hashlib
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import Enum
 from typing import Literal
 
 from servo.types.scalar import PartitionDimensionValue, ScalarValue
+
+
+def _canonicalize_date(value: date, granularity: Literal["year", "month", "day", "hour"]) -> str:
+    if granularity == "month":
+        return value.strftime("%Y-%m")
+    if granularity == "year":
+        return str(value.year)
+    return value.isoformat()
 
 
 class DimensionKind(str, Enum):
@@ -57,17 +65,12 @@ class TimeDimension(PartitionDimension):
         if isinstance(value, str):
             return value
         if isinstance(value, datetime):
+            value = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
             if self.granularity == "hour":
                 return value.strftime("%Y-%m-%dT%H:00:00Z")
             value = value.date()
         if isinstance(value, date):
-            if self.granularity == "day":
-                return value.isoformat()
-            if self.granularity == "month":
-                return value.strftime("%Y-%m")
-            if self.granularity == "year":
-                return str(value.year)
-            return value.isoformat()
+            return _canonicalize_date(value, self.granularity)
         return str(value)
 
 

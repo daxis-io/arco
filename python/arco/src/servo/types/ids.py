@@ -7,20 +7,22 @@ All IDs use ULID format for:
 """
 from __future__ import annotations
 
-import re
-
 import ulid
 
-# ULID validation regex (26 alphanumeric characters)
-_ULID_PATTERN = re.compile(r"^[0-9A-Za-z]{26}$")
+_ULID_LENGTH = 26
 
 
 def _validate_ulid(value: str) -> str:
     """Validate ULID format and normalize to uppercase."""
-    if not _ULID_PATTERN.match(value):
-        msg = f"Invalid ULID format: {value!r} (must be 26 alphanumeric characters)"
+    if len(value) != _ULID_LENGTH:
+        msg = f"Invalid ULID format: {value!r} (must be {_ULID_LENGTH} characters)"
         raise ValueError(msg)
-    return value.upper()
+    try:
+        parsed = ulid.from_str(value)
+    except ValueError as exc:
+        msg = f"Invalid ULID format: {value!r}"
+        raise ValueError(msg) from exc
+    return str(parsed)
 
 
 def _generate_ulid() -> str:

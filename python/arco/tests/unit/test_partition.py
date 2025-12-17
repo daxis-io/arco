@@ -1,9 +1,12 @@
 """Tests for partition types."""
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
+
+from servo.types.partition import DailyPartition, PartitionKey, PartitionStrategy
+from servo.types.scalar import ScalarValue
 
 
 class TestScalarValue:
@@ -11,42 +14,40 @@ class TestScalarValue:
 
     def test_string_value(self) -> None:
         """String scalars serialize correctly."""
-        from servo.types.scalar import ScalarValue
-
         sv = ScalarValue.from_value("hello")
         assert sv.kind == "string"
         assert sv.value == "hello"
 
     def test_int_value(self) -> None:
         """Integer scalars serialize correctly."""
-        from servo.types.scalar import ScalarValue
-
         sv = ScalarValue.from_value(42)
         assert sv.kind == "int64"
         assert sv.value == 42
 
     def test_date_value(self) -> None:
         """Date scalars use YYYY-MM-DD format."""
-        from servo.types.scalar import ScalarValue
-
         sv = ScalarValue.from_value(date(2025, 1, 15))
         assert sv.kind == "date"
         assert sv.value == "2025-01-15"
 
     def test_bool_value(self) -> None:
         """Boolean scalars serialize correctly."""
-        from servo.types.scalar import ScalarValue
-
         sv = ScalarValue.from_value(True)
         assert sv.kind == "bool"
         assert sv.value is True
 
     def test_rejects_float(self) -> None:
         """Floats are prohibited in partition keys."""
-        from servo.types.scalar import ScalarValue
-
         with pytest.raises(ValueError, match="float"):
             ScalarValue.from_value(3.14)
+
+    def test_timestamp_value_normalized_to_utc(self) -> None:
+        """Datetime scalars are normalized to UTC."""
+        sv = ScalarValue.from_value(
+            datetime(2025, 1, 15, 1, 2, 3, 456000, tzinfo=timezone(timedelta(hours=2)))
+        )
+        assert sv.kind == "timestamp"
+        assert sv.value == "2025-01-14T23:02:03.456Z"
 
 
 class TestPartitionKey:
@@ -54,8 +55,6 @@ class TestPartitionKey:
 
     def test_canonical_order(self) -> None:
         """Partition keys serialize with sorted dimension names."""
-        from servo.types.partition import PartitionKey
-
         pk1 = PartitionKey({"tenant": "acme", "date": "2025-01-15"})
         pk2 = PartitionKey({"date": "2025-01-15", "tenant": "acme"})
 
@@ -65,8 +64,6 @@ class TestPartitionKey:
 
     def test_fingerprint_stable(self) -> None:
         """Fingerprint is stable SHA-256 of canonical form."""
-        from servo.types.partition import PartitionKey
-
         pk = PartitionKey({"date": "2025-01-15"})
         fp = pk.fingerprint()
 
@@ -75,15 +72,11 @@ class TestPartitionKey:
 
     def test_rejects_float_in_dict(self) -> None:
         """Float values rejected even when passed via dict."""
-        from servo.types.partition import PartitionKey
-
         with pytest.raises(ValueError, match="float"):
             PartitionKey({"rate": 0.5})
 
     def test_from_dict_mixed_types(self) -> None:
         """PartitionKey accepts dict with mixed value types."""
-        from servo.types.partition import PartitionKey
-
         pk = PartitionKey({
             "date": date(2025, 1, 15),
             "region": "us-east-1",
@@ -94,8 +87,6 @@ class TestPartitionKey:
 
     def test_to_proto_dict_returns_string_values(self) -> None:
         """to_proto_dict() returns dict with all string values (proto compliance)."""
-        from servo.types.partition import PartitionKey
-
         pk = PartitionKey({
             "date": date(2025, 1, 15),
             "region": "us-east-1",
@@ -113,8 +104,6 @@ class TestPartitionKey:
 
     def test_from_proto_dict_roundtrip(self) -> None:
         """Can roundtrip through proto dict format."""
-        from servo.types.partition import PartitionKey
-
         original = PartitionKey({
             "date": date(2025, 1, 15),
             "region": "us-east-1",
@@ -133,15 +122,11 @@ class TestPartitionStrategy:
 
     def test_daily_partition(self) -> None:
         """DailyPartition creates day granularity."""
-        from servo.types.partition import DailyPartition, PartitionStrategy
-
         strategy = PartitionStrategy(dimensions=[DailyPartition("date")])
         assert strategy.is_partitioned
         assert strategy.dimension_names == ["date"]
 
     def test_empty_strategy(self) -> None:
         """Empty strategy is not partitioned."""
-        from servo.types.partition import PartitionStrategy
-
         strategy = PartitionStrategy()
         assert not strategy.is_partitioned

@@ -121,8 +121,9 @@ async fn tier2_idempotent_events() {
 
     let event_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
-    // Write same event multiple times (DoesNotExist prevents overwrites)
-    for _ in 0..3 {
+    // Write same event 10 times (DoesNotExist prevents overwrites)
+    // Per exit criteria: "Idempotency verified (10x)"
+    for _ in 0..10 {
         event_writer
             .append_with_id("execution", &event, event_id)
             .await
@@ -559,5 +560,79 @@ async fn invariant6_listing_dependency_documented() {
     assert!(
         uses_listing,
         "MVP: compactor uses listing over ledger prefix (Invariant 6 relaxation documented)"
+    );
+}
+
+/// Tests concurrent compactor race condition handling.
+///
+/// Per exit criteria: "CAS conflicts handled - Concurrent compactor race test passes"
+#[tokio::test]
+async fn concurrent_compactor_race() {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+
+    let tier1 = Tier1Writer::new(storage.clone());
+    tier1.initialize().await.expect("init");
+
+    // Write events to compact
+    let event_writer = EventWriter::new(storage.clone());
+    for i in 0..5 {
+        let event = MaterializationRecord {
+            materialization_id: format!("mat_{i:03}"),
+            asset_id: format!("asset_{i:03}"),
+            row_count: 1000,
+            byte_size: 50000,
+        };
+        event_writer
+            .append("execution", &event)
+            .await
+            .expect("append");
+    }
+
+    // Create two compactors racing on the same domain
+    let compactor1 = Compactor::new(storage.clone());
+    let compactor2 = Compactor::new(storage.clone());
+
+    // Run both compactors concurrently
+    let (result1, result2) = tokio::join!(
+        compactor1.compact_domain("execution"),
+        compactor2.compact_domain("execution")
+    );
+
+    // At least one must succeed
+    let success_count = [&result1, &result2]
+        .iter()
+        .filter(|r| r.is_ok())
+        .count();
+    assert!(
+        success_count >= 1,
+        "At least one compactor must succeed in a race"
+    );
+
+    // If one failed, it should be CasFailed (not a different error)
+    for result in [result1, result2] {
+        if let Err(e) = result {
+            let err_str = format!("{e:?}");
+            assert!(
+                err_str.contains("CasFailed") || err_str.contains("cas") || err_str.contains("conflict"),
+                "Race loser should fail with CAS conflict, got: {err_str}"
+            );
+        }
+    }
+
+    // Verify final state is consistent - exactly 5 records
+    let manifest = tier1.read_manifest().await.expect("read");
+    let snapshot_path = manifest.execution.snapshot_path.expect("snapshot_path");
+    let parquet_data = storage.get_raw(&snapshot_path).await.expect("read");
+    let reader = ParquetRecordBatchReaderBuilder::try_new(parquet_data)
+        .expect("parquet")
+        .build()
+        .expect("reader");
+    let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>().expect("read");
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+    assert_eq!(
+        total_rows, 5,
+        "Race should not corrupt data - exactly 5 records expected"
     );
 }

@@ -1,12 +1,15 @@
 """Introspection utilities for extracting metadata from decorated functions."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import inspect
-from collections.abc import Callable
-from typing import get_type_hints
+from typing import TYPE_CHECKING, get_type_hints
 
 from servo.types.asset import AssetDependency, AssetIn, AssetKey, CodeLocation, get_asset_in_key
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _ASSET_MODULE_PATH_MIN_PARTS = 2
 
@@ -38,9 +41,20 @@ def extract_dependencies(func: Callable[..., object]) -> list[AssetDependency]:
     sig = inspect.signature(func)
 
     try:
+        # Include AssetIn in localns to help resolve annotations
         hints = get_type_hints(func, globalns=func.__globals__, localns={"AssetIn": AssetIn})
-    except (TypeError, NameError, AttributeError):
-        hints = getattr(func, "__annotations__", {})
+    except (TypeError, NameError, AttributeError, ValueError):
+        # Fallback: manually resolve string annotations that look like AssetIn[...]
+        hints = {}
+        raw_annotations = getattr(func, "__annotations__", {})
+        eval_globals = dict(func.__globals__)
+        eval_globals["AssetIn"] = AssetIn
+        for name, annotation in raw_annotations.items():
+            if isinstance(annotation, str):
+                with contextlib.suppress(Exception):
+                    hints[name] = eval(annotation, eval_globals)  # noqa: S307
+            else:
+                hints[name] = annotation
 
     for param_name in sig.parameters:
         if param_name == "ctx":
@@ -107,4 +121,3 @@ def validate_asset_function(func: Callable[..., object]) -> None:
             f"Example: def {func.__name__}(ctx: AssetContext, ...) -> AssetOut: ..."
         )
         raise TypeError(msg)
-

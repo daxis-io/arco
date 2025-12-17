@@ -127,9 +127,24 @@ impl Default for CoreManifest {
     }
 }
 
+/// Metadata about compaction operations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionMetadata {
+    /// Total events compacted.
+    #[serde(default)]
+    pub total_events_compacted: u64,
+    /// Total Parquet files written.
+    #[serde(default)]
+    pub total_files_written: u64,
+}
+
 /// Execution manifest (Tier 2) - separate file.
 ///
 /// Written ONLY by compactor. Contains materializations, partitions.
+///
+/// INVARIANT 4 (Atomic Publish): Readers use `snapshot_path` to locate current
+/// snapshot. A snapshot isn't visible until manifest CAS succeeds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionManifest {
@@ -139,9 +154,32 @@ pub struct ExecutionManifest {
     /// Path to compaction checkpoint.
     pub checkpoint_path: String,
 
+    /// Path to the current published snapshot (atomic visibility gate).
+    /// Readers MUST use this to locate current state, not list state/.
+    #[serde(default)]
+    pub snapshot_path: Option<String>,
+
+    /// Version of the current snapshot (monotonically increasing).
+    #[serde(default)]
+    pub snapshot_version: u64,
+
+    /// Last compacted event file name (for file-based watermark).
+    /// Stored as exact filename including .json for correct comparison.
+    #[serde(default)]
+    pub watermark_event_id: Option<String>,
+
+    /// Monotonic position watermark for clock-skew-resistant ordering.
+    /// Architecture: "use `sequence_position` as watermark anchor to survive clock skew."
+    #[serde(default)]
+    pub watermark_position: Option<u64>,
+
     /// Last compaction timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_compaction_at: Option<DateTime<Utc>>,
+
+    /// Compaction statistics.
+    #[serde(default)]
+    pub compaction: CompactionMetadata,
 
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
@@ -154,7 +192,12 @@ impl ExecutionManifest {
         Self {
             watermark_version: 0,
             checkpoint_path: "state/execution/checkpoint.json".into(),
+            snapshot_path: None,
+            snapshot_version: 0,
+            watermark_event_id: None,
+            watermark_position: None,
             last_compaction_at: None,
+            compaction: CompactionMetadata::default(),
             updated_at: Utc::now(),
         }
     }
@@ -490,7 +533,15 @@ mod tests {
         let exec = ExecutionManifest {
             watermark_version: 100,
             checkpoint_path: "state/execution/checkpoint.json".into(),
+            snapshot_path: Some("state/execution/snapshot.parquet".into()),
+            snapshot_version: 5,
+            watermark_event_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV.json".into()),
+            watermark_position: Some(42),
             last_compaction_at: Some(now),
+            compaction: CompactionMetadata {
+                total_events_compacted: 100,
+                total_files_written: 5,
+            },
             updated_at: now,
         };
 

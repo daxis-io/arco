@@ -66,8 +66,10 @@
 #![deny(missing_docs)]
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 pub mod asset;
+pub mod compactor;
 pub mod error;
 pub mod event_writer;
 pub mod lock;
@@ -77,13 +79,14 @@ pub mod tier1_writer;
 pub mod writer;
 
 // Re-export main types at crate root
+pub use compactor::{CompactionResult, Compactor, MaterializationRecord};
 pub use error::{CatalogError, Result};
 pub use event_writer::EventWriter;
 pub use asset::{Asset, AssetFormat, AssetKey, AssetKeyError, CreateAssetRequest};
 pub use lock::{DistributedLock, LockGuard, LockInfo};
 pub use manifest::{
-    CatalogManifest, CommitRecord, CoreManifest, ExecutionManifest, GovernanceManifest,
-    LineageManifest, RootManifest,
+    CatalogManifest, CommitRecord, CompactionMetadata, CoreManifest, ExecutionManifest,
+    GovernanceManifest, LineageManifest, RootManifest,
 };
 pub use tier1_writer::Tier1Writer;
 

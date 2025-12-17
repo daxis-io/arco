@@ -3,6 +3,8 @@
 //! These benchmarks measure the performance of common catalog operations
 //! to ensure they meet the documented performance budgets.
 
+#![allow(missing_docs)]
+
 use criterion::{Criterion, criterion_group, criterion_main};
 
 fn catalog_lookup_benchmark(c: &mut Criterion) {

@@ -1,5 +1,7 @@
 //! Integration tests for arco-flow orchestration.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use arco_core::{AssetId, TaskId};
 use arco_flow::error::{Error, Result};
 use arco_flow::events::ExecutionEventData;
@@ -52,8 +54,7 @@ async fn full_orchestration_lifecycle() -> Result<()> {
             priority: 0,
             resources: ResourceRequirements::default(),
         })
-        .build()
-        ?;
+        .build()?;
 
     // Verify plan is topologically sorted
     let pos_raw = plan
@@ -99,24 +100,16 @@ async fn full_orchestration_lifecycle() -> Result<()> {
     assert_eq!(ready[0].task_id, task_raw);
 
     // Execute raw task
-    scheduler
-        .queue_task(&mut run, &task_raw, &mut outbox)
-        ?;
-    scheduler
-        .start_task(&mut run, &task_raw, "worker-1", &mut outbox)
-        ?;
+    scheduler.queue_task(&mut run, &task_raw, &mut outbox)?;
+    scheduler.start_task(&mut run, &task_raw, "worker-1", &mut outbox)?;
 
     let task_raw_spec = plan
         .get_task(&task_raw)
         .ok_or(Error::TaskNotFound { task_id: task_raw })?;
-    let result = runner
-        .run(&context, task_raw_spec)
-        .await;
+    let result = runner.run(&context, task_raw_spec).await;
     assert!(result.is_success());
 
-    scheduler
-        .record_task_result(&mut run, &task_raw, result, &mut outbox)
-        ?;
+    scheduler.record_task_result(&mut run, &task_raw, result, &mut outbox)?;
     assert_eq!(
         run.get_task(&task_raw)
             .ok_or(Error::TaskNotFound { task_id: task_raw })?
@@ -130,23 +123,13 @@ async fn full_orchestration_lifecycle() -> Result<()> {
     assert_eq!(ready[0].task_id, task_staging);
 
     // Execute staging task
-    scheduler
-        .queue_task(&mut run, &task_staging, &mut outbox)
-        ?;
-    scheduler
-        .start_task(&mut run, &task_staging, "worker-2", &mut outbox)
-        ?;
-    let task_staging_spec = plan
-        .get_task(&task_staging)
-        .ok_or(Error::TaskNotFound {
-            task_id: task_staging,
-        })?;
-    let result = runner
-        .run(&context, task_staging_spec)
-        .await;
-    scheduler
-        .record_task_result(&mut run, &task_staging, result, &mut outbox)
-        ?;
+    scheduler.queue_task(&mut run, &task_staging, &mut outbox)?;
+    scheduler.start_task(&mut run, &task_staging, "worker-2", &mut outbox)?;
+    let task_staging_spec = plan.get_task(&task_staging).ok_or(Error::TaskNotFound {
+        task_id: task_staging,
+    })?;
+    let result = runner.run(&context, task_staging_spec).await;
+    scheduler.record_task_result(&mut run, &task_staging, result, &mut outbox)?;
     assert_eq!(
         run.get_task(&task_staging)
             .ok_or(Error::TaskNotFound {
@@ -162,21 +145,13 @@ async fn full_orchestration_lifecycle() -> Result<()> {
     assert_eq!(ready[0].task_id, task_mart);
 
     // Execute mart task
-    scheduler
-        .queue_task(&mut run, &task_mart, &mut outbox)
-        ?;
-    scheduler
-        .start_task(&mut run, &task_mart, "worker-3", &mut outbox)
-        ?;
+    scheduler.queue_task(&mut run, &task_mart, &mut outbox)?;
+    scheduler.start_task(&mut run, &task_mart, "worker-3", &mut outbox)?;
     let task_mart_spec = plan
         .get_task(&task_mart)
         .ok_or(Error::TaskNotFound { task_id: task_mart })?;
-    let result = runner
-        .run(&context, task_mart_spec)
-        .await;
-    scheduler
-        .record_task_result(&mut run, &task_mart, result, &mut outbox)
-        ?;
+    let result = runner.run(&context, task_mart_spec).await;
+    scheduler.record_task_result(&mut run, &task_mart, result, &mut outbox)?;
     assert_eq!(
         run.get_task(&task_mart)
             .ok_or(Error::TaskNotFound { task_id: task_mart })?
@@ -186,8 +161,7 @@ async fn full_orchestration_lifecycle() -> Result<()> {
 
     // Complete the run (and emit RunCompleted)
     let final_state = scheduler
-        .maybe_complete_run(&mut run, &mut outbox)
-        ?
+        .maybe_complete_run(&mut run, &mut outbox)?
         .ok_or_else(|| Error::TaskExecutionFailed {
             message: "run should complete".into(),
         })?;
@@ -244,8 +218,7 @@ async fn skip_downstream_on_failure() -> Result<()> {
             priority: 0,
             resources: ResourceRequirements::default(),
         })
-        .build()
-        ?;
+        .build()?;
 
     let scheduler = Scheduler::new(plan);
     let mut outbox = InMemoryOutbox::new();
@@ -254,23 +227,17 @@ async fn skip_downstream_on_failure() -> Result<()> {
     scheduler.start_run(&mut run, &mut outbox)?;
 
     // Fail task_a
-    scheduler
-        .queue_task(&mut run, &task_a, &mut outbox)
-        ?;
-    scheduler
-        .start_task(&mut run, &task_a, "worker-1", &mut outbox)
-        ?;
-    scheduler
-        .record_task_result(
-            &mut run,
-            &task_a,
-            arco_flow::runner::TaskResult::Failed(TaskError::new(
-                TaskErrorCategory::UserCode,
-                "test failure",
-            )),
-            &mut outbox,
-        )
-        ?;
+    scheduler.queue_task(&mut run, &task_a, &mut outbox)?;
+    scheduler.start_task(&mut run, &task_a, "worker-1", &mut outbox)?;
+    scheduler.record_task_result(
+        &mut run,
+        &task_a,
+        arco_flow::runner::TaskResult::Failed(TaskError::new(
+            TaskErrorCategory::UserCode,
+            "test failure",
+        )),
+        &mut outbox,
+    )?;
 
     // Verify downstream tasks are skipped
     assert_eq!(
@@ -288,8 +255,7 @@ async fn skip_downstream_on_failure() -> Result<()> {
 
     // Run should complete as failed
     let final_state = scheduler
-        .maybe_complete_run(&mut run, &mut outbox)
-        ?
+        .maybe_complete_run(&mut run, &mut outbox)?
         .ok_or_else(|| Error::TaskExecutionFailed {
             message: "run should complete".into(),
         })?;
@@ -351,8 +317,7 @@ async fn parallel_independent_tasks() -> Result<()> {
             priority: 0,
             resources: ResourceRequirements::default(),
         })
-        .build()
-        ?;
+        .build()?;
 
     let scheduler = Scheduler::new(plan);
     let mut outbox = InMemoryOutbox::new();
@@ -388,13 +353,11 @@ fn plan_fingerprint_stability() -> Result<()> {
 
     let plan1 = PlanBuilder::new("tenant", "workspace")
         .add_task(task.clone())
-        .build()
-        ?;
+        .build()?;
 
     let plan2 = PlanBuilder::new("tenant", "workspace")
         .add_task(task)
-        .build()
-        ?;
+        .build()?;
 
     // Same inputs should produce same fingerprint
     assert_eq!(plan1.fingerprint, plan2.fingerprint);
@@ -447,8 +410,7 @@ async fn retryable_task_failure_retries_with_backoff() -> Result<()> {
             priority: 0,
             resources: ResourceRequirements::default(),
         })
-        .build()
-        ?;
+        .build()?;
 
     let config = SchedulerConfig {
         max_parallelism: 1,
@@ -475,19 +437,13 @@ async fn retryable_task_failure_retries_with_backoff() -> Result<()> {
     };
 
     // First attempt fails -> RetryWait.
-    scheduler
-        .queue_task(&mut run, &task_id, &mut outbox)
-        ?;
-    scheduler
-        .start_task(&mut run, &task_id, "worker-1", &mut outbox)
-        ?;
+    scheduler.queue_task(&mut run, &task_id, &mut outbox)?;
+    scheduler.start_task(&mut run, &task_id, "worker-1", &mut outbox)?;
     let task_spec = plan
         .get_task(&task_id)
         .ok_or(Error::TaskNotFound { task_id })?;
     let result = runner.run(&context, task_spec).await;
-    scheduler
-        .record_task_result(&mut run, &task_id, result, &mut outbox)
-        ?;
+    scheduler.record_task_result(&mut run, &task_id, result, &mut outbox)?;
 
     assert_eq!(
         run.get_task(&task_id)
@@ -522,23 +478,16 @@ async fn retryable_task_failure_retries_with_backoff() -> Result<()> {
     );
 
     // Second attempt succeeds.
-    scheduler
-        .queue_task(&mut run, &task_id, &mut outbox)
-        ?;
-    scheduler
-        .start_task(&mut run, &task_id, "worker-2", &mut outbox)
-        ?;
+    scheduler.queue_task(&mut run, &task_id, &mut outbox)?;
+    scheduler.start_task(&mut run, &task_id, "worker-2", &mut outbox)?;
     let task_spec = plan
         .get_task(&task_id)
         .ok_or(Error::TaskNotFound { task_id })?;
     let result = runner.run(&context, task_spec).await;
-    scheduler
-        .record_task_result(&mut run, &task_id, result, &mut outbox)
-        ?;
+    scheduler.record_task_result(&mut run, &task_id, result, &mut outbox)?;
 
     let final_state = scheduler
-        .maybe_complete_run(&mut run, &mut outbox)
-        ?
+        .maybe_complete_run(&mut run, &mut outbox)?
         .ok_or_else(|| Error::TaskExecutionFailed {
             message: "run should complete".into(),
         })?;
@@ -569,8 +518,7 @@ async fn heartbeat_staleness_triggers_retry() -> Result<()> {
             priority: 0,
             resources: ResourceRequirements::default(),
         })
-        .build()
-        ?;
+        .build()?;
 
     let config = SchedulerConfig {
         max_parallelism: 1,
@@ -588,12 +536,8 @@ async fn heartbeat_staleness_triggers_retry() -> Result<()> {
     scheduler.start_run(&mut run, &mut outbox)?;
 
     // Put the task into RUNNING, then force a stale heartbeat.
-    scheduler
-        .queue_task(&mut run, &task_id, &mut outbox)
-        ?;
-    scheduler
-        .start_task(&mut run, &task_id, "worker-1", &mut outbox)
-        ?;
+    scheduler.queue_task(&mut run, &task_id, &mut outbox)?;
+    scheduler.start_task(&mut run, &task_id, "worker-1", &mut outbox)?;
 
     {
         let exec = run
@@ -603,9 +547,7 @@ async fn heartbeat_staleness_triggers_retry() -> Result<()> {
         exec.last_heartbeat = Some(chrono::Utc::now() - chrono::Duration::seconds(10));
     }
 
-    let stale = scheduler
-        .process_stale_heartbeats_at(&mut run, &mut outbox, chrono::Utc::now())
-        ?;
+    let stale = scheduler.process_stale_heartbeats_at(&mut run, &mut outbox, chrono::Utc::now())?;
     assert_eq!(stale, vec![task_id]);
     assert_eq!(
         run.get_task(&task_id)
@@ -637,23 +579,16 @@ async fn heartbeat_staleness_triggers_retry() -> Result<()> {
         run_id: run.id,
     };
 
-    scheduler
-        .queue_task(&mut run, &task_id, &mut outbox)
-        ?;
-    scheduler
-        .start_task(&mut run, &task_id, "worker-2", &mut outbox)
-        ?;
+    scheduler.queue_task(&mut run, &task_id, &mut outbox)?;
+    scheduler.start_task(&mut run, &task_id, "worker-2", &mut outbox)?;
     let task_spec = plan
         .get_task(&task_id)
         .ok_or(Error::TaskNotFound { task_id })?;
     let result = runner.run(&context, task_spec).await;
-    scheduler
-        .record_task_result(&mut run, &task_id, result, &mut outbox)
-        ?;
+    scheduler.record_task_result(&mut run, &task_id, result, &mut outbox)?;
 
     let final_state = scheduler
-        .maybe_complete_run(&mut run, &mut outbox)
-        ?
+        .maybe_complete_run(&mut run, &mut outbox)?
         .ok_or_else(|| Error::TaskExecutionFailed {
             message: "run should complete".into(),
         })?;

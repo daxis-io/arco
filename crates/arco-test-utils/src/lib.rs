@@ -27,6 +27,7 @@
 // Test utilities use expect/unwrap for cleaner test code - panics are acceptable in tests
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
+#![allow(clippy::missing_panics_doc)]
 
 pub mod assertions;
 pub mod fixtures;
@@ -38,7 +39,7 @@ pub use storage::*;
 
 /// Initialize test logging (call once per test module).
 pub fn init_test_logging() {
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt};
 
     let _ = fmt()
         .with_env_filter(

@@ -3,6 +3,8 @@
 //! These tests use shared fixtures to ensure Rust and Python
 //! produce identical canonical strings.
 
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+
 use arco_core::partition::{PartitionKey, ScalarValue};
 use serde::Deserialize;
 use std::collections::HashMap;

@@ -3,6 +3,8 @@
 //! These tests ensure that the JSON serialization format remains stable
 //! across versions and is consistent with cross-language contracts.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use arco_proto::PartitionKey;
 
 #[test]

@@ -69,7 +69,8 @@ pub fn assert_topological_order(run: &Run, plan: &Plan) {
                 let dep_exec = run.get_task(dep_id).expect("dependency should exist");
 
                 // If this task started, dependency must have completed first
-                if let (Some(started), Some(dep_completed)) = (task.started_at, dep_exec.completed_at)
+                if let (Some(started), Some(dep_completed)) =
+                    (task.started_at, dep_exec.completed_at)
                 {
                     assert!(
                         dep_completed <= started,
@@ -92,12 +93,7 @@ pub fn assert_events_ordered(events: &[EventEnvelope]) {
     for window in events.windows(2) {
         let time0 = window[0].time.expect("event should have time");
         let time1 = window[1].time.expect("event should have time");
-        assert!(
-            time0 <= time1,
-            "Events not ordered: {:?} > {:?}",
-            time0,
-            time1
-        );
+        assert!(time0 <= time1, "Events not ordered: {time0:?} > {time1:?}");
     }
 }
 

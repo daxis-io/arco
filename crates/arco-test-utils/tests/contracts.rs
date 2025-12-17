@@ -3,6 +3,8 @@
 //! These tests validate that the contracts between arco-core, arco-catalog,
 //! and arco-flow are correctly implemented and maintained.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use arco_core::{AssetId, RunId, TaskId};
 use arco_flow::events::EventBuilder;
 use arco_flow::plan::PlanBuilder;
@@ -175,7 +177,14 @@ fn contract_events_serialize_to_json() {
         EventBuilder::run_started("tenant", "workspace", run_id, "plan-1"),
         EventBuilder::task_queued("tenant", "workspace", run_id, task_id, 1),
         EventBuilder::task_started("tenant", "workspace", run_id, task_id, 1, "worker-1"),
-        EventBuilder::task_completed("tenant", "workspace", run_id, task_id, TaskState::Succeeded, 1),
+        EventBuilder::task_completed(
+            "tenant",
+            "workspace",
+            run_id,
+            task_id,
+            TaskState::Succeeded,
+            1,
+        ),
         EventBuilder::run_completed(
             "tenant",
             "workspace",
@@ -203,8 +212,7 @@ fn contract_events_serialize_to_json() {
 #[test]
 fn contract_plan_stages_reflect_dependency_depth() {
     let ctx = TestContext::new();
-    let (plan, task_a, task_b, task_c) =
-        PlanFactory::linear_dag(&ctx.tenant_id, &ctx.workspace_id);
+    let (plan, task_a, task_b, task_c) = PlanFactory::linear_dag(&ctx.tenant_id, &ctx.workspace_id);
 
     // Linear DAG: a (stage 0) -> b (stage 1) -> c (stage 2)
     let spec_a = plan.get_task(&task_a).expect("task a");
@@ -212,16 +220,21 @@ fn contract_plan_stages_reflect_dependency_depth() {
     let spec_c = plan.get_task(&task_c).expect("task c");
 
     assert_eq!(spec_a.stage, 0, "Root task should be stage 0");
-    assert_eq!(spec_b.stage, 1, "Task depending on stage 0 should be stage 1");
-    assert_eq!(spec_c.stage, 2, "Task depending on stage 1 should be stage 2");
+    assert_eq!(
+        spec_b.stage, 1,
+        "Task depending on stage 0 should be stage 1"
+    );
+    assert_eq!(
+        spec_c.stage, 2,
+        "Task depending on stage 1 should be stage 2"
+    );
 }
 
 /// Contract: Plan topological order respects dependencies.
 #[test]
 fn contract_plan_toposort_respects_dependencies() {
     let ctx = TestContext::new();
-    let (plan, task_a, task_b, task_c) =
-        PlanFactory::linear_dag(&ctx.tenant_id, &ctx.workspace_id);
+    let (plan, task_a, task_b, task_c) = PlanFactory::linear_dag(&ctx.tenant_id, &ctx.workspace_id);
 
     let positions: std::collections::HashMap<TaskId, usize> = plan
         .tasks

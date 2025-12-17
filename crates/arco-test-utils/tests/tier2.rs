@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use arco_catalog::{Compactor, EventWriter, MaterializationRecord, Tier1Writer};
 use arco_core::scoped_storage::ScopedStorage;
 use arco_core::storage::MemoryBackend;
+use arco_test_utils::{StorageOp, TracingMemoryBackend};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MaterializationCompleted {
@@ -25,8 +26,7 @@ struct MaterializationCompleted {
 #[tokio::test]
 async fn tier2_append_compact_read_loop() {
     let backend = Arc::new(MemoryBackend::new());
-    let storage =
-        ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+    let storage = ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
 
     // 1. Initialize catalog
     let writer = Tier1Writer::new(storage.clone());
@@ -54,7 +54,10 @@ async fn tier2_append_compact_read_loop() {
 
     // 4. Compact
     let compactor = Compactor::new(storage.clone());
-    let result = compactor.compact_domain("execution").await.expect("compact");
+    let result = compactor
+        .compact_domain("execution")
+        .await
+        .expect("compact");
 
     assert!(result.events_processed > 0);
     assert!(result.parquet_files_written > 0);
@@ -63,49 +66,47 @@ async fn tier2_append_compact_read_loop() {
     let manifest = writer.read_manifest().await.expect("read");
     assert!(manifest.execution.watermark_version > 0);
 
-    // 6. Verify Parquet exists AND read to validate content
-    let state_files = storage.list("state/execution/").await.expect("list");
-    assert!(!state_files.is_empty());
+    // 6. Read snapshot via manifest pointer (Invariant 4 compliance)
+    let snapshot_path = manifest
+        .execution
+        .snapshot_path
+        .as_ref()
+        .expect("snapshot_path");
+    assert!(snapshot_path.ends_with(".parquet"));
 
-    // ACTUALLY READ PARQUET (not just check existence)
-    // This validates Invariant 5: "Readers never need the ledger"
-    for file in &state_files {
-        let path = file.as_str();
-        assert!(path.ends_with(".parquet"));
+    let parquet_data = storage.get_raw(snapshot_path).await.expect("read parquet");
+    // bytes::Bytes implements ChunkReader
+    let reader = ParquetRecordBatchReaderBuilder::try_new(parquet_data)
+        .expect("valid parquet")
+        .build()
+        .expect("build reader");
 
-        // Read Parquet content
-        let parquet_data = storage.get_raw(path).await.expect("read parquet");
-        // bytes::Bytes implements ChunkReader
-        let reader = ParquetRecordBatchReaderBuilder::try_new(parquet_data)
-            .expect("valid parquet")
-            .build()
-            .expect("build reader");
+    let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>().expect("read batches");
+    assert!(!batches.is_empty(), "Parquet should contain data");
 
-        let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>().expect("read batches");
-        assert!(!batches.is_empty(), "Parquet should contain data");
+    // Verify expected row count
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total_rows, 1,
+        "should have exactly 1 materialization record"
+    );
 
-        // Verify expected row count
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 1, "should have exactly 1 materialization record");
-
-        // Verify expected columns exist
-        let schema = batches[0].schema();
-        assert!(
-            schema.field_with_name("materialization_id").is_ok(),
-            "schema should have materialization_id column"
-        );
-        assert!(
-            schema.field_with_name("asset_id").is_ok(),
-            "schema should have asset_id column"
-        );
-    }
+    // Verify expected columns exist
+    let schema = batches[0].schema();
+    assert!(
+        schema.field_with_name("materialization_id").is_ok(),
+        "schema should have materialization_id column"
+    );
+    assert!(
+        schema.field_with_name("asset_id").is_ok(),
+        "schema should have asset_id column"
+    );
 }
 
 #[tokio::test]
 async fn tier2_idempotent_events() {
     let backend = Arc::new(MemoryBackend::new());
-    let storage =
-        ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+    let storage = ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
 
     let writer = Tier1Writer::new(storage.clone());
     writer.initialize().await.expect("init");
@@ -138,31 +139,32 @@ async fn tier2_idempotent_events() {
 
     // Compact should process only one event
     let compactor = Compactor::new(storage.clone());
-    let result = compactor.compact_domain("execution").await.expect("compact");
+    let result = compactor
+        .compact_domain("execution")
+        .await
+        .expect("compact");
     assert_eq!(result.events_processed, 1);
 
     // Read Parquet and verify only 1 row (no duplicates in output)
-    let state_files = storage.list("state/execution/").await.expect("list state");
-    assert!(!state_files.is_empty());
-
-    let parquet_data = storage
-        .get_raw(state_files[0].as_str())
-        .await
-        .expect("read");
+    let manifest = writer.read_manifest().await.expect("read");
+    let snapshot_path = manifest.execution.snapshot_path.expect("snapshot_path");
+    let parquet_data = storage.get_raw(&snapshot_path).await.expect("read");
     let reader = ParquetRecordBatchReaderBuilder::try_new(parquet_data)
         .expect("valid parquet")
         .build()
         .expect("build reader");
     let batches: Vec<_> = reader.collect::<Result<Vec<_>, _>>().expect("read");
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 1, "dedupe: only 1 row even with duplicate events");
+    assert_eq!(
+        total_rows, 1,
+        "dedupe: only 1 row even with duplicate events"
+    );
 }
 
 #[tokio::test]
 async fn tier2_incremental_compaction() {
     let backend = Arc::new(MemoryBackend::new());
-    let storage =
-        ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+    let storage = ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
 
     let writer = Tier1Writer::new(storage.clone());
     writer.initialize().await.expect("init");
@@ -178,10 +180,16 @@ async fn tier2_incremental_compaction() {
             row_count: 1000,
             byte_size: 50000,
         };
-        event_writer.append("execution", &event).await.expect("append");
+        event_writer
+            .append("execution", &event)
+            .await
+            .expect("append");
     }
 
-    let r1 = compactor.compact_domain("execution").await.expect("compact1");
+    let r1 = compactor
+        .compact_domain("execution")
+        .await
+        .expect("compact1");
     assert_eq!(r1.events_processed, 3);
 
     // Batch 2: 2 more events
@@ -192,10 +200,16 @@ async fn tier2_incremental_compaction() {
             row_count: 1000,
             byte_size: 50000,
         };
-        event_writer.append("execution", &event).await.expect("append");
+        event_writer
+            .append("execution", &event)
+            .await
+            .expect("append");
     }
 
-    let r2 = compactor.compact_domain("execution").await.expect("compact2");
+    let r2 = compactor
+        .compact_domain("execution")
+        .await
+        .expect("compact2");
     assert_eq!(r2.events_processed, 2, "only new events");
 
     // Verify watermark incremented
@@ -206,8 +220,7 @@ async fn tier2_incremental_compaction() {
 #[tokio::test]
 async fn tier2_compactor_sole_parquet_writer() {
     let backend = Arc::new(MemoryBackend::new());
-    let storage =
-        ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+    let storage = ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
 
     let writer = Tier1Writer::new(storage.clone());
     writer.initialize().await.expect("init");
@@ -225,19 +238,22 @@ async fn tier2_compactor_sole_parquet_writer() {
             row_count: 1000,
             byte_size: 50000,
         };
-        event_writer.append("execution", &event).await.expect("append");
+        event_writer
+            .append("execution", &event)
+            .await
+            .expect("append");
     }
 
     // Still no Parquet
     let after_write = storage.list("state/execution/").await.unwrap_or_default();
-    assert!(
-        after_write.is_empty(),
-        "EventWriter must not write Parquet"
-    );
+    assert!(after_write.is_empty(), "EventWriter must not write Parquet");
 
     // After compaction: Parquet exists
     let compactor = Compactor::new(storage.clone());
-    compactor.compact_domain("execution").await.expect("compact");
+    compactor
+        .compact_domain("execution")
+        .await
+        .expect("compact");
 
     let after_compact = storage.list("state/execution/").await.expect("list");
     assert!(
@@ -250,8 +266,7 @@ async fn tier2_compactor_sole_parquet_writer() {
 #[tokio::test]
 async fn invariant1_append_only_ingest() {
     let backend = Arc::new(MemoryBackend::new());
-    let storage =
-        ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+    let storage = ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
 
     let tier1 = Tier1Writer::new(storage.clone());
     tier1.initialize().await.expect("init");
@@ -303,8 +318,7 @@ async fn invariant2_compactor_sole_parquet_writer() {
     // This is essentially the same as tier2_compactor_sole_parquet_writer
     // but with explicit invariant labeling
     let backend = Arc::new(MemoryBackend::new());
-    let storage =
-        ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+    let storage = ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
 
     let tier1 = Tier1Writer::new(storage.clone());
     tier1.initialize().await.expect("init");
@@ -312,12 +326,15 @@ async fn invariant2_compactor_sole_parquet_writer() {
     // EventWriter writes only to ledger/, not state/
     let event_writer = EventWriter::new(storage.clone());
     event_writer
-        .append("execution", &MaterializationRecord {
-            materialization_id: "mat_001".into(),
-            asset_id: "asset_abc".into(),
-            row_count: 100,
-            byte_size: 5000,
-        })
+        .append(
+            "execution",
+            &MaterializationRecord {
+                materialization_id: "mat_001".into(),
+                asset_id: "asset_abc".into(),
+                row_count: 100,
+                byte_size: 5000,
+            },
+        )
         .await
         .expect("append");
 
@@ -330,7 +347,10 @@ async fn invariant2_compactor_sole_parquet_writer() {
 
     // Compactor creates Parquet
     let compactor = Compactor::new(storage.clone());
-    compactor.compact_domain("execution").await.expect("compact");
+    compactor
+        .compact_domain("execution")
+        .await
+        .expect("compact");
 
     let after_compact = storage.list("state/execution/").await.expect("list");
     assert!(
@@ -343,8 +363,7 @@ async fn invariant2_compactor_sole_parquet_writer() {
 #[tokio::test]
 async fn invariant3_idempotent_compaction() {
     let backend = Arc::new(MemoryBackend::new());
-    let storage =
-        ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+    let storage = ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
 
     let tier1 = Tier1Writer::new(storage.clone());
     tier1.initialize().await.expect("init");
@@ -359,18 +378,22 @@ async fn invariant3_idempotent_compaction() {
             row_count: i64::from(i) * 100,
             byte_size: i64::from(i) * 5000,
         };
-        event_writer.append("execution", &event).await.expect("append");
+        event_writer
+            .append("execution", &event)
+            .await
+            .expect("append");
     }
 
     let compactor = Compactor::new(storage.clone());
-    compactor.compact_domain("execution").await.expect("compact");
+    compactor
+        .compact_domain("execution")
+        .await
+        .expect("compact");
 
     // Read Parquet and verify only 1 row (dedupe by primary key)
-    let state_files = storage.list("state/execution/").await.expect("list");
-    let parquet_data = storage
-        .get_raw(state_files[0].as_str())
-        .await
-        .expect("read");
+    let manifest = tier1.read_manifest().await.expect("read");
+    let snapshot_path = manifest.execution.snapshot_path.expect("snapshot_path");
+    let parquet_data = storage.get_raw(&snapshot_path).await.expect("read");
     let reader = ParquetRecordBatchReaderBuilder::try_new(parquet_data)
         .expect("parquet")
         .build()
@@ -388,8 +411,7 @@ async fn invariant3_idempotent_compaction() {
 #[tokio::test]
 async fn invariant4_atomic_publish() {
     let backend = Arc::new(MemoryBackend::new());
-    let storage =
-        ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+    let storage = ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
 
     let tier1 = Tier1Writer::new(storage.clone());
     tier1.initialize().await.expect("init");
@@ -404,17 +426,23 @@ async fn invariant4_atomic_publish() {
     // Write event and compact
     let event_writer = EventWriter::new(storage.clone());
     event_writer
-        .append("execution", &MaterializationRecord {
-            materialization_id: "mat_001".into(),
-            asset_id: "asset_abc".into(),
-            row_count: 100,
-            byte_size: 5000,
-        })
+        .append(
+            "execution",
+            &MaterializationRecord {
+                materialization_id: "mat_001".into(),
+                asset_id: "asset_abc".into(),
+                row_count: 100,
+                byte_size: 5000,
+            },
+        )
         .await
         .expect("append");
 
     let compactor = Compactor::new(storage.clone());
-    compactor.compact_domain("execution").await.expect("compact");
+    compactor
+        .compact_domain("execution")
+        .await
+        .expect("compact");
 
     // After compaction: snapshot_path is set (atomic visibility gate)
     let manifest_after = tier1.read_manifest().await.expect("read");
@@ -425,9 +453,111 @@ async fn invariant4_atomic_publish() {
 
     // Verify the path actually exists
     let snapshot_path = manifest_after.execution.snapshot_path.unwrap();
-    let snapshot_data = storage.get_raw(&snapshot_path).await.expect("read snapshot");
+    let snapshot_data = storage
+        .get_raw(&snapshot_path)
+        .await
+        .expect("read snapshot");
     assert!(
         !snapshot_data.is_empty(),
         "INVARIANT 4: Snapshot file exists at manifest path"
+    );
+}
+
+/// Tests Invariant 5: Readers never need the ledger.
+#[tokio::test]
+async fn invariant5_readers_never_need_ledger() {
+    let backend = Arc::new(TracingMemoryBackend::new());
+    let storage = ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+
+    let tier1 = Tier1Writer::new(storage.clone());
+    tier1.initialize().await.expect("init");
+
+    let event_writer = EventWriter::new(storage.clone());
+    for i in 0..3 {
+        let event = MaterializationRecord {
+            materialization_id: format!("mat_{i:03}"),
+            asset_id: format!("asset_{i:03}"),
+            row_count: 1000,
+            byte_size: 50000,
+        };
+        event_writer
+            .append("execution", &event)
+            .await
+            .expect("append");
+    }
+
+    let compactor = Compactor::new(storage.clone());
+    compactor
+        .compact_domain("execution")
+        .await
+        .expect("compact");
+
+    // Clear operations to isolate read behavior.
+    backend.clear_operations();
+
+    let manifest = tier1.read_manifest().await.expect("read");
+    let snapshot_path = manifest.execution.snapshot_path.expect("snapshot_path");
+    let _snapshot = storage
+        .get_raw(&snapshot_path)
+        .await
+        .expect("read snapshot");
+
+    let ops = backend.operations();
+    assert!(!ops.is_empty(), "read path should perform storage ops");
+
+    for op in ops {
+        let path = match op {
+            StorageOp::Get { path }
+            | StorageOp::GetRange { path, .. }
+            | StorageOp::Head { path }
+            | StorageOp::Put { path, .. }
+            | StorageOp::Delete { path } => path,
+            StorageOp::List { prefix } => prefix,
+        };
+        assert!(
+            !path.contains("/ledger/"),
+            "INVARIANT 5 violated: read path accessed ledger: {path}"
+        );
+    }
+}
+
+/// Tests Invariant 6 (MVP): compactor currently depends on listing.
+#[tokio::test]
+async fn invariant6_listing_dependency_documented() {
+    let backend = Arc::new(TracingMemoryBackend::new());
+    let storage = ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+
+    let tier1 = Tier1Writer::new(storage.clone());
+    tier1.initialize().await.expect("init");
+
+    let event_writer = EventWriter::new(storage.clone());
+    for i in 0..3 {
+        let event = MaterializationRecord {
+            materialization_id: format!("mat_{i:03}"),
+            asset_id: format!("asset_{i:03}"),
+            row_count: 1000,
+            byte_size: 50000,
+        };
+        event_writer
+            .append("execution", &event)
+            .await
+            .expect("append");
+    }
+
+    backend.clear_operations();
+
+    let compactor = Compactor::new(storage.clone());
+    compactor
+        .compact_domain("execution")
+        .await
+        .expect("compact");
+
+    let ops = backend.operations();
+    let uses_listing = ops
+        .iter()
+        .any(|op| matches!(op, StorageOp::List { prefix } if prefix.contains("/ledger/")));
+    assert!(
+        uses_listing,
+        "MVP: compactor uses listing over ledger prefix (Invariant 6 relaxation documented)"
     );
 }

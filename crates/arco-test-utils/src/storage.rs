@@ -20,7 +20,7 @@ pub enum StorageOp {
         /// Path that was read.
         path: String,
     },
-    /// GetRange operation (for Parquet range reads).
+    /// `GetRange` operation (for Parquet range reads).
     GetRange {
         /// Path that was read.
         path: String,
@@ -172,29 +172,27 @@ impl StorageBackend for TracingMemoryBackend {
             end: range.end,
         });
 
-        // Validate range per StorageBackend contract
-        if range.end < range.start {
-            return Err(Error::InvalidInput(format!(
-                "invalid range: end ({}) < start ({})",
-                range.end, range.start
-            )));
-        }
-
         let data = self.data.lock().expect("lock");
         let obj = data
             .get(path)
             .ok_or_else(|| Error::NotFound(format!("object not found: {path}")))?;
 
-        let len = obj.data.len() as u64;
-        if range.start > len {
+        let len = obj.data.len();
+
+        // Validate/clamp range per StorageBackend contract.
+        let start = usize::try_from(range.start).unwrap_or(usize::MAX);
+        if start > len {
             return Err(Error::InvalidInput(format!(
-                "invalid range: start ({}) > object length ({len})",
-                range.start
+                "range start {start} exceeds object length {len}"
             )));
         }
 
-        let start = range.start as usize;
-        let end = std::cmp::min(range.end as usize, obj.data.len());
+        let end = usize::try_from(range.end).unwrap_or(usize::MAX).min(len);
+        if end < start {
+            return Err(Error::InvalidInput(format!(
+                "range end {end} is before start {start}"
+            )));
+        }
         Ok(obj.data.slice(start..end))
     }
 
@@ -364,14 +362,22 @@ mod tests {
 
         // First write succeeds
         let result = storage
-            .put("test.txt", Bytes::from("v1"), WritePrecondition::DoesNotExist)
+            .put(
+                "test.txt",
+                Bytes::from("v1"),
+                WritePrecondition::DoesNotExist,
+            )
             .await
             .expect("put");
         assert!(matches!(result, WriteResult::Success { ref version } if version == "1"));
 
         // Second write with DoesNotExist fails
         let result = storage
-            .put("test.txt", Bytes::from("v2"), WritePrecondition::DoesNotExist)
+            .put(
+                "test.txt",
+                Bytes::from("v2"),
+                WritePrecondition::DoesNotExist,
+            )
             .await
             .expect("put");
         assert!(matches!(result, WriteResult::PreconditionFailed { .. }));

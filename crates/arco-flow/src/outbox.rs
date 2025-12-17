@@ -176,9 +176,10 @@ mod tests {
         let path =
             "ledger/execution/2025-01-15/2025-01-15T10:00:00Z-01ARZ3NDEKTSV4RRFFQ69G5FAV.json";
         let data = storage.get_raw(path).await?;
-        let parsed: EventEnvelope = serde_json::from_slice(&data).map_err(|e| Error::Serialization {
-            message: format!("failed to parse stored envelope: {e}"),
-        })?;
+        let parsed: EventEnvelope =
+            serde_json::from_slice(&data).map_err(|e| Error::Serialization {
+                message: format!("failed to parse stored envelope: {e}"),
+            })?;
         assert_eq!(parsed.sequence, Some(1));
         assert_eq!(parsed.run_id(), Some(&run_id));
 

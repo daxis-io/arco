@@ -59,10 +59,10 @@ fn arb_task_spec() -> impl Strategy<Value = TaskSpec> {
 /// Generates an arbitrary event with varied properties.
 fn arb_materialization_event() -> impl Strategy<Value = (String, String, i64, i64)> {
     (
-        "[A-Z0-9]{26}",     // ULID-like materialization_id
-        "[A-Z0-9]{26}",     // ULID-like asset_id
-        0i64..1_000_000,    // row_count
-        0i64..100_000_000,  // byte_size
+        "[A-Z0-9]{26}",    // ULID-like materialization_id
+        "[A-Z0-9]{26}",    // ULID-like asset_id
+        0i64..1_000_000,   // row_count
+        0i64..100_000_000, // byte_size
     )
 }
 

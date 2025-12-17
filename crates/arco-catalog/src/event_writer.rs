@@ -49,11 +49,7 @@ impl EventWriter {
     /// # Errors
     ///
     /// Returns an error if serialization or storage fails.
-    pub async fn append<T: Serialize + Sync>(
-        &self,
-        domain: &str,
-        event: &T,
-    ) -> Result<String> {
+    pub async fn append<T: Serialize + Sync>(&self, domain: &str, event: &T) -> Result<String> {
         let event_id = Ulid::new().to_string();
         self.append_with_id(domain, event, &event_id).await?;
         Ok(event_id)
@@ -173,7 +169,8 @@ mod tests {
         // Verify file exists in ledger
         let files = writer.list_events("execution").await.expect("list");
         assert_eq!(files.len(), 1);
-        assert!(files[0].contains(&event_id), "file should contain event ID");
+        let file = files.first().expect("exactly one file");
+        assert!(file.contains(&event_id), "file should contain event ID");
     }
 
     #[tokio::test]
@@ -205,9 +202,13 @@ mod tests {
         assert_eq!(files.len(), 1, "append-only: no duplicates created");
 
         // Original value preserved (not overwritten)
-        let data = storage.get_raw(files[0].as_str()).await.expect("read");
+        let file = files.first().expect("exactly one file");
+        let data = storage.get_raw(file.as_str()).await.expect("read");
         let parsed: TestEvent = serde_json::from_slice(&data).expect("parse");
-        assert_eq!(parsed.value, 42, "original event preserved, not overwritten");
+        assert_eq!(
+            parsed.value, 42,
+            "original event preserved, not overwritten"
+        );
     }
 
     #[tokio::test]
@@ -219,11 +220,9 @@ mod tests {
         let writer = EventWriter::new(storage.clone());
 
         // Write 5 events
-        let mut ids = Vec::new();
         for i in 0..5 {
             let event = TestEvent { value: i };
-            let id = writer.append("execution", &event).await.expect("append");
-            ids.push(id);
+            let _id = writer.append("execution", &event).await.expect("append");
         }
 
         // List files - EventWriter.list_events() sorts explicitly

@@ -169,7 +169,10 @@ pub struct ExecutionManifest {
     pub watermark_event_id: Option<String>,
 
     /// Monotonic position watermark for clock-skew-resistant ordering.
-    /// Architecture: "use `sequence_position` as watermark anchor to survive clock skew."
+    ///
+    /// Planned: once events carry a monotonic `sequence_position` (assigned at ingest), Tier 2
+    /// compaction should use this field as the primary watermark to avoid skipping late-arriving
+    /// events under distributed writers and clock skew.
     #[serde(default)]
     pub watermark_position: Option<u64>,
 
@@ -533,7 +536,9 @@ mod tests {
         let exec = ExecutionManifest {
             watermark_version: 100,
             checkpoint_path: "state/execution/checkpoint.json".into(),
-            snapshot_path: Some("state/execution/snapshot.parquet".into()),
+            snapshot_path: Some(
+                "state/execution/snapshot_v5_01ARZ3NDEKTSV4RRFFQ69G5FAV.parquet".into(),
+            ),
             snapshot_version: 5,
             watermark_event_id: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV.json".into()),
             watermark_position: Some(42),

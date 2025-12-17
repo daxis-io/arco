@@ -62,6 +62,7 @@ impl Compactor {
     ///
     /// Returns an error if reading ledger or writing state fails.
     /// Returns `CatalogError::CasFailed` if another compactor won the race.
+    #[allow(clippy::too_many_lines)]
     pub async fn compact_domain(&self, domain: &str) -> Result<CompactionResult> {
         // 1. Read current manifest + its version for CAS
         let (manifest, current_version) = self.read_manifest_with_version().await?;
@@ -89,13 +90,13 @@ impl Compactor {
         let events_to_process: Vec<_> = files
             .into_iter()
             .filter(|path| {
-                if let Some(ref watermark) = watermark_event_id {
-                    // Compare exact filenames (both include .json)
-                    let filename = path.rsplit('/').next().unwrap_or("");
-                    // Watermark is exact filename, so > comparison works correctly
-                    filename > watermark.as_str()
-                } else {
-                    true
+                // Compare exact filenames (both include .json)
+                let filename = path.rsplit('/').next().unwrap_or("");
+                // If no watermark, process all events; otherwise, only events after watermark
+                #[allow(clippy::option_if_let_else)]
+                match &watermark_event_id {
+                    Some(watermark) => filename > watermark.as_str(),
+                    None => true,
                 }
             })
             .collect();
@@ -117,17 +118,21 @@ impl Compactor {
         for file_path in &events_to_process {
             let filename = file_path.rsplit('/').next().unwrap_or("").to_string();
 
-            let data = self.storage.get_raw(file_path).await.map_err(|e| {
-                CatalogError::Storage {
-                    message: format!("failed to read event: {e}"),
-                }
-            })?;
+            let data =
+                self.storage
+                    .get_raw(file_path)
+                    .await
+                    .map_err(|e| CatalogError::Storage {
+                        message: format!("failed to read event: {e}"),
+                    })?;
 
-            if let Ok(event) = serde_json::from_slice::<MaterializationRecord>(&data) {
-                // DEDUPE: Use materialization_id as primary key (upsert semantics)
-                // Later events overwrite earlier ones for the same key
-                records_by_key.insert(event.materialization_id.clone(), event);
-            }
+            let event: MaterializationRecord =
+                serde_json::from_slice(&data).map_err(|e| CatalogError::Serialization {
+                    message: format!("failed to parse event '{file_path}': {e}"),
+                })?;
+            // DEDUPE: Use materialization_id as primary key (upsert semantics)
+            // Later events overwrite earlier ones for the same key
+            records_by_key.insert(event.materialization_id.clone(), event);
 
             // Track watermark as the last processed file name
             if filename > last_event_file {
@@ -135,25 +140,33 @@ impl Compactor {
             }
         }
 
-        // Convert deduped map to vec for Parquet write
-        let records: Vec<_> = records_by_key.into_values().collect();
+        // Convert deduped map to vec for Parquet write (sort for determinism)
+        let mut records: Vec<_> = records_by_key.into_values().collect();
+        records.sort_by(|a, b| a.materialization_id.cmp(&b.materialization_id));
         // CRITICAL: Store exact filename (including .json) as watermark
         let last_event_id = last_event_file;
 
         // 5. Write Parquet file
         // INVARIANT 4: Parquet is written BEFORE manifest update (atomic publish)
-        let (parquet_files_written, new_snapshot_path) = if !records.is_empty() {
-            let path = self.write_parquet(domain, &records).await?;
-            (1, Some(path))
+        let (parquet_files_written, new_snapshot_path, new_snapshot_version) = if records.is_empty()
+        {
+            (0, manifest.snapshot_path.clone(), manifest.snapshot_version)
         } else {
-            (0, manifest.snapshot_path.clone())
+            let snapshot_version = manifest.snapshot_version + 1;
+            let snapshot_id = last_event_id
+                .strip_suffix(".json")
+                .unwrap_or(&last_event_id);
+            let path = format!("state/{domain}/snapshot_v{snapshot_version}_{snapshot_id}.parquet");
+
+            let wrote_new = self.write_parquet(&path, &records).await?;
+            let files_written = usize::from(wrote_new);
+
+            (files_written, Some(path), snapshot_version)
         };
 
         // 6. Update watermark in manifest with CAS (ARCHITECTURE-CRITICAL)
         // INVARIANT 4: snapshot_path makes the new Parquet visible atomically
         let new_watermark_version = manifest.watermark_version + 1;
-        let new_snapshot_version = manifest.snapshot_version
-            + if parquet_files_written > 0 { 1 } else { 0 };
 
         let mut new_manifest = manifest.clone();
         new_manifest.watermark_version = new_watermark_version;
@@ -205,14 +218,13 @@ impl Compactor {
     }
 
     /// Writes records to a Parquet snapshot file.
-    /// Returns the path to the written file for manifest `snapshot_path`.
-    async fn write_parquet(
-        &self,
-        domain: &str,
-        records: &[MaterializationRecord],
-    ) -> Result<String> {
-        let materialization_ids: Vec<_> =
-            records.iter().map(|r| r.materialization_id.as_str()).collect();
+    ///
+    /// Returns `true` if a new file was written, or `false` if the file already existed.
+    async fn write_parquet(&self, path: &str, records: &[MaterializationRecord]) -> Result<bool> {
+        let materialization_ids: Vec<_> = records
+            .iter()
+            .map(|r| r.materialization_id.as_str())
+            .collect();
         let asset_ids: Vec<_> = records.iter().map(|r| r.asset_id.as_str()).collect();
         let row_counts: Vec<_> = records.iter().map(|r| r.row_count).collect();
         let byte_sizes: Vec<_> = records.iter().map(|r| r.byte_size).collect();
@@ -239,32 +251,38 @@ impl Compactor {
 
         let mut buffer = Cursor::new(Vec::new());
         let props = WriterProperties::builder().build();
-        let mut writer = ArrowWriter::try_new(&mut buffer, Arc::new(schema), Some(props))
-            .map_err(|e| CatalogError::Serialization {
-                message: format!("failed to create Parquet writer: {e}"),
+        let mut writer =
+            ArrowWriter::try_new(&mut buffer, Arc::new(schema), Some(props)).map_err(|e| {
+                CatalogError::Serialization {
+                    message: format!("failed to create Parquet writer: {e}"),
+                }
             })?;
 
-        writer.write(&batch).map_err(|e| CatalogError::Serialization {
-            message: format!("failed to write batch: {e}"),
-        })?;
+        writer
+            .write(&batch)
+            .map_err(|e| CatalogError::Serialization {
+                message: format!("failed to write batch: {e}"),
+            })?;
         writer.close().map_err(|e| CatalogError::Serialization {
             message: format!("failed to close writer: {e}"),
         })?;
 
-        // Use deterministic naming for snapshot
-        let path = format!("state/{domain}/snapshot.parquet");
-        self.storage
+        let result = self
+            .storage
             .put_raw(
-                &path,
+                path,
                 Bytes::from(buffer.into_inner()),
-                WritePrecondition::None,
+                WritePrecondition::DoesNotExist,
             )
             .await
             .map_err(|e| CatalogError::Storage {
                 message: format!("failed to write Parquet: {e}"),
             })?;
 
-        Ok(path)
+        match result {
+            arco_core::storage::WriteResult::Success { .. } => Ok(true),
+            arco_core::storage::WriteResult::PreconditionFailed { .. } => Ok(false),
+        }
     }
 
     /// Reads the execution manifest with its current version for CAS.
@@ -272,24 +290,27 @@ impl Compactor {
         let manifest_path = "manifests/execution.manifest.json";
 
         // First, get metadata to retrieve version
-        let meta = self.storage.head_raw(manifest_path).await.map_err(|e| {
-            CatalogError::Storage {
-                message: format!("failed to read manifest metadata: {e}"),
-            }
-        })?;
+        let meta =
+            self.storage
+                .head_raw(manifest_path)
+                .await
+                .map_err(|e| CatalogError::Storage {
+                    message: format!("failed to read manifest metadata: {e}"),
+                })?;
 
         // If manifest doesn't exist, return default with version "0"
-        let version = match &meta {
-            Some(m) => m.version.clone(),
-            None => "0".to_string(),
-        };
+        let version = meta
+            .as_ref()
+            .map_or_else(|| "0".to_string(), |m| m.version.clone());
 
         // Read the content
-        let data = self.storage.get_raw(manifest_path).await.map_err(|e| {
-            CatalogError::Storage {
-                message: format!("failed to read manifest: {e}"),
-            }
-        })?;
+        let data =
+            self.storage
+                .get_raw(manifest_path)
+                .await
+                .map_err(|e| CatalogError::Storage {
+                    message: format!("failed to read manifest: {e}"),
+                })?;
 
         let manifest: ExecutionManifest =
             serde_json::from_slice(&data).map_err(|e| CatalogError::Serialization {
@@ -300,7 +321,7 @@ impl Compactor {
     }
 }
 
-/// Record structure for materialization events (matches EventWriter format).
+/// Record structure for materialization events (matches `EventWriter` format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaterializationRecord {
     /// Unique materialization ID.
@@ -332,7 +353,10 @@ mod tests {
         writer.initialize().await.expect("init");
 
         let compactor = Compactor::new(storage);
-        let result = compactor.compact_domain("execution").await.expect("compact");
+        let result = compactor
+            .compact_domain("execution")
+            .await
+            .expect("compact");
 
         assert_eq!(result.events_processed, 0);
         assert_eq!(result.parquet_files_written, 0);
@@ -355,11 +379,17 @@ mod tests {
                 row_count: 1000,
                 byte_size: 50000,
             };
-            event_writer.append("execution", &event).await.expect("append");
+            event_writer
+                .append("execution", &event)
+                .await
+                .expect("append");
         }
 
         let compactor = Compactor::new(storage);
-        let result = compactor.compact_domain("execution").await.expect("compact");
+        let result = compactor
+            .compact_domain("execution")
+            .await
+            .expect("compact");
 
         assert_eq!(result.events_processed, 5);
         assert!(result.parquet_files_written > 0);
@@ -385,9 +415,15 @@ mod tests {
                 row_count: 1000,
                 byte_size: 50000,
             };
-            event_writer.append("execution", &event).await.expect("append");
+            event_writer
+                .append("execution", &event)
+                .await
+                .expect("append");
         }
-        let result1 = compactor.compact_domain("execution").await.expect("compact1");
+        let result1 = compactor
+            .compact_domain("execution")
+            .await
+            .expect("compact1");
         assert_eq!(result1.events_processed, 3);
 
         // Write 2 more events and compact again
@@ -398,10 +434,19 @@ mod tests {
                 row_count: 1000,
                 byte_size: 50000,
             };
-            event_writer.append("execution", &event).await.expect("append");
+            event_writer
+                .append("execution", &event)
+                .await
+                .expect("append");
         }
-        let result2 = compactor.compact_domain("execution").await.expect("compact2");
+        let result2 = compactor
+            .compact_domain("execution")
+            .await
+            .expect("compact2");
 
-        assert_eq!(result2.events_processed, 2, "only new events since watermark");
+        assert_eq!(
+            result2.events_processed, 2,
+            "only new events since watermark"
+        );
     }
 }

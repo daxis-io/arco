@@ -350,8 +350,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use arco_core::storage::{MemoryBackend, ObjectMeta};
-    use std::ops::Range;
     use serde::de::DeserializeOwned;
+    use std::ops::Range;
 
     fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
         serde_json::from_slice(bytes).map_err(|e| Error::Serialization {
@@ -471,8 +471,7 @@ mod tests {
                 manifest.core.snapshot_path = "core/snapshots/v1/".into();
                 Ok(())
             })
-            .await
-            ?;
+            .await?;
 
         assert_eq!(commit.operation, "Update");
 
@@ -497,8 +496,7 @@ mod tests {
                 manifest.core.snapshot_version += 1;
                 Ok(())
             })
-            .await
-            ?;
+            .await?;
 
         let core_bytes = storage.get_raw(paths::CORE_MANIFEST).await?;
         let core: CoreManifest = parse_json(&core_bytes)?;
@@ -522,8 +520,7 @@ mod tests {
                 manifest.core.snapshot_version = 1;
                 Ok(())
             })
-            .await
-            ?;
+            .await?;
         assert!(commit1.prev_commit_id.is_none());
         assert!(commit1.prev_commit_hash.is_none());
 
@@ -533,8 +530,7 @@ mod tests {
                 manifest.core.snapshot_version = 2;
                 Ok(())
             })
-            .await
-            ?;
+            .await?;
         assert_eq!(commit2.prev_commit_id, Some(commit1.commit_id.clone()));
         assert!(
             commit2.prev_commit_hash.is_some(),
@@ -547,8 +543,7 @@ mod tests {
                 manifest.core.snapshot_version = 3;
                 Ok(())
             })
-            .await
-            ?;
+            .await?;
         assert_eq!(commit3.prev_commit_id, Some(commit2.commit_id.clone()));
         assert!(
             commit3.prev_commit_hash.is_some(),

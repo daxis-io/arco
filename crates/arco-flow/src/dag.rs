@@ -381,24 +381,27 @@ mod tests {
 
         let sorted = dag.toposort()?;
         // a must come before b, b must come before c
-        let pos_a = sorted
-            .iter()
-            .position(|x| x == "a")
-            .ok_or_else(|| Error::PlanGenerationFailed {
-                message: "missing node a in toposort output".into(),
-            })?;
-        let pos_b = sorted
-            .iter()
-            .position(|x| x == "b")
-            .ok_or_else(|| Error::PlanGenerationFailed {
-                message: "missing node b in toposort output".into(),
-            })?;
-        let pos_c = sorted
-            .iter()
-            .position(|x| x == "c")
-            .ok_or_else(|| Error::PlanGenerationFailed {
-                message: "missing node c in toposort output".into(),
-            })?;
+        let pos_a =
+            sorted
+                .iter()
+                .position(|x| x == "a")
+                .ok_or_else(|| Error::PlanGenerationFailed {
+                    message: "missing node a in toposort output".into(),
+                })?;
+        let pos_b =
+            sorted
+                .iter()
+                .position(|x| x == "b")
+                .ok_or_else(|| Error::PlanGenerationFailed {
+                    message: "missing node b in toposort output".into(),
+                })?;
+        let pos_c =
+            sorted
+                .iter()
+                .position(|x| x == "c")
+                .ok_or_else(|| Error::PlanGenerationFailed {
+                    message: "missing node c in toposort output".into(),
+                })?;
         assert!(pos_a < pos_b);
         assert!(pos_b < pos_c);
         Ok(())

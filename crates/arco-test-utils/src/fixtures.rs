@@ -46,10 +46,7 @@ impl TestContext {
     /// Returns the base path for this tenant/workspace.
     #[must_use]
     pub fn base_path(&self) -> String {
-        format!(
-            "tenant={}/workspace={}",
-            self.tenant_id, self.workspace_id
-        )
+        format!("tenant={}/workspace={}", self.tenant_id, self.workspace_id)
     }
 }
 

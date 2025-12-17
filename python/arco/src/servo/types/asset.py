@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, TypeVar
 
+from servo._internal.frozen import FrozenDict
 from servo.types.partition import PartitionStrategy
 
 if TYPE_CHECKING:
@@ -94,6 +95,12 @@ class AssetIn(Generic[T]):
         Returns:
             A dynamically created subclass with __asset_key__ set.
         """
+        if not isinstance(key, str):
+            raise TypeError("AssetIn[...] key must be a string in 'namespace.name' format")
+        if "." not in key:
+            raise ValueError("AssetIn[...] key must be in 'namespace.name' format")
+        # Validate format early (also enforces identifier pattern).
+        AssetKey.parse(key)
         if key not in cls._cache:
             # Create a new type dynamically
             new_type: type[AssetIn[Any]] = type(
@@ -212,9 +219,12 @@ class IoConfig:
 
     format: Literal["parquet", "delta", "iceberg", "json", "csv"] = "parquet"
     compression: Literal["none", "snappy", "gzip", "zstd", "lz4"] = "snappy"
-    partition_by: list[str] = field(default_factory=list)
+    partition_by: tuple[str, ...] = field(default_factory=tuple)
     row_group_size: int | None = None
     max_file_size_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "partition_by", tuple(self.partition_by))
 
 
 @dataclass(frozen=True)
@@ -228,19 +238,25 @@ class AssetDefinition:
     id: AssetId
     description: str = ""
 
-    owners: list[str] = field(default_factory=list)
-    tags: dict[str, str] = field(default_factory=dict)
+    owners: tuple[str, ...] = field(default_factory=tuple)
+    tags: FrozenDict[str, str] = field(default_factory=FrozenDict)
 
     partitioning: PartitionStrategy = field(default_factory=PartitionStrategy)
-    dependencies: list[AssetDependency] = field(default_factory=list)
+    dependencies: tuple[AssetDependency, ...] = field(default_factory=tuple)
 
     code: CodeLocation = field(default_factory=lambda: CodeLocation(module="", function=""))
-    checks: list[Check] = field(default_factory=list)  # Full Check objects, not names
+    checks: tuple[Check, ...] = field(default_factory=tuple)  # Full Check objects, not names
     execution: ExecutionPolicy = field(default_factory=ExecutionPolicy)
     resources: ResourceRequirements = field(default_factory=ResourceRequirements)
     io: IoConfig = field(default_factory=IoConfig)  # Output configuration
 
     transform_fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "owners", tuple(self.owners))
+        object.__setattr__(self, "tags", FrozenDict(self.tags))
+        object.__setattr__(self, "dependencies", tuple(self.dependencies))
+        object.__setattr__(self, "checks", tuple(self.checks))
 
 
 def is_asset_in_type(annotation: type[Any]) -> bool:

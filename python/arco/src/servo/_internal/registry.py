@@ -62,19 +62,26 @@ class AssetRegistry:
                 raise ValueError(msg)
             self._assets[key] = asset
             self._by_function[id(asset.func)] = asset
+            wrapped = getattr(asset.func, "__wrapped__", None)
+            if wrapped is not None:
+                self._by_function[id(wrapped)] = asset
 
     def get(self, key: AssetKey | str) -> RegisteredAssetProtocol | None:
         """Get asset by key."""
         key_str = str(key) if not isinstance(key, str) else key
-        return self._assets.get(key_str)
+        with self._lock:
+            return self._assets.get(key_str)
 
     def get_by_function(self, func: object) -> RegisteredAssetProtocol | None:
-        """Get asset by its decorated function."""
-        return self._by_function.get(id(func))
+        """Get asset by its decorated function (or underlying wrapped function)."""
+        with self._lock:
+            return self._by_function.get(id(func))
 
     def all(self) -> list[RegisteredAssetProtocol]:
         """Get all registered assets, sorted by key."""
-        return [self._assets[k] for k in sorted(self._assets.keys())]
+        with self._lock:
+            keys = sorted(self._assets.keys())
+            return [self._assets[k] for k in keys]
 
     def clear(self) -> None:
         """Clear all registered assets (for testing)."""
@@ -84,11 +91,13 @@ class AssetRegistry:
 
     def __len__(self) -> int:
         """Return number of registered assets."""
-        return len(self._assets)
+        with self._lock:
+            return len(self._assets)
 
     def __contains__(self, key: str) -> bool:
         """Check if asset is registered."""
-        return key in self._assets
+        with self._lock:
+            return key in self._assets
 
 
 # Global singleton instance

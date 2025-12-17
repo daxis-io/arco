@@ -3,8 +3,8 @@
 A Pythonic interface for defining data assets and orchestrating pipelines.
 
 Example:
-    >>> from servo import asset, AssetIn, AssetOut, AssetContext
-    >>> from servo.types import DailyPartition
+    >>> from servo import AssetContext, asset
+    >>> from servo.types import AssetIn, AssetOut, DailyPartition
     >>>
     >>> @asset(
     ...     description="Daily user metrics",
@@ -12,7 +12,7 @@ Example:
     ... )
     ... def user_metrics(
     ...     ctx: AssetContext,
-    ...     raw_events: AssetIn["raw_events"],
+    ...     raw_events: AssetIn["raw.events"],
     ... ) -> AssetOut:
     ...     events = raw_events.read()
     ...     return ctx.output(events.group_by("user_id").agg(...))
@@ -21,4 +21,7 @@ from __future__ import annotations
 
 __version__ = "0.1.0-alpha"
 
-__all__ = ["__version__"]
+from servo.asset import asset
+from servo.context import AssetContext
+
+__all__ = ["AssetContext", "__version__", "asset"]

@@ -154,13 +154,6 @@ def asset(
             transform_fingerprint=fingerprint,
         )
 
-        # Create registered asset
-        registered = RegisteredAsset(func=fn, key=asset_key, definition=definition)
-
-        # Register with global registry
-        registry = get_registry()
-        registry.register(registered)
-
         # Wrap function
         @functools.wraps(fn)
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
@@ -170,6 +163,12 @@ def asset(
         wrapper.__servo_asset__ = True  # type: ignore[attr-defined]
         wrapper.__servo_key__ = asset_key  # type: ignore[attr-defined]
         wrapper.__servo_definition__ = definition  # type: ignore[attr-defined]
+
+        # Create registered asset and register with global registry.
+        # Registering the wrapper ensures registry lookups by the decorated
+        # function object work as expected.
+        registered = RegisteredAsset(func=wrapper, key=asset_key, definition=definition)
+        get_registry().register(registered)
 
         return wrapper
 

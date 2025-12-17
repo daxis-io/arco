@@ -1,10 +1,10 @@
 """Introspection utilities for extracting metadata from decorated functions."""
 from __future__ import annotations
 
-import contextlib
+import ast
 import hashlib
 import inspect
-from typing import TYPE_CHECKING, get_type_hints
+from typing import TYPE_CHECKING, Any, get_type_hints
 
 from servo.types.asset import AssetDependency, AssetIn, AssetKey, CodeLocation, get_asset_in_key
 
@@ -12,6 +12,36 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 _ASSET_MODULE_PATH_MIN_PARTS = 2
+
+
+def _safe_parse_asset_in_forward_ref(annotation: str) -> type[AssetIn[Any]] | None:
+    """Safely parse a forward-ref string and extract an AssetIn type.
+
+    This intentionally supports only AssetIn["namespace.name"] (and cases where
+    that appears inside a larger expression, e.g. unions), without executing
+    arbitrary code (no eval()).
+    """
+    try:
+        expr = ast.parse(annotation, mode="eval")
+    except SyntaxError:
+        return None
+
+    for node in ast.walk(expr):
+        if not isinstance(node, ast.Subscript):
+            continue
+        if not isinstance(node.value, ast.Name) or node.value.id != "AssetIn":
+            continue
+
+        slice_node: ast.AST = node.slice
+        if hasattr(ast, "Index") and isinstance(slice_node, ast.Index):  # pragma: no cover
+            slice_node = slice_node.value  # type: ignore[attr-defined]
+
+        if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
+            return AssetIn.__class_getitem__(slice_node.value)
+        if isinstance(slice_node, ast.Str) and isinstance(slice_node.s, str):  # pragma: no cover
+            return AssetIn.__class_getitem__(slice_node.s)
+
+    return None
 
 
 def extract_code_location(func: Callable[..., object]) -> CodeLocation:
@@ -44,15 +74,14 @@ def extract_dependencies(func: Callable[..., object]) -> list[AssetDependency]:
         # Include AssetIn in localns to help resolve annotations
         hints = get_type_hints(func, globalns=func.__globals__, localns={"AssetIn": AssetIn})
     except (TypeError, NameError, AttributeError, ValueError):
-        # Fallback: manually resolve string annotations that look like AssetIn[...]
+        # Fallback: safely parse AssetIn[...] forward-ref strings without eval().
         hints = {}
         raw_annotations = getattr(func, "__annotations__", {})
-        eval_globals = dict(func.__globals__)
-        eval_globals["AssetIn"] = AssetIn
         for name, annotation in raw_annotations.items():
             if isinstance(annotation, str):
-                with contextlib.suppress(Exception):
-                    hints[name] = eval(annotation, eval_globals)  # noqa: S307
+                asset_in_type = _safe_parse_asset_in_forward_ref(annotation)
+                if asset_in_type is not None:
+                    hints[name] = asset_in_type
             else:
                 hints[name] = annotation
 

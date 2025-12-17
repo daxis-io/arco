@@ -47,6 +47,21 @@ class TestAssetIn:
         assert hasattr(hint, "__asset_key__")
         assert hint.__asset_key__ == "raw.events"
 
+    def test_subscript_requires_string_key(self) -> None:
+        """AssetIn[...] requires a string key."""
+        with pytest.raises(TypeError, match="must be a string"):
+            AssetIn[123]  # type: ignore[valid-type]
+
+    def test_subscript_requires_dotted_key(self) -> None:
+        """AssetIn[...] requires 'namespace.name' format."""
+        with pytest.raises(ValueError, match="namespace\\.name"):
+            AssetIn["events"]
+
+    def test_subscript_validates_key_pattern(self) -> None:
+        """AssetIn[...] validates namespace/name pattern."""
+        with pytest.raises(ValueError, match="namespace"):
+            AssetIn["Raw.events"]
+
     def test_subscript_returns_type(self) -> None:
         """AssetIn['key'] returns a type, not an instance."""
         hint = AssetIn["raw.events"]
@@ -77,7 +92,7 @@ class TestAssetIn:
 
     def test_typing_get_type_hints_compatibility(self) -> None:
         """AssetIn works with typing.get_type_hints()."""
-        def fn(ctx: object, upstream: AssetIn["raw.events"]) -> None:  # noqa: UP037, F821
+        def fn(ctx: object, upstream: AssetIn["raw.events"]) -> None:  # noqa: UP037
             pass
 
         hints = get_type_hints(fn)

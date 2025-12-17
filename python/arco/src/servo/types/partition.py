@@ -15,6 +15,7 @@ from datetime import UTC, date, datetime
 from enum import Enum
 from typing import Literal
 
+from servo._internal.frozen import FrozenDict
 from servo.types.scalar import PartitionDimensionValue, ScalarValue
 
 
@@ -151,13 +152,13 @@ class PartitionKey:
         {'date': 'd:2024-01-15', 'tenant': 's:acme'}
     """
 
-    dimensions: dict[str, ScalarValue] = field(default_factory=dict)
+    dimensions: FrozenDict[str, ScalarValue] = field(default_factory=FrozenDict)
 
     def __init__(self, dims: dict[str, PartitionDimensionValue] | None = None) -> None:
         """Create partition key from dimension values."""
         if dims is None:
             dims = {}
-        converted = {k: ScalarValue.from_value(v) for k, v in dims.items()}
+        converted = FrozenDict({k: ScalarValue.from_value(v) for k, v in dims.items()})
         object.__setattr__(self, "dimensions", converted)
 
     def to_proto_dict(self) -> dict[str, str]:
@@ -182,7 +183,7 @@ class PartitionKey:
         dims = {}
         for k, tagged in proto_dict.items():
             dims[k] = ScalarValue.from_tagged_string(tagged)
-        object.__setattr__(instance, "dimensions", dims)
+        object.__setattr__(instance, "dimensions", FrozenDict(dims))
         return instance
 
     def to_canonical(self) -> str:
@@ -215,7 +216,10 @@ class PartitionStrategy:
         >>> strategy = PartitionStrategy(dimensions=[DailyPartition("date")])
     """
 
-    dimensions: list[PartitionDimension] = field(default_factory=list)
+    dimensions: tuple[PartitionDimension, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "dimensions", tuple(self.dimensions))
 
     @property
     def is_partitioned(self) -> bool:

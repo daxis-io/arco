@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal
 
+from servo._internal.frozen import FrozenDict
+
 
 class CheckPhase(str, Enum):
     """When the check runs."""
@@ -30,7 +32,10 @@ class CheckResult:
     passed: bool
     severity: CheckSeverity
     message: str | None = None
-    details: dict[str, str | int | float | bool] = field(default_factory=dict)
+    details: FrozenDict[str, str | int | float | bool] = field(default_factory=FrozenDict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "details", FrozenDict(self.details))
 
 
 @dataclass(frozen=True)
@@ -65,7 +70,13 @@ class NotNullCheck(BaseCheck):
     """
 
     check_type: Literal["not_null"] = "not_null"
-    columns: list[str] = field(default_factory=list)
+    columns: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        columns = tuple(self.columns)
+        if not columns:
+            raise ValueError("NotNullCheck requires at least one column")
+        object.__setattr__(self, "columns", columns)
 
 
 @dataclass(frozen=True)
@@ -77,7 +88,13 @@ class UniqueCheck(BaseCheck):
     """
 
     check_type: Literal["unique"] = "unique"
-    columns: list[str] = field(default_factory=list)
+    columns: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        columns = tuple(self.columns)
+        if not columns:
+            raise ValueError("UniqueCheck requires at least one column")
+        object.__setattr__(self, "columns", columns)
 
 
 @dataclass(frozen=True)
@@ -144,9 +161,11 @@ def not_null(*columns: str, severity: CheckSeverity = CheckSeverity.ERROR) -> No
         >>> @asset(checks=[not_null("user_id", "email")])
         ... def my_asset(ctx): ...
     """
+    if not columns:
+        raise ValueError("not_null() requires at least one column name")
     return NotNullCheck(
         name=f"not_null_{'-'.join(columns)}",
-        columns=list(columns),
+        columns=tuple(columns),
         severity=severity,
     )
 
@@ -158,8 +177,10 @@ def unique(*columns: str, severity: CheckSeverity = CheckSeverity.ERROR) -> Uniq
         >>> @asset(checks=[unique("id")])
         ... def my_asset(ctx): ...
     """
+    if not columns:
+        raise ValueError("unique() requires at least one column name")
     return UniqueCheck(
         name=f"unique_{'-'.join(columns)}",
-        columns=list(columns),
+        columns=tuple(columns),
         severity=severity,
     )

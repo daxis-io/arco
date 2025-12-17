@@ -44,6 +44,26 @@ class TestAssetRegistry:
         assert len(reg) == 1
         assert reg.get(key) is asset
 
+    def test_get_by_function_supports_decorated_wrapper(self) -> None:
+        """get_by_function should work for the decorated function object."""
+        from servo._internal.registry import get_registry
+        from servo.asset import asset
+        from servo.context import AssetContext
+
+        reg = get_registry()
+        reg.clear()
+
+        @asset(namespace="raw")
+        def my_events(ctx: AssetContext) -> None:
+            del ctx
+
+        registered = reg.get_by_function(my_events)
+        assert registered is not None
+
+        original = getattr(my_events, "__wrapped__", None)
+        assert original is not None
+        assert reg.get_by_function(original) is registered
+
     def test_rejects_duplicate(self) -> None:
         """Duplicate asset keys are rejected with helpful error."""
         from servo._internal.registry import get_registry

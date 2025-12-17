@@ -1,6 +1,8 @@
 """Tests for check types."""
 from __future__ import annotations
 
+import pytest
+
 from servo.types.check import (
     CheckPhase,
     CheckSeverity,
@@ -29,7 +31,7 @@ class TestCheckTypes:
         """NotNullCheck with column list."""
         check = NotNullCheck(name="not_null", columns=["user_id", "email"])
         assert check.check_type == "not_null"
-        assert check.columns == ["user_id", "email"]
+        assert check.columns == ("user_id", "email")
 
     def test_unique_check(self) -> None:
         """UniqueCheck with column list."""
@@ -71,10 +73,20 @@ class TestCheckHelpers:
         """not_null() creates NotNullCheck."""
         check = not_null("user_id", "email")
         assert check.check_type == "not_null"
-        assert check.columns == ["user_id", "email"]
+        assert check.columns == ("user_id", "email")
+
+    def test_not_null_requires_columns(self) -> None:
+        """not_null() requires at least one column."""
+        with pytest.raises(ValueError, match="requires at least one column"):
+            not_null()
 
     def test_unique_helper(self) -> None:
         """unique() creates UniqueCheck."""
         check = unique("id")
         assert check.check_type == "unique"
-        assert check.columns == ["id"]
+        assert check.columns == ("id",)
+
+    def test_unique_requires_columns(self) -> None:
+        """unique() requires at least one column."""
+        with pytest.raises(ValueError, match="requires at least one column"):
+            unique()

@@ -22,4 +22,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+arrow = { workspace = true }
+parquet = { workspace = true }
 proptest = { workspace = true }

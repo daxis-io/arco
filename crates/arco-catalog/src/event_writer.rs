@@ -1,12 +1,12 @@
 //! Tier 2 event writer for append-only ledger persistence.
 //!
-//! INVARIANT 1: Ingest is append-only + ack. EventWriter must NEVER overwrite
+//! INVARIANT 1: Ingest is append-only + ack. `EventWriter` must NEVER overwrite
 //! existing events. Uses `DoesNotExist` precondition for true append-only semantics.
 //!
 //! Events are written as individual JSON files to the ledger path:
 //! `ledger/{domain}/{event_id}.json`
 //!
-//! File naming uses ULID event_id ONLY (no timestamp prefix) for idempotent writes.
+//! File naming uses ULID `event_id` ONLY (no timestamp prefix) for idempotent writes.
 //! ULID's embedded timestamp ensures lexicographic ordering = chronological ordering.
 //! NOTE: Production should use micro-batched segments to avoid "too many small files".
 
@@ -27,9 +27,9 @@ use crate::error::{CatalogError, Result};
 /// Events are stored as individual JSON files at:
 /// `ledger/{domain}/{event_id}.json`
 ///
-/// Using event_id only (no timestamp prefix) ensures:
-/// 1. Idempotent writes: same event_id always maps to same path
-/// 2. DoesNotExist precondition prevents overwrites on replay
+/// Using `event_id` only (no timestamp prefix) ensures:
+/// 1. Idempotent writes: same `event_id` always maps to same path
+/// 2. `DoesNotExist` precondition prevents overwrites on replay
 /// 3. ULID's embedded timestamp maintains lexicographic = chronological ordering
 pub struct EventWriter {
     storage: ScopedStorage,
@@ -49,7 +49,11 @@ impl EventWriter {
     /// # Errors
     ///
     /// Returns an error if serialization or storage fails.
-    pub async fn append<T: Serialize>(&self, domain: &str, event: &T) -> Result<String> {
+    pub async fn append<T: Serialize + Sync>(
+        &self,
+        domain: &str,
+        event: &T,
+    ) -> Result<String> {
         let event_id = Ulid::new().to_string();
         self.append_with_id(domain, event, &event_id).await?;
         Ok(event_id)
@@ -61,13 +65,13 @@ impl EventWriter {
     /// If an event with this ID already exists, returns Ok (duplicate delivery).
     /// The ledger is immutable; duplicates are handled at compaction time.
     ///
-    /// IDEMPOTENCY: Path is deterministic based on event_id only.
-    /// Same event_id always maps to same path, enabling DoesNotExist to prevent duplicates.
+    /// IDEMPOTENCY: Path is deterministic based on `event_id` only.
+    /// Same `event_id` always maps to same path, enabling `DoesNotExist` to prevent duplicates.
     ///
     /// # Errors
     ///
     /// Returns an error if serialization or storage fails (NOT for duplicates).
-    pub async fn append_with_id<T: Serialize>(
+    pub async fn append_with_id<T: Serialize + Sync>(
         &self,
         domain: &str,
         event: &T,
@@ -103,7 +107,7 @@ impl EventWriter {
     /// Lists all event files in a domain.
     ///
     /// Returns file paths sorted lexicographically (ULID ensures chronological).
-    /// NOTE: Object store list() ordering is NOT guaranteed - we sort explicitly.
+    /// NOTE: Object store `list()` ordering is NOT guaranteed - we sort explicitly.
     ///
     /// # Errors
     ///
@@ -143,6 +147,7 @@ impl EventWriter {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use arco_core::storage::MemoryBackend;

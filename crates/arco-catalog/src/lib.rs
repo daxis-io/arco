@@ -36,7 +36,7 @@
 //! ├── core/
 //! │   ├── snapshots/                # Tier 1: Immutable catalog snapshots (Parquet)
 //! │   └── commits/                  # Commit records (audit trail)
-//! └── events/                       # Tier 2: Append-only event log
+//! └── ledger/                       # Tier 2: Append-only event log
 //! ```
 //!
 //! The multi-file manifest structure reduces contention by separating domains

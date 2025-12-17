@@ -3,6 +3,8 @@
 //! These tests verify the catalog's distributed locking and CAS mechanisms work
 //! correctly under contention.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 

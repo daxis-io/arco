@@ -172,14 +172,30 @@ impl StorageBackend for TracingMemoryBackend {
             end: range.end,
         });
 
+        // Validate range per StorageBackend contract
+        if range.end < range.start {
+            return Err(Error::InvalidInput(format!(
+                "invalid range: end ({}) < start ({})",
+                range.end, range.start
+            )));
+        }
+
         let data = self.data.lock().expect("lock");
-        data.get(path)
-            .map(|o| {
-                let start = range.start as usize;
-                let end = std::cmp::min(range.end as usize, o.data.len());
-                o.data.slice(start..end)
-            })
-            .ok_or_else(|| Error::NotFound(format!("object not found: {path}")))
+        let obj = data
+            .get(path)
+            .ok_or_else(|| Error::NotFound(format!("object not found: {path}")))?;
+
+        let len = obj.data.len() as u64;
+        if range.start > len {
+            return Err(Error::InvalidInput(format!(
+                "invalid range: start ({}) > object length ({len})",
+                range.start
+            )));
+        }
+
+        let start = range.start as usize;
+        let end = std::cmp::min(range.end as usize, obj.data.len());
+        Ok(obj.data.slice(start..end))
     }
 
     async fn head(&self, path: &str) -> Result<Option<ObjectMeta>> {

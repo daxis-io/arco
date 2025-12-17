@@ -1,0 +1,42 @@
+# python/arco/ruff.toml
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+
+[lint]
+select = [
+    "E", "W",     # pycodestyle
+    "F",          # Pyflakes
+    "I",          # isort
+    "B",          # flake8-bugbear
+    "C4",         # flake8-comprehensions
+    "UP",         # pyupgrade
+    "ARG",        # flake8-unused-arguments
+    "SIM",        # flake8-simplify
+    "TCH",        # flake8-type-checking
+    "PTH",        # flake8-use-pathlib
+    "PL",         # Pylint
+    "RUF",        # Ruff-specific
+    "D",          # pydocstyle
+    "ANN",        # flake8-annotations
+    "S",          # flake8-bandit (security)
+    "N",          # pep8-naming
+]
+
+ignore = [
+    "D100", "D104", "D105", "D107",  # Missing docstrings (handled at package level)
+    "ANN101", "ANN102",              # Missing self/cls annotations
+    "PLR0913",                       # Too many arguments (decorators need many)
+    "S101",                          # Assert allowed in tests
+]
+
+[lint.per-file-ignores]
+"tests/**/*.py" = ["D", "ANN", "S101", "PLR2004"]
+"src/servo/cli/*.py" = ["PLR0913"]
+
+[lint.pydocstyle]
+convention = "google"
+
+[lint.isort]
+known-first-party = ["servo"]
+required-imports = ["from __future__ import annotations"]

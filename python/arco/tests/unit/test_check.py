@@ -1,10 +1,7 @@
 """Tests for check types."""
 from __future__ import annotations
 
-import pytest
-
 from servo.types.check import (
-    Check,
     CheckPhase,
     CheckSeverity,
     FreshnessCheck,

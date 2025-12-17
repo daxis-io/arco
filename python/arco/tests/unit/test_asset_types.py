@@ -77,7 +77,7 @@ class TestAssetIn:
 
     def test_typing_get_type_hints_compatibility(self) -> None:
         """AssetIn works with typing.get_type_hints()."""
-        def fn(ctx: object, upstream: AssetIn["raw.events"]) -> None:
+        def fn(ctx: object, upstream: AssetIn["raw.events"]) -> None:  # noqa: UP037, F821
             pass
 
         hints = get_type_hints(fn)

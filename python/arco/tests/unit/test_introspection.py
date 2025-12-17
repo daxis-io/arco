@@ -85,6 +85,19 @@ class TestExtractDependencies:
         deps = extract_dependencies(my_asset)
         assert len(deps) == 1
 
+    def test_fallback_parses_string_annotations(self) -> None:
+        """Fallback path should parse AssetIn[...] when get_type_hints fails."""
+        # The "NotAType" annotation will cause get_type_hints() to fail,
+        # triggering the AST-based fallback path for all annotations
+        def my_asset(ctx: object, raw: AssetIn["raw.events"], bad: NotAType) -> None:  # type: ignore[name-defined]  # noqa: UP037
+            pass
+
+        deps = extract_dependencies(my_asset)
+        assert len(deps) == 1
+        assert deps[0].upstream_key.namespace == "raw"
+        assert deps[0].upstream_key.name == "events"
+        assert deps[0].parameter_name == "raw"
+
 
 class TestComputeTransformFingerprint:
     """Tests for compute_transform_fingerprint."""

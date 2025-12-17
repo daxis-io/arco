@@ -10,12 +10,14 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
+use arrow::array::Array;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use chrono::Utc;
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
 
@@ -113,6 +115,12 @@ impl Compactor {
         // Architecture: "Compactor dedupes by idempotency_key during fold"
         // Use HashMap keyed by primary key (materialization_id) for upsert semantics
         let mut records_by_key: HashMap<String, MaterializationRecord> = HashMap::new();
+        if let Some(snapshot_path) = manifest.snapshot_path.as_deref() {
+            let existing = self.read_snapshot_records(snapshot_path).await?;
+            for record in existing {
+                records_by_key.insert(record.materialization_id.clone(), record);
+            }
+        }
         let mut last_event_file = String::new();
 
         for file_path in &events_to_process {
@@ -150,7 +158,9 @@ impl Compactor {
         // INVARIANT 4: Parquet is written BEFORE manifest update (atomic publish)
         let (parquet_files_written, new_snapshot_path, new_snapshot_version) = if records.is_empty()
         {
-            (0, manifest.snapshot_path.clone(), manifest.snapshot_version)
+            return Err(CatalogError::InvariantViolation {
+                message: "compactor produced empty snapshot while processing events".to_string(),
+            });
         } else {
             let snapshot_version = manifest.snapshot_version + 1;
             let snapshot_id = last_event_id
@@ -215,6 +225,101 @@ impl Compactor {
             parquet_files_written,
             new_watermark: last_event_id,
         })
+    }
+
+    /// Reads all records from an existing Parquet snapshot.
+    async fn read_snapshot_records(&self, path: &str) -> Result<Vec<MaterializationRecord>> {
+        let parquet_data = self
+            .storage
+            .get_raw(path)
+            .await
+            .map_err(|e| CatalogError::Storage {
+                message: format!("failed to read snapshot '{path}': {e}"),
+            })?;
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(parquet_data)
+            .map_err(|e| CatalogError::Serialization {
+                message: format!("failed to open Parquet snapshot '{path}': {e}"),
+            })?
+            .build()
+            .map_err(|e| CatalogError::Serialization {
+                message: format!("failed to build Parquet reader for '{path}': {e}"),
+            })?;
+
+        let mut records = Vec::new();
+        for batch in reader {
+            let batch = batch.map_err(|e| CatalogError::Serialization {
+                message: format!("failed to read Parquet batch from '{path}': {e}"),
+            })?;
+
+            let schema = batch.schema();
+            let materialization_id_col_idx =
+                schema
+                    .index_of("materialization_id")
+                    .map_err(|e| CatalogError::Serialization {
+                        message: format!("snapshot '{path}' is missing 'materialization_id': {e}"),
+                    })?;
+            let asset_id_col_idx =
+                schema
+                    .index_of("asset_id")
+                    .map_err(|e| CatalogError::Serialization {
+                        message: format!("snapshot '{path}' is missing 'asset_id': {e}"),
+                    })?;
+            let row_count_col_idx =
+                schema
+                    .index_of("row_count")
+                    .map_err(|e| CatalogError::Serialization {
+                        message: format!("snapshot '{path}' is missing 'row_count': {e}"),
+                    })?;
+            let byte_size_col_idx =
+                schema
+                    .index_of("byte_size")
+                    .map_err(|e| CatalogError::Serialization {
+                        message: format!("snapshot '{path}' is missing 'byte_size': {e}"),
+                    })?;
+
+            let materialization_ids = batch
+                .column(materialization_id_col_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| CatalogError::Serialization {
+                    message: format!(
+                        "snapshot '{path}' column 'materialization_id' has unexpected type"
+                    ),
+                })?;
+            let asset_ids = batch
+                .column(asset_id_col_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| CatalogError::Serialization {
+                    message: format!("snapshot '{path}' column 'asset_id' has unexpected type"),
+                })?;
+            let row_counts = batch
+                .column(row_count_col_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| CatalogError::Serialization {
+                    message: format!("snapshot '{path}' column 'row_count' has unexpected type"),
+                })?;
+            let byte_sizes = batch
+                .column(byte_size_col_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| CatalogError::Serialization {
+                    message: format!("snapshot '{path}' column 'byte_size' has unexpected type"),
+                })?;
+
+            for row in 0..batch.num_rows() {
+                records.push(MaterializationRecord {
+                    materialization_id: materialization_ids.value(row).to_string(),
+                    asset_id: asset_ids.value(row).to_string(),
+                    row_count: row_counts.value(row),
+                    byte_size: byte_sizes.value(row),
+                });
+            }
+        }
+
+        Ok(records)
     }
 
     /// Writes records to a Parquet snapshot file.

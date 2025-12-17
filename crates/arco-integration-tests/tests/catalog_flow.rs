@@ -7,7 +7,7 @@ fn test_tenant_isolation() {
     let tenant_a = TenantId::new("tenant-a").unwrap();
     let tenant_b = TenantId::new("tenant-b").unwrap();
 
-    // Verify different storage prefixes
+    // Verify different storage prefixes.
     assert_ne!(tenant_a.storage_prefix(), tenant_b.storage_prefix());
     assert!(tenant_a.storage_prefix().contains("tenant-a"));
     assert!(tenant_b.storage_prefix().contains("tenant-b"));

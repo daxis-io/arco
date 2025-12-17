@@ -8,6 +8,7 @@ members = [
     "crates/arco-proto",
     "crates/arco-compactor",
     "crates/arco-test-utils",
+    "crates/arco-integration-tests",
     "tools/xtask",
 ]
 

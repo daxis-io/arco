@@ -1,0 +1,24 @@
+[package]
+name = "arco-integration-tests"
+description = "Cross-crate integration tests for the Arco workspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+arco-core = { path = "../arco-core" }
+arco-catalog = { path = "../arco-catalog" }
+arco-flow = { path = "../arco-flow" }
+
+tokio = { workspace = true, features = ["full", "test-util"] }

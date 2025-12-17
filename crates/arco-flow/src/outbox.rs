@@ -5,9 +5,10 @@
 //! compacted into queryable state.
 
 use bytes::Bytes;
-use chrono::{SecondsFormat, Utc};
+use chrono::Utc;
 use futures::TryStreamExt;
 use futures::stream;
+use ulid::Ulid;
 
 use arco_core::{ScopedStorage, WritePrecondition, WriteResult};
 
@@ -73,9 +74,11 @@ impl LedgerWriter {
 
     /// Appends an event to the ledger.
     ///
-    /// Events are written to `ledger/{domain}/{date}/{timestamp}-{event_id}.json`, where:
-    /// - `date` is `YYYY-MM-DD` (UTC), used for partitioning/list efficiency
-    /// - `timestamp` is RFC 3339 (UTC)
+    /// Events are written to `ledger/flow/{domain}/{date}/{event_id}.json`, where:
+    /// - `date` is `YYYY-MM-DD` (UTC), derived from the ULID timestamp in `event.id`
+    ///
+    /// The `flow/` namespace prevents collisions with catalog Tier 2 ledgers, which store
+    /// materialization records under `ledger/{domain}/...`.
     ///
     /// # Errors
     ///
@@ -96,14 +99,14 @@ impl LedgerWriter {
         })?;
         tracing::Span::current().record("run_id", tracing::field::display(run_id));
 
-        let event_time = event.time.unwrap_or_else(Utc::now);
+        let event_ulid = Ulid::from_string(&event.id).map_err(|e| Error::Serialization {
+            message: format!("execution event id is not a valid ULID: {e}"),
+        })?;
+        let ms_i64 = i64::try_from(event_ulid.timestamp_ms()).unwrap_or(i64::MAX);
+        let event_time = chrono::DateTime::from_timestamp_millis(ms_i64).unwrap_or_else(Utc::now);
         let date = event_time.format("%Y-%m-%d").to_string();
-        let timestamp = event_time.to_rfc3339_opts(SecondsFormat::Secs, true);
 
-        let path = format!(
-            "ledger/{}/{}/{}-{}.json",
-            self.domain, date, timestamp, event.id
-        );
+        let path = format!("ledger/flow/{}/{}/{}.json", self.domain, date, event.id);
         tracing::Span::current().record("path", tracing::field::display(&path));
 
         let json = serde_json::to_string(&event).map_err(|e| Error::Serialization {
@@ -117,9 +120,10 @@ impl LedgerWriter {
 
         match result {
             WriteResult::Success { .. } => Ok(()),
-            WriteResult::PreconditionFailed { current_version } => Err(Error::storage(format!(
-                "event already exists at {path} (version {current_version})"
-            ))),
+            WriteResult::PreconditionFailed { .. } => {
+                tracing::debug!(event_id = %event.id, "duplicate execution event delivery");
+                Ok(())
+            }
         }
     }
 
@@ -150,7 +154,6 @@ mod tests {
     use super::*;
     use crate::events::{EventBuilder, EventEnvelope};
     use arco_core::{MemoryBackend, RunId, ScopedStorage};
-    use chrono::TimeZone;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -163,19 +166,16 @@ mod tests {
         let mut event =
             EventBuilder::run_started("tenant", "workspace", run_id, "plan-1").with_sequence(1);
         event.id = "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string();
-        event.time = Some(
-            Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0)
-                .single()
-                .ok_or_else(|| Error::TaskExecutionFailed {
-                    message: "fixed test timestamp should be valid".into(),
-                })?,
-        );
 
         writer.append(event).await?;
 
-        let path =
-            "ledger/execution/2025-01-15/2025-01-15T10:00:00Z-01ARZ3NDEKTSV4RRFFQ69G5FAV.json";
-        let data = storage.get_raw(path).await?;
+        let ulid = Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("valid ULID");
+        let ms_i64 = i64::try_from(ulid.timestamp_ms()).unwrap_or(i64::MAX);
+        let event_time = chrono::DateTime::from_timestamp_millis(ms_i64).unwrap_or_else(Utc::now);
+        let date = event_time.format("%Y-%m-%d").to_string();
+
+        let path = format!("ledger/flow/execution/{date}/01ARZ3NDEKTSV4RRFFQ69G5FAV.json");
+        let data = storage.get_raw(&path).await?;
         let parsed: EventEnvelope =
             serde_json::from_slice(&data).map_err(|e| Error::Serialization {
                 message: format!("failed to parse stored envelope: {e}"),

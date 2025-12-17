@@ -56,7 +56,7 @@ Building on Parts 1-3 (core infrastructure, catalog Tier 1, orchestration MVP), 
 **Deliverables:**
 
 - `crates/arco-test-utils/` shared test utilities crate (with `GetRange`, `Head` operations)
-- `tests/integration/` directory with comprehensive integration tests
+- Integration tests in `crates/arco-test-utils/tests/` + `crates/arco-integration-tests/tests/` (virtual workspace-safe)
 - Complete `arco-catalog` with EventWriter, Compactor (CAS-based atomic publish)
 - Property-based test suites with proptest and arbitrary generators
 - D.6 acceptance tests (7/10 implemented, 3 deferred to Part 5)
@@ -80,16 +80,19 @@ tenant={tenant}/workspace={workspace}/
 │   ├── core.manifest.json
 │   └── execution.manifest.json   # Contains snapshot_path pointer
 ├── ledger/                       # Tier 2: Append-only event log
-│   └── {domain}/
-│       └── {event_id}.json       # ULID-based naming (deterministic)
+│   ├── {domain}/                 # Catalog Tier 2: materialization records
+│   │   └── {event_id}.json       # ULID-based naming (deterministic)
+│   └── flow/{domain}/{date}/     # Flow outbox: execution envelopes (namespaced)
+│       └── {event_id}.json
 └── state/                        # Tier 2: Compacted Parquet snapshots
     └── {domain}/
-        └── snapshot_{version}.parquet
+        └── snapshot_v{version}_{last_event_id}.parquet
 ```
 
 **Key decisions:**
-- **ledger/ not events/**: The canonical path is `ledger/{domain}/{event_id}.json`
-- **Deterministic filenames**: Event files use `{event_id}.json` (NOT `{timestamp}-{event_id}.json`) for idempotent writes
+- **Ledger namespaces**: Catalog uses `ledger/{domain}/{event_id}.json`; flow uses `ledger/flow/{domain}/{date}/{event_id}.json` to avoid schema collisions
+- **Deterministic filenames**: Event files use `{event_id}.json` (NOT `{timestamp}-{event_id}.json`) for idempotent writes; flow adds a deterministic `{date}/` partition
+- **Full snapshots**: Compaction publishes a full immutable snapshot at `state/{domain}/snapshot_v{version}_{last_event_id}.parquet` (old snapshots retained)
 - **Manifest as visibility gate**: Readers discover current snapshot via `execution.manifest.snapshot_path`, not by listing `state/`
 
 ### Event Envelope (CloudEvents-compatible)
@@ -143,6 +146,10 @@ if filename > watermark { /* process this event */ }
 4. Update compactor filtering to use `sequence_position > watermark_position` (optionally retaining filename watermark for debugging/backfill).
 5. Add regression tests that write events with out-of-order ULIDs but increasing `sequence_position` and assert no events are skipped.
 
+### Snapshot Model (Full Snapshot)
+
+Each compaction publishes a **full snapshot**, not a delta chain: the compactor loads the previously published snapshot (if any), merges it with new ledger events, then writes a new Parquet snapshot and publishes it via manifest CAS. A regression test (`tier2_snapshot_does_not_shrink_across_compactions`) proves state does not shrink across compactions.
+
 ### Snapshot Pointer (Atomic Publish)
 
 The manifest contains an explicit pointer to the current published snapshot:
@@ -178,9 +185,9 @@ Per architecture mandate, 10 acceptance tests are required. This plan implements
 | D.6.7 | Browser Query Pruning | ⏸️ Deferred | Requires sharded Parquet layout |
 | D.6.8 | L0 Delta Limits | ⏸️ Deferred | Requires L0/L1 tiered compaction |
 | D.6.9 | Derived Current Pointers | ✅ | `tier2_derived_current_pointers` |
-| D.6.10 | Canonical Partition Key Encoding | ⏸️ Deferred | Requires cross-language golden tests |
+| D.6.10 | Canonical Partition Key Encoding | ✅ | `crates/arco-core/tests/cross_language/partition_key_test.rs`, `crates/arco-proto/tests/golden_fixtures.rs` |
 
-**Deferred items rationale:** D.6.3, D.6.7, D.6.8, and D.6.10 require additional infrastructure (sequence positions, sharding, tiered compaction, Python interop) that is out of scope for Part 4's focus on core Tier 2 mechanics.
+**Deferred items rationale:** D.6.3, D.6.7, and D.6.8 require additional infrastructure (sequence positions, sharding, tiered compaction) that is out of scope for Part 4's focus on core Tier 2 mechanics.
 
 ---
 
@@ -1161,41 +1168,15 @@ functions for plans and events, and custom assertion helpers."
 **Goal:** Validate that contracts between arco-core, arco-catalog, and arco-flow are correctly implemented.
 
 **Files:**
-- Create: `tests/integration.rs` (entrypoint - REQUIRED by Cargo)
-- Create: `tests/integration/mod.rs`
-- Create: `tests/integration/contracts.rs`
+- Create: `crates/arco-test-utils/tests/contracts.rs`
 
-**Step 0: Create test entrypoint (Cargo requirement)**
+**Step 0: Choose a test home (virtual workspace note)**
 
-In Rust/Cargo, integration tests are files directly under `tests/` (e.g., `tests/integration.rs`).
-A `tests/integration/mod.rs` file alone is NOT a test target.
+This repository is a virtual workspace (no `[package]` at the root), so Cargo will not discover repo-root `tests/`. Place cross-crate contract tests in a real crate's `tests/` directory so they can be run via `cargo test -p ...`.
 
-Create `tests/integration.rs` (the entrypoint):
+**Step 1: Write contract tests**
 
-```rust
-//! Integration test entrypoint.
-//!
-//! This file is required by Cargo to recognize the integration test module.
-//! Submodules are defined in the `integration/` directory.
-
-mod integration;
-```
-
-**Step 1: Create integration test module**
-
-Create `tests/integration/mod.rs`:
-
-```rust
-//! Integration tests for Arco platform.
-//!
-//! These tests validate cross-crate contracts and end-to-end flows.
-
-mod contracts;
-```
-
-**Step 2: Write contract tests**
-
-Create `tests/integration/contracts.rs`:
+Create `crates/arco-test-utils/tests/contracts.rs`:
 
 ```rust
 //! Cross-crate contract tests.
@@ -1438,16 +1419,16 @@ fn contract_plan_toposort_respects_dependencies() {
 }
 ```
 
-**Step 3: Run tests to verify**
+**Step 2: Run tests to verify**
 
-Run: `cargo test --test integration`
+Run: `cargo test -p arco-test-utils --test contracts`
 
 Expected: All tests PASS
 
-**Step 4: Commit**
+**Step 3: Commit**
 
 ```bash
-git add tests/integration.rs tests/integration/
+git add crates/arco-test-utils/tests/contracts.rs
 git commit -m "test(integration): add cross-crate contract tests
 
 Validates contracts between arco-core, arco-catalog, and arco-flow:
@@ -2766,12 +2747,11 @@ Uses proptest to verify:
 **Goal:** Prove the append→compact→read loop works end-to-end.
 
 **Files:**
-- Create: `tests/integration/tier2.rs`
-- Modify: `tests/integration/mod.rs`
+- Create: `crates/arco-test-utils/tests/tier2.rs`
 
 **Step 1: Write Tier 2 walking skeleton tests**
 
-Create `tests/integration/tier2.rs`:
+Create `crates/arco-test-utils/tests/tier2.rs`:
 
 ```rust
 //! Tier 2 walking skeleton: append event → compact → read from Parquet.
@@ -3703,24 +3683,20 @@ async fn invariant_listing_dependency_documented() {
 }
 ```
 
-**Step 2: Update mod.rs**
+**Step 2: (No mod.rs needed)**
 
-Add to `tests/integration/mod.rs`:
-
-```rust
-mod tier2;
-```
+Files under `crates/*/tests/*.rs` are discovered automatically by Cargo for that crate.
 
 **Step 3: Run tests**
 
-Run: `cargo test --test integration tier2`
+Run: `cargo test -p arco-test-utils --test tier2`
 
 Expected: All tests PASS
 
 **Step 4: Commit**
 
 ```bash
-git add tests/integration/tier2.rs tests/integration/mod.rs
+git add crates/arco-test-utils/tests/tier2.rs
 git commit -m "test(integration): add Tier 2 walking skeleton tests
 
 Proves the Tier 2 eventual consistency model:
@@ -3762,15 +3738,23 @@ Expected: No warnings
 
 **Step 3: Run format check**
 
-Run: `cargo fmt --check`
+Run: `cargo fmt --all --check`
 
 Expected: No formatting issues
 
-**Step 4: Run integration tests**
+**Step 4: Run focused integration tests**
 
 Run: `cargo test -p arco-test-utils --test contracts`
 
 Expected: All contract tests PASS
+
+Run: `cargo test -p arco-test-utils --test tier2`
+
+Expected: All Tier 2 tests PASS
+
+Run: `cargo test -p arco-integration-tests`
+
+Expected: All workspace-level integration tests PASS
 
 **Step 5: Commit verification**
 
@@ -3975,9 +3959,9 @@ Maintain rollback capability:
 2. **EventWriter idempotency fixed** - Uses `{event_id}.json` path (no timestamp prefix) for deterministic writes
 3. **Compactor watermark bug fixed** - Stores exact filename including `.json` for correct comparison
 4. **Atomic publish implemented** - Manifest now has `snapshot_path` and `snapshot_version` as visibility gate
-5. **D.6 coverage clarified** - 7/10 implemented, 4 deferred (D.6.3, D.6.7, D.6.8, D.6.10) with rationale
+5. **D.6 coverage clarified** - 7/10 implemented, 3 deferred (D.6.3, D.6.7, D.6.8) with rationale
 6. **Invariant 4 & 6 tests added** - Explicit tests for atomic publish and listing dependency documentation
 7. **E2E tests added** - Happy path and retry scenarios proving Product Outcomes #1 and #2
 8. **ULID property test fixed** - Now tests chronological timestamp ordering, not insertion order
-9. **Parquet reader fixed** - Uses `Cursor<Vec<u8>>` for Read + Seek requirements
-10. **Path consistency fixed** - All tests use canonical `ledger/` path
+9. **Parquet reader fixed** - Reads snapshots via Arrow/Parquet in-memory readers
+10. **Path consistency fixed** - Catalog uses `ledger/{domain}/...`; flow uses `ledger/flow/...` to avoid schema collisions

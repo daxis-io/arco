@@ -35,4 +35,11 @@ pub enum CatalogError {
         /// Description of what was not found.
         message: String,
     },
+
+    /// An internal invariant was violated (bug or corrupted state).
+    #[error("invariant violation: {message}")]
+    InvariantViolation {
+        /// Description of the invariant violation.
+        message: String,
+    },
 }

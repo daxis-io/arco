@@ -233,6 +233,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "arco-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "arco-catalog",
+ "arco-core",
+ "arco-flow",
+ "tokio",
+]
+
+[[package]]
 name = "arco-proto"
 version = "0.1.0"
 dependencies = [

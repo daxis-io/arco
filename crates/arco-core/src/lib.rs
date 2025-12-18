@@ -33,6 +33,7 @@
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 
+pub mod canonical_json;
 pub mod catalog_event;
 pub mod catalog_paths;
 pub mod error;
@@ -58,7 +59,8 @@ pub mod prelude {
     pub use crate::partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
     pub use crate::scoped_storage::ScopedStorage;
     pub use crate::storage::{
-        MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+        MemoryBackend, ObjectMeta, ObjectStoreBackend, StorageBackend, WritePrecondition,
+        WriteResult,
     };
     pub use crate::tenant::TenantId;
 }
@@ -71,5 +73,7 @@ pub use id::{AssetId, EventId, MaterializationId, RunId, TaskId};
 pub use observability::{LogFormat, init_logging};
 pub use partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
 pub use scoped_storage::ScopedStorage;
-pub use storage::{MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
+pub use storage::{
+    MemoryBackend, ObjectMeta, ObjectStoreBackend, StorageBackend, WritePrecondition, WriteResult,
+};
 pub use tenant::TenantId;

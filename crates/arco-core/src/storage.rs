@@ -18,6 +18,13 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::TryStreamExt;
+use http::Method;
+use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
+use object_store::path::Path as ObjectStorePath;
+use object_store::signer::Signer as ObjectStoreSigner;
+use object_store::{DynObjectStore, PutMode, PutOptions, UpdateVersion};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, RwLock};
@@ -128,6 +135,328 @@ pub trait StorageBackend: Send + Sync + 'static {
     ///
     /// Per architecture docs: required for direct client access.
     async fn signed_url(&self, path: &str, expiry: Duration) -> Result<String>;
+}
+
+/// Storage backend adapter for [`object_store`] implementations.
+///
+/// This bridges the Arco `StorageBackend` contract (CAS writes, listing, signed URLs)
+/// onto an `object_store::ObjectStore`.
+///
+/// ## Version Tokens
+///
+/// Object stores provide conditional update semantics using a combination of:
+/// - `e_tag` (HTTP etag)
+/// - `version` (backend-specific version ID)
+///
+/// Arco exposes these as an opaque `String` version token. This adapter encodes
+/// the pair `{e_tag, version}` as a JSON string so callers can preserve both.
+#[derive(Debug, Clone)]
+pub struct ObjectStoreBackend {
+    store: Arc<DynObjectStore>,
+    signer: Option<Arc<dyn ObjectStoreSigner>>,
+}
+
+impl ObjectStoreBackend {
+    /// Creates a new backend adapter.
+    #[must_use]
+    pub fn new(store: Arc<DynObjectStore>, signer: Option<Arc<dyn ObjectStoreSigner>>) -> Self {
+        Self { store, signer }
+    }
+
+    /// Creates a Google Cloud Storage backend for the given bucket.
+    ///
+    /// `bucket` may be provided as a bare bucket name (`my-bucket`) or with a
+    /// `gs://` prefix (`gs://my-bucket`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the GCS client cannot be configured.
+    pub fn gcs(bucket: &str) -> Result<Self> {
+        let bucket = normalize_bucket("gs://", bucket);
+        if bucket.is_empty() {
+            return Err(Error::InvalidInput(
+                "ARCO_STORAGE_BUCKET cannot be empty".to_string(),
+            ));
+        }
+
+        let gcs = object_store::gcp::GoogleCloudStorageBuilder::new()
+            .with_bucket_name(&bucket)
+            .build()
+            .map_err(|e| {
+                Error::storage_with_source(format!("failed to configure GCS bucket '{bucket}'"), e)
+            })?;
+
+        let gcs = Arc::new(gcs);
+        let store: Arc<DynObjectStore> = gcs.clone();
+        let signer: Arc<dyn ObjectStoreSigner> = gcs;
+        Ok(Self::new(store, Some(signer)))
+    }
+
+    /// Creates an Amazon S3 backend for the given bucket.
+    ///
+    /// `bucket` may be provided as a bare bucket name (`my-bucket`) or with a
+    /// `s3://` prefix (`s3://my-bucket`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the S3 client cannot be configured.
+    pub fn s3(bucket: &str) -> Result<Self> {
+        let bucket = normalize_bucket("s3://", bucket);
+        if bucket.is_empty() {
+            return Err(Error::InvalidInput(
+                "ARCO_STORAGE_BUCKET cannot be empty".to_string(),
+            ));
+        }
+
+        let s3 = AmazonS3Builder::from_env()
+            .with_bucket_name(&bucket)
+            .build()
+            .map_err(|e| {
+                Error::storage_with_source(format!("failed to configure S3 bucket '{bucket}'"), e)
+            })?;
+
+        let s3 = Arc::new(s3);
+        let store: Arc<DynObjectStore> = s3.clone();
+        let signer: Arc<dyn ObjectStoreSigner> = s3;
+        Ok(Self::new(store, Some(signer)))
+    }
+
+    /// Creates a storage backend from a bucket string, inferring the provider.
+    ///
+    /// Defaults to GCS when no scheme prefix is provided.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot be configured.
+    pub fn from_bucket(bucket: &str) -> Result<Self> {
+        let trimmed = bucket.trim();
+        if trimmed.starts_with("s3://") || trimmed.starts_with("s3a://") {
+            return Self::s3(trimmed);
+        }
+        if trimmed.starts_with("gs://") || trimmed.starts_with("gcs://") {
+            return Self::gcs(trimmed);
+        }
+
+        Self::gcs(trimmed)
+    }
+}
+
+fn normalize_bucket(prefix: &str, raw: &str) -> String {
+    let trimmed = raw.trim();
+    let no_prefix = trimmed
+        .strip_prefix(prefix)
+        .or_else(|| match prefix {
+            "gs://" => trimmed.strip_prefix("gcs://"),
+            "s3://" => trimmed.strip_prefix("s3a://"),
+            _ => None,
+        })
+        .unwrap_or(trimmed);
+
+    no_prefix
+        .split_once('/')
+        .map_or(no_prefix, |(bucket, _)| bucket)
+        .trim()
+        .to_string()
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct VersionToken {
+    e_tag: Option<String>,
+    version: Option<String>,
+}
+
+impl VersionToken {
+    fn from_parts(e_tag: Option<String>, version: Option<String>) -> Self {
+        Self { e_tag, version }
+    }
+
+    fn to_update_version(&self) -> UpdateVersion {
+        UpdateVersion {
+            e_tag: self.e_tag.clone(),
+            version: self.version.clone(),
+        }
+    }
+
+    fn encode(&self) -> String {
+        match serde_json::to_string(self) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialize version token; falling back to raw version");
+                self.version.clone().unwrap_or_default()
+            }
+        }
+    }
+
+    fn decode(token: &str) -> Self {
+        let token = token.trim();
+        if token.is_empty() {
+            return Self::from_parts(None, None);
+        }
+
+        // Prefer the structured encoding used by this adapter.
+        if let Ok(v) = serde_json::from_str::<Self>(token) {
+            return v;
+        }
+
+        // Backwards/interop fallback: treat the token as a raw `version` string.
+        Self::from_parts(None, Some(token.to_string()))
+    }
+}
+
+fn map_object_store_error(err: object_store::Error) -> Error {
+    match err {
+        object_store::Error::NotFound { path, .. } => Error::NotFound(path),
+        object_store::Error::InvalidPath { source } => {
+            Error::InvalidInput(format!("invalid object store path: {source}"))
+        }
+        err @ object_store::Error::PermissionDenied { .. } => {
+            Error::storage_with_source("permission denied".to_string(), err)
+        }
+        err @ object_store::Error::Unauthenticated { .. } => {
+            Error::storage_with_source("unauthenticated".to_string(), err)
+        }
+        err => Error::storage_with_source("object store error".to_string(), err),
+    }
+}
+
+fn object_store_meta_to_meta(meta: object_store::ObjectMeta) -> ObjectMeta {
+    let version = VersionToken::from_parts(meta.e_tag.clone(), meta.version.clone()).encode();
+    ObjectMeta {
+        path: meta.location.to_string(),
+        size: u64::try_from(meta.size).unwrap_or(u64::MAX),
+        version,
+        last_modified: Some(meta.last_modified),
+        etag: meta.e_tag,
+    }
+}
+
+#[async_trait]
+impl StorageBackend for ObjectStoreBackend {
+    async fn get(&self, path: &str) -> Result<Bytes> {
+        let location = ObjectStorePath::from(path);
+        let result = self
+            .store
+            .get(&location)
+            .await
+            .map_err(map_object_store_error)?;
+        result.bytes().await.map_err(map_object_store_error)
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+        let meta = self
+            .head(path)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("object not found: {path}")))?;
+
+        let size_usize = usize::try_from(meta.size).map_err(|_| {
+            Error::InvalidInput(format!(
+                "object size too large for range requests: {}",
+                meta.size
+            ))
+        })?;
+
+        let start = usize::try_from(range.start)
+            .map_err(|_| Error::InvalidInput(format!("range start too large: {}", range.start)))?;
+
+        if start > size_usize {
+            return Err(Error::InvalidInput(format!(
+                "range start {start} exceeds object length {size_usize}"
+            )));
+        }
+
+        let end = usize::try_from(range.end)
+            .unwrap_or(usize::MAX)
+            .min(size_usize);
+
+        if end < start {
+            return Err(Error::InvalidInput(format!(
+                "range end {end} is before start {start}"
+            )));
+        }
+
+        let location = ObjectStorePath::from(path);
+        self.store
+            .get_range(&location, start..end)
+            .await
+            .map_err(map_object_store_error)
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> Result<WriteResult> {
+        let location = ObjectStorePath::from(path);
+        let opts = match precondition {
+            WritePrecondition::DoesNotExist => PutOptions::from(PutMode::Create),
+            WritePrecondition::MatchesVersion(token) => {
+                let token = VersionToken::decode(&token);
+                PutOptions::from(PutMode::Update(token.to_update_version()))
+            }
+            WritePrecondition::None => PutOptions::default(),
+        };
+
+        match self.store.put_opts(&location, data.into(), opts).await {
+            Ok(result) => {
+                let version = VersionToken::from_parts(result.e_tag, result.version).encode();
+                Ok(WriteResult::Success { version })
+            }
+            Err(
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. },
+            ) => {
+                let current = self.head(path).await?;
+                let current_version = current.map_or_else(String::new, |m| m.version);
+                Ok(WriteResult::PreconditionFailed { current_version })
+            }
+            Err(e) => Err(map_object_store_error(e)),
+        }
+    }
+
+    async fn delete(&self, path: &str) -> Result<()> {
+        let location = ObjectStorePath::from(path);
+        match self.store.delete(&location).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(map_object_store_error(e)),
+        }
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+        let prefix = ObjectStorePath::from(prefix);
+        let metas = self
+            .store
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(map_object_store_error)?;
+
+        Ok(metas.into_iter().map(object_store_meta_to_meta).collect())
+    }
+
+    async fn head(&self, path: &str) -> Result<Option<ObjectMeta>> {
+        let location = ObjectStorePath::from(path);
+        match self.store.head(&location).await {
+            Ok(meta) => Ok(Some(object_store_meta_to_meta(meta))),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(map_object_store_error(e)),
+        }
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> Result<String> {
+        let Some(signer) = self.signer.as_ref() else {
+            return Err(Error::storage(
+                "signed URLs are not supported by this storage backend".to_string(),
+            ));
+        };
+
+        let location = ObjectStorePath::from(path);
+        let url = signer
+            .signed_url(Method::GET, &location, expiry)
+            .await
+            .map_err(map_object_store_error)?;
+        Ok(url.to_string())
+    }
 }
 
 /// In-memory storage backend for testing.

@@ -54,10 +54,15 @@ sha2 = { workspace = true }
 
 # Async
 async-trait = { workspace = true }
+futures = { workspace = true }
 
 # Optional test utilities
 proptest = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
+
+# Cloud object storage integration (GCS/S3/Azure) via `object_store`.
+object_store = { workspace = true }
+http = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -386,7 +386,7 @@ impl std::error::Error for PartitionKeyParseError {}
 
 /// Derived partition identifier (stable across re-materializations).
 ///
-/// The partition ID is derived from `hash(asset_id + canonical_partition_key)`,
+/// The partition ID is derived from `hash(asset_id + partition_key.canonical_string())`,
 /// ensuring the same asset partition always has the same ID.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PartitionId(String);

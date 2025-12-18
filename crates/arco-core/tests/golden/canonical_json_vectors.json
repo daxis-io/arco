@@ -1,0 +1,65 @@
+{
+  "vectors": [
+    {
+      "name": "simple_object_sorted_keys",
+      "input": {"tenant": "acme", "date": "2025-01-15"},
+      "expected_canonical": "{\"date\":\"2025-01-15\",\"tenant\":\"acme\"}"
+    },
+    {
+      "name": "nested_object",
+      "input": {"b": {"d": 2, "c": 1}, "a": 0},
+      "expected_canonical": "{\"a\":0,\"b\":{\"c\":1,\"d\":2}}"
+    },
+    {
+      "name": "array_preserves_order",
+      "input": [3, 2, 1],
+      "expected_canonical": "[3,2,1]"
+    },
+    {
+      "name": "unicode_string",
+      "input": {"emoji": "\ud83c\udf89", "chinese": "\u4e2d\u6587"},
+      "expected_canonical": "{\"chinese\":\"\u4e2d\u6587\",\"emoji\":\"\ud83c\udf89\"}"
+    },
+    {
+      "name": "escaped_string",
+      "input": {"s": "a\"b\nc"},
+      "expected_canonical": "{\"s\":\"a\\\"b\\nc\"}"
+    },
+    {
+      "name": "negative_integer",
+      "input": {"n": -42},
+      "expected_canonical": "{\"n\":-42}"
+    },
+    {
+      "name": "large_integer",
+      "input": {"big": 9223372036854775807},
+      "expected_canonical": "{\"big\":9223372036854775807}"
+    },
+    {
+      "name": "empty_object",
+      "input": {},
+      "expected_canonical": "{}"
+    },
+    {
+      "name": "empty_array",
+      "input": [],
+      "expected_canonical": "[]"
+    },
+    {
+      "name": "null_value",
+      "input": null,
+      "expected_canonical": "null"
+    },
+    {
+      "name": "boolean_values",
+      "input": {"a": true, "b": false},
+      "expected_canonical": "{\"a\":true,\"b\":false}"
+    },
+    {
+      "name": "deeply_nested",
+      "input": {"z": {"y": {"x": [1, 2, {"w": 3, "v": 4}]}}, "a": "first"},
+      "expected_canonical": "{\"a\":\"first\",\"z\":{\"y\":{\"x\":[1,2,{\"v\":4,\"w\":3}]}}}"
+    }
+  ],
+  "python_reference": "json.dumps(input, sort_keys=True, separators=(',', ':'), ensure_ascii=False)"
+}

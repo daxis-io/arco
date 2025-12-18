@@ -1,0 +1,159 @@
+# Arco Catalog Alert Rules
+#
+# These alerts are designed for Prometheus/Alertmanager and can be adapted
+# for Cloud Monitoring or other alerting systems.
+#
+# Per M8 Task 8.3 requirements:
+# - API error rate > 1% for 5 min
+# - Compaction lag > 10 min
+# - CAS retry rate > 10/min
+# - Rate limit hits > 100/min per tenant
+
+groups:
+  - name: arco.api
+    rules:
+      # API Error Rate Alert
+      # Fires when error rate exceeds 1% for 5 minutes
+      - alert: ArcoApiErrorRateHigh
+        expr: |
+          sum(rate(api_request_total{status_class=~"4xx|5xx"}[5m]))
+          / sum(rate(api_request_total[5m])) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+          service: arco-api
+        annotations:
+          summary: "API error rate > 1%"
+          description: |
+            The Arco API error rate has exceeded 1% for 5 minutes.
+            Current rate: {{ $value | printf "%.2f" }}%
+          runbook_url: "https://docs.arco.dev/runbooks/api-errors"
+
+      # API High Latency Alert
+      - alert: ArcoApiLatencyHigh
+        expr: |
+          histogram_quantile(0.95, sum(rate(api_request_duration_seconds_bucket[5m])) by (le, endpoint))
+          > 1.0
+        for: 5m
+        labels:
+          severity: warning
+          service: arco-api
+        annotations:
+          summary: "API p95 latency > 1s for {{ $labels.endpoint }}"
+          description: |
+            The Arco API endpoint {{ $labels.endpoint }} has p95 latency exceeding 1 second.
+            Current p95: {{ $value | printf "%.2f" }}s
+          runbook_url: "https://docs.arco.dev/runbooks/slow-requests"
+
+      # Rate Limit Hits Alert
+      # Fires when any tenant exceeds 100 rate limit hits per minute
+      - alert: ArcoRateLimitHitsHigh
+        expr: |
+          sum by (tenant) (rate(rate_limit_hits_total[1m])) > 100
+        for: 1m
+        labels:
+          severity: warning
+          service: arco-api
+        annotations:
+          summary: "Rate limit hits > 100/min for tenant {{ $labels.tenant }}"
+          description: |
+            Tenant {{ $labels.tenant }} is hitting rate limits frequently.
+            Rate: {{ $value | printf "%.0f" }} hits/min
+          runbook_url: "https://docs.arco.dev/runbooks/rate-limiting"
+
+  - name: arco.compactor
+    rules:
+      # Compaction Lag Alert
+      # Fires when compaction lag exceeds 10 minutes
+      - alert: ArcoCompactionLagHigh
+        expr: compaction_lag_seconds > 600
+        for: 5m
+        labels:
+          severity: warning
+          service: arco-compactor
+        annotations:
+          summary: "Compaction lag > 10 minutes for domain {{ $labels.domain }}"
+          description: |
+            Compaction for domain {{ $labels.domain }} is lagging behind by more than 10 minutes.
+            Current lag: {{ $value | printf "%.0f" }} seconds
+          runbook_url: "https://docs.arco.dev/runbooks/compactor-stuck"
+
+      # Compactor Not Running Alert
+      # Fires when no compaction cycles complete in 24 hours
+      - alert: ArcoCompactorNotRunning
+        expr: |
+          time() - max(compaction_cycles_total) > 86400
+        for: 1h
+        labels:
+          severity: critical
+          service: arco-compactor
+        annotations:
+          summary: "Compactor has not run in 24 hours"
+          description: |
+            No compaction cycle has completed in the last 24 hours.
+            This may indicate the compactor is down or stuck.
+          runbook_url: "https://docs.arco.dev/runbooks/compactor-stuck"
+
+      # CAS Retry Rate Alert
+      # Fires when CAS retries exceed 10/min
+      - alert: ArcoCasRetryRateHigh
+        expr: |
+          sum(rate(cas_retry_total[1m])) > 10
+          or sum(rate(arco_cas_retry_total[1m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+          service: arco-catalog
+        annotations:
+          summary: "CAS retry rate > 10/min"
+          description: |
+            High CAS retry rate indicates contention on catalog writes.
+            Current rate: {{ $value | printf "%.1f" }} retries/min
+          runbook_url: "https://docs.arco.dev/runbooks/cas-contention"
+
+  - name: arco.gc
+    rules:
+      # GC Not Running Alert
+      - alert: ArcoGCNotRunning
+        expr: |
+          time() - max(timestamp(arco_gc_objects_deleted_total)) > 86400
+        for: 1h
+        labels:
+          severity: warning
+          service: arco-gc
+        annotations:
+          summary: "GC has not run in 24 hours"
+          description: |
+            Garbage collection has not run in the last 24 hours.
+            Storage costs may be increasing.
+          runbook_url: "https://docs.arco.dev/runbooks/gc-failure"
+
+      # GC Errors Alert
+      - alert: ArcoGCErrors
+        expr: increase(arco_gc_errors_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: arco-gc
+        annotations:
+          summary: "GC encountered errors"
+          description: |
+            Garbage collection encountered {{ $value | printf "%.0f" }} errors in the last hour.
+            Phase: {{ $labels.phase }}
+          runbook_url: "https://docs.arco.dev/runbooks/gc-failure"
+
+      # Storage Growth Alert
+      - alert: ArcoStorageGrowthHigh
+        expr: |
+          rate(arco_gc_bytes_reclaimed_total[24h]) < 0
+          and sum(increase(arco_gc_objects_deleted_total[24h])) == 0
+        for: 24h
+        labels:
+          severity: warning
+          service: arco-gc
+        annotations:
+          summary: "Catalog storage growing without GC"
+          description: |
+            Storage is growing but no objects are being garbage collected.
+            Check GC health and retention policy.
+          runbook_url: "https://docs.arco.dev/runbooks/gc-failure"

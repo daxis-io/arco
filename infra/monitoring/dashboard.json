@@ -1,0 +1,175 @@
+{
+  "$schema": "https://grafana.com/schema/dashboard/v0",
+  "title": "Arco Catalog Overview",
+  "description": "Production dashboard for Arco Catalog API and Compactor services",
+  "uid": "arco-catalog-overview",
+  "tags": ["arco", "catalog", "production"],
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "title": "API Request Rate",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(api_request_total[5m])) by (endpoint)",
+          "legendFormat": "{{endpoint}}"
+        }
+      ],
+      "description": "Total API request rate per endpoint"
+    },
+    {
+      "title": "API Latency (P50/P95/P99)",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(api_request_duration_seconds_bucket[5m])) by (le, endpoint))",
+          "legendFormat": "p50 {{endpoint}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(api_request_duration_seconds_bucket[5m])) by (le, endpoint))",
+          "legendFormat": "p95 {{endpoint}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(api_request_duration_seconds_bucket[5m])) by (le, endpoint))",
+          "legendFormat": "p99 {{endpoint}}"
+        }
+      ],
+      "description": "API request latency percentiles"
+    },
+    {
+      "title": "API Error Rate",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(api_request_total{status_class=~\"4xx|5xx\"}[5m])) by (status_class) / sum(rate(api_request_total[5m]))",
+          "legendFormat": "{{status_class}} rate"
+        }
+      ],
+      "description": "Percentage of requests returning 4xx/5xx errors"
+    },
+    {
+      "title": "Rate Limit Hits",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(rate_limit_hits_total[5m])) by (tenant)",
+          "legendFormat": "{{tenant}}"
+        }
+      ],
+      "description": "Rate limit rejections per tenant"
+    },
+    {
+      "title": "Compaction Duration",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(compaction_duration_seconds_bucket[5m])) by (le, domain))",
+          "legendFormat": "p95 {{domain}}"
+        }
+      ],
+      "description": "Compaction duration by domain (p95)"
+    },
+    {
+      "title": "Events Processed by Compaction",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum(rate(compaction_events_processed[5m])) by (domain)",
+          "legendFormat": "{{domain}}"
+        }
+      ],
+      "description": "Events processed per compaction cycle"
+    },
+    {
+      "title": "Compaction Lag",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "expr": "compaction_lag_seconds",
+          "legendFormat": "{{domain}}"
+        }
+      ],
+      "description": "Seconds since oldest uncompacted event",
+      "alert": {
+        "threshold": 600,
+        "message": "Compaction lag > 10 minutes"
+      }
+    },
+    {
+      "title": "GC Objects Deleted",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        {
+          "expr": "sum(rate(arco_gc_objects_deleted_total[1h])) by (phase)",
+          "legendFormat": "{{phase}}"
+        }
+      ],
+      "description": "GC objects deleted per hour by phase"
+    },
+    {
+      "title": "GC Bytes Reclaimed",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 32 },
+      "targets": [
+        {
+          "expr": "sum(increase(arco_gc_bytes_reclaimed_total[24h]))",
+          "legendFormat": "Total"
+        }
+      ],
+      "description": "Bytes reclaimed in last 24h",
+      "unit": "bytes"
+    },
+    {
+      "title": "GC Errors",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 32 },
+      "targets": [
+        {
+          "expr": "sum(increase(arco_gc_errors_total[1h]))",
+          "legendFormat": "Errors"
+        }
+      ],
+      "description": "GC errors in last hour"
+    },
+    {
+      "title": "Signed URLs Minted",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "targets": [
+        {
+          "expr": "sum(rate(signed_url_minted_total[5m])) by (tenant)",
+          "legendFormat": "{{tenant}}"
+        }
+      ],
+      "description": "Signed URL minting rate per tenant"
+    },
+    {
+      "title": "CAS Retries",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "targets": [
+        {
+          "expr": "sum(rate(cas_retry_total[5m])) by (operation)",
+          "legendFormat": "{{operation}}"
+        },
+        {
+          "expr": "sum(rate(arco_cas_retry_total[5m])) by (operation)",
+          "legendFormat": "{{operation}} (catalog)"
+        }
+      ],
+      "description": "CAS retry rate by operation"
+    }
+  ]
+}

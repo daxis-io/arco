@@ -50,6 +50,7 @@ pub mod run;
 pub mod runner;
 pub mod scheduler;
 pub mod task;
+pub mod task_key;
 
 /// Prelude module for convenient imports.
 pub mod prelude {
@@ -60,4 +61,5 @@ pub mod prelude {
     pub use crate::runner::{RunContext, Runner, TaskResult};
     pub use crate::scheduler::Scheduler;
     pub use crate::task::{TaskExecution, TaskState};
+    pub use crate::task_key::{TaskKey, TaskOperation};
 }

@@ -7,13 +7,13 @@
 //!
 //! **Note:** This module is internal to `arco-flow` to preserve freedom to change internals.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt::Display;
 use std::hash::Hash;
 
-use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
+use petgraph::Direction;
 
 use crate::error::{Error, Result};
 
@@ -191,6 +191,163 @@ where
         }
 
         Ok(result)
+    }
+
+    /// Returns a topologically sorted list of nodes with deterministic ordering.
+    ///
+    /// Uses a caller-provided key function for tie-breaking when multiple nodes
+    /// have zero in-degree. This makes the result independent of insertion order.
+    ///
+    /// **Important:** The key must be semantic (e.g., `TaskKey::canonical_string()`),
+    /// not a generated ID (`TaskId`), otherwise the "deterministic" order will still
+    /// change across plan regenerations.
+    ///
+    /// **Complexity:** O((V+E) log V) due to `BTreeSet` operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the graph contains a cycle.
+    #[allow(dead_code)]
+    pub fn toposort_by_key<K, F>(&self, key_fn: F) -> Result<Vec<T>>
+    where
+        K: Ord,
+        F: Fn(&T) -> K,
+    {
+        let node_count = self.graph.node_count();
+        if node_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Compute in-degrees
+        let mut in_degree: HashMap<NodeIndex, usize> = HashMap::with_capacity(node_count);
+        for idx in self.graph.node_indices() {
+            in_degree.insert(idx, 0);
+        }
+        for edge in self.graph.edge_references() {
+            *in_degree.entry(edge.target()).or_insert(0) += 1;
+        }
+
+        // Use BTreeSet<(K, usize)> for deterministic ordering; usize is the NodeIndex.
+        // The key controls tie-breaking, and the index avoids collisions.
+        let mut ready: BTreeSet<(K, usize)> = BTreeSet::new();
+
+        for idx in self.graph.node_indices() {
+            if in_degree.get(&idx).copied().unwrap_or(0) == 0 {
+                if let Some(value) = self.graph.node_weight(idx) {
+                    ready.insert((key_fn(value), idx.index()));
+                }
+            }
+        }
+
+        let mut result = Vec::with_capacity(node_count);
+
+        while let Some((_, idx)) = ready.pop_first() {
+            let idx = NodeIndex::new(idx);
+            let node = self
+                .graph
+                .node_weight(idx)
+                .ok_or_else(|| Error::DagNodeNotFound {
+                    node: format!("index {}", idx.index()),
+                })?
+                .clone();
+            result.push(node);
+
+            for neighbor in self.graph.neighbors_directed(idx, Direction::Outgoing) {
+                if let Some(deg) = in_degree.get_mut(&neighbor) {
+                    *deg = deg.saturating_sub(1);
+                    if *deg == 0 {
+                        if let Some(value) = self.graph.node_weight(neighbor) {
+                            ready.insert((key_fn(value), neighbor.index()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cycle detection
+        if result.len() != node_count {
+            return Err(self.find_cycle_path());
+        }
+
+        Ok(result)
+    }
+
+    /// Finds a cycle path using iterative DFS with color marking.
+    ///
+    /// **Complexity:** O(V+E), no recursion depth risk.
+    fn find_cycle_path(&self) -> Error {
+        // Color marking: 0 = white (unvisited), 1 = gray (in progress), 2 = black (done)
+        let mut color: HashMap<NodeIndex, u8> = HashMap::new();
+        let mut parent: HashMap<NodeIndex, NodeIndex> = HashMap::new();
+
+        for idx in self.graph.node_indices() {
+            color.insert(idx, 0);
+        }
+
+        // Start DFS from each unvisited node
+        for start in self.graph.node_indices() {
+            if color.get(&start).copied().unwrap_or(0) != 0 {
+                continue;
+            }
+
+            let mut stack = vec![start];
+
+            while let Some(node) = stack.last().copied() {
+                match color.get(&node).copied().unwrap_or(0) {
+                    0 => {
+                        // Mark as in-progress
+                        color.insert(node, 1);
+
+                        // Push neighbors
+                        for neighbor in self.graph.neighbors_directed(node, Direction::Outgoing) {
+                            match color.get(&neighbor).copied().unwrap_or(0) {
+                                0 => {
+                                    parent.insert(neighbor, node);
+                                    stack.push(neighbor);
+                                }
+                                1 => {
+                                    // Found cycle! Build path
+                                    let mut cycle_path = vec![neighbor];
+                                    let mut current = node;
+                                    while current != neighbor {
+                                        cycle_path.push(current);
+                                        current = match parent.get(&current) {
+                                            Some(&p) => p,
+                                            None => break,
+                                        };
+                                    }
+                                    cycle_path.push(neighbor);
+                                    cycle_path.reverse();
+
+                                    let cycle_names: Vec<String> = cycle_path
+                                        .iter()
+                                        .filter_map(|&idx| {
+                                            self.graph.node_weight(idx).map(ToString::to_string)
+                                        })
+                                        .collect();
+
+                                    return Error::CycleDetected { cycle: cycle_names };
+                                }
+                                _ => { /* black, skip */ }
+                            }
+                        }
+                    }
+                    1 => {
+                        // Done with this node
+                        color.insert(node, 2);
+                        stack.pop();
+                    }
+                    _ => {
+                        stack.pop();
+                    }
+                }
+            }
+        }
+
+        // No cycle found (shouldn't happen if called from toposort failure)
+        Error::CycleDetected {
+            cycle: vec!["unknown".to_string()],
+        }
     }
 
     /// Returns the upstream dependencies of a node (nodes that point to it).
@@ -546,6 +703,124 @@ mod tests {
         // Each dag's toposort should be stable across multiple calls
         assert_eq!(dag1.toposort()?, sorted1);
         assert_eq!(dag2.toposort()?, sorted2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn toposort_by_key_regardless_of_insertion_order() -> Result<()> {
+        // Build same logical DAG with different insertion orders
+
+        // Order 1: a, b, c
+        let mut dag1: Dag<String> = Dag::new();
+        let a1 = dag1.add_node("a".into());
+        let b1 = dag1.add_node("b".into());
+        let c1 = dag1.add_node("c".into());
+        dag1.add_edge(a1, c1)?;
+        dag1.add_edge(b1, c1)?;
+
+        // Order 2: c, b, a (reverse)
+        let mut dag2: Dag<String> = Dag::new();
+        let c2 = dag2.add_node("c".into());
+        let b2 = dag2.add_node("b".into());
+        let a2 = dag2.add_node("a".into());
+        dag2.add_edge(a2, c2)?;
+        dag2.add_edge(b2, c2)?;
+
+        // Order 3: b, a, c
+        let mut dag3: Dag<String> = Dag::new();
+        let b3 = dag3.add_node("b".into());
+        let a3 = dag3.add_node("a".into());
+        let c3 = dag3.add_node("c".into());
+        dag3.add_edge(a3, c3)?;
+        dag3.add_edge(b3, c3)?;
+
+        // All should produce the same deterministic result when using string key
+        let sorted1 = dag1.toposort_by_key(|v| v.clone())?;
+        let sorted2 = dag2.toposort_by_key(|v| v.clone())?;
+        let sorted3 = dag3.toposort_by_key(|v| v.clone())?;
+
+        assert_eq!(sorted1, sorted2);
+        assert_eq!(sorted2, sorted3);
+
+        // Expected: a, b (alphabetically), then c (depends on both)
+        assert_eq!(sorted1, vec!["a", "b", "c"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn toposort_by_key_with_complex_dag() -> Result<()> {
+        // DAG: a -> c, b -> c, c -> d
+        // Build with insertion order: d, c, b, a (worst case)
+        let mut dag: Dag<String> = Dag::new();
+        let d = dag.add_node("d".into());
+        let c = dag.add_node("c".into());
+        let b = dag.add_node("b".into());
+        let a = dag.add_node("a".into());
+        dag.add_edge(a, c)?;
+        dag.add_edge(b, c)?;
+        dag.add_edge(c, d)?;
+
+        // With key-based sorting, should get alphabetical roots first
+        let sorted = dag.toposort_by_key(|v| v.clone())?;
+        assert_eq!(sorted, vec!["a", "b", "c", "d"]);
+
+        // Verify regular toposort uses insertion order (different result)
+        let sorted_insertion = dag.toposort()?;
+        // Insertion order was d, c, b, a - roots are b and a, so b comes first
+        assert_eq!(sorted_insertion, vec!["b", "a", "c", "d"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn cycle_detection_reports_full_path() -> Result<()> {
+        let mut dag: Dag<String> = Dag::new();
+        let a = dag.add_node("a".into());
+        let b = dag.add_node("b".into());
+        let c = dag.add_node("c".into());
+        dag.add_edge(a, b)?;
+        dag.add_edge(b, c)?;
+        dag.add_edge(c, a)?; // Creates cycle: a -> b -> c -> a
+
+        let result = dag.toposort_by_key(|v| v.clone());
+
+        match result {
+            Err(Error::CycleDetected { cycle }) => {
+                // Should contain all nodes in the cycle
+                assert!(
+                    cycle.len() >= 3,
+                    "Cycle path should have at least 3 nodes, got: {cycle:?}"
+                );
+                // First and last should be the same (cycle completed)
+                assert_eq!(
+                    cycle.first(),
+                    cycle.last(),
+                    "First and last should match in cycle: {cycle:?}"
+                );
+            }
+            _ => panic!("Expected CycleDetected error"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn cycle_detection_reports_path_for_self_loop() -> Result<()> {
+        let mut dag: Dag<String> = Dag::new();
+        let a = dag.add_node("a".into());
+        dag.add_edge(a, a)?; // Self-loop
+
+        let result = dag.toposort_by_key(|v| v.clone());
+
+        match result {
+            Err(Error::CycleDetected { cycle }) => {
+                // Should detect self-loop
+                assert!(!cycle.is_empty(), "Cycle should not be empty");
+            }
+            _ => panic!("Expected CycleDetected error for self-loop"),
+        }
 
         Ok(())
     }

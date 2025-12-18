@@ -15,6 +15,7 @@ use petgraph::graph::NodeIndex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use arco_core::canonical_json;
 use arco_core::partition::PartitionKey;
 use arco_core::{AssetId, TaskId};
 
@@ -437,13 +438,17 @@ struct StructuralTaskSpec {
 /// Computes SHA-256 fingerprint of the plan spec using structural properties only.
 ///
 /// The fingerprint excludes nondeterministic IDs (`task_id`, `asset_id`) and uses
-/// `asset_key` for dependency references. This ensures the same logical plan
-/// produces the same fingerprint regardless of generated IDs.
+/// `asset_key.canonical_string()` (using `/` separator per ADR-011) for dependency
+/// references. This ensures the same logical plan produces the same fingerprint
+/// regardless of generated IDs.
+///
+/// Uses canonical JSON serialization for cross-language determinism (ADR-010).
 fn compute_fingerprint(tasks: &[TaskSpec]) -> Result<String> {
-    // Build task_id -> asset_key mapping for dependency resolution
+    // Build task_id -> canonical asset key mapping for dependency resolution
+    // Uses canonical_string() with `/` separator per ADR-011
     let id_to_key: HashMap<TaskId, String> = tasks
         .iter()
-        .map(|t| (t.task_id, t.asset_key.qualified_name()))
+        .map(|t| (t.task_id, t.asset_key.canonical_string()))
         .collect();
 
     // Convert to structural representation
@@ -469,11 +474,14 @@ fn compute_fingerprint(tasks: &[TaskSpec]) -> Result<String> {
         })
         .collect();
 
-    let json = serde_json::to_string(&structural).map_err(|e| Error::Serialization {
-        message: format!("failed to serialize structural tasks: {e}"),
+    // Use canonical JSON for cross-language determinism (ADR-010)
+    let canonical = canonical_json::to_canonical_bytes(&structural).map_err(|e| {
+        Error::Serialization {
+            message: format!("failed to serialize structural tasks to canonical JSON: {e}"),
+        }
     })?;
 
-    let hash = Sha256::digest(json.as_bytes());
+    let hash = Sha256::digest(&canonical);
     Ok(format!("sha256:{}", hex::encode(hash)))
 }
 

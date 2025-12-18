@@ -47,6 +47,7 @@ pub mod events;
 pub mod leader;
 pub mod outbox;
 pub mod plan;
+pub mod quota;
 pub mod run;
 pub mod runner;
 pub mod scheduler;
@@ -60,6 +61,7 @@ pub mod prelude {
     pub use crate::leader::{LeaderElector, LeadershipResult, RenewalResult};
     pub use crate::outbox::{EventSink, InMemoryOutbox, LedgerWriter};
     pub use crate::plan::{Plan, PlanBuilder, TaskSpec};
+    pub use crate::quota::{QuotaDecision, QuotaManager, TenantQuota};
     pub use crate::run::{Run, RunState};
     pub use crate::runner::{RunContext, Runner, TaskResult};
     pub use crate::scheduler::Scheduler;

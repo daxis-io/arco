@@ -134,7 +134,7 @@ impl Store for InMemoryStore {
 
         let transition_result = task.transition_to_with_reason(target_state, reason);
         drop(runs);
-        transition_result.map(|_| CasResult::Success)
+        transition_result.map(|()| CasResult::Success)
     }
 
     async fn get_tasks_by_state(
@@ -257,6 +257,55 @@ mod tests {
         Ok(Run::from_plan(&plan, RunTrigger::manual("test-user")))
     }
 
+    fn create_priority_run() -> Result<(Run, TaskId, TaskId, TaskId)> {
+        let high_priority_task = TaskId::generate();
+        let mid_priority_task = TaskId::generate();
+        let low_priority_task = TaskId::generate();
+
+        let plan = PlanBuilder::new("test-tenant", "test-workspace")
+            .add_task(TaskSpec {
+                task_id: low_priority_task,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
+                partition_key: None,
+                upstream_task_ids: vec![],
+                stage: 0,
+                priority: 5,
+                resources: ResourceRequirements::default(),
+            })
+            .add_task(TaskSpec {
+                task_id: high_priority_task,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("raw", "accounts"),
+                operation: TaskOperation::Materialize,
+                partition_key: None,
+                upstream_task_ids: vec![],
+                stage: 0,
+                priority: 1,
+                resources: ResourceRequirements::default(),
+            })
+            .add_task(TaskSpec {
+                task_id: mid_priority_task,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("raw", "users"),
+                operation: TaskOperation::Materialize,
+                partition_key: None,
+                upstream_task_ids: vec![],
+                stage: 0,
+                priority: 1,
+                resources: ResourceRequirements::default(),
+            })
+            .build()?;
+
+        Ok((
+            Run::from_plan(&plan, RunTrigger::manual("test-user")),
+            low_priority_task,
+            high_priority_task,
+            mid_priority_task,
+        ))
+    }
+
     #[tokio::test]
     async fn save_and_get_run() -> Result<()> {
         let store = InMemoryStore::new();
@@ -307,6 +356,80 @@ mod tests {
             task.last_transition_reason,
             Some(TransitionReason::DependenciesSatisfied)
         );
+        assert!(task.last_transition_at.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cas_task_state_sets_transition_timestamps() -> Result<()> {
+        let store = InMemoryStore::new();
+        let run = create_test_run()?;
+        let run_id = run.id;
+        let task_id = run.task_executions[0].task_id;
+
+        store.save_run(&run).await?;
+
+        store
+            .cas_task_state(
+                &run_id,
+                &task_id,
+                TaskState::Pending,
+                TaskState::Ready,
+                TransitionReason::DependenciesSatisfied,
+            )
+            .await?;
+        store
+            .cas_task_state(
+                &run_id,
+                &task_id,
+                TaskState::Ready,
+                TaskState::Queued,
+                TransitionReason::QuotaAcquired,
+            )
+            .await?;
+        store
+            .cas_task_state(
+                &run_id,
+                &task_id,
+                TaskState::Queued,
+                TaskState::Dispatched,
+                TransitionReason::DispatchedToWorker,
+            )
+            .await?;
+
+        let updated = store.get_run(&run_id).await?.unwrap();
+        let task = updated.get_task(&task_id).unwrap();
+        assert_eq!(task.state, TaskState::Dispatched);
+        assert!(task.dispatched_at.is_some());
+        assert!(task.last_transition_at.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cas_task_state_rejects_invalid_transition() -> Result<()> {
+        let store = InMemoryStore::new();
+        let run = create_test_run()?;
+        let run_id = run.id;
+        let task_id = run.task_executions[0].task_id;
+
+        store.save_run(&run).await?;
+
+        let result = store
+            .cas_task_state(
+                &run_id,
+                &task_id,
+                TaskState::Pending,
+                TaskState::Running,
+                TransitionReason::ExecutionStarted,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidStateTransition { .. })
+        ));
 
         Ok(())
     }
@@ -520,6 +643,33 @@ mod tests {
         assert_eq!(by_tenant.len(), 1);
         assert_eq!(by_tenant[0].0, "test-tenant");
         assert_eq!(by_tenant[0].1.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_ready_tasks_by_tenant_orders_by_priority_and_key() -> Result<()> {
+        let store = InMemoryStore::new();
+        let (mut run, low_priority_task, high_priority_task, mid_priority_task) =
+            create_priority_run()?;
+        let run_id = run.id;
+
+        for task_id in [low_priority_task, high_priority_task, mid_priority_task] {
+            run.get_task_mut(&task_id)
+                .unwrap()
+                .transition_to(TaskState::Ready)?;
+        }
+
+        store.save_run(&run).await?;
+
+        let by_tenant = store.get_ready_tasks_by_tenant(&run_id).await?;
+        assert_eq!(by_tenant.len(), 1);
+        let ready_ids: Vec<TaskId> = by_tenant[0].1.iter().map(|t| t.task_id).collect();
+
+        assert_eq!(
+            ready_ids,
+            vec![high_priority_task, mid_priority_task, low_priority_task]
+        );
 
         Ok(())
     }

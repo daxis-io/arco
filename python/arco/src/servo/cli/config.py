@@ -65,7 +65,7 @@ class ServoConfig(BaseSettings):
         if not self.api_key.get_secret_value():
             errors.append(
                 "API key not configured. "
-                "Set SERVO_API_KEY environment variable or use --dry-run."
+                "Set SERVO_API_KEY environment variable."
             )
 
         if not self.tenant_id:

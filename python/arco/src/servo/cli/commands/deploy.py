@@ -1,8 +1,9 @@
 """Deploy command implementation."""
 from __future__ import annotations
 
-from collections.abc import Sequence  # noqa: TC003 - used at runtime
+from collections.abc import Sequence  # noqa: TC003
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from rich.console import Console
 from rich.table import Table
@@ -10,7 +11,10 @@ from rich.tree import Tree
 
 from servo.cli.config import get_config
 from servo.manifest.builder import ManifestBuilder
-from servo.manifest.discovery import AssetDiscovery
+from servo.manifest.discovery import AssetDiscovery, AssetDiscoveryError
+
+if TYPE_CHECKING:
+    from servo._internal.registry import RegisteredAssetProtocol
 
 console = Console()
 err_console = Console(stderr=True)
@@ -32,11 +36,7 @@ def run_deploy(
         json_output: Output raw JSON.
     """
     config = get_config()
-
-    if workspace:
-        # Create a new config with the overridden workspace
-        # (We can't modify the cached config directly)
-        pass  # For now, we'll use the default
+    workspace_id = workspace or config.workspace_id
 
     # Validate for non-dry-run
     if not dry_run:
@@ -51,7 +51,13 @@ def run_deploy(
         console.print(f"[blue]i[/blue] Discovering assets in {Path.cwd()}...")
 
     discovery = AssetDiscovery()
-    assets = discovery.discover()
+    try:
+        assets = discovery.discover(strict=True)
+    except AssetDiscoveryError as e:
+        err_console.print("[red]✗[/red] Asset discovery failed")
+        for failure in e.failures:
+            err_console.print(f"  - {failure.file_path}: {failure.error}")
+        raise SystemExit(1) from None
 
     if not assets:
         console.print("[yellow]![/yellow] No assets found. Use @asset decorator to define assets.")
@@ -60,7 +66,7 @@ def run_deploy(
     # Build manifest
     builder = ManifestBuilder(
         tenant_id=config.tenant_id or "local",
-        workspace_id=config.workspace_id,
+        workspace_id=workspace_id,
     )
     manifest = builder.build(assets)
 
@@ -80,11 +86,11 @@ def run_deploy(
     else:
         # TODO: Implement actual deployment
         console.print(
-            f"[green]✓[/green] Deployed {len(assets)} assets to {config.workspace_id}"
+            f"[green]✓[/green] Deployed {len(assets)} assets to {workspace_id}"
         )
 
 
-def _print_summary(manifest: object, assets: Sequence[object]) -> None:
+def _print_summary(manifest: object, assets: Sequence[RegisteredAssetProtocol]) -> None:
     """Print manifest summary.
 
     Args:
@@ -116,16 +122,16 @@ def _print_summary(manifest: object, assets: Sequence[object]) -> None:
 
     # Asset tree
     tree = Tree("[bold]Assets[/bold]")
-    by_ns: dict[str, list[object]] = {}
+    by_ns: dict[str, list[RegisteredAssetProtocol]] = {}
     for a in assets:
-        ns = a.key.namespace  # type: ignore[attr-defined]
+        ns = a.key.namespace
         by_ns.setdefault(ns, []).append(a)
 
     for ns, ns_assets in sorted(by_ns.items()):
         branch = tree.add(f"[cyan]{ns}/[/cyan]")
         for a in ns_assets:
-            deps = len(a.definition.dependencies)  # type: ignore[attr-defined]
-            name = a.key.name  # type: ignore[attr-defined]
+            deps = len(a.definition.dependencies)
+            name = a.key.name
             branch.add(f"{name} [dim]({deps} deps)[/dim]")
 
     console.print(tree)

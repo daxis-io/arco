@@ -41,10 +41,12 @@ def _show_run_status(run_id: str, watch: bool) -> None:
     console.print(f"[blue]i[/blue] Checking status for run [cyan]{run_id}[/cyan]...")
 
     # TODO: Implement actual status check via API
-    console.print("[yellow]![/yellow] Status checking not yet implemented.")
+    err_console.print("[red]✗[/red] Status checking not yet implemented.")
 
     if watch:
-        console.print("  Would watch for status updates...")
+        err_console.print("  Would watch for status updates...")
+
+    raise SystemExit(2)
 
 
 def _show_recent_runs(limit: int) -> None:
@@ -64,5 +66,7 @@ def _show_recent_runs(limit: int) -> None:
     table.add_column("Duration")
 
     # Placeholder data
-    console.print("[yellow]![/yellow] Run listing not yet implemented.")
+    err_console.print("[red]✗[/red] Run listing not yet implemented.")
     console.print(table)
+
+    raise SystemExit(2)

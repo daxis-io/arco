@@ -72,6 +72,13 @@ pub enum Error {
         /// Description of the internal error.
         message: String,
     },
+
+    /// A validation error occurred (uniqueness, referential integrity, etc.).
+    #[error("validation error: {message}")]
+    Validation {
+        /// Description of the validation failure.
+        message: String,
+    },
 }
 
 impl Error {

@@ -47,6 +47,11 @@ tenant={tenant}/workspace={workspace}/
 ├── ledger/
 │   └── {domain}/
 │       └── {event_id}.json          # Tier-2 append-only events
+├── sequence/
+│   └── {domain}.sequence.json       # Tier-2 monotonic ingest sequencing
+├── quarantine/
+│   └── {domain}/
+│       └── {event_id}.json          # Tier-2 dead-letter / operator review
 └── state/
     └── {domain}/
         └── snapshot_v{version}_{ulid}.parquet  # Tier-2 compacted state
@@ -74,34 +79,27 @@ tenant={tenant}/workspace={workspace}/
    - Enables efficient range queries
    - Supports watermark-based compaction
 
+5. **Tier-2 Sequence Positions**: Monotonic, ingest-assigned ordering
+   - `sequence/{domain}.sequence.json` stores a per-domain counter updated via CAS
+   - `EventWriter` assigns `sequence_position` in the ADR-004 envelope
+   - Compactor advances `watermark_position` from `sequence_position` to avoid permanent drops from clock skew or out-of-order ULIDs
+
 ### Single Path Module
 
-All paths MUST be constructed through `arco_catalog::paths`:
+All paths MUST be constructed through `arco_core::CatalogPaths`:
 
 ```rust
-pub mod paths {
-    pub const ROOT_MANIFEST: &str = "manifests/root.manifest.json";
+use arco_core::{CatalogDomain, CatalogPaths};
 
-    pub fn domain_manifest(domain: &str) -> String {
-        format!("manifests/{domain}.manifest.json")
-    }
-
-    pub fn domain_lock(domain: &str) -> String {
-        format!("locks/{domain}.lock.json")
-    }
-
-    pub fn snapshot_dir(domain: &str, version: u64) -> String {
-        format!("snapshots/{domain}/v{version}/")
-    }
-
-    pub fn ledger_event(domain: &str, event_id: &str) -> String {
-        format!("ledger/{domain}/{event_id}.json")
-    }
-
-    pub fn state_snapshot(domain: &str, version: u64, ulid: &str) -> String {
-        format!("state/{domain}/snapshot_v{version}_{ulid}.parquet")
-    }
-}
+assert_eq!(CatalogPaths::ROOT_MANIFEST, "manifests/root.manifest.json");
+assert_eq!(
+    CatalogPaths::ledger_event(CatalogDomain::Executions, "01ARZ3NDEK"),
+    "ledger/executions/01ARZ3NDEK.json"
+);
+assert_eq!(
+    CatalogPaths::sequence_counter(CatalogDomain::Executions),
+    "sequence/executions.sequence.json"
+);
 ```
 
 ### Path Validation Rules

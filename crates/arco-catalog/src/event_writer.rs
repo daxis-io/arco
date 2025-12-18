@@ -15,13 +15,36 @@
 
 use bytes::Bytes;
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use arco_core::scoped_storage::ScopedStorage;
 use arco_core::storage::WritePrecondition;
 use arco_core::{CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths, EventId};
 
 use crate::error::{CatalogError, Result};
+use crate::metrics;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SequenceCounter {
+    next: u64,
+}
+
+impl SequenceCounter {
+    const fn new(next: u64) -> Self {
+        Self { next }
+    }
+
+    fn allocate(&mut self) -> Result<u64> {
+        let allocated = self.next;
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or_else(|| CatalogError::InvariantViolation {
+                message: "sequence counter overflowed u64".to_string(),
+            })?;
+        Ok(allocated)
+    }
+}
 
 /// Writes events to the Tier 2 append-only ledger.
 ///
@@ -41,6 +64,8 @@ pub struct EventWriter {
 }
 
 impl EventWriter {
+    const SEQUENCE_CAS_MAX_RETRIES: u32 = 10;
+
     /// Creates a new event writer.
     #[must_use]
     pub fn new(storage: ScopedStorage) -> Self {
@@ -92,6 +117,25 @@ impl EventWriter {
         event: &T,
         event_id: &EventId,
     ) -> Result<()> {
+        // CRITICAL: Use event_id ONLY (no timestamp prefix) for idempotent writes
+        // ULID's embedded timestamp ensures lexicographic = chronological ordering
+        let path = CatalogPaths::ledger_event(domain, &event_id.to_string());
+
+        // Fast-path duplicates to avoid wasting sequence positions.
+        if self
+            .storage
+            .head_raw(&path)
+            .await
+            .map_err(|e| CatalogError::Storage {
+                message: format!("failed to check event existence: {e}"),
+            })?
+            .is_some()
+        {
+            tracing::debug!(event_id = %event_id, "duplicate event delivery (already exists)");
+            metrics::inc_event_writer_written(domain, "duplicate");
+            return Ok(());
+        }
+
         let event_type = T::EVENT_TYPE;
         let event_version = T::EVENT_VERSION;
         let idempotency_key =
@@ -100,6 +144,8 @@ impl EventWriter {
                     message: format!("failed to generate idempotency key: {e}"),
                 })?;
 
+        let sequence_position = self.allocate_sequence_position(domain).await?;
+
         let envelope = CatalogEvent {
             event_type: event_type.to_string(),
             event_version,
@@ -107,7 +153,7 @@ impl EventWriter {
             occurred_at: Utc::now(),
             source: self.source.clone(),
             trace_id: None,
-            sequence_position: None,
+            sequence_position: Some(sequence_position),
             payload: event,
         };
 
@@ -117,13 +163,11 @@ impl EventWriter {
                 message: format!("invalid event envelope: {e}"),
             })?;
 
-        // CRITICAL: Use event_id ONLY (no timestamp prefix) for idempotent writes
-        // ULID's embedded timestamp ensures lexicographic = chronological ordering
-        let path = CatalogPaths::ledger_event(domain, &event_id.to_string());
         let json =
             serde_json::to_vec_pretty(&envelope).map_err(|e| CatalogError::Serialization {
                 message: format!("failed to serialize event: {e}"),
             })?;
+        let json_len = u64::try_from(json.len()).unwrap_or(u64::MAX);
 
         // CRITICAL: Use DoesNotExist for true append-only semantics
         let result = self
@@ -136,10 +180,16 @@ impl EventWriter {
 
         // Handle duplicate delivery gracefully (idempotent behavior)
         match result {
-            arco_core::storage::WriteResult::Success { .. } => Ok(()),
+            arco_core::storage::WriteResult::Success { .. } => {
+                metrics::inc_event_writer_written(domain, "success");
+                metrics::add_event_writer_bytes_written(domain, json_len);
+                Ok(())
+            }
             arco_core::storage::WriteResult::PreconditionFailed { .. } => {
                 // Duplicate delivery - this is OK, compactor will dedupe
                 tracing::debug!(event_id = %event_id, "duplicate event delivery (already exists)");
+                metrics::inc_event_writer_written(domain, "duplicate");
+                metrics::inc_event_writer_sequence_allocation("wasted_duplicate");
                 Ok(())
             }
         }
@@ -185,6 +235,107 @@ impl EventWriter {
                 message: format!("failed to read event: {e}"),
             })
     }
+
+    async fn allocate_sequence_position(&self, domain: CatalogDomain) -> Result<u64> {
+        let path = CatalogPaths::sequence_counter(domain);
+
+        for attempt in 1..=Self::SEQUENCE_CAS_MAX_RETRIES {
+            let meta = self
+                .storage
+                .head_raw(&path)
+                .await
+                .map_err(|e| CatalogError::Storage {
+                    message: format!("failed to read sequence counter metadata: {e}"),
+                })?;
+
+            match meta {
+                None => {
+                    let counter = SequenceCounter::new(2);
+                    let json = serde_json::to_vec_pretty(&counter).map_err(|e| {
+                        CatalogError::Serialization {
+                            message: format!("failed to serialize sequence counter: {e}"),
+                        }
+                    })?;
+
+                    let result = self
+                        .storage
+                        .put_raw(&path, Bytes::from(json), WritePrecondition::DoesNotExist)
+                        .await
+                        .map_err(|e| CatalogError::Storage {
+                            message: format!("failed to create sequence counter: {e}"),
+                        })?;
+
+                    match result {
+                        arco_core::storage::WriteResult::Success { .. } => {
+                            metrics::inc_event_writer_sequence_allocation("success");
+                            return Ok(1);
+                        }
+                        arco_core::storage::WriteResult::PreconditionFailed { .. } => {
+                            metrics::inc_event_writer_sequence_allocation("cas_retry");
+                            if attempt == Self::SEQUENCE_CAS_MAX_RETRIES {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                Some(meta) => {
+                    let data =
+                        self.storage
+                            .get_raw(&path)
+                            .await
+                            .map_err(|e| CatalogError::Storage {
+                                message: format!("failed to read sequence counter: {e}"),
+                            })?;
+
+                    let mut counter: SequenceCounter =
+                        serde_json::from_slice(&data).map_err(|e| CatalogError::Serialization {
+                            message: format!("failed to parse sequence counter: {e}"),
+                        })?;
+
+                    let allocated = counter.allocate()?;
+                    let json = serde_json::to_vec_pretty(&counter).map_err(|e| {
+                        CatalogError::Serialization {
+                            message: format!("failed to serialize sequence counter: {e}"),
+                        }
+                    })?;
+
+                    let result = self
+                        .storage
+                        .put_raw(
+                            &path,
+                            Bytes::from(json),
+                            WritePrecondition::MatchesVersion(meta.version.clone()),
+                        )
+                        .await
+                        .map_err(|e| CatalogError::Storage {
+                            message: format!("failed to update sequence counter: {e}"),
+                        })?;
+
+                    match result {
+                        arco_core::storage::WriteResult::Success { .. } => {
+                            metrics::inc_event_writer_sequence_allocation("success");
+                            return Ok(allocated);
+                        }
+                        arco_core::storage::WriteResult::PreconditionFailed { .. } => {
+                            metrics::inc_event_writer_sequence_allocation("cas_retry");
+                            if attempt == Self::SEQUENCE_CAS_MAX_RETRIES {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        metrics::inc_event_writer_sequence_allocation("cas_exhausted");
+        Err(CatalogError::CasFailed {
+            message: format!(
+                "sequence counter CAS failed after {} retries for domain '{domain}'",
+                Self::SEQUENCE_CAS_MAX_RETRIES
+            ),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -194,6 +345,7 @@ mod tests {
     use arco_core::storage::MemoryBackend;
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
+    use tokio::sync::Barrier;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct TestEvent {
@@ -238,6 +390,10 @@ mod tests {
         assert_eq!(stored.event_version, 1);
         assert!(!stored.idempotency_key.is_empty());
         assert_eq!(stored.source, "arco-catalog");
+        assert!(
+            stored.sequence_position.is_some(),
+            "writer should assign sequence_position at ingest"
+        );
         assert_eq!(stored.payload.value, 42);
     }
 
@@ -316,5 +472,85 @@ mod tests {
             files, sorted,
             "ULID ensures lexicographic = chronological ordering"
         );
+    }
+
+    #[tokio::test]
+    async fn sequence_positions_are_monotonic() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage =
+            ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+
+        let writer = EventWriter::new(storage.clone());
+
+        for i in 0..5 {
+            let event = TestEvent { value: i };
+            writer
+                .append(CatalogDomain::Executions, &event)
+                .await
+                .expect("append");
+        }
+
+        let files = writer
+            .list_events(CatalogDomain::Executions)
+            .await
+            .expect("list");
+
+        let mut positions: Vec<u64> = Vec::new();
+        for file in files {
+            let data = storage.get_raw(file.as_str()).await.expect("read");
+            let stored: CatalogEvent<TestEvent> = serde_json::from_slice(&data).expect("parse");
+            positions.push(stored.sequence_position.expect("sequence"));
+        }
+
+        positions.sort_unstable();
+        assert_eq!(positions, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_appends_allocate_unique_sequence_positions() {
+        const N: usize = 20;
+
+        let backend = Arc::new(MemoryBackend::new());
+        let storage =
+            ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+
+        let writer = Arc::new(EventWriter::new(storage.clone()));
+        let barrier = Arc::new(Barrier::new(N));
+
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let writer = Arc::clone(&writer);
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let value = i32::try_from(i).expect("i fits in i32");
+                let event = TestEvent { value };
+                writer
+                    .append(CatalogDomain::Executions, &event)
+                    .await
+                    .expect("append");
+            }));
+        }
+
+        for handle in handles {
+            handle.await.expect("task");
+        }
+
+        let files = writer
+            .list_events(CatalogDomain::Executions)
+            .await
+            .expect("list");
+        assert_eq!(files.len(), N);
+
+        let mut positions: Vec<u64> = Vec::new();
+        for file in files {
+            let data = storage.get_raw(file.as_str()).await.expect("read");
+            let stored: CatalogEvent<TestEvent> = serde_json::from_slice(&data).expect("parse");
+            positions.push(stored.sequence_position.expect("sequence"));
+        }
+
+        positions.sort_unstable();
+        positions.dedup();
+        assert_eq!(positions.len(), N, "sequence positions must be unique");
     }
 }

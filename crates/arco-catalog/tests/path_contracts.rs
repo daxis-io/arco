@@ -5,11 +5,14 @@
 //!
 //! # Invariants Tested
 //!
-//! 1. EventWriter ledger paths match `CatalogPaths::ledger_event` format
-//! 2. Tier1Writer snapshot paths match `CatalogPaths::snapshot_dir` format
+//! 1. `EventWriter` ledger paths match `CatalogPaths::ledger_event` format
+//! 2. `Tier1Writer` snapshot paths match `CatalogPaths::snapshot_dir` format
 //! 3. No hardcoded paths bypass the canonical layout
 //! 4. All domains use consistent naming (catalog, lineage, executions, search)
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::path::Path;
 use std::sync::Arc;
 
 use arco_catalog::event_writer::EventWriter;
@@ -55,15 +58,14 @@ async fn contract_event_writer_path_format() {
     // The scoped path should end with the canonical relative path
     assert!(
         expected_path.ends_with(&expected_relative),
-        "EventWriter path should match CatalogPaths format: {}",
-        expected_relative
+        "EventWriter path should match CatalogPaths format: {expected_relative}"
     );
 
     // Verify the event was written to the expected location
     let objects = storage.list("ledger/").await.unwrap();
     assert_eq!(objects.len(), 1, "should have one event in ledger");
 
-    let written_path = objects[0].as_str();
+    let written_path = objects.first().expect("ledger object").as_str();
     assert!(
         written_path.contains("executions"),
         "ledger path should contain domain name"
@@ -89,9 +91,7 @@ fn contract_manifest_paths_canonical_naming() {
         let manifest = CatalogPaths::domain_manifest(domain);
         assert!(
             manifest.contains(expected_name),
-            "Manifest path '{}' should contain domain name '{}'",
-            manifest,
-            expected_name
+            "Manifest path '{manifest}' should contain domain name '{expected_name}'"
         );
         assert!(
             manifest.ends_with(".manifest.json"),
@@ -114,9 +114,7 @@ fn contract_lock_paths_canonical_naming() {
         let lock = CatalogPaths::domain_lock(domain);
         assert!(
             lock.contains(expected_name),
-            "Lock path '{}' should contain domain name '{}'",
-            lock,
-            expected_name
+            "Lock path '{lock}' should contain domain name '{expected_name}'"
         );
         assert!(
             lock.ends_with(".lock.json"),
@@ -159,7 +157,12 @@ fn contract_ledger_paths_canonical_structure() {
             path.starts_with("ledger/"),
             "Ledger path should start with 'ledger/'"
         );
-        assert!(path.ends_with(".json"), "Ledger path should end with .json");
+        assert!(
+            Path::new(&path)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json")),
+            "Ledger path should end with .json"
+        );
         assert!(
             path.contains(event_id),
             "Ledger path should contain event ID"

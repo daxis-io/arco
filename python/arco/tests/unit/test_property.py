@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time
 
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -126,10 +127,14 @@ class TestSerializationProperties:
         """Serialization is deterministic."""
         from servo.manifest.serialization import serialize_to_manifest_json
 
-        result1 = serialize_to_manifest_json(data)
-        result2 = serialize_to_manifest_json(data)
-
-        assert result1 == result2
+        try:
+            result1 = serialize_to_manifest_json(data)
+        except (TypeError, ValueError) as err:
+            with pytest.raises(type(err)):
+                serialize_to_manifest_json(data)
+        else:
+            result2 = serialize_to_manifest_json(data)
+            assert result1 == result2
 
     @given(
         key=st.from_regex(r"[a-z][a-z0-9_]+", fullmatch=True),

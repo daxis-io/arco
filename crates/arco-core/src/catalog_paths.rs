@@ -29,6 +29,8 @@
 //! ├── ledger/
 //! │   └── {domain}/
 //! │       └── {event_id}.json
+//! ├── sequence/                     # Tier-2 ingest sequencing (monotonic)
+//! │   └── {domain}.sequence.json
 //! ├── quarantine/
 //! │   └── {domain}/
 //! │       └── {event_id}.json
@@ -192,6 +194,20 @@ impl CatalogPaths {
     #[must_use]
     pub fn ledger_dir(domain: CatalogDomain) -> String {
         format!("ledger/{}/", domain.as_str())
+    }
+
+    // =========================================================================
+    // Sequence Paths (Tier-2 ingest ordering)
+    // =========================================================================
+
+    /// Returns the monotonic ingest sequence counter path for a domain.
+    ///
+    /// This file is used by Tier-2 ingestion to assign `sequence_position` to events
+    /// (ADR-004) so compaction can advance `watermark_position` without relying on
+    /// event ID ordering.
+    #[must_use]
+    pub fn sequence_counter(domain: CatalogDomain) -> String {
+        format!("sequence/{}.sequence.json", domain.as_str())
     }
 
     // =========================================================================
@@ -381,6 +397,14 @@ mod tests {
         assert_eq!(
             CatalogPaths::quarantine_event(CatalogDomain::Executions, "01ARZ3NDEK.json"),
             "quarantine/executions/01ARZ3NDEK.json"
+        );
+    }
+
+    #[test]
+    fn test_sequence_paths() {
+        assert_eq!(
+            CatalogPaths::sequence_counter(CatalogDomain::Executions),
+            "sequence/executions.sequence.json"
         );
     }
 

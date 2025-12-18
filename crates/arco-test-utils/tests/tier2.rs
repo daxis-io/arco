@@ -356,8 +356,8 @@ async fn tier2_out_of_order_processing() {
     let records = read_snapshot_records(&storage, &snapshot_path).await;
     assert_eq!(records.len(), 1, "upsert semantics: one key");
     assert_eq!(
-        records[0].row_count, 300,
-        "latest ULID should win regardless of arrival order"
+        records[0].row_count, 200,
+        "ingest-assigned sequence_position should win regardless of ULID order"
     );
 }
 

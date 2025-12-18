@@ -5,7 +5,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from servo.manifest.discovery import AssetDiscovery
+from servo.manifest.discovery import AssetDiscovery, AssetDiscoveryError
 
 console = Console()
 err_console = Console(stderr=True)
@@ -19,9 +19,14 @@ def run_validate() -> None:
     discovery = AssetDiscovery()
 
     try:
-        assets = discovery.discover()
+        assets = discovery.discover(strict=True)
+    except AssetDiscoveryError as e:
+        err_console.print("[red]✗[/red] Asset discovery failed")
+        for failure in e.failures:
+            err_console.print(f"  - {failure.file_path}: {failure.error}")
+        raise SystemExit(1) from None
     except Exception as e:
-        err_console.print(f"[red]✗[/red] Discovery failed: {e}")
+        err_console.print(f"[red]✗[/red] Unexpected discovery failure: {e}")
         raise SystemExit(1) from None
 
     if not assets:

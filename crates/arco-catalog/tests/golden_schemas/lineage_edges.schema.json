@@ -1,0 +1,36 @@
+{
+  "name": "lineage_edges",
+  "version": 1,
+  "fields": [
+    {
+      "name": "id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "source_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "target_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "edge_type",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "run_id",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "created_at",
+      "data_type": "Timestamp(Millisecond)",
+      "nullable": false
+    }
+  ]
+}

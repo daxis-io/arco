@@ -70,7 +70,7 @@ pub use catalog_event::{CatalogEvent, CatalogEventPayload};
 pub use catalog_paths::{CatalogDomain, CatalogPaths};
 pub use error::{Error, Result};
 pub use id::{AssetId, EventId, MaterializationId, RunId, TaskId};
-pub use observability::{LogFormat, init_logging};
+pub use observability::{LogFormat, Redacted, init_logging};
 pub use partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
 pub use scoped_storage::ScopedStorage;
 pub use storage::{

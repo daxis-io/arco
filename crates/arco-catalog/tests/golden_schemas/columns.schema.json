@@ -1,0 +1,41 @@
+{
+  "name": "columns",
+  "version": 1,
+  "fields": [
+    {
+      "name": "id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "table_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "name",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "data_type",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "is_nullable",
+      "data_type": "Boolean",
+      "nullable": false
+    },
+    {
+      "name": "ordinal",
+      "data_type": "Int32",
+      "nullable": false
+    },
+    {
+      "name": "description",
+      "data_type": "Utf8",
+      "nullable": true
+    }
+  ]
+}

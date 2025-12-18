@@ -4,6 +4,8 @@ from __future__ import annotations
 from pathlib import Path  # noqa: TC003 - used at runtime
 from textwrap import dedent
 
+import pytest
+
 
 class TestAssetDiscovery:
     """Tests for AssetDiscovery."""
@@ -144,6 +146,38 @@ class TestAssetDiscovery:
 
         keys = [str(a.key) for a in assets]
         assert keys == sorted(keys)
+
+    def test_strict_mode_raises_on_import_error(self, tmp_path: Path) -> None:
+        """Strict mode fails discovery if any module cannot be imported."""
+        from servo.manifest.discovery import AssetDiscovery, AssetDiscoveryError
+
+        (tmp_path / "assets").mkdir()
+        (tmp_path / "assets" / "__init__.py").write_text("")
+
+        # Valid asset module
+        (tmp_path / "assets" / "raw.py").write_text(dedent("""
+            from servo import asset
+            from servo.context import AssetContext
+
+            @asset(namespace="raw")
+            def events(ctx: AssetContext) -> None:
+                pass
+        """))
+
+        # Invalid module (syntax error)
+        (tmp_path / "assets" / "broken.py").write_text("def oops(:\n")
+
+        discovery = AssetDiscovery(root_path=tmp_path)
+
+        # Non-strict: still discovers valid assets.
+        assets = discovery.discover(strict=False)
+        assert {str(a.key) for a in assets} == {"raw.events"}
+
+        # Strict: raises with details.
+        with pytest.raises(AssetDiscoveryError) as exc:
+            discovery.discover(strict=True)
+
+        assert any("assets.broken" in f.module_name for f in exc.value.failures)
 
 
 class TestFindPythonFiles:

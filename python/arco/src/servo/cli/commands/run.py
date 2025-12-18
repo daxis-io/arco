@@ -48,8 +48,10 @@ def run_asset(
         console.print(f"  Partitions: {partition_dict}")
 
     # TODO: Implement actual run trigger via API
-    console.print("[yellow]![/yellow] Run triggering not yet implemented.")
-    console.print("  This will call the Servo API to trigger the asset run.")
+    err_console.print("[red]✗[/red] Run triggering not yet implemented.")
+    err_console.print("  This will call the Servo API to trigger the asset run.")
 
     if wait:
-        console.print(f"  Would wait up to {timeout}s for completion.")
+        err_console.print(f"  Would wait up to {timeout}s for completion.")
+
+    raise SystemExit(2)

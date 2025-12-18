@@ -77,6 +77,7 @@ pub mod event_writer;
 pub mod gc;
 pub mod lock;
 pub mod manifest;
+pub mod metrics;
 mod parquet_util;
 pub mod reader;
 pub mod reconciler;

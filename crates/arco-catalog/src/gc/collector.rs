@@ -221,6 +221,15 @@ impl GarbageCollector {
                     metric = "arco_gc_phase_completed",
                     "GC phase completed"
                 );
+
+                // Record metrics
+                crate::metrics::record_gc_completion(
+                    phase,
+                    phase_result.objects_deleted,
+                    phase_result.bytes_reclaimed,
+                    duration_secs,
+                );
+
                 result.merge(phase_result);
             }
             Err(e) => {
@@ -230,6 +239,10 @@ impl GarbageCollector {
                     metric = "arco_gc_errors_total",
                     "GC phase failed"
                 );
+
+                // Record error metric
+                crate::metrics::record_gc_error(phase);
+
                 result.errors.push(format!("{error_context}: {e}"));
             }
         }

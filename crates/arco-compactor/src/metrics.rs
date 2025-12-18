@@ -41,13 +41,19 @@ static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 /// Initializes the global metrics recorder with Prometheus exporter.
 ///
 /// Safe to call multiple times; subsequent calls are no-ops.
+///
+/// # Panics
+///
+/// Panics if the Prometheus recorder cannot be installed. This is intentional
+/// as metrics are critical infrastructure and the service should not start without them.
+#[allow(clippy::panic)]
 pub fn init_metrics() -> PrometheusHandle {
     PROMETHEUS_HANDLE
         .get_or_init(|| {
             let builder = PrometheusBuilder::new();
-            let handle = builder
-                .install_recorder()
-                .unwrap_or_else(|e| panic!("failed to install prometheus recorder: {e}"));
+            let handle = builder.install_recorder().unwrap_or_else(|e| {
+                panic!("failed to install prometheus recorder: {e}")
+            });
 
             // Register metric descriptions
             describe_histogram!(

@@ -1,36 +1,57 @@
 //! # arco-compactor
 //!
-//! Compaction binary for the Arco serverless lakehouse infrastructure.
+//! Compaction service for the Arco serverless lakehouse infrastructure.
 //!
 //! The compactor merges Tier 2 events into Tier 1 snapshots, maintaining
 //! query performance while preserving the append-only event history.
 //!
-//! ## Deployment
+//! ## Modes
 //!
-//! The compactor is designed to run as:
+//! - **Service Mode**: Runs continuously with HTTP health endpoints
+//! - **CLI Mode**: Manual compaction for debugging or recovery
 //!
-//! - **Cloud Function**: Triggered by pub/sub on event thresholds
-//! - **Kubernetes Job**: Scheduled or event-driven batch job
-//! - **CLI**: Manual compaction for debugging or recovery
+//! ## Health Endpoints
+//!
+//! - `GET /health` - Shallow liveness check (always 200)
+//! - `GET /ready` - Readiness check with compaction health status
 //!
 //! ## Usage
 //!
 //! ```bash
-//! # Compact a specific tenant
-//! arco-compactor --tenant acme-corp
+//! # Run as service (default)
+//! arco-compactor serve --port 8081
 //!
-//! # Compact all tenants
-//! arco-compactor --all
+//! # Manual compaction
+//! arco-compactor compact --tenant acme-corp
 //!
-//! # Dry run (show what would be compacted)
-//! arco-compactor --tenant acme-corp --dry-run
+//! # Dry run
+//! arco-compactor compact --tenant acme-corp --dry-run
 //! ```
 
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+mod metrics;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+
 use anyhow::Result;
-use clap::Parser;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use chrono::{DateTime, Utc};
+use clap::{Parser, Subcommand};
+use serde::Serialize;
+use tokio::sync::Mutex;
+
+// ============================================================================
+// CLI Arguments
+// ============================================================================
 
 /// Arco catalog compactor.
 #[derive(Debug, Parser)]
@@ -38,22 +59,319 @@ use clap::Parser;
 #[command(about = "Compacts Tier 2 events into Tier 1 snapshots")]
 #[command(version)]
 struct Args {
-    /// Tenant ID to compact.
-    #[arg(long, conflicts_with = "all")]
-    tenant: Option<String>,
-
-    /// Compact all tenants.
-    #[arg(long, conflicts_with = "tenant")]
-    all: bool,
-
-    /// Perform a dry run without making changes.
-    #[arg(long)]
-    dry_run: bool,
-
-    /// Minimum events before compaction (default: 1000).
-    #[arg(long, default_value = "1000")]
-    min_events: usize,
+    #[command(subcommand)]
+    command: Commands,
 }
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Run as a service with health endpoints.
+    Serve {
+        /// HTTP port for health endpoints.
+        #[arg(long, env = "ARCO_COMPACTOR_PORT", default_value = "8081")]
+        port: u16,
+
+        /// Compaction interval in seconds.
+        #[arg(long, env = "ARCO_COMPACTOR_INTERVAL_SECS", default_value = "60")]
+        interval_secs: u64,
+
+        /// Maximum time without successful compaction before unhealthy (seconds).
+        #[arg(
+            long,
+            env = "ARCO_COMPACTOR_UNHEALTHY_THRESHOLD_SECS",
+            default_value = "300"
+        )]
+        unhealthy_threshold_secs: u64,
+    },
+
+    /// Run a single compaction pass.
+    Compact {
+        /// Tenant ID to compact.
+        #[arg(long, conflicts_with = "all")]
+        tenant: Option<String>,
+
+        /// Compact all tenants.
+        #[arg(long, conflicts_with = "tenant")]
+        all: bool,
+
+        /// Perform a dry run without making changes.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Minimum events before compaction (default: 1000).
+        #[arg(long, default_value = "1000")]
+        min_events: usize,
+    },
+}
+
+// ============================================================================
+// Health State
+// ============================================================================
+
+/// Shared state for tracking compaction health.
+#[derive(Debug)]
+struct CompactorState {
+    /// Whether the service is ready to accept work.
+    ready: AtomicBool,
+    /// Unix timestamp of last successful compaction.
+    last_successful_compaction_ts: AtomicU64,
+    /// Total successful compaction cycles.
+    successful_compactions: AtomicU64,
+    /// Total failed compaction cycles.
+    failed_compactions: AtomicU64,
+    /// Whether a compaction cycle is currently running.
+    compaction_in_progress: AtomicBool,
+    /// Serializes compaction cycles to avoid concurrent runs.
+    compaction_lock: Mutex<()>,
+    /// Threshold (seconds) before marking unhealthy.
+    unhealthy_threshold_secs: u64,
+}
+
+impl CompactorState {
+    fn new(unhealthy_threshold_secs: u64) -> Self {
+        Self {
+            ready: AtomicBool::new(false),
+            last_successful_compaction_ts: AtomicU64::new(0),
+            successful_compactions: AtomicU64::new(0),
+            failed_compactions: AtomicU64::new(0),
+            compaction_in_progress: AtomicBool::new(false),
+            compaction_lock: Mutex::new(()),
+            unhealthy_threshold_secs,
+        }
+    }
+
+    fn mark_ready(&self) {
+        self.ready.store(true, Ordering::Release);
+    }
+
+    fn record_success(&self) {
+        let now: u64 = Utc::now().timestamp().try_into().unwrap_or_default();
+        self.last_successful_compaction_ts
+            .store(now, Ordering::Release);
+        self.successful_compactions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_failure(&self) {
+        self.failed_compactions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn is_healthy(&self) -> bool {
+        if !self.ready.load(Ordering::Acquire) {
+            return false;
+        }
+
+        if self.successful_compactions.load(Ordering::Acquire) == 0 {
+            // HARD GATE: we are not healthy until we've completed at least one
+            // successful compaction cycle. This prevents serving traffic against a
+            // potentially stale/uninitialized snapshot state.
+            return false;
+        }
+
+        let last = self.last_successful_compaction_ts.load(Ordering::Acquire);
+        if last == 0 {
+            return false;
+        }
+
+        let now: u64 = Utc::now().timestamp().try_into().unwrap_or_default();
+        let elapsed = now.saturating_sub(last);
+        elapsed < self.unhealthy_threshold_secs
+    }
+
+    fn last_successful_compaction(&self) -> Option<DateTime<Utc>> {
+        let ts = self.last_successful_compaction_ts.load(Ordering::Acquire);
+        if ts == 0 {
+            None
+        } else {
+            let ts = i64::try_from(ts).ok()?;
+            DateTime::from_timestamp(ts, 0)
+        }
+    }
+}
+
+// ============================================================================
+// Health Endpoints
+// ============================================================================
+
+/// Health check response.
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: String,
+}
+
+/// Readiness check response.
+#[derive(Debug, Serialize)]
+struct ReadyResponse {
+    ready: bool,
+    healthy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_successful_compaction: Option<String>,
+    successful_compactions: u64,
+    failed_compactions: u64,
+    compaction_in_progress: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+/// GET /health - Shallow liveness check.
+async fn health() -> impl IntoResponse {
+    Json(HealthResponse {
+        status: "ok".to_string(),
+    })
+}
+
+/// GET /ready - Readiness check with compaction health.
+async fn ready(State(state): State<Arc<CompactorState>>) -> impl IntoResponse {
+    let ready = state.ready.load(Ordering::Acquire);
+    let healthy = state.is_healthy();
+    let last_successful = state.last_successful_compaction();
+    let successful_compactions = state.successful_compactions.load(Ordering::Relaxed);
+    let failed_compactions = state.failed_compactions.load(Ordering::Relaxed);
+    let compaction_in_progress = state.compaction_in_progress.load(Ordering::Acquire);
+
+    let message = if !ready {
+        Some("Service starting up".to_string())
+    } else if successful_compactions == 0 {
+        Some("Waiting for first successful compaction".to_string())
+    } else if !healthy {
+        Some(format!(
+            "No successful compaction in {} seconds",
+            state.unhealthy_threshold_secs
+        ))
+    } else {
+        None
+    };
+
+    let status = if ready && healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        status,
+        Json(ReadyResponse {
+            ready,
+            healthy,
+            last_successful_compaction: last_successful.map(|dt| dt.to_rfc3339()),
+            successful_compactions,
+            failed_compactions,
+            compaction_in_progress,
+            message,
+        }),
+    )
+}
+
+/// POST /compact - Trigger a compaction cycle on-demand.
+///
+/// Returns:
+/// - `202 Accepted` if a new compaction cycle was started
+/// - `409 Conflict` if a compaction cycle is already in progress
+async fn compact(State(state): State<Arc<CompactorState>>) -> impl IntoResponse {
+    if state
+        .compaction_in_progress
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "already_running",
+                "message": "Compaction is already in progress"
+            })),
+        );
+    }
+
+    let state_clone = Arc::clone(&state);
+    tokio::spawn(async move {
+        run_compaction_cycle_guarded(&state_clone).await;
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "started",
+            "message": "Compaction triggered"
+        })),
+    )
+}
+
+// ============================================================================
+// Compaction Loop
+// ============================================================================
+
+/// Runs the compaction loop in service mode.
+async fn run_compaction_loop(state: Arc<CompactorState>, interval: Duration) {
+    let mut interval_timer = tokio::time::interval(interval);
+
+    // Mark as ready after first tick (startup complete).
+    //
+    // Note: the first `tick()` completes immediately to align the interval.
+    interval_timer.tick().await;
+    state.mark_ready();
+    tracing::info!("Compactor ready, starting compaction loop");
+
+    // Run a compaction cycle immediately on startup so readiness can become healthy
+    // without waiting a full interval.
+    run_compaction_cycle_guarded(&state).await;
+
+    loop {
+        interval_timer.tick().await;
+
+        tracing::info!("Starting compaction cycle");
+
+        run_compaction_cycle_guarded(&state).await;
+    }
+}
+
+async fn run_compaction_cycle_guarded(state: &Arc<CompactorState>) {
+    let _guard = state.compaction_lock.lock().await;
+
+    // If this cycle was started by the periodic loop, `compaction_in_progress` may be false.
+    // If it was started by `/compact`, it is already true. Either way, ensure it's true while
+    // work is running and reset it at the end.
+    state.compaction_in_progress.store(true, Ordering::Release);
+
+    match run_compaction_cycle().await {
+        Ok(()) => {
+            state.record_success();
+            tracing::info!("Compaction cycle completed successfully");
+        }
+        Err(e) => {
+            state.record_failure();
+            tracing::error!(error = %e, "Compaction cycle failed");
+        }
+    }
+
+    state.compaction_in_progress.store(false, Ordering::Release);
+}
+
+/// Runs a single compaction cycle.
+async fn run_compaction_cycle() -> Result<()> {
+    // TODO: Implement actual compaction logic
+    // This will call arco_catalog::Compactor::compact_domain() for each domain
+    //
+    // When implemented, use metrics::CompactionTimer for each domain:
+    //   let timer = metrics::CompactionTimer::start("catalog");
+    //   let result = compact_domain("catalog").await;
+    //   timer.finish(events_processed);
+
+    // For now, record a simulated compaction for all domains
+    for domain in ["catalog", "lineage", "executions", "search"] {
+        let timer = metrics::CompactionTimer::start(domain);
+
+        // Simulate some work per domain
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        // Record simulated metrics (0 events processed for now)
+        timer.finish(0);
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -68,20 +386,71 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    tracing::info!(
-        tenant = ?args.tenant,
-        all = args.all,
-        dry_run = args.dry_run,
-        min_events = args.min_events,
-        "Starting compaction"
-    );
+    match args.command {
+        Commands::Serve {
+            port,
+            interval_secs,
+            unhealthy_threshold_secs,
+        } => {
+            // Initialize metrics before starting
+            metrics::init_metrics();
 
-    if args.dry_run {
-        tracing::info!("Dry run mode - no changes will be made");
+            tracing::info!(
+                port = port,
+                interval_secs = interval_secs,
+                unhealthy_threshold_secs = unhealthy_threshold_secs,
+                "Starting compactor service"
+            );
+
+            let state = Arc::new(CompactorState::new(unhealthy_threshold_secs));
+
+            // Build HTTP router
+            let router = Router::new()
+                .route("/health", get(health))
+                .route("/ready", get(ready))
+                .route("/metrics", get(metrics::serve_metrics))
+                .route("/compact", post(compact))
+                .with_state(Arc::clone(&state));
+
+            // Spawn compaction loop
+            let state_clone = Arc::clone(&state);
+            let interval = Duration::from_secs(interval_secs);
+            tokio::spawn(async move {
+                run_compaction_loop(state_clone, interval).await;
+            });
+
+            // Start HTTP server
+            let addr = SocketAddr::from(([0, 0, 0, 0], port));
+            tracing::info!(address = %addr, "Starting health server");
+
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            axum::serve(listener, router).await?;
+        }
+
+        Commands::Compact {
+            tenant,
+            all,
+            dry_run,
+            min_events,
+        } => {
+            tracing::info!(
+                tenant = ?tenant,
+                all = all,
+                dry_run = dry_run,
+                min_events = min_events,
+                "Starting manual compaction"
+            );
+
+            if dry_run {
+                tracing::info!("Dry run mode - no changes will be made");
+            }
+
+            // TODO: Implement actual compaction logic
+            run_compaction_cycle().await?;
+
+            tracing::info!("Compaction complete");
+        }
     }
 
-    // TODO: Implement actual compaction logic
-
-    tracing::info!("Compaction complete");
     Ok(())
 }

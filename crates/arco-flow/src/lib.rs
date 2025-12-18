@@ -42,6 +42,7 @@
 // Internal modules - not exposed in public API.
 pub(crate) mod dag;
 
+pub mod dispatch;
 pub mod error;
 pub mod events;
 pub mod leader;
@@ -57,6 +58,7 @@ pub mod task_key;
 
 /// Prelude module for convenient imports.
 pub mod prelude {
+    pub use crate::dispatch::{EnqueueResult, TaskEnvelope, TaskQueue};
     pub use crate::error::{Error, Result};
     pub use crate::leader::{LeaderElector, LeadershipResult, RenewalResult};
     pub use crate::outbox::{EventSink, InMemoryOutbox, LedgerWriter};

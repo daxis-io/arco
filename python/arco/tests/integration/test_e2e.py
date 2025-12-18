@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path  # noqa: TC003 - used at runtime
 from textwrap import dedent
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.fixture
@@ -91,7 +94,11 @@ class TestManifestE2E:
         discovery = AssetDiscovery(root_path=project_with_assets)
         assets = discovery.discover()
 
-        builder = ManifestBuilder(tenant_id="test", workspace_id="dev")
+        builder = ManifestBuilder(
+            tenant_id="test",
+            workspace_id="dev",
+            lockfile_path=project_with_assets / ".servo" / "state.json",
+        )
         manifest = builder.build(assets)
 
         # Should be valid JSON
@@ -109,7 +116,11 @@ class TestManifestE2E:
         discovery = AssetDiscovery(root_path=project_with_assets)
         assets = discovery.discover()
 
-        builder = ManifestBuilder(tenant_id="test", workspace_id="dev")
+        builder = ManifestBuilder(
+            tenant_id="test",
+            workspace_id="dev",
+            lockfile_path=project_with_assets / ".servo" / "state.json",
+        )
         manifest = builder.build(assets)
 
         # We're in a git repo during tests
@@ -123,7 +134,12 @@ class TestManifestE2E:
         discovery = AssetDiscovery(root_path=project_with_assets)
         assets = discovery.discover()
 
-        builder = ManifestBuilder(tenant_id="test", workspace_id="dev", include_git=False)
+        builder = ManifestBuilder(
+            tenant_id="test",
+            workspace_id="dev",
+            include_git=False,
+            lockfile_path=project_with_assets / ".servo" / "state.json",
+        )
         manifest1 = builder.build(assets)
         manifest2 = builder.build(assets)
 

@@ -14,6 +14,11 @@ from typing import Any, cast
 # Type alias for JSON-serializable values (Any is appropriate here)
 JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
 
+# Fields whose values are map/struct-like and must preserve user keys exactly.
+#
+# Protobuf JSON casing applies to *field names*, not to map keys.
+_MAP_FIELD_NAMES = frozenset({"metadata", "tags"})
+
 
 def to_camel_case(snake_str: str) -> str:
     """Convert snake_case string to camelCase.
@@ -34,19 +39,37 @@ def to_camel_case(snake_str: str) -> str:
     return components[0] + "".join(x.title() for x in components[1:])
 
 
-def _convert_keys(obj: JsonValue) -> JsonValue:
-    """Recursively convert dictionary keys to camelCase.
+def _convert_keys(obj: JsonValue, *, convert_keys: bool = True) -> JsonValue:
+    """Recursively convert dictionary *field* names to camelCase.
 
     Args:
         obj: Any JSON-serializable object.
+        convert_keys: Whether to convert dict keys (used to preserve map keys).
 
     Returns:
-        Object with all dict keys converted to camelCase.
+        Object with schema field names converted to camelCase.
     """
     if isinstance(obj, dict):
-        return {to_camel_case(k): _convert_keys(v) for k, v in sorted(obj.items())}
+        converted: dict[str, Any] = {}
+        for key, value in sorted(obj.items()):
+            if not isinstance(key, str):  # defensive runtime check
+                msg = f"JSON object keys must be strings, got {type(key).__name__}"  # type: ignore[unreachable]
+                raise TypeError(msg)
+
+            out_key = to_camel_case(key) if convert_keys else key
+            if out_key in converted:
+                msg = (
+                    "Key collision during camelCase conversion: "
+                    f"{key!r} -> {out_key!r} conflicts with an existing key. "
+                    "This usually indicates mixed casing or invalid input."
+                )
+                raise ValueError(msg)
+
+            next_convert_keys = convert_keys and key not in _MAP_FIELD_NAMES
+            converted[out_key] = _convert_keys(value, convert_keys=next_convert_keys)
+        return converted
     if isinstance(obj, list):
-        return [_convert_keys(item) for item in obj]
+        return [_convert_keys(item, convert_keys=convert_keys) for item in obj]
     return obj
 
 

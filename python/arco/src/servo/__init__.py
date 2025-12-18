@@ -3,10 +3,11 @@
 A Pythonic interface for defining data assets and orchestrating pipelines.
 
 Example:
-    >>> from servo import AssetContext, asset
-    >>> from servo.types import AssetIn, AssetOut, DailyPartition
+    >>> from servo import asset, AssetIn, AssetOut, AssetContext
+    >>> from servo.types import DailyPartition
     >>>
     >>> @asset(
+    ...     namespace="staging",
     ...     description="Daily user metrics",
     ...     partitions=DailyPartition("date"),
     ... )
@@ -19,9 +20,60 @@ Example:
 """
 from __future__ import annotations
 
+from servo.asset import RegisteredAsset, asset
+from servo.context import AssetContext
+from servo.types import (
+    AssetDefinition,
+    AssetDependency,
+    AssetId,
+    AssetIn,
+    AssetKey,
+    AssetOut,
+    Check,
+    CheckPhase,
+    CheckSeverity,
+    DailyPartition,
+    DependencyMapping,
+    ExecutionPolicy,
+    HourlyPartition,
+    MaterializationId,
+    PartitionKey,
+    PartitionStrategy,
+    ResourceRequirements,
+    RunId,
+    TaskId,
+    not_null,
+    row_count,
+    unique,
+)
+
 __version__ = "0.1.0-alpha"
 
-from servo.asset import asset
-from servo.context import AssetContext
-
-__all__ = ["AssetContext", "__version__", "asset"]
+__all__ = [
+    "AssetContext",
+    "AssetDefinition",
+    "AssetDependency",
+    "AssetId",
+    "AssetIn",
+    "AssetKey",
+    "AssetOut",
+    "Check",
+    "CheckPhase",
+    "CheckSeverity",
+    "DailyPartition",
+    "DependencyMapping",
+    "ExecutionPolicy",
+    "HourlyPartition",
+    "MaterializationId",
+    "PartitionKey",
+    "PartitionStrategy",
+    "RegisteredAsset",
+    "ResourceRequirements",
+    "RunId",
+    "TaskId",
+    "__version__",
+    "asset",
+    "not_null",
+    "row_count",
+    "unique",
+]

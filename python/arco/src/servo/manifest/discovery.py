@@ -8,14 +8,14 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import structlog
 
-from servo._internal.registry import clear_registry, get_registry
-
-if TYPE_CHECKING:
-    from servo.asset import RegisteredAsset
+from servo._internal.registry import (
+    RegisteredAssetProtocol,
+    clear_registry,
+    get_registry,
+)
 
 logger = structlog.get_logger()
 
@@ -55,7 +55,7 @@ class AssetDiscovery:
         """
         self.root_path = root_path or Path.cwd()
 
-    def discover(self, *, clear: bool = True) -> list[RegisteredAsset]:
+    def discover(self, *, clear: bool = True) -> list[RegisteredAssetProtocol]:
         """Discover all assets in the project.
 
         This method:

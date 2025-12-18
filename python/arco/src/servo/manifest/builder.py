@@ -4,13 +4,12 @@ from __future__ import annotations
 import os
 import subprocess
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from pathlib import Path
 
+from servo._internal.registry import RegisteredAssetProtocol  # noqa: TC001
+from servo.manifest.lockfile import Lockfile
 from servo.manifest.model import AssetEntry, AssetManifest, GitContext
 from servo.types.ids import MaterializationId
-
-if TYPE_CHECKING:
-    from servo.asset import RegisteredAsset
 
 
 def _run_git_command(args: list[str]) -> str:
@@ -110,6 +109,8 @@ class ManifestBuilder:
         *,
         deployed_by: str | None = None,
         include_git: bool = True,
+        lockfile_path: str | Path | None = ".servo/state.json",
+        write_lockfile: bool = True,
     ) -> None:
         """Initialize the manifest builder.
 
@@ -118,13 +119,17 @@ class ManifestBuilder:
             workspace_id: Workspace identifier.
             deployed_by: User or system deploying (defaults to environment user).
             include_git: Whether to include Git context.
+            lockfile_path: Path to `.servo/state.json` for stable AssetIds; pass None to disable.
+            write_lockfile: Whether to persist newly assigned IDs to the lockfile.
         """
         self.tenant_id = tenant_id
         self.workspace_id = workspace_id
         self.deployed_by = deployed_by or os.environ.get("USER", "unknown")
         self.include_git = include_git
+        self.lockfile_path = Path(lockfile_path) if lockfile_path is not None else None
+        self.write_lockfile = write_lockfile
 
-    def build(self, assets: list[RegisteredAsset]) -> AssetManifest:
+    def build(self, assets: list[RegisteredAssetProtocol]) -> AssetManifest:
         """Build a manifest from discovered assets.
 
         Args:
@@ -133,11 +138,25 @@ class ManifestBuilder:
         Returns:
             Complete AssetManifest ready for deployment.
         """
-        # Convert assets to entries
-        asset_entries = [
-            AssetEntry.from_definition(asset.definition)
-            for asset in sorted(assets, key=lambda a: str(a.key))
-        ]
+        lockfile = (
+            Lockfile.load(self.lockfile_path)
+            if self.lockfile_path is not None
+            else None
+        )
+        lockfile_dirty = False
+
+        # Convert assets to entries (stable order by key).
+        asset_entries: list[AssetEntry] = []
+        for asset in sorted(assets, key=lambda a: str(a.key)):
+            entry = AssetEntry.from_definition(asset.definition)
+
+            # Ensure stable deploy identity by assigning AssetIds via lockfile.
+            if lockfile is not None:
+                asset_id, created = lockfile.get_or_create(asset.key)
+                entry.id = str(asset_id)
+                lockfile_dirty = lockfile_dirty or created
+
+            asset_entries.append(entry)
 
         # Extract Git context if enabled
         git_context = extract_git_context() if self.include_git else GitContext()
@@ -145,7 +164,7 @@ class ManifestBuilder:
         # Generate code version ID (ULID)
         code_version_id = str(MaterializationId.generate())
 
-        return AssetManifest(
+        manifest = AssetManifest(
             manifest_version="1.0",
             tenant_id=self.tenant_id,
             workspace_id=self.workspace_id,
@@ -155,3 +174,14 @@ class ManifestBuilder:
             deployed_at=datetime.now(UTC),
             deployed_by=self.deployed_by,
         )
+
+        # Persist lockfile updates if configured.
+        if (
+            lockfile is not None
+            and self.lockfile_path is not None
+            and self.write_lockfile
+            and lockfile_dirty
+        ):
+            lockfile.save(self.lockfile_path)
+
+        return manifest

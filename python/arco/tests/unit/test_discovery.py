@@ -1,14 +1,8 @@
 """Tests for asset discovery."""
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path  # noqa: TC003 - used at runtime
 from textwrap import dedent
-from typing import TYPE_CHECKING
-
-import pytest
-
-if TYPE_CHECKING:
-    pass
 
 
 class TestAssetDiscovery:

@@ -103,6 +103,27 @@ class TestSerializeToManifestJson:
 
         assert "itemName" in parsed["items"][0]
 
+    def test_map_keys_preserved_for_tags(self) -> None:
+        """Map keys (e.g., tags) are not camelCased."""
+        from servo.manifest.serialization import serialize_to_manifest_json
+
+        data = {"tags": {"foo_bar": "x", "foo__bar": "y"}}
+        result = serialize_to_manifest_json(data)
+        parsed = json.loads(result)
+
+        # Map keys must be preserved exactly; conversion must not drop/merge keys.
+        assert parsed["tags"] == {"foo_bar": "x", "foo__bar": "y"}
+
+    def test_struct_keys_preserved_for_metadata(self) -> None:
+        """Struct-like metadata must preserve keys at all nesting levels."""
+        from servo.manifest.serialization import serialize_to_manifest_json
+
+        data = {"metadata": {"foo_bar": {"inner_key": 1}}}
+        result = serialize_to_manifest_json(data)
+        parsed = json.loads(result)
+
+        assert parsed["metadata"]["foo_bar"]["inner_key"] == 1
+
     def test_deterministic_output(self) -> None:
         """Same input produces identical output every time."""
         from servo.manifest.serialization import serialize_to_manifest_json

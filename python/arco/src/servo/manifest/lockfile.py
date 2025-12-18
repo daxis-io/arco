@@ -3,7 +3,7 @@
 The lockfile (.servo/state.json) maps AssetKey -> AssetId persistently.
 This ensures:
 - Same asset keeps same ID across deploys
-- IDs survive renames (key can change, ID stays)
+- Renames require migrating the mapping (e.g., server reconciliation or manual update)
 - Deploy is idempotent (no random ID generation per import)
 """
 from __future__ import annotations

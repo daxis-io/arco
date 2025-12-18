@@ -1,6 +1,7 @@
 """Deploy command implementation."""
 from __future__ import annotations
 
+from collections.abc import Sequence  # noqa: TC003 - used at runtime
 from pathlib import Path
 
 from rich.console import Console
@@ -83,7 +84,7 @@ def run_deploy(
         )
 
 
-def _print_summary(manifest: object, assets: list[object]) -> None:
+def _print_summary(manifest: object, assets: Sequence[object]) -> None:
     """Print manifest summary.
 
     Args:

@@ -9,6 +9,7 @@ use arco_flow::events::{EventBuilder, EventEnvelope};
 use arco_flow::plan::{AssetKey, Plan, PlanBuilder, ResourceRequirements, TaskSpec};
 use arco_flow::run::{Run, RunState};
 use arco_flow::task::TaskState;
+use arco_flow::task_key::TaskOperation;
 
 use crate::storage::TracingMemoryBackend;
 
@@ -72,6 +73,7 @@ impl PlanFactory {
                 task_id: task_a,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 priority: 0,
@@ -82,6 +84,7 @@ impl PlanFactory {
                 task_id: task_b,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("staging", "events_cleaned"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_a],
                 priority: 0,
@@ -92,6 +95,7 @@ impl PlanFactory {
                 task_id: task_c,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("mart", "daily_summary"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_b],
                 priority: 0,
@@ -117,6 +121,7 @@ impl PlanFactory {
                 task_id: task_a,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "source"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 priority: 0,
@@ -127,6 +132,7 @@ impl PlanFactory {
                 task_id: task_b,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("staging", "branch_a"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_a],
                 priority: 0,
@@ -137,6 +143,7 @@ impl PlanFactory {
                 task_id: task_c,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("staging", "branch_b"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_a],
                 priority: 0,
@@ -147,6 +154,7 @@ impl PlanFactory {
                 task_id: task_d,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("mart", "combined"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_b, task_c],
                 priority: 0,
@@ -167,6 +175,7 @@ impl PlanFactory {
                 task_id: TaskId::generate(),
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", format!("task_{i}")),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 priority: i32::try_from(i).unwrap_or(0),

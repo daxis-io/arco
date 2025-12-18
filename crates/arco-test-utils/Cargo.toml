@@ -11,11 +11,15 @@ arco-catalog = { path = "../arco-catalog" }
 arco-flow = { path = "../arco-flow" }
 
 tokio = { workspace = true, features = ["full", "test-util"] }
+axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+base64 = { workspace = true }
+hmac = "0.12"
+sha2 = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }

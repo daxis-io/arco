@@ -9,6 +9,7 @@ use arco_core::{AssetId, RunId, TaskId};
 use arco_flow::events::EventBuilder;
 use arco_flow::plan::PlanBuilder;
 use arco_flow::task::TaskState;
+use arco_flow::task_key::TaskOperation;
 use arco_test_utils::{PlanFactory, TestContext};
 
 /// Contract: Plan fingerprint is deterministic.
@@ -25,6 +26,7 @@ fn contract_plan_fingerprint_is_deterministic() {
             task_id: task_a,
             asset_id: asset_a,
             asset_key: arco_flow::plan::AssetKey::new("raw", "events"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![],
             priority: 0,
@@ -39,6 +41,7 @@ fn contract_plan_fingerprint_is_deterministic() {
             task_id: task_a,
             asset_id: asset_a,
             asset_key: arco_flow::plan::AssetKey::new("raw", "events"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![],
             priority: 0,

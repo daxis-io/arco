@@ -31,10 +31,12 @@
 
 pub mod assertions;
 pub mod fixtures;
+pub mod http_signed_url;
 pub mod storage;
 
 pub use assertions::*;
 pub use fixtures::*;
+pub use http_signed_url::*;
 pub use storage::*;
 
 /// Initialize test logging (call once per test module).

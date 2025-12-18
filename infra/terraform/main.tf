@@ -1,6 +1,26 @@
 # Arco Infrastructure - GCP
 #
-# This is a starter template. Customize for your environment.
+# Terraform configuration for deploying Arco to Google Cloud Platform.
+#
+# ## Architecture
+#
+# - Storage: GCS bucket for catalog metadata (ledger + snapshots)
+# - Compute: Cloud Run services for API and Compactor
+# - IAM: Least-privilege service accounts per service
+# - Security: Secret Manager for JWT secrets
+#
+# ## Deployment Order
+#
+# CRITICAL: Compactor must be healthy before API accepts traffic.
+# Use the deploy script (scripts/deploy.sh) to ensure proper ordering.
+#
+# ## Usage
+#
+# ```bash
+# terraform init
+# terraform plan -var-file=environments/prod.tfvars
+# terraform apply -var-file=environments/prod.tfvars
+# ```
 
 terraform {
   required_version = ">= 1.5"
@@ -11,31 +31,38 @@ terraform {
       version = "~> 5.0"
     }
   }
+
+  # Uncomment and configure for remote state
+  # backend "gcs" {
+  #   bucket = "your-terraform-state-bucket"
+  #   prefix = "arco"
+  # }
 }
 
-variable "project_id" {
-  description = "GCP project ID"
-  type        = string
+provider "google" {
+  project = var.project_id
+  region  = var.region
 }
 
-variable "region" {
-  description = "GCP region"
-  type        = string
-  default     = "us-central1"
-}
+# ============================================================================
+# Storage
+# ============================================================================
 
 # Storage bucket for catalog metadata
 resource "google_storage_bucket" "catalog" {
-  name     = "${var.project_id}-arco-catalog"
+  name     = "${var.project_id}-arco-catalog-${var.environment}"
   location = var.region
   project  = var.project_id
 
+  # Uniform access control (recommended for security)
   uniform_bucket_level_access = true
 
+  # Enable versioning for data protection
   versioning {
     enabled = true
   }
 
+  # Lifecycle rules for cost optimization
   lifecycle_rule {
     condition {
       age = 30
@@ -45,8 +72,64 @@ resource "google_storage_bucket" "catalog" {
       storage_class = "NEARLINE"
     }
   }
+
+  # Delete old versions after 90 days
+  lifecycle_rule {
+    condition {
+      age                = 90
+      with_state         = "ARCHIVED"
+      num_newer_versions = 3
+    }
+    action {
+      type = "Delete"
+    }
+  }
+
+  # Prevent accidental deletion in production
+  force_destroy = var.environment != "prod"
+
+  labels = {
+    environment = var.environment
+    service     = "arco"
+    component   = "catalog"
+  }
 }
 
+# ============================================================================
+# Secret Manager (optional - for JWT secrets)
+# ============================================================================
+
+# Create secret placeholder (actual value set manually or via CI/CD)
+resource "google_secret_manager_secret" "jwt_secret" {
+  count     = var.jwt_secret_name != "" ? 1 : 0
+  project   = var.project_id
+  secret_id = var.jwt_secret_name
+
+  replication {
+    auto {}
+  }
+
+  labels = {
+    environment = var.environment
+    service     = "arco"
+  }
+}
+
+# ============================================================================
+# Outputs
+# ============================================================================
+
 output "catalog_bucket" {
-  value = google_storage_bucket.catalog.name
+  description = "Name of the catalog storage bucket"
+  value       = google_storage_bucket.catalog.name
+}
+
+output "environment" {
+  description = "Deployed environment"
+  value       = var.environment
+}
+
+output "region" {
+  description = "Deployed region"
+  value       = var.region
 }

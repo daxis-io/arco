@@ -1,0 +1,36 @@
+# Arco Development Environment Configuration
+#
+# Copy to dev.tfvars and customize for your environment.
+# Usage: terraform apply -var-file=environments/dev.tfvars
+
+project_id  = "your-gcp-project-id"
+region      = "us-central1"
+environment = "dev"
+
+# Container images (update with your registry)
+api_image       = "gcr.io/your-project/arco-api:latest"
+compactor_image = "gcr.io/your-project/arco-compactor:latest"
+
+# Cloud Run scaling (dev: scale to zero)
+api_min_instances       = 0
+api_max_instances       = 2
+compactor_min_instances = 0
+compactor_max_instances = 1
+
+# Resource limits (dev: smaller)
+api_cpu        = "1"
+api_memory     = "512Mi"
+compactor_cpu  = "1"
+compactor_memory = "512Mi"
+
+# Security (dev: relaxed)
+api_public           = true
+allowed_cors_origins = "*"
+
+# JWT (dev: simple HS256 secret, or leave empty for header-based auth)
+jwt_secret_name = ""
+jwt_issuer      = ""
+jwt_audience    = ""
+
+# Networking (dev: no VPC connector)
+vpc_connector_name = ""

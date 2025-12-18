@@ -31,9 +31,13 @@ arco-proto = { path = "../arco-proto" }
 # Async runtime
 tokio = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
 
 # HTTP
 axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+governor = { workspace = true }
 
 # gRPC
 tonic = { workspace = true }
@@ -42,13 +46,35 @@ tonic = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# IDs
+ulid = { workspace = true }
+
+# Hashing/encoding
+base64 = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
 # Error handling
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+
+# Auth
+jsonwebtoken = "9"
+
+# OpenAPI
+utoipa = { version = "5.4.0", features = ["axum_extras"] }
 
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# Metrics
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+
 [dev-dependencies]
+arco-test-utils = { path = "../arco-test-utils" }
+duckdb = { version = "1.4.3", features = ["parquet"] }
+tempfile = { workspace = true }
 tokio-test = { workspace = true }

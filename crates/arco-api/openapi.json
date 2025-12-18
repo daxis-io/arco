@@ -1,0 +1,1392 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Arco API",
+    "description": "Arco catalog REST API (M4/M5)",
+    "contact": {
+      "name": "Daxis",
+      "email": "engineering@daxis.io"
+    },
+    "license": {
+      "name": "Apache-2.0 OR MIT",
+      "identifier": "Apache-2.0 OR MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/v1/browser/urls": {
+      "post": {
+        "tags": [
+          "browser"
+        ],
+        "summary": "Mint signed URLs for browser-based reads.",
+        "description": "POST /api/v1/browser/urls\n\n## Security\n\n- Only paths in the current manifest's `SnapshotInfo.files` are mintable\n- Ledger and manifest paths are rejected\n- Cross-tenant paths are rejected (tenant scoping)\n- Path traversal attempts are rejected\n- TTL is bounded to maximum 1 hour",
+        "operationId": "mint_urls",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MintUrlsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Signed URLs minted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MintUrlsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/lineage/edges": {
+      "post": {
+        "tags": [
+          "lineage"
+        ],
+        "summary": "Add lineage edge(s).",
+        "description": "POST /api/v1/lineage/edges",
+        "operationId": "add_edges",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddEdgesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Edges added",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AddEdgesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/lineage/{table_id}": {
+      "get": {
+        "tags": [
+          "lineage"
+        ],
+        "summary": "Get lineage for a table.",
+        "description": "`GET /api/v1/lineage/{table_id}`",
+        "operationId": "get_lineage",
+        "parameters": [
+          {
+            "name": "table_id",
+            "in": "path",
+            "description": "Table ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Lineage graph",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LineageResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/namespaces": {
+      "get": {
+        "tags": [
+          "namespaces"
+        ],
+        "summary": "List all namespaces.",
+        "description": "GET /api/v1/namespaces",
+        "operationId": "list_namespaces",
+        "responses": {
+          "200": {
+            "description": "Namespaces listed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListNamespacesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "namespaces"
+        ],
+        "summary": "Create a namespace.",
+        "description": "POST /api/v1/namespaces",
+        "operationId": "create_namespace",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateNamespaceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Namespace created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamespaceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/namespaces/{namespace}/tables": {
+      "get": {
+        "tags": [
+          "tables"
+        ],
+        "summary": "List tables in a namespace.",
+        "description": "GET /api/v1/namespaces/{namespace}/tables",
+        "operationId": "list_tables",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tables listed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListTablesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Namespace not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "tables"
+        ],
+        "summary": "Register a table.",
+        "description": "POST /api/v1/namespaces/{namespace}/tables",
+        "operationId": "register_table",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterTableRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Table registered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TableResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Namespace not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/namespaces/{namespace}/tables/{name}": {
+      "get": {
+        "tags": [
+          "tables"
+        ],
+        "summary": "Get a table by name.",
+        "description": "GET /api/v1/namespaces/{namespace}/tables/{name}",
+        "operationId": "get_table",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Table name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Table found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TableResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "tables"
+        ],
+        "summary": "Update a table.",
+        "description": "PUT /api/v1/namespaces/{namespace}/tables/{name}",
+        "operationId": "update_table",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Table name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTableRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Table updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TableResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "tables"
+        ],
+        "summary": "Drop a table.",
+        "description": "DELETE /api/v1/namespaces/{namespace}/tables/{name}",
+        "operationId": "drop_table",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "Namespace name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Table name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Table dropped"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/namespaces/{name}": {
+      "get": {
+        "tags": [
+          "namespaces"
+        ],
+        "summary": "Get a namespace by name.",
+        "description": "GET /api/v1/namespaces/{name}",
+        "operationId": "get_namespace",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Namespace name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Namespace found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamespaceResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "namespaces"
+        ],
+        "summary": "Delete a namespace.",
+        "description": "DELETE /api/v1/namespaces/{name}",
+        "operationId": "delete_namespace",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Namespace name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Namespace deleted"
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AddEdgesRequest": {
+        "type": "object",
+        "description": "Request to add lineage edge(s).",
+        "required": [
+          "edges"
+        ],
+        "properties": {
+          "edges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EdgeDefinition"
+            },
+            "description": "List of edges to add."
+          }
+        }
+      },
+      "AddEdgesResponse": {
+        "type": "object",
+        "description": "Add edges response.",
+        "required": [
+          "added"
+        ],
+        "properties": {
+          "added": {
+            "type": "integer",
+            "description": "Number of edges added.",
+            "minimum": 0
+          }
+        }
+      },
+      "ApiErrorBody": {
+        "type": "object",
+        "description": "Standard JSON error response body.",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable machine-readable error code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable message (safe for clients)."
+          },
+          "requestId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional request ID for correlation."
+          }
+        }
+      },
+      "ColumnDefinition": {
+        "type": "object",
+        "description": "Column definition for table registration.",
+        "required": [
+          "name",
+          "data_type"
+        ],
+        "properties": {
+          "data_type": {
+            "type": "string",
+            "description": "Column data type."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description."
+          },
+          "name": {
+            "type": "string",
+            "description": "Column name."
+          },
+          "nullable": {
+            "type": "boolean",
+            "description": "Whether the column is nullable."
+          }
+        }
+      },
+      "ColumnResponse": {
+        "type": "object",
+        "description": "Column response.",
+        "required": [
+          "id",
+          "name",
+          "data_type",
+          "nullable",
+          "position"
+        ],
+        "properties": {
+          "data_type": {
+            "type": "string",
+            "description": "Column data type."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description."
+          },
+          "id": {
+            "type": "string",
+            "description": "Column ID."
+          },
+          "name": {
+            "type": "string",
+            "description": "Column name."
+          },
+          "nullable": {
+            "type": "boolean",
+            "description": "Whether the column is nullable."
+          },
+          "position": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Column position (0-indexed)."
+          }
+        }
+      },
+      "CreateNamespaceRequest": {
+        "type": "object",
+        "description": "Request to create a namespace.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description."
+          },
+          "name": {
+            "type": "string",
+            "description": "Namespace name (must be unique within workspace)."
+          }
+        }
+      },
+      "EdgeDefinition": {
+        "type": "object",
+        "description": "Edge definition for lineage.",
+        "required": [
+          "source_id",
+          "target_id"
+        ],
+        "properties": {
+          "edge_type": {
+            "type": "string",
+            "description": "Edge type (e.g., `derives_from`, `copies`, `transforms`)."
+          },
+          "run_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional run ID that created this edge."
+          },
+          "source_id": {
+            "type": "string",
+            "description": "Source table ID (upstream)."
+          },
+          "target_id": {
+            "type": "string",
+            "description": "Target table ID (downstream)."
+          }
+        }
+      },
+      "EdgeResponse": {
+        "type": "object",
+        "description": "Lineage edge response.",
+        "required": [
+          "id",
+          "source_id",
+          "target_id",
+          "edge_type",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "Creation timestamp (ISO 8601)."
+          },
+          "edge_type": {
+            "type": "string",
+            "description": "Edge type."
+          },
+          "id": {
+            "type": "string",
+            "description": "Edge ID."
+          },
+          "run_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional run ID."
+          },
+          "source_id": {
+            "type": "string",
+            "description": "Source table ID."
+          },
+          "target_id": {
+            "type": "string",
+            "description": "Target table ID."
+          }
+        }
+      },
+      "LineageResponse": {
+        "type": "object",
+        "description": "Get lineage response.",
+        "required": [
+          "table_id",
+          "upstream",
+          "downstream"
+        ],
+        "properties": {
+          "downstream": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EdgeResponse"
+            },
+            "description": "Downstream edges (tables that depend on this table)."
+          },
+          "table_id": {
+            "type": "string",
+            "description": "Table ID queried."
+          },
+          "upstream": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EdgeResponse"
+            },
+            "description": "Upstream edges (sources that feed into this table)."
+          }
+        }
+      },
+      "ListNamespacesResponse": {
+        "type": "object",
+        "description": "List namespaces response.",
+        "required": [
+          "namespaces"
+        ],
+        "properties": {
+          "namespaces": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NamespaceResponse"
+            },
+            "description": "List of namespaces."
+          }
+        }
+      },
+      "ListTablesResponse": {
+        "type": "object",
+        "description": "List tables response.",
+        "required": [
+          "tables"
+        ],
+        "properties": {
+          "tables": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TableResponse"
+            },
+            "description": "List of tables."
+          }
+        }
+      },
+      "MintUrlsRequest": {
+        "type": "object",
+        "description": "Request to mint signed URLs.",
+        "required": [
+          "domain",
+          "paths"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string",
+            "description": "Catalog domain (e.g., \"catalog\", \"lineage\")."
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Paths to mint URLs for (must be in manifest allowlist)."
+          },
+          "ttl_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Optional TTL in seconds (max 3600, default 900).",
+            "minimum": 0
+          }
+        }
+      },
+      "MintUrlsResponse": {
+        "type": "object",
+        "description": "Response with signed URLs.",
+        "required": [
+          "urls",
+          "ttl_seconds"
+        ],
+        "properties": {
+          "ttl_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "TTL used for all URLs.",
+            "minimum": 0
+          },
+          "urls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SignedUrl"
+            },
+            "description": "Signed URLs keyed by path."
+          }
+        }
+      },
+      "NamespaceResponse": {
+        "type": "object",
+        "description": "Namespace response.",
+        "required": [
+          "id",
+          "name",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "Creation timestamp (ISO 8601)."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description."
+          },
+          "id": {
+            "type": "string",
+            "description": "Namespace ID."
+          },
+          "name": {
+            "type": "string",
+            "description": "Namespace name."
+          },
+          "updated_at": {
+            "type": "string",
+            "description": "Last update timestamp (ISO 8601)."
+          }
+        }
+      },
+      "RegisterTableRequest": {
+        "type": "object",
+        "description": "Request to register a table.",
+        "required": [
+          "name",
+          "columns"
+        ],
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ColumnDefinition"
+            },
+            "description": "Table schema (columns)."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description."
+          },
+          "name": {
+            "type": "string",
+            "description": "Table name (must be unique within namespace)."
+          }
+        }
+      },
+      "SignedUrl": {
+        "type": "object",
+        "description": "A single signed URL.",
+        "required": [
+          "path",
+          "url"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Original path requested."
+          },
+          "url": {
+            "type": "string",
+            "description": "Signed URL (valid for TTL)."
+          }
+        }
+      },
+      "TableResponse": {
+        "type": "object",
+        "description": "Table response.",
+        "required": [
+          "id",
+          "namespace",
+          "name",
+          "columns",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ColumnResponse"
+            },
+            "description": "Table columns."
+          },
+          "created_at": {
+            "type": "string",
+            "description": "Creation timestamp (ISO 8601)."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description."
+          },
+          "id": {
+            "type": "string",
+            "description": "Table ID."
+          },
+          "name": {
+            "type": "string",
+            "description": "Table name."
+          },
+          "namespace": {
+            "type": "string",
+            "description": "Namespace name."
+          },
+          "updated_at": {
+            "type": "string",
+            "description": "Last update timestamp (ISO 8601)."
+          }
+        }
+      },
+      "UpdateTableRequest": {
+        "type": "object",
+        "description": "Request to update a table.",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional new description."
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "namespaces",
+      "description": "Namespace operations"
+    },
+    {
+      "name": "tables",
+      "description": "Table operations"
+    },
+    {
+      "name": "lineage",
+      "description": "Lineage operations"
+    },
+    {
+      "name": "browser",
+      "description": "Browser signed URL minting"
+    }
+  ]
+}

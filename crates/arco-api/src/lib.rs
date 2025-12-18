@@ -18,10 +18,12 @@
 //!
 //! ```text
 //! HTTP:
-//!   GET  /health           - Health check
-//!   GET  /api/v1/assets    - List assets
-//!   GET  /api/v1/runs      - List runs
-//!   POST /api/v1/runs      - Create a run
+//!   GET  /health                 - Health check
+//!   GET  /ready                  - Readiness check
+//!   /api/v1/namespaces           - Namespace CRUD
+//!   /api/v1/namespaces/{ns}/tables - Table CRUD
+//!   /api/v1/lineage              - Lineage edge APIs
+//!   /api/v1/browser/urls         - Signed URL minting for browser reads
 //!
 //! gRPC:
 //!   arco.v1.CatalogService - Catalog operations
@@ -31,12 +33,12 @@
 //! ## Example
 //!
 //! ```rust,ignore
-//! use arco_api::Server;
+//! use arco_api::server::Server;
 //!
 //! let server = Server::builder()
 //!     .http_port(8080)
 //!     .grpc_port(9090)
-//!     .build()?;
+//!     .build();
 //!
 //! server.serve().await?;
 //! ```
@@ -47,10 +49,19 @@
 #![warn(clippy::pedantic)]
 
 pub mod config;
+pub mod context;
+pub mod error;
+pub mod metrics;
+pub mod openapi;
+pub mod rate_limit;
+pub(crate) mod redaction;
+pub mod routes;
 pub mod server;
 
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::config::Config;
+    pub use crate::context::RequestContext;
+    pub use crate::error::{ApiError, ApiResult};
     pub use crate::server::Server;
 }

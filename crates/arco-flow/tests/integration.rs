@@ -11,6 +11,7 @@ use arco_flow::run::{RunState, RunTrigger};
 use arco_flow::runner::{NoOpRunner, RunContext, Runner};
 use arco_flow::scheduler::{RetryPolicy, Scheduler, SchedulerConfig};
 use arco_flow::task::{TaskError, TaskErrorCategory, TaskState};
+use arco_flow::task_key::TaskOperation;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -28,6 +29,7 @@ async fn full_orchestration_lifecycle() -> Result<()> {
             task_id: task_raw,
             asset_id: AssetId::generate(),
             asset_key: AssetKey::new("raw", "events"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![],
             stage: 0,
@@ -38,6 +40,7 @@ async fn full_orchestration_lifecycle() -> Result<()> {
             task_id: task_staging,
             asset_id: AssetId::generate(),
             asset_key: AssetKey::new("staging", "events_cleaned"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![task_raw],
             stage: 0,
@@ -48,6 +51,7 @@ async fn full_orchestration_lifecycle() -> Result<()> {
             task_id: task_mart,
             asset_id: AssetId::generate(),
             asset_key: AssetKey::new("mart", "daily_summary"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![task_staging],
             stage: 0,
@@ -192,6 +196,7 @@ async fn skip_downstream_on_failure() -> Result<()> {
             task_id: task_a,
             asset_id: AssetId::generate(),
             asset_key: AssetKey::new("raw", "a"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![],
             stage: 0,
@@ -202,6 +207,7 @@ async fn skip_downstream_on_failure() -> Result<()> {
             task_id: task_b,
             asset_id: AssetId::generate(),
             asset_key: AssetKey::new("staging", "b"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![task_a],
             stage: 0,
@@ -212,6 +218,7 @@ async fn skip_downstream_on_failure() -> Result<()> {
             task_id: task_c,
             asset_id: AssetId::generate(),
             asset_key: AssetKey::new("mart", "c"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![task_b],
             stage: 0,
@@ -291,6 +298,7 @@ async fn parallel_independent_tasks() -> Result<()> {
             task_id: task_a,
             asset_id: AssetId::generate(),
             asset_key: AssetKey::new("raw", "a"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![],
             stage: 0,
@@ -301,6 +309,7 @@ async fn parallel_independent_tasks() -> Result<()> {
             task_id: task_b,
             asset_id: AssetId::generate(),
             asset_key: AssetKey::new("raw", "b"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![],
             stage: 0,
@@ -311,6 +320,7 @@ async fn parallel_independent_tasks() -> Result<()> {
             task_id: task_c,
             asset_id: AssetId::generate(),
             asset_key: AssetKey::new("mart", "c"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![task_a, task_b],
             stage: 0,
@@ -344,6 +354,7 @@ fn plan_fingerprint_stability() -> Result<()> {
         task_id,
         asset_id,
         asset_key: AssetKey::new("raw", "events"),
+        operation: TaskOperation::Materialize,
         partition_key: None,
         upstream_task_ids: vec![],
         stage: 0,
@@ -404,6 +415,7 @@ async fn retryable_task_failure_retries_with_backoff() -> Result<()> {
             task_id,
             asset_id: AssetId::generate(),
             asset_key: AssetKey::new("raw", "events"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![],
             stage: 0,
@@ -512,6 +524,7 @@ async fn heartbeat_staleness_triggers_retry() -> Result<()> {
             task_id,
             asset_id: AssetId::generate(),
             asset_key: AssetKey::new("raw", "events"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![],
             stage: 0,

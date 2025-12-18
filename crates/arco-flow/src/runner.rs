@@ -116,6 +116,7 @@ mod tests {
     use super::*;
     use crate::plan::{AssetKey, ResourceRequirements, TaskSpec};
     use crate::task::TaskErrorCategory;
+    use crate::task_key::TaskOperation;
     use arco_core::{AssetId, MaterializationId, TaskId};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -154,6 +155,7 @@ mod tests {
             task_id: TaskId::generate(),
             asset_id: AssetId::generate(),
             asset_key: AssetKey::new("raw", "events"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![],
             stage: 0,
@@ -181,6 +183,7 @@ mod tests {
             task_id: TaskId::generate(),
             asset_id: AssetId::generate(),
             asset_key: AssetKey::new("raw", "events"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![],
             stage: 0,
@@ -207,6 +210,7 @@ mod tests {
             task_id: TaskId::generate(),
             asset_id: AssetId::generate(),
             asset_key: AssetKey::new("raw", "events"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![],
             stage: 0,

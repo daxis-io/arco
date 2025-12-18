@@ -21,6 +21,7 @@ use arco_core::{AssetId, TaskId};
 
 use crate::dag::Dag;
 use crate::error::{Error, Result};
+use crate::task_key::{TaskKey, TaskOperation};
 
 /// Production guardrail: hard cap on tasks per plan.
 const MAX_TASKS_PER_PLAN: usize = 10_000;
@@ -150,6 +151,9 @@ pub struct TaskSpec {
     pub asset_id: AssetId,
     /// Asset key (namespace.name).
     pub asset_key: AssetKey,
+    /// Operation type for this task (materialize/check/backfill).
+    #[serde(default)]
+    pub operation: TaskOperation,
     /// Typed partition key (if partitioned asset).
     /// Uses `arco_core::partition::PartitionKey` for cross-language determinism.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -301,105 +305,25 @@ impl PlanBuilder {
         )
     )]
     pub fn build(mut self) -> Result<Plan> {
-        if self.tasks.len() > MAX_TASKS_PER_PLAN {
-            return Err(Error::PlanTooLarge {
-                task_count: self.tasks.len(),
-                max_tasks: MAX_TASKS_PER_PLAN,
-            });
-        }
+        validate_task_limit(self.tasks.len())?;
 
-        // Collect all task IDs
-        let task_ids: HashSet<_> = self.tasks.iter().map(|t| t.task_id).collect();
+        let task_idx_by_id = index_tasks_by_id(&self.tasks)?;
+        let key_by_id = build_task_keys(&self.tasks)?;
+        validate_dependencies_exist(&self.tasks, &task_idx_by_id)?;
 
-        // Validate all dependencies exist
-        for task in &self.tasks {
-            for dep_id in &task.upstream_task_ids {
-                if !task_ids.contains(dep_id) {
-                    return Err(Error::DependencyNotFound {
-                        asset_key: format!("task {dep_id}"),
-                    });
-                }
-            }
-        }
+        let mut edges = build_edges(&self.tasks);
+        let sorted_ids = topo_sort_task_ids(&self.tasks, &key_by_id, &mut edges)?;
 
-        // Build DAG and check for cycles
-        // Use NodeIndex-based API for type safety
-        let mut dag: Dag<TaskId> = Dag::new();
-        let mut id_to_idx: HashMap<TaskId, NodeIndex> = HashMap::new();
-
-        for task in &self.tasks {
-            let idx = dag.add_node(task.task_id);
-            id_to_idx.insert(task.task_id, idx);
-        }
-        for task in &self.tasks {
-            let to_idx =
-                id_to_idx
-                    .get(&task.task_id)
-                    .copied()
-                    .ok_or_else(|| Error::DagNodeNotFound {
-                        node: task.task_id.to_string(),
-                    })?;
-            for dep_id in &task.upstream_task_ids {
-                let from_idx =
-                    id_to_idx
-                        .get(dep_id)
-                        .copied()
-                        .ok_or_else(|| Error::DagNodeNotFound {
-                            node: dep_id.to_string(),
-                        })?;
-                dag.add_edge(from_idx, to_idx)?;
-            }
-        }
-
-        // Topological sort to verify acyclicity and get execution order
-        let sorted_ids = dag.toposort()?;
-
-        // Compute stages: stage = max(upstream stages) + 1, roots have stage 0
-        let mut stages: HashMap<TaskId, u32> = HashMap::new();
-        for id in &sorted_ids {
-            let task = self
-                .tasks
-                .iter()
-                .find(|t| &t.task_id == id)
-                .ok_or_else(|| Error::TaskNotFound { task_id: *id })?;
-            let stage = if task.upstream_task_ids.is_empty() {
-                0
-            } else {
-                task.upstream_task_ids
-                    .iter()
-                    .filter_map(|dep| stages.get(dep))
-                    .max()
-                    .map_or(0, |max_stage| max_stage + 1)
-            };
-            stages.insert(*id, stage);
-        }
-
-        // Update tasks with computed stages
+        let stages = compute_stages(&self.tasks, &task_idx_by_id, &sorted_ids)?;
         for task in &mut self.tasks {
             task.stage = stages.get(&task.task_id).copied().unwrap_or(0);
         }
 
-        // Reorder tasks by topological order
-        let mut sorted_tasks = Vec::with_capacity(self.tasks.len());
-        for id in sorted_ids {
-            if let Some(task) = self.tasks.iter().find(|t| t.task_id == id) {
-                sorted_tasks.push(task.clone());
-            }
-        }
+        let sorted_tasks = tasks_in_order(&self.tasks, &task_idx_by_id, &sorted_ids)?;
+        let dependencies = edges_to_dependencies(edges);
 
-        // Build dependency edges
-        let dependencies: Vec<DependencyEdge> = sorted_tasks
-            .iter()
-            .flat_map(|task| {
-                task.upstream_task_ids.iter().map(|dep_id| DependencyEdge {
-                    source_task_id: *dep_id,
-                    target_task_id: task.task_id,
-                })
-            })
-            .collect();
-
-        // Compute fingerprint from canonical JSON of tasks
-        let fingerprint = compute_fingerprint(&sorted_tasks)?;
+        // Compute deterministic fingerprint (independent of insertion order).
+        let fingerprint = compute_fingerprint(&self.tenant_id, &self.workspace_id, &sorted_tasks)?;
 
         // Generate plan ID
         let plan_id = ulid::Ulid::new().to_string();
@@ -418,76 +342,299 @@ impl PlanBuilder {
     }
 }
 
-/// Structural representation of a task for fingerprinting.
+fn validate_task_limit(task_count: usize) -> Result<()> {
+    if task_count > MAX_TASKS_PER_PLAN {
+        return Err(Error::PlanTooLarge {
+            task_count,
+            max_tasks: MAX_TASKS_PER_PLAN,
+        });
+    }
+    Ok(())
+}
+
+fn index_tasks_by_id(tasks: &[TaskSpec]) -> Result<HashMap<TaskId, usize>> {
+    let mut task_idx_by_id: HashMap<TaskId, usize> = HashMap::with_capacity(tasks.len());
+    for (idx, task) in tasks.iter().enumerate() {
+        if task_idx_by_id.insert(task.task_id, idx).is_some() {
+            return Err(Error::PlanGenerationFailed {
+                message: format!("duplicate task_id in plan builder: {}", task.task_id),
+            });
+        }
+    }
+    Ok(task_idx_by_id)
+}
+
+fn build_task_keys(tasks: &[TaskSpec]) -> Result<HashMap<TaskId, String>> {
+    let mut key_by_id: HashMap<TaskId, String> = HashMap::with_capacity(tasks.len());
+    let mut seen_keys: HashSet<String> = HashSet::with_capacity(tasks.len());
+
+    for task in tasks {
+        let key = TaskKey {
+            asset_key: task.asset_key.clone(),
+            partition_key: task.partition_key.clone(),
+            operation: task.operation,
+        }
+        .canonical_string();
+
+        if !seen_keys.insert(key.clone()) {
+            return Err(Error::PlanGenerationFailed {
+                message: format!("duplicate TaskKey in plan builder: {key}"),
+            });
+        }
+
+        key_by_id.insert(task.task_id, key);
+    }
+
+    Ok(key_by_id)
+}
+
+fn validate_dependencies_exist(
+    tasks: &[TaskSpec],
+    task_idx_by_id: &HashMap<TaskId, usize>,
+) -> Result<()> {
+    for task in tasks {
+        for dep_id in &task.upstream_task_ids {
+            if !task_idx_by_id.contains_key(dep_id) {
+                return Err(Error::DependencyNotFound {
+                    asset_key: format!("task {dep_id}"),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_edges(tasks: &[TaskSpec]) -> Vec<(TaskId, TaskId)> {
+    tasks
+        .iter()
+        .flat_map(|task| {
+            task.upstream_task_ids
+                .iter()
+                .copied()
+                .map(move |dep_id| (dep_id, task.task_id))
+        })
+        .collect()
+}
+
+fn topo_sort_task_ids(
+    tasks: &[TaskSpec],
+    key_by_id: &HashMap<TaskId, String>,
+    edges: &mut Vec<(TaskId, TaskId)>,
+) -> Result<Vec<TaskId>> {
+    let mut dag: Dag<TaskId> = Dag::new();
+    let mut id_to_idx: HashMap<TaskId, NodeIndex> = HashMap::with_capacity(tasks.len());
+
+    let mut node_ids: Vec<TaskId> = tasks.iter().map(|t| t.task_id).collect();
+    node_ids.sort_by(|a, b| {
+        key_by_id
+            .get(a)
+            .cmp(&key_by_id.get(b))
+            .then_with(|| a.cmp(b))
+    });
+
+    for id in &node_ids {
+        let idx = dag.add_node(*id);
+        id_to_idx.insert(*id, idx);
+    }
+
+    edges.sort_by(|(from_a, to_a), (from_b, to_b)| {
+        key_by_id
+            .get(from_a)
+            .cmp(&key_by_id.get(from_b))
+            .then_with(|| key_by_id.get(to_a).cmp(&key_by_id.get(to_b)))
+            .then_with(|| from_a.cmp(from_b))
+            .then_with(|| to_a.cmp(to_b))
+    });
+
+    for (from_id, to_id) in &*edges {
+        let from_idx = id_to_idx
+            .get(from_id)
+            .copied()
+            .ok_or_else(|| Error::DagNodeNotFound {
+                node: from_id.to_string(),
+            })?;
+        let to_idx = id_to_idx
+            .get(to_id)
+            .copied()
+            .ok_or_else(|| Error::DagNodeNotFound {
+                node: to_id.to_string(),
+            })?;
+        dag.add_edge(from_idx, to_idx)?;
+    }
+
+    dag.toposort_by_key(|id| key_by_id.get(id).cloned().unwrap_or_else(|| id.to_string()))
+}
+
+fn compute_stages(
+    tasks: &[TaskSpec],
+    task_idx_by_id: &HashMap<TaskId, usize>,
+    sorted_ids: &[TaskId],
+) -> Result<HashMap<TaskId, u32>> {
+    let mut stages: HashMap<TaskId, u32> = HashMap::with_capacity(tasks.len());
+
+    for id in sorted_ids {
+        let task_idx = task_idx_by_id
+            .get(id)
+            .copied()
+            .ok_or_else(|| Error::TaskNotFound { task_id: *id })?;
+
+        let task = tasks
+            .get(task_idx)
+            .ok_or_else(|| Error::TaskNotFound { task_id: *id })?;
+
+        let stage = if task.upstream_task_ids.is_empty() {
+            0
+        } else {
+            task.upstream_task_ids
+                .iter()
+                .filter_map(|dep| stages.get(dep))
+                .max()
+                .map_or(0, |max_stage| max_stage + 1)
+        };
+        stages.insert(*id, stage);
+    }
+
+    Ok(stages)
+}
+
+fn tasks_in_order(
+    tasks: &[TaskSpec],
+    task_idx_by_id: &HashMap<TaskId, usize>,
+    sorted_ids: &[TaskId],
+) -> Result<Vec<TaskSpec>> {
+    let mut sorted_tasks = Vec::with_capacity(tasks.len());
+    for id in sorted_ids {
+        let task_idx = task_idx_by_id
+            .get(id)
+            .copied()
+            .ok_or_else(|| Error::TaskNotFound { task_id: *id })?;
+
+        let task = tasks
+            .get(task_idx)
+            .ok_or_else(|| Error::TaskNotFound { task_id: *id })?;
+        sorted_tasks.push(task.clone());
+    }
+    Ok(sorted_tasks)
+}
+
+fn edges_to_dependencies(edges: Vec<(TaskId, TaskId)>) -> Vec<DependencyEdge> {
+    edges
+        .into_iter()
+        .map(|(source_task_id, target_task_id)| DependencyEdge {
+            source_task_id,
+            target_task_id,
+        })
+        .collect()
+}
+
+/// Version of the plan fingerprint preimage format.
 ///
-/// This excludes nondeterministic IDs (`task_id`, `asset_id`) and uses
-/// `asset_key` for dependency references, ensuring the fingerprint is
-/// stable across plan regenerations with the same structure.
+/// Increment when intentionally changing fingerprint semantics.
+const PLAN_FINGERPRINT_VERSION: u32 = 1;
+
+/// Normalized plan spec for fingerprinting.
+///
+/// Contains only deterministic, semantic content:
+/// - Tenant/workspace scope
+/// - Task semantic keys + dependencies
+/// - Priority + resources
+///
+/// Excludes nondeterministic IDs (`task_id`, `asset_id`) and derived fields (`stage`).
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct StructuralTaskSpec {
-    asset_key: AssetKey,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    partition_key: Option<PartitionKey>,
-    upstream_asset_keys: Vec<String>,
-    stage: u32,
+struct FingerprintPlanSpec {
+    version: u32,
+    tenant_id: String,
+    workspace_id: String,
+    tasks: Vec<FingerprintTaskSpec>,
+}
+
+/// Normalized task spec for fingerprinting.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FingerprintTaskSpec {
+    /// Canonical semantic key (asset + partition + operation).
+    key: String,
+    /// Canonical upstream keys (sorted).
+    upstream_keys: Vec<String>,
+    /// Execution priority.
     priority: i32,
+    /// Resource requirements (integer-only).
     resources: ResourceRequirements,
 }
 
-/// Computes SHA-256 fingerprint of the plan spec using structural properties only.
+/// Computes SHA-256 fingerprint of the plan spec using semantic properties only.
 ///
-/// The fingerprint excludes nondeterministic IDs (`task_id`, `asset_id`) and uses
-/// `asset_key.canonical_string()` (using `/` separator per ADR-011) for dependency
-/// references. This ensures the same logical plan produces the same fingerprint
-/// regardless of generated IDs.
-///
-/// Uses canonical JSON serialization for cross-language determinism (ADR-010).
-fn compute_fingerprint(tasks: &[TaskSpec]) -> Result<String> {
-    // Build task_id -> canonical asset key mapping for dependency resolution
-    // Uses canonical_string() with `/` separator per ADR-011
+/// Deterministic invariants:
+/// - Independent of task insertion order
+/// - Independent of generated IDs (`task_id`, `asset_id`)
+/// - Uses semantic `TaskKey` (asset + partition + operation) for dependency references
+/// - Uses canonical JSON serialization (ADR-010)
+fn compute_fingerprint(tenant_id: &str, workspace_id: &str, tasks: &[TaskSpec]) -> Result<String> {
+    // Build task_id -> semantic TaskKey mapping for dependency resolution.
     let id_to_key: HashMap<TaskId, String> = tasks
         .iter()
-        .map(|t| (t.task_id, t.asset_key.canonical_string()))
+        .map(|t| {
+            let key = TaskKey {
+                asset_key: t.asset_key.clone(),
+                partition_key: t.partition_key.clone(),
+                operation: t.operation,
+            }
+            .canonical_string();
+            (t.task_id, key)
+        })
         .collect();
 
-    // Convert to structural representation
-    let structural: Vec<StructuralTaskSpec> = tasks
+    let mut normalized_tasks: Vec<FingerprintTaskSpec> = tasks
         .iter()
         .map(|t| {
+            let key = id_to_key
+                .get(&t.task_id)
+                .cloned()
+                .unwrap_or_else(|| t.task_id.to_string());
+
             let mut upstream_keys: Vec<String> = t
                 .upstream_task_ids
                 .iter()
-                .filter_map(|id| id_to_key.get(id).cloned())
+                .map(|id| id_to_key.get(id).cloned().unwrap_or_else(|| id.to_string()))
                 .collect();
-            // Sort for determinism
             upstream_keys.sort();
 
-            StructuralTaskSpec {
-                asset_key: t.asset_key.clone(),
-                partition_key: t.partition_key.clone(),
-                upstream_asset_keys: upstream_keys,
-                stage: t.stage,
+            FingerprintTaskSpec {
+                key,
+                upstream_keys,
                 priority: t.priority,
                 resources: t.resources.clone(),
             }
         })
         .collect();
 
-    // Use canonical JSON for cross-language determinism (ADR-010)
-    let canonical = canonical_json::to_canonical_bytes(&structural).map_err(|e| {
-        Error::Serialization {
-            message: format!("failed to serialize structural tasks to canonical JSON: {e}"),
-        }
-    })?;
+    // Sort tasks by semantic key for deterministic output independent of insertion order.
+    normalized_tasks.sort_by(|a, b| a.key.cmp(&b.key));
 
-    let hash = Sha256::digest(&canonical);
-    Ok(format!("sha256:{}", hex::encode(hash)))
+    let spec = FingerprintPlanSpec {
+        version: PLAN_FINGERPRINT_VERSION,
+        tenant_id: tenant_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        tasks: normalized_tasks,
+    };
+
+    // Use canonical JSON for cross-language determinism (ADR-010).
+    let canonical =
+        canonical_json::to_canonical_bytes(&spec).map_err(|e| Error::Serialization {
+            message: format!("failed to serialize fingerprint preimage to canonical JSON: {e}"),
+        })?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(format!("arco-plan:v{PLAN_FINGERPRINT_VERSION}:").as_bytes());
+    hasher.update(&canonical);
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arco_core::partition::ScalarValue;
 
     #[test]
     fn asset_key_canonical_string_uses_slash_separator() {
@@ -503,6 +650,7 @@ mod tests {
                 task_id: TaskId::generate(),
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,
@@ -528,6 +676,7 @@ mod tests {
             task_id,
             asset_id,
             asset_key: AssetKey::new("raw", "events"),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: vec![],
             stage: 0,
@@ -555,6 +704,7 @@ mod tests {
                 task_id: TaskId::generate(),
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![TaskId::generate()],
                 stage: 0,
@@ -578,6 +728,7 @@ mod tests {
                 task_id: task_c,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("mart", "report"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_b],
                 stage: 0, // Will be computed to 2
@@ -588,6 +739,7 @@ mod tests {
                 task_id: task_a,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0, // Will be computed to 0
@@ -598,6 +750,7 @@ mod tests {
                 task_id: task_b,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("staging", "cleaned"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_a],
                 stage: 0, // Will be computed to 1
@@ -659,6 +812,7 @@ mod tests {
                 task_id: task_a,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "a"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_b],
                 stage: 0,
@@ -669,6 +823,7 @@ mod tests {
                 task_id: task_b,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "b"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_a],
                 stage: 0,
@@ -678,6 +833,188 @@ mod tests {
             .build();
 
         assert!(matches!(result, Err(Error::CycleDetected { .. })));
+    }
+
+    #[test]
+    fn plan_task_order_is_stable_across_insertion_order() -> Result<()> {
+        let task_a = TaskId::generate();
+        let task_b = TaskId::generate();
+        let task_c = TaskId::generate();
+
+        // Graph: a -> c, b -> c (two independent roots, tie-break required).
+        let plan1 = PlanBuilder::new("tenant", "workspace")
+            // Intentionally add out of order.
+            .add_task(TaskSpec {
+                task_id: task_c,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("raw", "c"),
+                operation: TaskOperation::Materialize,
+                partition_key: None,
+                upstream_task_ids: vec![task_a, task_b],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            })
+            .add_task(TaskSpec {
+                task_id: task_b,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("raw", "b"),
+                operation: TaskOperation::Materialize,
+                partition_key: None,
+                upstream_task_ids: vec![],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            })
+            .add_task(TaskSpec {
+                task_id: task_a,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("raw", "a"),
+                operation: TaskOperation::Materialize,
+                partition_key: None,
+                upstream_task_ids: vec![],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            })
+            .build()?;
+
+        let plan2 = PlanBuilder::new("tenant", "workspace")
+            .add_task(TaskSpec {
+                task_id: task_a,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("raw", "a"),
+                operation: TaskOperation::Materialize,
+                partition_key: None,
+                upstream_task_ids: vec![],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            })
+            .add_task(TaskSpec {
+                task_id: task_b,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("raw", "b"),
+                operation: TaskOperation::Materialize,
+                partition_key: None,
+                upstream_task_ids: vec![],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            })
+            .add_task(TaskSpec {
+                task_id: task_c,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("raw", "c"),
+                operation: TaskOperation::Materialize,
+                partition_key: None,
+                upstream_task_ids: vec![task_a, task_b],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            })
+            .build()?;
+
+        let order1: Vec<String> = plan1
+            .tasks
+            .iter()
+            .map(|t| {
+                TaskKey {
+                    asset_key: t.asset_key.clone(),
+                    partition_key: t.partition_key.clone(),
+                    operation: t.operation,
+                }
+                .canonical_string()
+            })
+            .collect();
+        let order2: Vec<String> = plan2
+            .tasks
+            .iter()
+            .map(|t| {
+                TaskKey {
+                    asset_key: t.asset_key.clone(),
+                    partition_key: t.partition_key.clone(),
+                    operation: t.operation,
+                }
+                .canonical_string()
+            })
+            .collect();
+
+        assert_eq!(order1, order2);
+        assert_eq!(
+            order1,
+            vec![
+                "raw/a:materialize".to_string(),
+                "raw/b:materialize".to_string(),
+                "raw/c:materialize".to_string(),
+            ]
+        );
+
+        // Fingerprint must also be stable across insertion order.
+        assert_eq!(plan1.fingerprint, plan2.fingerprint);
+
+        Ok(())
+    }
+
+    #[test]
+    fn fingerprint_upstream_identity_includes_partition_key() -> Result<()> {
+        fn date_partition(date: &str) -> PartitionKey {
+            let mut pk = PartitionKey::new();
+            pk.insert("date", ScalarValue::Date(date.to_string()));
+            pk
+        }
+
+        let upstream_a = TaskId::generate();
+        let upstream_b = TaskId::generate();
+        let downstream = TaskId::generate();
+
+        // Both plans include the same three tasks, but downstream depends on a different partition.
+        let base = |upstream_dep: TaskId| {
+            PlanBuilder::new("tenant", "workspace")
+                .add_task(TaskSpec {
+                    task_id: upstream_a,
+                    asset_id: AssetId::generate(),
+                    asset_key: AssetKey::new("raw", "events"),
+                    operation: TaskOperation::Materialize,
+                    partition_key: Some(date_partition("2025-01-01")),
+                    upstream_task_ids: vec![],
+                    stage: 0,
+                    priority: 0,
+                    resources: ResourceRequirements::default(),
+                })
+                .add_task(TaskSpec {
+                    task_id: upstream_b,
+                    asset_id: AssetId::generate(),
+                    asset_key: AssetKey::new("raw", "events"),
+                    operation: TaskOperation::Materialize,
+                    partition_key: Some(date_partition("2025-01-02")),
+                    upstream_task_ids: vec![],
+                    stage: 0,
+                    priority: 0,
+                    resources: ResourceRequirements::default(),
+                })
+                .add_task(TaskSpec {
+                    task_id: downstream,
+                    asset_id: AssetId::generate(),
+                    asset_key: AssetKey::new("staging", "cleaned"),
+                    operation: TaskOperation::Materialize,
+                    partition_key: None,
+                    upstream_task_ids: vec![upstream_dep],
+                    stage: 0,
+                    priority: 0,
+                    resources: ResourceRequirements::default(),
+                })
+        };
+
+        let plan1 = base(upstream_a).build()?;
+        let plan2 = base(upstream_b).build()?;
+
+        assert_ne!(
+            plan1.fingerprint, plan2.fingerprint,
+            "fingerprint must distinguish upstream partition dependencies"
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -692,6 +1029,7 @@ mod tests {
                 task_id: task_a,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "a"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,
@@ -702,6 +1040,7 @@ mod tests {
                 task_id: task_b,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("staging", "b"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_a],
                 stage: 0, // Will be computed to 1
@@ -712,6 +1051,7 @@ mod tests {
                 task_id: task_c,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("mart", "c"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_b],
                 stage: 0, // Will be computed to 2
@@ -741,6 +1081,7 @@ mod tests {
                 task_id: TaskId::generate(),
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,
@@ -771,6 +1112,7 @@ mod tests {
                 task_id: task_a1,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,
@@ -781,6 +1123,7 @@ mod tests {
                 task_id: task_b1,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("staging", "cleaned"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_a1],
                 stage: 0,
@@ -791,6 +1134,7 @@ mod tests {
                 task_id: task_c1,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("mart", "report"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_b1],
                 stage: 0,
@@ -809,6 +1153,7 @@ mod tests {
                 task_id: task_a2,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,
@@ -819,6 +1164,7 @@ mod tests {
                 task_id: task_b2,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("staging", "cleaned"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_a2],
                 stage: 0,
@@ -829,6 +1175,7 @@ mod tests {
                 task_id: task_c2,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("mart", "report"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_b2],
                 stage: 0,

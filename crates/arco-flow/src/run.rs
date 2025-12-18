@@ -31,6 +31,7 @@ use arco_core::{RunId, TaskId};
 use crate::error::{Error, Result};
 use crate::plan::Plan;
 use crate::task::{TaskExecution, TaskState};
+use crate::task_key::TaskKey;
 
 /// Run state machine states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -237,7 +238,12 @@ impl Run {
             .tasks
             .iter()
             .map(|task| {
-                let mut exec = TaskExecution::new(task.task_id);
+                let task_key = TaskKey {
+                    asset_key: task.asset_key.clone(),
+                    partition_key: task.partition_key.clone(),
+                    operation: task.operation,
+                };
+                let mut exec = TaskExecution::new(task.task_id).with_metadata(task_key, task.priority);
                 exec.state = TaskState::Pending;
                 exec
             })
@@ -436,6 +442,7 @@ mod tests {
     use super::*;
     use crate::plan::{AssetKey, PlanBuilder, ResourceRequirements, TaskSpec};
     use crate::task::TaskState;
+    use crate::task_key::TaskOperation;
     use arco_core::AssetId;
 
     #[test]
@@ -446,6 +453,7 @@ mod tests {
                 task_id,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,
@@ -484,6 +492,7 @@ mod tests {
                 task_id,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,
@@ -522,6 +531,7 @@ mod tests {
                 task_id: task_a,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,
@@ -532,6 +542,7 @@ mod tests {
                 task_id: task_b,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("staging", "cleaned"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_a],
                 stage: 0,
@@ -573,6 +584,7 @@ mod tests {
                 task_id,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,

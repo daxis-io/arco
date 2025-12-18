@@ -925,6 +925,7 @@ mod tests {
     use super::*;
     use crate::outbox::InMemoryOutbox;
     use crate::plan::{AssetKey, PlanBuilder, ResourceRequirements, TaskSpec};
+    use crate::task_key::TaskOperation;
     use arco_core::AssetId;
 
     #[test]
@@ -935,6 +936,7 @@ mod tests {
                 task_id,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,
@@ -965,6 +967,7 @@ mod tests {
                 task_id: task_a,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,
@@ -975,6 +978,7 @@ mod tests {
                 task_id: task_b,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("staging", "cleaned"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_a],
                 stage: 0,
@@ -1004,6 +1008,7 @@ mod tests {
                 task_id: task_a,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,
@@ -1014,6 +1019,7 @@ mod tests {
                 task_id: task_b,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("staging", "cleaned"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![task_a],
                 stage: 0,
@@ -1062,6 +1068,7 @@ mod tests {
                 task_id: task_low,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "low"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,
@@ -1072,6 +1079,7 @@ mod tests {
                 task_id: task_high,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "high"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,
@@ -1095,10 +1103,11 @@ mod tests {
     #[test]
     fn scheduler_respects_max_parallelism() -> Result<()> {
         let tasks: Vec<_> = (0..5)
-            .map(|_| TaskSpec {
+            .map(|i| TaskSpec {
                 task_id: TaskId::generate(),
                 asset_id: AssetId::generate(),
-                asset_key: AssetKey::new("raw", "task"),
+                asset_key: AssetKey::new("raw", format!("task_{i}")),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,
@@ -1136,6 +1145,7 @@ mod tests {
                 task_id,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,
@@ -1183,6 +1193,7 @@ mod tests {
                 task_id: task_a,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "a"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,
@@ -1193,6 +1204,7 @@ mod tests {
                 task_id: task_b,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", "b"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 stage: 0,

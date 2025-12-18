@@ -11,9 +11,9 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt::Display;
 use std::hash::Hash;
 
+use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
-use petgraph::Direction;
 
 use crate::error::{Error, Result};
 
@@ -115,6 +115,7 @@ where
     /// # Errors
     ///
     /// Returns an error if the graph contains a cycle.
+    #[allow(dead_code)]
     pub fn toposort(&self) -> Result<Vec<T>> {
         let node_count = self.graph.node_count();
         if node_count == 0 {

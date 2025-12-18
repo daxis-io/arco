@@ -12,6 +12,7 @@ use arco_core::{AssetId, TaskId};
 use arco_flow::plan::{AssetKey, PlanBuilder, ResourceRequirements, TaskSpec};
 use arco_flow::run::RunState;
 use arco_flow::task::TaskState;
+use arco_flow::task_key::TaskOperation;
 
 /// Generates a random TaskId (diverse, not constant per run).
 fn arb_task_id() -> impl Strategy<Value = TaskId> {
@@ -48,6 +49,7 @@ fn arb_task_spec() -> impl Strategy<Value = TaskSpec> {
             task_id,
             asset_id,
             asset_key: AssetKey::new(&ns, &name),
+            operation: TaskOperation::Materialize,
             partition_key: None,
             upstream_task_ids: deps,
             priority,
@@ -81,6 +83,7 @@ proptest! {
                 task_id,
                 asset_id,
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 priority: 0,
@@ -95,6 +98,7 @@ proptest! {
                 task_id,
                 asset_id,
                 asset_key: AssetKey::new("raw", "events"),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: vec![],
                 priority: 0,
@@ -239,6 +243,7 @@ proptest! {
                 task_id,
                 asset_id: AssetId::generate(),
                 asset_key: AssetKey::new("raw", format!("task_{i}")),
+                operation: TaskOperation::Materialize,
                 partition_key: None,
                 upstream_task_ids: upstream,
                 priority: 0,

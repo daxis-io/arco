@@ -117,7 +117,9 @@ impl TaskKey {
             |pk| {
                 format!(
                     "{}/{}[{}]",
-                    self.asset_key.namespace, self.asset_key.name, pk.canonical_string()
+                    self.asset_key.namespace,
+                    self.asset_key.name,
+                    pk.canonical_string()
                 )
             },
         );
@@ -226,10 +228,7 @@ mod tests {
 
         // Format: namespace/name[partition]:operation (per ADR-011)
         // Partition uses typed PartitionKey format: date=d:2025-01-01
-        assert_eq!(
-            key.to_string(),
-            "raw/events[date=d:2025-01-01]:materialize"
-        );
+        assert_eq!(key.to_string(), "raw/events[date=d:2025-01-01]:materialize");
     }
 
     #[test]

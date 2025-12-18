@@ -1,7 +1,7 @@
 //! Golden vector tests for cross-language canonical JSON verification.
 //!
 //! These tests ensure Rust produces identical output to the Python reference:
-//! `json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)`
+//! `json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)`
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -50,7 +50,7 @@ fn canonical_json_golden_vectors() {
 ///     data = json.load(f)
 ///
 /// for vector in data['vectors']:
-///     canonical = json.dumps(vector['input'], sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+///     canonical = json.dumps(vector['input'], sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)
 ///     assert canonical == vector['expected_canonical'], f"{vector['name']}: {canonical} != {vector['expected_canonical']}"
 /// ```
 #[test]

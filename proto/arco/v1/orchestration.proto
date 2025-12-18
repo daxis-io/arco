@@ -60,18 +60,33 @@ message TaskSpec {
 
   // Resource requirements
   ResourceRequirements resources = 7;
+
+  // Operation performed by this task (materialize/check/backfill).
+  // If unset/unspecified, defaults to MATERIALIZE.
+  TaskOperation operation = 8;
+}
+
+// The semantic operation a task performs.
+enum TaskOperation {
+  TASK_OPERATION_UNSPECIFIED = 0;
+  MATERIALIZE = 1;
+  CHECK = 2;
+  BACKFILL = 3;
 }
 
 // Resource requirements for task scheduling.
+//
+// All values use integer representations for deterministic serialization
+// (no floats allowed per ADR-010).
 message ResourceRequirements {
-  // Memory limit in bytes
-  int64 memory_bytes = 1;
+  // Memory limit in bytes (negative memory is nonsensical).
+  uint64 memory_bytes = 1;
 
-  // CPU cores (fractional allowed)
-  double cpu_cores = 2;
+  // CPU in millicores (1000 = 1 full core).
+  uint64 cpu_millicores = 2;
 
-  // Maximum execution time in seconds
-  int64 timeout_seconds = 3;
+  // Maximum execution time in milliseconds.
+  uint64 timeout_ms = 3;
 }
 
 // Edge in the dependency graph.

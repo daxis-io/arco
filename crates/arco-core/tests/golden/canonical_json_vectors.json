@@ -61,5 +61,5 @@
       "expected_canonical": "{\"a\":\"first\",\"z\":{\"y\":{\"x\":[1,2,{\"v\":4,\"w\":3}]}}}"
     }
   ],
-  "python_reference": "json.dumps(input, sort_keys=True, separators=(',', ':'), ensure_ascii=False)"
+  "python_reference": "json.dumps(input, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)"
 }

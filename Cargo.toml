@@ -74,9 +74,16 @@ anyhow = "1"
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Metrics (OpenTelemetry-compatible)
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
 # Async utilities
 futures = "0.3"
 async-trait = "0.1"
+
+# Rate limiting
+governor = "0.6"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -95,15 +102,18 @@ base64 = "0.22"
 petgraph = "0.7"
 
 # Data formats
-parquet = { version = "53", features = ["async"] }
-arrow = { version = "53", features = ["chrono-tz"] }
+parquet = { version = "54", features = ["async"] }
+arrow = { version = "54", features = ["chrono-tz"] }
 bytes = "1"
 
 # HTTP/gRPC
 axum = "0.7"
+tower = { version = "0.5", features = ["limit", "timeout"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
 tonic = "0.12"
 prost = "0.13"
 prost-types = "0.13"
+http = "1"
 
 # Cloud storage
 object_store = { version = "0.11", features = ["gcp", "aws", "azure"] }

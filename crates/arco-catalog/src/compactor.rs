@@ -762,7 +762,8 @@ impl Compactor {
                 message: format!("failed to read manifest metadata: {e}"),
             })?
             .ok_or_else(|| CatalogError::NotFound {
-                message: format!("manifest not found: {manifest_path}"),
+                entity: "manifest".to_string(),
+                name: manifest_path.clone(),
             })?;
 
         let version = meta.version.clone();

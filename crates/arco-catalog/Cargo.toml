@@ -41,6 +41,9 @@ thiserror = { workspace = true }
 # Logging
 tracing = { workspace = true }
 
+# Metrics
+metrics = { workspace = true }
+
 # Data formats
 parquet = { workspace = true }
 arrow = { workspace = true }
@@ -58,6 +61,7 @@ hex = { workspace = true }
 
 # Identifiers
 ulid = { workspace = true }
+uuid = { workspace = true }
 
 # Optional test utilities
 proptest = { workspace = true, optional = true }

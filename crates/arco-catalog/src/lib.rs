@@ -74,10 +74,15 @@ pub mod asset;
 pub mod compactor;
 pub mod error;
 pub mod event_writer;
+pub mod gc;
 pub mod lock;
 pub mod manifest;
+mod parquet_util;
 pub mod reader;
+pub mod reconciler;
+mod state;
 pub mod tier1_writer;
+pub mod write_options;
 pub mod writer;
 
 // Re-export main types at crate root
@@ -91,7 +96,14 @@ pub use manifest::{
     ExecutionManifest, ExecutionsManifest, GovernanceManifest, LineageManifest, RootManifest,
     SearchManifest,
 };
+pub use reader::{CatalogReader, LineageGraph, SignedUrl, SnapshotFreshness};
+pub use reconciler::{Reconciler, ReconciliationIssue, ReconciliationReport, RepairResult};
 pub use tier1_writer::Tier1Writer;
+pub use write_options::{IdempotencyKey, SnapshotVersion, WriteOptions};
+pub use writer::{
+    CatalogWriter, Column, ColumnDefinition, EventSource, LineageEdge, Namespace,
+    RegisterTableRequest, Table, TablePatch,
+};
 
 /// Prelude module for convenient imports.
 pub mod prelude {
@@ -99,5 +111,6 @@ pub mod prelude {
     pub use crate::manifest::{CatalogDomainManifest, CatalogManifest, CommitRecord, RootManifest};
     pub use crate::reader::CatalogReader;
     pub use crate::tier1_writer::Tier1Writer;
+    pub use crate::write_options::{IdempotencyKey, SnapshotVersion, WriteOptions};
     pub use crate::writer::CatalogWriter;
 }

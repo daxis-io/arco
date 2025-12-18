@@ -130,6 +130,12 @@ pub struct CatalogDomainManifest {
     /// Path to snapshot directory.
     pub snapshot_path: String,
 
+    /// Optional enhanced snapshot metadata (per-file checksums, sizes, row counts).
+    ///
+    /// When present, this is the canonical allowlist for signed URL minting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotInfo>,
+
     /// Last commit ID for hash chain integrity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_commit_id: Option<String>,
@@ -145,6 +151,7 @@ impl CatalogDomainManifest {
         Self {
             snapshot_version: 0,
             snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 0),
+            snapshot: None,
             last_commit_id: None,
             updated_at: Utc::now(),
         }
@@ -176,6 +183,115 @@ pub struct CompactionMetadata {
     /// Total Parquet files written.
     #[serde(default)]
     pub total_files_written: u64,
+}
+
+// ============================================================================
+// Snapshot Info (per-file metadata for manifest-driven URL allowlist)
+// ============================================================================
+
+/// Metadata for a single Parquet file in a snapshot.
+///
+/// Used for:
+/// - **Manifest-driven URL allowlist**: Only mint URLs for files in `SnapshotInfo`
+/// - **Integrity verification**: Checksums detect corruption/tampering
+/// - **Query optimization**: Row counts for cost estimation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotFile {
+    /// Relative path within snapshot directory.
+    pub path: String,
+
+    /// SHA-256 checksum of file contents (hex encoded).
+    pub checksum_sha256: String,
+
+    /// File size in bytes.
+    pub byte_size: u64,
+
+    /// Number of rows in the Parquet file.
+    pub row_count: u64,
+
+    /// Optional min/max position range for L0 delta files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_range: Option<(u64, u64)>,
+}
+
+/// Complete snapshot metadata stored in domain manifest.
+///
+/// The manifest stores a `SnapshotInfo` per domain, enabling:
+/// - Readers to locate current snapshot files
+/// - URL minting to validate requested paths
+/// - Integrity verification via checksums
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotInfo {
+    /// Snapshot version (monotonically increasing).
+    pub version: u64,
+
+    /// Snapshot directory path.
+    pub path: String,
+
+    /// List of files with checksums and metadata.
+    pub files: Vec<SnapshotFile>,
+
+    /// When this snapshot was published.
+    pub published_at: DateTime<Utc>,
+
+    /// Total row count across all files.
+    pub total_rows: u64,
+
+    /// Total size in bytes.
+    pub total_bytes: u64,
+
+    /// Optional tail commit range for incremental refresh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail: Option<TailRange>,
+}
+
+/// Tail range for incremental refresh (commit range since last full snapshot).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailRange {
+    /// First commit ID in the tail.
+    pub from_commit: String,
+    /// Last commit ID in the tail.
+    pub to_commit: String,
+    /// Number of commits in the tail.
+    pub commit_count: u64,
+}
+
+impl SnapshotInfo {
+    /// Creates a new empty snapshot info.
+    #[must_use]
+    pub fn new(version: u64, path: String) -> Self {
+        Self {
+            version,
+            path,
+            files: Vec::new(),
+            published_at: Utc::now(),
+            total_rows: 0,
+            total_bytes: 0,
+            tail: None,
+        }
+    }
+
+    /// Adds a file to the snapshot and updates totals.
+    pub fn add_file(&mut self, file: SnapshotFile) {
+        self.total_rows += file.row_count;
+        self.total_bytes += file.byte_size;
+        self.files.push(file);
+    }
+
+    /// Returns the list of all file paths in this snapshot.
+    #[must_use]
+    pub fn file_paths(&self) -> Vec<&str> {
+        self.files.iter().map(|f| f.path.as_str()).collect()
+    }
+
+    /// Checks if a path is allowed in this snapshot (for URL allowlist).
+    #[must_use]
+    pub fn contains_path(&self, path: &str) -> bool {
+        self.files.iter().any(|f| f.path == path)
+    }
 }
 
 /// Executions manifest (Tier 2) - separate file.
@@ -215,7 +331,10 @@ pub struct ExecutionsManifest {
     #[serde(default)]
     pub watermark_position: Option<u64>,
 
-    /// Last compaction timestamp.
+    /// Last compaction cutoff timestamp.
+    ///
+    /// This is recorded at the start of a compaction run and used with object
+    /// `last_modified` metadata to detect out-of-order events written during compaction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_compaction_at: Option<DateTime<Utc>>,
 
@@ -269,6 +388,10 @@ pub struct LineageManifest {
     /// Path to edges Parquet files.
     pub edges_path: String,
 
+    /// Optional enhanced snapshot metadata (per-file checksums, sizes, row counts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotInfo>,
+
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
 }
@@ -280,6 +403,7 @@ impl LineageManifest {
         Self {
             snapshot_version: 0,
             edges_path: CatalogPaths::snapshot_dir(CatalogDomain::Lineage, 0),
+            snapshot: None,
             updated_at: Utc::now(),
         }
     }
@@ -596,6 +720,7 @@ mod tests {
         let core = CoreManifest {
             snapshot_version: 42,
             snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 42),
+            snapshot: None,
             last_commit_id: Some("commit_abc".into()),
             updated_at: now,
         };

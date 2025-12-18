@@ -16,15 +16,18 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
-use arco_core::error::{Error, Result};
 use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
 use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
 
+use crate::error::{CatalogError, Result};
+use crate::lock::LockGuard;
 use crate::lock::{DEFAULT_LOCK_TTL, DEFAULT_MAX_RETRIES, DistributedLock};
 use crate::manifest::{
     CatalogDomainManifest, CatalogManifest, CommitRecord, ExecutionsManifest, LineageManifest,
-    RootManifest, SearchManifest,
+    RootManifest, SearchManifest, SnapshotFile, SnapshotInfo,
 };
+use crate::parquet_util;
+use crate::state::{CatalogState, LineageState};
 
 /// Maximum CAS retries for manifest writes.
 const DEFAULT_MAX_CAS_RETRIES: u32 = 10;
@@ -97,7 +100,8 @@ impl Tier1Writer {
                 self.lock_max_retries,
                 Some("InitializeCatalog".into()),
             )
-            .await?;
+            .await
+            .map_err(CatalogError::from)?;
 
         let mut root = RootManifest::new();
         root.normalize_paths();
@@ -113,7 +117,7 @@ impl Tier1Writer {
         self.ensure_json_exists(&root.search_manifest_path, &SearchManifest::new())
             .await?;
 
-        guard.release().await
+        guard.release().await.map_err(CatalogError::from)
     }
 
     /// Reads the current catalog manifest by loading domain manifests.
@@ -157,17 +161,159 @@ impl Tier1Writer {
         let guard = self
             .lock
             .acquire_with_operation(self.lock_ttl, self.lock_max_retries, Some("Update".into()))
-            .await?;
+            .await
+            .map_err(CatalogError::from)?;
 
         let result = self.update_inner(&mut update_fn).await;
 
         match result {
             Ok(commit) => {
-                guard.release().await?;
+                guard.release().await.map_err(CatalogError::from)?;
                 Ok(commit)
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Applies an update to the catalog domain manifest while an external lock is held.
+    ///
+    /// This is used by higher-level writers that acquire the lock once, perform
+    /// snapshot writes, then publish by updating the manifest in the same critical
+    /// section.
+    ///
+    /// The passed `guard` is a proof of lock acquisition; it is not otherwise used.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if manifest reads/writes fail or if the update closure returns an error.
+    pub async fn update_locked<F>(
+        &self,
+        _guard: &LockGuard<dyn StorageBackend>,
+        mut update_fn: F,
+    ) -> Result<CommitRecord>
+    where
+        F: FnMut(&mut CatalogDomainManifest) -> Result<()>,
+    {
+        self.update_inner(&mut update_fn).await
+    }
+
+    /// Acquires the catalog domain lock and returns a guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock cannot be acquired within the retry budget.
+    pub async fn acquire_lock(
+        &self,
+        ttl: Duration,
+        max_retries: u32,
+    ) -> Result<LockGuard<dyn StorageBackend>> {
+        self.lock
+            .acquire(ttl, max_retries)
+            .await
+            .map_err(Self::map_lock)
+    }
+
+    fn map_lock(err: arco_core::Error) -> CatalogError {
+        CatalogError::from(err)
+    }
+
+    /// Writes a new catalog snapshot (namespaces/tables/columns) for the given version.
+    ///
+    /// Snapshot files are written before the manifest is updated (atomic publish).
+    /// Snapshot paths are versioned; overwriting is allowed for crash recovery when the
+    /// manifest CAS fails (the snapshot is not visible until publish succeeds).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serializing the snapshot or writing to storage fails.
+    pub async fn write_catalog_snapshot(
+        &self,
+        _guard: &LockGuard<dyn StorageBackend>,
+        version: u64,
+        state: &CatalogState,
+    ) -> Result<SnapshotInfo> {
+        let snapshot_dir = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, version);
+
+        let namespaces_bytes = parquet_util::write_namespaces(&state.namespaces)?;
+        let tables_bytes = parquet_util::write_tables(&state.tables)?;
+        let columns_bytes = parquet_util::write_columns(&state.columns)?;
+
+        let ns_path =
+            CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "namespaces.parquet");
+        let tables_path =
+            CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "tables.parquet");
+        let cols_path =
+            CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "columns.parquet");
+
+        let _ = self
+            .storage
+            .put_raw(&ns_path, namespaces_bytes.clone(), WritePrecondition::None)
+            .await?;
+        let _ = self
+            .storage
+            .put_raw(&tables_path, tables_bytes.clone(), WritePrecondition::None)
+            .await?;
+        let _ = self
+            .storage
+            .put_raw(&cols_path, columns_bytes.clone(), WritePrecondition::None)
+            .await?;
+
+        let mut info = SnapshotInfo::new(version, snapshot_dir);
+        info.add_file(SnapshotFile {
+            path: "namespaces.parquet".to_string(),
+            checksum_sha256: sha256_hex(&namespaces_bytes),
+            byte_size: namespaces_bytes.len() as u64,
+            row_count: state.namespaces.len() as u64,
+            position_range: None,
+        });
+        info.add_file(SnapshotFile {
+            path: "tables.parquet".to_string(),
+            checksum_sha256: sha256_hex(&tables_bytes),
+            byte_size: tables_bytes.len() as u64,
+            row_count: state.tables.len() as u64,
+            position_range: None,
+        });
+        info.add_file(SnapshotFile {
+            path: "columns.parquet".to_string(),
+            checksum_sha256: sha256_hex(&columns_bytes),
+            byte_size: columns_bytes.len() as u64,
+            row_count: state.columns.len() as u64,
+            position_range: None,
+        });
+
+        Ok(info)
+    }
+
+    /// Writes a new lineage snapshot (`lineage_edges.parquet`) for the given version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serializing the snapshot or writing to storage fails.
+    pub async fn write_lineage_snapshot(
+        &self,
+        _guard: &LockGuard<dyn StorageBackend>,
+        version: u64,
+        state: &LineageState,
+    ) -> Result<SnapshotInfo> {
+        let snapshot_dir = CatalogPaths::snapshot_dir(CatalogDomain::Lineage, version);
+        let bytes = parquet_util::write_lineage_edges(&state.edges)?;
+        let path =
+            CatalogPaths::snapshot_file(CatalogDomain::Lineage, version, "lineage_edges.parquet");
+
+        let _ = self
+            .storage
+            .put_raw(&path, bytes.clone(), WritePrecondition::None)
+            .await?;
+
+        let mut info = SnapshotInfo::new(version, snapshot_dir);
+        info.add_file(SnapshotFile {
+            path: "lineage_edges.parquet".to_string(),
+            checksum_sha256: sha256_hex(&bytes),
+            byte_size: bytes.len() as u64,
+            row_count: state.edges.len() as u64,
+            position_range: None,
+        });
+        Ok(info)
     }
 
     async fn update_inner<F>(&self, update_fn: &mut F) -> Result<CommitRecord>
@@ -206,7 +352,7 @@ impl Tier1Writer {
                 }
                 WriteResult::PreconditionFailed { .. } => {
                     if attempt == self.cas_max_retries {
-                        return Err(Error::PreconditionFailed {
+                        return Err(CatalogError::PreconditionFailed {
                             message: "manifest update lost CAS race after max retries".into(),
                         });
                     }
@@ -218,7 +364,7 @@ impl Tier1Writer {
             }
         }
 
-        Err(Error::Internal {
+        Err(CatalogError::InvariantViolation {
             message: "unreachable: CAS retry loop exhausted".into(),
         })
     }
@@ -242,7 +388,7 @@ impl Tier1Writer {
         T: serde::de::DeserializeOwned,
     {
         let bytes = self.storage.get_raw(path).await?;
-        serde_json::from_slice(&bytes).map_err(|e| Error::Serialization {
+        serde_json::from_slice(&bytes).map_err(|e| CatalogError::Serialization {
             message: format!("parse JSON at {path}: {e}"),
         })
     }
@@ -255,7 +401,10 @@ impl Tier1Writer {
             .storage
             .head_raw(path)
             .await?
-            .ok_or_else(|| Error::NotFound(format!("manifest not found: {path}")))?;
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "manifest".to_string(),
+                name: path.to_string(),
+            })?;
 
         let value = self.read_json(path).await?;
         Ok((value, meta.version))
@@ -279,11 +428,11 @@ impl Tier1Writer {
                 let path = CatalogPaths::commit(CatalogDomain::Catalog, id);
                 match self.storage.get_raw(&path).await {
                     Ok(bytes) => Some(sha256_prefixed(&bytes)),
-                    Err(Error::NotFound(_)) => {
+                    Err(arco_core::Error::NotFound(_)) => {
                         // First commit or missing record - acceptable edge case
                         None
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(CatalogError::from(e)),
                 }
             }
             None => None,
@@ -308,7 +457,7 @@ impl Tier1Writer {
             .await?
         {
             WriteResult::Success { .. } => Ok(()),
-            WriteResult::PreconditionFailed { .. } => Err(Error::PreconditionFailed {
+            WriteResult::PreconditionFailed { .. } => Err(CatalogError::PreconditionFailed {
                 message: format!("commit already exists: {}", commit.commit_id),
             }),
         }
@@ -316,7 +465,7 @@ impl Tier1Writer {
 }
 
 fn json_vec<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
-    serde_json::to_vec(value).map_err(|e| Error::Serialization {
+    serde_json::to_vec(value).map_err(|e| CatalogError::Serialization {
         message: format!("serialize JSON: {e}"),
     })
 }
@@ -330,6 +479,11 @@ fn sha256_prefixed(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(hash))
 }
 
+fn sha256_hex(bytes: &Bytes) -> String {
+    let hash = Sha256::digest(bytes);
+    hex::encode(hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,12 +491,13 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use arco_core::Result as CoreResult;
     use arco_core::storage::{MemoryBackend, ObjectMeta};
     use serde::de::DeserializeOwned;
     use std::ops::Range;
 
     fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-        serde_json::from_slice(bytes).map_err(|e| Error::Serialization {
+        serde_json::from_slice(bytes).map_err(|e| CatalogError::Serialization {
             message: format!("failed to parse json: {e}"),
         })
     }
@@ -364,11 +519,11 @@ mod tests {
 
     #[async_trait]
     impl StorageBackend for HookedBackend {
-        async fn get(&self, path: &str) -> Result<Bytes> {
+        async fn get(&self, path: &str) -> CoreResult<Bytes> {
             self.inner.get(path).await
         }
 
-        async fn get_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+        async fn get_range(&self, path: &str, range: Range<u64>) -> CoreResult<Bytes> {
             self.inner.get_range(path, range).await
         }
 
@@ -377,7 +532,7 @@ mod tests {
             path: &str,
             data: Bytes,
             precondition: WritePrecondition,
-        ) -> Result<WriteResult> {
+        ) -> CoreResult<WriteResult> {
             // Inject a no-op write once to force a CAS conflict.
             if matches!(&precondition, WritePrecondition::MatchesVersion(_))
                 && path.ends_with(&CatalogPaths::domain_manifest(CatalogDomain::Catalog))
@@ -393,19 +548,19 @@ mod tests {
             self.inner.put(path, data, precondition).await
         }
 
-        async fn delete(&self, path: &str) -> Result<()> {
+        async fn delete(&self, path: &str) -> CoreResult<()> {
             self.inner.delete(path).await
         }
 
-        async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+        async fn list(&self, prefix: &str) -> CoreResult<Vec<ObjectMeta>> {
             self.inner.list(prefix).await
         }
 
-        async fn head(&self, path: &str) -> Result<Option<ObjectMeta>> {
+        async fn head(&self, path: &str) -> CoreResult<Option<ObjectMeta>> {
             self.inner.head(path).await
         }
 
-        async fn signed_url(&self, path: &str, expiry: Duration) -> Result<String> {
+        async fn signed_url(&self, path: &str, expiry: Duration) -> CoreResult<String> {
             self.inner.signed_url(path, expiry).await
         }
     }

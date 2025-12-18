@@ -99,13 +99,70 @@ impl ScalarValue {
             Self::Null => 'n',
         }
     }
+
+    /// Returns a rank for ordering by type.
+    const fn type_rank(&self) -> u8 {
+        match self {
+            Self::Null => 0,
+            Self::Boolean(_) => 1,
+            Self::Int64(_) => 2,
+            Self::String(_) => 3,
+            Self::Date(_) => 4,
+            Self::Timestamp(_) => 5,
+        }
+    }
+}
+
+impl PartialOrd for ScalarValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScalarValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+
+        // Order by type first, then by value
+        match self.type_rank().cmp(&other.type_rank()) {
+            Ordering::Equal => {}
+            ord => return ord,
+        }
+
+        // Same type - compare values
+        match (self, other) {
+            (Self::Null, Self::Null) => Ordering::Equal,
+            (Self::Boolean(a), Self::Boolean(b)) => a.cmp(b),
+            (Self::Int64(a), Self::Int64(b)) => a.cmp(b),
+            // String-like types all compare as strings
+            (Self::String(a), Self::String(b))
+            | (Self::Date(a), Self::Date(b))
+            | (Self::Timestamp(a), Self::Timestamp(b)) => a.cmp(b),
+            // Different types are handled by type_rank comparison above
+            _ => unreachable!("same type_rank should match same variant"),
+        }
+    }
 }
 
 /// Multi-dimensional partition key with deterministic canonical form.
 ///
 /// Uses `BTreeMap` internally to ensure keys are always sorted alphabetically.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Implements `Ord` for use in sorted collections and deterministic comparisons.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct PartitionKey(BTreeMap<String, ScalarValue>);
+
+impl PartialOrd for PartitionKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PartitionKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Compare by canonical string for deterministic cross-language ordering
+        self.canonical_string().cmp(&other.canonical_string())
+    }
+}
 
 impl PartitionKey {
     /// Creates a new empty partition key.

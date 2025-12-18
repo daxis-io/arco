@@ -7,7 +7,7 @@
 //! - **Serializable**: Can be stored and compared for debugging
 //! - **Explainable**: Every task inclusion can be traced to a reason
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -15,6 +15,7 @@ use petgraph::graph::NodeIndex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use arco_core::partition::PartitionKey;
 use arco_core::{AssetId, TaskId};
 
 use crate::dag::Dag;
@@ -44,9 +45,20 @@ impl AssetKey {
     }
 
     /// Returns the fully qualified name (namespace.name).
+    ///
+    /// Uses `.` separator for backward compatibility with existing code.
     #[must_use]
     pub fn qualified_name(&self) -> String {
         format!("{}.{}", self.namespace, self.name)
+    }
+
+    /// Returns the canonical string representation (namespace/name).
+    ///
+    /// Uses `/` separator per ADR-011 for deterministic identity.
+    /// This is the preferred format for use in `TaskKey` and fingerprinting.
+    #[must_use]
+    pub fn canonical_string(&self) -> String {
+        format!("{}/{}", self.namespace, self.name)
     }
 }
 
@@ -57,27 +69,73 @@ impl std::fmt::Display for AssetKey {
 }
 
 /// Resource requirements for task execution.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// All fields use integer types for cross-language determinism (ADR-010).
+/// Float serialization differs between Rust and Python, so we use:
+/// - `memory_bytes`: bytes (not fractional GB)
+/// - `cpu_millicores`: 1/1000th of a CPU core (1000 = 1 CPU)
+/// - `timeout_ms`: milliseconds (not fractional seconds)
+///
+/// **Serde defaults:** Each field has an explicit default function to ensure
+/// partial deserialization uses sensible values (not 0).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceRequirements {
-    /// Memory limit in bytes.
-    #[serde(default)]
-    pub memory_bytes: i64,
-    /// CPU cores (fractional allowed).
-    #[serde(default)]
-    pub cpu_cores: f64,
-    /// Maximum execution time.
-    #[serde(default, with = "humantime_serde")]
-    pub timeout: Duration,
+    /// Memory limit in bytes (unsigned - negative memory is invalid).
+    #[serde(default = "default_memory_bytes")]
+    pub memory_bytes: u64,
+
+    /// CPU in millicores (1000 = 1 CPU core, 500 = 0.5 CPU).
+    /// This avoids float serialization issues across languages.
+    #[serde(default = "default_cpu_millicores")]
+    pub cpu_millicores: u64,
+
+    /// Maximum execution time in milliseconds.
+    /// This avoids Duration serialization complexity.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+/// Default memory: 512 MB.
+const fn default_memory_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+
+/// Default CPU: 1 core (1000 millicores).
+const fn default_cpu_millicores() -> u64 {
+    1000
+}
+
+/// Default timeout: 1 hour (3,600,000 ms).
+const fn default_timeout_ms() -> u64 {
+    3_600_000
 }
 
 impl Default for ResourceRequirements {
     fn default() -> Self {
         Self {
-            memory_bytes: 512 * 1024 * 1024, // 512 MB
-            cpu_cores: 1.0,
-            timeout: Duration::from_secs(3600), // 1 hour
+            memory_bytes: default_memory_bytes(),
+            cpu_millicores: default_cpu_millicores(),
+            timeout_ms: default_timeout_ms(),
         }
+    }
+}
+
+impl ResourceRequirements {
+    /// Creates a new `ResourceRequirements` with the given values.
+    #[must_use]
+    pub fn new(memory_bytes: u64, cpu_millicores: u64, timeout_ms: u64) -> Self {
+        Self {
+            memory_bytes,
+            cpu_millicores,
+            timeout_ms,
+        }
+    }
+
+    /// Returns the timeout as a `Duration`.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms)
     }
 }
 
@@ -91,9 +149,10 @@ pub struct TaskSpec {
     pub asset_id: AssetId,
     /// Asset key (namespace.name).
     pub asset_key: AssetKey,
-    /// Partition key (if partitioned asset).
+    /// Typed partition key (if partitioned asset).
+    /// Uses `arco_core::partition::PartitionKey` for cross-language determinism.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub partition_key: Option<BTreeMap<String, String>>,
+    pub partition_key: Option<PartitionKey>,
     /// Upstream dependencies (task IDs that must complete first).
     #[serde(default)]
     pub upstream_task_ids: Vec<TaskId>,
@@ -368,7 +427,7 @@ impl PlanBuilder {
 struct StructuralTaskSpec {
     asset_key: AssetKey,
     #[serde(skip_serializing_if = "Option::is_none")]
-    partition_key: Option<BTreeMap<String, String>>,
+    partition_key: Option<PartitionKey>,
     upstream_asset_keys: Vec<String>,
     stage: u32,
     priority: i32,
@@ -421,6 +480,13 @@ fn compute_fingerprint(tasks: &[TaskSpec]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asset_key_canonical_string_uses_slash_separator() {
+        let key = AssetKey::new("raw", "events");
+        assert_eq!(key.canonical_string(), "raw/events");
+        assert_eq!(key.qualified_name(), "raw.events");
+    }
 
     #[test]
     fn plan_builder_creates_valid_plan() -> Result<()> {

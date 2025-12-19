@@ -1,0 +1,228 @@
+# Prometheus Alert Rules for Arco Flow Orchestration
+#
+# Deploy these rules to your Prometheus server or Alertmanager.
+# Adjust thresholds based on your SLOs and traffic patterns.
+
+groups:
+  - name: arco-flow-slos
+    rules:
+      # Task Failure Rate SLO: < 5% failure rate
+      - alert: ArcoFlowHighTaskFailureRate
+        expr: |
+          (
+            sum(rate(arco_flow_tasks_total{to_state="failed"}[5m]))
+            /
+            sum(rate(arco_flow_tasks_total{to_state=~"succeeded|failed"}[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: High task failure rate detected
+          description: |
+            Task failure rate is {{ $value | humanizePercentage }} (threshold: 5%).
+            Check worker logs and upstream data sources.
+          runbook_url: https://docs.arco.dev/runbooks/high-task-failure-rate
+
+      - alert: ArcoFlowCriticalTaskFailureRate
+        expr: |
+          (
+            sum(rate(arco_flow_tasks_total{to_state="failed"}[5m]))
+            /
+            sum(rate(arco_flow_tasks_total{to_state=~"succeeded|failed"}[5m]))
+          ) > 0.30
+        for: 2m
+        labels:
+          severity: critical
+          team: data-platform
+        annotations:
+          summary: Critical task failure rate - immediate attention required
+          description: |
+            Task failure rate is {{ $value | humanizePercentage }} (threshold: 30%).
+            Consider pausing affected pipelines.
+          runbook_url: https://docs.arco.dev/runbooks/high-task-failure-rate
+
+  - name: arco-flow-scheduler
+    rules:
+      # Scheduler Health
+      - alert: ArcoFlowSchedulerStalled
+        expr: |
+          rate(arco_flow_scheduler_tick_duration_seconds_count[5m]) < 0.1
+        for: 5m
+        labels:
+          severity: critical
+          team: data-platform
+        annotations:
+          summary: Scheduler is not making progress
+          description: |
+            Scheduler tick rate is {{ $value }}/s (expected: >0.1/s).
+            Tasks are not being scheduled. Check scheduler pod health.
+          runbook_url: https://docs.arco.dev/runbooks/scheduler-not-progressing
+
+      - alert: ArcoFlowSchedulerSlowTicks
+        expr: |
+          histogram_quantile(0.99, sum(rate(arco_flow_scheduler_tick_duration_seconds_bucket[5m])) by (le)) > 10
+        for: 5m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: Scheduler ticks are slow
+          description: |
+            P99 scheduler tick duration is {{ $value | humanizeDuration }}.
+            This may indicate database contention or high task volume.
+          runbook_url: https://docs.arco.dev/runbooks/scheduler-not-progressing
+
+  - name: arco-flow-tasks
+    rules:
+      # Task Latency SLO: P99 < 5 minutes
+      - alert: ArcoFlowTaskLatencySLO
+        expr: |
+          histogram_quantile(0.99, sum(rate(arco_flow_task_duration_seconds_bucket{state="succeeded"}[15m])) by (le)) > 300
+        for: 15m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: Task latency SLO at risk
+          description: |
+            P99 task duration is {{ $value | humanizeDuration }} (SLO: 5 minutes).
+            Check for resource constraints or slow dependencies.
+          runbook_url: https://docs.arco.dev/runbooks/high-task-failure-rate
+
+      # Stuck Tasks
+      - alert: ArcoFlowTasksStuckDispatched
+        expr: |
+          sum(increase(arco_flow_tasks_total{to_state="dispatched"}[5m])) > 0
+          and
+          sum(increase(arco_flow_tasks_total{to_state="running"}[5m])) == 0
+        for: 5m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: Tasks stuck in dispatched state
+          description: |
+            Tasks are being dispatched but not transitioning to running.
+            Check worker connectivity and Cloud Tasks queue.
+          runbook_url: https://docs.arco.dev/runbooks/task-stuck-dispatched
+
+      # Retry Storm
+      - alert: ArcoFlowRetryStorm
+        expr: |
+          sum(rate(arco_flow_retries_total[5m])) > 50
+        for: 5m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: High retry rate detected
+          description: |
+            Retry rate is {{ $value }}/s. This indicates systemic failures.
+            Investigate root cause before retries exhaust.
+          runbook_url: https://docs.arco.dev/runbooks/high-task-failure-rate
+
+  - name: arco-flow-capacity
+    rules:
+      # Queue Depth
+      - alert: ArcoFlowDispatchQueueBacklog
+        expr: |
+          sum(arco_flow_dispatch_queue_depth) > 1000
+        for: 10m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: Dispatch queue backlog building
+          description: |
+            Queue depth is {{ $value }} tasks.
+            Workers may be falling behind or Cloud Tasks is throttling.
+          runbook_url: https://docs.arco.dev/runbooks/scheduler-not-progressing
+
+      # Quota Saturation
+      - alert: ArcoFlowTenantQuotaSaturated
+        expr: |
+          arco_flow_quota_usage_ratio > 0.9
+        for: 10m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: Tenant quota nearly saturated
+          description: |
+            Tenant {{ $labels.tenant }} is at {{ $value | humanizePercentage }} quota usage.
+            Consider increasing quota or investigating high task volume.
+          runbook_url: https://docs.arco.dev/runbooks/scheduler-not-progressing
+
+      # Active Runs Limit
+      - alert: ArcoFlowHighActiveRuns
+        expr: |
+          sum(arco_flow_active_runs) by (tenant) > 100
+        for: 10m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: High number of active runs
+          description: |
+            Tenant {{ $labels.tenant }} has {{ $value }} active runs.
+            This may indicate stuck runs or excessive parallelism.
+          runbook_url: https://docs.arco.dev/runbooks/scheduler-not-progressing
+
+  - name: arco-flow-reliability
+    rules:
+      # Data Freshness SLO (if tracking via custom metric)
+      - alert: ArcoFlowDataFreshnessBreached
+        expr: |
+          arco_flow_asset_age_seconds > 3600
+        for: 15m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: Data freshness SLO breached
+          description: |
+            Asset {{ $labels.asset }} is {{ $value | humanizeDuration }} old (SLO: 1 hour).
+            Check upstream pipeline health.
+          runbook_url: https://docs.arco.dev/runbooks/high-task-failure-rate
+
+      # No Successful Tasks
+      - alert: ArcoFlowNoSuccessfulTasks
+        expr: |
+          sum(rate(arco_flow_tasks_total{to_state="succeeded"}[15m])) == 0
+          and
+          sum(arco_flow_active_runs) > 0
+        for: 15m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: No tasks succeeding despite active runs
+          description: |
+            Active runs exist but no tasks are completing successfully.
+            Investigate for systemic failures.
+          runbook_url: https://docs.arco.dev/runbooks/high-task-failure-rate
+
+# Recording rules for efficiency
+  - name: arco-flow-recording
+    rules:
+      - record: arco_flow:task_failure_rate:5m
+        expr: |
+          sum(rate(arco_flow_tasks_total{to_state="failed"}[5m]))
+          /
+          sum(rate(arco_flow_tasks_total{to_state=~"succeeded|failed"}[5m]))
+
+      - record: arco_flow:task_success_rate:5m
+        expr: |
+          sum(rate(arco_flow_tasks_total{to_state="succeeded"}[5m]))
+          /
+          sum(rate(arco_flow_tasks_total{to_state=~"succeeded|failed"}[5m]))
+
+      - record: arco_flow:task_duration_p99:5m
+        expr: |
+          histogram_quantile(0.99, sum(rate(arco_flow_task_duration_seconds_bucket[5m])) by (le))
+
+      - record: arco_flow:scheduler_tick_p99:5m
+        expr: |
+          histogram_quantile(0.99, sum(rate(arco_flow_scheduler_tick_duration_seconds_bucket[5m])) by (le))

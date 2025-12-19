@@ -13,7 +13,7 @@
 //! - Work conservation: Idle tenant capacity is redistributed
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::task::TaskExecution;
 
@@ -27,7 +27,7 @@ pub struct TenantEntry {
     /// Weight (quantum added per round).
     pub weight: u32,
     /// Ready tasks for this tenant.
-    pub tasks: Vec<TaskExecution>,
+    pub tasks: VecDeque<TaskExecution>,
 }
 
 impl TenantEntry {
@@ -38,7 +38,7 @@ impl TenantEntry {
             tenant_id: tenant_id.into(),
             deficit: 0,
             weight,
-            tasks: Vec::new(),
+            tasks: VecDeque::new(),
         }
     }
 }
@@ -104,8 +104,6 @@ pub struct DispatchSelection {
 pub struct DrrScheduler {
     /// Tenant entries by tenant ID.
     tenants: HashMap<String, TenantEntry>,
-    /// Whether a scheduling round has been started.
-    round_started: bool,
 }
 
 impl Default for DrrScheduler {
@@ -120,7 +118,6 @@ impl DrrScheduler {
     pub fn new() -> Self {
         Self {
             tenants: HashMap::new(),
-            round_started: false,
         }
     }
 
@@ -142,15 +139,13 @@ impl DrrScheduler {
             .entry(tenant_id.clone())
             .or_insert_with(|| TenantEntry::new(tenant_id, weight));
 
+        entry.weight = weight;
         entry.tasks.extend(tasks);
-        // Reset round state when new tasks arrive
-        self.round_started = false;
     }
 
     /// Clears all tasks and deficits.
     pub fn clear(&mut self) {
         self.tenants.clear();
-        self.round_started = false;
     }
 
     /// Returns the number of tenants with tasks.
@@ -174,7 +169,6 @@ impl DrrScheduler {
                 entry.deficit += i64::from(entry.weight);
             }
         }
-        self.round_started = true;
     }
 
     /// Selects the next task to dispatch using DRR algorithm.
@@ -182,10 +176,6 @@ impl DrrScheduler {
     /// Returns `None` if no tasks are available.
     #[must_use]
     pub fn select_next(&mut self) -> Option<DispatchSelection> {
-        if !self.round_started {
-            self.start_round();
-        }
-
         // Find tenant with highest deficit that has tasks
         // Use deterministic selection by collecting and sorting
         let mut candidates: Vec<_> = self
@@ -196,6 +186,21 @@ impl DrrScheduler {
 
         if candidates.is_empty() {
             return None;
+        }
+
+        let max_deficit = candidates
+            .iter()
+            .map(|entry| entry.deficit)
+            .max()
+            .unwrap_or(0);
+
+        if max_deficit <= 0 {
+            self.start_round();
+            candidates = self
+                .tenants
+                .values()
+                .filter(|t| !t.tasks.is_empty())
+                .collect();
         }
 
         // Sort by (deficit DESC, tenant_id ASC) for determinism
@@ -209,13 +214,8 @@ impl DrrScheduler {
 
         // Take one task from the selected tenant
         let entry = self.tenants.get_mut(&selected_tenant_id)?;
-        let task = entry.tasks.remove(0);
+        let task = entry.tasks.pop_front()?;
         entry.deficit -= 1;
-
-        // If tenant has no more tasks and deficit <= 0, we can start a new round next time
-        if entry.tasks.is_empty() {
-            self.round_started = false;
-        }
 
         Some(DispatchSelection {
             task,
@@ -343,13 +343,32 @@ mod tests {
             *counts.entry(sel.tenant_id.clone()).or_default() += 1;
         }
 
-        // With 2:1 weights, tenant-a should get ~4 and tenant-b ~2
-        let a_count = *counts.get("tenant-a").unwrap_or(&0);
-        let b_count = *counts.get("tenant-b").unwrap_or(&0);
+        // With 2:1 weights, tenant-a should get exactly 4 and tenant-b exactly 2
+        // DRR is deterministic: each round adds quantum, then selects from highest deficit
+        assert_eq!(counts.get("tenant-a"), Some(&4));
+        assert_eq!(counts.get("tenant-b"), Some(&2));
+    }
 
-        // Allow some flexibility due to round boundaries
-        assert!(a_count >= 3 && a_count <= 5, "tenant-a got {a_count}");
-        assert!(b_count >= 1 && b_count <= 3, "tenant-b got {b_count}");
+    #[test]
+    fn drr_weighted_fairness_long_run() {
+        let mut drr = DrrScheduler::new();
+
+        let tasks_a: Vec<_> = (0..100).map(|_| make_task(0)).collect();
+        let tasks_b: Vec<_> = (0..100).map(|_| make_task(0)).collect();
+
+        drr.add_ready_tasks("tenant-a", 3, tasks_a);
+        drr.add_ready_tasks("tenant-b", 1, tasks_b);
+
+        let selections = drr.select_batch(80);
+        assert_eq!(selections.len(), 80);
+
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for sel in &selections {
+            *counts.entry(sel.tenant_id.clone()).or_default() += 1;
+        }
+
+        assert_eq!(counts.get("tenant-a"), Some(&60));
+        assert_eq!(counts.get("tenant-b"), Some(&20));
     }
 
     #[test]
@@ -461,5 +480,30 @@ mod tests {
         // After second selection
         let _ = drr.select_next();
         assert_eq!(drr.get_deficit("tenant-a"), 1);
+    }
+
+    #[test]
+    fn drr_updates_weight_for_existing_tenant() {
+        let mut drr = DrrScheduler::new();
+
+        let tasks_a: Vec<_> = (0..8).map(|_| make_task(0)).collect();
+        let tasks_b: Vec<_> = (0..8).map(|_| make_task(0)).collect();
+
+        drr.add_ready_tasks("tenant-a", 1, tasks_a);
+        drr.add_ready_tasks("tenant-b", 1, tasks_b);
+
+        // Update tenant-a weight to 3 without adding tasks.
+        drr.add_ready_tasks("tenant-a", 3, Vec::new());
+
+        let selections = drr.select_batch(8);
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for sel in &selections {
+            *counts.entry(sel.tenant_id.clone()).or_default() += 1;
+        }
+
+        let a_count = *counts.get("tenant-a").unwrap_or(&0);
+        let b_count = *counts.get("tenant-b").unwrap_or(&0);
+
+        assert!(a_count > b_count, "expected tenant-a to receive more tasks");
     }
 }

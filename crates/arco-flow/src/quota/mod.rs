@@ -133,6 +133,24 @@ pub trait QuotaManager: Send + Sync {
     /// - `QuotaDecision::Denied` with reason if quota would be exceeded
     async fn can_dispatch(&self, tenant_id: &str, task_count: usize) -> Result<QuotaDecision>;
 
+    /// Atomically checks and reserves quota for the specified number of tasks.
+    ///
+    /// # Safety
+    ///
+    /// **Production implementations MUST override this method** to provide
+    /// atomic check-and-reserve semantics. The default implementation composes
+    /// `can_dispatch` + `record_dispatch` which has a TOCTOU race condition
+    /// that can cause quota oversubscription under concurrent access.
+    ///
+    /// The default is provided only for simple single-threaded test scenarios.
+    async fn try_dispatch(&self, tenant_id: &str, task_count: usize) -> Result<QuotaDecision> {
+        let decision = self.can_dispatch(tenant_id, task_count).await?;
+        if decision.is_allowed() {
+            self.record_dispatch(tenant_id, task_count).await?;
+        }
+        Ok(decision)
+    }
+
     /// Records that tasks have been dispatched for a tenant.
     ///
     /// This should be called after successful dispatch to update

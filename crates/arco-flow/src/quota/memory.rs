@@ -159,15 +159,75 @@ impl QuotaManager for InMemoryQuotaManager {
         }
     }
 
+    async fn try_dispatch(&self, tenant_id: &str, task_count: usize) -> Result<QuotaDecision> {
+        let mut tenants = self.tenants.write().map_err(poison_err)?;
+
+        if let Some(state) = tenants.get_mut(tenant_id) {
+            let limit = state.quota.max_concurrent_tasks;
+            let allowed = state
+                .active_tasks
+                .checked_add(task_count)
+                .is_some_and(|new_total| new_total <= limit);
+
+            if allowed {
+                state.active_tasks = state.active_tasks.saturating_add(task_count);
+                return Ok(QuotaDecision::Allowed);
+            }
+
+            return Ok(QuotaDecision::Denied {
+                reason: QuotaDenialReason::MaxConcurrentTasks {
+                    current: state.active_tasks,
+                    limit,
+                },
+            });
+        }
+
+        let Some(default_quota) = self.default_quota.clone() else {
+            return Ok(QuotaDecision::Denied {
+                reason: QuotaDenialReason::UnknownTenant,
+            });
+        };
+
+        let limit = default_quota.max_concurrent_tasks;
+        let allowed = task_count <= limit;
+        if !allowed {
+            return Ok(QuotaDecision::Denied {
+                reason: QuotaDenialReason::MaxConcurrentTasks { current: 0, limit },
+            });
+        }
+
+        tenants.insert(
+            tenant_id.to_string(),
+            TenantState {
+                quota: default_quota,
+                active_tasks: task_count,
+            },
+        );
+        drop(tenants);
+
+        Ok(QuotaDecision::Allowed)
+    }
+
     async fn record_dispatch(&self, tenant_id: &str, task_count: usize) -> Result<()> {
         let mut tenants = self.tenants.write().map_err(poison_err)?;
 
-        let state = tenants.entry(tenant_id.to_string()).or_insert_with(|| {
-            TenantState {
-                quota: self.default_quota.clone().unwrap_or_default(),
-                active_tasks: 0,
-            }
-        });
+        let state = if let Some(state) = tenants.get_mut(tenant_id) {
+            state
+        } else {
+            let default_quota = self.default_quota.clone().ok_or_else(|| {
+                Error::configuration(format!("unknown tenant: {tenant_id}"))
+            })?;
+            tenants.insert(
+                tenant_id.to_string(),
+                TenantState {
+                    quota: default_quota,
+                    active_tasks: 0,
+                },
+            );
+            tenants
+                .get_mut(tenant_id)
+                .ok_or_else(|| Error::storage("failed to initialize tenant state"))?
+        };
 
         state.active_tasks = state.active_tasks.saturating_add(task_count);
         drop(tenants);
@@ -232,6 +292,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn try_dispatch_reserves_quota() -> Result<()> {
+        let manager = InMemoryQuotaManager::with_quotas(vec![(
+            "tenant-1".to_string(),
+            TenantQuota::new(5),
+        )]);
+
+        let decision = manager.try_dispatch("tenant-1", 3).await?;
+        assert!(decision.is_allowed());
+        assert_eq!(manager.active_tasks("tenant-1").await?, 3);
+
+        let decision = manager.try_dispatch("tenant-1", 3).await?;
+        assert!(!decision.is_allowed());
+        assert_eq!(manager.active_tasks("tenant-1").await?, 3);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn try_dispatch_unknown_tenant_default_quota() -> Result<()> {
+        let manager = InMemoryQuotaManager::with_default_quota(TenantQuota::new(4));
+
+        let decision = manager.try_dispatch("tenant-new", 2).await?;
+        assert!(decision.is_allowed());
+        assert_eq!(manager.active_tasks("tenant-new").await?, 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn denies_dispatch_over_quota() -> Result<()> {
         let manager = InMemoryQuotaManager::with_quotas(vec![(
             "tenant-1".to_string(),
@@ -271,6 +360,14 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn record_dispatch_unknown_tenant_without_default_fails() {
+        let manager = InMemoryQuotaManager::new();
+
+        let result = manager.record_dispatch("unknown", 1).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

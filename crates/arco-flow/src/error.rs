@@ -94,6 +94,20 @@ pub enum Error {
         message: String,
     },
 
+    /// A configuration error occurred.
+    #[error("configuration error: {message}")]
+    Configuration {
+        /// Description of the configuration failure.
+        message: String,
+    },
+
+    /// A dispatch error occurred (task queue operation failed).
+    #[error("dispatch error: {message}")]
+    Dispatch {
+        /// Description of the dispatch failure.
+        message: String,
+    },
+
     /// An error from arco-core.
     #[error("core error: {0}")]
     Core(#[from] arco_core::error::Error),
@@ -118,6 +132,30 @@ impl Error {
         Self::Storage {
             message: message.into(),
             source: Some(Box::new(source)),
+        }
+    }
+
+    /// Creates a new serialization error.
+    #[must_use]
+    pub fn serialization(message: impl Into<String>) -> Self {
+        Self::Serialization {
+            message: message.into(),
+        }
+    }
+
+    /// Creates a new configuration error.
+    #[must_use]
+    pub fn configuration(message: impl Into<String>) -> Self {
+        Self::Configuration {
+            message: message.into(),
+        }
+    }
+
+    /// Creates a new dispatch error.
+    #[must_use]
+    pub fn dispatch(message: impl Into<String>) -> Self {
+        Self::Dispatch {
+            message: message.into(),
         }
     }
 }

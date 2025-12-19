@@ -8,8 +8,9 @@
 //! - **NOT suitable for production**: No persistence, no distribution
 //! - **Single-process only**: Tasks are not visible across process boundaries
 //! - **No delay support**: Delay option is accepted but ignored
+//! - **Deduplication is queue-scoped**: Keys are released when tasks are dequeued
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{PoisonError, RwLock};
 
 use async_trait::async_trait;
@@ -23,10 +24,19 @@ use crate::error::{Error, Result};
 pub struct QueueEntry {
     /// Message ID.
     pub message_id: String,
+    /// Idempotency key for deduplication.
+    pub idempotency_key: String,
     /// Task envelope.
     pub envelope: TaskEnvelope,
     /// Options used when enqueuing.
     pub options: EnqueueOptions,
+}
+
+/// Internal queue state protected by a single lock.
+#[derive(Debug, Default)]
+struct QueueState {
+    queue: VecDeque<QueueEntry>,
+    seen_keys: HashMap<String, String>,
 }
 
 /// In-memory task queue for testing.
@@ -45,9 +55,7 @@ pub struct QueueEntry {
 #[derive(Debug)]
 pub struct InMemoryTaskQueue {
     name: String,
-    queue: RwLock<VecDeque<QueueEntry>>,
-    /// Set of idempotency keys for deduplication.
-    seen_keys: RwLock<HashSet<String>>,
+    state: RwLock<QueueState>,
     /// Maximum queue capacity.
     max_capacity: Option<usize>,
 }
@@ -69,8 +77,7 @@ impl InMemoryTaskQueue {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            queue: RwLock::new(VecDeque::new()),
-            seen_keys: RwLock::new(HashSet::new()),
+            state: RwLock::new(QueueState::default()),
             max_capacity: None,
         }
     }
@@ -80,8 +87,7 @@ impl InMemoryTaskQueue {
     pub fn with_capacity(name: impl Into<String>, max_capacity: usize) -> Self {
         Self {
             name: name.into(),
-            queue: RwLock::new(VecDeque::new()),
-            seen_keys: RwLock::new(HashSet::new()),
+            state: RwLock::new(QueueState::default()),
             max_capacity: Some(max_capacity),
         }
     }
@@ -99,8 +105,13 @@ impl InMemoryTaskQueue {
     ///
     /// Returns an error if the lock is poisoned.
     pub fn take(&self) -> Result<Option<QueueEntry>> {
-        let mut queue = self.queue.write().map_err(poison_err)?;
-        Ok(queue.pop_front())
+        let mut state = self.state.write().map_err(poison_err)?;
+        let entry = state.queue.pop_front();
+        if let Some(ref entry) = entry {
+            state.seen_keys.remove(&entry.idempotency_key);
+        }
+        drop(state);
+        Ok(entry)
     }
 
     /// Peeks at the next task without removing it.
@@ -109,8 +120,8 @@ impl InMemoryTaskQueue {
     ///
     /// Returns an error if the lock is poisoned.
     pub fn peek(&self) -> Result<Option<QueueEntry>> {
-        let queue = self.queue.read().map_err(poison_err)?;
-        Ok(queue.front().cloned())
+        let state = self.state.read().map_err(poison_err)?;
+        Ok(state.queue.front().cloned())
     }
 
     /// Returns all enqueued tasks.
@@ -119,8 +130,13 @@ impl InMemoryTaskQueue {
     ///
     /// Returns an error if the lock is poisoned.
     pub fn drain(&self) -> Result<Vec<QueueEntry>> {
-        let mut queue = self.queue.write().map_err(poison_err)?;
-        Ok(queue.drain(..).collect())
+        let mut state = self.state.write().map_err(poison_err)?;
+        let drained: Vec<_> = state.queue.drain(..).collect();
+        for entry in &drained {
+            state.seen_keys.remove(&entry.idempotency_key);
+        }
+        drop(state);
+        Ok(drained)
     }
 
     /// Clears the queue and deduplication state.
@@ -129,14 +145,10 @@ impl InMemoryTaskQueue {
     ///
     /// Returns an error if the lock is poisoned.
     pub fn clear(&self) -> Result<()> {
-        {
-            let mut queue = self.queue.write().map_err(poison_err)?;
-            queue.clear();
-        }
-        {
-            let mut seen = self.seen_keys.write().map_err(poison_err)?;
-            seen.clear();
-        }
+        let mut state = self.state.write().map_err(poison_err)?;
+        state.queue.clear();
+        state.seen_keys.clear();
+        drop(state);
         Ok(())
     }
 }
@@ -146,52 +158,38 @@ impl TaskQueue for InMemoryTaskQueue {
     async fn enqueue(&self, envelope: TaskEnvelope, options: EnqueueOptions) -> Result<EnqueueResult> {
         let idempotency_key = envelope.idempotency_key();
 
-        // Check deduplication
-        {
-            let seen = self.seen_keys.read().map_err(poison_err)?;
-            if seen.contains(&idempotency_key) {
-                drop(seen);
-                // Return the existing message ID (we don't track it, so generate a placeholder)
-                return Ok(EnqueueResult::Deduplicated {
-                    existing_message_id: format!("dedup-{idempotency_key}"),
-                });
-            }
-        }
+        let mut state = self.state.write().map_err(poison_err)?;
 
-        // Check capacity
-        {
-            let queue = self.queue.read().map_err(poison_err)?;
-            if let Some(max) = self.max_capacity {
-                if queue.len() >= max {
-                    drop(queue);
-                    return Ok(EnqueueResult::QueueFull);
-                }
-            }
-        }
-
-        // Enqueue the task
-        let message_id = Self::generate_message_id();
-
-        {
-            let mut seen = self.seen_keys.write().map_err(poison_err)?;
-            seen.insert(idempotency_key);
-        }
-
-        {
-            let mut queue = self.queue.write().map_err(poison_err)?;
-            queue.push_back(QueueEntry {
-                message_id: message_id.clone(),
-                envelope,
-                options,
+        if let Some(existing) = state.seen_keys.get(&idempotency_key) {
+            return Ok(EnqueueResult::Deduplicated {
+                existing_message_id: existing.clone(),
             });
         }
+
+        if let Some(max) = self.max_capacity {
+            if state.queue.len() >= max {
+                return Ok(EnqueueResult::QueueFull);
+            }
+        }
+
+        let message_id = Self::generate_message_id();
+        state
+            .seen_keys
+            .insert(idempotency_key.clone(), message_id.clone());
+        state.queue.push_back(QueueEntry {
+            message_id: message_id.clone(),
+            idempotency_key,
+            envelope,
+            options,
+        });
+        drop(state);
 
         Ok(EnqueueResult::Enqueued { message_id })
     }
 
     async fn queue_depth(&self) -> Result<usize> {
-        let queue = self.queue.read().map_err(poison_err)?;
-        Ok(queue.len())
+        let state = self.state.read().map_err(poison_err)?;
+        Ok(state.queue.len())
     }
 
     fn queue_name(&self) -> &str {
@@ -228,6 +226,7 @@ mod tests {
         let queue = InMemoryTaskQueue::new("test");
 
         let envelope = create_test_envelope();
+        let envelope_clone = envelope.clone();
         let task_id = envelope.task_id;
 
         let result = queue.enqueue(envelope, EnqueueOptions::default()).await?;
@@ -238,6 +237,12 @@ mod tests {
 
         // Queue should be empty now
         assert!(queue.take()?.is_none());
+
+        // Dedup key should be released after take
+        let result = queue
+            .enqueue(envelope_clone, EnqueueOptions::default())
+            .await?;
+        assert!(result.is_enqueued());
 
         Ok(())
     }
@@ -252,11 +257,22 @@ mod tests {
         // First enqueue succeeds
         let result1 = queue.enqueue(envelope, EnqueueOptions::default()).await?;
         assert!(result1.is_enqueued());
+        let first_message_id = match result1 {
+            EnqueueResult::Enqueued { message_id } => message_id,
+            _ => return Err(Error::dispatch("expected Enqueued result")),
+        };
 
         // Second enqueue with same idempotency key is deduplicated
         let result2 = queue.enqueue(envelope2, EnqueueOptions::default()).await?;
         assert!(!result2.is_enqueued());
-        assert!(matches!(result2, EnqueueResult::Deduplicated { .. }));
+        if let EnqueueResult::Deduplicated {
+            existing_message_id,
+        } = result2
+        {
+            assert_eq!(existing_message_id, first_message_id);
+        } else {
+            panic!("Expected Deduplicated");
+        }
 
         // Only one task in queue
         assert_eq!(queue.queue_depth().await?, 1);

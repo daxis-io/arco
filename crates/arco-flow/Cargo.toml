@@ -18,7 +18,7 @@ workspace = true
 [features]
 default = []
 full = ["gcp", "aws", "azure"]
-gcp = ["arco-core/gcp"]
+gcp = ["arco-core/gcp", "dep:reqwest", "dep:gcp_auth", "dep:base64"]
 aws = ["arco-core/aws"]
 azure = ["arco-core/azure"]
 test-utils = ["arco-core/test-utils", "dep:proptest", "dep:tempfile"]
@@ -39,8 +39,9 @@ bytes = { workspace = true }
 # Error handling
 thiserror = { workspace = true }
 
-# Logging
+# Logging and metrics
 tracing = { workspace = true }
+metrics = { workspace = true }
 
 # Time
 chrono = { workspace = true }
@@ -59,6 +60,11 @@ ulid = { workspace = true }
 # Optional test utilities
 proptest = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
+
+# Optional GCP Cloud Tasks support
+reqwest = { workspace = true, optional = true }
+gcp_auth = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

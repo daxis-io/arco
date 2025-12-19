@@ -257,6 +257,24 @@ impl TaskState {
         }
     }
 
+    /// Returns a lowercase label suitable for metrics and logs.
+    #[must_use]
+    pub const fn as_label(&self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Queued => "queued",
+            Self::Dispatched => "dispatched",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+            Self::Cancelled => "cancelled",
+            Self::RetryWait => "retry_wait",
+        }
+    }
+
     /// Returns all valid target states from the current state.
     #[must_use]
     pub fn valid_transitions(&self) -> Vec<Self> {

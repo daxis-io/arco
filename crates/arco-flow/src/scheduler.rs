@@ -6,7 +6,7 @@
 //! - **Dependency ordering**: Tasks wait for their dependencies
 //! - **Fault tolerance**: Failed tasks skip downstream, continue independent branches
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -14,13 +14,18 @@ use sha2::{Digest, Sha256};
 
 use arco_core::{RunId, TaskId};
 
+use crate::dispatch::{EnqueueOptions, EnqueueResult, TaskEnvelope, TaskQueue};
 use crate::error::{Error, Result};
 use crate::events::EventBuilder;
+use crate::metrics::{time_scheduler_tick, FlowMetrics};
 use crate::outbox::EventSink;
 use crate::plan::{Plan, TaskSpec};
+use crate::quota::drr::FairTaskSelector;
+use crate::quota::{QuotaDecision, QuotaManager};
 use crate::run::{Run, RunState, RunTrigger};
 use crate::runner::TaskResult;
 use crate::task::{TaskError, TaskErrorCategory, TaskState};
+use crate::task_key::TaskKey;
 
 /// Scheduler configuration.
 #[derive(Debug, Clone)]
@@ -109,6 +114,35 @@ fn deterministic_full_jitter(
     let range = max_ms.saturating_add(1);
     let jitter_ms = if range == 0 { value } else { value % range };
     Duration::from_millis(jitter_ms)
+}
+
+/// Summary of a dispatch attempt.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchReport {
+    /// Number of tasks considered for dispatch.
+    pub attempted: usize,
+    /// Number of tasks successfully enqueued.
+    pub enqueued: usize,
+    /// Number of tasks deduplicated by the queue.
+    pub deduplicated: usize,
+    /// Number of tasks rejected due to queue capacity.
+    pub queue_full: usize,
+    /// Number of tasks rejected due to quota.
+    pub quota_denied: usize,
+    /// Number of tasks that failed to dispatch due to errors.
+    pub errors: usize,
+}
+
+impl DispatchReport {
+    /// Returns total tasks accepted by the queue (enqueued + deduplicated).
+    #[must_use]
+    pub const fn accepted(&self) -> usize {
+        self.enqueued + self.deduplicated
+    }
+}
+
+fn record_transition(metrics: &FlowMetrics, tenant: &str, from: TaskState, to: TaskState) {
+    metrics.record_task_transition(tenant, from.as_label(), to.as_label());
 }
 
 /// Scheduler for executing plans.
@@ -214,6 +248,142 @@ impl Scheduler {
         ready_tasks.into_iter().take(available_slots).collect()
     }
 
+    /// Dispatches ready tasks to a task queue with quota enforcement and fairness.
+    ///
+    /// This method:
+    /// - Selects ready tasks with DRR fairness (by tenant)
+    /// - Reserves quota before dispatch
+    /// - Enqueues tasks to the provided queue
+    /// - Transitions tasks to `Queued` on successful enqueue
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if enqueueing or state transitions fail unexpectedly.
+    #[tracing::instrument(
+        skip(self, run, queue, quota, outbox),
+        fields(run_id = %run.id, tenant_id = %run.tenant_id)
+    )]
+    pub async fn dispatch_ready_tasks<Q, M>(
+        &self,
+        run: &mut Run,
+        queue: &Q,
+        quota: &M,
+        outbox: &mut impl EventSink,
+    ) -> Result<DispatchReport>
+    where
+        Q: TaskQueue,
+        M: QuotaManager,
+    {
+        let _tick = time_scheduler_tick();
+        let metrics = FlowMetrics::new();
+
+        let ready_specs = self.get_ready_tasks(run);
+        let mut report = DispatchReport {
+            attempted: ready_specs.len(),
+            ..DispatchReport::default()
+        };
+
+        if ready_specs.is_empty() {
+            self.record_queue_depth(queue, &metrics).await;
+            self.record_quota_usage(quota, &run.tenant_id, &metrics).await;
+            return Ok(report);
+        }
+
+        let mut spec_by_id = HashMap::with_capacity(ready_specs.len());
+        let mut ready_execs = Vec::with_capacity(ready_specs.len());
+        for spec in ready_specs {
+            spec_by_id.insert(spec.task_id, spec);
+            let exec = run
+                .get_task(&spec.task_id)
+                .ok_or(Error::TaskNotFound {
+                    task_id: spec.task_id,
+                })?;
+            ready_execs.push(exec.clone());
+        }
+
+        let weight = quota
+            .get_quota(&run.tenant_id)
+            .await?
+            .map_or(1, |q| q.weight);
+
+        let mut selector = FairTaskSelector::new();
+        selector.add_tenant_tasks(&run.tenant_id, weight, ready_execs);
+
+        let selections = selector.select_fair(spec_by_id.len());
+
+        for selection in selections {
+            let task_id = selection.task.task_id;
+            let Some(spec) = spec_by_id.get(&task_id) else {
+                report.errors += 1;
+                metrics.record_dispatch(&run.tenant_id, "error");
+                continue;
+            };
+
+            let decision = quota.try_dispatch(&run.tenant_id, 1).await?;
+            if matches!(decision, QuotaDecision::Denied { .. }) {
+                report.quota_denied += 1;
+                metrics.record_dispatch(&run.tenant_id, "quota_denied");
+                continue;
+            }
+
+            let attempt = run
+                .get_task(&task_id)
+                .map_or(1, |exec| exec.attempt);
+            let envelope = Self::build_task_envelope(run, spec, attempt);
+            let options = Self::enqueue_options_for(spec);
+
+            let enqueue_result = queue.enqueue(envelope, options).await;
+            let enqueue_result = match enqueue_result {
+                Ok(result) => result,
+                Err(err) => {
+                    report.errors += 1;
+                    metrics.record_dispatch(&run.tenant_id, "failure");
+                    let _ = quota.record_completion(&run.tenant_id, 1).await;
+                    return Err(err);
+                }
+            };
+
+            match enqueue_result {
+                EnqueueResult::QueueFull => {
+                    report.queue_full += 1;
+                    metrics.record_dispatch(&run.tenant_id, "failure");
+                    let _ = quota.record_completion(&run.tenant_id, 1).await;
+                    continue;
+                }
+                EnqueueResult::Enqueued { .. } => {
+                    report.enqueued += 1;
+                    metrics.record_dispatch(&run.tenant_id, "success");
+                }
+                EnqueueResult::Deduplicated { .. } => {
+                    report.deduplicated += 1;
+                    metrics.record_dispatch(&run.tenant_id, "deduplicated");
+                }
+            }
+
+            match run.get_task(&task_id).map(|exec| exec.state) {
+                Some(TaskState::Queued) => {
+                    let _ = quota.record_completion(&run.tenant_id, 1).await;
+                }
+                Some(TaskState::Pending | TaskState::Ready) => {
+                    if let Err(err) = self.queue_task(run, &task_id, outbox) {
+                        report.errors += 1;
+                        let _ = quota.record_completion(&run.tenant_id, 1).await;
+                        return Err(err);
+                    }
+                }
+                _ => {
+                    report.errors += 1;
+                    let _ = quota.record_completion(&run.tenant_id, 1).await;
+                }
+            }
+        }
+
+        self.record_queue_depth(queue, &metrics).await;
+        self.record_quota_usage(quota, &run.tenant_id, &metrics).await;
+
+        Ok(report)
+    }
+
     /// Processes task completion and cascades effects to downstream tasks.
     ///
     /// If a task fails and `continue_on_failure` is true, all downstream
@@ -259,6 +429,7 @@ impl Scheduler {
 
     /// Skips all tasks that depend on the given task (directly or transitively).
     fn skip_downstream_tasks(&self, run: &mut Run, failed_task_id: &TaskId) -> Vec<TaskId> {
+        let metrics = FlowMetrics::new();
         let mut visited: HashSet<TaskId> = HashSet::new();
         let mut frontier: Vec<TaskId> = vec![*failed_task_id];
         let mut skipped_in_order = Vec::new();
@@ -275,7 +446,9 @@ impl Scheduler {
 
                 if let Some(exec) = run.get_task_mut(&task.task_id) {
                     if exec.state == TaskState::Pending {
+                        let from_state = exec.state;
                         let _ = exec.skip();
+                        record_transition(&metrics, &run.tenant_id, from_state, TaskState::Skipped);
                         skipped_in_order.push(task.task_id);
                     }
                 }
@@ -299,6 +472,8 @@ impl Scheduler {
         task_id: &TaskId,
         outbox: &mut impl EventSink,
     ) -> Result<()> {
+        let metrics = FlowMetrics::new();
+        let tenant_id = run.tenant_id.clone();
         let is_ready = run.ready_tasks(&self.plan).contains(task_id);
 
         let attempt = {
@@ -316,10 +491,14 @@ impl Scheduler {
             }
 
             if exec.state == TaskState::Pending {
+                let from_state = exec.state;
                 exec.transition_to(TaskState::Ready)?;
+                record_transition(&metrics, &tenant_id, from_state, TaskState::Ready);
             }
 
+            let from_state = exec.state;
             exec.transition_to(TaskState::Queued)?;
+            record_transition(&metrics, &tenant_id, from_state, TaskState::Queued);
             exec.attempt
         };
 
@@ -348,12 +527,21 @@ impl Scheduler {
         worker_id: &str,
         outbox: &mut impl EventSink,
     ) -> Result<()> {
+        let metrics = FlowMetrics::new();
+        let tenant_id = run.tenant_id.clone();
         let attempt = {
             let exec = run
                 .get_task_mut(task_id)
                 .ok_or(Error::TaskNotFound { task_id: *task_id })?;
 
+            let from_state = exec.state;
             exec.transition_to(TaskState::Dispatched)?;
+            record_transition(
+                &metrics,
+                &tenant_id,
+                from_state,
+                TaskState::Dispatched,
+            );
             exec.worker_id = Some(worker_id.to_string());
             exec.attempt
         };
@@ -375,7 +563,9 @@ impl Scheduler {
             let exec = run
                 .get_task_mut(task_id)
                 .ok_or(Error::TaskNotFound { task_id: *task_id })?;
+            let from_state = exec.state;
             exec.transition_to(TaskState::Running)?;
+            record_transition(&metrics, &tenant_id, from_state, TaskState::Running);
         }
 
         emit_sequenced(
@@ -471,6 +661,7 @@ impl Scheduler {
     /// Returns an error if the run cannot be cancelled.
     #[tracing::instrument(skip(self, run, outbox), fields(run_id = %run.id))]
     pub fn cancel_run(&self, run: &mut Run, outbox: &mut impl EventSink) -> Result<()> {
+        let metrics = FlowMetrics::new();
         if run.state != RunState::Cancelling {
             run.transition_to(RunState::Cancelling)?;
         }
@@ -481,8 +672,10 @@ impl Scheduler {
                 exec.state,
                 TaskState::Pending | TaskState::Ready | TaskState::Queued
             ) {
+                let from_state = exec.state;
                 cancelled.push((exec.task_id, exec.attempt));
                 let _ = exec.cancel();
+                record_transition(&metrics, &run.tenant_id, from_state, TaskState::Cancelled);
             }
         }
 
@@ -543,13 +736,13 @@ impl Scheduler {
     ) -> Result<()> {
         match result {
             TaskResult::Succeeded(output) => {
-                Self::record_task_success(run, task_id, output, outbox)?;
+                self.record_task_success(run, task_id, output, outbox)?;
             }
             TaskResult::Failed(error) => {
                 self.record_task_failure(run, task_id, error, outbox)?;
             }
             TaskResult::Cancelled => {
-                Self::record_task_cancelled(run, task_id, outbox)?;
+                self.record_task_cancelled(run, task_id, outbox)?;
             }
         };
 
@@ -557,22 +750,35 @@ impl Scheduler {
     }
 
     fn record_task_success(
+        &self,
         run: &mut Run,
         task_id: &TaskId,
         output: crate::task::TaskOutput,
         outbox: &mut impl EventSink,
     ) -> Result<()> {
-        let (attempt, materialization_id, row_count, byte_size) = {
+        let metrics = FlowMetrics::new();
+        let (attempt, materialization_id, row_count, byte_size, from_state, duration_ms) = {
             let exec = run
                 .get_task_mut(task_id)
                 .ok_or(Error::TaskNotFound { task_id: *task_id })?;
+            let from_state = exec.state;
             let attempt = exec.attempt;
             let materialization_id = output.materialization_id;
             let row_count = output.row_count;
             let byte_size = output.byte_size;
             exec.succeed(output)?;
-            (attempt, materialization_id, row_count, byte_size)
+            (
+                attempt,
+                materialization_id,
+                row_count,
+                byte_size,
+                from_state,
+                exec.metrics.duration_ms,
+            )
         };
+
+        record_transition(&metrics, &run.tenant_id, from_state, TaskState::Succeeded);
+        self.record_task_duration(&metrics, task_id, TaskState::Succeeded, duration_ms);
 
         emit_sequenced(
             run,
@@ -611,13 +817,16 @@ impl Scheduler {
         error: TaskError,
         outbox: &mut impl EventSink,
     ) -> Result<()> {
+        let metrics = FlowMetrics::new();
         let run_id = run.id;
-        let (attempt, retry_at, backoff) = {
+        let (attempt, retry_at, backoff, duration_ms, from_state) = {
             let exec = run
                 .get_task_mut(task_id)
                 .ok_or(Error::TaskNotFound { task_id: *task_id })?;
+            let from_state = exec.state;
             let attempt = exec.attempt;
             exec.fail(error.clone())?;
+            let duration_ms = exec.metrics.duration_ms;
             if self.config.retry_policy.enabled && error.retryable && exec.can_retry() {
                 let now = Utc::now();
                 let backoff = self
@@ -630,11 +839,20 @@ impl Scheduler {
                 exec.transition_to(TaskState::RetryWait)?;
                 exec.retry_at = Some(retry_at);
 
-                (attempt, Some(retry_at), Some(backoff))
+                (
+                    attempt,
+                    Some(retry_at),
+                    Some(backoff),
+                    duration_ms,
+                    from_state,
+                )
             } else {
-                (attempt, None, None)
+                (attempt, None, None, duration_ms, from_state)
             }
         };
+
+        record_transition(&metrics, &run.tenant_id, from_state, TaskState::Failed);
+        self.record_task_duration(&metrics, task_id, TaskState::Failed, duration_ms);
 
         emit_sequenced(
             run,
@@ -663,6 +881,13 @@ impl Scheduler {
         );
 
         if let (Some(retry_at), Some(backoff)) = (retry_at, backoff) {
+            record_transition(
+                &metrics,
+                &run.tenant_id,
+                TaskState::Failed,
+                TaskState::RetryWait,
+            );
+            metrics.record_retry(&run.tenant_id, attempt);
             emit_sequenced(
                 run,
                 outbox,
@@ -682,18 +907,24 @@ impl Scheduler {
     }
 
     fn record_task_cancelled(
+        &self,
         run: &mut Run,
         task_id: &TaskId,
         outbox: &mut impl EventSink,
     ) -> Result<()> {
-        let attempt = {
+        let metrics = FlowMetrics::new();
+        let (attempt, from_state, duration_ms) = {
             let exec = run
                 .get_task_mut(task_id)
                 .ok_or(Error::TaskNotFound { task_id: *task_id })?;
+            let from_state = exec.state;
             let attempt = exec.attempt;
             exec.cancel()?;
-            attempt
+            (attempt, from_state, exec.metrics.duration_ms)
         };
+
+        record_transition(&metrics, &run.tenant_id, from_state, TaskState::Cancelled);
+        self.record_task_duration(&metrics, task_id, TaskState::Cancelled, duration_ms);
 
         emit_sequenced(
             run,
@@ -760,6 +991,7 @@ impl Scheduler {
         outbox: &mut impl EventSink,
         now: DateTime<Utc>,
     ) -> Result<Vec<TaskId>> {
+        let metrics = FlowMetrics::new();
         let mut transitioned = Vec::new();
 
         for spec in &self.plan.tasks {
@@ -778,9 +1010,11 @@ impl Scheduler {
                     .ok_or(Error::TaskNotFound { task_id })?;
 
                 let previous_attempt = exec.attempt;
+                let from_state = exec.state;
                 exec.transition_to(TaskState::Ready)?;
                 let new_attempt = exec.attempt;
 
+                record_transition(&metrics, &run.tenant_id, from_state, TaskState::Ready);
                 (previous_attempt, new_attempt)
             };
 
@@ -913,6 +1147,80 @@ impl Scheduler {
 
         Ok(stale)
     }
+
+    fn record_task_duration(
+        &self,
+        metrics: &FlowMetrics,
+        task_id: &TaskId,
+        final_state: TaskState,
+        duration_ms: i64,
+    ) {
+        if duration_ms <= 0 {
+            return;
+        }
+
+        let operation = self.plan.get_task(task_id).map_or_else(
+            || "unknown".to_string(),
+            |spec| spec.operation.to_string(),
+        );
+
+        #[allow(clippy::cast_precision_loss)]
+        let duration_secs = duration_ms as f64 / 1000.0;
+        metrics.observe_task_duration(&operation, final_state.as_label(), duration_secs);
+    }
+
+    fn build_task_envelope(run: &Run, spec: &TaskSpec, attempt: u32) -> TaskEnvelope {
+        let task_key = spec.partition_key.clone().map_or_else(
+            || TaskKey::new(spec.asset_key.clone(), spec.operation),
+            |partition_key| TaskKey::with_partition(spec.asset_key.clone(), partition_key, spec.operation),
+        );
+
+        TaskEnvelope::new(
+            spec.task_id,
+            run.id,
+            spec.asset_id,
+            task_key,
+            run.tenant_id.clone(),
+            run.workspace_id.clone(),
+            attempt,
+            spec.resources.clone(),
+        )
+    }
+
+    fn enqueue_options_for(spec: &TaskSpec) -> EnqueueOptions {
+        EnqueueOptions::new().with_priority(spec.priority)
+    }
+
+    async fn record_queue_depth<Q: TaskQueue>(&self, queue: &Q, metrics: &FlowMetrics) {
+        if let Ok(depth) = queue.queue_depth().await {
+            metrics.set_queue_depth(queue.queue_name(), depth);
+        }
+    }
+
+    async fn record_quota_usage<M: QuotaManager>(
+        &self,
+        quota: &M,
+        tenant_id: &str,
+        metrics: &FlowMetrics,
+    ) {
+        let Ok(Some(quota_config)) = quota.get_quota(tenant_id).await else {
+            return;
+        };
+
+        let Ok(active) = quota.active_tasks(tenant_id).await else {
+            return;
+        };
+
+        let limit = quota_config.max_concurrent_tasks;
+        if limit == 0 {
+            metrics.set_quota_usage(tenant_id, 0.0);
+            return;
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = active as f64 / limit as f64;
+        metrics.set_quota_usage(tenant_id, ratio);
+    }
 }
 
 fn emit_sequenced(run: &mut Run, outbox: &mut impl EventSink, event: crate::events::EventEnvelope) {
@@ -923,8 +1231,11 @@ fn emit_sequenced(run: &mut Run, outbox: &mut impl EventSink, event: crate::even
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::memory::InMemoryTaskQueue;
     use crate::outbox::InMemoryOutbox;
     use crate::plan::{AssetKey, PlanBuilder, ResourceRequirements, TaskSpec};
+    use crate::quota::memory::InMemoryQuotaManager;
+    use crate::quota::TenantQuota;
     use crate::task_key::TaskOperation;
     use arco_core::AssetId;
 
@@ -1236,4 +1547,106 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn dispatch_ready_tasks_enqueues_tasks() -> Result<()> {
+        let task_a = TaskId::generate();
+        let task_b = TaskId::generate();
+
+        let plan = PlanBuilder::new("tenant", "workspace")
+            .add_task(TaskSpec {
+                task_id: task_a,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("raw", "a"),
+                operation: TaskOperation::Materialize,
+                partition_key: None,
+                upstream_task_ids: vec![],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            })
+            .add_task(TaskSpec {
+                task_id: task_b,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("raw", "b"),
+                operation: TaskOperation::Materialize,
+                partition_key: None,
+                upstream_task_ids: vec![],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            })
+            .build()?;
+
+        let scheduler = Scheduler::new(plan);
+        let mut outbox = InMemoryOutbox::new();
+        let mut run = scheduler.create_run(RunTrigger::manual("user"), &mut outbox);
+        scheduler.start_run(&mut run, &mut outbox)?;
+
+        let queue = InMemoryTaskQueue::new("test-queue");
+        let quota = InMemoryQuotaManager::with_default_quota(TenantQuota::new(10));
+
+        let report = scheduler
+            .dispatch_ready_tasks(&mut run, &queue, &quota, &mut outbox)
+            .await?;
+
+        assert_eq!(report.enqueued, 2);
+        assert_eq!(queue.queue_depth().await?, 2);
+        assert_eq!(run.tasks_queued(), 2);
+        assert_eq!(quota.active_tasks(&run.tenant_id).await?, 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_ready_tasks_respects_quota() -> Result<()> {
+        let task_a = TaskId::generate();
+        let task_b = TaskId::generate();
+
+        let plan = PlanBuilder::new("tenant", "workspace")
+            .add_task(TaskSpec {
+                task_id: task_a,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("raw", "a"),
+                operation: TaskOperation::Materialize,
+                partition_key: None,
+                upstream_task_ids: vec![],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            })
+            .add_task(TaskSpec {
+                task_id: task_b,
+                asset_id: AssetId::generate(),
+                asset_key: AssetKey::new("raw", "b"),
+                operation: TaskOperation::Materialize,
+                partition_key: None,
+                upstream_task_ids: vec![],
+                stage: 0,
+                priority: 0,
+                resources: ResourceRequirements::default(),
+            })
+            .build()?;
+
+        let scheduler = Scheduler::new(plan);
+        let mut outbox = InMemoryOutbox::new();
+        let mut run = scheduler.create_run(RunTrigger::manual("user"), &mut outbox);
+        scheduler.start_run(&mut run, &mut outbox)?;
+
+        let queue = InMemoryTaskQueue::new("test-queue");
+        let quota = InMemoryQuotaManager::with_default_quota(TenantQuota::new(1));
+
+        let report = scheduler
+            .dispatch_ready_tasks(&mut run, &queue, &quota, &mut outbox)
+            .await?;
+
+        assert_eq!(report.enqueued, 1);
+        assert_eq!(report.quota_denied, 1);
+        assert_eq!(queue.queue_depth().await?, 1);
+        assert_eq!(run.tasks_queued(), 1);
+        assert_eq!(quota.active_tasks(&run.tenant_id).await?, 1);
+
+        Ok(())
+    }
+
 }

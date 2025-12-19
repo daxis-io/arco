@@ -46,6 +46,7 @@ pub mod dispatch;
 pub mod error;
 pub mod events;
 pub mod leader;
+pub mod metrics;
 pub mod outbox;
 pub mod plan;
 pub mod quota;
@@ -61,6 +62,7 @@ pub mod prelude {
     pub use crate::dispatch::{EnqueueResult, TaskEnvelope, TaskQueue};
     pub use crate::error::{Error, Result};
     pub use crate::leader::{LeaderElector, LeadershipResult, RenewalResult};
+    pub use crate::metrics::FlowMetrics;
     pub use crate::outbox::{EventSink, InMemoryOutbox, LedgerWriter};
     pub use crate::plan::{Plan, PlanBuilder, TaskSpec};
     pub use crate::quota::{QuotaDecision, QuotaManager, TenantQuota};

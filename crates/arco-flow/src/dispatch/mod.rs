@@ -5,6 +5,7 @@
 //! - [`TaskQueue`]: Trait for enqueueing tasks to execution backends
 //! - [`TaskEnvelope`]: Serializable task dispatch payload
 //! - [`InMemoryTaskQueue`]: In-memory queue for testing
+//! - [`CloudTasksDispatcher`]: Google Cloud Tasks integration (gcp feature, placeholder)
 //!
 //! ## Design Principles
 //!
@@ -12,6 +13,8 @@
 //! - **Idempotent dispatch**: Task IDs enable deduplication
 //! - **Structured payloads**: JSON-serializable task envelopes
 
+#[cfg(feature = "gcp")]
+pub mod cloud_tasks;
 pub mod memory;
 
 use std::time::Duration;
@@ -92,10 +95,10 @@ impl TaskEnvelope {
 
     /// Returns the idempotency key for this task.
     ///
-    /// Uses `task_id` + attempt to ensure retries are distinguishable.
+    /// Uses `run_id`, `task_id`, and attempt to ensure retries are distinguishable.
     #[must_use]
     pub fn idempotency_key(&self) -> String {
-        format!("{}-{}", self.task_id, self.attempt)
+        format!("{}/{}/{}", self.run_id, self.task_id, self.attempt)
     }
 }
 
@@ -264,9 +267,11 @@ mod tests {
     #[test]
     fn task_envelope_idempotency_key() {
         let envelope = create_test_envelope();
-        let key = envelope.idempotency_key();
-        assert!(key.contains(&envelope.task_id.to_string()));
-        assert!(key.contains("-1"));
+        let expected = format!(
+            "{}/{}/{}",
+            envelope.run_id, envelope.task_id, envelope.attempt
+        );
+        assert_eq!(envelope.idempotency_key(), expected);
     }
 
     #[test]

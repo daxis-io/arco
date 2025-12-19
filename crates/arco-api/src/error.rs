@@ -161,9 +161,9 @@ impl From<CatalogError> for ApiError {
 impl From<CoreError> for ApiError {
     fn from(value: CoreError) -> Self {
         match value {
-            CoreError::InvalidId { message } | CoreError::InvalidInput(message) => {
-                Self::bad_request(message)
-            }
+            CoreError::InvalidId { message }
+            | CoreError::InvalidInput(message)
+            | CoreError::Validation { message } => Self::bad_request(message),
             CoreError::TenantIsolation { message } => Self::forbidden(message),
             CoreError::NotFound(message) => Self::not_found(message),
             CoreError::ResourceNotFound { resource_type, id } => {

@@ -66,7 +66,7 @@ pub fn init_metrics() -> PrometheusHandle {
             );
             describe_gauge!(
                 COMPACTION_LAG,
-                "Seconds since oldest uncompacted event (compaction lag)"
+                "Seconds since last successful compaction (lag proxy)"
             );
             describe_counter!(COMPACTION_CYCLES_TOTAL, "Total compaction cycles completed");
             describe_counter!(COMPACTION_ERRORS_TOTAL, "Total compaction errors");
@@ -88,6 +88,7 @@ pub fn prometheus_handle() -> Option<PrometheusHandle> {
 // ============================================================================
 
 /// Handler for the `/metrics` endpoint.
+#[allow(clippy::option_if_let_else)]
 pub async fn serve_metrics() -> impl IntoResponse {
     match prometheus_handle() {
         Some(handle) => {

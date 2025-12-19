@@ -32,8 +32,6 @@ pub const SIGNED_URL_MINTED: &str = "signed_url_minted_total";
 /// Rate limit hit counter.
 pub const RATE_LIMIT_HITS: &str = "rate_limit_hits_total";
 
-/// CAS retry counter (for writer operations).
-pub const CAS_RETRY: &str = "cas_retry_total";
 
 // ============================================================================
 // Prometheus Recorder
@@ -75,7 +73,6 @@ pub fn init_metrics() -> PrometheusHandle {
                 RATE_LIMIT_HITS,
                 "Total number of requests rejected by rate limiting"
             );
-            describe_counter!(CAS_RETRY, "Total number of CAS retries in write operations");
 
             tracing::info!("Prometheus metrics recorder initialized");
             handle
@@ -161,21 +158,23 @@ fn status_class(status: StatusCode) -> &'static str {
 ///
 /// Returns Prometheus-formatted metrics text.
 pub async fn serve_metrics() -> impl IntoResponse {
-    match prometheus_handle() {
-        Some(handle) => {
+    prometheus_handle().map_or_else(
+        || {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("content-type", "text/plain; charset=utf-8")],
+                "Metrics not initialized".to_string(),
+            )
+        },
+        |handle| {
             let metrics = handle.render();
             (
                 StatusCode::OK,
                 [("content-type", "text/plain; charset=utf-8")],
                 metrics,
             )
-        }
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [("content-type", "text/plain; charset=utf-8")],
-            "Metrics not initialized".to_string(),
-        ),
-    }
+        },
+    )
 }
 
 // ============================================================================
@@ -195,11 +194,6 @@ pub fn record_rate_limit_hit(tenant: &str, endpoint: &str) {
         "endpoint" => endpoint.to_string()
     )
     .increment(1);
-}
-
-/// Records a CAS retry.
-pub fn record_cas_retry(operation: &str) {
-    counter!(CAS_RETRY, "operation" => operation.to_string()).increment(1);
 }
 
 // ============================================================================

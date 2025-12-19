@@ -234,7 +234,7 @@ impl Server {
             .nest(
                 "/api/v1",
                 crate::routes::api_v1_routes()
-                    .layer(rate_limit_layer)
+                    .route_layer(rate_limit_layer)
                     .layer(auth_layer),
             )
             // Middleware (order matters): Metrics outermost for timing, then trace, then CORS.
@@ -349,6 +349,7 @@ impl Server {
 
         // Initialize metrics before starting the server
         crate::metrics::init_metrics();
+        arco_catalog::metrics::register_metrics();
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.http_port));
         let router = self.create_router();
@@ -412,16 +413,16 @@ impl Server {
 
         // Require JWT configuration in production mode.
         if !self.config.debug {
-            let has_hs256 = self.config.jwt.hs256_secret.is_some();
-            let has_rs256 = self.config.jwt.rs256_public_key_pem.is_some();
+            let has_hs256_secret = self.config.jwt.hs256_secret.is_some();
+            let has_rs256_public_key = self.config.jwt.rs256_public_key_pem.is_some();
 
-            if !has_hs256 && !has_rs256 {
+            if !has_hs256_secret && !has_rs256_public_key {
                 return Err(arco_core::Error::InvalidInput(
                     "jwt.hs256_secret or jwt.rs256_public_key_pem is required when debug=false"
                         .to_string(),
                 ));
             }
-            if has_hs256 && has_rs256 {
+            if has_hs256_secret && has_rs256_public_key {
                 return Err(arco_core::Error::InvalidInput(
                     "jwt.hs256_secret and jwt.rs256_public_key_pem are mutually exclusive"
                         .to_string(),

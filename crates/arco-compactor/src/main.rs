@@ -53,6 +53,9 @@ use tokio::sync::Mutex;
 // CLI Arguments
 // ============================================================================
 
+const COMPACTION_DOMAINS: [&str; 4] = ["catalog", "lineage", "executions", "search"];
+const COMPACTION_LAG_UPDATE_SECS: u64 = 30;
+
 /// Arco catalog compactor.
 #[derive(Debug, Parser)]
 #[command(name = "arco-compactor")]
@@ -338,6 +341,7 @@ async fn run_compaction_cycle_guarded(state: &Arc<CompactorState>) {
         }
         Err(e) => {
             state.record_failure();
+            metrics::record_compaction_error("all");
             tracing::error!(error = %e, "Compaction cycle failed");
         }
     }
@@ -356,7 +360,7 @@ async fn run_compaction_cycle() -> Result<()> {
     //   timer.finish(events_processed);
 
     // For now, record a simulated compaction for all domains
-    for domain in ["catalog", "lineage", "executions", "search"] {
+    for domain in COMPACTION_DOMAINS {
         let timer = metrics::CompactionTimer::start(domain);
 
         // Simulate some work per domain
@@ -394,6 +398,7 @@ async fn main() -> Result<()> {
         } => {
             // Initialize metrics before starting
             metrics::init_metrics();
+            arco_catalog::metrics::register_metrics();
 
             tracing::info!(
                 port = port,
@@ -403,6 +408,27 @@ async fn main() -> Result<()> {
             );
 
             let state = Arc::new(CompactorState::new(unhealthy_threshold_secs));
+
+            // Update compaction lag gauge periodically using last successful compaction as proxy.
+            let lag_state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let start = Utc::now();
+                loop {
+                    let now = Utc::now();
+                    let lag_seconds = lag_state
+                        .last_successful_compaction()
+                        .map_or_else(|| (now - start).num_seconds(), |ts| (now - ts).num_seconds());
+                    let lag_seconds = u64::try_from(lag_seconds.max(0)).unwrap_or(u64::MAX);
+                    #[allow(clippy::cast_precision_loss)]
+                    let lag_seconds = lag_seconds as f64;
+
+                    for domain in COMPACTION_DOMAINS {
+                        metrics::set_compaction_lag(domain, lag_seconds);
+                    }
+
+                    tokio::time::sleep(Duration::from_secs(COMPACTION_LAG_UPDATE_SECS)).await;
+                }
+            });
 
             // Build HTTP router
             let router = Router::new()

@@ -48,11 +48,15 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "targets": [
         {
-          "expr": "sum(rate(api_request_total{status_class=~\"4xx|5xx\"}[5m])) by (status_class) / sum(rate(api_request_total[5m]))",
-          "legendFormat": "{{status_class}} rate"
+          "expr": "sum(rate(api_request_total{status_class=\"5xx\"}[5m])) / sum(rate(api_request_total[5m]))",
+          "legendFormat": "5xx rate"
+        },
+        {
+          "expr": "sum(rate(api_request_total{status_class=\"4xx\"}[5m])) / sum(rate(api_request_total[5m]))",
+          "legendFormat": "4xx rate"
         }
       ],
-      "description": "Percentage of requests returning 4xx/5xx errors"
+      "description": "Percentage of requests returning 4xx/5xx responses"
     },
     {
       "title": "Rate Limit Hits",
@@ -60,7 +64,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "targets": [
         {
-          "expr": "sum(rate(rate_limit_hits_total[5m])) by (tenant)",
+          "expr": "sum(increase(rate_limit_hits_total[5m])) by (tenant)",
           "legendFormat": "{{tenant}}"
         }
       ],
@@ -100,7 +104,7 @@
           "legendFormat": "{{domain}}"
         }
       ],
-      "description": "Seconds since oldest uncompacted event",
+      "description": "Seconds since last successful compaction (proxy)",
       "alert": {
         "threshold": 600,
         "message": "Compaction lag > 10 minutes"
@@ -163,13 +167,46 @@
         {
           "expr": "sum(rate(cas_retry_total[5m])) by (operation)",
           "legendFormat": "{{operation}}"
-        },
-        {
-          "expr": "sum(rate(arco_cas_retry_total[5m])) by (operation)",
-          "legendFormat": "{{operation}} (catalog)"
         }
       ],
       "description": "CAS retry rate by operation"
+    },
+    {
+      "title": "Compaction Runs (per hour)",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "targets": [
+        {
+          "expr": "sum(increase(compaction_cycles_total[1h])) by (domain)",
+          "legendFormat": "{{domain}}"
+        }
+      ],
+      "description": "Compaction cycles completed per hour"
+    },
+    {
+      "title": "Storage Objects by Prefix",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "targets": [
+        {
+          "expr": "arco_storage_objects_total",
+          "legendFormat": "{{prefix}}"
+        }
+      ],
+      "description": "Object count by storage prefix"
+    },
+    {
+      "title": "Storage Bytes by Prefix",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "targets": [
+        {
+          "expr": "arco_storage_bytes_total",
+          "legendFormat": "{{prefix}}"
+        }
+      ],
+      "description": "Storage bytes by prefix",
+      "unit": "bytes"
     }
   ]
 }

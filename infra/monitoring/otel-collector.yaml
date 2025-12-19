@@ -1,0 +1,22 @@
+receivers:
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: arco-api
+          metrics_path: /metrics
+          static_configs:
+            - targets: ["arco-api:8080"]
+        - job_name: arco-compactor
+          metrics_path: /metrics
+          static_configs:
+            - targets: ["arco-compactor:8081"]
+
+exporters:
+  googlecloud:
+    project: ${GCP_PROJECT_ID}
+
+service:
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      exporters: [googlecloud]

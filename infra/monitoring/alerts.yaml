@@ -16,16 +16,16 @@ groups:
       # Fires when error rate exceeds 1% for 5 minutes
       - alert: ArcoApiErrorRateHigh
         expr: |
-          sum(rate(api_request_total{status_class=~"4xx|5xx"}[5m]))
+          sum(rate(api_request_total{status_class="5xx"}[5m]))
           / sum(rate(api_request_total[5m])) > 0.01
         for: 5m
         labels:
           severity: warning
           service: arco-api
         annotations:
-          summary: "API error rate > 1%"
+          summary: "API 5xx error rate > 1%"
           description: |
-            The Arco API error rate has exceeded 1% for 5 minutes.
+            The Arco API 5xx error rate has exceeded 1% for 5 minutes.
             Current rate: {{ $value | printf "%.2f" }}%
           runbook_url: "https://docs.arco.dev/runbooks/api-errors"
 
@@ -49,7 +49,7 @@ groups:
       # Fires when any tenant exceeds 100 rate limit hits per minute
       - alert: ArcoRateLimitHitsHigh
         expr: |
-          sum by (tenant) (rate(rate_limit_hits_total[1m])) > 100
+          sum by (tenant) (increase(rate_limit_hits_total[1m])) > 100
         for: 1m
         labels:
           severity: warning
@@ -74,15 +74,15 @@ groups:
         annotations:
           summary: "Compaction lag > 10 minutes for domain {{ $labels.domain }}"
           description: |
-            Compaction for domain {{ $labels.domain }} is lagging behind by more than 10 minutes.
-            Current lag: {{ $value | printf "%.0f" }} seconds
+            Compaction for domain {{ $labels.domain }} has not completed recently.
+            Current lag proxy: {{ $value | printf "%.0f" }} seconds
           runbook_url: "https://docs.arco.dev/runbooks/compactor-stuck"
 
       # Compactor Not Running Alert
       # Fires when no compaction cycles complete in 24 hours
       - alert: ArcoCompactorNotRunning
         expr: |
-          time() - max(compaction_cycles_total) > 86400
+          sum(increase(compaction_cycles_total[24h])) == 0
         for: 1h
         labels:
           severity: critical
@@ -98,14 +98,13 @@ groups:
       # Fires when CAS retries exceed 10/min
       - alert: ArcoCasRetryRateHigh
         expr: |
-          sum(rate(cas_retry_total[1m])) > 10
-          or sum(rate(arco_cas_retry_total[1m])) > 10
+          sum by (operation) (increase(cas_retry_total[1m])) > 10
         for: 5m
         labels:
           severity: warning
           service: arco-catalog
         annotations:
-          summary: "CAS retry rate > 10/min"
+          summary: "CAS retry rate > 10/min for {{ $labels.operation }}"
           description: |
             High CAS retry rate indicates contention on catalog writes.
             Current rate: {{ $value | printf "%.1f" }} retries/min
@@ -116,7 +115,7 @@ groups:
       # GC Not Running Alert
       - alert: ArcoGCNotRunning
         expr: |
-          time() - max(timestamp(arco_gc_objects_deleted_total)) > 86400
+          sum(increase(arco_gc_run_duration_seconds_count[24h])) == 0
         for: 1h
         labels:
           severity: warning
@@ -140,20 +139,4 @@ groups:
           description: |
             Garbage collection encountered {{ $value | printf "%.0f" }} errors in the last hour.
             Phase: {{ $labels.phase }}
-          runbook_url: "https://docs.arco.dev/runbooks/gc-failure"
-
-      # Storage Growth Alert
-      - alert: ArcoStorageGrowthHigh
-        expr: |
-          rate(arco_gc_bytes_reclaimed_total[24h]) < 0
-          and sum(increase(arco_gc_objects_deleted_total[24h])) == 0
-        for: 24h
-        labels:
-          severity: warning
-          service: arco-gc
-        annotations:
-          summary: "Catalog storage growing without GC"
-          description: |
-            Storage is growing but no objects are being garbage collected.
-            Check GC health and retention policy.
           runbook_url: "https://docs.arco.dev/runbooks/gc-failure"

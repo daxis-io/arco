@@ -74,6 +74,13 @@ enum TaskOperation {
   BACKFILL = 3;
 }
 
+// Semantic identity for a task (asset + partition + operation).
+message TaskKey {
+  AssetKey asset_key = 1;
+  PartitionKey partition_key = 2;
+  TaskOperation operation = 3;
+}
+
 // Resource requirements for task scheduling.
 //
 // All values use integer representations for deterministic serialization
@@ -200,6 +207,12 @@ message TaskExecution {
 
   // Execution metrics
   TaskMetrics metrics = 10;
+
+  // Semantic task key for deterministic ordering
+  TaskKey task_key = 11;
+
+  // Execution priority (lower = higher priority)
+  int32 priority = 12;
 }
 
 // Task execution state machine.

@@ -258,14 +258,18 @@ version = "0.1.0"
 dependencies = [
  "arco-core",
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "criterion",
  "futures",
+ "gcp_auth",
  "hex",
  "humantime-serde",
+ "metrics",
  "petgraph",
  "proptest",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -1557,6 +1561,32 @@ dependencies = [
  "pin-project-lite",
  "pin-utils",
  "slab",
+]
+
+[[package]]
+name = "gcp_auth"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d24fd9357c4d0ae97d90b38e8fabeb07f9590f6944f4f65f50b5110d7c3882b6"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "chrono",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "ring",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "tracing-futures",
+ "url",
 ]
 
 [[package]]
@@ -4184,6 +4214,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-futures"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97d095ae15e245a057c8e8451bab9b3ee1e1f68e9ba2b4fbc18d0ac5237835f2"
+dependencies = [
+ "pin-project",
+ "tracing",
+]
+
+[[package]]
 name = "tracing-log"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4812,9 +4852,17 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arco-catalog",
+ "arco-core",
+ "chrono",
  "clap",
+ "hex",
  "semver",
+ "serde",
+ "serde_json",
  "serde_yaml",
+ "sha2",
+ "tokio",
  "toml",
  "walkdir",
 ]

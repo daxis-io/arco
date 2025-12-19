@@ -349,6 +349,14 @@ impl GarbageCollector {
                             message: format!("failed to list ledger for {domain}: {e}"),
                         })?;
 
+                let objects = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+                let bytes: u64 = entries.iter().map(|meta| meta.size).sum();
+                crate::metrics::record_storage_inventory(
+                    &format!("ledger/{}", domain.as_str()),
+                    objects,
+                    bytes,
+                );
+
                 for meta in entries {
                     if let Some(last_modified) = meta.last_modified {
                         if last_modified < cutoff {
@@ -400,6 +408,14 @@ impl GarbageCollector {
                     .map_err(|e| CatalogError::Storage {
                         message: format!("failed to list snapshots for {domain}: {e}"),
                     })?;
+
+            let objects = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+            let bytes: u64 = entries.iter().map(|meta| meta.size).sum();
+            crate::metrics::record_storage_inventory(
+                &format!("snapshots/{}", domain.as_str()),
+                objects,
+                bytes,
+            );
 
             // Group by version directory and get max timestamp for each
             let mut version_dirs: Vec<(String, u64, DateTime<Utc>)> = Vec::new();

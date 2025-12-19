@@ -1172,6 +1172,7 @@ impl CatalogWriter {
                     if attempt == DEFAULT_LINEAGE_CAS_MAX_RETRIES {
                         break;
                     }
+                    crate::metrics::record_cas_retry("lineage_manifest");
                     continue;
                 }
             }

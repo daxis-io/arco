@@ -38,11 +38,8 @@ serde_json = { workspace = true }
 # Error handling
 thiserror = { workspace = true }
 
-# Logging
+# Logging and metrics
 tracing = { workspace = true }
-metrics = { workspace = true }
-
-# Metrics
 metrics = { workspace = true }
 
 # Data formats

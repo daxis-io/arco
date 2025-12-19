@@ -29,7 +29,7 @@
     },
     {
       "name": "created_at",
-      "data_type": "Timestamp(Millisecond)",
+      "data_type": "Int64",
       "nullable": false
     }
   ]

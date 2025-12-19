@@ -141,6 +141,34 @@ fn lineage_schema() -> Arc<Schema> {
     ]))
 }
 
+// ============================================================================
+// Public Schema Accessors (for tests and external consumers)
+// ============================================================================
+
+/// Returns the namespace schema for golden file comparison.
+#[must_use]
+pub fn namespace_schema() -> Schema {
+    (*namespaces_schema()).clone()
+}
+
+/// Returns the table schema for golden file comparison.
+#[must_use]
+pub fn table_schema() -> Schema {
+    (*tables_schema()).clone()
+}
+
+/// Returns the column schema for golden file comparison.
+#[must_use]
+pub fn column_schema() -> Schema {
+    (*columns_schema()).clone()
+}
+
+/// Returns the lineage edge schema for golden file comparison.
+#[must_use]
+pub fn lineage_edge_schema() -> Schema {
+    (*lineage_schema()).clone()
+}
+
 fn writer_properties() -> WriterProperties {
     // Keep properties minimal and widely compatible with DuckDB readers.
     let created_by = KeyValue {
@@ -170,6 +198,11 @@ fn write_single_batch(schema: Arc<Schema>, batch: &RecordBatch) -> Result<Bytes>
 }
 
 /// Writes `namespaces.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if the record batch cannot be built or the Parquet write
+/// fails.
 pub fn write_namespaces(rows: &[NamespaceRecord]) -> Result<Bytes> {
     let schema = namespaces_schema();
 
@@ -205,6 +238,11 @@ pub fn write_namespaces(rows: &[NamespaceRecord]) -> Result<Bytes> {
 }
 
 /// Writes `tables.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if the record batch cannot be built or the Parquet write
+/// fails.
 pub fn write_tables(rows: &[TableRecord]) -> Result<Bytes> {
     let schema = tables_schema();
 
@@ -254,6 +292,11 @@ pub fn write_tables(rows: &[TableRecord]) -> Result<Bytes> {
 }
 
 /// Writes `columns.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if the record batch cannot be built or the Parquet write
+/// fails.
 pub fn write_columns(rows: &[ColumnRecord]) -> Result<Bytes> {
     let schema = columns_schema();
 
@@ -301,6 +344,11 @@ pub fn write_columns(rows: &[ColumnRecord]) -> Result<Bytes> {
 }
 
 /// Writes `lineage_edges.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if the record batch cannot be built or the Parquet write
+/// fails.
 pub fn write_lineage_edges(rows: &[LineageEdgeRecord]) -> Result<Bytes> {
     let schema = lineage_schema();
 
@@ -430,6 +478,11 @@ fn col_bool<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BooleanArray> 
 }
 
 /// Reads `namespaces.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if the Parquet payload is invalid or required columns are
+/// missing.
 pub fn read_namespaces(bytes: &Bytes) -> Result<Vec<NamespaceRecord>> {
     let mut out = Vec::new();
     for batch in read_batches(bytes)? {
@@ -457,6 +510,11 @@ pub fn read_namespaces(bytes: &Bytes) -> Result<Vec<NamespaceRecord>> {
 }
 
 /// Reads `tables.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if the Parquet payload is invalid or required columns are
+/// missing.
 pub fn read_tables(bytes: &Bytes) -> Result<Vec<TableRecord>> {
     let mut out = Vec::new();
     for batch in read_batches(bytes)? {
@@ -498,6 +556,11 @@ pub fn read_tables(bytes: &Bytes) -> Result<Vec<TableRecord>> {
 }
 
 /// Reads `columns.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if the Parquet payload is invalid or required columns are
+/// missing.
 pub fn read_columns(bytes: &Bytes) -> Result<Vec<ColumnRecord>> {
     let mut out = Vec::new();
     for batch in read_batches(bytes)? {
@@ -529,6 +592,11 @@ pub fn read_columns(bytes: &Bytes) -> Result<Vec<ColumnRecord>> {
 }
 
 /// Reads `lineage_edges.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if the Parquet payload is invalid or required columns are
+/// missing.
 pub fn read_lineage_edges(bytes: &Bytes) -> Result<Vec<LineageEdgeRecord>> {
     let mut out = Vec::new();
     for batch in read_batches(bytes)? {

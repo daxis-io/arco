@@ -10,7 +10,7 @@
 //! makes each compaction `O(total_records)` I/O and CPU. This is acceptable for early workloads,
 //! but should evolve toward incremental compaction as catalog size grows.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -42,6 +42,12 @@ pub struct CompactionResult {
     pub parquet_files_written: usize,
     /// New watermark position (event ID).
     pub new_watermark: String,
+}
+
+#[derive(Debug, Clone)]
+struct RecordWithSequence {
+    record: MaterializationRecord,
+    sequence_position: Option<u64>,
 }
 
 /// Policy for handling unknown or unsupported event envelopes during compaction.
@@ -82,6 +88,14 @@ fn rand_jitter_ms(max_exclusive: u64) -> u64 {
         .unwrap_or_default()
         .subsec_nanos();
     u64::from(nanos) % max_exclusive
+}
+
+fn should_replace_sequence(existing: Option<u64>, incoming: Option<u64>) -> bool {
+    match (existing, incoming) {
+        (Some(existing), Some(incoming)) => incoming >= existing,
+        (Some(_), None) => false,
+        (None, Some(_) | None) => true,
+    }
 }
 
 /// Compacts Tier 2 ledger events into Parquet snapshots.
@@ -167,6 +181,7 @@ impl Compactor {
                     let backoff = cas_backoff(self.cas_backoff_base, self.cas_backoff_max, attempt);
                     let backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX);
                     tracing::info!(attempt, backoff_ms, "compactor lost CAS race, retrying");
+                    crate::metrics::record_cas_retry("compaction_manifest");
                     tokio::time::sleep(backoff).await;
                 }
                 Err(e) => return Err(e),
@@ -263,11 +278,17 @@ impl Compactor {
             .to_string();
 
         // 4. Read, parse, and dedupe events by idempotency_key; upsert by primary key.
-        let mut records_by_key: HashMap<String, MaterializationRecord> = HashMap::new();
+        let mut records_by_key: HashMap<String, RecordWithSequence> = HashMap::new();
         if let Some(snapshot_path) = manifest.snapshot_path.as_deref() {
             let existing = self.read_snapshot_records(snapshot_path).await?;
             for record in existing {
-                records_by_key.insert(record.materialization_id.clone(), record);
+                records_by_key.insert(
+                    record.materialization_id.clone(),
+                    RecordWithSequence {
+                        record,
+                        sequence_position: None,
+                    },
+                );
             }
         }
 
@@ -293,11 +314,12 @@ impl Compactor {
             // Prefer the enveloped format (ADR-004), but accept legacy raw payloads for migration.
             let parsed_envelope = serde_json::from_slice::<CatalogEvent<serde_json::Value>>(&data);
 
-            let (event_type, event_version, idempotency_key, record): (
+            let (event_type, event_version, idempotency_key, record, sequence_position): (
                 String,
                 u32,
                 String,
                 MaterializationRecord,
+                Option<u64>,
             ) = if let Ok(envelope) = parsed_envelope {
                 if let Err(e) = envelope.validate() {
                     match self.unknown_event_policy {
@@ -348,6 +370,7 @@ impl Compactor {
                     envelope.event_version,
                     envelope.idempotency_key,
                     record,
+                    envelope.sequence_position,
                 )
             } else {
                 // Legacy payload format (raw MaterializationRecord JSON).
@@ -387,6 +410,7 @@ impl Compactor {
                     expected_version,
                     idempotency_key,
                     record,
+                    None,
                 )
             };
 
@@ -419,15 +443,33 @@ impl Compactor {
                 continue;
             }
 
-            // UPSERT: materialization_id is the primary key; later events overwrite earlier state.
-            records_by_key.insert(record.materialization_id.clone(), record);
+            // UPSERT: materialization_id is the primary key; sequence position wins when present.
+            match records_by_key.entry(record.materialization_id.clone()) {
+                Entry::Occupied(mut entry) => {
+                    if should_replace_sequence(entry.get().sequence_position, sequence_position) {
+                        entry.insert(RecordWithSequence {
+                            record,
+                            sequence_position,
+                        });
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(RecordWithSequence {
+                        record,
+                        sequence_position,
+                    });
+                }
+            }
             events_applied += 1;
         }
 
         // 5. Write Parquet snapshot BEFORE manifest update (atomic publish).
         let (parquet_files_written, new_snapshot_path, new_snapshot_version) = if events_applied > 0
         {
-            let mut records: Vec<_> = records_by_key.into_values().collect();
+            let mut records: Vec<_> = records_by_key
+                .into_values()
+                .map(|entry| entry.record)
+                .collect();
             records.sort_by(|a, b| a.materialization_id.cmp(&b.materialization_id));
 
             let snapshot_version = manifest.snapshot_version + 1;

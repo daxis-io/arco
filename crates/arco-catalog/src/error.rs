@@ -93,7 +93,8 @@ impl From<arco_core::Error> for CatalogError {
         match value {
             arco_core::Error::InvalidId { message }
             | arco_core::Error::InvalidInput(message)
-            | arco_core::Error::TenantIsolation { message } => Self::Validation { message },
+            | arco_core::Error::TenantIsolation { message }
+            | arco_core::Error::Validation { message } => Self::Validation { message },
             arco_core::Error::Storage { message, source } => {
                 if let Some(source) = source {
                     Self::Storage {

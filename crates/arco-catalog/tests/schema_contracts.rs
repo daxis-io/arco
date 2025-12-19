@@ -373,7 +373,8 @@ fn contract_lineage_edges_required_fields() {
 
 #[test]
 fn contract_timestamp_fields_use_milliseconds() {
-    // All timestamp fields should use millisecond precision for consistency
+    // All timestamp fields should use Int64 (milliseconds since epoch) for portability
+    // across different query engines (DuckDB, Datafusion, etc.)
     let test_cases = [
         ("namespaces", arco_catalog::parquet_util::namespace_schema()),
         ("tables", arco_catalog::parquet_util::table_schema()),
@@ -388,9 +389,10 @@ fn contract_timestamp_fields_use_milliseconds() {
             if field.name().contains("_at") || field.name().contains("timestamp") {
                 let field_name = field.name();
                 match field.data_type() {
-                    DataType::Timestamp(TimeUnit::Millisecond, _) => {}
+                    // Int64 is used to store milliseconds since epoch for portability
+                    DataType::Int64 | DataType::Timestamp(TimeUnit::Millisecond, _) => {}
                     other => panic!(
-                        "Schema '{name}' field '{field_name}' should use Timestamp(Millisecond), got {other:?}"
+                        "Schema '{name}' field '{field_name}' should use Int64 or Timestamp(Millisecond), got {other:?}"
                     ),
                 }
             }
@@ -451,7 +453,7 @@ fn contract_namespaces_roundtrip_preserves_schema() {
     ];
 
     let result = write_namespaces(&records).expect("write should succeed");
-    let read_back = read_namespaces(&result.bytes).expect("read should succeed");
+    let read_back = read_namespaces(&result).expect("read should succeed");
 
     assert_eq!(read_back.len(), 2);
     let first = read_back.first().expect("first namespace record");
@@ -479,7 +481,7 @@ fn contract_tables_roundtrip_preserves_schema() {
     }];
 
     let result = write_tables(&records).expect("write should succeed");
-    let read_back = read_tables(&result.bytes).expect("read should succeed");
+    let read_back = read_tables(&result).expect("read should succeed");
 
     assert_eq!(read_back.len(), 1);
     let first = read_back.first().expect("table record");
@@ -513,7 +515,7 @@ fn contract_columns_roundtrip_preserves_schema() {
     ];
 
     let result = write_columns(&records).expect("write should succeed");
-    let read_back = read_columns(&result.bytes).expect("read should succeed");
+    let read_back = read_columns(&result).expect("read should succeed");
 
     assert_eq!(read_back.len(), 2);
     let first = read_back.first().expect("first column record");
@@ -540,7 +542,7 @@ fn contract_lineage_edges_roundtrip_preserves_schema() {
     }];
 
     let result = write_lineage_edges(&records).expect("write should succeed");
-    let read_back = read_lineage_edges(&result.bytes).expect("read should succeed");
+    let read_back = read_lineage_edges(&result).expect("read should succeed");
 
     assert_eq!(read_back.len(), 1);
     let first = read_back.first().expect("lineage edge record");

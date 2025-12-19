@@ -359,6 +359,7 @@ impl Tier1Writer {
 
                     // Another writer updated the manifest between read and write.
                     // Retry from fresh state.
+                    crate::metrics::record_cas_retry("catalog_manifest");
                     continue;
                 }
             }
@@ -427,7 +428,17 @@ impl Tier1Writer {
             Some(id) => {
                 let path = CatalogPaths::commit(CatalogDomain::Catalog, id);
                 match self.storage.get_raw(&path).await {
-                    Ok(bytes) => Some(sha256_prefixed(&bytes)),
+                    Ok(bytes) => {
+                        let record: CommitRecord = serde_json::from_slice(&bytes).map_err(|e| {
+                            CatalogError::Serialization {
+                                message: format!(
+                                    "deserialize commit record '{}': {e}",
+                                    path
+                                ),
+                            }
+                        })?;
+                        Some(record.compute_hash())
+                    }
                     Err(arco_core::Error::NotFound(_)) => {
                         // First commit or missing record - acceptable edge case
                         None
@@ -710,9 +721,7 @@ mod tests {
         );
 
         // Verify chain integrity: commit3.prev_commit_hash should be SHA256 of commit2
-        let commit2_path = CatalogPaths::commit(CatalogDomain::Catalog, &commit2.commit_id);
-        let commit2_bytes = storage.get_raw(&commit2_path).await?;
-        let expected_hash = format!("sha256:{}", hex::encode(Sha256::digest(&commit2_bytes)));
+        let expected_hash = commit2.compute_hash();
         assert_eq!(commit3.prev_commit_hash, Some(expected_hash));
 
         Ok(())

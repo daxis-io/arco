@@ -34,12 +34,12 @@
     },
     {
       "name": "created_at",
-      "data_type": "Timestamp(Millisecond)",
+      "data_type": "Int64",
       "nullable": false
     },
     {
       "name": "updated_at",
-      "data_type": "Timestamp(Millisecond)",
+      "data_type": "Int64",
       "nullable": false
     }
   ]

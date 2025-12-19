@@ -272,6 +272,7 @@ impl EventWriter {
                         }
                         arco_core::storage::WriteResult::PreconditionFailed { .. } => {
                             metrics::inc_event_writer_sequence_allocation("cas_retry");
+                            metrics::record_cas_retry("sequence_counter");
                             if attempt == Self::SEQUENCE_CAS_MAX_RETRIES {
                                 break;
                             }
@@ -319,6 +320,7 @@ impl EventWriter {
                         }
                         arco_core::storage::WriteResult::PreconditionFailed { .. } => {
                             metrics::inc_event_writer_sequence_allocation("cas_retry");
+                            metrics::record_cas_retry("sequence_counter");
                             if attempt == Self::SEQUENCE_CAS_MAX_RETRIES {
                                 break;
                             }

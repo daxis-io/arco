@@ -2,9 +2,26 @@
 //!
 //! Run with: `cargo xtask <command>`
 
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use std::collections::HashSet;
+use std::env;
+use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use clap::{Parser, Subcommand};
+use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
+use tokio::runtime::Runtime;
+
+use arco_catalog::lock::LockInfo;
+use arco_catalog::manifest::{
+    CatalogDomainManifest, CommitRecord, ExecutionsManifest, LineageManifest, RootManifest,
+    SearchManifest, SnapshotInfo,
+};
+use arco_core::storage::ObjectStoreBackend;
+use arco_core::{CatalogDomain, CatalogPaths, Error as CoreError, ScopedStorage};
 
 /// Expected tool versions (should match CI)
 mod versions {
@@ -32,6 +49,27 @@ enum Commands {
     Doctor,
     /// Check ADR conformance
     AdrCheck,
+    /// Verify catalog integrity (schemas, golden files, workspace checks)
+    VerifyIntegrity {
+        /// Show detailed output
+        #[arg(long, short)]
+        verbose: bool,
+        /// Report issues without failing
+        #[arg(long)]
+        dry_run: bool,
+        /// Fail if any active lock is present (maintenance windows only)
+        #[arg(long)]
+        lock_strict: bool,
+        /// Tenant ID for storage integrity checks
+        #[arg(long, value_name = "TENANT", requires = "workspace")]
+        tenant: Option<String>,
+        /// Workspace ID for storage integrity checks
+        #[arg(long, value_name = "WORKSPACE", requires = "tenant")]
+        workspace: Option<String>,
+        /// Storage bucket override (defaults to ARCO_STORAGE_BUCKET)
+        #[arg(long, value_name = "BUCKET")]
+        bucket: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -43,6 +81,14 @@ fn main() -> Result<()> {
         Commands::Coverage => run_coverage(),
         Commands::Doctor => run_doctor(),
         Commands::AdrCheck => run_adr_check(),
+        Commands::VerifyIntegrity {
+            verbose,
+            dry_run,
+            lock_strict,
+            tenant,
+            workspace,
+            bucket,
+        } => run_verify_integrity(verbose, dry_run, lock_strict, tenant, workspace, bucket),
     }
 }
 
@@ -224,12 +270,16 @@ const REQUIRED_ADRS: &[(&str, &str)] = &[
         "Event envelope format and evolution",
     ),
     ("adr-005-storage-layout.md", "Canonical storage layout"),
+    (
+        "adr-006-schema-evolution.md",
+        "Parquet schema evolution policy",
+    ),
 ];
 
 fn run_adr_check() -> Result<()> {
     println!("Checking ADR conformance...\n");
 
-    let adr_dir = std::path::Path::new("docs/adr");
+    let adr_dir = Path::new("docs/adr");
     let readme_path = adr_dir.join("README.md");
 
     // Check ADR directory exists
@@ -286,6 +336,949 @@ fn run_adr_check() -> Result<()> {
     }
 
     println!("All ADRs present and indexed!");
+    Ok(())
+}
+
+// ============================================================================
+// Integrity Verification
+// ============================================================================
+
+/// Golden schema definition for validation
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)] // Fields used for schema validation via deserialization
+struct GoldenSchema {
+    name: String,
+    version: u32,
+    fields: Vec<GoldenField>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)] // Fields used for schema validation via deserialization
+struct GoldenField {
+    name: String,
+    data_type: String,
+    nullable: bool,
+}
+
+/// Expected golden schema files
+const GOLDEN_SCHEMAS: &[&str] = &[
+    "namespaces",
+    "tables",
+    "columns",
+    "lineage_edges",
+];
+
+type CheckResult = (Vec<String>, Vec<String>);
+
+fn run_verify_integrity(
+    verbose: bool,
+    dry_run: bool,
+    lock_strict: bool,
+    tenant: Option<String>,
+    workspace: Option<String>,
+    bucket: Option<String>,
+) -> Result<()> {
+    println!("Verifying catalog integrity...\n");
+
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+
+    // 1. Verify golden schema files exist and are valid
+    println!("=== Golden Schema Files ===\n");
+    for name in GOLDEN_SCHEMAS {
+        print!("  {name}.schema.json... ");
+        match verify_golden_schema(name) {
+            Ok(schema) => {
+                if verbose {
+                    println!("[ok] {} fields, version {}", schema.fields.len(), schema.version);
+                } else {
+                    println!("[ok]");
+                }
+            }
+            Err(e) => {
+                println!("[FAIL]");
+                errors.push(format!("Golden schema '{name}': {e}"));
+            }
+        }
+    }
+
+    // 2. Verify ADR-006 (schema evolution policy) exists
+    println!("\n=== Schema Evolution Policy ===\n");
+    print!("  ADR-006 exists... ");
+    let adr_path = Path::new("docs/adr/adr-006-schema-evolution.md");
+    if adr_path.exists() {
+        println!("[ok]");
+    } else {
+        println!("[FAIL]");
+        errors.push("ADR-006 (schema evolution policy) not found".to_string());
+    }
+
+    // 3. Verify schema contract tests exist
+    println!("\n=== Schema Contract Tests ===\n");
+    print!("  schema_contracts.rs exists... ");
+    let test_path = Path::new("crates/arco-catalog/tests/schema_contracts.rs");
+    if test_path.exists() {
+        println!("[ok]");
+    } else {
+        println!("[FAIL]");
+        errors.push("Schema contract tests not found".to_string());
+    }
+
+    // 4. Run schema compatibility tests
+    println!("\n=== Schema Compatibility Tests ===\n");
+    print!("  Running cargo test schema_backward_compatible... ");
+    match run_schema_tests() {
+        Ok(()) => println!("[ok]"),
+        Err(e) => {
+            println!("[FAIL]");
+            errors.push(format!("Schema compatibility tests failed: {e}"));
+        }
+    }
+
+    // 5. Verify PR template has invariant checklist
+    println!("\n=== PR Template ===\n");
+    print!("  Invariant checklist present... ");
+    match verify_pr_template() {
+        Ok(()) => println!("[ok]"),
+        Err(e) => {
+            println!("[FAIL]");
+            errors.push(format!("PR template: {e}"));
+        }
+    }
+
+    // 6. Verify CatalogPaths module exists (no hardcoded paths)
+    println!("\n=== Path Canonicalization ===\n");
+    print!("  CatalogPaths module exists... ");
+    let paths_module = Path::new("crates/arco-core/src/catalog_paths.rs");
+    if paths_module.exists() {
+        println!("[ok]");
+    } else {
+        println!("[FAIL]");
+        errors.push("CatalogPaths module not found".to_string());
+    }
+
+    if let (Some(tenant), Some(workspace)) = (tenant.as_deref(), workspace.as_deref()) {
+        println!("\n=== Workspace Integrity ===\n");
+        match run_workspace_integrity(
+            tenant,
+            workspace,
+            bucket.as_deref(),
+            verbose,
+            lock_strict,
+        ) {
+            Ok((storage_errors, storage_warnings)) => {
+                errors.extend(storage_errors);
+                warnings.extend(storage_warnings);
+            }
+            Err(e) => errors.push(format!("Workspace integrity checks failed: {e}")),
+        }
+    } else {
+        let message = if bucket.is_some() {
+            "Storage integrity checks skipped: --bucket provided without --tenant/--workspace"
+        } else {
+            "Storage integrity checks skipped: provide --tenant and --workspace plus ARCO_STORAGE_BUCKET or --bucket"
+        };
+        warnings.push(message.to_string());
+    }
+
+    println!();
+
+    // Print warnings
+    if !warnings.is_empty() {
+        println!("Warnings:");
+        for w in &warnings {
+            println!("  - {w}");
+        }
+        println!();
+    }
+
+    // Print errors
+    if !errors.is_empty() {
+        println!("Errors:");
+        for e in &errors {
+            println!("  - {e}");
+        }
+        println!();
+
+        if dry_run {
+            println!("Dry run mode: {} error(s) found but not failing.", errors.len());
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "Integrity verification failed with {} error(s).",
+            errors.len()
+        );
+    }
+
+    println!("All integrity checks passed!");
+    Ok(())
+}
+
+fn run_workspace_integrity(
+    tenant: &str,
+    workspace: &str,
+    bucket_override: Option<&str>,
+    verbose: bool,
+    lock_strict: bool,
+) -> Result<CheckResult> {
+    let bucket = resolve_bucket(bucket_override)?;
+    println!("  Scope: tenant={tenant}, workspace={workspace}");
+    println!("  Bucket: {bucket}");
+
+    let backend = ObjectStoreBackend::from_bucket(&bucket)
+        .with_context(|| format!("Failed to configure storage backend for '{bucket}'"))?;
+    let storage = ScopedStorage::new(Arc::new(backend), tenant, workspace)
+        .context("Failed to create scoped storage")?;
+
+    let runtime = Runtime::new().context("Failed to create tokio runtime")?;
+    runtime.block_on(verify_workspace(storage, verbose, lock_strict))
+}
+
+fn resolve_bucket(bucket_override: Option<&str>) -> Result<String> {
+    if let Some(bucket) = bucket_override {
+        let trimmed = bucket.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("--bucket cannot be empty");
+        }
+        return Ok(trimmed.to_string());
+    }
+
+    if let Ok(bucket) = env::var("ARCO_STORAGE_BUCKET") {
+        let trimmed = bucket.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    anyhow::bail!(
+        "ARCO_STORAGE_BUCKET is required for storage integrity checks (or pass --bucket)"
+    );
+}
+
+async fn verify_workspace(
+    storage: ScopedStorage,
+    verbose: bool,
+    lock_strict: bool,
+) -> Result<CheckResult> {
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+
+    print!("  Root manifest... ");
+    let root = match read_json::<RootManifest>(&storage, CatalogPaths::ROOT_MANIFEST).await {
+        Ok(root) => {
+            println!("[ok]");
+            root
+        }
+        Err(e) => {
+            println!("[FAIL]");
+            errors.push(format!("Root manifest: {e}"));
+            return Ok((errors, warnings));
+        }
+    };
+
+    check_root_paths(&root, &mut warnings);
+
+    print!("  Domain manifests... ");
+    let mut domain_errors = Vec::new();
+    let catalog = match read_json::<CatalogDomainManifest>(&storage, &root.catalog_manifest_path).await
+    {
+        Ok(manifest) => Some(manifest),
+        Err(e) => {
+            domain_errors.push(format!(
+                "Catalog manifest ({}): {e}",
+                root.catalog_manifest_path
+            ));
+            None
+        }
+    };
+    let lineage = match read_json::<LineageManifest>(&storage, &root.lineage_manifest_path).await {
+        Ok(manifest) => Some(manifest),
+        Err(e) => {
+            domain_errors.push(format!(
+                "Lineage manifest ({}): {e}",
+                root.lineage_manifest_path
+            ));
+            None
+        }
+    };
+    let executions =
+        match read_json::<ExecutionsManifest>(&storage, &root.executions_manifest_path).await {
+            Ok(manifest) => Some(manifest),
+            Err(e) => {
+                domain_errors.push(format!(
+                    "Executions manifest ({}): {e}",
+                    root.executions_manifest_path
+                ));
+                None
+            }
+        };
+    let search = match read_json::<SearchManifest>(&storage, &root.search_manifest_path).await {
+        Ok(manifest) => Some(manifest),
+        Err(e) => {
+            domain_errors.push(format!(
+                "Search manifest ({}): {e}",
+                root.search_manifest_path
+            ));
+            None
+        }
+    };
+
+    if domain_errors.is_empty() {
+        println!("[ok]");
+    } else {
+        println!("[FAIL]");
+        errors.extend(domain_errors);
+    }
+
+    print!("  Commit chain (catalog)... ");
+    if let Some(catalog) = &catalog {
+        if let Some(last_commit_id) = catalog.last_commit_id.as_deref() {
+            let (chain_errors, commit_count) =
+                verify_commit_chain(&storage, last_commit_id).await;
+            if chain_errors.is_empty() {
+                if verbose {
+                    println!("[ok] {commit_count} commits");
+                } else {
+                    println!("[ok]");
+                }
+            } else {
+                println!("[FAIL]");
+                errors.extend(chain_errors);
+            }
+        } else {
+            println!("[ok] (no commits)");
+        }
+    } else {
+        println!("[SKIP]");
+        warnings.push("Catalog manifest missing; skipping commit chain verification".to_string());
+    }
+
+    print!("  Catalog snapshot... ");
+    if let Some(catalog) = &catalog {
+        let (snap_errors, snap_warnings) = verify_catalog_snapshot(&storage, catalog).await;
+        if snap_errors.is_empty() {
+            println!("[ok]");
+        } else {
+            println!("[FAIL]");
+            errors.extend(snap_errors);
+        }
+        warnings.extend(snap_warnings);
+    } else {
+        println!("[SKIP]");
+        warnings.push("Catalog manifest missing; skipping catalog snapshot checks".to_string());
+    }
+
+    print!("  Lineage snapshot... ");
+    if let Some(lineage) = &lineage {
+        let (snap_errors, snap_warnings) = verify_lineage_snapshot(&storage, lineage).await;
+        if snap_errors.is_empty() {
+            println!("[ok]");
+        } else {
+            println!("[FAIL]");
+            errors.extend(snap_errors);
+        }
+        warnings.extend(snap_warnings);
+    } else {
+        println!("[SKIP]");
+        warnings.push("Lineage manifest missing; skipping lineage snapshot checks".to_string());
+    }
+
+    print!("  Executions state... ");
+    if let Some(executions) = &executions {
+        let (exec_errors, exec_warnings) =
+            verify_executions_state(&storage, executions).await;
+        if exec_errors.is_empty() {
+            println!("[ok]");
+        } else {
+            println!("[FAIL]");
+            errors.extend(exec_errors);
+        }
+        warnings.extend(exec_warnings);
+    } else {
+        println!("[SKIP]");
+        warnings.push("Executions manifest missing; skipping executions checks".to_string());
+    }
+
+    print!("  Search state... ");
+    if let Some(search) = &search {
+        let (search_errors, search_warnings) = verify_search_state(search);
+        if search_errors.is_empty() {
+            println!("[ok]");
+        } else {
+            println!("[FAIL]");
+            errors.extend(search_errors);
+        }
+        warnings.extend(search_warnings);
+    } else {
+        println!("[SKIP]");
+        warnings.push("Search manifest missing; skipping search checks".to_string());
+    }
+
+    print!("  Lock freshness... ");
+    let (lock_errors, lock_warnings) = verify_locks(&storage, verbose, lock_strict).await;
+    if lock_errors.is_empty() {
+        println!("[ok]");
+    } else {
+        println!("[FAIL]");
+        errors.extend(lock_errors);
+    }
+    warnings.extend(lock_warnings);
+
+    Ok((errors, warnings))
+}
+
+fn check_root_paths(root: &RootManifest, warnings: &mut Vec<String>) {
+    let expected_catalog = CatalogPaths::domain_manifest(CatalogDomain::Catalog);
+    if root.catalog_manifest_path != expected_catalog {
+        warnings.push(format!(
+            "Root manifest catalog path '{}' is not canonical (expected '{}')",
+            root.catalog_manifest_path, expected_catalog
+        ));
+    }
+
+    let expected_lineage = CatalogPaths::domain_manifest(CatalogDomain::Lineage);
+    if root.lineage_manifest_path != expected_lineage {
+        warnings.push(format!(
+            "Root manifest lineage path '{}' is not canonical (expected '{}')",
+            root.lineage_manifest_path, expected_lineage
+        ));
+    }
+
+    let expected_executions = CatalogPaths::domain_manifest(CatalogDomain::Executions);
+    if root.executions_manifest_path != expected_executions {
+        warnings.push(format!(
+            "Root manifest executions path '{}' is not canonical (expected '{}')",
+            root.executions_manifest_path, expected_executions
+        ));
+    }
+
+    let expected_search = CatalogPaths::domain_manifest(CatalogDomain::Search);
+    if root.search_manifest_path != expected_search {
+        warnings.push(format!(
+            "Root manifest search path '{}' is not canonical (expected '{}')",
+            root.search_manifest_path, expected_search
+        ));
+    }
+}
+
+async fn verify_catalog_snapshot(
+    storage: &ScopedStorage,
+    manifest: &CatalogDomainManifest,
+) -> CheckResult {
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+
+    let expected_path =
+        CatalogPaths::snapshot_dir(CatalogDomain::Catalog, manifest.snapshot_version);
+    if manifest.snapshot_path != expected_path {
+        errors.push(format!(
+            "Catalog snapshot path '{}' does not match expected '{}'",
+            manifest.snapshot_path, expected_path
+        ));
+    }
+
+    match &manifest.snapshot {
+        Some(snapshot) => {
+            if snapshot.version != manifest.snapshot_version {
+                errors.push(format!(
+                    "Catalog snapshot version mismatch: manifest {}, snapshot {}",
+                    manifest.snapshot_version, snapshot.version
+                ));
+            }
+            if snapshot.path != manifest.snapshot_path {
+                errors.push(format!(
+                    "Catalog snapshot path mismatch: manifest '{}', snapshot '{}'",
+                    manifest.snapshot_path, snapshot.path
+                ));
+            }
+            let (file_errors, file_warnings) = verify_snapshot_files(storage, snapshot).await;
+            errors.extend(file_errors);
+            warnings.extend(file_warnings);
+        }
+        None => {
+            if manifest.snapshot_version > 0 {
+                errors.push(format!(
+                    "Catalog snapshot metadata missing for version {}",
+                    manifest.snapshot_version
+                ));
+            }
+        }
+    }
+
+    (errors, warnings)
+}
+
+async fn verify_lineage_snapshot(
+    storage: &ScopedStorage,
+    manifest: &LineageManifest,
+) -> CheckResult {
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+
+    let expected_path =
+        CatalogPaths::snapshot_dir(CatalogDomain::Lineage, manifest.snapshot_version);
+    if manifest.edges_path != expected_path {
+        errors.push(format!(
+            "Lineage snapshot path '{}' does not match expected '{}'",
+            manifest.edges_path, expected_path
+        ));
+    }
+
+    match &manifest.snapshot {
+        Some(snapshot) => {
+            if snapshot.version != manifest.snapshot_version {
+                errors.push(format!(
+                    "Lineage snapshot version mismatch: manifest {}, snapshot {}",
+                    manifest.snapshot_version, snapshot.version
+                ));
+            }
+            if snapshot.path != manifest.edges_path {
+                errors.push(format!(
+                    "Lineage snapshot path mismatch: manifest '{}', snapshot '{}'",
+                    manifest.edges_path, snapshot.path
+                ));
+            }
+            let (file_errors, file_warnings) = verify_snapshot_files(storage, snapshot).await;
+            errors.extend(file_errors);
+            warnings.extend(file_warnings);
+        }
+        None => {
+            if manifest.snapshot_version > 0 {
+                errors.push(format!(
+                    "Lineage snapshot metadata missing for version {}",
+                    manifest.snapshot_version
+                ));
+            }
+        }
+    }
+
+    (errors, warnings)
+}
+
+async fn verify_executions_state(
+    storage: &ScopedStorage,
+    manifest: &ExecutionsManifest,
+) -> CheckResult {
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+
+    let state_dir = CatalogPaths::state_dir(CatalogDomain::Executions);
+    if !manifest.checkpoint_path.starts_with(&state_dir) {
+        errors.push(format!(
+            "Executions checkpoint path '{}' is not under '{}'",
+            manifest.checkpoint_path, state_dir
+        ));
+    }
+
+    let needs_checkpoint = manifest.watermark_version > 0 || manifest.snapshot_version > 0;
+    if needs_checkpoint {
+        match storage.head_raw(&manifest.checkpoint_path).await {
+            Ok(Some(_)) => {}
+            Ok(None) => errors.push(format!(
+                "Executions checkpoint missing: {}",
+                manifest.checkpoint_path
+            )),
+            Err(e) => errors.push(format!(
+                "Failed to read executions checkpoint '{}': {e}",
+                manifest.checkpoint_path
+            )),
+        }
+    }
+
+    match manifest.snapshot_path.as_deref() {
+        Some(snapshot_path) => {
+            if !snapshot_path.starts_with(&state_dir) {
+                errors.push(format!(
+                    "Executions snapshot path '{}' is not under '{}'",
+                    snapshot_path, state_dir
+                ));
+            }
+            if !snapshot_path.ends_with(".parquet") {
+                errors.push(format!(
+                    "Executions snapshot path '{}' does not end with .parquet",
+                    snapshot_path
+                ));
+            }
+            match storage.head_raw(snapshot_path).await {
+                Ok(Some(_)) => {}
+                Ok(None) => errors.push(format!(
+                    "Executions snapshot missing: {}",
+                    snapshot_path
+                )),
+                Err(e) => errors.push(format!(
+                    "Failed to read executions snapshot '{}': {e}",
+                    snapshot_path
+                )),
+            }
+            if manifest.snapshot_version == 0 {
+                warnings.push(
+                    "Executions snapshot_path set while snapshot_version is 0".to_string(),
+                );
+            }
+        }
+        None => {
+            if manifest.snapshot_version > 0 {
+                errors.push(format!(
+                    "Executions snapshot_version is {} but snapshot_path is None",
+                    manifest.snapshot_version
+                ));
+            }
+        }
+    }
+
+    (errors, warnings)
+}
+
+fn verify_search_state(manifest: &SearchManifest) -> CheckResult {
+    let mut errors = Vec::new();
+    let warnings = Vec::new();
+
+    let expected_path =
+        CatalogPaths::snapshot_dir(CatalogDomain::Search, manifest.snapshot_version);
+    if manifest.base_path != expected_path {
+        errors.push(format!(
+            "Search base_path '{}' does not match expected '{}'",
+            manifest.base_path, expected_path
+        ));
+    }
+
+    (errors, warnings)
+}
+
+async fn verify_snapshot_files(
+    storage: &ScopedStorage,
+    snapshot: &SnapshotInfo,
+) -> CheckResult {
+    let mut errors = Vec::new();
+    let warnings = Vec::new();
+
+    if snapshot.files.is_empty() {
+        errors.push(format!("Snapshot '{}' has no files", snapshot.path));
+        return (errors, warnings);
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut total_rows = 0u64;
+    let mut total_bytes = 0u64;
+
+    for file in &snapshot.files {
+        if file.path.trim().is_empty() {
+            errors.push(format!(
+                "Snapshot '{}' has a file with empty path",
+                snapshot.path
+            ));
+            continue;
+        }
+
+        if !seen.insert(file.path.clone()) {
+            errors.push(format!(
+                "Snapshot '{}' has duplicate file entry '{}'",
+                snapshot.path, file.path
+            ));
+        }
+
+        let full_path = join_snapshot_path(&snapshot.path, &file.path);
+        let bytes = match storage.get_raw(&full_path).await {
+            Ok(bytes) => bytes,
+            Err(e) if is_not_found(&e) => {
+                errors.push(format!("Snapshot file missing: {full_path}"));
+                continue;
+            }
+            Err(e) => {
+                errors.push(format!("Failed to read snapshot file '{full_path}': {e}"));
+                continue;
+            }
+        };
+
+        let actual_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if actual_size != file.byte_size {
+            errors.push(format!(
+                "Snapshot file size mismatch for '{}': manifest {}, actual {}",
+                full_path, file.byte_size, actual_size
+            ));
+        }
+
+        let actual_checksum = sha256_hex(bytes.as_ref());
+        if actual_checksum != file.checksum_sha256 {
+            errors.push(format!(
+                "Snapshot checksum mismatch for '{}': manifest {}, actual {}",
+                full_path, file.checksum_sha256, actual_checksum
+            ));
+        }
+
+        total_rows = total_rows.saturating_add(file.row_count);
+        total_bytes = total_bytes.saturating_add(file.byte_size);
+    }
+
+    if snapshot.total_rows != total_rows {
+        errors.push(format!(
+            "Snapshot '{}' total_rows mismatch: manifest {}, sum {}",
+            snapshot.path, snapshot.total_rows, total_rows
+        ));
+    }
+
+    if snapshot.total_bytes != total_bytes {
+        errors.push(format!(
+            "Snapshot '{}' total_bytes mismatch: manifest {}, sum {}",
+            snapshot.path, snapshot.total_bytes, total_bytes
+        ));
+    }
+
+    (errors, warnings)
+}
+
+async fn verify_commit_chain(
+    storage: &ScopedStorage,
+    last_commit_id: &str,
+) -> (Vec<String>, usize) {
+    let mut errors = Vec::new();
+    let mut visited = HashSet::new();
+    let mut expected_hash: Option<String> = None;
+    let mut current = Some(last_commit_id.to_string());
+    let mut count = 0usize;
+
+    while let Some(commit_id) = current {
+        if !visited.insert(commit_id.clone()) {
+            errors.push(format!("Commit chain cycle detected at {commit_id}"));
+            break;
+        }
+
+        let path = CatalogPaths::commit(CatalogDomain::Catalog, &commit_id);
+        let bytes = match storage.get_raw(&path).await {
+            Ok(bytes) => bytes,
+            Err(e) if is_not_found(&e) => {
+                errors.push(format!("Commit record missing: {path}"));
+                break;
+            }
+            Err(e) => {
+                errors.push(format!("Failed to read commit record '{path}': {e}"));
+                break;
+            }
+        };
+
+        let record: CommitRecord = match serde_json::from_slice(&bytes) {
+            Ok(record) => record,
+            Err(e) => {
+                errors.push(format!("Invalid commit JSON at '{}': {e}", path));
+                break;
+            }
+        };
+
+        let actual_hash = record.compute_hash();
+        if let Some(expected) = expected_hash.as_deref() {
+            if expected != actual_hash {
+                let legacy_hash = sha256_prefixed(bytes.as_ref());
+                if expected == legacy_hash {
+                    errors.push(format!(
+                        "Commit hash mismatch for '{}': expected {}, got {} (matches legacy raw JSON hash)",
+                        path, expected, actual_hash
+                    ));
+                } else {
+                    errors.push(format!(
+                        "Commit hash mismatch for '{}': expected {}, got {}",
+                        path, expected, actual_hash
+                    ));
+                }
+            }
+        }
+
+        if record.commit_id != commit_id {
+            errors.push(format!(
+                "Commit ID mismatch at '{}': expected {}, found {}",
+                path, commit_id, record.commit_id
+            ));
+        }
+
+        if record.prev_commit_id.is_none() && record.prev_commit_hash.is_some() {
+            errors.push(format!(
+                "Commit '{}' has prev_commit_hash but no prev_commit_id",
+                commit_id
+            ));
+        }
+        if record.prev_commit_id.is_some() && record.prev_commit_hash.is_none() {
+            errors.push(format!(
+                "Commit '{}' has prev_commit_id but no prev_commit_hash",
+                commit_id
+            ));
+        }
+
+        expected_hash = record.prev_commit_hash.clone();
+        current = record.prev_commit_id.clone();
+        count += 1;
+    }
+
+    (errors, count)
+}
+
+async fn verify_locks(
+    storage: &ScopedStorage,
+    verbose: bool,
+    lock_strict: bool,
+) -> CheckResult {
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+
+    for domain in CatalogDomain::all() {
+        let path = CatalogPaths::domain_lock(*domain);
+        let bytes = match storage.get_raw(&path).await {
+            Ok(bytes) => bytes,
+            Err(e) if is_not_found(&e) => continue,
+            Err(e) => {
+                errors.push(format!("Failed to read lock '{path}': {e}"));
+                continue;
+            }
+        };
+
+        let info: LockInfo = match serde_json::from_slice(&bytes) {
+            Ok(info) => info,
+            Err(e) => {
+                errors.push(format!("Invalid lock JSON at '{path}': {e}"));
+                continue;
+            }
+        };
+
+        if info.is_expired() {
+            // Expired locks are typically debris from crashed processes.
+            // Only treat as error if expired > 1 hour ago (very stale).
+            let expired_duration = Utc::now() - info.expires_at;
+            let stale_threshold = chrono::Duration::hours(1);
+
+            if expired_duration > stale_threshold {
+                errors.push(format!(
+                    "Lock '{}' expired {} ago (stale - consider cleanup)",
+                    path,
+                    format_duration(expired_duration)
+                ));
+            } else {
+                warnings.push(format!(
+                    "Lock '{}' expired {} ago (likely crashed process)",
+                    path,
+                    format_duration(expired_duration)
+                ));
+            }
+        } else {
+            let message = if verbose {
+                format!(
+                    "Lock '{}' held by {} (expires in {:?})",
+                    path,
+                    info.holder_id,
+                    info.remaining_ttl()
+                )
+            } else {
+                format!("Lock '{}' is active (held by {})", path, info.holder_id)
+            };
+            if lock_strict {
+                errors.push(message);
+            } else {
+                warnings.push(message);
+            }
+        }
+    }
+
+    (errors, warnings)
+}
+
+async fn read_json<T: DeserializeOwned>(storage: &ScopedStorage, path: &str) -> Result<T> {
+    let bytes = storage
+        .get_raw(path)
+        .await
+        .with_context(|| format!("Failed to read '{path}'"))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("Invalid JSON at '{path}'"))
+}
+
+fn join_snapshot_path(dir: &str, file: &str) -> String {
+    let file = file.trim_start_matches('/');
+    if dir.ends_with('/') {
+        format!("{dir}{file}")
+    } else {
+        format!("{dir}/{file}")
+    }
+}
+
+fn is_not_found(err: &CoreError) -> bool {
+    matches!(err, CoreError::NotFound(_) | CoreError::ResourceNotFound { .. })
+}
+
+fn sha256_prefixed(bytes: &[u8]) -> String {
+    let hash = Sha256::digest(bytes);
+    format!("sha256:{}", hex::encode(hash))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let hash = Sha256::digest(bytes);
+    hex::encode(hash)
+}
+
+/// Formats a chrono Duration as a human-readable string.
+fn format_duration(d: chrono::Duration) -> String {
+    let hours = d.num_hours();
+    let minutes = d.num_minutes() % 60;
+
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        let seconds = d.num_seconds() % 60;
+        format!("{seconds}s")
+    }
+}
+
+fn verify_golden_schema(name: &str) -> Result<GoldenSchema> {
+    let path = format!("crates/arco-catalog/tests/golden_schemas/{name}.schema.json");
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read golden schema: {path}"))?;
+
+    let schema: GoldenSchema = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse golden schema JSON: {path}"))?;
+
+    // Validate schema has fields
+    if schema.fields.is_empty() {
+        anyhow::bail!("Schema has no fields");
+    }
+
+    Ok(schema)
+}
+
+fn run_schema_tests() -> Result<()> {
+    let output = Command::new("cargo")
+        .args([
+            "test",
+            "-p", "arco-catalog",
+            "--test", "schema_contracts",
+            "--",
+            "--test-threads=1",
+        ])
+        .output()
+        .context("Failed to run schema tests")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("{}", stderr.lines().take(10).collect::<Vec<_>>().join("\n"));
+    }
+
+    Ok(())
+}
+
+fn verify_pr_template() -> Result<()> {
+    let path = ".github/pull_request_template.md";
+    let content = std::fs::read_to_string(path)
+        .context("PR template not found")?;
+
+    let required_sections = [
+        "Invariant Checklist",
+        "Architecture Invariants",
+        "Two-tier consistency",
+        "Schema evolution rules",
+    ];
+
+    for section in required_sections {
+        if !content.contains(section) {
+            anyhow::bail!("Missing section: {section}");
+        }
+    }
+
     Ok(())
 }
 

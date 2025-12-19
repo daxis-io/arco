@@ -31,6 +31,7 @@ jobs:
           version: '1.47.2'
       - run: cargo xtask doctor
       - run: cargo xtask adr-check
+      - run: cargo xtask verify-integrity
 
   check:
     name: Check

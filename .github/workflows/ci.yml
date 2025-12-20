@@ -130,3 +130,48 @@ jobs:
         run: |
           buf breaking proto/ \
             --against 'https://github.com/${{ github.repository }}.git#branch=main,subdir=proto'
+
+  # ==========================================================================
+  # Gate 5: IAM Smoke Tests (deployed environment)
+  # ==========================================================================
+  iam-smoke:
+    name: IAM Smoke Tests
+    runs-on: ubuntu-latest
+    # Only run on main branch pushes, not PRs (requires deployed infrastructure)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: dev
+    needs: [check, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Authenticate to GCP (API SA)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_API }}
+
+      - name: Run API IAM smoke tests
+        env:
+          ARCO_TEST_BUCKET: ${{ vars.ARCO_BUCKET_DEV }}
+        run: |
+          cargo test --package arco-integration-tests \
+            --features iam-smoke \
+            -- --ignored --test-threads=1
+
+  # ==========================================================================
+  # Compile-Negative Tests (Gate 5 trait separation)
+  # ==========================================================================
+  compile-negative:
+    name: Compile-Negative Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85
+      - uses: Swatinem/rust-cache@v2
+      - name: Run UI/compile-fail tests
+        run: cargo test -p arco-core --test ui

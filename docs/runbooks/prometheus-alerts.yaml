@@ -204,6 +204,219 @@ groups:
             Investigate for systemic failures.
           runbook_url: https://docs.arco.dev/runbooks/high-task-failure-rate
 
+  # ==========================================================================
+  # Gate 5: Storage Integrity Alerts
+  # ==========================================================================
+  - name: arco-gate5-integrity
+    rules:
+      # CRITICAL: API should never write to state/ prefix
+      - alert: ArcoApiWritingState
+        expr: |
+          increase(arco_storage_operations_total{service="api", operation="put_state"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          team: data-platform
+          gate5: true
+        annotations:
+          summary: GATE 5 VIOLATION - API writing to state/ prefix
+          description: |
+            API service is writing to state/ prefix which violates the "compactor is sole writer" invariant.
+            This is a critical security issue - investigate immediately.
+          runbook_url: https://docs.arco.dev/runbooks/gate5-violations
+
+      # CRITICAL: Stale fencing token attempts
+      - alert: ArcoStaleFencingToken
+        expr: |
+          increase(arco_publish_permit_consumed_total{result="stale_token"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          team: data-platform
+          gate5: true
+        annotations:
+          summary: GATE 5 VIOLATION - Stale fencing token publish attempt
+          description: |
+            A process attempted to publish with a stale fencing token.
+            This could indicate a split-brain scenario or lock contention issue.
+            Token: {{ $labels.fencing_token }}
+          runbook_url: https://docs.arco.dev/runbooks/gate5-violations
+
+      # CRITICAL: Manifest succession failure
+      - alert: ArcoManifestSuccessionFailure
+        expr: |
+          increase(arco_manifest_succession_failures_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          team: data-platform
+          gate5: true
+        annotations:
+          summary: GATE 5 VIOLATION - Manifest succession validation failed
+          description: |
+            Manifest update failed validation. Reason: {{ $labels.reason }}.
+            This could indicate rollback attempt, concurrent modification, or data corruption.
+          runbook_url: https://docs.arco.dev/runbooks/gate5-violations
+
+      # WARNING: Anti-entropy finding gaps
+      - alert: ArcoAntiEntropyGaps
+        expr: |
+          increase(arco_anti_entropy_gaps_found_total[1h]) > 10
+        for: 5m
+        labels:
+          severity: warning
+          team: data-platform
+          gate5: true
+        annotations:
+          summary: Anti-entropy finding missed events
+          description: |
+            Anti-entropy discovered {{ $value }} missed events in the past hour.
+            This indicates notification delivery issues.
+          runbook_url: https://docs.arco.dev/runbooks/storage-integrity-verification
+
+  # ==========================================================================
+  # Gate 5: Backpressure Alerts
+  # ==========================================================================
+  - name: arco-gate5-backpressure
+    rules:
+      # WARNING: Soft backpressure threshold
+      - alert: ArcoBackpressureSoftThreshold
+        expr: |
+          arco_backpressure_pending_lag > 5000
+        for: 5m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: Backpressure soft threshold exceeded
+          description: |
+            Domain {{ $labels.domain }} has pending lag of {{ $value }}.
+            Compactor may be falling behind. Consider scaling compactor.
+          runbook_url: https://docs.arco.dev/runbooks/scheduler-not-progressing
+
+      # CRITICAL: Hard backpressure threshold
+      - alert: ArcoBackpressureHardThreshold
+        expr: |
+          arco_backpressure_pending_lag > 10000
+        for: 2m
+        labels:
+          severity: critical
+          team: data-platform
+        annotations:
+          summary: Backpressure hard threshold - writes may be rejected
+          description: |
+            Domain {{ $labels.domain }} has critical pending lag of {{ $value }}.
+            Writes are being rejected with retry_after headers.
+          runbook_url: https://docs.arco.dev/runbooks/scheduler-not-progressing
+
+      # WARNING: Backpressure rejections occurring
+      - alert: ArcoBackpressureRejections
+        expr: |
+          increase(arco_backpressure_rejections_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: Requests being rejected due to backpressure
+          description: |
+            {{ $value }} requests rejected in the past 5 minutes due to backpressure.
+            Clients should be retrying with exponential backoff.
+          runbook_url: https://docs.arco.dev/runbooks/scheduler-not-progressing
+
+  # ==========================================================================
+  # Gate 5: Lock and CAS Alerts
+  # ==========================================================================
+  - name: arco-gate5-locks
+    rules:
+      # WARNING: High CAS contention
+      - alert: ArcoHighCASContention
+        expr: |
+          (
+            sum(rate(arco_cas_attempts_total{result="precondition_failed"}[5m]))
+            /
+            sum(rate(arco_cas_attempts_total[5m]))
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: High CAS contention rate
+          description: |
+            CAS failure rate is {{ $value | humanizePercentage }}.
+            This indicates high write contention on manifests.
+          runbook_url: https://docs.arco.dev/runbooks/storage-integrity-verification
+
+      # WARNING: Lock held too long
+      - alert: ArcoLongHeldLock
+        expr: |
+          histogram_quantile(0.99, sum(rate(arco_lock_held_seconds_bucket[5m])) by (le, resource)) > 60
+        for: 5m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: Lock held for extended period
+          description: |
+            Lock {{ $labels.resource }} P99 hold time is {{ $value | humanizeDuration }}.
+            This may indicate slow operations or potential deadlock.
+          runbook_url: https://docs.arco.dev/runbooks/scheduler-not-progressing
+
+      # WARNING: High lock contention
+      - alert: ArcoHighLockContention
+        expr: |
+          (
+            sum(rate(arco_lock_acquisitions_total{result="contention"}[5m]))
+            /
+            sum(rate(arco_lock_acquisitions_total[5m]))
+          ) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: High lock contention
+          description: |
+            Lock contention rate is {{ $value | humanizePercentage }}.
+            Multiple processes competing for the same locks.
+          runbook_url: https://docs.arco.dev/runbooks/scheduler-not-progressing
+
+  # ==========================================================================
+  # Gate 5: Compaction Alerts
+  # ==========================================================================
+  - name: arco-gate5-compaction
+    rules:
+      # WARNING: Sync compaction timeout
+      - alert: ArcoSyncCompactionTimeout
+        expr: |
+          histogram_quantile(0.99, sum(rate(arco_compaction_latency_seconds_bucket{trigger="sync_rpc"}[5m])) by (le)) > 30
+        for: 5m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: Sync compaction latency high
+          description: |
+            P99 sync compaction latency is {{ $value | humanizeDuration }}.
+            Tier-1 DDL operations will be slow.
+          runbook_url: https://docs.arco.dev/runbooks/scheduler-not-progressing
+
+      # WARNING: Compactor not running
+      - alert: ArcoCompactorStalled
+        expr: |
+          time() - max(arco_compactor_last_run_timestamp) by (domain) > 600
+        for: 5m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: Compactor not running for domain
+          description: |
+            Domain {{ $labels.domain }} has not had a compaction run in {{ $value | humanizeDuration }}.
+            Check compactor health.
+          runbook_url: https://docs.arco.dev/runbooks/scheduler-not-progressing
+
 # Recording rules for efficiency
   - name: arco-flow-recording
     rules:

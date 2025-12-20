@@ -24,7 +24,7 @@ azure = ["arco-core/azure"]
 test-utils = ["arco-core/test-utils", "dep:proptest", "dep:tempfile"]
 
 [dependencies]
-arco-core = { path = "../arco-core" }
+arco-core = { path = "../arco-core", features = ["sync-compaction"] }
 
 # Async runtime
 tokio = { workspace = true }

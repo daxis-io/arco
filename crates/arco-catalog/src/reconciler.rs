@@ -557,6 +557,9 @@ mod tests {
             snapshot_path: snapshot_path.clone(),
             snapshot: Some(snapshot),
             last_commit_id: None,
+            fencing_token: None,
+            commit_ulid: None,
+            parent_hash: None,
             updated_at: Utc::now(),
         };
         storage

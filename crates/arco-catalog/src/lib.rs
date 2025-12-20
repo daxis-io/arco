@@ -81,7 +81,13 @@ pub mod metrics;
 pub mod parquet_util;
 pub mod reader;
 pub mod reconciler;
+pub mod search_tombstone;
+pub mod sync_compactor;
 mod state;
+pub mod tier1_compactor;
+pub mod tier1_events;
+pub mod tier1_snapshot;
+pub mod tier1_state;
 pub mod tier1_writer;
 pub mod write_options;
 pub mod writer;
@@ -99,12 +105,30 @@ pub use manifest::{
 };
 pub use reader::{CatalogReader, LineageGraph, SignedUrl, SnapshotFreshness};
 pub use reconciler::{Reconciler, ReconciliationIssue, ReconciliationReport, RepairResult};
+pub use search_tombstone::{SearchTombstone, TombstoneBatch, TombstoneReason};
+pub use sync_compactor::SyncCompactor;
+pub use tier1_compactor::{Tier1CompactionError, Tier1CompactionResult, Tier1Compactor};
+pub use tier1_events::{CatalogDdlEvent, LineageDdlEvent};
 pub use tier1_writer::Tier1Writer;
 pub use write_options::{IdempotencyKey, SnapshotVersion, WriteOptions};
 pub use writer::{
     CatalogWriter, Column, ColumnDefinition, EventSource, LineageEdge, Namespace,
     RegisterTableRequest, Table, TablePatch,
 };
+
+/// Creates a publish permit issuer for sync compaction.
+///
+/// # Safety
+///
+/// Callers MUST validate the fencing token against the current lock state before
+/// calling this function. Normal code paths should use `LockGuard::permit_issuer()`.
+#[must_use]
+pub fn sync_compact_permit_issuer(
+    fencing_token: u64,
+    lock_path: &str,
+) -> arco_core::publish::PermitIssuer {
+    arco_core::lock::sync_compact_permit_issuer(lock_path, fencing_token)
+}
 
 /// Prelude module for convenient imports.
 pub mod prelude {

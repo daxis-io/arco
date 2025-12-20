@@ -26,6 +26,40 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 // ============================================================================
+// Raw Byte Hashing for Rollback Detection
+// ============================================================================
+
+/// Computes a cryptographic hash from raw manifest bytes.
+///
+/// **Critical:** This function takes the exact bytes read from storage,
+/// NOT re-serialized JSON. Re-serialization may produce different bytes
+/// due to JSON field ordering, whitespace, or other formatting differences.
+///
+/// # Arguments
+///
+/// - `raw_bytes`: The exact bytes read from storage
+///
+/// # Returns
+///
+/// A string in the format `sha256:{hex}` where `{hex}` is the lowercase
+/// hex-encoded SHA-256 hash.
+///
+/// # Example
+///
+/// ```rust
+/// use arco_catalog::manifest::compute_manifest_hash;
+///
+/// let raw_bytes = br#"{"snapshotVersion":1,"snapshotPath":"..."}"#;
+/// let hash = compute_manifest_hash(raw_bytes);
+/// assert!(hash.starts_with("sha256:"));
+/// ```
+#[must_use]
+pub fn compute_manifest_hash(raw_bytes: &[u8]) -> String {
+    let hash = Sha256::digest(raw_bytes);
+    format!("sha256:{}", hex::encode(hash))
+}
+
+// ============================================================================
 // Root Manifest (pointer to domain manifests)
 // ============================================================================
 
@@ -124,7 +158,7 @@ impl Default for RootManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogDomainManifest {
-    /// Current snapshot version.
+    /// Current snapshot version (monotonically increasing).
     pub snapshot_version: u64,
 
     /// Path to snapshot directory.
@@ -140,6 +174,27 @@ pub struct CatalogDomainManifest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_commit_id: Option<String>,
 
+    /// Fencing token for distributed lock validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fencing_token: Option<u64>,
+
+    /// Commit ULID for audit correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_ulid: Option<String>,
+
+    /// Parent manifest hash (sha256 of RAW stored bytes).
+    ///
+    /// **Critical:** This must be computed from the exact bytes read from
+    /// storage, NOT from re-serializing the manifest struct. Re-serialization
+    /// may produce different bytes (JSON field ordering, whitespace, etc.).
+    ///
+    /// Used for:
+    /// - **Rollback detection**: Ensures version cannot regress
+    /// - **Concurrent modification detection**: Hash mismatch means someone else modified
+    /// - **Integrity verification**: Chain from current to previous manifest
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_hash: Option<String>,
+
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
 }
@@ -153,6 +208,9 @@ impl CatalogDomainManifest {
             snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 0),
             snapshot: None,
             last_commit_id: None,
+            fencing_token: None,
+            commit_ulid: None,
+            parent_hash: None,
             updated_at: Utc::now(),
         }
     }
@@ -161,6 +219,69 @@ impl CatalogDomainManifest {
     #[must_use]
     pub fn next_version(&self) -> u64 {
         self.snapshot_version + 1
+    }
+
+    /// Validates that this manifest can succeed the given previous manifest.
+    ///
+    /// # Arguments
+    ///
+    /// - `previous`: The previous manifest struct
+    /// - `previous_raw_hash`: Hash computed from raw stored bytes of previous
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if succession is valid, or an error describing the violation.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - `snapshot_version` decreased (rollback attempt)
+    /// - `parent_hash` doesn't match `previous_raw_hash` (concurrent modification)
+    pub fn validate_succession(
+        &self,
+        previous: &Self,
+        previous_raw_hash: &str,
+    ) -> Result<(), String> {
+        // Version must not decrease (rollback detection)
+        if self.snapshot_version < previous.snapshot_version {
+            return Err(format!(
+                "version regression: {} -> {} (rollback not allowed)",
+                previous.snapshot_version, self.snapshot_version
+            ));
+        }
+
+        // Parent hash must match raw stored bytes (concurrent modification detection)
+        if let Some(ref parent_hash) = self.parent_hash {
+            if parent_hash != previous_raw_hash {
+                return Err(format!(
+                    "parent hash mismatch: expected {}, got {} (concurrent modification detected)",
+                    previous_raw_hash, parent_hash
+                ));
+            }
+        }
+
+        if let (Some(prev), Some(next)) = (previous.fencing_token, self.fencing_token) {
+            if next < prev {
+                return Err(format!(
+                    "fencing token regression: {} -> {} (stale holder)",
+                    prev, next
+                ));
+            }
+        }
+
+        if let (Some(prev), Some(next)) = (
+            previous.commit_ulid.as_deref(),
+            self.commit_ulid.as_deref(),
+        ) {
+            if next <= prev {
+                return Err(format!(
+                    "commit ulid regression: {} -> {} (non-monotonic)",
+                    prev, next
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -342,6 +463,14 @@ pub struct ExecutionsManifest {
     #[serde(default)]
     pub compaction: CompactionMetadata,
 
+    /// Fencing token for distributed lock validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fencing_token: Option<u64>,
+
+    /// Commit ULID for audit correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_ulid: Option<String>,
+
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
 }
@@ -362,6 +491,8 @@ impl ExecutionsManifest {
             watermark_position: None,
             last_compaction_at: None,
             compaction: CompactionMetadata::default(),
+            fencing_token: None,
+            commit_ulid: None,
             updated_at: Utc::now(),
         }
     }
@@ -392,6 +523,22 @@ pub struct LineageManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<SnapshotInfo>,
 
+    /// Hash of the previous raw manifest (tamper-evident chain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_hash: Option<String>,
+
+    /// Fencing token for distributed lock validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fencing_token: Option<u64>,
+
+    /// Commit ULID for audit correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_ulid: Option<String>,
+
+    /// Last commit ID for audit trail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_commit_id: Option<String>,
+
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
 }
@@ -404,8 +551,66 @@ impl LineageManifest {
             snapshot_version: 0,
             edges_path: CatalogPaths::snapshot_dir(CatalogDomain::Lineage, 0),
             snapshot: None,
+            parent_hash: None,
+            fencing_token: None,
+            commit_ulid: None,
+            last_commit_id: None,
             updated_at: Utc::now(),
         }
+    }
+
+    /// Validates that this manifest can succeed the given previous manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - `snapshot_version` decreased (rollback attempt)
+    /// - `parent_hash` doesn't match `previous_raw_hash` (concurrent modification)
+    /// - `fencing_token` regresses (stale holder)
+    /// - `commit_ulid` is non-monotonic
+    pub fn validate_succession(
+        &self,
+        previous: &Self,
+        previous_raw_hash: &str,
+    ) -> Result<(), String> {
+        if self.snapshot_version < previous.snapshot_version {
+            return Err(format!(
+                "version regression: {} -> {} (rollback not allowed)",
+                previous.snapshot_version, self.snapshot_version
+            ));
+        }
+
+        if let Some(ref parent_hash) = self.parent_hash {
+            if parent_hash != previous_raw_hash {
+                return Err(format!(
+                    "parent hash mismatch: expected {}, got {} (concurrent modification detected)",
+                    previous_raw_hash, parent_hash
+                ));
+            }
+        }
+
+        if let (Some(prev), Some(next)) = (previous.fencing_token, self.fencing_token) {
+            if next < prev {
+                return Err(format!(
+                    "fencing token regression: {} -> {} (stale holder)",
+                    prev, next
+                ));
+            }
+        }
+
+        if let (Some(prev), Some(next)) = (
+            previous.commit_ulid.as_deref(),
+            self.commit_ulid.as_deref(),
+        ) {
+            if next <= prev {
+                return Err(format!(
+                    "commit ulid regression: {} -> {} (non-monotonic)",
+                    prev, next
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -427,6 +632,14 @@ pub struct SearchManifest {
     /// Path to search Parquet files.
     pub base_path: String,
 
+    /// Fencing token for distributed lock validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fencing_token: Option<u64>,
+
+    /// Commit ULID for audit correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_ulid: Option<String>,
+
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
 }
@@ -438,6 +651,8 @@ impl SearchManifest {
         Self {
             snapshot_version: 0,
             base_path: CatalogPaths::snapshot_dir(CatalogDomain::Search, 0),
+            fencing_token: None,
+            commit_ulid: None,
             updated_at: Utc::now(),
         }
     }
@@ -722,6 +937,9 @@ mod tests {
             snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 42),
             snapshot: None,
             last_commit_id: Some("commit_abc".into()),
+            fencing_token: None,
+            commit_ulid: None,
+            parent_hash: None,
             updated_at: now,
         };
 
@@ -742,6 +960,8 @@ mod tests {
                 total_events_compacted: 100,
                 total_files_written: 5,
             },
+            fencing_token: None,
+            commit_ulid: None,
             updated_at: now,
         };
 
@@ -869,5 +1089,277 @@ mod tests {
         assert_eq!(commit2.prev_commit_id, Some("commit_001".into()));
         assert_eq!(commit2.prev_commit_hash, Some(commit1.compute_hash()));
         assert_eq!(commit2.operation, "CreateAsset");
+    }
+
+    // === Rollback Detection Tests (Gate 5) ===
+
+    #[test]
+    fn test_compute_manifest_hash_deterministic() {
+        let raw_bytes = br#"{"snapshotVersion":1,"snapshotPath":"state/catalog/v1/"}"#;
+
+        let hash1 = compute_manifest_hash(raw_bytes);
+        let hash2 = compute_manifest_hash(raw_bytes);
+
+        // Hash should be deterministic
+        assert_eq!(hash1, hash2);
+        assert!(hash1.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn test_compute_manifest_hash_different_bytes() {
+        let bytes1 = br#"{"snapshotVersion":1}"#;
+        let bytes2 = br#"{"snapshotVersion":2}"#;
+
+        let hash1 = compute_manifest_hash(bytes1);
+        let hash2 = compute_manifest_hash(bytes2);
+
+        // Different bytes should produce different hashes
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_validate_succession_version_regression_rejected() {
+        let now = Utc::now();
+        let previous = CatalogDomainManifest {
+            snapshot_version: 5,
+            snapshot_path: "state/catalog/v5/".into(),
+            snapshot: None,
+            last_commit_id: None,
+            fencing_token: None,
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: now,
+        };
+
+        // Attempt to regress version from 5 to 3
+        let regressed = CatalogDomainManifest {
+            snapshot_version: 3,
+            snapshot_path: "state/catalog/v3/".into(),
+            snapshot: None,
+            last_commit_id: None,
+            fencing_token: None,
+            commit_ulid: None,
+            parent_hash: Some("sha256:abc123".into()),
+            updated_at: now,
+        };
+
+        let previous_raw_hash = "sha256:abc123";
+        let result = regressed.validate_succession(&previous, previous_raw_hash);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("regression"));
+    }
+
+    #[test]
+    fn test_validate_succession_parent_hash_mismatch_rejected() {
+        let now = Utc::now();
+        let previous = CatalogDomainManifest {
+            snapshot_version: 5,
+            snapshot_path: "state/catalog/v5/".into(),
+            snapshot: None,
+            last_commit_id: None,
+            fencing_token: None,
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: now,
+        };
+
+        // Attempt with wrong parent hash (concurrent modification)
+        let concurrent_modified = CatalogDomainManifest {
+            snapshot_version: 6,
+            snapshot_path: "state/catalog/v6/".into(),
+            snapshot: None,
+            last_commit_id: None,
+            fencing_token: None,
+            commit_ulid: None,
+            parent_hash: Some("sha256:wrong_hash".into()),
+            updated_at: now,
+        };
+
+        let actual_raw_hash = "sha256:actual_hash";
+        let result = concurrent_modified.validate_succession(&previous, actual_raw_hash);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("mismatch"));
+    }
+
+    #[test]
+    fn test_validate_succession_fencing_token_regression_rejected() {
+        let now = Utc::now();
+        let previous = CatalogDomainManifest {
+            snapshot_version: 5,
+            snapshot_path: "state/catalog/v5/".into(),
+            snapshot: None,
+            last_commit_id: None,
+            fencing_token: Some(5),
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: now,
+        };
+
+        let stale = CatalogDomainManifest {
+            snapshot_version: 6,
+            snapshot_path: "state/catalog/v6/".into(),
+            snapshot: None,
+            last_commit_id: None,
+            fencing_token: Some(4),
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: now,
+        };
+
+        let result = stale.validate_succession(&previous, "sha256:any");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("fencing token regression"));
+    }
+
+    #[test]
+    fn test_validate_succession_commit_ulid_regression_rejected() {
+        let now = Utc::now();
+        let previous = CatalogDomainManifest {
+            snapshot_version: 5,
+            snapshot_path: "state/catalog/v5/".into(),
+            snapshot: None,
+            last_commit_id: None,
+            fencing_token: None,
+            commit_ulid: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".into()),
+            parent_hash: None,
+            updated_at: now,
+        };
+
+        let stale = CatalogDomainManifest {
+            snapshot_version: 6,
+            snapshot_path: "state/catalog/v6/".into(),
+            snapshot: None,
+            last_commit_id: None,
+            fencing_token: None,
+            commit_ulid: Some("01ARZ3NDEKTSV4RRFFQ69G5FAU".into()),
+            parent_hash: None,
+            updated_at: now,
+        };
+
+        let result = stale.validate_succession(&previous, "sha256:any");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("commit ulid regression"));
+    }
+
+    #[test]
+    fn test_validate_succession_valid() {
+        let now = Utc::now();
+        let previous = CatalogDomainManifest {
+            snapshot_version: 5,
+            snapshot_path: "state/catalog/v5/".into(),
+            snapshot: None,
+            last_commit_id: None,
+            fencing_token: None,
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: now,
+        };
+
+        // Valid succession: version increases, parent hash matches
+        let valid_successor = CatalogDomainManifest {
+            snapshot_version: 6,
+            snapshot_path: "state/catalog/v6/".into(),
+            snapshot: None,
+            last_commit_id: None,
+            fencing_token: None,
+            commit_ulid: None,
+            parent_hash: Some("sha256:correct_hash".into()),
+            updated_at: now,
+        };
+
+        let previous_raw_hash = "sha256:correct_hash";
+        let result = valid_successor.validate_succession(&previous, previous_raw_hash);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_succession_same_version_allowed() {
+        let now = Utc::now();
+        let previous = CatalogDomainManifest {
+            snapshot_version: 5,
+            snapshot_path: "state/catalog/v5/".into(),
+            snapshot: None,
+            last_commit_id: None,
+            fencing_token: None,
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: now,
+        };
+
+        // Same version is allowed (idempotent retry)
+        let same_version = CatalogDomainManifest {
+            snapshot_version: 5,
+            snapshot_path: "state/catalog/v5/".into(),
+            snapshot: None,
+            last_commit_id: None,
+            fencing_token: None,
+            commit_ulid: None,
+            parent_hash: Some("sha256:hash".into()),
+            updated_at: now,
+        };
+
+        let previous_raw_hash = "sha256:hash";
+        let result = same_version.validate_succession(&previous, previous_raw_hash);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_succession_no_parent_hash_allowed() {
+        let now = Utc::now();
+        let previous = CatalogDomainManifest {
+            snapshot_version: 5,
+            snapshot_path: "state/catalog/v5/".into(),
+            snapshot: None,
+            last_commit_id: None,
+            fencing_token: None,
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: now,
+        };
+
+        // No parent hash (backwards compatibility with old manifests)
+        let no_parent_hash = CatalogDomainManifest {
+            snapshot_version: 6,
+            snapshot_path: "state/catalog/v6/".into(),
+            snapshot: None,
+            last_commit_id: None,
+            fencing_token: None,
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: now,
+        };
+
+        let previous_raw_hash = "sha256:anything";
+        let result = no_parent_hash.validate_succession(&previous, previous_raw_hash);
+
+        // Should pass - no parent_hash means no hash check
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_catalog_manifest_has_parent_hash_field() {
+        // Verify the field exists and is serializable
+        let manifest = CatalogDomainManifest {
+            snapshot_version: 1,
+            snapshot_path: "state/catalog/v1/".into(),
+            snapshot: None,
+            last_commit_id: None,
+            fencing_token: None,
+            commit_ulid: None,
+            parent_hash: Some("sha256:abc123".into()),
+            updated_at: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&manifest).expect("serialize");
+        assert!(json.contains("parentHash"));
+        assert!(json.contains("sha256:abc123"));
+
+        // Roundtrip
+        let parsed: CatalogDomainManifest = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed.parent_hash, Some("sha256:abc123".into()));
     }
 }

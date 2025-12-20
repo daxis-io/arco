@@ -20,11 +20,12 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
 use parquet::format::KeyValue;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{CatalogError, Result};
 
 /// Record stored in `namespaces.parquet`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NamespaceRecord {
     /// Namespace ID (UUID v7).
     pub id: String,
@@ -39,7 +40,7 @@ pub struct NamespaceRecord {
 }
 
 /// Record stored in `tables.parquet`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableRecord {
     /// Table ID (UUID v7).
     pub id: String,
@@ -60,7 +61,7 @@ pub struct TableRecord {
 }
 
 /// Record stored in `columns.parquet`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnRecord {
     /// Column ID (UUID v7).
     pub id: String,
@@ -79,7 +80,7 @@ pub struct ColumnRecord {
 }
 
 /// Record stored in `lineage_edges.parquet`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineageEdgeRecord {
     /// Edge ID (ULID).
     pub id: String,

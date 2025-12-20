@@ -26,7 +26,7 @@ use arco_core::storage::{
 };
 use arco_core::{Error as CoreError, Result as CoreResult, ScopedStorage};
 
-use arco_catalog::CatalogWriter;
+use arco_catalog::{CatalogWriter, Tier1Compactor};
 use arco_catalog::manifest::{CatalogDomainManifest, RootManifest};
 use arco_catalog::write_options::WriteOptions;
 
@@ -230,7 +230,8 @@ async fn tier1_crash_between_snapshot_and_cas() {
     let backend = Arc::new(FailingBackend::new());
     let storage =
         ScopedStorage::new(backend.clone(), TEST_TENANT, TEST_WORKSPACE).expect("scoped storage");
-    let writer = CatalogWriter::new(storage.clone());
+    let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
 
     // Initialize catalog (this should succeed)
     writer
@@ -284,7 +285,8 @@ async fn tier1_reader_sees_only_committed_state() {
     let backend = Arc::new(FailingBackend::new());
     let storage =
         ScopedStorage::new(backend.clone(), TEST_TENANT, TEST_WORKSPACE).expect("scoped storage");
-    let writer = CatalogWriter::new(storage.clone());
+    let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
 
     // Initialize
     writer.initialize().await.expect("initialize");
@@ -339,7 +341,8 @@ async fn tier1_initialize_idempotent_after_failure() {
     let backend = Arc::new(FailingBackend::new());
     let storage =
         ScopedStorage::new(backend.clone(), TEST_TENANT, TEST_WORKSPACE).expect("scoped storage");
-    let writer = CatalogWriter::new(storage.clone());
+    let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
 
     // First initialization succeeds
     writer.initialize().await.expect("first init");
@@ -379,7 +382,8 @@ async fn tier1_lock_failure_does_not_corrupt_state() {
     let backend = Arc::new(FailingBackend::new());
     let storage =
         ScopedStorage::new(backend.clone(), TEST_TENANT, TEST_WORKSPACE).expect("scoped storage");
-    let writer = CatalogWriter::new(storage.clone());
+    let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
 
     // Initialize
     writer.initialize().await.expect("initialize");

@@ -23,22 +23,24 @@
 #![allow(clippy::option_if_let_else)]
 #![allow(clippy::uninlined_format_args)]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use uuid::Uuid;
 
 use arco_core::storage::StorageBackend;
-use arco_core::storage::{WritePrecondition, WriteResult};
+use arco_core::sync_compact::SyncCompactRequest;
 use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
-use bytes::Bytes;
 
 use crate::error::{CatalogError, Result};
 use crate::event_writer::EventWriter;
-use crate::lock::{DistributedLock, LockGuard};
-use crate::manifest::{LineageManifest, RootManifest, SnapshotInfo};
+use crate::lock::DistributedLock;
+use crate::manifest::SnapshotInfo;
 use crate::parquet_util::{ColumnRecord, LineageEdgeRecord, NamespaceRecord, TableRecord};
-use crate::state::{CatalogState, LineageState};
+use crate::sync_compactor::SyncCompactor;
+use crate::tier1_events::{CatalogDdlEvent, LineageDdlEvent};
+use crate::tier1_state;
 use crate::tier1_writer::Tier1Writer;
 use crate::write_options::WriteOptions;
 
@@ -46,9 +48,6 @@ use crate::write_options::WriteOptions;
 const DEFAULT_LOCK_TTL: Duration = Duration::from_secs(30);
 /// Default maximum lock acquisition retries.
 const DEFAULT_LOCK_MAX_RETRIES: u32 = 10;
-/// Default maximum CAS retries for lineage manifest updates.
-const DEFAULT_LINEAGE_CAS_MAX_RETRIES: u32 = 10;
-
 // ============================================================================
 // Domain Types (returned from write operations)
 // ============================================================================
@@ -334,6 +333,8 @@ pub struct CatalogWriter {
     lock_ttl: Duration,
     /// Max lock retries
     lock_max_retries: u32,
+    /// Sync compaction client for Tier-1 DDL operations.
+    sync_compactor: Option<Arc<dyn SyncCompactor>>,
 }
 
 impl std::fmt::Debug for CatalogWriter {
@@ -354,7 +355,8 @@ impl CatalogWriter {
     /// use arco_core::ScopedStorage;
     ///
     /// let storage = ScopedStorage::new(backend, "acme", "production")?;
-    /// let writer = CatalogWriter::new(storage);
+    /// let compactor = std::sync::Arc::new(arco_catalog::Tier1Compactor::new(storage.clone()));
+    /// let writer = CatalogWriter::new(storage).with_sync_compactor(compactor);
     /// ```
     #[must_use]
     pub fn new(storage: ScopedStorage) -> Self {
@@ -368,7 +370,15 @@ impl CatalogWriter {
             storage,
             lock_ttl: DEFAULT_LOCK_TTL,
             lock_max_retries: DEFAULT_LOCK_MAX_RETRIES,
+            sync_compactor: None,
         }
+    }
+
+    /// Configures the sync compaction client for Tier-1 DDL operations.
+    #[must_use]
+    pub fn with_sync_compactor(mut self, compactor: Arc<dyn SyncCompactor>) -> Self {
+        self.sync_compactor = Some(compactor);
+        self
     }
 
     /// Sets the lock acquisition policy for this writer.
@@ -385,16 +395,24 @@ impl CatalogWriter {
         &self.storage
     }
 
+    fn sync_compactor(&self) -> Result<&Arc<dyn SyncCompactor>> {
+        self.sync_compactor.as_ref().ok_or_else(|| {
+            CatalogError::InvariantViolation {
+                message: "sync compactor is not configured (Tier-1 DDL is disabled)".to_string(),
+            }
+        })
+    }
+
     // ========================================================================
     // Initialization
     // ========================================================================
 
-    /// Initializes the catalog with empty Parquet state tables.
+    /// Initializes the catalog manifest scaffolding.
     ///
     /// Creates:
     /// - All manifest files (root, catalog, lineage, executions, search)
-    /// - Empty Parquet snapshots for catalog domain (namespaces, tables, columns)
-    /// - Empty Parquet snapshot for lineage domain (lineage_edges)
+    ///
+    /// Parquet snapshots are written by the compactor on first sync compaction.
     ///
     /// Idempotent: safe to call multiple times.
     ///
@@ -402,67 +420,8 @@ impl CatalogWriter {
     ///
     /// Returns an error if storage operations fail.
     pub async fn initialize(&self) -> Result<()> {
-        // Initialize manifests (idempotent)
-        self.tier1.initialize().await?;
-
-        // Initialize catalog domain snapshot (idempotent)
-        {
-            let guard = self
-                .tier1
-                .acquire_lock(self.lock_ttl, self.lock_max_retries)
-                .await?;
-
-            let manifest = self.tier1.read_manifest().await?;
-            if manifest.catalog.snapshot_version == 0 {
-                let empty_catalog = CatalogState::empty();
-                let next_version = manifest.catalog.snapshot_version + 1;
-                let catalog_snapshot = self
-                    .tier1
-                    .write_catalog_snapshot(&guard, next_version, &empty_catalog)
-                    .await?;
-
-                // Publish under the same lock to prevent intermediate contention.
-                self.tier1
-                    .update_locked(&guard, |m| {
-                        m.snapshot_version = catalog_snapshot.version;
-                        m.snapshot_path.clone_from(&catalog_snapshot.path);
-                        m.snapshot = Some(catalog_snapshot.clone());
-                        Ok(())
-                    })
-                    .await?;
-            }
-
-            guard.release().await?;
-        }
-
-        // Initialize lineage domain snapshot (idempotent)
-        {
-            let guard = self
-                .lineage_lock
-                .acquire(self.lock_ttl, self.lock_max_retries)
-                .await?;
-
-            let manifest = self.tier1.read_manifest().await?;
-            if manifest.lineage.snapshot_version == 0 {
-                let empty_lineage = LineageState::empty();
-                let next_version = manifest.lineage.snapshot_version + 1;
-                let lineage_snapshot = self
-                    .tier1
-                    .write_lineage_snapshot(&guard, next_version, &empty_lineage)
-                    .await?;
-
-                self.publish_lineage_snapshot(
-                    &guard,
-                    &lineage_snapshot,
-                    manifest.lineage.snapshot_version,
-                )
-                .await?;
-            }
-
-            guard.release().await?;
-        }
-
-        Ok(())
+        // Only create manifest scaffolding. Parquet snapshots are written by the compactor.
+        self.tier1.initialize().await
     }
 
     // ========================================================================
@@ -512,17 +471,18 @@ impl CatalogWriter {
             updated_at: now,
         };
 
-        // Acquire lock and write snapshot
+        let compactor = self.sync_compactor()?;
+
+        // Acquire lock and append ledger event
         let guard = self
             .tier1
             .acquire_lock(self.lock_ttl, self.lock_max_retries)
             .await?;
 
-        // Load current state and add namespace
         let manifest = self.tier1.read_manifest().await?;
-        let mut state = self
-            .load_catalog_state(&manifest.catalog.snapshot_path)
-            .await?;
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path)
+                .await?;
 
         // Check for duplicate
         if state.namespaces.iter().any(|ns| ns.name == name) {
@@ -533,28 +493,33 @@ impl CatalogWriter {
             });
         }
 
-        state.namespaces.push(NamespaceRecord::from(&namespace));
+        let event = CatalogDdlEvent::NamespaceCreated {
+            namespace: NamespaceRecord::from(&namespace),
+        };
 
-        // Write new snapshot
-        let next_version = manifest.catalog.snapshot_version + 1;
-        let snapshot = self
+        let event_id = self
             .tier1
-            .write_catalog_snapshot(&guard, next_version, &state)
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
             .await?;
 
-        // Publish under the same lock to prevent intermediate contention.
-        self.tier1
-            .update_locked(&guard, |m| {
-                m.snapshot_version = snapshot.version;
-                m.snapshot_path.clone_from(&snapshot.path);
-                m.snapshot = Some(snapshot.clone());
-                Ok(())
-            })
-            .await?;
+        let request = SyncCompactRequest {
+            domain: CatalogDomain::Catalog.as_str().to_string(),
+            event_paths: vec![CatalogPaths::ledger_event(
+                CatalogDomain::Catalog,
+                &event_id.to_string(),
+            )],
+            fencing_token: guard.fencing_token().sequence(),
+            request_id: opts.request_id.clone(),
+        };
 
+        let result = compactor.sync_compact(request).await;
         guard.release().await?;
-
-        Ok(namespace)
+        result.map(|_| namespace)
     }
 
     /// Deletes a namespace.
@@ -585,15 +550,17 @@ impl CatalogWriter {
             }
         }
 
+        let compactor = self.sync_compactor()?;
+
         let guard = self
             .tier1
             .acquire_lock(self.lock_ttl, self.lock_max_retries)
             .await?;
 
         let manifest = self.tier1.read_manifest().await?;
-        let mut state = self
-            .load_catalog_state(&manifest.catalog.snapshot_path)
-            .await?;
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path)
+                .await?;
 
         // Find namespace
         let ns_idx = state
@@ -615,28 +582,34 @@ impl CatalogWriter {
             });
         }
 
-        state.namespaces.remove(ns_idx);
+        let event = CatalogDdlEvent::NamespaceDeleted {
+            namespace_id: ns_id.clone(),
+            namespace_name: name.to_string(),
+        };
 
-        // Write new snapshot
-        let next_version = manifest.catalog.snapshot_version + 1;
-        let snapshot = self
+        let event_id = self
             .tier1
-            .write_catalog_snapshot(&guard, next_version, &state)
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
             .await?;
 
-        // Publish under the same lock to prevent intermediate contention.
-        self.tier1
-            .update_locked(&guard, |m| {
-                m.snapshot_version = snapshot.version;
-                m.snapshot_path.clone_from(&snapshot.path);
-                m.snapshot = Some(snapshot.clone());
-                Ok(())
-            })
-            .await?;
+        let request = SyncCompactRequest {
+            domain: CatalogDomain::Catalog.as_str().to_string(),
+            event_paths: vec![CatalogPaths::ledger_event(
+                CatalogDomain::Catalog,
+                &event_id.to_string(),
+            )],
+            fencing_token: guard.fencing_token().sequence(),
+            request_id: opts.request_id.clone(),
+        };
 
+        let result = compactor.sync_compact(request).await;
         guard.release().await?;
-
-        Ok(())
+        result.map(|_| ())
     }
 
     // ========================================================================
@@ -670,15 +643,17 @@ impl CatalogWriter {
             }
         }
 
+        let compactor = self.sync_compactor()?;
+
         let guard = self
             .tier1
             .acquire_lock(self.lock_ttl, self.lock_max_retries)
             .await?;
 
         let manifest = self.tier1.read_manifest().await?;
-        let mut state = self
-            .load_catalog_state(&manifest.catalog.snapshot_path)
-            .await?;
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path)
+                .await?;
 
         // Find namespace
         let ns = state
@@ -718,11 +693,11 @@ impl CatalogWriter {
             updated_at: now,
         };
 
-        state.tables.push(TableRecord::from(&table));
-
-        // Add columns
-        for (ordinal, col_def) in req.columns.iter().enumerate() {
-            state.columns.push(ColumnRecord {
+        let columns: Vec<ColumnRecord> = req
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(ordinal, col_def)| ColumnRecord {
                 id: Uuid::now_v7().to_string(),
                 table_id: table_id.clone(),
                 name: col_def.name.clone(),
@@ -730,29 +705,37 @@ impl CatalogWriter {
                 is_nullable: col_def.is_nullable,
                 ordinal: ordinal as i32,
                 description: col_def.description.clone(),
-            });
-        }
-
-        // Write new snapshot
-        let next_version = manifest.catalog.snapshot_version + 1;
-        let snapshot = self
-            .tier1
-            .write_catalog_snapshot(&guard, next_version, &state)
-            .await?;
-
-        // Publish under the same lock to prevent intermediate contention.
-        self.tier1
-            .update_locked(&guard, |m| {
-                m.snapshot_version = snapshot.version;
-                m.snapshot_path.clone_from(&snapshot.path);
-                m.snapshot = Some(snapshot.clone());
-                Ok(())
             })
+            .collect();
+
+        let event = CatalogDdlEvent::TableRegistered {
+            table: TableRecord::from(&table),
+            columns,
+        };
+
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
             .await?;
 
-        guard.release().await?;
+        let request = SyncCompactRequest {
+            domain: CatalogDomain::Catalog.as_str().to_string(),
+            event_paths: vec![CatalogPaths::ledger_event(
+                CatalogDomain::Catalog,
+                &event_id.to_string(),
+            )],
+            fencing_token: guard.fencing_token().sequence(),
+            request_id: opts.request_id.clone(),
+        };
 
-        Ok(table)
+        let result = compactor.sync_compact(request).await;
+        guard.release().await?;
+        result.map(|_| table)
     }
 
     /// Updates a table.
@@ -784,15 +767,17 @@ impl CatalogWriter {
             }
         }
 
+        let compactor = self.sync_compactor()?;
+
         let guard = self
             .tier1
             .acquire_lock(self.lock_ttl, self.lock_max_retries)
             .await?;
 
         let manifest = self.tier1.read_manifest().await?;
-        let mut state = self
-            .load_catalog_state(&manifest.catalog.snapshot_path)
-            .await?;
+        let mut state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path)
+                .await?;
 
         // Find namespace
         let ns = state
@@ -828,28 +813,36 @@ impl CatalogWriter {
             table_rec.format = fmt;
         }
 
-        let updated_table = Table::from(table_rec.clone());
+        let table_record = table_rec.clone();
+        let updated_table = Table::from(table_record.clone());
 
-        // Write new snapshot
-        let next_version = manifest.catalog.snapshot_version + 1;
-        let snapshot = self
+        let event = CatalogDdlEvent::TableUpdated {
+            table: table_record,
+        };
+
+        let event_id = self
             .tier1
-            .write_catalog_snapshot(&guard, next_version, &state)
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
             .await?;
 
-        // Publish under the same lock to prevent intermediate contention.
-        self.tier1
-            .update_locked(&guard, |m| {
-                m.snapshot_version = snapshot.version;
-                m.snapshot_path.clone_from(&snapshot.path);
-                m.snapshot = Some(snapshot.clone());
-                Ok(())
-            })
-            .await?;
+        let request = SyncCompactRequest {
+            domain: CatalogDomain::Catalog.as_str().to_string(),
+            event_paths: vec![CatalogPaths::ledger_event(
+                CatalogDomain::Catalog,
+                &event_id.to_string(),
+            )],
+            fencing_token: guard.fencing_token().sequence(),
+            request_id: opts.request_id.clone(),
+        };
 
+        let result = compactor.sync_compact(request).await;
         guard.release().await?;
-
-        Ok(updated_table)
+        result.map(|_| updated_table)
     }
 
     /// Drops a table.
@@ -874,15 +867,17 @@ impl CatalogWriter {
             }
         }
 
+        let compactor = self.sync_compactor()?;
+
         let guard = self
             .tier1
             .acquire_lock(self.lock_ttl, self.lock_max_retries)
             .await?;
 
         let manifest = self.tier1.read_manifest().await?;
-        let mut state = self
-            .load_catalog_state(&manifest.catalog.snapshot_path)
-            .await?;
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path)
+                .await?;
 
         // Find namespace
         let ns = state
@@ -907,32 +902,35 @@ impl CatalogWriter {
 
         let table_id = state.tables[table_idx].id.clone();
 
-        // Remove columns for this table
-        state.columns.retain(|c| c.table_id != table_id);
+        let event = CatalogDdlEvent::TableDropped {
+            table_id: table_id.clone(),
+            namespace_id: namespace_id.clone(),
+            table_name: name.to_string(),
+        };
 
-        // Remove table
-        state.tables.remove(table_idx);
-
-        // Write new snapshot
-        let next_version = manifest.catalog.snapshot_version + 1;
-        let snapshot = self
+        let event_id = self
             .tier1
-            .write_catalog_snapshot(&guard, next_version, &state)
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
             .await?;
 
-        // Publish under the same lock to prevent intermediate contention.
-        self.tier1
-            .update_locked(&guard, |m| {
-                m.snapshot_version = snapshot.version;
-                m.snapshot_path.clone_from(&snapshot.path);
-                m.snapshot = Some(snapshot.clone());
-                Ok(())
-            })
-            .await?;
+        let request = SyncCompactRequest {
+            domain: CatalogDomain::Catalog.as_str().to_string(),
+            event_paths: vec![CatalogPaths::ledger_event(
+                CatalogDomain::Catalog,
+                &event_id.to_string(),
+            )],
+            fencing_token: guard.fencing_token().sequence(),
+            request_id: opts.request_id.clone(),
+        };
 
+        let result = compactor.sync_compact(request).await;
         guard.release().await?;
-
-        Ok(())
+        result.map(|_| ())
     }
 
     // ========================================================================
@@ -949,35 +947,42 @@ impl CatalogWriter {
     pub async fn add_lineage_edge(
         &self,
         edge: LineageEdge,
-        _opts: WriteOptions,
+        opts: WriteOptions,
     ) -> Result<LineageEdge> {
+        let compactor = self.sync_compactor()?;
+
         let guard = self
             .lineage_lock
             .acquire(self.lock_ttl, self.lock_max_retries)
             .await?;
 
-        // Load current lineage state
-        let manifest = self.tier1.read_manifest().await?;
-        let mut state = self
-            .load_lineage_state(&manifest.lineage.edges_path)
-            .await?;
+        let event = LineageDdlEvent::EdgesAdded {
+            edges: vec![LineageEdgeRecord::from(&edge)],
+        };
 
-        state.edges.push(LineageEdgeRecord::from(&edge));
-
-        // Write new snapshot
-        // Note: For MVP, we're using a simple version increment
-        let next_version = manifest.lineage.snapshot_version + 1;
-        let snapshot = self
+        let event_id = self
             .tier1
-            .write_lineage_snapshot(&guard, next_version, &state)
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Lineage,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
             .await?;
 
-        self.publish_lineage_snapshot(&guard, &snapshot, manifest.lineage.snapshot_version)
-            .await?;
+        let request = SyncCompactRequest {
+            domain: CatalogDomain::Lineage.as_str().to_string(),
+            event_paths: vec![CatalogPaths::ledger_event(
+                CatalogDomain::Lineage,
+                &event_id.to_string(),
+            )],
+            fencing_token: guard.fencing_token().sequence(),
+            request_id: opts.request_id.clone(),
+        };
 
+        let result = compactor.sync_compact(request).await;
         guard.release().await?;
-
-        Ok(edge)
+        result.map(|_| edge)
     }
 
     /// Adds multiple lineage edges in a single transaction.
@@ -990,40 +995,46 @@ impl CatalogWriter {
     pub async fn add_lineage_edges(
         &self,
         edges: Vec<LineageEdge>,
-        _opts: WriteOptions,
+        opts: WriteOptions,
     ) -> Result<Vec<LineageEdge>> {
         if edges.is_empty() {
             return Ok(Vec::new());
         }
+
+        let compactor = self.sync_compactor()?;
 
         let guard = self
             .lineage_lock
             .acquire(self.lock_ttl, self.lock_max_retries)
             .await?;
 
-        // Load current lineage state
-        let manifest = self.tier1.read_manifest().await?;
-        let mut state = self
-            .load_lineage_state(&manifest.lineage.edges_path)
-            .await?;
+        let event = LineageDdlEvent::EdgesAdded {
+            edges: edges.iter().map(LineageEdgeRecord::from).collect(),
+        };
 
-        for edge in &edges {
-            state.edges.push(LineageEdgeRecord::from(edge));
-        }
-
-        // Write new snapshot
-        let next_version = manifest.lineage.snapshot_version + 1;
-        let snapshot = self
+        let event_id = self
             .tier1
-            .write_lineage_snapshot(&guard, next_version, &state)
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Lineage,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
             .await?;
 
-        self.publish_lineage_snapshot(&guard, &snapshot, manifest.lineage.snapshot_version)
-            .await?;
+        let request = SyncCompactRequest {
+            domain: CatalogDomain::Lineage.as_str().to_string(),
+            event_paths: vec![CatalogPaths::ledger_event(
+                CatalogDomain::Lineage,
+                &event_id.to_string(),
+            )],
+            fencing_token: guard.fencing_token().sequence(),
+            request_id: opts.request_id.clone(),
+        };
 
+        let result = compactor.sync_compact(request).await;
         guard.release().await?;
-
-        Ok(edges)
+        result.map(|_| edges)
     }
 
     // ========================================================================
@@ -1037,184 +1048,6 @@ impl CatalogWriter {
     #[must_use]
     pub fn event_writer(&self, source: &EventSource) -> EventWriter {
         EventWriter::new(self.storage.clone()).with_source(source.to_source_string())
-    }
-
-    // ========================================================================
-    // Internal Helpers
-    // ========================================================================
-
-    /// Loads catalog state from the current snapshot.
-    ///
-    /// Returns empty state if snapshot doesn't exist yet.
-    async fn load_catalog_state(&self, snapshot_path: &str) -> Result<CatalogState> {
-        // snapshot_path looks like "snapshots/catalog/v1/"
-        // If version is 0 or path is empty, return empty state
-        if snapshot_path.is_empty() || snapshot_path.contains("/v0/") {
-            return Ok(CatalogState::empty());
-        }
-
-        // Parse version from path (e.g., "snapshots/catalog/v1/" -> 1)
-        let version = snapshot_path
-            .split("/v")
-            .last()
-            .and_then(|s| s.trim_end_matches('/').parse::<u64>().ok())
-            .unwrap_or(0);
-
-        if version == 0 {
-            return Ok(CatalogState::empty());
-        }
-
-        // Read individual Parquet files
-        let ns_path =
-            CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "namespaces.parquet");
-        let tables_path =
-            CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "tables.parquet");
-        let columns_path =
-            CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "columns.parquet");
-
-        let namespaces = match self.storage.get_raw(&ns_path).await {
-            Ok(bytes) => crate::parquet_util::read_namespaces(&bytes)?,
-            Err(_) => Vec::new(),
-        };
-
-        let tables = match self.storage.get_raw(&tables_path).await {
-            Ok(bytes) => crate::parquet_util::read_tables(&bytes)?,
-            Err(_) => Vec::new(),
-        };
-
-        let columns = match self.storage.get_raw(&columns_path).await {
-            Ok(bytes) => crate::parquet_util::read_columns(&bytes)?,
-            Err(_) => Vec::new(),
-        };
-
-        Ok(CatalogState {
-            namespaces,
-            tables,
-            columns,
-        })
-    }
-
-    /// Loads lineage state from the current snapshot.
-    ///
-    /// Returns empty state if snapshot doesn't exist yet.
-    async fn load_lineage_state(&self, edges_path: &str) -> Result<LineageState> {
-        // edges_path looks like "snapshots/lineage/v1/"
-        if edges_path.is_empty() || edges_path.contains("/v0/") {
-            return Ok(LineageState::empty());
-        }
-
-        // Parse version from path
-        let version = edges_path
-            .split("/v")
-            .last()
-            .and_then(|s| s.trim_end_matches('/').parse::<u64>().ok())
-            .unwrap_or(0);
-
-        if version == 0 {
-            return Ok(LineageState::empty());
-        }
-
-        let path =
-            CatalogPaths::snapshot_file(CatalogDomain::Lineage, version, "lineage_edges.parquet");
-        let edges = match self.storage.get_raw(&path).await {
-            Ok(bytes) => crate::parquet_util::read_lineage_edges(&bytes)?,
-            Err(_) => Vec::new(),
-        };
-
-        Ok(LineageState { edges })
-    }
-
-    async fn publish_lineage_snapshot(
-        &self,
-        _guard: &LockGuard<dyn StorageBackend>,
-        snapshot: &SnapshotInfo,
-        expected_prev_version: u64,
-    ) -> Result<()> {
-        for attempt in 1..=DEFAULT_LINEAGE_CAS_MAX_RETRIES {
-            let root = self.read_root_manifest().await?;
-            let (mut lineage, lineage_version) =
-                self.read_lineage_manifest_with_version(&root).await?;
-
-            if lineage.snapshot_version >= snapshot.version {
-                return Ok(());
-            }
-
-            if lineage.snapshot_version != expected_prev_version {
-                return Err(CatalogError::PreconditionFailed {
-                    message: format!(
-                        "lineage manifest version mismatch: expected {}, got {}",
-                        expected_prev_version, lineage.snapshot_version
-                    ),
-                });
-            }
-
-            lineage.snapshot_version = snapshot.version;
-            lineage.edges_path.clone_from(&snapshot.path);
-            lineage.snapshot = Some(snapshot.clone());
-            lineage.updated_at = Utc::now();
-
-            let bytes = serde_json::to_vec(&lineage).map_err(|e| CatalogError::Serialization {
-                message: format!("serialize lineage manifest: {e}"),
-            })?;
-
-            let result = self
-                .storage
-                .put_raw(
-                    &root.lineage_manifest_path,
-                    Bytes::from(bytes),
-                    WritePrecondition::MatchesVersion(lineage_version),
-                )
-                .await?;
-
-            match result {
-                WriteResult::Success { .. } => return Ok(()),
-                WriteResult::PreconditionFailed { .. } => {
-                    if attempt == DEFAULT_LINEAGE_CAS_MAX_RETRIES {
-                        break;
-                    }
-                    crate::metrics::record_cas_retry("lineage_manifest");
-                    continue;
-                }
-            }
-        }
-
-        Err(CatalogError::CasFailed {
-            message: format!(
-                "lineage manifest update lost CAS race after {DEFAULT_LINEAGE_CAS_MAX_RETRIES} retries"
-            ),
-        })
-    }
-
-    async fn read_root_manifest(&self) -> Result<RootManifest> {
-        let bytes = self.storage.get_raw(CatalogPaths::ROOT_MANIFEST).await?;
-        let mut root: RootManifest =
-            serde_json::from_slice(&bytes).map_err(|e| CatalogError::Serialization {
-                message: format!("parse root manifest: {e}"),
-            })?;
-        root.normalize_paths();
-        Ok(root)
-    }
-
-    async fn read_lineage_manifest_with_version(
-        &self,
-        root: &RootManifest,
-    ) -> Result<(LineageManifest, String)> {
-        let meta = self
-            .storage
-            .head_raw(&root.lineage_manifest_path)
-            .await?
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "manifest".into(),
-                name: root.lineage_manifest_path.clone(),
-            })?;
-
-        let bytes = self.storage.get_raw(&root.lineage_manifest_path).await?;
-        let lineage: LineageManifest =
-            serde_json::from_slice(&bytes).map_err(|e| CatalogError::Serialization {
-                message: format!("parse lineage manifest: {e}"),
-            })?;
-
-        Ok((lineage, meta.version))
     }
 
     /// Gets current snapshot info for a domain.
@@ -1238,11 +1071,13 @@ mod tests {
     use arco_core::storage::MemoryBackend;
     use std::sync::Arc;
     use ulid::Ulid;
+    use crate::tier1_compactor::Tier1Compactor;
 
     fn setup() -> CatalogWriter {
         let backend = Arc::new(MemoryBackend::new());
         let storage = ScopedStorage::new(backend, "acme", "production").expect("valid storage");
-        CatalogWriter::new(storage)
+        let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+        CatalogWriter::new(storage).with_sync_compactor(compactor)
     }
 
     #[tokio::test]
@@ -1399,12 +1234,13 @@ mod tests {
         let backend = Arc::new(MemoryBackend::new());
         let storage =
             ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
-        let writer = CatalogWriter::new(storage.clone());
+        let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+        let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
         let reader = crate::reader::CatalogReader::new(storage);
 
         writer.initialize().await.expect("initialize");
 
-        // After initialize, lineage is at v1 (empty). First edge publish creates v2.
+        // After initialize, lineage is at v0. First edge publish creates v1.
         let edge1 = LineageEdge {
             id: Ulid::new().to_string(),
             source_id: "table_a".to_string(),
@@ -1422,12 +1258,12 @@ mod tests {
             .get_snapshot_info(CatalogDomain::Lineage)
             .await
             .expect("snapshot info");
-        assert_eq!(info1.unwrap().version, 2);
+        assert_eq!(info1.unwrap().version, 1);
 
         let graph1 = reader.get_lineage("table_a").await.expect("lineage");
         assert_eq!(graph1.downstream.len(), 1);
 
-        // Second write should publish v3 and include both edges.
+        // Second write should publish v2 and include both edges.
         let edge2 = LineageEdge {
             id: Ulid::new().to_string(),
             source_id: "table_a".to_string(),
@@ -1445,7 +1281,7 @@ mod tests {
             .get_snapshot_info(CatalogDomain::Lineage)
             .await
             .expect("snapshot info 2");
-        assert_eq!(info2.unwrap().version, 3);
+        assert_eq!(info2.unwrap().version, 2);
 
         let graph2 = reader.get_lineage("table_a").await.expect("lineage 2");
         assert_eq!(graph2.downstream.len(), 2);

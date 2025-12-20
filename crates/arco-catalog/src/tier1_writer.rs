@@ -16,18 +16,21 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
+use arco_core::publish::Publisher;
 use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
-use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
+use arco_core::storage_keys::{CommitKey, LedgerKey, ManifestKey};
+use arco_core::storage_traits::{CommitPutStore, LedgerPutStore};
+use arco_core::{
+    CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths, EventId, ScopedStorage,
+};
 
 use crate::error::{CatalogError, Result};
 use crate::lock::LockGuard;
 use crate::lock::{DEFAULT_LOCK_TTL, DEFAULT_MAX_RETRIES, DistributedLock};
 use crate::manifest::{
-    CatalogDomainManifest, CatalogManifest, CommitRecord, ExecutionsManifest, LineageManifest,
-    RootManifest, SearchManifest, SnapshotFile, SnapshotInfo,
+    compute_manifest_hash, CatalogDomainManifest, CatalogManifest, CommitRecord, ExecutionsManifest,
+    LineageManifest, RootManifest, SearchManifest,
 };
-use crate::parquet_util;
-use crate::state::{CatalogState, LineageState};
 
 /// Maximum CAS retries for manifest writes.
 const DEFAULT_MAX_CAS_RETRIES: u32 = 10;
@@ -164,7 +167,7 @@ impl Tier1Writer {
             .await
             .map_err(CatalogError::from)?;
 
-        let result = self.update_inner(&mut update_fn).await;
+        let result = self.update_inner(&guard, &mut update_fn).await;
 
         match result {
             Ok(commit) => {
@@ -188,13 +191,13 @@ impl Tier1Writer {
     /// Returns an error if manifest reads/writes fail or if the update closure returns an error.
     pub async fn update_locked<F>(
         &self,
-        _guard: &LockGuard<dyn StorageBackend>,
+        guard: &LockGuard<dyn StorageBackend>,
         mut update_fn: F,
     ) -> Result<CommitRecord>
     where
         F: FnMut(&mut CatalogDomainManifest) -> Result<()>,
     {
-        self.update_inner(&mut update_fn).await
+        self.update_inner(guard, &mut update_fn).await
     }
 
     /// Acquires the catalog domain lock and returns a guard.
@@ -217,132 +220,133 @@ impl Tier1Writer {
         CatalogError::from(err)
     }
 
-    /// Writes a new catalog snapshot (namespaces/tables/columns) for the given version.
+    /// Appends a ledger event for a Tier-1 DDL operation (ADR-018).
     ///
-    /// Snapshot files are written before the manifest is updated (atomic publish).
-    /// Snapshot paths are versioned; overwriting is allowed for crash recovery when the
-    /// manifest CAS fails (the snapshot is not visible until publish succeeds).
+    /// This is the new flow for Tier-1 operations where API only appends events
+    /// to the ledger and the compactor is responsible for writing Parquet and
+    /// updating manifests.
     ///
-    /// # Errors
+    /// # Flow
     ///
-    /// Returns an error if serializing the snapshot or writing to storage fails.
-    pub async fn write_catalog_snapshot(
-        &self,
-        _guard: &LockGuard<dyn StorageBackend>,
-        version: u64,
-        state: &CatalogState,
-    ) -> Result<SnapshotInfo> {
-        let snapshot_dir = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, version);
-
-        let namespaces_bytes = parquet_util::write_namespaces(&state.namespaces)?;
-        let tables_bytes = parquet_util::write_tables(&state.tables)?;
-        let columns_bytes = parquet_util::write_columns(&state.columns)?;
-
-        let ns_path =
-            CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "namespaces.parquet");
-        let tables_path =
-            CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "tables.parquet");
-        let cols_path =
-            CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "columns.parquet");
-
-        let _ = self
-            .storage
-            .put_raw(&ns_path, namespaces_bytes.clone(), WritePrecondition::None)
-            .await?;
-        let _ = self
-            .storage
-            .put_raw(&tables_path, tables_bytes.clone(), WritePrecondition::None)
-            .await?;
-        let _ = self
-            .storage
-            .put_raw(&cols_path, columns_bytes.clone(), WritePrecondition::None)
-            .await?;
-
-        let mut info = SnapshotInfo::new(version, snapshot_dir);
-        info.add_file(SnapshotFile {
-            path: "namespaces.parquet".to_string(),
-            checksum_sha256: sha256_hex(&namespaces_bytes),
-            byte_size: namespaces_bytes.len() as u64,
-            row_count: state.namespaces.len() as u64,
-            position_range: None,
-        });
-        info.add_file(SnapshotFile {
-            path: "tables.parquet".to_string(),
-            checksum_sha256: sha256_hex(&tables_bytes),
-            byte_size: tables_bytes.len() as u64,
-            row_count: state.tables.len() as u64,
-            position_range: None,
-        });
-        info.add_file(SnapshotFile {
-            path: "columns.parquet".to_string(),
-            checksum_sha256: sha256_hex(&columns_bytes),
-            byte_size: columns_bytes.len() as u64,
-            row_count: state.columns.len() as u64,
-            position_range: None,
-        });
-
-        Ok(info)
-    }
-
-    /// Writes a new lineage snapshot (`lineage_edges.parquet`) for the given version.
+    /// 1. API holds distributed lock
+    /// 2. API calls this method to append the DDL event
+    /// 3. API calls compactor sync RPC with explicit event paths
+    /// 4. Compactor writes Parquet + publishes manifest
+    /// 5. API releases lock
     ///
     /// # Errors
     ///
-    /// Returns an error if serializing the snapshot or writing to storage fails.
-    pub async fn write_lineage_snapshot(
+    /// Returns an error if serialization or storage fails.
+    pub async fn append_ledger_event<T: CatalogEventPayload + serde::Serialize + Sync>(
         &self,
         _guard: &LockGuard<dyn StorageBackend>,
-        version: u64,
-        state: &LineageState,
-    ) -> Result<SnapshotInfo> {
-        let snapshot_dir = CatalogPaths::snapshot_dir(CatalogDomain::Lineage, version);
-        let bytes = parquet_util::write_lineage_edges(&state.edges)?;
-        let path =
-            CatalogPaths::snapshot_file(CatalogDomain::Lineage, version, "lineage_edges.parquet");
+        domain: CatalogDomain,
+        payload: &T,
+        source: &str,
+    ) -> Result<EventId> {
+        let event_id = EventId::generate();
+        let key = LedgerKey::event(domain, &event_id.to_string());
 
-        let _ = self
-            .storage
-            .put_raw(&path, bytes.clone(), WritePrecondition::None)
-            .await?;
+        let idempotency_key =
+            CatalogEvent::<()>::generate_idempotency_key(T::EVENT_TYPE, T::EVENT_VERSION, payload)
+                .map_err(|e| CatalogError::Serialization {
+                    message: format!("failed to generate idempotency key: {e}"),
+                })?;
 
-        let mut info = SnapshotInfo::new(version, snapshot_dir);
-        info.add_file(SnapshotFile {
-            path: "lineage_edges.parquet".to_string(),
-            checksum_sha256: sha256_hex(&bytes),
-            byte_size: bytes.len() as u64,
-            row_count: state.edges.len() as u64,
-            position_range: None,
-        });
-        Ok(info)
+        let envelope = CatalogEvent {
+            event_type: T::EVENT_TYPE.to_string(),
+            event_version: T::EVENT_VERSION,
+            idempotency_key,
+            occurred_at: Utc::now(),
+            source: source.to_string(),
+            trace_id: None,
+            sequence_position: None, // Tier-1 doesn't need sequence positions
+            payload,
+        };
+
+        envelope
+            .validate()
+            .map_err(|e| CatalogError::InvariantViolation {
+                message: format!("invalid event envelope: {e}"),
+            })?;
+
+        let json =
+            serde_json::to_vec_pretty(&envelope).map_err(|e| CatalogError::Serialization {
+                message: format!("failed to serialize event: {e}"),
+            })?;
+
+        // Use DoesNotExist for append-only semantics
+        match self.storage.put_ledger(&key, Bytes::from(json)).await? {
+            WriteResult::Success { .. } => Ok(event_id),
+            WriteResult::PreconditionFailed { .. } => {
+                // Event already exists - this is fine for idempotency
+                tracing::debug!(event_id = %event_id, "duplicate ledger event (already exists)");
+                Ok(event_id)
+            }
+        }
     }
 
-    async fn update_inner<F>(&self, update_fn: &mut F) -> Result<CommitRecord>
+    async fn update_inner<F>(
+        &self,
+        guard: &LockGuard<dyn StorageBackend>,
+        update_fn: &mut F,
+    ) -> Result<CommitRecord>
     where
         F: FnMut(&mut CatalogDomainManifest) -> Result<()>,
     {
+        let issuer = guard.permit_issuer();
+        let publisher = Publisher::new(&self.storage);
+
         for attempt in 1..=self.cas_max_retries {
             let mut root: RootManifest = self.read_json(CatalogPaths::ROOT_MANIFEST).await?;
             root.normalize_paths();
 
-            let (mut catalog, catalog_version): (CatalogDomainManifest, String) = self
-                .read_json_with_version(&root.catalog_manifest_path)
-                .await?;
+            let meta = self
+                .storage
+                .head_raw(&root.catalog_manifest_path)
+                .await?
+                .ok_or_else(|| CatalogError::NotFound {
+                    entity: "manifest".to_string(),
+                    name: root.catalog_manifest_path.clone(),
+                })?;
+
+            let prev_bytes = self.storage.get_raw(&root.catalog_manifest_path).await?;
+            let mut catalog: CatalogDomainManifest =
+                serde_json::from_slice(&prev_bytes).map_err(|e| CatalogError::Serialization {
+                    message: format!("parse JSON at {}: {e}", root.catalog_manifest_path),
+                })?;
+            let prev_raw_hash = compute_manifest_hash(&prev_bytes);
             let prev_catalog = catalog.clone();
 
             update_fn(&mut catalog)?;
 
             catalog.updated_at = Utc::now();
+            catalog.parent_hash = Some(prev_raw_hash.clone());
+            catalog.fencing_token = Some(guard.fencing_token().sequence());
+            let commit_ulid = next_commit_ulid(prev_catalog.commit_ulid.as_deref())?;
+            catalog.commit_ulid = Some(commit_ulid.clone());
 
-            let commit = self.build_commit_record(&prev_catalog, &catalog).await?;
+            catalog
+                .validate_succession(&prev_catalog, &prev_raw_hash)
+                .map_err(|message| CatalogError::InvariantViolation { message })?;
+
+            let commit = self
+                .build_commit_record(&prev_catalog, &catalog, &commit_ulid)
+                .await?;
             catalog.last_commit_id = Some(commit.commit_id.clone());
 
             let catalog_bytes = json_bytes(&catalog)?;
-            match self
-                .storage
-                .put_raw(
-                    &root.catalog_manifest_path,
+            let permit = issuer.issue_permit_with_commit_ulid(
+                CatalogDomain::Catalog.as_str(),
+                meta.version.clone(),
+                commit_ulid,
+            );
+
+            match publisher
+                .publish(
+                    permit,
+                    &ManifestKey::domain(CatalogDomain::Catalog),
                     catalog_bytes,
-                    WritePrecondition::MatchesVersion(catalog_version),
                 )
                 .await?
             {
@@ -394,23 +398,6 @@ impl Tier1Writer {
         })
     }
 
-    async fn read_json_with_version<T>(&self, path: &str) -> Result<(T, String)>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let meta = self
-            .storage
-            .head_raw(path)
-            .await?
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "manifest".to_string(),
-                name: path.to_string(),
-            })?;
-
-        let value = self.read_json(path).await?;
-        Ok((value, meta.version))
-    }
-
     /// Builds a commit record for an update operation.
     ///
     /// If the previous manifest has a `last_commit_id`, this method loads that
@@ -419,6 +406,7 @@ impl Tier1Writer {
         &self,
         prev: &CatalogDomainManifest,
         next: &CatalogDomainManifest,
+        commit_id: &str,
     ) -> Result<CommitRecord> {
         let payload_hash = sha256_prefixed(&json_vec(next)?);
         let prev_commit_id = prev.last_commit_id.clone();
@@ -450,7 +438,7 @@ impl Tier1Writer {
         };
 
         Ok(CommitRecord {
-            commit_id: Ulid::new().to_string(),
+            commit_id: commit_id.to_string(),
             prev_commit_id,
             prev_commit_hash,
             operation: "Update".into(),
@@ -460,19 +448,36 @@ impl Tier1Writer {
     }
 
     async fn persist_commit_record(&self, commit: &CommitRecord) -> Result<()> {
-        let path = CatalogPaths::commit(CatalogDomain::Catalog, &commit.commit_id);
         let bytes = json_bytes(commit)?;
-        match self
-            .storage
-            .put_raw(&path, bytes, WritePrecondition::DoesNotExist)
-            .await?
-        {
+        let key = CommitKey::record(CatalogDomain::Catalog, &commit.commit_id);
+        match self.storage.put_commit(&key, bytes).await? {
             WriteResult::Success { .. } => Ok(()),
             WriteResult::PreconditionFailed { .. } => Err(CatalogError::PreconditionFailed {
                 message: format!("commit already exists: {}", commit.commit_id),
             }),
         }
     }
+}
+
+fn next_commit_ulid(previous: Option<&str>) -> Result<String> {
+    let candidate = Ulid::new();
+
+    let Some(previous) = previous else {
+        return Ok(candidate.to_string());
+    };
+
+    let previous = Ulid::from_string(previous).map_err(|e| CatalogError::InvariantViolation {
+        message: format!("invalid previous commit_ulid '{previous}': {e}"),
+    })?;
+
+    if candidate > previous {
+        return Ok(candidate.to_string());
+    }
+
+    let next = previous.increment().ok_or_else(|| CatalogError::InvariantViolation {
+        message: "commit_ulid overflow while generating monotonic successor".to_string(),
+    })?;
+    Ok(next.to_string())
 }
 
 fn json_vec<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -488,11 +493,6 @@ fn json_bytes<T: serde::Serialize>(value: &T) -> Result<Bytes> {
 fn sha256_prefixed(bytes: &[u8]) -> String {
     let hash = Sha256::digest(bytes);
     format!("sha256:{}", hex::encode(hash))
-}
-
-fn sha256_hex(bytes: &Bytes) -> String {
-    let hash = Sha256::digest(bytes);
-    hex::encode(hash)
 }
 
 #[cfg(test)]

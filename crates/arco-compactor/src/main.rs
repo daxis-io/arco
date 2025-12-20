@@ -31,14 +31,17 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+pub mod anti_entropy;
 mod metrics;
+pub mod notification_consumer;
+pub mod sync_compact;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -48,6 +51,9 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use tokio::sync::Mutex;
+
+use arco_core::scoped_storage::ScopedStorage;
+use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 
 // ============================================================================
 // CLI Arguments
@@ -62,6 +68,18 @@ const COMPACTION_LAG_UPDATE_SECS: u64 = 30;
 #[command(about = "Compacts Tier 2 events into Tier 1 snapshots")]
 #[command(version)]
 struct Args {
+    /// Tenant ID for scoped compaction (single-tenant service mode).
+    #[arg(long, env = "ARCO_TENANT_ID", global = true)]
+    tenant_id: Option<String>,
+
+    /// Workspace ID for scoped compaction (single-tenant service mode).
+    #[arg(long, env = "ARCO_WORKSPACE_ID", global = true)]
+    workspace_id: Option<String>,
+
+    /// Object storage bucket name (e.g., `my-bucket`, `gs://my-bucket`, `s3://my-bucket`).
+    #[arg(long, env = "ARCO_STORAGE_BUCKET", global = true)]
+    storage_bucket: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -105,6 +123,58 @@ enum Commands {
         #[arg(long, default_value = "1000")]
         min_events: usize,
     },
+
+    /// Run a single anti-entropy pass.
+    AntiEntropy {
+        /// Domain to scan (e.g., "catalog", "lineage").
+        #[arg(long, default_value = "catalog")]
+        domain: String,
+
+        /// Maximum objects to scan per run.
+        #[arg(long, default_value = "1000")]
+        max_objects_per_run: usize,
+    },
+}
+
+// ============================================================================
+// Scoped Configuration (Single-Tenant Mode)
+// ============================================================================
+
+/// Scoped configuration for single-tenant compactor instances.
+struct ScopedConfig {
+    tenant_id: String,
+    workspace_id: String,
+    storage_bucket: String,
+}
+
+impl ScopedConfig {
+    fn from_args(args: &Args) -> Result<Self> {
+        let tenant_id = args
+            .tenant_id
+            .clone()
+            .ok_or_else(|| anyhow!("missing ARCO_TENANT_ID (required for service mode)"))?;
+        let workspace_id = args
+            .workspace_id
+            .clone()
+            .ok_or_else(|| anyhow!("missing ARCO_WORKSPACE_ID (required for service mode)"))?;
+        let storage_bucket = args
+            .storage_bucket
+            .clone()
+            .ok_or_else(|| anyhow!("missing ARCO_STORAGE_BUCKET (required for service mode)"))?;
+
+        Ok(Self {
+            tenant_id,
+            workspace_id,
+            storage_bucket,
+        })
+    }
+
+    fn scoped_storage(&self) -> Result<ScopedStorage> {
+        let backend = ObjectStoreBackend::from_bucket(&self.storage_bucket)?;
+        let backend: Arc<dyn StorageBackend> = Arc::new(backend);
+        ScopedStorage::new(backend, &self.tenant_id, &self.workspace_id)
+            .map_err(anyhow::Error::from)
+    }
 }
 
 // ============================================================================
@@ -191,6 +261,13 @@ impl CompactorState {
     }
 }
 
+/// Shared state for HTTP handlers (health + sync compaction).
+#[derive(Clone)]
+struct ServiceState {
+    compactor: Arc<CompactorState>,
+    storage: ScopedStorage,
+}
+
 // ============================================================================
 // Health Endpoints
 // ============================================================================
@@ -223,13 +300,16 @@ async fn health() -> impl IntoResponse {
 }
 
 /// GET /ready - Readiness check with compaction health.
-async fn ready(State(state): State<Arc<CompactorState>>) -> impl IntoResponse {
-    let ready = state.ready.load(Ordering::Acquire);
-    let healthy = state.is_healthy();
-    let last_successful = state.last_successful_compaction();
-    let successful_compactions = state.successful_compactions.load(Ordering::Relaxed);
-    let failed_compactions = state.failed_compactions.load(Ordering::Relaxed);
-    let compaction_in_progress = state.compaction_in_progress.load(Ordering::Acquire);
+async fn ready(State(state): State<Arc<ServiceState>>) -> impl IntoResponse {
+    let ready = state.compactor.ready.load(Ordering::Acquire);
+    let healthy = state.compactor.is_healthy();
+    let last_successful = state.compactor.last_successful_compaction();
+    let successful_compactions = state.compactor.successful_compactions.load(Ordering::Relaxed);
+    let failed_compactions = state.compactor.failed_compactions.load(Ordering::Relaxed);
+    let compaction_in_progress = state
+        .compactor
+        .compaction_in_progress
+        .load(Ordering::Acquire);
 
     let message = if !ready {
         Some("Service starting up".to_string())
@@ -238,7 +318,7 @@ async fn ready(State(state): State<Arc<CompactorState>>) -> impl IntoResponse {
     } else if !healthy {
         Some(format!(
             "No successful compaction in {} seconds",
-            state.unhealthy_threshold_secs
+            state.compactor.unhealthy_threshold_secs
         ))
     } else {
         None
@@ -264,13 +344,157 @@ async fn ready(State(state): State<Arc<CompactorState>>) -> impl IntoResponse {
     )
 }
 
+/// POST /internal/anti-entropy - Trigger an anti-entropy pass (Gate 5).
+///
+/// This endpoint runs a bounded anti-entropy scan to detect missed events.
+/// It lists ledger objects (the ONLY component that lists!) and compares
+/// to the compaction watermark.
+///
+/// Returns:
+/// - `200 OK` with scan results
+/// - `409 Conflict` if anti-entropy is already running
+/// - `501 Not Implemented` if anti-entropy is not yet wired
+/// - `500 Internal Server Error` on failure
+async fn anti_entropy_handler(
+    State(state): State<Arc<ServiceState>>,
+    Json(request): Json<anti_entropy::AntiEntropyConfig>,
+) -> impl IntoResponse {
+    // Check if anti-entropy is already running
+    if state.compactor.compaction_in_progress.load(Ordering::Acquire) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "busy",
+                "message": "Compaction or anti-entropy is already in progress"
+            })),
+        );
+    }
+
+    let compaction_guard = match state.compactor.compaction_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "busy",
+                    "message": "Compaction or anti-entropy is already in progress"
+                })),
+            );
+        }
+    };
+
+    if state
+        .compactor
+        .compaction_in_progress
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "busy",
+                "message": "Compaction or anti-entropy is already in progress"
+            })),
+        );
+    }
+
+    // Run anti-entropy pass
+    let mut job = anti_entropy::AntiEntropyJob::new((), request);
+    let response = match job.run_pass().await {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "completed",
+                "objects_scanned": result.objects_scanned,
+                "missed_events": result.missed_events,
+                "scan_complete": result.scan_complete,
+                "duration_ms": result.duration_ms
+            })),
+        ),
+        Err(anti_entropy::AntiEntropyError::NotImplemented { message }) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "not_implemented",
+                "message": message
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "anti_entropy_failed",
+                "message": e.to_string()
+            })),
+        ),
+    };
+
+    state
+        .compactor
+        .compaction_in_progress
+        .store(false, Ordering::Release);
+    drop(compaction_guard);
+
+    response
+}
+
+/// POST /internal/sync-compact - Synchronous compaction for Tier-1 DDL (ADR-018).
+///
+/// This endpoint is called by API while holding a distributed lock.
+/// It processes explicit event paths (no listing) and publishes the manifest.
+///
+/// Returns:
+/// - `200 OK` with manifest version on success
+/// - `400 Bad Request` if request is invalid
+/// - `409 Conflict` if fencing token is stale
+/// - `501 Not Implemented` if sync compaction is not yet wired
+/// - `500 Internal Server Error` on processing failure
+async fn sync_compact_handler(
+    State(state): State<Arc<ServiceState>>,
+    Json(request): Json<sync_compact::SyncCompactRequest>,
+) -> impl IntoResponse {
+    let handler = sync_compact::SyncCompactHandler::new(state.storage.clone());
+
+    match handler.handle(request).await {
+        Ok(response) => (StatusCode::OK, Json(serde_json::json!(response))),
+        Err(sync_compact::SyncCompactError::StaleFencingToken { .. }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "stale_fencing_token",
+                "message": "Fencing token does not match current lock holder"
+            })),
+        ),
+        Err(sync_compact::SyncCompactError::UnsupportedDomain { domain }) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "unsupported_domain",
+                "message": format!("Domain '{}' is not supported for sync compaction", domain)
+            })),
+        ),
+        Err(sync_compact::SyncCompactError::NotImplemented { domain, message }) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": "not_implemented",
+                "domain": domain,
+                "message": message
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "processing_error",
+                "message": e.to_string()
+            })),
+        ),
+    }
+}
+
 /// POST /compact - Trigger a compaction cycle on-demand.
 ///
 /// Returns:
 /// - `202 Accepted` if a new compaction cycle was started
 /// - `409 Conflict` if a compaction cycle is already in progress
-async fn compact(State(state): State<Arc<CompactorState>>) -> impl IntoResponse {
+async fn compact(State(state): State<Arc<ServiceState>>) -> impl IntoResponse {
     if state
+        .compactor
         .compaction_in_progress
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -284,7 +508,7 @@ async fn compact(State(state): State<Arc<CompactorState>>) -> impl IntoResponse 
         );
     }
 
-    let state_clone = Arc::clone(&state);
+    let state_clone = Arc::clone(&state.compactor);
     tokio::spawn(async move {
         run_compaction_cycle_guarded(&state_clone).await;
     });
@@ -396,6 +620,9 @@ async fn main() -> Result<()> {
             interval_secs,
             unhealthy_threshold_secs,
         } => {
+            let scoped = ScopedConfig::from_args(&args)?;
+            let scoped_storage = scoped.scoped_storage()?;
+
             // Initialize metrics before starting
             metrics::init_metrics();
             arco_catalog::metrics::register_metrics();
@@ -404,13 +631,19 @@ async fn main() -> Result<()> {
                 port = port,
                 interval_secs = interval_secs,
                 unhealthy_threshold_secs = unhealthy_threshold_secs,
+                tenant_id = %scoped.tenant_id,
+                workspace_id = %scoped.workspace_id,
                 "Starting compactor service"
             );
 
-            let state = Arc::new(CompactorState::new(unhealthy_threshold_secs));
+            let compactor_state = Arc::new(CompactorState::new(unhealthy_threshold_secs));
+            let state = Arc::new(ServiceState {
+                compactor: Arc::clone(&compactor_state),
+                storage: scoped_storage,
+            });
 
             // Update compaction lag gauge periodically using last successful compaction as proxy.
-            let lag_state = Arc::clone(&state);
+            let lag_state = Arc::clone(&compactor_state);
             tokio::spawn(async move {
                 let start = Utc::now();
                 loop {
@@ -431,15 +664,21 @@ async fn main() -> Result<()> {
             });
 
             // Build HTTP router
+            // Note: /internal/anti-entropy is separate from /internal/sync-compact
+            // because they have different IAM requirements:
+            // - sync-compact: compactor-fastpath-sa (NO list)
+            // - anti-entropy: compactor-antientropy-sa (WITH list)
             let router = Router::new()
                 .route("/health", get(health))
                 .route("/ready", get(ready))
                 .route("/metrics", get(metrics::serve_metrics))
                 .route("/compact", post(compact))
+                .route("/internal/sync-compact", post(sync_compact_handler))
+                .route("/internal/anti-entropy", post(anti_entropy_handler))
                 .with_state(Arc::clone(&state));
 
             // Spawn compaction loop
-            let state_clone = Arc::clone(&state);
+            let state_clone = Arc::clone(&compactor_state);
             let interval = Duration::from_secs(interval_secs);
             tokio::spawn(async move {
                 run_compaction_loop(state_clone, interval).await;
@@ -475,6 +714,37 @@ async fn main() -> Result<()> {
             run_compaction_cycle().await?;
 
             tracing::info!("Compaction complete");
+        }
+
+        Commands::AntiEntropy {
+            domain,
+            max_objects_per_run,
+        } => {
+            let scoped = ScopedConfig::from_args(&args)?;
+            let scoped_storage = scoped.scoped_storage()?;
+
+            let config = anti_entropy::AntiEntropyConfig {
+                domain,
+                tenant_id: scoped.tenant_id,
+                workspace_id: scoped.workspace_id,
+                max_objects_per_run,
+                ..anti_entropy::AntiEntropyConfig::default()
+            };
+
+            let mut job = anti_entropy::AntiEntropyJob::new(scoped_storage, config);
+
+            let result = job.run_pass().await.map_err(|err| {
+                anyhow!(
+                    "anti-entropy run failed: {err}"
+                )
+            })?;
+
+            tracing::info!(
+                objects_scanned = result.objects_scanned,
+                missed_events = result.missed_events,
+                scan_complete = result.scan_complete,
+                "anti-entropy run completed"
+            );
         }
     }
 

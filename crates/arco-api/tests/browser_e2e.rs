@@ -399,7 +399,7 @@ mod signed_url_security {
     async fn test_ttl_bounded_to_maximum() -> Result<()> {
         let router = test_router().await?;
 
-        // Initialize catalog first (writes snapshot v2).
+        // Initialize catalog first (writes snapshot v1).
         let create_ns = CreateNamespaceRequest {
             name: "ttl_test_ns".to_string(),
             description: None,
@@ -407,7 +407,7 @@ mod signed_url_security {
         let response = post_json(&router, "/api/v1/namespaces", &create_ns).await?;
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        let snapshot_version = 2_u64;
+        let snapshot_version = 1_u64;
 
         // Request with excessive TTL (2 hours = 7200 seconds)
         let mint_req = MintUrlsRequest {
@@ -429,7 +429,7 @@ mod signed_url_security {
     async fn test_ttl_default_applied() -> Result<()> {
         let router = test_router().await?;
 
-        // Initialize catalog (writes snapshot v2).
+        // Initialize catalog (writes snapshot v1).
         let create_ns = CreateNamespaceRequest {
             name: "default_ttl_ns".to_string(),
             description: None,
@@ -437,7 +437,7 @@ mod signed_url_security {
         let response = post_json(&router, "/api/v1/namespaces", &create_ns).await?;
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        let snapshot_version = 2_u64;
+        let snapshot_version = 1_u64;
 
         // Request without TTL
         let mint_req = MintUrlsRequest {

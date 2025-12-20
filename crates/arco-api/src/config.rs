@@ -39,6 +39,10 @@ pub struct Config {
     /// Storage configuration (bucket/backend selection).
     #[serde(default)]
     pub storage: StorageConfig,
+
+    /// Compactor base URL for sync compaction (e.g., "http://compactor:8081").
+    #[serde(default)]
+    pub compactor_url: Option<String>,
 }
 
 /// CORS configuration for browser-based access.
@@ -73,6 +77,7 @@ impl Default for Config {
             jwt: JwtConfig::default(),
             rate_limit: RateLimitConfig::default(),
             storage: StorageConfig::default(),
+            compactor_url: None,
         }
     }
 }
@@ -104,6 +109,7 @@ impl Config {
     /// - `ARCO_JWT_ISSUER`
     /// - `ARCO_JWT_AUDIENCE`
     /// - `ARCO_STORAGE_BUCKET`
+    /// - `ARCO_COMPACTOR_URL`
     ///
     /// # Errors
     ///
@@ -157,6 +163,9 @@ impl Config {
 
         if let Some(bucket) = env_string("ARCO_STORAGE_BUCKET") {
             config.storage.bucket = Some(bucket);
+        }
+        if let Some(url) = env_string("ARCO_COMPACTOR_URL") {
+            config.compactor_url = Some(url);
         }
 
         Ok(config)

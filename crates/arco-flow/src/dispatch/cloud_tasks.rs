@@ -32,7 +32,8 @@
 //!     "us-central1",
 //!     "arco-tasks",
 //!     "https://my-service.run.app",
-//! );
+//! )
+//! .with_queue_retry_updates(false); // Skip queue updates for IaC-managed queues.
 //!
 //! let dispatcher = CloudTasksDispatcher::new(config).await?;
 //! dispatcher.enqueue(envelope, options).await?;
@@ -67,6 +68,8 @@ pub struct CloudTasksConfig {
     #[serde(default)]
     pub retry_config: RetryConfig,
     /// Whether to apply retry configuration to queues via the Cloud Tasks API.
+    ///
+    /// Defaults to true; set to false for IaC-managed queues.
     #[serde(default = "default_apply_queue_retry_config")]
     pub apply_queue_retry_config: bool,
 }
@@ -760,6 +763,19 @@ mod tests {
         assert_eq!(config.min_backoff, Duration::from_secs(10));
         assert_eq!(config.max_backoff, Duration::from_secs(300));
         assert_eq!(config.max_retry_duration, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn config_disables_queue_retry_updates() {
+        let config = CloudTasksConfig::new(
+            "my-project",
+            "us-central1",
+            "arco-tasks",
+            "https://example.run.app",
+        )
+        .with_queue_retry_updates(false);
+
+        assert!(!config.apply_queue_retry_config);
     }
 
     #[cfg(not(feature = "gcp"))]

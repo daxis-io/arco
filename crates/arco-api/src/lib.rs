@@ -49,6 +49,7 @@
 #![warn(clippy::pedantic)]
 
 pub mod config;
+pub mod compactor_client;
 pub mod context;
 pub mod error;
 pub mod metrics;

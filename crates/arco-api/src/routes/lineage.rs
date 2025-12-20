@@ -22,6 +22,7 @@ use crate::context::RequestContext;
 use crate::error::ApiError;
 use crate::error::ApiErrorBody;
 use crate::server::AppState;
+use arco_catalog::Tier1Compactor;
 
 /// Request to add lineage edge(s).
 #[derive(Debug, Deserialize, ToSchema)]
@@ -123,7 +124,10 @@ pub(crate) async fn add_edges(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
-    let writer = arco_catalog::CatalogWriter::new(storage);
+    let compactor = state
+        .sync_compactor()
+        .unwrap_or_else(|| Arc::new(Tier1Compactor::new(storage.clone())));
+    let writer = arco_catalog::CatalogWriter::new(storage).with_sync_compactor(compactor);
 
     // Ensure initialized
     writer

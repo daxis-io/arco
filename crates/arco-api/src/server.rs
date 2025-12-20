@@ -16,9 +16,11 @@ use serde::Serialize;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
+use crate::compactor_client::CompactorClient;
 use crate::config::{Config, CorsConfig};
 use crate::rate_limit::RateLimitState;
 use arco_core::Result;
+use arco_catalog::SyncCompactor;
 
 // ============================================================================
 // Health and Ready Responses
@@ -56,6 +58,8 @@ pub struct AppState {
     storage: Arc<dyn arco_core::storage::StorageBackend>,
     /// Rate limiting state (shared across tenants).
     rate_limit: Arc<RateLimitState>,
+    /// Sync compaction client (Tier-1 DDL).
+    sync_compactor: Option<Arc<dyn SyncCompactor>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -64,6 +68,7 @@ impl std::fmt::Debug for AppState {
             .field("config", &self.config)
             .field("storage", &"<StorageBackend>")
             .field("rate_limit", &"<RateLimitState>")
+            .field("sync_compactor", &self.sync_compactor.is_some())
             .finish()
     }
 }
@@ -73,20 +78,32 @@ impl AppState {
     #[must_use]
     pub fn new(config: Config, storage: Arc<dyn arco_core::storage::StorageBackend>) -> Self {
         let rate_limit = Arc::new(RateLimitState::new(config.rate_limit.clone()));
+        let sync_compactor = config.compactor_url.as_ref().map(|url| {
+            let client: Arc<dyn SyncCompactor> =
+                Arc::new(CompactorClient::new(url.clone()));
+            client
+        });
         Self {
             config,
             storage,
             rate_limit,
+            sync_compactor,
         }
     }
 
     /// Creates new application state with in-memory storage (for testing).
     #[must_use]
     pub fn with_memory_storage(config: Config) -> Self {
+        let sync_compactor = config.compactor_url.as_ref().map(|url| {
+            let client: Arc<dyn SyncCompactor> =
+                Arc::new(CompactorClient::new(url.clone()));
+            client
+        });
         Self {
             rate_limit: Arc::new(RateLimitState::new(config.rate_limit.clone())),
             config,
             storage: Arc::new(arco_core::storage::MemoryBackend::new()),
+            sync_compactor,
         }
     }
 
@@ -97,6 +114,12 @@ impl AppState {
     /// Returns an error if the storage backend is not configured (should never happen).
     pub fn storage_backend(&self) -> Result<Arc<dyn arco_core::storage::StorageBackend>> {
         Ok(Arc::clone(&self.storage))
+    }
+
+    /// Returns the sync compactor if configured.
+    #[must_use]
+    pub fn sync_compactor(&self) -> Option<Arc<dyn SyncCompactor>> {
+        self.sync_compactor.clone()
     }
 }
 

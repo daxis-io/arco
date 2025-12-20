@@ -26,6 +26,10 @@ fn choose_log_format(config: &Config) -> LogFormat {
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
 
+    if !config.debug && config.compactor_url.is_none() {
+        anyhow::bail!("ARCO_COMPACTOR_URL is required when ARCO_DEBUG=false");
+    }
+
     init_logging(choose_log_format(&config));
 
     let storage: Arc<dyn StorageBackend> = if let Some(bucket) = config.storage.bucket.as_deref()

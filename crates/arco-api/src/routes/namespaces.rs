@@ -23,6 +23,7 @@ use crate::context::RequestContext;
 use crate::error::ApiError;
 use crate::error::ApiErrorBody;
 use crate::server::AppState;
+use arco_catalog::Tier1Compactor;
 
 /// Request to create a namespace.
 #[derive(Debug, Deserialize, ToSchema)]
@@ -102,7 +103,10 @@ pub(crate) async fn create_namespace(
     let storage = ctx.scoped_storage(backend)?;
 
     // Create catalog writer and ensure initialized
-    let writer = arco_catalog::CatalogWriter::new(storage.clone());
+    let compactor = state
+        .sync_compactor()
+        .unwrap_or_else(|| Arc::new(Tier1Compactor::new(storage.clone())));
+    let writer = arco_catalog::CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
 
     // Initialize if not already (idempotent)
     writer.initialize().await.map_err(ApiError::from)?;
@@ -276,7 +280,10 @@ pub(crate) async fn delete_namespace(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
-    let writer = arco_catalog::CatalogWriter::new(storage);
+    let compactor = state
+        .sync_compactor()
+        .unwrap_or_else(|| Arc::new(Tier1Compactor::new(storage.clone())));
+    let writer = arco_catalog::CatalogWriter::new(storage).with_sync_compactor(compactor);
 
     let options = arco_catalog::write_options::WriteOptions::default()
         .with_actor(format!("api:{}", ctx.tenant))

@@ -24,6 +24,7 @@ use crate::context::RequestContext;
 use crate::error::ApiError;
 use crate::error::ApiErrorBody;
 use crate::server::AppState;
+use arco_catalog::Tier1Compactor;
 
 /// Request to register a table.
 #[derive(Debug, Deserialize, ToSchema)]
@@ -158,7 +159,10 @@ pub(crate) async fn register_table(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
-    let writer = arco_catalog::CatalogWriter::new(storage.clone());
+    let compactor = state
+        .sync_compactor()
+        .unwrap_or_else(|| Arc::new(Tier1Compactor::new(storage.clone())));
+    let writer = arco_catalog::CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
 
     // Ensure initialized
     writer.initialize().await.map_err(ApiError::from)?;
@@ -415,7 +419,10 @@ pub(crate) async fn update_table(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
-    let writer = arco_catalog::CatalogWriter::new(storage.clone());
+    let compactor = state
+        .sync_compactor()
+        .unwrap_or_else(|| Arc::new(Tier1Compactor::new(storage.clone())));
+    let writer = arco_catalog::CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
 
     let options = arco_catalog::write_options::WriteOptions::default()
         .with_actor(format!("api:{}", ctx.tenant))
@@ -503,7 +510,10 @@ pub(crate) async fn drop_table(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
-    let writer = arco_catalog::CatalogWriter::new(storage);
+    let compactor = state
+        .sync_compactor()
+        .unwrap_or_else(|| Arc::new(Tier1Compactor::new(storage.clone())));
+    let writer = arco_catalog::CatalogWriter::new(storage).with_sync_compactor(compactor);
 
     let options = arco_catalog::write_options::WriteOptions::default()
         .with_actor(format!("api:{}", ctx.tenant))

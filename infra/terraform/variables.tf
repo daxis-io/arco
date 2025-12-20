@@ -39,6 +39,42 @@ variable "compactor_image" {
 }
 
 # ============================================================================
+# Compactor Scoped Configuration
+# ============================================================================
+
+variable "compactor_tenant_id" {
+  description = "Tenant ID for compactor and anti-entropy jobs"
+  type        = string
+}
+
+variable "compactor_workspace_id" {
+  description = "Workspace ID for compactor and anti-entropy jobs"
+  type        = string
+}
+
+# ============================================================================
+# Anti-Entropy Configuration
+# ============================================================================
+
+variable "anti_entropy_domain" {
+  description = "Domain to scan during anti-entropy runs"
+  type        = string
+  default     = "catalog"
+}
+
+variable "anti_entropy_max_objects_per_run" {
+  description = "Maximum objects to scan per anti-entropy run"
+  type        = number
+  default     = 1000
+}
+
+variable "anti_entropy_schedule" {
+  description = "Cron schedule for anti-entropy job"
+  type        = string
+  default     = "*/15 * * * *"
+}
+
+# ============================================================================
 # Cloud Run Configuration
 # ============================================================================
 

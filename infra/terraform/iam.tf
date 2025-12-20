@@ -27,12 +27,17 @@ resource "google_service_account" "api" {
   project      = var.project_id
 }
 
-# API needs read/write access to catalog bucket (for Tier-1 operations)
-resource "google_storage_bucket_iam_member" "api_catalog_access" {
-  bucket = google_storage_bucket.catalog.name
-  role   = "roles/storage.objectUser"
-  member = "serviceAccount:${google_service_account.api.email}"
-}
+# Gate 5: Prefix-scoped IAM - see iam_conditions.tf for detailed bindings
+#
+# API can write to: ledger/, locks/, commits/, manifests/
+# Compactor can write to: state/, l0/, manifests/
+# Both can read all prefixes
+#
+# NOTE: Prefix scoping MUST be anchored (no `contains()`); see iam_conditions.tf.
+#
+# REMOVED (Gate 5 violation): Bucket-wide objectUser grants
+# The following resource was removed and replaced with prefix-scoped bindings:
+# resource "google_storage_bucket_iam_member" "api_catalog_access" { ... }
 
 # API can read JWT secret (if using HS256)
 resource "google_secret_manager_secret_iam_member" "api_jwt_secret" {
@@ -44,22 +49,40 @@ resource "google_secret_manager_secret_iam_member" "api_jwt_secret" {
 }
 
 # ============================================================================
-# Compactor Service Account
+# Compactor Service Accounts (Split for Gate 5 Defense-in-Depth)
 # ============================================================================
+#
+# Gate 5 Patch 9: Split compactor into two service accounts to prevent
+# accidental listing in the fast path:
+#
+# | SA                     | Permissions                          | Purpose               |
+# |------------------------|--------------------------------------|-----------------------|
+# | compactor-fastpath     | state/, l0/, manifests/ write; NO list | Notification consumer |
+# | compactor-antientropy  | ledger/ list; state/ read            | Anti-entropy job      |
+#
+# This makes "oops, compactor started listing in hot path" a deploy-time
+# IAM failure, not just a code review issue.
 
+# Fast-path compactor: handles notifications, writes state, NO listing
 resource "google_service_account" "compactor" {
   account_id   = "arco-compactor-${var.environment}"
-  display_name = "Arco Compactor Service (${var.environment})"
-  description  = "Service account for Arco Compactor - sole writer of Parquet state"
+  display_name = "Arco Compactor Fast-Path (${var.environment})"
+  description  = "Fast-path compactor - sole writer of Parquet state, NO list permission"
   project      = var.project_id
 }
 
-# Compactor needs read/write access to catalog bucket (reads ledger, writes state)
-resource "google_storage_bucket_iam_member" "compactor_catalog_access" {
-  bucket = google_storage_bucket.catalog.name
-  role   = "roles/storage.objectUser"
-  member = "serviceAccount:${google_service_account.compactor.email}"
+# Anti-entropy compactor: can list ledger to find missed events
+resource "google_service_account" "compactor_antientropy" {
+  account_id   = "arco-compactor-ae-${var.environment}"
+  display_name = "Arco Compactor Anti-Entropy (${var.environment})"
+  description  = "Anti-entropy job - can list ledger/ to discover missed events"
+  project      = var.project_id
 }
+
+# REMOVED (Gate 5 violation): Bucket-wide objectUser grants
+# The following resource was removed and replaced with prefix-scoped bindings:
+# resource "google_storage_bucket_iam_member" "compactor_catalog_access" { ... }
+# See iam_conditions.tf for the new prefix-scoped bindings.
 
 # ============================================================================
 # Cloud Run Invoker (for scheduled jobs)
@@ -70,6 +93,19 @@ resource "google_service_account" "invoker" {
   display_name = "Arco Service Invoker (${var.environment})"
   description  = "Service account for invoking Arco services (Cloud Scheduler, Pub/Sub)"
   project      = var.project_id
+}
+
+# ============================================================================
+# Custom IAM Roles
+# ============================================================================
+
+# Read-only object access without list permission (enforces no-list invariant).
+resource "google_project_iam_custom_role" "storage_object_reader_no_list" {
+  role_id     = "storageObjectReaderNoList"
+  title       = "Storage Object Reader (No List)"
+  description = "Read individual objects without list capability"
+  permissions = ["storage.objects.get"]
+  project     = var.project_id
 }
 
 # Invoker can trigger Cloud Run services
@@ -106,8 +142,13 @@ output "api_service_account_email" {
 }
 
 output "compactor_service_account_email" {
-  description = "Email of the Compactor service account"
+  description = "Email of the Compactor fast-path service account"
   value       = google_service_account.compactor.email
+}
+
+output "compactor_antientropy_service_account_email" {
+  description = "Email of the Compactor anti-entropy service account"
+  value       = google_service_account.compactor_antientropy.email
 }
 
 output "invoker_service_account_email" {

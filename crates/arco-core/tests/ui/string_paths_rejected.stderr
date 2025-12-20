@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/string_paths_rejected.rs:10:21
+   |
+10 |         .put_ledger("ledger/catalog/event.json", Bytes::from("{}"))
+   |          ---------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `&LedgerKey`, found `&str`
+   |          |
+   |          arguments to this method are incorrect
+   |
+   = note: expected reference `&LedgerKey`
+              found reference `&'static str`
+note: method defined here
+  --> src/storage_traits.rs
+   |
+   |     async fn put_ledger(&self, key: &LedgerKey, data: Bytes) -> Result<WriteResult>;
+   |              ^^^^^^^^^^

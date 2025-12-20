@@ -1,0 +1,11 @@
+error[E0599]: no method named `put_ledger` found for reference `&R` in the current scope
+  --> tests/ui/read_only_cannot_put_ledger.rs:18:12
+   |
+18 |     reader.put_ledger(&key, Bytes::from("{}")).await;
+   |            ^^^^^^^^^^ method not found in `&R`
+   |
+   = help: items from traits can only be used if the type parameter is bounded by the trait
+help: the following trait defines an item `put_ledger`, perhaps you need to restrict type parameter `R` with it:
+   |
+12 | async fn read_only_handler<R: ReadStore + LedgerPutStore>(reader: &R) {
+   |                                         ++++++++++++++++

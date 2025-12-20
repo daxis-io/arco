@@ -1,0 +1,11 @@
+error[E0599]: no method named `put_state` found for reference `&W` in the current scope
+  --> tests/ui/ledger_only_cannot_put_state.rs:26:12
+   |
+26 |     writer.put_state(&state_key, Bytes::from_static(&[])).await;
+   |            ^^^^^^^^^ method not found in `&W`
+   |
+   = help: items from traits can only be used if the type parameter is bounded by the trait
+help: the following trait defines an item `put_state`, perhaps you need to restrict type parameter `W` with it:
+   |
+12 | async fn api_handler<R: ReadStore, W: LedgerPutStore + StatePutStore>(reader: &R, writer: &W) {
+   |                                                      +++++++++++++++

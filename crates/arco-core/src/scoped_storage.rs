@@ -17,12 +17,19 @@
 //! - Tenant/workspace IDs are validated at construction
 
 use bytes::Bytes;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use crate::catalog_paths::{CatalogDomain, CatalogPaths};
 use crate::error::{Error, Result};
 use crate::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
+use crate::storage_keys::{CommitKey, LedgerKey, LockKey, ManifestKey, StateKey};
+use crate::storage_traits::{
+    CasStore, CommitPutStore, LedgerPutStore, LockPutStore, MetaStore, ReadStore, SignedUrlStore,
+    StatePutStore,
+};
 
 /// Tenant + workspace scoped storage wrapper.
 ///
@@ -576,6 +583,89 @@ impl ScopedPath {
 impl std::fmt::Display for ScopedPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+// ============================================================================
+// Storage trait implementations for scoped storage
+// ============================================================================
+
+#[async_trait]
+impl ReadStore for ScopedStorage {
+    async fn get(&self, path: &str) -> Result<Bytes> {
+        self.get_raw(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+        Self::validate_path(path)?;
+        self.backend.get_range(&self.scoped_path(path), range).await
+    }
+}
+
+#[async_trait]
+impl LedgerPutStore for ScopedStorage {
+    async fn put_ledger(&self, key: &LedgerKey, data: Bytes) -> Result<WriteResult> {
+        self.put_raw(key.as_ref(), data, WritePrecondition::DoesNotExist)
+            .await
+    }
+}
+
+#[async_trait]
+impl StatePutStore for ScopedStorage {
+    async fn put_state(&self, key: &StateKey, data: Bytes) -> Result<WriteResult> {
+        self.put_raw(key.as_ref(), data, WritePrecondition::DoesNotExist)
+            .await
+    }
+}
+
+#[async_trait]
+impl CasStore for ScopedStorage {
+    async fn cas(&self, key: &ManifestKey, data: Bytes, version: &str) -> Result<WriteResult> {
+        self.put_raw(
+            key.as_ref(),
+            data,
+            WritePrecondition::MatchesVersion(version.to_string()),
+        )
+        .await
+    }
+
+    async fn create_if_absent(&self, key: &ManifestKey, data: Bytes) -> Result<WriteResult> {
+        self.put_raw(key.as_ref(), data, WritePrecondition::DoesNotExist)
+            .await
+    }
+}
+
+#[async_trait]
+impl LockPutStore for ScopedStorage {
+    async fn put_lock(
+        &self,
+        key: &LockKey,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> Result<WriteResult> {
+        self.put_raw(key.as_ref(), data, precondition).await
+    }
+}
+
+#[async_trait]
+impl CommitPutStore for ScopedStorage {
+    async fn put_commit(&self, key: &CommitKey, data: Bytes) -> Result<WriteResult> {
+        self.put_raw(key.as_ref(), data, WritePrecondition::DoesNotExist)
+            .await
+    }
+}
+
+#[async_trait]
+impl MetaStore for ScopedStorage {
+    async fn head(&self, path: &str) -> Result<Option<ObjectMeta>> {
+        self.head_raw(path).await
+    }
+}
+
+#[async_trait]
+impl SignedUrlStore for ScopedStorage {
+    async fn signed_url(&self, path: &str, expiry: Duration) -> Result<String> {
+        self.signed_url_raw(path, expiry).await
     }
 }
 

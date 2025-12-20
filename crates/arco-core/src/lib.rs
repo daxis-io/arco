@@ -33,15 +33,21 @@
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 
+pub mod backpressure;
 pub mod canonical_json;
 pub mod catalog_event;
 pub mod catalog_paths;
 pub mod error;
 pub mod id;
+pub mod lock;
 pub mod observability;
 pub mod partition;
+pub mod publish;
 pub mod scoped_storage;
+pub mod sync_compact;
 pub mod storage;
+pub mod storage_keys;
+pub mod storage_traits;
 pub mod tenant;
 
 /// Prelude module for convenient imports.
@@ -62,6 +68,17 @@ pub mod prelude {
         MemoryBackend, ObjectMeta, ObjectStoreBackend, StorageBackend, WritePrecondition,
         WriteResult,
     };
+    pub use crate::storage_keys::{
+        CommitKey, LedgerKey, LockKey, ManifestKey, QuarantineKey, SequenceKey, StateKey,
+        StorageKey,
+    };
+    pub use crate::storage_traits::{
+        CasStore, CommitPutStore, LedgerPutStore, ListStore, LockPutStore, MetaStore, ReadStore,
+        SignedUrlStore, StatePutStore,
+    };
+    pub use crate::sync_compact::{SyncCompactRequest, SyncCompactResponse};
+    pub use crate::publish::{FencingToken, PermitIssuer, PublishPermit, Publisher};
+    pub use crate::lock::{DistributedLock, LockGuard, LockInfo};
     pub use crate::tenant::TenantId;
 }
 
@@ -70,9 +87,11 @@ pub use catalog_event::{CatalogEvent, CatalogEventPayload};
 pub use catalog_paths::{CatalogDomain, CatalogPaths};
 pub use error::{Error, Result};
 pub use id::{AssetId, EventId, MaterializationId, RunId, TaskId};
+pub use lock::{DistributedLock, LockGuard, LockInfo};
 pub use observability::{LogFormat, Redacted, init_logging};
 pub use partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
 pub use scoped_storage::ScopedStorage;
+pub use sync_compact::{SyncCompactRequest, SyncCompactResponse};
 pub use storage::{
     MemoryBackend, ObjectMeta, ObjectStoreBackend, StorageBackend, WritePrecondition, WriteResult,
 };

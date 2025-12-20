@@ -22,6 +22,7 @@ gcp = []
 aws = []
 azure = []
 test-utils = ["dep:proptest", "dep:tempfile"]
+sync-compaction = []
 
 [dependencies]
 # Serialization
@@ -55,6 +56,7 @@ sha2 = { workspace = true }
 # Async
 async-trait = { workspace = true }
 futures = { workspace = true }
+tokio = { workspace = true }
 
 # Optional test utilities
 proptest = { workspace = true, optional = true }
@@ -68,3 +70,4 @@ http = { workspace = true }
 tokio = { workspace = true }
 tokio-test = { workspace = true }
 proptest = { workspace = true }
+trybuild = { workspace = true }

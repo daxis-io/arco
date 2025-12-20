@@ -1,0 +1,11 @@
+error[E0599]: no method named `cas` found for reference `&S` in the current scope
+  --> tests/ui/api_cannot_cas_manifest.rs:26:13
+   |
+26 |     storage.cas(&manifest_key, Bytes::from("{}"), "v1").await;
+   |             ^^^ method not found in `&S`
+   |
+   = help: items from traits can only be used if the type parameter is bounded by the trait
+help: the following trait defines an item `cas`, perhaps you need to restrict type parameter `S` with it:
+   |
+12 | async fn api_handler<S: ReadStore + LedgerPutStore + CommitPutStore + CasStore>(storage: &S) {
+   |                                                                     ++++++++++

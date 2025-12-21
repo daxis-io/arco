@@ -43,6 +43,9 @@
 pub(crate) mod dag;
 
 pub mod dispatch;
+
+/// Event-driven orchestration module (ADR-020).
+pub mod orchestration;
 pub mod error;
 pub mod events;
 pub mod leader;

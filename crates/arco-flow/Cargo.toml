@@ -54,6 +54,10 @@ petgraph = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 
+# Arrow/Parquet for orchestration state projections
+arrow = { workspace = true }
+parquet = { workspace = true }
+
 # IDs
 ulid = { workspace = true }
 

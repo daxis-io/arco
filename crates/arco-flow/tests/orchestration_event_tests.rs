@@ -101,6 +101,46 @@ fn test_task_started_includes_attempt_id() {
 }
 
 #[test]
+fn test_task_heartbeat_idempotency_key_includes_timestamp() {
+    let heartbeat_at = Utc::now();
+
+    let event = OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::TaskHeartbeat {
+            run_id: "01HQXYZ123RUN".into(),
+            task_key: "extract".into(),
+            attempt: 1,
+            attempt_id: "01HQXYZ456ATT".into(),
+            heartbeat_at: Some(heartbeat_at),
+        },
+    );
+
+    let ts_fragment = heartbeat_at.timestamp_millis().to_string();
+    assert!(event.idempotency_key.contains(&ts_fragment));
+}
+
+#[test]
+fn test_task_heartbeat_idempotency_key_without_timestamp() {
+    let event = OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::TaskHeartbeat {
+            run_id: "01HQXYZ123RUN".into(),
+            task_key: "extract".into(),
+            attempt: 1,
+            attempt_id: "01HQXYZ456ATT".into(),
+            heartbeat_at: None,
+        },
+    );
+
+    assert_eq!(
+        event.idempotency_key,
+        "heartbeat:01HQXYZ123RUN:extract:1:01HQXYZ456ATT"
+    );
+}
+
+#[test]
 fn test_dispatch_requested_event() {
     let event = OrchestrationEvent::new(
         "tenant-abc",
@@ -135,6 +175,40 @@ fn test_timer_requested_event() {
     );
 
     assert_eq!(event.event_type, "TimerRequested");
+}
+
+#[test]
+fn test_dispatch_enqueued_sets_correlation() {
+    let event = OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::DispatchEnqueued {
+            dispatch_id: "dispatch:01HQXYZ123RUN:extract:1".into(),
+            run_id: Some("01HQXYZ123RUN".into()),
+            task_key: Some("extract".into()),
+            attempt: Some(1),
+            cloud_task_id: "cloudtask-01".into(),
+        },
+    );
+
+    assert_eq!(event.correlation_id.as_deref(), Some("01HQXYZ123RUN"));
+}
+
+#[test]
+fn test_timer_fired_sets_correlation_when_present() {
+    let event = OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::TimerFired {
+            timer_id: "timer:retry:01HQXYZ123RUN:extract:1:1705340400".into(),
+            timer_type: arco_flow::orchestration::events::TimerType::Retry,
+            run_id: Some("01HQXYZ123RUN".into()),
+            task_key: Some("extract".into()),
+            attempt: Some(1),
+        },
+    );
+
+    assert_eq!(event.correlation_id.as_deref(), Some("01HQXYZ123RUN"));
 }
 
 #[test]

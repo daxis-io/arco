@@ -33,4 +33,5 @@
 //! - **ADR-021**: Cloud Tasks naming convention (dual-identifier pattern)
 //! - **ADR-022**: Per-edge dependency satisfaction for duplicate-safe readiness
 
+pub mod compactor;
 pub mod events;

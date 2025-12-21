@@ -184,6 +184,9 @@ pub enum OrchestrationEventData {
         attempt: u32,
         /// Attempt identifier - must match active attempt.
         attempt_id: String,
+        /// Heartbeat timestamp from worker (UTC).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        heartbeat_at: Option<DateTime<Utc>>,
     },
 
     /// Task has finished executing.
@@ -249,6 +252,15 @@ pub enum OrchestrationEventData {
     DispatchEnqueued {
         /// Internal dispatch ID.
         dispatch_id: String,
+        /// Run identifier.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        /// Task name within run.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_key: Option<String>,
+        /// Attempt number.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attempt: Option<u32>,
         /// Cloud Tasks ID (hash-based per ADR-021).
         cloud_task_id: String,
     },
@@ -257,6 +269,15 @@ pub enum OrchestrationEventData {
     TimerEnqueued {
         /// Internal timer ID.
         timer_id: String,
+        /// Associated run (nullable for cron timers).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        /// Associated task (nullable for cron timers).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_key: Option<String>,
+        /// Associated attempt (for retry/heartbeat timers).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attempt: Option<u32>,
         /// Cloud Tasks ID (hash-based per ADR-021).
         cloud_task_id: String,
     },
@@ -267,6 +288,15 @@ pub enum OrchestrationEventData {
         timer_id: String,
         /// Timer type.
         timer_type: TimerType,
+        /// Associated run (nullable for cron timers).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        /// Associated task (nullable for cron timers).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_key: Option<String>,
+        /// Associated attempt (for retry/heartbeat timers).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attempt: Option<u32>,
     },
 }
 
@@ -312,8 +342,16 @@ impl OrchestrationEventData {
                 task_key,
                 attempt,
                 attempt_id,
-                ..
-            } => format!("heartbeat:{run_id}:{task_key}:{attempt}:{attempt_id}"),
+                heartbeat_at,
+            } => heartbeat_at.as_ref().map_or_else(
+                || format!("heartbeat:{run_id}:{task_key}:{attempt}:{attempt_id}"),
+                |ts| {
+                    format!(
+                        "heartbeat:{run_id}:{task_key}:{attempt}:{attempt_id}:{}",
+                        ts.timestamp_millis()
+                    )
+                },
+            ),
             Self::TaskFinished {
                 run_id,
                 task_key,
@@ -343,9 +381,11 @@ impl OrchestrationEventData {
 
             Self::TimerRequested { run_id, .. } => run_id.as_deref(),
 
-            Self::DispatchEnqueued { .. }
-            | Self::TimerEnqueued { .. }
-            | Self::TimerFired { .. } => None,
+            Self::DispatchEnqueued { run_id, .. } => run_id.as_deref(),
+
+            Self::TimerEnqueued { run_id, .. } | Self::TimerFired { run_id, .. } => {
+                run_id.as_deref()
+            }
         }
     }
 }

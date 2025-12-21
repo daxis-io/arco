@@ -34,4 +34,5 @@
 //! - **ADR-022**: Per-edge dependency satisfaction for duplicate-safe readiness
 
 pub mod compactor;
+pub mod controllers;
 pub mod events;

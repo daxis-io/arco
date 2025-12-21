@@ -56,7 +56,7 @@ production issues.
 | satisfying_attempt | INT32 | Which attempt satisfied the edge |
 | row_version | STRING | ULID of satisfying event |
 
-**Primary Key:** `(run_id, upstream_task_key, downstream_task_key)`
+**Primary Key:** `(tenant_id, workspace_id, run_id, upstream_task_key, downstream_task_key)`
 
 ### Fold Logic
 
@@ -94,6 +94,8 @@ fn satisfy_edge(
     resolution: DepResolution,
     event_id: &str,
 ) {
+    // Deterministic event-time derived from the event ULID.
+    let event_time = ulid_to_timestamp(event_id);
     let edge_key = (upstream, downstream);
 
     // Check if edge was already satisfied
@@ -106,7 +108,7 @@ fn satisfy_edge(
     self.dep_satisfaction.insert(edge_key, DepSatisfactionRow {
         satisfied: true,
         resolution,
-        satisfied_at: Utc::now(),
+        satisfied_at: event_time,
         row_version: event_id.to_string(),
         ..
     });
@@ -121,7 +123,7 @@ fn satisfy_edge(
             && downstream_task.state == TaskState::Blocked
         {
             downstream_task.state = TaskState::Ready;
-            downstream_task.ready_at = Some(Utc::now());
+            downstream_task.ready_at = Some(event_time);
             self.emit_dispatch_request(downstream);
         }
     }

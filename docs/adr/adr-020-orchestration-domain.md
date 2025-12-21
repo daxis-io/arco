@@ -39,9 +39,9 @@ Following ADR-005 storage layout:
 |-------|---------|-------------|
 | `runs.parquet` | Run state and counters | `(tenant_id, workspace_id, run_id)` |
 | `tasks.parquet` | Task state machine | `(tenant_id, workspace_id, run_id, task_key)` |
-| `dep_satisfaction.parquet` | Per-edge dependency facts | `(run_id, upstream_task_key, downstream_task_key)` |
-| `timers.parquet` | Active durable timers | `(timer_id)` |
-| `dispatch_outbox.parquet` | Pending dispatch intents | `(dispatch_id)` |
+| `dep_satisfaction.parquet` | Per-edge dependency facts | `(tenant_id, workspace_id, run_id, upstream_task_key, downstream_task_key)` |
+| `timers.parquet` | Active durable timers | `(tenant_id, workspace_id, timer_id)` |
+| `dispatch_outbox.parquet` | Pending dispatch intents | `(tenant_id, workspace_id, dispatch_id)` |
 
 ### Deterministic Merge
 

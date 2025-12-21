@@ -1,7 +1,7 @@
 # ADR-015: Postgres Orchestration Store
 
 ## Status
-Proposed
+Superseded by ADR-020
 
 ## Context
 The orchestration engine needs a persistent store for:

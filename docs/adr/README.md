@@ -25,6 +25,12 @@ Each ADR follows this structure:
 | [012](adr-012-asset-key-format.md) | AssetKey canonical string format | Accepted |
 | [013](adr-013-id-wire-formats.md) | ID type wire formats | Accepted |
 | [014](adr-014-leader-election.md) | Leader election strategy | Accepted |
-| [015](adr-015-postgres-store.md) | Postgres orchestration store | Proposed |
+| [015](adr-015-postgres-store.md) | Postgres orchestration store | Superseded |
 | [016](adr-016-tenant-quotas.md) | Tenant quotas and fairness | Accepted |
 | [017](adr-017-cloud-tasks-dispatcher.md) | Cloud Tasks dispatcher | Accepted |
+| [018](adr-018-tier1-write-path.md) | Tier-1 write path architecture | Accepted |
+| [019](adr-019-existence-privacy.md) | Existence privacy | Accepted |
+| [020](adr-020-orchestration-domain.md) | Orchestration as unified domain | Accepted |
+| [021](adr-021-cloud-tasks-naming.md) | Cloud Tasks naming convention | Accepted |
+| [022](adr-022-dependency-satisfaction.md) | Per-edge dependency satisfaction | Accepted |
+| [023](adr-023-worker-contract.md) | Worker contract specification | Accepted |

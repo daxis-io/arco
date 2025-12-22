@@ -133,6 +133,12 @@ The existing `sanitize_task_id()` function can continue to work alongside
 the new hash-based approach. New orchestration code should use hash-based IDs
 exclusively.
 
+### Implementation Note
+
+Cloud Tasks IDs are generated using base32-encoded SHA-256 per this ADR. The
+legacy `sanitize_task_id()` path is deprecated and should be removed once
+all callers migrate to hash-based IDs.
+
 ## Deduplication Window Clarification
 
 Cloud Tasks deduplication window is **up to 24 hours** for Cloud Tasks HTTP targets

@@ -33,6 +33,21 @@
 //! - **ADR-021**: Cloud Tasks naming convention (dual-identifier pattern)
 //! - **ADR-022**: Per-edge dependency satisfaction for duplicate-safe readiness
 
+pub mod callbacks;
 pub mod compactor;
 pub mod controllers;
 pub mod events;
+pub mod ids;
+pub mod ledger;
+pub mod run_key;
+
+pub use callbacks::{
+    CallbackError, CallbackResult, ErrorCategory, HeartbeatRequest, HeartbeatResponse,
+    TaskCompletedRequest, TaskCompletedResponse, TaskError, TaskMetrics, TaskOutput,
+    TaskStartedRequest, TaskStartedResponse, WorkerOutcome,
+};
+pub use ledger::{LedgerWriter, OrchestrationLedgerWriter};
+pub use run_key::{
+    FingerprintPolicy, ReservationResult, RunKeyReservation, get_reservation,
+    reserve_run_key, reservation_path,
+};

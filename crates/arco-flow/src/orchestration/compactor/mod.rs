@@ -10,6 +10,10 @@
 
 pub mod fold;
 pub mod manifest;
+pub mod parquet_util;
+pub mod service;
 
 pub use fold::*;
 pub use manifest::*;
+pub use parquet_util::*;
+pub use service::{CompactionResult, MicroCompactor};

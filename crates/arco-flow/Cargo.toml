@@ -42,6 +42,7 @@ thiserror = { workspace = true }
 # Logging and metrics
 tracing = { workspace = true }
 metrics = { workspace = true }
+axum = { workspace = true }
 
 # Time
 chrono = { workspace = true }
@@ -53,6 +54,7 @@ petgraph = { workspace = true }
 # Hashing and encoding
 sha2 = { workspace = true }
 hex = { workspace = true }
+base32 = { workspace = true }
 
 # Arrow/Parquet for orchestration state projections
 arrow = { workspace = true }

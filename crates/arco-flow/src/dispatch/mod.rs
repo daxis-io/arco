@@ -13,7 +13,6 @@
 //! - **Idempotent dispatch**: Task IDs enable deduplication
 //! - **Structured payloads**: JSON-serializable task envelopes
 
-#[cfg(feature = "gcp")]
 pub mod cloud_tasks;
 pub mod memory;
 
@@ -49,6 +48,9 @@ pub struct TaskEnvelope {
     pub workspace_id: String,
     /// Attempt number (1-indexed).
     pub attempt: u32,
+    /// Attempt identifier - concurrency guard.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
     /// Resource requirements for scheduling.
     pub resources: ResourceRequirements,
     /// When the task was enqueued.
@@ -80,6 +82,7 @@ impl TaskEnvelope {
             tenant_id: tenant_id.into(),
             workspace_id: workspace_id.into(),
             attempt,
+            attempt_id: None,
             resources,
             enqueued_at: Utc::now(),
             deadline: None,
@@ -138,6 +141,19 @@ impl EnqueueResult {
     }
 }
 
+/// Maps Cloud Tasks HTTP status codes to enqueue results when applicable.
+#[cfg(any(test, feature = "gcp"))]
+#[must_use]
+pub(crate) fn enqueue_result_for_status(status: u16, task_name: &str) -> Option<EnqueueResult> {
+    match status {
+        409 => Some(EnqueueResult::Deduplicated {
+            existing_message_id: task_name.to_string(),
+        }),
+        429 => Some(EnqueueResult::QueueFull),
+        _ => None,
+    }
+}
+
 /// Options for task enqueueing.
 #[derive(Debug, Clone, Default)]
 pub struct EnqueueOptions {
@@ -192,14 +208,16 @@ impl EnqueueOptions {
 ///
 /// ## Example
 ///
-/// ```rust,ignore
-/// use arco_flow::dispatch::{TaskQueue, TaskEnvelope, EnqueueOptions};
+/// ```rust,no_run
+/// use arco_flow::dispatch::{EnqueueOptions, TaskEnvelope, TaskQueue};
+/// use arco_flow::error::Result;
 ///
-/// async fn dispatch_task<Q: TaskQueue>(queue: &Q, envelope: TaskEnvelope) {
+/// async fn dispatch_task<Q: TaskQueue>(queue: &Q, envelope: TaskEnvelope) -> Result<()> {
 ///     let result = queue.enqueue(envelope, EnqueueOptions::default()).await?;
 ///     if result.is_enqueued() {
 ///         println!("Task dispatched: {:?}", result.message_id());
 ///     }
+///     Ok(())
 /// }
 /// ```
 #[async_trait]
@@ -247,6 +265,29 @@ mod tests {
     use super::*;
     use crate::plan::AssetKey;
     use crate::task_key::TaskOperation;
+
+    #[test]
+    fn enqueue_result_for_status_deduplicates_on_already_exists() {
+        let result = enqueue_result_for_status(409, "tasks/dispatch_01");
+        assert_eq!(
+            result,
+            Some(EnqueueResult::Deduplicated {
+                existing_message_id: "tasks/dispatch_01".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn enqueue_result_for_status_marks_queue_full() {
+        let result = enqueue_result_for_status(429, "tasks/dispatch_01");
+        assert_eq!(result, Some(EnqueueResult::QueueFull));
+    }
+
+    #[test]
+    fn enqueue_result_for_status_ignores_other_codes() {
+        let result = enqueue_result_for_status(500, "tasks/dispatch_01");
+        assert!(result.is_none());
+    }
 
     fn create_test_envelope() -> TaskEnvelope {
         TaskEnvelope::new(

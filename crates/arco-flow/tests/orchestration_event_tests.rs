@@ -16,6 +16,7 @@ fn test_event_envelope_serialization() {
             },
             root_assets: vec!["analytics.daily_summary".into()],
             run_key: None,
+            labels: std::collections::HashMap::new(),
         },
     );
 
@@ -41,6 +42,7 @@ fn test_run_triggered_idempotency_key() {
             },
             root_assets: vec!["analytics.daily_summary".into()],
             run_key: Some("daily-etl:2025-01-15".into()),
+            labels: std::collections::HashMap::new(),
         },
     );
 
@@ -60,9 +62,15 @@ fn test_task_finished_with_attempt_id() {
             task_key: "extract".into(),
             attempt: 1,
             attempt_id: attempt_id.clone(),
+            worker_id: "worker-01".into(),
             outcome: arco_flow::orchestration::events::TaskOutcome::Succeeded,
             materialization_id: Some("01HQXYZ789MAT".into()),
             error_message: None,
+            output: None,
+            error: None,
+            metrics: None,
+            cancelled_during_phase: None,
+            partial_progress: None,
         },
     );
 
@@ -112,7 +120,10 @@ fn test_task_heartbeat_idempotency_key_includes_timestamp() {
             task_key: "extract".into(),
             attempt: 1,
             attempt_id: "01HQXYZ456ATT".into(),
+            worker_id: "worker-01".into(),
             heartbeat_at: Some(heartbeat_at),
+            progress_pct: None,
+            message: None,
         },
     );
 
@@ -130,7 +141,10 @@ fn test_task_heartbeat_idempotency_key_without_timestamp() {
             task_key: "extract".into(),
             attempt: 1,
             attempt_id: "01HQXYZ456ATT".into(),
+            worker_id: "worker-01".into(),
             heartbeat_at: None,
+            progress_pct: None,
+            message: None,
         },
     );
 
@@ -150,6 +164,7 @@ fn test_dispatch_requested_event() {
             task_key: "extract".into(),
             attempt: 1,
             attempt_id: "01HQXYZ456ATT".into(),
+            worker_queue: "default-queue".into(),
             dispatch_id: "dispatch:01HQXYZ123RUN:extract:1".into(),
         },
     );
@@ -224,6 +239,7 @@ fn test_event_version_is_set() {
             },
             root_assets: vec![],
             run_key: None,
+            labels: std::collections::HashMap::new(),
         },
     );
 

@@ -90,7 +90,19 @@ Controllers emit only Intent and Acknowledgement facts to the ledger:
 
 Derived state changes (`TaskBecameReady`, `TaskSkipped`, `RunCompleted`) are
 **projection-only** - computed during compaction fold and written to Parquet,
-not emitted as ledger events.
+not emitted as ledger events. The event envelope intentionally excludes
+projection-only events to prevent accidental ledger writes.
+
+### Execution Model
+
+Controllers are pure, stateless reconcilers. They are executed by an external
+runner that:
+- Loads state via the manifest (base snapshot + L0 deltas)
+- Calls controller reconcile methods
+- Persists emitted events to the ledger
+
+In this repository, the end-to-end dispatch loop is proven via tests; production
+runtime wiring is owned by the orchestration service layer.
 
 ## Consequences
 

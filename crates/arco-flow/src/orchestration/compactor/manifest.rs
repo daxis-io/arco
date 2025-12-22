@@ -123,23 +123,23 @@ pub struct BaseSnapshot {
 /// Paths to Parquet table files within a snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TablePaths {
-    /// Path to runs.parquet (relative to state/).
+    /// Path to runs.parquet (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runs: Option<String>,
 
-    /// Path to tasks.parquet.
+    /// Path to tasks.parquet (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tasks: Option<String>,
 
-    /// Path to dep_satisfaction.parquet.
+    /// Path to `dep_satisfaction.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dep_satisfaction: Option<String>,
 
-    /// Path to timers.parquet.
+    /// Path to timers.parquet (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timers: Option<String>,
 
-    /// Path to dispatch_outbox.parquet.
+    /// Path to `dispatch_outbox.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dispatch_outbox: Option<String>,
 }
@@ -212,13 +212,13 @@ pub struct RowCounts {
     /// Rows in tasks table.
     pub tasks: u32,
 
-    /// Rows in dep_satisfaction table.
+    /// Rows in `dep_satisfaction` table.
     pub dep_satisfaction: u32,
 
     /// Rows in timers table.
     pub timers: u32,
 
-    /// Rows in dispatch_outbox table.
+    /// Rows in `dispatch_outbox` table.
     pub dispatch_outbox: u32,
 }
 

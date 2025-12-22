@@ -10,6 +10,7 @@
 //! These schemas are the contract for orchestration controllers reading state.
 //! Keep changes backwards-compatible and gated by snapshot versioning.
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -39,13 +40,17 @@ fn runs_schema() -> Arc<Schema> {
         Field::new("run_id", DataType::Utf8, false),
         Field::new("plan_id", DataType::Utf8, false),
         Field::new("state", DataType::Utf8, false),
+        Field::new("run_key", DataType::Utf8, true),
+        Field::new("cancel_requested", DataType::Boolean, false),
         Field::new("tasks_total", DataType::UInt32, false),
         Field::new("tasks_completed", DataType::UInt32, false),
         Field::new("tasks_succeeded", DataType::UInt32, false),
         Field::new("tasks_failed", DataType::UInt32, false),
         Field::new("tasks_skipped", DataType::UInt32, false),
+        Field::new("tasks_cancelled", DataType::UInt32, false),
         Field::new("triggered_at", DataType::Int64, false),
         Field::new("completed_at", DataType::Int64, true),
+        Field::new("labels", DataType::Utf8, true),
         Field::new("row_version", DataType::Utf8, false),
     ]))
 }
@@ -57,6 +62,9 @@ fn tasks_schema() -> Arc<Schema> {
         Field::new("state", DataType::Utf8, false),
         Field::new("attempt", DataType::UInt32, false),
         Field::new("attempt_id", DataType::Utf8, true),
+        Field::new("started_at", DataType::Int64, true),
+        Field::new("completed_at", DataType::Int64, true),
+        Field::new("error_message", DataType::Utf8, true),
         Field::new("deps_total", DataType::UInt32, false),
         Field::new("deps_satisfied_count", DataType::UInt32, false),
         Field::new("max_attempts", DataType::UInt32, false),
@@ -128,7 +136,7 @@ pub fn task_schema() -> Schema {
     (*tasks_schema()).clone()
 }
 
-/// Returns the dep_satisfaction schema for golden file comparison.
+/// Returns the `dep_satisfaction` schema for golden file comparison.
 #[must_use]
 pub fn dep_satisfaction_parquet_schema() -> Schema {
     (*dep_satisfaction_schema()).clone()
@@ -140,7 +148,7 @@ pub fn timer_schema() -> Schema {
     (*timers_schema()).clone()
 }
 
-/// Returns the dispatch_outbox schema for golden file comparison.
+/// Returns the `dispatch_outbox` schema for golden file comparison.
 #[must_use]
 pub fn dispatch_outbox_parquet_schema() -> Schema {
     (*dispatch_outbox_schema()).clone()
@@ -180,19 +188,38 @@ fn write_single_batch(schema: Arc<Schema>, batch: &RecordBatch) -> Result<Bytes>
 // ============================================================================
 
 /// Writes `runs.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet serialization fails.
 pub fn write_runs(rows: &[RunRow]) -> Result<Bytes> {
     let schema = runs_schema();
 
     let run_ids = StringArray::from(rows.iter().map(|r| Some(r.run_id.as_str())).collect::<Vec<_>>());
     let plan_ids = StringArray::from(rows.iter().map(|r| Some(r.plan_id.as_str())).collect::<Vec<_>>());
     let states = StringArray::from(rows.iter().map(|r| Some(run_state_to_str(r.state))).collect::<Vec<_>>());
+    let run_keys = StringArray::from(rows.iter().map(|r| r.run_key.as_deref()).collect::<Vec<_>>());
+    let cancel_requested = BooleanArray::from(rows.iter().map(|r| r.cancel_requested).collect::<Vec<_>>());
     let tasks_total = UInt32Array::from(rows.iter().map(|r| r.tasks_total).collect::<Vec<_>>());
     let tasks_completed = UInt32Array::from(rows.iter().map(|r| r.tasks_completed).collect::<Vec<_>>());
     let tasks_succeeded = UInt32Array::from(rows.iter().map(|r| r.tasks_succeeded).collect::<Vec<_>>());
     let tasks_failed = UInt32Array::from(rows.iter().map(|r| r.tasks_failed).collect::<Vec<_>>());
     let tasks_skipped = UInt32Array::from(rows.iter().map(|r| r.tasks_skipped).collect::<Vec<_>>());
+    let tasks_cancelled = UInt32Array::from(rows.iter().map(|r| r.tasks_cancelled).collect::<Vec<_>>());
     let triggered_at = Int64Array::from(rows.iter().map(|r| r.triggered_at.timestamp_millis()).collect::<Vec<_>>());
     let completed_at = Int64Array::from(rows.iter().map(|r| r.completed_at.map(|t| t.timestamp_millis())).collect::<Vec<_>>());
+    let labels = rows
+        .iter()
+        .map(|r| {
+            if r.labels.is_empty() {
+                Ok(None)
+            } else {
+                serde_json::to_string(&r.labels).map(Some)
+            }
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::parquet(format!("failed to serialize run labels: {e}")))?;
+    let labels = StringArray::from(labels);
     let row_versions = StringArray::from(rows.iter().map(|r| Some(r.row_version.as_str())).collect::<Vec<_>>());
 
     let batch = RecordBatch::try_new(
@@ -201,13 +228,17 @@ pub fn write_runs(rows: &[RunRow]) -> Result<Bytes> {
             Arc::new(run_ids),
             Arc::new(plan_ids),
             Arc::new(states),
+            Arc::new(run_keys),
+            Arc::new(cancel_requested),
             Arc::new(tasks_total),
             Arc::new(tasks_completed),
             Arc::new(tasks_succeeded),
             Arc::new(tasks_failed),
             Arc::new(tasks_skipped),
+            Arc::new(tasks_cancelled),
             Arc::new(triggered_at),
             Arc::new(completed_at),
+            Arc::new(labels),
             Arc::new(row_versions),
         ],
     )
@@ -217,6 +248,10 @@ pub fn write_runs(rows: &[RunRow]) -> Result<Bytes> {
 }
 
 /// Writes `tasks.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet serialization fails.
 pub fn write_tasks(rows: &[TaskRow]) -> Result<Bytes> {
     let schema = tasks_schema();
 
@@ -225,6 +260,9 @@ pub fn write_tasks(rows: &[TaskRow]) -> Result<Bytes> {
     let states = StringArray::from(rows.iter().map(|r| Some(task_state_to_str(r.state))).collect::<Vec<_>>());
     let attempts = UInt32Array::from(rows.iter().map(|r| r.attempt).collect::<Vec<_>>());
     let attempt_ids = StringArray::from(rows.iter().map(|r| r.attempt_id.as_deref()).collect::<Vec<_>>());
+    let started_at = Int64Array::from(rows.iter().map(|r| r.started_at.map(|t| t.timestamp_millis())).collect::<Vec<_>>());
+    let completed_at = Int64Array::from(rows.iter().map(|r| r.completed_at.map(|t| t.timestamp_millis())).collect::<Vec<_>>());
+    let error_messages = StringArray::from(rows.iter().map(|r| r.error_message.as_deref()).collect::<Vec<_>>());
     let deps_total = UInt32Array::from(rows.iter().map(|r| r.deps_total).collect::<Vec<_>>());
     let deps_satisfied_count = UInt32Array::from(rows.iter().map(|r| r.deps_satisfied_count).collect::<Vec<_>>());
     let max_attempts = UInt32Array::from(rows.iter().map(|r| r.max_attempts).collect::<Vec<_>>());
@@ -243,6 +281,9 @@ pub fn write_tasks(rows: &[TaskRow]) -> Result<Bytes> {
             Arc::new(states),
             Arc::new(attempts),
             Arc::new(attempt_ids),
+            Arc::new(started_at),
+            Arc::new(completed_at),
+            Arc::new(error_messages),
             Arc::new(deps_total),
             Arc::new(deps_satisfied_count),
             Arc::new(max_attempts),
@@ -260,6 +301,10 @@ pub fn write_tasks(rows: &[TaskRow]) -> Result<Bytes> {
 }
 
 /// Writes `dep_satisfaction.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet serialization fails.
 pub fn write_dep_satisfaction(rows: &[DepSatisfactionRow]) -> Result<Bytes> {
     let schema = dep_satisfaction_schema();
 
@@ -291,6 +336,10 @@ pub fn write_dep_satisfaction(rows: &[DepSatisfactionRow]) -> Result<Bytes> {
 }
 
 /// Writes `timers.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet serialization fails.
 pub fn write_timers(rows: &[TimerRow]) -> Result<Bytes> {
     let schema = timers_schema();
 
@@ -326,6 +375,10 @@ pub fn write_timers(rows: &[TimerRow]) -> Result<Bytes> {
 }
 
 /// Writes `dispatch_outbox.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet serialization fails.
 pub fn write_dispatch_outbox(rows: &[DispatchOutboxRow]) -> Result<Bytes> {
     let schema = dispatch_outbox_schema();
 
@@ -387,6 +440,18 @@ fn col_string<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray>
     })
 }
 
+/// Returns None if column doesn't exist (backwards compatibility for new optional columns).
+fn col_string_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringArray> {
+    let idx = batch.schema().index_of(name).ok()?;
+    batch.column(idx).as_any().downcast_ref::<StringArray>()
+}
+
+/// Returns None if column doesn't exist (backwards compatibility for new optional columns).
+fn col_bool_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a BooleanArray> {
+    let idx = batch.schema().index_of(name).ok()?;
+    batch.column(idx).as_any().downcast_ref::<BooleanArray>()
+}
+
 fn col_u32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt32Array> {
     let idx = batch.schema().index_of(name).map_err(|e| {
         Error::parquet(format!("missing column '{name}': {e}"))
@@ -405,6 +470,12 @@ fn col_i64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
     })
 }
 
+/// Returns None if column doesn't exist (backwards compatibility for new optional columns).
+fn col_i64_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int64Array> {
+    let idx = batch.schema().index_of(name).ok()?;
+    batch.column(idx).as_any().downcast_ref::<Int64Array>()
+}
+
 fn col_bool<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BooleanArray> {
     let idx = batch.schema().index_of(name).map_err(|e| {
         Error::parquet(format!("missing column '{name}': {e}"))
@@ -416,35 +487,60 @@ fn col_bool<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BooleanArray> 
 
 fn millis_to_datetime(millis: i64) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::from_timestamp_millis(millis)
-        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).expect("epoch"))
+        .unwrap_or_else(chrono::Utc::now)
 }
 
 /// Reads `runs.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet decoding fails or required columns are missing.
 pub fn read_runs(bytes: &Bytes) -> Result<Vec<RunRow>> {
     let mut out = Vec::new();
     for batch in read_batches(bytes)? {
         let run_id = col_string(&batch, "run_id")?;
         let plan_id = col_string(&batch, "plan_id")?;
         let state = col_string(&batch, "state")?;
+        let run_key = col_string_opt(&batch, "run_key");
+        let cancel_requested = col_bool_opt(&batch, "cancel_requested");
         let tasks_total = col_u32(&batch, "tasks_total")?;
         let tasks_completed = col_u32(&batch, "tasks_completed")?;
         let tasks_succeeded = col_u32(&batch, "tasks_succeeded")?;
         let tasks_failed = col_u32(&batch, "tasks_failed")?;
         let tasks_skipped = col_u32(&batch, "tasks_skipped")?;
+        let tasks_cancelled = col_u32(&batch, "tasks_cancelled")?;
         let triggered_at = col_i64(&batch, "triggered_at")?;
         let completed_at = col_i64(&batch, "completed_at")?;
+        let labels = col_string_opt(&batch, "labels");
         let row_version = col_string(&batch, "row_version")?;
 
         for row in 0..batch.num_rows() {
+            let labels = if let Some(col) = labels {
+                if col.is_null(row) {
+                    HashMap::new()
+                } else {
+                    serde_json::from_str::<HashMap<String, String>>(col.value(row))
+                        .map_err(|e| Error::parquet(format!("failed to parse run labels: {e}")))?
+                }
+            } else {
+                HashMap::new()
+            };
             out.push(RunRow {
                 run_id: run_id.value(row).to_string(),
                 plan_id: plan_id.value(row).to_string(),
-                state: str_to_run_state(state.value(row)),
+                state: str_to_run_state(state.value(row))?,
+                run_key: run_key.as_ref().and_then(|col| {
+                    if col.is_null(row) { None } else { Some(col.value(row).to_string()) }
+                }),
+                labels,
+                cancel_requested: cancel_requested
+                    .is_some_and(|col| !col.is_null(row) && col.value(row)),
                 tasks_total: tasks_total.value(row),
                 tasks_completed: tasks_completed.value(row),
                 tasks_succeeded: tasks_succeeded.value(row),
                 tasks_failed: tasks_failed.value(row),
                 tasks_skipped: tasks_skipped.value(row),
+                tasks_cancelled: tasks_cancelled.value(row),
                 triggered_at: millis_to_datetime(triggered_at.value(row)),
                 completed_at: if completed_at.is_null(row) {
                     None
@@ -459,6 +555,10 @@ pub fn read_runs(bytes: &Bytes) -> Result<Vec<RunRow>> {
 }
 
 /// Reads `tasks.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet decoding fails or required columns are missing.
 pub fn read_tasks(bytes: &Bytes) -> Result<Vec<TaskRow>> {
     let mut out = Vec::new();
     for batch in read_batches(bytes)? {
@@ -467,6 +567,9 @@ pub fn read_tasks(bytes: &Bytes) -> Result<Vec<TaskRow>> {
         let state = col_string(&batch, "state")?;
         let attempt = col_u32(&batch, "attempt")?;
         let attempt_id = col_string(&batch, "attempt_id")?;
+        let started_at = col_i64_opt(&batch, "started_at");
+        let completed_at = col_i64_opt(&batch, "completed_at");
+        let error_message = col_string_opt(&batch, "error_message");
         let deps_total = col_u32(&batch, "deps_total")?;
         let deps_satisfied_count = col_u32(&batch, "deps_satisfied_count")?;
         let max_attempts = col_u32(&batch, "max_attempts")?;
@@ -481,9 +584,30 @@ pub fn read_tasks(bytes: &Bytes) -> Result<Vec<TaskRow>> {
             out.push(TaskRow {
                 run_id: run_id.value(row).to_string(),
                 task_key: task_key.value(row).to_string(),
-                state: str_to_task_state(state.value(row)),
+                state: str_to_task_state(state.value(row))?,
                 attempt: attempt.value(row),
                 attempt_id: if attempt_id.is_null(row) { None } else { Some(attempt_id.value(row).to_string()) },
+                started_at: started_at.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(millis_to_datetime(col.value(row)))
+                    }
+                }),
+                completed_at: completed_at.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(millis_to_datetime(col.value(row)))
+                    }
+                }),
+                error_message: error_message.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
                 deps_total: deps_total.value(row),
                 deps_satisfied_count: deps_satisfied_count.value(row),
                 max_attempts: max_attempts.value(row),
@@ -500,6 +624,10 @@ pub fn read_tasks(bytes: &Bytes) -> Result<Vec<TaskRow>> {
 }
 
 /// Reads `dep_satisfaction.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet decoding fails or required columns are missing.
 pub fn read_dep_satisfaction(bytes: &Bytes) -> Result<Vec<DepSatisfactionRow>> {
     let mut out = Vec::new();
     for batch in read_batches(bytes)? {
@@ -518,7 +646,7 @@ pub fn read_dep_satisfaction(bytes: &Bytes) -> Result<Vec<DepSatisfactionRow>> {
                 upstream_task_key: upstream_task_key.value(row).to_string(),
                 downstream_task_key: downstream_task_key.value(row).to_string(),
                 satisfied: satisfied.value(row),
-                resolution: if resolution.is_null(row) { None } else { Some(str_to_dep_resolution(resolution.value(row))) },
+                resolution: if resolution.is_null(row) { None } else { Some(str_to_dep_resolution(resolution.value(row))?) },
                 satisfied_at: if satisfied_at.is_null(row) { None } else { Some(millis_to_datetime(satisfied_at.value(row))) },
                 satisfying_attempt: if satisfying_attempt.is_null(row) { None } else { Some(satisfying_attempt.value(row)) },
                 row_version: row_version.value(row).to_string(),
@@ -529,6 +657,10 @@ pub fn read_dep_satisfaction(bytes: &Bytes) -> Result<Vec<DepSatisfactionRow>> {
 }
 
 /// Reads `timers.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet decoding fails or required columns are missing.
 pub fn read_timers(bytes: &Bytes) -> Result<Vec<TimerRow>> {
     let mut out = Vec::new();
     for batch in read_batches(bytes)? {
@@ -547,12 +679,12 @@ pub fn read_timers(bytes: &Bytes) -> Result<Vec<TimerRow>> {
             out.push(TimerRow {
                 timer_id: timer_id.value(row).to_string(),
                 cloud_task_id: if cloud_task_id.is_null(row) { None } else { Some(cloud_task_id.value(row).to_string()) },
-                timer_type: str_to_timer_type(timer_type.value(row)),
+                timer_type: str_to_timer_type(timer_type.value(row))?,
                 run_id: if run_id.is_null(row) { None } else { Some(run_id.value(row).to_string()) },
                 task_key: if task_key.is_null(row) { None } else { Some(task_key.value(row).to_string()) },
                 attempt: if attempt.is_null(row) { None } else { Some(attempt.value(row)) },
                 fire_at: millis_to_datetime(fire_at.value(row)),
-                state: str_to_timer_state(state.value(row)),
+                state: str_to_timer_state(state.value(row))?,
                 payload: if payload.is_null(row) { None } else { Some(payload.value(row).to_string()) },
                 row_version: row_version.value(row).to_string(),
             });
@@ -562,6 +694,10 @@ pub fn read_timers(bytes: &Bytes) -> Result<Vec<TimerRow>> {
 }
 
 /// Reads `dispatch_outbox.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet decoding fails or required columns are missing.
 pub fn read_dispatch_outbox(bytes: &Bytes) -> Result<Vec<DispatchOutboxRow>> {
     let mut out = Vec::new();
     for batch in read_batches(bytes)? {
@@ -583,7 +719,7 @@ pub fn read_dispatch_outbox(bytes: &Bytes) -> Result<Vec<DispatchOutboxRow>> {
                 attempt: attempt.value(row),
                 dispatch_id: dispatch_id.value(row).to_string(),
                 cloud_task_id: if cloud_task_id.is_null(row) { None } else { Some(cloud_task_id.value(row).to_string()) },
-                status: str_to_dispatch_status(status.value(row)),
+                status: str_to_dispatch_status(status.value(row))?,
                 attempt_id: attempt_id.value(row).to_string(),
                 worker_queue: worker_queue.value(row).to_string(),
                 created_at: millis_to_datetime(created_at.value(row)),
@@ -608,14 +744,14 @@ fn run_state_to_str(state: RunState) -> &'static str {
     }
 }
 
-fn str_to_run_state(s: &str) -> RunState {
+fn str_to_run_state(s: &str) -> Result<RunState> {
     match s {
-        "TRIGGERED" => RunState::Triggered,
-        "RUNNING" => RunState::Running,
-        "SUCCEEDED" => RunState::Succeeded,
-        "FAILED" => RunState::Failed,
-        "CANCELLED" => RunState::Cancelled,
-        _ => RunState::Triggered, // Default fallback
+        "TRIGGERED" => Ok(RunState::Triggered),
+        "RUNNING" => Ok(RunState::Running),
+        "SUCCEEDED" => Ok(RunState::Succeeded),
+        "FAILED" => Ok(RunState::Failed),
+        "CANCELLED" => Ok(RunState::Cancelled),
+        _ => Err(Error::parquet(format!("unknown run state '{s}'"))),
     }
 }
 
@@ -634,19 +770,19 @@ fn task_state_to_str(state: TaskState) -> &'static str {
     }
 }
 
-fn str_to_task_state(s: &str) -> TaskState {
+fn str_to_task_state(s: &str) -> Result<TaskState> {
     match s {
-        "PLANNED" => TaskState::Planned,
-        "BLOCKED" => TaskState::Blocked,
-        "READY" => TaskState::Ready,
-        "DISPATCHED" => TaskState::Dispatched,
-        "RUNNING" => TaskState::Running,
-        "RETRY_WAIT" => TaskState::RetryWait,
-        "SKIPPED" => TaskState::Skipped,
-        "CANCELLED" => TaskState::Cancelled,
-        "FAILED" => TaskState::Failed,
-        "SUCCEEDED" => TaskState::Succeeded,
-        _ => TaskState::Planned, // Default fallback
+        "PLANNED" => Ok(TaskState::Planned),
+        "BLOCKED" => Ok(TaskState::Blocked),
+        "READY" => Ok(TaskState::Ready),
+        "DISPATCHED" => Ok(TaskState::Dispatched),
+        "RUNNING" => Ok(TaskState::Running),
+        "RETRY_WAIT" => Ok(TaskState::RetryWait),
+        "SKIPPED" => Ok(TaskState::Skipped),
+        "CANCELLED" => Ok(TaskState::Cancelled),
+        "FAILED" => Ok(TaskState::Failed),
+        "SUCCEEDED" => Ok(TaskState::Succeeded),
+        _ => Err(Error::parquet(format!("unknown task state '{s}'"))),
     }
 }
 
@@ -659,13 +795,13 @@ fn dep_resolution_to_str(resolution: DepResolution) -> &'static str {
     }
 }
 
-fn str_to_dep_resolution(s: &str) -> DepResolution {
+fn str_to_dep_resolution(s: &str) -> Result<DepResolution> {
     match s {
-        "SUCCESS" => DepResolution::Success,
-        "FAILED" => DepResolution::Failed,
-        "SKIPPED" => DepResolution::Skipped,
-        "CANCELLED" => DepResolution::Cancelled,
-        _ => DepResolution::Success, // Default fallback
+        "SUCCESS" => Ok(DepResolution::Success),
+        "FAILED" => Ok(DepResolution::Failed),
+        "SKIPPED" => Ok(DepResolution::Skipped),
+        "CANCELLED" => Ok(DepResolution::Cancelled),
+        _ => Err(Error::parquet(format!("unknown dep resolution '{s}'"))),
     }
 }
 
@@ -678,13 +814,13 @@ fn timer_type_to_str(t: TimerType) -> &'static str {
     }
 }
 
-fn str_to_timer_type(s: &str) -> TimerType {
+fn str_to_timer_type(s: &str) -> Result<TimerType> {
     match s {
-        "RETRY" => TimerType::Retry,
-        "HEARTBEAT_CHECK" => TimerType::HeartbeatCheck,
-        "CRON" => TimerType::Cron,
-        "SLA_CHECK" => TimerType::SlaCheck,
-        _ => TimerType::Retry, // Default fallback
+        "RETRY" => Ok(TimerType::Retry),
+        "HEARTBEAT_CHECK" => Ok(TimerType::HeartbeatCheck),
+        "CRON" => Ok(TimerType::Cron),
+        "SLA_CHECK" => Ok(TimerType::SlaCheck),
+        _ => Err(Error::parquet(format!("unknown timer type '{s}'"))),
     }
 }
 
@@ -696,12 +832,12 @@ fn timer_state_to_str(state: TimerState) -> &'static str {
     }
 }
 
-fn str_to_timer_state(s: &str) -> TimerState {
+fn str_to_timer_state(s: &str) -> Result<TimerState> {
     match s {
-        "SCHEDULED" => TimerState::Scheduled,
-        "FIRED" => TimerState::Fired,
-        "CANCELLED" => TimerState::Cancelled,
-        _ => TimerState::Scheduled, // Default fallback
+        "SCHEDULED" => Ok(TimerState::Scheduled),
+        "FIRED" => Ok(TimerState::Fired),
+        "CANCELLED" => Ok(TimerState::Cancelled),
+        _ => Err(Error::parquet(format!("unknown timer state '{s}'"))),
     }
 }
 
@@ -714,13 +850,13 @@ fn dispatch_status_to_str(status: DispatchStatus) -> &'static str {
     }
 }
 
-fn str_to_dispatch_status(s: &str) -> DispatchStatus {
+fn str_to_dispatch_status(s: &str) -> Result<DispatchStatus> {
     match s {
-        "PENDING" => DispatchStatus::Pending,
-        "CREATED" => DispatchStatus::Created,
-        "ACKED" => DispatchStatus::Acked,
-        "FAILED" => DispatchStatus::Failed,
-        _ => DispatchStatus::Pending, // Default fallback
+        "PENDING" => Ok(DispatchStatus::Pending),
+        "CREATED" => Ok(DispatchStatus::Created),
+        "ACKED" => Ok(DispatchStatus::Acked),
+        "FAILED" => Ok(DispatchStatus::Failed),
+        _ => Err(Error::parquet(format!("unknown dispatch status '{s}'"))),
     }
 }
 
@@ -736,11 +872,15 @@ mod tests {
                 run_id: "run_01HQXYZ123".to_string(),
                 plan_id: "plan_01HQXYZ456".to_string(),
                 state: RunState::Running,
+                run_key: Some("daily-etl:2025-01-15".to_string()),
+                labels: HashMap::from([("team".to_string(), "analytics".to_string())]),
+                cancel_requested: false,
                 tasks_total: 5,
                 tasks_completed: 2,
                 tasks_succeeded: 2,
                 tasks_failed: 0,
                 tasks_skipped: 0,
+                tasks_cancelled: 0,
                 triggered_at: Utc::now(),
                 completed_at: None,
                 row_version: "01HQXYZ789".to_string(),
@@ -753,7 +893,54 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].run_id, "run_01HQXYZ123");
         assert_eq!(parsed[0].state, RunState::Running);
+        assert_eq!(parsed[0].run_key, Some("daily-etl:2025-01-15".to_string()));
         assert_eq!(parsed[0].tasks_total, 5);
+        assert_eq!(parsed[0].labels.get("team").map(String::as_str), Some("analytics"));
+    }
+
+    #[test]
+    fn test_read_runs_defaults_cancel_requested_when_missing_column() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("run_id", DataType::Utf8, false),
+            Field::new("plan_id", DataType::Utf8, false),
+            Field::new("state", DataType::Utf8, false),
+            Field::new("tasks_total", DataType::UInt32, false),
+            Field::new("tasks_completed", DataType::UInt32, false),
+            Field::new("tasks_succeeded", DataType::UInt32, false),
+            Field::new("tasks_failed", DataType::UInt32, false),
+            Field::new("tasks_skipped", DataType::UInt32, false),
+            Field::new("tasks_cancelled", DataType::UInt32, false),
+            Field::new("triggered_at", DataType::Int64, false),
+            Field::new("completed_at", DataType::Int64, true),
+            Field::new("row_version", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("run_01")])),
+                Arc::new(StringArray::from(vec![Some("plan_01")])),
+                Arc::new(StringArray::from(vec![Some("RUNNING")])),
+                Arc::new(UInt32Array::from(vec![1])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(StringArray::from(vec![Some("01A")])),
+            ],
+        )
+        .expect("record batch");
+
+        let bytes = write_single_batch(schema, &batch).expect("write");
+        let parsed = read_runs(&bytes).expect("read");
+
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].run_key.is_none());
+        assert!(!parsed[0].cancel_requested);
+        assert!(parsed[0].labels.is_empty());
     }
 
     #[test]
@@ -765,6 +952,9 @@ mod tests {
                 state: TaskState::Ready,
                 attempt: 1,
                 attempt_id: Some("01HQXYZ456ATT".to_string()),
+                started_at: Some(Utc::now()),
+                completed_at: None,
+                error_message: None,
                 deps_total: 0,
                 deps_satisfied_count: 0,
                 max_attempts: 3,
@@ -784,6 +974,7 @@ mod tests {
         assert_eq!(parsed[0].task_key, "extract");
         assert_eq!(parsed[0].state, TaskState::Ready);
         assert_eq!(parsed[0].asset_key.as_deref(), Some("analytics.extract"));
+        assert!(parsed[0].started_at.is_some());
     }
 
     #[test]
@@ -857,5 +1048,67 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].status, DispatchStatus::Created);
         assert_eq!(parsed[0].worker_queue, "default-queue");
+    }
+
+    #[test]
+    fn test_read_runs_rejects_unknown_state() {
+        let schema = Arc::new(run_schema());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("run_01")])),
+                Arc::new(StringArray::from(vec![Some("plan_01")])),
+                Arc::new(StringArray::from(vec![Some("UNKNOWN_STATE")])),
+                Arc::new(StringArray::from(vec![None::<&str>])), // run_key
+                Arc::new(BooleanArray::from(vec![false])), // cancel_requested
+                Arc::new(UInt32Array::from(vec![1])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec![Some("01A")])),
+            ],
+        )
+        .expect("record batch");
+
+        let bytes = write_single_batch(schema, &batch).expect("write");
+        let err = read_runs(&bytes).unwrap_err();
+        assert!(err.to_string().contains("unknown run state"));
+    }
+
+    #[test]
+    fn test_read_tasks_rejects_unknown_state() {
+        let schema = Arc::new(task_schema());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("run_01")])),
+                Arc::new(StringArray::from(vec![Some("extract")])),
+                Arc::new(StringArray::from(vec![Some("UNKNOWN_TASK")])),
+                Arc::new(UInt32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![3])),
+                Arc::new(UInt32Array::from(vec![300])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec![Some("01A")])),
+            ],
+        )
+        .expect("record batch");
+
+        let bytes = write_single_batch(schema, &batch).expect("write");
+        let err = read_tasks(&bytes).unwrap_err();
+        assert!(err.to_string().contains("unknown task state"));
     }
 }

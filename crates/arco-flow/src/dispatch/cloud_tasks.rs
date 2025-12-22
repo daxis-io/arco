@@ -46,6 +46,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{EnqueueOptions, EnqueueResult, TaskEnvelope, TaskQueue};
 use crate::error::{Error, Result};
+#[cfg(feature = "gcp")]
+use crate::orchestration::ids::cloud_task_id;
 
 /// Configuration for Cloud Tasks dispatcher.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -374,33 +376,11 @@ mod gcp_impl {
             )
         }
 
-        /// Sanitizes a string for use as a Cloud Tasks task ID.
+        /// Generates a Cloud Tasks-compliant task ID from an idempotency key.
         ///
-        /// Cloud Tasks task IDs must:
-        /// - Start with a letter or underscore
-        /// - Contain only letters, numbers, underscores, and hyphens
-        /// - Be at most 500 characters
-        pub(crate) fn sanitize_task_id(key: &str) -> String {
-            let sanitized: String = key
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
-
-            // Ensure it starts with a letter or underscore
-            if sanitized.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
-                format!("t_{sanitized}")
-            } else {
-                sanitized
-            }
-            .chars()
-            .take(500)
-            .collect()
+        /// Uses hash-based IDs to avoid collisions and sequential prefixes.
+        pub(crate) fn task_id_from_key(key: &str) -> String {
+            cloud_task_id("t", key)
         }
 
         /// Gets an access token for the Cloud Tasks API.
@@ -511,6 +491,105 @@ mod gcp_impl {
             configured.insert(queue_path.to_string());
             Ok(())
         }
+
+        /// Enqueues an HTTP task using a precomputed Cloud Tasks ID.
+        ///
+        /// This supports orchestration controllers that generate deterministic
+        /// IDs and send custom payloads to worker or timer handlers.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the Cloud Tasks API call fails.
+        pub async fn enqueue_http(
+            &self,
+            task_id: &str,
+            target_url: &str,
+            body: &[u8],
+            options: EnqueueOptions,
+            audience: Option<&str>,
+        ) -> Result<EnqueueResult> {
+            let queue_path = self.queue_path_for_routing(options.routing_key.as_deref());
+            let task_name = format!("{}/tasks/{}", queue_path, task_id);
+
+            self.ensure_queue_retry_config(&queue_path).await?;
+
+            let body_base64 = base64::engine::general_purpose::STANDARD.encode(body);
+
+            let oidc_token = self.config.service_account_email.as_ref().map(|email| {
+                OidcToken {
+                    service_account_email: email.clone(),
+                    audience: Some(audience.unwrap_or(target_url).to_string()),
+                }
+            });
+
+            let request = CreateTaskRequest {
+                task: CloudTask {
+                    name: Some(task_name.clone()),
+                    http_request: HttpRequest {
+                        url: target_url.to_string(),
+                        http_method: "POST".to_string(),
+                        headers: Some({
+                            let mut headers = std::collections::HashMap::new();
+                            headers.insert("Content-Type".to_string(), "application/json".to_string());
+                            headers
+                        }),
+                        body: Some(body_base64),
+                        oidc_token,
+                    },
+                    schedule_time: options.delay.map(Self::format_schedule_time),
+                    dispatch_deadline: Some(Self::format_duration(self.config.task_timeout)),
+                },
+            };
+
+            let access_token = self.get_access_token().await?;
+            let api_url = format!(
+                "https://cloudtasks.googleapis.com/v2/{}/tasks",
+                queue_path
+            );
+
+            let response = self
+                .client
+                .post(&api_url)
+                .bearer_auth(&access_token)
+                .json(&request)
+                .send()
+                .await
+                .map_err(|e| Error::dispatch(format!("Cloud Tasks API request failed: {e}")))?;
+
+            let status = response.status();
+
+            if status.is_success() {
+                let success: CloudTasksSuccessResponse = response
+                    .json()
+                    .await
+                    .map_err(|e| Error::dispatch(format!("Failed to parse success response: {e}")))?;
+
+                return Ok(EnqueueResult::Enqueued {
+                    message_id: success.name,
+                });
+            }
+
+            if let Some(result) = super::enqueue_result_for_status(status.as_u16(), &task_name) {
+                return Ok(result);
+            }
+
+            let error_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unknown error".to_string());
+
+            if let Ok(error_response) = serde_json::from_str::<CloudTasksErrorResponse>(&error_body) {
+                return Err(Error::dispatch(format!(
+                    "Cloud Tasks API error: {} ({})",
+                    error_response.error.message, error_response.error.status
+                )));
+            }
+
+            Err(Error::dispatch(format!(
+                "Cloud Tasks API error: {} - {}",
+                status, error_body
+            )))
+        }
     }
 
     #[async_trait]
@@ -522,9 +601,9 @@ mod gcp_impl {
         ) -> Result<EnqueueResult> {
             // Build the Cloud Tasks task name for idempotency
             let idempotency_key = envelope.idempotency_key();
-            let sanitized_id = Self::sanitize_task_id(&idempotency_key);
+            let task_id = Self::task_id_from_key(&idempotency_key);
             let queue_path = self.queue_path_for_routing(options.routing_key.as_deref());
-            let task_name = format!("{}/tasks/{}", queue_path, sanitized_id);
+            let task_name = format!("{}/tasks/{}", queue_path, task_id);
 
             self.ensure_queue_retry_config(&queue_path).await?;
 
@@ -594,14 +673,8 @@ mod gcp_impl {
                 Ok(EnqueueResult::Enqueued {
                     message_id: success.name,
                 })
-            } else if status.as_u16() == 409 {
-                // ALREADY_EXISTS - task with this name already exists (idempotent)
-                Ok(EnqueueResult::Deduplicated {
-                    existing_message_id: task_name,
-                })
-            } else if status.as_u16() == 429 {
-                // RESOURCE_EXHAUSTED - queue is full or rate limited
-                Ok(EnqueueResult::QueueFull)
+            } else if let Some(result) = super::enqueue_result_for_status(status.as_u16(), &task_name) {
+                Ok(result)
             } else {
                 // Other error
                 let error_body = response
@@ -679,6 +752,25 @@ mod placeholder_impl {
             }
 
             Ok(Self { config })
+        }
+
+        /// Enqueues an HTTP task (placeholder implementation).
+        ///
+        /// # Errors
+        ///
+        /// Always returns a configuration error when the `gcp` feature is disabled.
+        pub async fn enqueue_http(
+            &self,
+            _task_id: &str,
+            _target_url: &str,
+            _body: &[u8],
+            _options: EnqueueOptions,
+            _audience: Option<&str>,
+        ) -> Result<EnqueueResult> {
+            Err(Error::configuration(
+                "CloudTasksDispatcher requires the 'gcp' feature to be enabled. \
+                 Add `arco-flow = { features = [\"gcp\"] }` to your Cargo.toml.",
+            ))
         }
     }
 
@@ -809,27 +901,25 @@ mod tests {
         use super::*;
 
         #[test]
-        fn sanitize_task_id_basic() {
-            assert_eq!(
-                CloudTasksDispatcher::sanitize_task_id("run_123/task_456/1"),
-                "run_123_task_456_1"
-            );
+        fn task_id_from_key_is_deterministic() {
+            let id1 = CloudTasksDispatcher::task_id_from_key("run_123/task_456/1");
+            let id2 = CloudTasksDispatcher::task_id_from_key("run_123/task_456/1");
+            assert_eq!(id1, id2);
         }
 
         #[test]
-        fn sanitize_task_id_starting_with_digit() {
-            assert_eq!(
-                CloudTasksDispatcher::sanitize_task_id("123-task"),
-                "t_123-task"
-            );
+        fn task_id_from_key_is_compliant() {
+            let id = CloudTasksDispatcher::task_id_from_key("run_123/task_456/1");
+            assert!(id.starts_with("t_"));
+            assert_eq!(id.len(), 28);
+            assert!(id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'));
         }
 
         #[test]
-        fn sanitize_task_id_special_chars() {
-            assert_eq!(
-                CloudTasksDispatcher::sanitize_task_id("a@b#c$d"),
-                "a_b_c_d"
-            );
+        fn task_id_from_key_differs_for_distinct_keys() {
+            let id1 = CloudTasksDispatcher::task_id_from_key("run_123/task_456/1");
+            let id2 = CloudTasksDispatcher::task_id_from_key("run_123/task_456/2");
+            assert_ne!(id1, id2);
         }
 
         #[test]

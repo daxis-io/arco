@@ -12,7 +12,8 @@
 //! | Worker Facts | `TaskStarted`, `TaskHeartbeat`, `TaskFinished` | "This happened" |
 //!
 //! Derived state changes (`TaskBecameReady`, `TaskSkipped`, `RunCompleted`) are
-//! projection-only - computed during compaction fold, not emitted as ledger events.
+//! projection-only - computed during compaction fold and intentionally excluded
+//! from the ledger event envelope.
 //!
 //! ## Idempotency
 //!
@@ -21,12 +22,14 @@
 //!
 //! ## Attempt ID (per ADR-022)
 //!
-//! Task events include `attempt_id` (ULID) as a concurrency guard. This prevents
+//! Task events include `attempt_id` as a concurrency guard. This prevents
 //! state regression when out-of-order events arrive (e.g., "attempt 1 finished"
 //! arriving after "attempt 2 started").
 
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use ulid::Ulid;
 
 /// Orchestration event envelope.
@@ -38,7 +41,7 @@ pub struct OrchestrationEvent {
     /// Unique event identifier (ULID).
     pub event_id: String,
 
-    /// Event type (e.g., "TaskFinished", "DispatchRequested").
+    /// Event type (e.g., "`TaskFinished`", "`DispatchRequested`").
     pub event_type: String,
 
     /// Schema version for forward compatibility.
@@ -129,6 +132,9 @@ pub enum OrchestrationEventData {
         /// Optional run key for idempotency (e.g., "daily-etl:2025-01-15").
         #[serde(skip_serializing_if = "Option::is_none")]
         run_key: Option<String>,
+        /// Optional labels for the run.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        labels: HashMap<String, String>,
     },
 
     /// Plan has been created with task graph.
@@ -141,20 +147,15 @@ pub enum OrchestrationEventData {
         tasks: Vec<TaskDef>,
     },
 
-    /// Run has completed (projection-only, but can be emitted for observability).
-    RunCompleted {
+    /// Cancellation has been requested for a run.
+    RunCancelRequested {
         /// Run identifier.
         run_id: String,
-        /// Final outcome.
-        outcome: RunOutcome,
-        /// Tasks succeeded count.
-        tasks_succeeded: u32,
-        /// Tasks failed count.
-        tasks_failed: u32,
-        /// Tasks skipped count.
-        tasks_skipped: u32,
-        /// Total duration in milliseconds.
-        duration_ms: u64,
+        /// Optional reason for cancellation.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// Who requested the cancellation.
+        requested_by: String,
     },
 
     // ========================================================================
@@ -168,7 +169,7 @@ pub enum OrchestrationEventData {
         task_key: String,
         /// Attempt number (1-indexed).
         attempt: u32,
-        /// Attempt identifier (ULID) - concurrency guard per ADR-022.
+        /// Attempt identifier - concurrency guard per ADR-022.
         attempt_id: String,
         /// Worker that started execution.
         worker_id: String,
@@ -184,9 +185,17 @@ pub enum OrchestrationEventData {
         attempt: u32,
         /// Attempt identifier - must match active attempt.
         attempt_id: String,
+        /// Worker identifier.
+        worker_id: String,
         /// Heartbeat timestamp from worker (UTC).
         #[serde(skip_serializing_if = "Option::is_none")]
         heartbeat_at: Option<DateTime<Utc>>,
+        /// Optional progress percentage (0-100).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        progress_pct: Option<u8>,
+        /// Optional status message.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
 
     /// Task has finished executing.
@@ -199,6 +208,8 @@ pub enum OrchestrationEventData {
         attempt: u32,
         /// Attempt identifier - must match active attempt for state update.
         attempt_id: String,
+        /// Worker identifier.
+        worker_id: String,
         /// Task outcome.
         outcome: TaskOutcome,
         /// Materialization ID if succeeded.
@@ -207,6 +218,21 @@ pub enum OrchestrationEventData {
         /// Error message if failed.
         #[serde(skip_serializing_if = "Option::is_none")]
         error_message: Option<String>,
+        /// Full output payload (serialized).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<Value>,
+        /// Full error payload (serialized).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<Value>,
+        /// Execution metrics payload (serialized).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metrics: Option<Value>,
+        /// Phase when cancellation occurred (if CANCELLED).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cancelled_during_phase: Option<String>,
+        /// Partial progress payload for cancellation.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partial_progress: Option<Value>,
     },
 
     // ========================================================================
@@ -222,6 +248,9 @@ pub enum OrchestrationEventData {
         attempt: u32,
         /// Attempt identifier to include in dispatch payload.
         attempt_id: String,
+        /// Target worker queue name.
+        #[serde(default = "default_worker_queue")]
+        worker_queue: String,
         /// Internal dispatch ID.
         dispatch_id: String,
     },
@@ -307,7 +336,7 @@ impl OrchestrationEventData {
         match self {
             Self::RunTriggered { .. } => "RunTriggered",
             Self::PlanCreated { .. } => "PlanCreated",
-            Self::RunCompleted { .. } => "RunCompleted",
+            Self::RunCancelRequested { .. } => "RunCancelRequested",
             Self::TaskStarted { .. } => "TaskStarted",
             Self::TaskHeartbeat { .. } => "TaskHeartbeat",
             Self::TaskFinished { .. } => "TaskFinished",
@@ -329,7 +358,7 @@ impl OrchestrationEventData {
                 .as_ref()
                 .map_or_else(|| format!("run:{run_id}"), |key| format!("run:{key}")),
             Self::PlanCreated { run_id, .. } => format!("plan:{run_id}"),
-            Self::RunCompleted { run_id, .. } => format!("run_completed:{run_id}"),
+            Self::RunCancelRequested { run_id, .. } => format!("cancel_req:{run_id}"),
 
             Self::TaskStarted {
                 run_id,
@@ -343,6 +372,7 @@ impl OrchestrationEventData {
                 attempt,
                 attempt_id,
                 heartbeat_at,
+                ..
             } => heartbeat_at.as_ref().map_or_else(
                 || format!("heartbeat:{run_id}:{task_key}:{attempt}:{attempt_id}"),
                 |ts| {
@@ -373,19 +403,16 @@ impl OrchestrationEventData {
         match self {
             Self::RunTriggered { run_id, .. }
             | Self::PlanCreated { run_id, .. }
-            | Self::RunCompleted { run_id, .. }
+            | Self::RunCancelRequested { run_id, .. }
             | Self::TaskStarted { run_id, .. }
             | Self::TaskHeartbeat { run_id, .. }
             | Self::TaskFinished { run_id, .. }
             | Self::DispatchRequested { run_id, .. } => Some(run_id),
 
-            Self::TimerRequested { run_id, .. } => run_id.as_deref(),
-
-            Self::DispatchEnqueued { run_id, .. } => run_id.as_deref(),
-
-            Self::TimerEnqueued { run_id, .. } | Self::TimerFired { run_id, .. } => {
-                run_id.as_deref()
-            }
+            Self::TimerRequested { run_id, .. }
+            | Self::DispatchEnqueued { run_id, .. }
+            | Self::TimerEnqueued { run_id, .. }
+            | Self::TimerFired { run_id, .. } => run_id.as_deref(),
         }
     }
 }
@@ -452,6 +479,10 @@ fn default_heartbeat_timeout() -> u32 {
     300
 }
 
+fn default_worker_queue() -> String {
+    "default-queue".to_string()
+}
+
 /// Task completion outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -509,6 +540,7 @@ mod tests {
                 },
                 root_assets: vec!["asset1".into()],
                 run_key: None,
+                labels: HashMap::new(),
             },
         );
 
@@ -529,6 +561,7 @@ mod tests {
             },
             root_assets: vec![],
             run_key: Some("daily:2025-01-15".into()),
+            labels: HashMap::new(),
         };
 
         assert_eq!(data.idempotency_key(), "run:daily:2025-01-15");
@@ -541,9 +574,15 @@ mod tests {
             task_key: "extract".into(),
             attempt: 1,
             attempt_id: "att456".into(),
+            worker_id: "worker-01".into(),
             outcome: TaskOutcome::Succeeded,
             materialization_id: None,
             error_message: None,
+            output: None,
+            error: None,
+            metrics: None,
+            cancelled_during_phase: None,
+            partial_progress: None,
         };
 
         assert_eq!(data.idempotency_key(), "finished:run123:extract:1");

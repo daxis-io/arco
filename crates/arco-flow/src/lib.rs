@@ -24,14 +24,39 @@
 //!
 //! ## Example
 //!
-//! ```rust,ignore
-//! use arco_flow::{Planner, Scheduler};
+//! ```rust,no_run
+//! use arco_core::{AssetId, TaskId};
+//! use arco_flow::error::Result;
+//! use arco_flow::outbox::InMemoryOutbox;
+//! use arco_flow::plan::{AssetKey, PlanBuilder, ResourceRequirements, TaskSpec};
+//! use arco_flow::run::RunTrigger;
+//! use arco_flow::scheduler::Scheduler;
+//! use arco_flow::task_key::TaskOperation;
 //!
-//! // Generate a deterministic plan
-//! let plan = Planner::new(assets).plan()?;
+//! # fn main() -> Result<()> {
+//! // Generate a deterministic plan with one task.
+//! let task = TaskSpec {
+//!     task_id: TaskId::generate(),
+//!     asset_id: AssetId::generate(),
+//!     asset_key: AssetKey::new("raw", "events"),
+//!     operation: TaskOperation::Materialize,
+//!     partition_key: None,
+//!     upstream_task_ids: Vec::new(),
+//!     stage: 0,
+//!     priority: 0,
+//!     resources: ResourceRequirements::default(),
+//! };
 //!
-//! // Execute with dependency-aware scheduling
-//! let run = Scheduler::new(plan).execute().await?;
+//! let plan = PlanBuilder::new("tenant", "workspace")
+//!     .add_task(task)
+//!     .build()?;
+//!
+//! // Create a run and emit events to an outbox.
+//! let scheduler = Scheduler::new(plan);
+//! let mut outbox = InMemoryOutbox::new();
+//! let _run = scheduler.create_run(RunTrigger::manual("user@example.com"), &mut outbox);
+//! # Ok(())
+//! # }
 //! ```
 
 #![forbid(unsafe_code)]

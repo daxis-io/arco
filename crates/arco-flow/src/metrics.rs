@@ -86,6 +86,8 @@ pub mod names {
     pub const SCHEDULE_TICKS_TOTAL: &str = "arco_flow_schedule_ticks_total";
     /// Counter: Run requests by source.
     pub const RUN_REQUESTS_TOTAL: &str = "arco_flow_run_requests_total";
+    /// Counter: Sensor evaluations by type and status.
+    pub const SENSOR_EVALS_TOTAL: &str = "arco_flow_sensor_evals_total";
 }
 
 /// Label keys used across metrics.
@@ -112,6 +114,8 @@ pub mod labels {
     pub const STATUS: &str = "status";
     /// Trigger source (schedule, sensor, backfill, manual).
     pub const SOURCE: &str = "source";
+    /// Sensor type (push, poll).
+    pub const SENSOR_TYPE: &str = "sensor_type";
 }
 
 /// High-level interface for recording orchestration metrics.

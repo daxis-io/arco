@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 
 use crate::orchestration::events::{
     BackfillState, ChunkState, OrchestrationEvent, OrchestrationEventData, PartitionSelector,
-    SensorStatus, TaskDef, TaskOutcome, TickStatus, TimerType as EventTimerType,
+    SensorEvalStatus, SensorStatus, TaskDef, TaskOutcome, TickStatus, TimerType as EventTimerType,
 };
 
 /// Task state machine states.
@@ -1105,13 +1105,35 @@ impl FoldState {
                 );
             }
 
+            // Layer 2 sensor events
+            OrchestrationEventData::SensorEvaluated {
+                sensor_id,
+                eval_id,
+                cursor_before: _,
+                cursor_after,
+                expected_state_version,
+                trigger_source: _,
+                run_requests: _,
+                status,
+            } => {
+                self.fold_sensor_evaluated(
+                    &event.tenant_id,
+                    &event.workspace_id,
+                    sensor_id,
+                    eval_id,
+                    cursor_after.clone(),
+                    *expected_state_version,
+                    status,
+                    event.timestamp,
+                    &event.event_id,
+                );
+            }
+
             // Layer 2 automation events - stubs for remaining events
-            OrchestrationEventData::SensorEvaluated { .. }
-            | OrchestrationEventData::RunRequested { .. }
+            OrchestrationEventData::RunRequested { .. }
             | OrchestrationEventData::BackfillCreated { .. }
             | OrchestrationEventData::BackfillChunkPlanned { .. }
             | OrchestrationEventData::BackfillStateChanged { .. } => {
-                // TODO(Task 3.3): Implement fold_sensor_evaluated (sensor_state + CAS).
                 // TODO(Task 6.1): Implement fold_run_requested (run_id + projection).
                 // TODO(Task 4.2): Implement fold_backfill_created (backfills projection).
                 // TODO(Task 4.3): Implement fold_backfill_chunk_planned (chunks + progress).
@@ -1778,6 +1800,79 @@ impl FoldState {
         );
     }
 
+    /// Fold a `SensorEvaluated` event.
+    ///
+    /// Updates projections:
+    /// 1. `sensor_state` - Cursor and evaluation info (with CAS check)
+    /// 2. `sensor_evals` - Evaluation history (if tracking enabled)
+    ///
+    /// Per P0-1, this is pure projection - fold does NOT emit new events.
+    /// The controller emits `SensorEvaluated` + `RunRequested`(s) atomically.
+    ///
+    /// Per P0-2, poll sensors include `expected_state_version` for CAS.
+    /// If the expected version doesn't match, the evaluation is stale and dropped.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_sensor_evaluated(
+        &mut self,
+        tenant_id: &str,
+        workspace_id: &str,
+        sensor_id: &str,
+        eval_id: &str,
+        cursor_after: Option<String>,
+        expected_state_version: Option<u32>,
+        status: &SensorEvalStatus,
+        timestamp: DateTime<Utc>,
+        event_id: &str,
+    ) {
+        // Get or create sensor state
+        let state = self.sensor_state.entry(sensor_id.to_string()).or_insert_with(|| {
+            SensorStateRow {
+                tenant_id: tenant_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                sensor_id: sensor_id.to_string(),
+                cursor: None,
+                last_evaluation_at: None,
+                last_eval_id: None,
+                status: SensorStatus::Active,
+                state_version: 0,
+                row_version: String::new(),
+            }
+        });
+
+        // CAS check for poll sensors (P0-2)
+        // If expected_state_version is set and doesn't match, drop this stale evaluation
+        if let Some(expected) = expected_state_version {
+            if state.state_version != expected {
+                // Stale evaluation - drop silently
+                // In production, this would increment a "stale_evals" metric
+                return;
+            }
+        }
+
+        // Only update if this event is newer (idempotency)
+        if event_id <= state.row_version.as_str() {
+            return;
+        }
+
+        // Update sensor state
+        state.cursor = cursor_after;
+        state.last_evaluation_at = Some(timestamp);
+        state.last_eval_id = Some(eval_id.to_string());
+        state.row_version = event_id.to_string();
+
+        // Increment state_version for CAS (poll sensors)
+        state.state_version += 1;
+
+        // Update status if evaluation errored
+        if matches!(status, SensorEvalStatus::Error { .. }) {
+            state.status = SensorStatus::Error;
+        }
+
+        // NOTE: Per P0-1, fold does NOT emit RunRequested events.
+        // The controller already emitted SensorEvaluated + RunRequested(s) atomically.
+        // fold_run_requested handles each RunRequested event separately.
+    }
+
     fn satisfy_downstream_edges(
         &mut self,
         run_id: &str,
@@ -1995,7 +2090,7 @@ pub fn merge_timer_rows(rows: Vec<TimerRow>) -> Option<TimerRow> {
 mod tests {
     use super::*;
     use crate::orchestration::events::{
-        OrchestrationEventData, TriggerInfo, TimerType as EventTimerType,
+        OrchestrationEventData, TriggerInfo, TriggerSource, TimerType as EventTimerType,
     };
     use ulid::Ulid;
 
@@ -3308,6 +3403,9 @@ mod tests {
         );
         state.fold_event(&event1);
 
+        // Ensure second event has a larger ULID (wait for next millisecond)
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
         // Second tick (newer)
         let event2 = schedule_ticked_event(
             "daily-etl",
@@ -3323,5 +3421,293 @@ mod tests {
 
         // Both ticks should be in history
         assert_eq!(state.schedule_ticks.len(), 2);
+    }
+
+    // ========================================================================
+    // Layer 2: Sensor Fold Tests
+    // ========================================================================
+
+    fn sensor_evaluated_event(
+        sensor_id: &str,
+        cursor_after: Option<&str>,
+        expected_state_version: Option<u32>,
+        trigger_source: TriggerSource,
+    ) -> OrchestrationEvent {
+        OrchestrationEvent::new(
+            "tenant-abc",
+            "workspace-prod",
+            OrchestrationEventData::SensorEvaluated {
+                sensor_id: sensor_id.to_string(),
+                eval_id: format!("eval_{}_{}", sensor_id, Ulid::new()),
+                cursor_before: None,
+                cursor_after: cursor_after.map(ToString::to_string),
+                expected_state_version,
+                trigger_source,
+                run_requests: vec![],
+                status: SensorEvalStatus::NoNewData,
+            },
+        )
+    }
+
+    #[test]
+    fn test_fold_sensor_evaluated_updates_state() {
+        let mut state = FoldState::new();
+
+        let event = sensor_evaluated_event(
+            "01HQ123SENSORXYZ",
+            Some("cursor_v1"),
+            None, // Push sensor - no CAS
+            TriggerSource::Push {
+                message_id: "msg_001".into(),
+            },
+        );
+
+        state.fold_event(&event);
+
+        // Should create sensor state
+        let sensor_state = state.sensor_state.get("01HQ123SENSORXYZ").unwrap();
+        assert_eq!(sensor_state.cursor, Some("cursor_v1".into()));
+        assert!(sensor_state.last_evaluation_at.is_some());
+        assert!(sensor_state.last_eval_id.is_some());
+        assert_eq!(sensor_state.state_version, 1);
+        assert_eq!(sensor_state.status, SensorStatus::Active);
+    }
+
+    /// Per P0-1, fold does NOT emit events. Controllers emit all events atomically.
+    /// This test verifies fold only updates projections.
+    #[test]
+    fn test_fold_sensor_evaluated_is_pure_projection() {
+        let mut state = FoldState::new();
+
+        let event = sensor_evaluated_event(
+            "01HQ123SENSORXYZ",
+            Some("cursor_v1"),
+            None,
+            TriggerSource::Push {
+                message_id: "msg_001".into(),
+            },
+        );
+
+        // fold_event returns nothing (pure projection)
+        state.fold_event(&event);
+
+        // Verify projections updated
+        assert!(state.sensor_state.contains_key("01HQ123SENSORXYZ"));
+        // RunRequested should come from controller, not fold
+    }
+
+    /// Per P0-2, poll sensors use CAS for cursor serialization.
+    /// If expected_state_version doesn't match, the stale eval is dropped.
+    #[test]
+    fn test_fold_sensor_evaluated_drops_on_version_mismatch() {
+        let mut state = FoldState::new();
+
+        // Create initial sensor state with version 2
+        state.sensor_state.insert(
+            "01HQ456POLLSENSOR".into(),
+            SensorStateRow {
+                tenant_id: "tenant-abc".into(),
+                workspace_id: "workspace-prod".into(),
+                sensor_id: "01HQ456POLLSENSOR".into(),
+                cursor: Some("cursor_v1".into()),
+                last_evaluation_at: None,
+                last_eval_id: None,
+                status: SensorStatus::Active,
+                state_version: 2,
+                row_version: "initial".into(),
+            },
+        );
+
+        // Try to evaluate with stale expected_state_version (1 != 2)
+        let event = sensor_evaluated_event(
+            "01HQ456POLLSENSOR",
+            Some("cursor_v2"), // Would update cursor if accepted
+            Some(1),           // Stale! Current is 2
+            TriggerSource::Poll { poll_epoch: 1736935200 },
+        );
+
+        state.fold_event(&event);
+
+        // Stale eval should be dropped - cursor unchanged
+        let sensor_state = state.sensor_state.get("01HQ456POLLSENSOR").unwrap();
+        assert_eq!(
+            sensor_state.cursor,
+            Some("cursor_v1".into()),
+            "Cursor should NOT be updated for stale eval"
+        );
+        assert_eq!(
+            sensor_state.state_version, 2,
+            "state_version should NOT increment for stale eval"
+        );
+    }
+
+    /// CAS should accept eval when expected_state_version matches.
+    #[test]
+    fn test_fold_sensor_evaluated_accepts_on_version_match() {
+        let mut state = FoldState::new();
+
+        // Create initial sensor state with version 2
+        state.sensor_state.insert(
+            "01HQ456POLLSENSOR".into(),
+            SensorStateRow {
+                tenant_id: "tenant-abc".into(),
+                workspace_id: "workspace-prod".into(),
+                sensor_id: "01HQ456POLLSENSOR".into(),
+                cursor: Some("cursor_v1".into()),
+                last_evaluation_at: None,
+                last_eval_id: None,
+                status: SensorStatus::Active,
+                state_version: 2,
+                row_version: String::new(),
+            },
+        );
+
+        // Evaluate with matching expected_state_version
+        let event = sensor_evaluated_event(
+            "01HQ456POLLSENSOR",
+            Some("cursor_v2"),
+            Some(2), // Matches current state_version
+            TriggerSource::Poll { poll_epoch: 1736935200 },
+        );
+
+        state.fold_event(&event);
+
+        // Eval should be accepted - cursor updated
+        let sensor_state = state.sensor_state.get("01HQ456POLLSENSOR").unwrap();
+        assert_eq!(
+            sensor_state.cursor,
+            Some("cursor_v2".into()),
+            "Cursor should be updated for valid eval"
+        );
+        assert_eq!(
+            sensor_state.state_version, 3,
+            "state_version should increment after valid eval"
+        );
+    }
+
+    /// Push sensors (no expected_state_version) should always be accepted.
+    #[test]
+    fn test_fold_sensor_evaluated_push_bypasses_cas() {
+        let mut state = FoldState::new();
+
+        // Create initial sensor state with version 5
+        state.sensor_state.insert(
+            "01HQ789PUSHSENSOR".into(),
+            SensorStateRow {
+                tenant_id: "tenant-abc".into(),
+                workspace_id: "workspace-prod".into(),
+                sensor_id: "01HQ789PUSHSENSOR".into(),
+                cursor: None,
+                last_evaluation_at: None,
+                last_eval_id: None,
+                status: SensorStatus::Active,
+                state_version: 5,
+                row_version: String::new(),
+            },
+        );
+
+        // Push sensor eval (no expected_state_version)
+        let event = sensor_evaluated_event(
+            "01HQ789PUSHSENSOR",
+            Some("msg_001"),
+            None, // No CAS for push sensors
+            TriggerSource::Push {
+                message_id: "msg_001".into(),
+            },
+        );
+
+        state.fold_event(&event);
+
+        // Push eval should be accepted regardless of state_version
+        let sensor_state = state.sensor_state.get("01HQ789PUSHSENSOR").unwrap();
+        assert_eq!(sensor_state.cursor, Some("msg_001".into()));
+        assert_eq!(
+            sensor_state.state_version, 6,
+            "state_version should increment after push eval"
+        );
+    }
+
+    /// Error status should update sensor status to Error.
+    #[test]
+    fn test_fold_sensor_evaluated_error_updates_status() {
+        let mut state = FoldState::new();
+
+        // Create error event
+        let event = OrchestrationEvent::new(
+            "tenant-abc",
+            "workspace-prod",
+            OrchestrationEventData::SensorEvaluated {
+                sensor_id: "01HQ123ERRORSENSOR".to_string(),
+                eval_id: format!("eval_error_{}", Ulid::new()),
+                cursor_before: None,
+                cursor_after: None,
+                expected_state_version: None,
+                trigger_source: TriggerSource::Push {
+                    message_id: "msg_error".into(),
+                },
+                run_requests: vec![],
+                status: SensorEvalStatus::Error {
+                    message: "Connection failed".into(),
+                },
+            },
+        );
+
+        state.fold_event(&event);
+
+        let sensor_state = state.sensor_state.get("01HQ123ERRORSENSOR").unwrap();
+        assert_eq!(
+            sensor_state.status,
+            SensorStatus::Error,
+            "Sensor status should be Error after error eval"
+        );
+    }
+
+    /// State version should increment on each evaluation.
+    #[test]
+    fn test_fold_sensor_evaluated_increments_state_version() {
+        let mut state = FoldState::new();
+
+        // First evaluation
+        let event1 = sensor_evaluated_event(
+            "01HQ123SENSORXYZ",
+            Some("cursor_v1"),
+            None,
+            TriggerSource::Push {
+                message_id: "msg_001".into(),
+            },
+        );
+        state.fold_event(&event1);
+
+        assert_eq!(
+            state
+                .sensor_state
+                .get("01HQ123SENSORXYZ")
+                .unwrap()
+                .state_version,
+            1
+        );
+
+        // Ensure second event has a larger ULID (wait for next millisecond)
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // Second evaluation
+        let event2 = sensor_evaluated_event(
+            "01HQ123SENSORXYZ",
+            Some("cursor_v2"),
+            None,
+            TriggerSource::Push {
+                message_id: "msg_002".into(),
+            },
+        );
+        state.fold_event(&event2);
+
+        assert_eq!(
+            state
+                .sensor_state
+                .get("01HQ123SENSORXYZ")
+                .unwrap()
+                .state_version,
+            2
+        );
     }
 }

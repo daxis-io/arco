@@ -1,8 +1,8 @@
 //! Tests for Layer 2 automation events and controllers.
 
 use arco_flow::orchestration::events::{
-    OrchestrationEvent, OrchestrationEventData, RunRequest, SensorEvalStatus, TickStatus,
-    TriggerSource, sha256_short,
+    BackfillState, OrchestrationEvent, OrchestrationEventData, PartitionSelector, RunRequest,
+    SensorEvalStatus, TickStatus, TriggerSource, sha256_short,
 };
 use chrono::{TimeZone, Utc};
 
@@ -220,6 +220,96 @@ fn test_sensor_evaluated_no_run_id() {
             },
             run_requests: vec![],
             status: SensorEvalStatus::NoNewData,
+        },
+    );
+
+    assert!(event.data.run_id().is_none());
+}
+
+// ============================================================================
+// Backfill Event Tests
+// ============================================================================
+
+#[test]
+fn test_backfill_chunk_planned_idempotency() {
+    let event = OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::BackfillChunkPlanned {
+            backfill_id: "bf_01HQ123".into(),
+            chunk_id: "bf_01HQ123:0".into(),
+            chunk_index: 0,
+            partition_keys: vec!["2025-01-01".into(), "2025-01-02".into()],
+            run_key: "backfill:bf_01HQ123:chunk:0".into(),
+            request_fingerprint: "fp_chunk0".into(),
+        },
+    );
+
+    assert_eq!(event.event_type, "BackfillChunkPlanned");
+    assert!(event.idempotency_key.contains("backfill_chunk:bf_01HQ123:0"));
+}
+
+#[test]
+fn test_backfill_state_changed_uses_state_version() {
+    let event = OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::BackfillStateChanged {
+            backfill_id: "bf_01HQ123".into(),
+            from_state: BackfillState::Running,
+            to_state: BackfillState::Paused,
+            state_version: 3,
+            changed_by: Some("user@example.com".into()),
+        },
+    );
+
+    // Idempotency uses state_version (monotonic)
+    assert!(event.idempotency_key.contains("backfill_state:bf_01HQ123:3"));
+}
+
+#[test]
+fn test_backfill_created_uses_compact_selector() {
+    // Per P0-6, BackfillCreated uses PartitionSelector, not full partition list
+    let event = OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::BackfillCreated {
+            backfill_id: "bf_01HQ123".into(),
+            client_request_id: "req_abc123".into(),
+            asset_selection: vec!["analytics.summary".into()],
+            partition_selector: PartitionSelector::Range {
+                start: "2025-01-01".into(),
+                end: "2025-12-31".into(),
+            },
+            total_partitions: 365,
+            chunk_size: 10,
+            max_concurrent_runs: 5,
+            parent_backfill_id: None,
+        },
+    );
+
+    assert_eq!(event.event_type, "BackfillCreated");
+    // Idempotency uses client_request_id
+    assert!(event.idempotency_key.contains("backfill_create:req_abc123"));
+}
+
+#[test]
+fn test_backfill_events_no_run_id() {
+    // Backfill events don't have direct run_id - runs are created via chunks
+    let event = OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::BackfillCreated {
+            backfill_id: "bf_01HQ123".into(),
+            client_request_id: "req_xyz".into(),
+            asset_selection: vec!["test".into()],
+            partition_selector: PartitionSelector::Explicit {
+                partition_keys: vec!["p1".into()],
+            },
+            total_partitions: 1,
+            chunk_size: 1,
+            max_concurrent_runs: 1,
+            parent_backfill_id: None,
         },
     );
 

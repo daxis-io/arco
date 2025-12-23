@@ -664,6 +664,18 @@ impl FoldState {
                 // TODO(Task 3.3): Implement fold_sensor_evaluated
                 // Updates sensor_state projection, enforces CAS for poll sensors
             }
+            OrchestrationEventData::BackfillCreated { .. } => {
+                // TODO(Task 4.2): Implement fold_backfill_created
+                // Creates backfill row in backfills projection
+            }
+            OrchestrationEventData::BackfillChunkPlanned { .. } => {
+                // TODO(Task 4.3): Implement fold_backfill_chunk_planned
+                // Creates chunk row, updates backfill progress
+            }
+            OrchestrationEventData::BackfillStateChanged { .. } => {
+                // TODO(Task 4.4): Implement fold_backfill_state_changed
+                // Updates backfill state with version check
+            }
         }
     }
 

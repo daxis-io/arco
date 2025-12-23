@@ -29,11 +29,13 @@
 //! arriving after "attempt 2 started").
 
 pub mod automation_events;
+pub mod backfill_events;
 
 pub use automation_events::{
     RunRequest, SensorEvalStatus, SensorStatus, SourceRef, TickStatus, TriggerSource,
     sha256_short,
 };
+pub use backfill_events::{BackfillState, ChunkState, PartitionSelector};
 
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -388,6 +390,61 @@ pub enum OrchestrationEventData {
         /// Evaluation status.
         status: SensorEvalStatus,
     },
+
+    // ========================================================================
+    // Backfill Events (Layer 2)
+    // ========================================================================
+    /// A backfill has been created.
+    BackfillCreated {
+        /// Backfill identifier (ULID).
+        backfill_id: String,
+        /// Client request ID for idempotency.
+        client_request_id: String,
+        /// Assets to backfill.
+        asset_selection: Vec<String>,
+        /// Partition selector (compact, per P0-6).
+        partition_selector: PartitionSelector,
+        /// Pre-computed total partition count.
+        total_partitions: u32,
+        /// Number of partitions per chunk.
+        chunk_size: u32,
+        /// Maximum concurrent chunk runs.
+        max_concurrent_runs: u32,
+        /// Parent backfill ID (for retry-failed).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_backfill_id: Option<String>,
+    },
+
+    /// A backfill chunk has been planned.
+    BackfillChunkPlanned {
+        /// Backfill identifier.
+        backfill_id: String,
+        /// Chunk identifier: `{backfill_id}:{chunk_index}`.
+        chunk_id: String,
+        /// Zero-indexed chunk number.
+        chunk_index: u32,
+        /// Partition keys in this chunk.
+        partition_keys: Vec<String>,
+        /// Run key for this chunk.
+        run_key: String,
+        /// Request fingerprint for conflict detection.
+        request_fingerprint: String,
+    },
+
+    /// Backfill state has changed.
+    BackfillStateChanged {
+        /// Backfill identifier.
+        backfill_id: String,
+        /// Previous state.
+        from_state: BackfillState,
+        /// New state.
+        to_state: BackfillState,
+        /// State version (monotonic, for idempotency).
+        state_version: u32,
+        /// Who initiated the change (user ID or "system").
+        #[serde(skip_serializing_if = "Option::is_none")]
+        changed_by: Option<String>,
+    },
 }
 
 impl OrchestrationEventData {
@@ -408,6 +465,9 @@ impl OrchestrationEventData {
             Self::TimerFired { .. } => "TimerFired",
             Self::ScheduleTicked { .. } => "ScheduleTicked",
             Self::SensorEvaluated { .. } => "SensorEvaluated",
+            Self::BackfillCreated { .. } => "BackfillCreated",
+            Self::BackfillChunkPlanned { .. } => "BackfillChunkPlanned",
+            Self::BackfillStateChanged { .. } => "BackfillStateChanged",
         }
     }
 
@@ -479,6 +539,22 @@ impl OrchestrationEventData {
                     }
                 }
             }
+
+            Self::BackfillCreated {
+                client_request_id, ..
+            } => format!("backfill_create:{client_request_id}"),
+
+            Self::BackfillChunkPlanned {
+                backfill_id,
+                chunk_index,
+                ..
+            } => format!("backfill_chunk:{backfill_id}:{chunk_index}"),
+
+            Self::BackfillStateChanged {
+                backfill_id,
+                state_version,
+                ..
+            } => format!("backfill_state:{backfill_id}:{state_version}"),
         }
     }
 
@@ -500,7 +576,11 @@ impl OrchestrationEventData {
             | Self::TimerFired { run_id, .. } => run_id.as_deref(),
 
             // Automation events don't have direct run_id (runs are created separately)
-            Self::ScheduleTicked { .. } | Self::SensorEvaluated { .. } => None,
+            Self::ScheduleTicked { .. }
+            | Self::SensorEvaluated { .. }
+            | Self::BackfillCreated { .. }
+            | Self::BackfillChunkPlanned { .. }
+            | Self::BackfillStateChanged { .. } => None,
         }
     }
 }

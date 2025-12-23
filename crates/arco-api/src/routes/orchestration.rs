@@ -386,6 +386,10 @@ pub struct ManualSensorEvaluateResponse {
     pub run_requests: Vec<RunRequestResponse>,
     /// Number of events written to the ledger.
     pub events_written: u32,
+    /// Warning if manual evaluate bypassed sensor status (paused/error).
+    /// Manual evaluate always runs regardless of sensor operational state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// Sensor evaluation status (API response).
@@ -1030,6 +1034,10 @@ pub(crate) async fn manual_evaluate_sensor(
 
     compact_orchestration_events(&state.config, storage, event_paths).await?;
 
+    // TODO: Once sensor_state is persisted to Parquet, look up actual sensor status
+    // and set warning if paused/errored: "Sensor is paused/errored but manual evaluate bypasses status"
+    let warning: Option<String> = None;
+
     Ok((
         StatusCode::OK,
         Json(ManualSensorEvaluateResponse {
@@ -1038,6 +1046,7 @@ pub(crate) async fn manual_evaluate_sensor(
             status: map_sensor_eval_status(&status),
             run_requests: map_run_requests(&run_requests),
             events_written: u32::try_from(events_written).unwrap_or(u32::MAX),
+            warning,
         }),
     ))
 }

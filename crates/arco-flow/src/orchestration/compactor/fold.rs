@@ -597,6 +597,19 @@ impl SensorStateRow {
 }
 
 /// Sensor evaluation history row.
+///
+/// This projection tracks all sensor evaluations including stale ones (CAS failures).
+/// Used for:
+/// - Debugging overlapping poll sensor issues
+/// - Correlating RunRequested events back to their source evaluation
+/// - Observability into sensor evaluation patterns
+///
+/// ## Persistence Strategy
+///
+/// When persisted to Parquet, entries should be retained for 7-30 days (configurable).
+/// The `evaluated_at` field enables time-based cleanup during compaction.
+/// Stale evaluations (`status = SkippedStaleCursor`) are particularly useful for
+/// diagnosing concurrent poll overlap issues.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SensorEvalRow {
     /// Tenant identifier.

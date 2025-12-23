@@ -5,6 +5,7 @@ use arco_flow::orchestration::compactor::{
     RunKeyConflictRow, RunKeyIndexRow, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
     SensorStateRow,
 };
+use arco_flow::orchestration::events::TaskOutcome;
 use chrono::{TimeZone, Utc};
 use std::collections::HashMap;
 
@@ -179,13 +180,12 @@ fn test_partition_status_row_schema() {
         workspace_id: "workspace-prod".into(),
         asset_key: "analytics.summary".into(),
         partition_key: "2025-01-15".into(),
-        status: PartitionMaterializationStatus::Materialized,
         last_materialization_run_id: Some("run_01HQ123".into()),
         last_materialization_at: Some(Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap()),
         last_materialization_code_version: Some("v1.2.3".into()),
         last_attempt_run_id: Some("run_01HQ123".into()),
         last_attempt_at: Some(Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap()),
-        last_attempt_outcome: Some("SUCCEEDED".into()),
+        last_attempt_outcome: Some(TaskOutcome::Succeeded),
         stale_since: None,
         stale_reason_code: None,
         partition_values,

@@ -31,7 +31,7 @@ This prevents a failed retry from overwriting valid prior materialization data.
 | last_materialization_code_version | STRING | Code version used (success only) |
 | last_attempt_run_id | STRING | Most recent attempt (any outcome) |
 | last_attempt_at | TIMESTAMP | When last attempted (any outcome) |
-| last_attempt_outcome | STRING | SUCCEEDED/FAILED/CANCELLED |
+| last_attempt_outcome | TaskOutcome | SUCCEEDED/FAILED/CANCELLED (SKIPPED permitted) |
 | stale_since | TIMESTAMP | When became stale (nullable; derived at query time or precomputed) |
 | stale_reason_code | STRING | FRESHNESS_POLICY/UPSTREAM_CHANGED/CODE_CHANGED (nullable; derived or precomputed) |
 | partition_values | MAP<STRING,STRING> | Dimension key-values |

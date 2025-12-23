@@ -458,7 +458,7 @@ pub struct ScheduleDefinitionRow {
     pub schedule_id: String,
     /// Cron expression (e.g., "0 10 * * *").
     pub cron_expression: String,
-    /// IANA timezone (e.g., "UTC", "America/New_York").
+    /// IANA timezone (e.g., `UTC`, `America/New_York`).
     pub timezone: String,
     /// Maximum minutes to look back for missed ticks.
     pub catchup_window_minutes: u32,
@@ -491,7 +491,7 @@ pub struct ScheduleStateRow {
     pub workspace_id: String,
     /// Schedule identifier.
     pub schedule_id: String,
-    /// Last scheduled_for timestamp that was processed.
+    /// Last `scheduled_for` timestamp that was processed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_scheduled_for: Option<DateTime<Utc>>,
     /// Last tick ID that was processed.
@@ -537,7 +537,7 @@ pub struct ScheduleTickRow {
     /// Run key if a run was requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_key: Option<String>,
-    /// Run ID (correlated from RunRequested during fold).
+    /// Run ID (correlated from `RunRequested` during fold).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     /// Request fingerprint for conflict detection.
@@ -718,8 +718,6 @@ pub struct PartitionStatusRow {
     pub asset_key: String,
     /// Partition key.
     pub partition_key: String,
-    /// Display status (computed).
-    pub status: PartitionMaterializationStatus,
     /// Run that last materialized (success only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_materialization_run_id: Option<String>,
@@ -735,13 +733,13 @@ pub struct PartitionStatusRow {
     /// When last attempted (any outcome).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_attempt_at: Option<DateTime<Utc>>,
-    /// Last attempt outcome (SUCCEEDED/FAILED/CANCELLED).
+    /// Last attempt outcome (TaskOutcome).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_attempt_outcome: Option<String>,
+    pub last_attempt_outcome: Option<TaskOutcome>,
     /// When partition became stale (nullable; derived or precomputed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_since: Option<DateTime<Utc>>,
-    /// Stale reason code (FRESHNESS_POLICY/UPSTREAM_CHANGED/CODE_CHANGED).
+    /// Stale reason code (`FRESHNESS_POLICY/UPSTREAM_CHANGED/CODE_CHANGED`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_reason_code: Option<String>,
     /// Dimension key-values for the partition.
@@ -795,7 +793,7 @@ impl RunKeyIndexRow {
     }
 }
 
-/// Run key conflict (when same run_key has different fingerprint).
+/// Run key conflict (when same `run_key` has different fingerprint).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunKeyConflictRow {
     /// Tenant identifier.

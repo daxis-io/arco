@@ -10,6 +10,8 @@
 //! | Intent | `DispatchRequested`, `TimerRequested` | "I want this to happen" |
 //! | Acknowledgement | `DispatchEnqueued`, `TimerEnqueued` | "External system accepted" |
 //! | Worker Facts | `TaskStarted`, `TaskHeartbeat`, `TaskFinished` | "This happened" |
+//! | Automation | `ScheduleTicked`, `SensorEvaluated`, `RunRequested` | "Trigger evaluated" |
+//! | Backfill | `BackfillCreated`, `BackfillChunkPlanned`, `BackfillStateChanged` | "Backfill lifecycle" |
 //!
 //! Derived state changes (`TaskBecameReady`, `TaskSkipped`, `RunCompleted`) are
 //! projection-only - computed during compaction fold and intentionally excluded
@@ -25,6 +27,13 @@
 //! Task events include `attempt_id` as a concurrency guard. This prevents
 //! state regression when out-of-order events arrive (e.g., "attempt 1 finished"
 //! arriving after "attempt 2 started").
+
+pub mod automation_events;
+
+pub use automation_events::{
+    RunRequest, SensorEvalStatus, SensorStatus, SourceRef, TickStatus, TriggerSource,
+    sha256_short,
+};
 
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -327,6 +336,34 @@ pub enum OrchestrationEventData {
         #[serde(skip_serializing_if = "Option::is_none")]
         attempt: Option<u32>,
     },
+
+    // ========================================================================
+    // Automation Events (Layer 2)
+    // ========================================================================
+    /// A schedule tick has been evaluated.
+    ScheduleTicked {
+        /// Schedule identifier (ULID).
+        schedule_id: String,
+        /// When this tick was scheduled for.
+        scheduled_for: DateTime<Utc>,
+        /// Unique tick identifier: `{schedule_id}:{scheduled_for_epoch}`.
+        tick_id: String,
+        /// Definition version used for this tick (for replay determinism).
+        definition_version: String,
+        /// Snapshot of asset selection at tick time.
+        asset_selection: Vec<String>,
+        /// Optional partition selection snapshot.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partition_selection: Option<Vec<String>>,
+        /// Tick evaluation status.
+        status: TickStatus,
+        /// Run key if a run was requested (None if skipped).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_key: Option<String>,
+        /// Request fingerprint for conflict detection.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_fingerprint: Option<String>,
+    },
 }
 
 impl OrchestrationEventData {
@@ -345,6 +382,7 @@ impl OrchestrationEventData {
             Self::DispatchEnqueued { .. } => "DispatchEnqueued",
             Self::TimerEnqueued { .. } => "TimerEnqueued",
             Self::TimerFired { .. } => "TimerFired",
+            Self::ScheduleTicked { .. } => "ScheduleTicked",
         }
     }
 
@@ -394,6 +432,8 @@ impl OrchestrationEventData {
             Self::DispatchEnqueued { dispatch_id, .. } => format!("dispatch_ack:{dispatch_id}"),
             Self::TimerEnqueued { timer_id, .. } => format!("timer_ack:{timer_id}"),
             Self::TimerFired { timer_id, .. } => format!("timer_fired:{timer_id}"),
+
+            Self::ScheduleTicked { tick_id, .. } => format!("sched_tick:{tick_id}"),
         }
     }
 
@@ -413,6 +453,9 @@ impl OrchestrationEventData {
             | Self::DispatchEnqueued { run_id, .. }
             | Self::TimerEnqueued { run_id, .. }
             | Self::TimerFired { run_id, .. } => run_id.as_deref(),
+
+            // Automation events don't have direct run_id (runs are created separately)
+            Self::ScheduleTicked { .. } => None,
         }
     }
 }

@@ -654,6 +654,12 @@ impl FoldState {
             OrchestrationEventData::RunCancelRequested { run_id, .. } => {
                 self.fold_run_cancel_requested(run_id, &event.event_id, event.timestamp);
             }
+
+            // Layer 2 automation events - stubs for now, implemented in Task 2.2+
+            OrchestrationEventData::ScheduleTicked { .. } => {
+                // TODO(Task 2.2): Implement fold_schedule_ticked
+                // Updates schedule_state and schedule_ticks projections
+            }
         }
     }
 

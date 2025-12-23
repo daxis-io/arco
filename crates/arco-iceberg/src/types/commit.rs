@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use super::table::{PartitionSpec, Schema, Snapshot, SortOrder};
+use super::table::{PartitionSpec, Schema, Snapshot, SortOrder, TableIdent};
 
 /// Iceberg table update requirement for optimistic concurrency.
 ///
@@ -248,6 +248,45 @@ pub enum SnapshotRefType {
     Tag,
 }
 
+/// Request body for `POST /v1/{prefix}/namespaces/{namespace}/tables/{table}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitTableRequest {
+    /// Table identifier (optional in body, taken from URL path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<TableIdent>,
+
+    /// Requirements that must be met before applying updates.
+    #[serde(default)]
+    pub requirements: Vec<UpdateRequirement>,
+
+    /// Updates to apply atomically.
+    #[serde(default)]
+    pub updates: Vec<TableUpdate>,
+}
+
+impl CommitTableRequest {
+    /// Checks all updates against governance guardrails.
+    ///
+    /// Returns the first rejection reason if any update is rejected.
+    #[must_use]
+    pub fn check_guardrails(&self) -> Option<String> {
+        self.updates
+            .iter()
+            .find_map(TableUpdate::is_rejected_by_guardrails)
+    }
+}
+
+/// Response from `POST /v1/{prefix}/namespaces/{namespace}/tables/{table}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitTableResponse {
+    /// Location of the new metadata file.
+    #[serde(rename = "metadata-location")]
+    pub metadata_location: String,
+
+    /// Full table metadata (inline JSON).
+    pub metadata: serde_json::Value,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,5 +419,33 @@ mod tests {
             },
         };
         assert!(update.is_rejected_by_guardrails().is_none());
+    }
+
+    #[test]
+    fn test_commit_table_request_deserialization() {
+        let json = r#"{
+            "identifier": {"namespace": ["sales"], "name": "orders"},
+            "requirements": [
+                {"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": 100}
+            ],
+            "updates": [
+                {"action": "add-snapshot", "snapshot": {"snapshot-id": 101, "timestamp-ms": 1234567890000, "manifest-list": "s3://bucket/snap.avro"}}
+            ]
+        }"#;
+        let req: CommitTableRequest = serde_json::from_str(json).expect("deserialize");
+        let identifier = req.identifier.expect("identifier present");
+        assert_eq!(identifier.name, "orders");
+        assert_eq!(req.requirements.len(), 1);
+        assert_eq!(req.updates.len(), 1);
+    }
+
+    #[test]
+    fn test_commit_table_response_serialization() {
+        let response = CommitTableResponse {
+            metadata_location: "s3://bucket/metadata/00001.json".to_string(),
+            metadata: serde_json::json!({"format-version": 2}),
+        };
+        let json = serde_json::to_string(&response).expect("serialize");
+        assert!(json.contains("metadata-location"));
     }
 }

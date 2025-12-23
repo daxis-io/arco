@@ -282,4 +282,58 @@ mod tests {
             panic!("wrong variant");
         }
     }
+
+    #[test]
+    fn test_guardrail_rejects_set_location() {
+        let update = TableUpdate::SetLocation {
+            location: "s3://new-bucket/table".to_string(),
+        };
+        assert!(update.is_rejected_by_guardrails().is_some());
+    }
+
+    #[test]
+    fn test_guardrail_rejects_arco_properties() {
+        let update = TableUpdate::SetProperties {
+            updates: [("arco.lineage.source".to_string(), "value".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        assert!(update.is_rejected_by_guardrails().is_some());
+    }
+
+    #[test]
+    fn test_guardrail_allows_normal_properties() {
+        let update = TableUpdate::SetProperties {
+            updates: [("write.format.default".to_string(), "parquet".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        assert!(update.is_rejected_by_guardrails().is_none());
+    }
+
+    #[test]
+    fn test_guardrail_rejects_remove_arco_properties() {
+        let update = TableUpdate::RemoveProperties {
+            removals: vec!["arco.governance.owner".to_string()],
+        };
+        assert!(update.is_rejected_by_guardrails().is_some());
+    }
+
+    #[test]
+    fn test_guardrail_allows_add_snapshot() {
+        use super::super::table::Snapshot;
+
+        let update = TableUpdate::AddSnapshot {
+            snapshot: Snapshot {
+                snapshot_id: 1,
+                parent_snapshot_id: None,
+                sequence_number: 1,
+                timestamp_ms: 1234567890000,
+                manifest_list: "s3://bucket/manifests/snap.avro".to_string(),
+                summary: HashMap::new(),
+                schema_id: Some(0),
+            },
+        };
+        assert!(update.is_rejected_by_guardrails().is_none());
+    }
 }

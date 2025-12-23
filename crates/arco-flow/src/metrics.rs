@@ -20,7 +20,7 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
+//! ```rust,no_run
 //! use arco_flow::metrics::FlowMetrics;
 //!
 //! let metrics = FlowMetrics::new();
@@ -70,6 +70,16 @@ pub mod names {
     pub const DISPATCHES_TOTAL: &str = "arco_flow_dispatches_total";
     /// Counter: Total retry operations.
     pub const RETRIES_TOTAL: &str = "arco_flow_retries_total";
+    /// Counter: Total orchestration callback requests.
+    pub const ORCH_CALLBACKS_TOTAL: &str = "arco_orch_callbacks_total";
+    /// Counter: Total orchestration callback errors.
+    pub const ORCH_CALLBACK_ERRORS_TOTAL: &str = "arco_orch_callback_errors_total";
+    /// Histogram: Orchestration callback latency in seconds.
+    pub const ORCH_CALLBACK_DURATION_SECONDS: &str = "arco_orch_callback_duration_seconds";
+    /// Counter: Orchestration controller actions emitted.
+    pub const ORCH_CONTROLLER_ACTIONS_TOTAL: &str = "arco_orch_controller_actions_total";
+    /// Histogram: Orchestration controller reconcile duration in seconds.
+    pub const ORCH_CONTROLLER_RECONCILE_SECONDS: &str = "arco_orch_controller_reconcile_seconds";
 }
 
 /// Label keys used across metrics.
@@ -88,6 +98,10 @@ pub mod labels {
     pub const QUEUE: &str = "queue";
     /// Result status (success, failure, deduplicated).
     pub const RESULT: &str = "result";
+    /// Callback handler name.
+    pub const HANDLER: &str = "handler";
+    /// Controller name.
+    pub const CONTROLLER: &str = "controller";
 }
 
 /// High-level interface for recording orchestration metrics.
@@ -207,7 +221,7 @@ impl FlowMetrics {
 ///
 /// ## Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use arco_flow::metrics::{FlowMetrics, TimingGuard};
 ///
 /// let metrics = FlowMetrics::new();
@@ -262,7 +276,7 @@ where
 ///
 /// ## Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use arco_flow::metrics::time_scheduler_tick;
 ///
 /// async fn scheduler_tick() {

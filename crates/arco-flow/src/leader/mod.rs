@@ -92,13 +92,18 @@ impl RenewalResult {
 ///
 /// ## Example Usage
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// use std::time::Duration;
+///
+/// use arco_flow::error::Result;
 /// use arco_flow::leader::{LeaderElector, LeadershipResult};
 ///
-/// async fn run_scheduler<L: LeaderElector>(elector: &L, instance_id: &str) {
+/// async fn process_scheduler_tasks() {}
+///
+/// async fn run_scheduler<L: LeaderElector>(elector: &L, instance_id: &str) -> Result<()> {
 ///     loop {
 ///         match elector.try_acquire("scheduler", instance_id).await? {
-///             LeadershipResult::Acquired { lease_token, lease_duration } => {
+///             LeadershipResult::Acquired { lease_token, .. } => {
 ///                 // We are the leader - process work
 ///                 process_scheduler_tasks().await;
 ///

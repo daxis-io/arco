@@ -108,6 +108,13 @@ pub enum Error {
         message: String,
     },
 
+    /// A Parquet encoding/decoding error occurred.
+    #[error("parquet error: {message}")]
+    Parquet {
+        /// Description of the Parquet failure.
+        message: String,
+    },
+
     /// An error from arco-core.
     #[error("core error: {0}")]
     Core(#[from] arco_core::error::Error),
@@ -155,6 +162,14 @@ impl Error {
     #[must_use]
     pub fn dispatch(message: impl Into<String>) -> Self {
         Self::Dispatch {
+            message: message.into(),
+        }
+    }
+
+    /// Creates a new Parquet error.
+    #[must_use]
+    pub fn parquet(message: impl Into<String>) -> Self {
+        Self::Parquet {
             message: message.into(),
         }
     }

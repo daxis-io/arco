@@ -94,12 +94,25 @@ mod helpers {
         uri: &str,
         body: Option<serde_json::Value>,
     ) -> Result<Request<Body>> {
-        let builder = Request::builder()
+        make_request_with_headers(method, uri, body, &[])
+    }
+
+    pub fn make_request_with_headers(
+        method: Method,
+        uri: &str,
+        body: Option<serde_json::Value>,
+        headers: &[(&str, &str)],
+    ) -> Result<Request<Body>> {
+        let mut builder = Request::builder()
             .method(method)
             .uri(uri)
             .header("X-Tenant-Id", "test-tenant")
             .header("X-Workspace-Id", "test-workspace")
             .header(header::CONTENT_TYPE, "application/json");
+
+        for (key, value) in headers {
+            builder = builder.header(*key, *value);
+        }
 
         let body = match body {
             Some(v) => Body::from(serde_json::to_vec(&v).context("serialize request body")?),
@@ -143,12 +156,42 @@ mod helpers {
         Ok((status, json))
     }
 
+    pub async fn get_text(
+        router: axum::Router,
+        uri: &str,
+    ) -> Result<(StatusCode, String)> {
+        let request = make_request(Method::GET, uri, None)?;
+        let response = send(router, request).await?;
+        let (status, body) = response_body(response).await?;
+        let text = String::from_utf8(body.to_vec())
+            .context("parse text response")?;
+        Ok((status, text))
+    }
+
     pub async fn post_json<T: DeserializeOwned>(
         router: axum::Router,
         uri: &str,
         body: serde_json::Value,
     ) -> Result<(StatusCode, T)> {
         let request = make_request(Method::POST, uri, Some(body))?;
+        let response = send(router, request).await?;
+        let (status, body) = response_body(response).await?;
+        let json = serde_json::from_slice(&body).with_context(|| {
+            format!(
+                "parse JSON response (status={status}): {}",
+                String::from_utf8_lossy(&body)
+            )
+        })?;
+        Ok((status, json))
+    }
+
+    pub async fn post_json_with_headers<T: DeserializeOwned>(
+        router: axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+        headers: &[(&str, &str)],
+    ) -> Result<(StatusCode, T)> {
+        let request = make_request_with_headers(Method::POST, uri, Some(body), headers)?;
         let response = send(router, request).await?;
         let (status, body) = response_body(response).await?;
         let json = serde_json::from_slice(&body).with_context(|| {
@@ -577,6 +620,342 @@ mod browser {
 }
 
 // ============================================================================
+// Manifest Tests
+// ============================================================================
+
+mod manifests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DeployManifestResponse {
+        manifest_id: String,
+        workspace_id: String,
+        code_version_id: String,
+        fingerprint: String,
+        asset_count: u32,
+        deployed_at: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ManifestListItem {
+        manifest_id: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ListManifestsResponse {
+        manifests: Vec<ManifestListItem>,
+    }
+
+    #[tokio::test]
+    async fn test_manifest_deploy_get_list_idempotent() -> Result<()> {
+        let router = test_router();
+
+        let request = serde_json::json!({
+            "manifestVersion": "1.0",
+            "codeVersionId": "abc123",
+            "assets": [{
+                "key": {"namespace": "analytics", "name": "users"},
+                "id": "01HQXYZ123",
+                "description": "User analytics asset"
+            }],
+            "schedules": [{
+                "id": "daily-users",
+                "cron": "0 0 * * *",
+                "assets": ["analytics/users"],
+                "timezone": "UTC"
+            }]
+        });
+
+        let (status, deploy): (_, DeployManifestResponse) = helpers::post_json_with_headers(
+            router.clone(),
+            "/api/v1/workspaces/test-workspace/manifests",
+            request.clone(),
+            &[("Idempotency-Key", "idem-001")],
+        )
+        .await?;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(deploy.workspace_id, "test-workspace");
+        assert_eq!(deploy.code_version_id, "abc123");
+        assert_eq!(deploy.asset_count, 1);
+        assert!(!deploy.fingerprint.is_empty());
+
+        let (status, deploy_repeat): (_, DeployManifestResponse) =
+            helpers::post_json_with_headers(
+                router.clone(),
+                "/api/v1/workspaces/test-workspace/manifests",
+                request,
+                &[("Idempotency-Key", "idem-001")],
+            )
+            .await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(deploy_repeat.manifest_id, deploy.manifest_id);
+
+        let get_path = format!(
+            "/api/v1/workspaces/test-workspace/manifests/{}",
+            deploy.manifest_id
+        );
+        let (status, stored): (_, serde_json::Value) =
+            helpers::get_json(router.clone(), &get_path).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stored["manifestId"], deploy.manifest_id);
+
+        let (status, list): (_, ListManifestsResponse) = helpers::get_json(
+            router.clone(),
+            "/api/v1/workspaces/test-workspace/manifests",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(list
+            .manifests
+            .iter()
+            .any(|item| item.manifest_id == deploy.manifest_id));
+
+        let (status, _): (_, serde_json::Value) = helpers::get_json(
+            router,
+            "/api/v1/workspaces/test-workspace/manifests/does-not-exist",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Orchestration Tests
+// ============================================================================
+
+mod orchestration {
+    use super::*;
+    use serde::Deserialize;
+    use std::sync::Arc;
+
+    use chrono::Utc;
+
+    use arco_core::ScopedStorage;
+    use arco_core::storage::{MemoryBackend, StorageBackend};
+    use arco_flow::orchestration::LedgerWriter;
+    use arco_flow::orchestration::compactor::MicroCompactor;
+    use arco_flow::orchestration::controllers::ReadyDispatchController;
+    use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TriggerRunResponse {
+        run_id: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RunResponse {
+        run_id: String,
+        tasks: Vec<TaskSummary>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TaskSummary {
+        task_key: String,
+        attempt: u32,
+        state: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TaskCallbackResponse {
+        acknowledged: bool,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RunLogsResponse {
+        path: String,
+        size_bytes: u64,
+    }
+
+    #[tokio::test]
+    async fn test_servo_deploy_run_callbacks_and_logs() -> Result<()> {
+        let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let router = ServerBuilder::new()
+            .debug(true)
+            .storage_backend(backend.clone())
+            .build()
+            .test_router();
+
+        let manifest = serde_json::json!({
+            "manifestVersion": "1.0",
+            "codeVersionId": "abc123",
+            "assets": [{
+                "key": {"namespace": "analytics", "name": "users"},
+                "id": "01HQXYZ123",
+                "description": "User analytics asset"
+            }],
+            "schedules": [{
+                "id": "daily-users",
+                "cron": "0 0 * * *",
+                "assets": ["analytics.users"],
+                "timezone": "UTC"
+            }]
+        });
+
+        let (status, _deploy): (_, serde_json::Value) = helpers::post_json_with_headers(
+            router.clone(),
+            "/api/v1/workspaces/test-workspace/manifests",
+            manifest,
+            &[("Idempotency-Key", "idem-servo-001")],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let run_request = serde_json::json!({
+            "selection": ["analytics.users"],
+            "partitions": []
+        });
+        let (status, trigger): (_, TriggerRunResponse) = helpers::post_json(
+            router.clone(),
+            "/api/v1/workspaces/test-workspace/runs",
+            run_request,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let run_path = format!(
+            "/api/v1/workspaces/test-workspace/runs/{}",
+            trigger.run_id
+        );
+        let (status, run): (_, RunResponse) = helpers::get_json(
+            router.clone(),
+            &run_path,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(run.run_id, trigger.run_id);
+        let task = run.tasks.first().context("expected run task")?;
+        assert_eq!(task.attempt, 0);
+
+        let task_key = task.task_key.clone();
+        let storage = ScopedStorage::new(backend.clone(), "test-tenant", "test-workspace")?;
+        let ledger = LedgerWriter::new(storage.clone());
+        let compactor = MicroCompactor::new(storage.clone());
+        let (manifest, fold_state) = compactor.load_state().await?;
+        let ready_controller = ReadyDispatchController::with_defaults();
+        let ready_actions = ready_controller.reconcile(&manifest, &fold_state);
+        let ready_events: Vec<_> = ready_actions
+            .into_iter()
+            .filter_map(|action| action.into_event_data())
+            .map(|data| OrchestrationEvent::new("test-tenant", "test-workspace", data))
+            .collect();
+
+        let (attempt, attempt_id) = ready_events
+            .iter()
+            .find_map(|event| match &event.data {
+                OrchestrationEventData::DispatchRequested {
+                    task_key: event_task_key,
+                    attempt,
+                    attempt_id,
+                    ..
+                } if event_task_key == &task_key => Some((*attempt, attempt_id.clone())),
+                _ => None,
+            })
+            .context("expected DispatchRequested event for task")?;
+
+        let event_paths: Vec<_> = ready_events
+            .iter()
+            .map(LedgerWriter::event_path)
+            .collect();
+        ledger.append_all(ready_events).await?;
+        compactor.compact_events(event_paths).await?;
+
+        let started_request = serde_json::json!({
+            "attempt": attempt,
+            "attemptId": attempt_id,
+            "workerId": "worker-1",
+            "startedAt": Utc::now().to_rfc3339(),
+        });
+        let (status, started): (_, TaskCallbackResponse) = helpers::post_json_with_headers(
+            router.clone(),
+            &format!("/api/v1/tasks/{task_key}/started"),
+            started_request,
+            &[("Authorization", "Bearer test-token")],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(started.acknowledged);
+
+        let logs_request = serde_json::json!({
+            "taskKey": task_key.clone(),
+            "attempt": attempt,
+            "stdout": "hello stdout",
+            "stderr": "hello stderr",
+        });
+        let (status, logs): (_, RunLogsResponse) = helpers::post_json(
+            router.clone(),
+            &format!(
+                "/api/v1/workspaces/test-workspace/runs/{}/logs",
+                trigger.run_id
+            ),
+            logs_request,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(logs.path.contains("attempt-1.log"));
+        assert!(logs.size_bytes > 0);
+
+        let completed_request = serde_json::json!({
+            "attempt": attempt,
+            "attemptId": attempt_id,
+            "workerId": "worker-1",
+            "outcome": "SUCCEEDED",
+            "completedAt": Utc::now().to_rfc3339(),
+        });
+        let (status, completed): (_, TaskCallbackResponse) = helpers::post_json_with_headers(
+            router.clone(),
+            &format!("/api/v1/tasks/{task_key}/completed"),
+            completed_request,
+            &[("Authorization", "Bearer test-token")],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(completed.acknowledged);
+
+        let (status, finished): (_, RunResponse) = helpers::get_json(
+            router.clone(),
+            &run_path,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        let finished_task = finished
+            .tasks
+            .iter()
+            .find(|task| task.task_key == task_key)
+            .context("expected completed task")?;
+        assert_eq!(finished_task.state, "SUCCEEDED");
+
+        let (status, logs_text) = helpers::get_text(
+            router,
+            &format!(
+                "/api/v1/workspaces/test-workspace/runs/{}/logs",
+                trigger.run_id
+            ),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(logs_text.contains("=== stdout ==="));
+        assert!(logs_text.contains("hello stdout"));
+        assert!(logs_text.contains("=== stderr ==="));
+        assert!(logs_text.contains("hello stderr"));
+
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Cross-Cutting Tests
 // ============================================================================
 
@@ -621,7 +1000,43 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
 3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQIDAQAB
 -----END RSA PUBLIC KEY-----"#;
 
+    const TEST_USER_ID: &str = "test-user";
+
     fn make_test_jwt(tenant: &str, workspace: &str) -> Result<String> {
+        use serde::Serialize;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        #[derive(Debug, Serialize)]
+        struct Claims<'a> {
+            tenant: &'a str,
+            workspace: &'a str,
+            sub: &'a str,
+            exp: u64,
+        }
+
+        let exp = SystemTime::now()
+            .checked_add(Duration::from_secs(60 * 60))
+            .context("compute JWT expiry")?
+            .duration_since(UNIX_EPOCH)
+            .context("system time before unix epoch")?
+            .as_secs();
+
+        let claims = Claims {
+            tenant,
+            workspace,
+            sub: TEST_USER_ID,
+            exp,
+        };
+
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        )
+        .context("encode JWT")
+    }
+
+    fn make_test_jwt_without_user(tenant: &str, workspace: &str) -> Result<String> {
         use serde::Serialize;
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -661,6 +1076,7 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
         struct Claims<'a> {
             tenant: &'a str,
             workspace: &'a str,
+            sub: &'a str,
             exp: u64,
         }
 
@@ -674,6 +1090,7 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
         let claims = Claims {
             tenant,
             workspace,
+            sub: TEST_USER_ID,
             exp,
         };
 
@@ -738,6 +1155,35 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
             .context("read response body")?;
         let error: ErrorBody = serde_json::from_slice(&body).context("parse JSON body")?;
         assert_eq!(error.code, "MISSING_AUTH");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_production_mode_rejects_missing_user_claim() -> Result<()> {
+        #[derive(Debug, Deserialize)]
+        struct ErrorBody {
+            code: String,
+        }
+
+        let router = test_router_prod();
+        let jwt = make_test_jwt_without_user("test-tenant", "test-workspace")?;
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/namespaces")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(Body::empty())
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .context("read response body")?;
+        let error: ErrorBody = serde_json::from_slice(&body).context("parse JSON body")?;
+        assert_eq!(error.code, "INVALID_TOKEN");
 
         Ok(())
     }

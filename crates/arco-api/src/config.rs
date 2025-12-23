@@ -1,5 +1,6 @@
 //! Server configuration.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use arco_core::{Error, Result};
@@ -40,9 +41,19 @@ pub struct Config {
     #[serde(default)]
     pub storage: StorageConfig,
 
-    /// Compactor base URL for sync compaction (e.g., "http://compactor:8081").
+    /// Compactor base URL for sync compaction (e.g., `<http://compactor:8081>`).
     #[serde(default)]
     pub compactor_url: Option<String>,
+
+    /// Orchestration compactor base URL for sync compaction (e.g., `<http://servo-compactor:8080>`).
+    #[serde(default)]
+    pub orchestration_compactor_url: Option<String>,
+
+    /// Cutoff timestamp for strict `run_key` fingerprint validation (RFC3339).
+    ///
+    /// Reservations created before this cutoff allow missing fingerprints for backward compatibility.
+    #[serde(default)]
+    pub run_key_fingerprint_cutoff: Option<DateTime<Utc>>,
 }
 
 /// CORS configuration for browser-based access.
@@ -78,6 +89,8 @@ impl Default for Config {
             rate_limit: RateLimitConfig::default(),
             storage: StorageConfig::default(),
             compactor_url: None,
+            orchestration_compactor_url: None,
+            run_key_fingerprint_cutoff: None,
         }
     }
 }
@@ -108,8 +121,16 @@ impl Config {
     /// - `ARCO_JWT_PUBLIC_KEY_PATH`
     /// - `ARCO_JWT_ISSUER`
     /// - `ARCO_JWT_AUDIENCE`
+    /// - `ARCO_JWT_TENANT_CLAIM`
+    /// - `ARCO_JWT_WORKSPACE_CLAIM`
+    /// - `ARCO_JWT_USER_CLAIM`
     /// - `ARCO_STORAGE_BUCKET`
     /// - `ARCO_COMPACTOR_URL`
+    /// - `ARCO_ORCH_COMPACTOR_URL`
+    /// - `ARCO_RUN_KEY_FINGERPRINT_CUTOFF` (RFC3339, e.g. "2025-01-01T00:00:00Z")
+    ///
+    /// JWTs must include tenant/workspace/user claims. The user claim defaults
+    /// to `sub` unless overridden via `ARCO_JWT_USER_CLAIM`.
     ///
     /// # Errors
     ///
@@ -160,12 +181,27 @@ impl Config {
         if let Some(audience) = env_string("ARCO_JWT_AUDIENCE") {
             config.jwt.audience = Some(audience);
         }
+        if let Some(claim) = env_string("ARCO_JWT_TENANT_CLAIM") {
+            config.jwt.tenant_claim = claim;
+        }
+        if let Some(claim) = env_string("ARCO_JWT_WORKSPACE_CLAIM") {
+            config.jwt.workspace_claim = claim;
+        }
+        if let Some(claim) = env_string("ARCO_JWT_USER_CLAIM") {
+            config.jwt.user_claim = claim;
+        }
 
         if let Some(bucket) = env_string("ARCO_STORAGE_BUCKET") {
             config.storage.bucket = Some(bucket);
         }
         if let Some(url) = env_string("ARCO_COMPACTOR_URL") {
             config.compactor_url = Some(url);
+        }
+        if let Some(url) = env_string("ARCO_ORCH_COMPACTOR_URL") {
+            config.orchestration_compactor_url = Some(url);
+        }
+        if let Some(cutoff) = env_datetime("ARCO_RUN_KEY_FINGERPRINT_CUTOFF")? {
+            config.run_key_fingerprint_cutoff = Some(cutoff);
         }
 
         Ok(config)
@@ -215,6 +251,16 @@ fn env_bool(name: &str) -> Result<Option<bool>> {
     }
 }
 
+fn env_datetime(name: &str) -> Result<Option<DateTime<Utc>>> {
+    let Some(v) = env_string(name) else {
+        return Ok(None);
+    };
+    let parsed = DateTime::parse_from_rfc3339(&v).map_err(|e| {
+        Error::InvalidInput(format!("{name} must be RFC3339 (e.g. 2025-01-01T00:00:00Z): {e}"))
+    })?;
+    Ok(Some(parsed.with_timezone(&Utc)))
+}
+
 fn parse_cors_allowed_origins(value: &str) -> Vec<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -233,7 +279,7 @@ fn parse_cors_allowed_origins(value: &str) -> Vec<String> {
 }
 
 /// JWT configuration for production authentication.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JwtConfig {
     /// HS256 secret used to verify bearer tokens.
     ///
@@ -254,6 +300,44 @@ pub struct JwtConfig {
     /// Optional audience (`aud`) to enforce.
     #[serde(default)]
     pub audience: Option<String>,
+
+    /// Claim name that contains the tenant identifier.
+    #[serde(default = "default_tenant_claim")]
+    pub tenant_claim: String,
+
+    /// Claim name that contains the workspace identifier.
+    #[serde(default = "default_workspace_claim")]
+    pub workspace_claim: String,
+
+    /// Claim name that contains the user identifier.
+    #[serde(default = "default_user_claim")]
+    pub user_claim: String,
+}
+
+impl Default for JwtConfig {
+    fn default() -> Self {
+        Self {
+            hs256_secret: None,
+            rs256_public_key_pem: None,
+            issuer: None,
+            audience: None,
+            tenant_claim: default_tenant_claim(),
+            workspace_claim: default_workspace_claim(),
+            user_claim: default_user_claim(),
+        }
+    }
+}
+
+fn default_tenant_claim() -> String {
+    "tenant".to_string()
+}
+
+fn default_workspace_claim() -> String {
+    "workspace".to_string()
+}
+
+fn default_user_claim() -> String {
+    "sub".to_string()
 }
 
 fn normalize_pem(pem: &str) -> String {

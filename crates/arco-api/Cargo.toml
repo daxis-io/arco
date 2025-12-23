@@ -46,12 +46,15 @@ tonic = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+bytes = { workspace = true }
 
 # IDs
 ulid = { workspace = true }
 
 # Hashing/encoding
 base64 = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
 
 # Time
 chrono = { workspace = true }
@@ -64,7 +67,7 @@ anyhow = { workspace = true }
 jsonwebtoken = "9"
 
 # OpenAPI
-utoipa = { version = "5.4.0", features = ["axum_extras"] }
+utoipa = { version = "5.4.0", features = ["axum_extras", "chrono"] }
 
 # Logging
 tracing = { workspace = true }

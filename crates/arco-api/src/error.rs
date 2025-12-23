@@ -96,6 +96,11 @@ impl ApiError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", message)
     }
 
+    /// Returns a not implemented error response.
+    pub fn not_implemented(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_IMPLEMENTED, "NOT_IMPLEMENTED", message)
+    }
+
     /// Attaches a request ID for correlation.
     #[must_use]
     pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {

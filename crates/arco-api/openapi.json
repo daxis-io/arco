@@ -888,6 +888,1045 @@
           }
         ]
       }
+    },
+    "/api/v1/tasks/{task_id}/completed": {
+      "post": {
+        "tags": [
+          "Worker Callbacks"
+        ],
+        "summary": "Worker task completed callback.",
+        "description": "Called when a worker finishes executing a task (success, failure, or cancellation).",
+        "operationId": "task_completed",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "description": "Task ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskCompletedRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Completion acknowledged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskCompletedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallbackErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or missing token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallbackErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Task not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallbackErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict (terminal state or attempt mismatch)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallbackErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "taskAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/tasks/{task_id}/heartbeat": {
+      "post": {
+        "tags": [
+          "Worker Callbacks"
+        ],
+        "summary": "Worker heartbeat callback.",
+        "description": "Called periodically by workers to indicate they're still alive and report progress.",
+        "operationId": "task_heartbeat",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "description": "Task ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HeartbeatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Heartbeat acknowledged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HeartbeatResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallbackErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or missing token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallbackErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Task not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallbackErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict (attempt mismatch)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallbackErrorResponse"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Task no longer active",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallbackErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "taskAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/tasks/{task_id}/started": {
+      "post": {
+        "tags": [
+          "Worker Callbacks"
+        ],
+        "summary": "Worker started execution callback.",
+        "description": "Called when a worker begins executing a task.",
+        "operationId": "task_started",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "description": "Task ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskStartedRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Callback acknowledged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskStartedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallbackErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or missing token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallbackErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Task not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallbackErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict (terminal state or attempt mismatch)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallbackErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "taskAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/manifests": {
+      "get": {
+        "tags": [
+          "Manifests"
+        ],
+        "summary": "List manifests.",
+        "description": "Returns a list of deployed manifests for the workspace.",
+        "operationId": "list_manifests",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of manifests",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListManifestsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workspace not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Manifests"
+        ],
+        "summary": "Deploy a new manifest.",
+        "description": "Uploads and registers an asset manifest for the workspace.",
+        "operationId": "deploy_manifest",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeployManifestRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Manifest deployed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeployManifestResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid manifest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workspace not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/manifests/{manifest_id}": {
+      "get": {
+        "tags": [
+          "Manifests"
+        ],
+        "summary": "Get manifest by ID.",
+        "description": "Returns the full manifest including all asset definitions.",
+        "operationId": "get_manifest",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "manifest_id",
+            "in": "path",
+            "description": "Manifest ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Manifest details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoredManifest"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Manifest not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/runs": {
+      "get": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "List runs.",
+        "description": "Returns a paginated list of runs for the workspace.",
+        "operationId": "list_runs",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum runs to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Pagination cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "Filter by state",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/RunStateResponse"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of runs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListRunsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workspace not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "Trigger a new run.",
+        "description": "Creates an execution plan and starts a new run for the selected assets.",
+        "operationId": "trigger_run",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TriggerRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Existing run returned (run_key match)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TriggerRunResponse"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Run created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TriggerRunResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workspace not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "run_key conflict (payload mismatch)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/runs/run-key/backfill": {
+      "post": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "Backfill missing run_key fingerprints.",
+        "description": "Allows updating legacy reservations that were created before fingerprints\nwere introduced, enabling strict payload validation moving forward.",
+        "operationId": "backfill_run_key",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunKeyBackfillRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Backfill result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunKeyBackfillResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "run_key not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "run_key fingerprint conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/runs/{run_id}": {
+      "get": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "Get run by ID.",
+        "description": "Returns the current state and task details for a run.",
+        "operationId": "get_run",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "path",
+            "description": "Run ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Run not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/runs/{run_id}/cancel": {
+      "post": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "Cancel a run.",
+        "description": "Initiates cancellation of a running run.",
+        "operationId": "cancel_run",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "path",
+            "description": "Run ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Run cancelled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CancelRunResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Run not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Run already completed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/runs/{run_id}/logs": {
+      "get": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "Get logs for a run.",
+        "operationId": "get_run_logs",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "path",
+            "description": "Run ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "taskKey",
+            "in": "query",
+            "description": "Filter by task key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Aggregated logs",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Logs not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "Upload task logs for a run.",
+        "operationId": "upload_run_logs",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "path",
+            "description": "Run ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunLogsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Logs stored",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunLogsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workspace not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Log already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -944,6 +1983,202 @@
               "null"
             ],
             "description": "Optional request ID for correlation."
+          }
+        }
+      },
+      "AssetDependency": {
+        "type": "object",
+        "description": "Asset dependency.",
+        "required": [
+          "upstreamKey"
+        ],
+        "properties": {
+          "mapping": {
+            "type": "string",
+            "description": "Partition mapping strategy."
+          },
+          "parameterName": {
+            "type": "string",
+            "description": "Parameter name in function signature."
+          },
+          "upstreamKey": {
+            "$ref": "#/components/schemas/AssetKey",
+            "description": "Upstream asset key."
+          }
+        }
+      },
+      "AssetEntry": {
+        "type": "object",
+        "description": "Asset entry in manifest.",
+        "required": [
+          "key",
+          "id"
+        ],
+        "properties": {
+          "checks": {
+            "type": "array",
+            "items": {},
+            "description": "Data quality checks."
+          },
+          "code": {
+            "description": "Code location."
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AssetDependency"
+            },
+            "description": "Dependencies on other assets."
+          },
+          "description": {
+            "type": "string",
+            "description": "Asset description."
+          },
+          "execution": {
+            "description": "Execution configuration."
+          },
+          "id": {
+            "type": "string",
+            "description": "Asset ID (ULID)."
+          },
+          "io": {
+            "description": "I/O configuration."
+          },
+          "key": {
+            "$ref": "#/components/schemas/AssetKey",
+            "description": "Asset key (namespace + name)."
+          },
+          "owners": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Asset owners."
+          },
+          "partitioning": {
+            "description": "Partitioning configuration."
+          },
+          "resources": {
+            "description": "Resource requirements."
+          },
+          "tags": {
+            "description": "Asset tags."
+          },
+          "transformFingerprint": {
+            "type": "string",
+            "description": "Transform fingerprint for change detection."
+          }
+        }
+      },
+      "AssetKey": {
+        "type": "object",
+        "description": "Asset key (namespace + name).",
+        "required": [
+          "namespace",
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Asset name."
+          },
+          "namespace": {
+            "type": "string",
+            "description": "Namespace."
+          }
+        }
+      },
+      "CallbackErrorResponse": {
+        "type": "object",
+        "description": "Callback error response per ADR-023.",
+        "required": [
+          "error",
+          "message"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Error code."
+          },
+          "expectedAttempt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Expected attempt (for 409 Conflict).",
+            "minimum": 0
+          },
+          "expectedAttemptId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Expected attempt ID (for 409 Conflict)."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable message."
+          },
+          "receivedAttempt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Received attempt (for 409 Conflict).",
+            "minimum": 0
+          },
+          "receivedAttemptId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Received attempt ID (for 409 Conflict)."
+          },
+          "state": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Current task state (for 409 Conflict)."
+          }
+        }
+      },
+      "CancelRunRequest": {
+        "type": "object",
+        "description": "Request to cancel a run.",
+        "properties": {
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Reason for cancellation."
+          }
+        }
+      },
+      "CancelRunResponse": {
+        "type": "object",
+        "description": "Response after cancelling a run.",
+        "required": [
+          "runId",
+          "state",
+          "cancelledAt"
+        ],
+        "properties": {
+          "cancelledAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Cancellation timestamp."
+          },
+          "runId": {
+            "type": "string",
+            "description": "Run ID."
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunStateResponse",
+            "description": "New state (should be CANCELLED or CANCELLING)."
           }
         }
       },
@@ -1037,6 +2272,94 @@
           }
         }
       },
+      "DeployManifestRequest": {
+        "type": "object",
+        "description": "Request to deploy a new manifest.",
+        "required": [
+          "manifestVersion",
+          "codeVersionId",
+          "assets"
+        ],
+        "properties": {
+          "assets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AssetEntry"
+            },
+            "description": "Asset definitions."
+          },
+          "codeVersionId": {
+            "type": "string",
+            "description": "Code version identifier (e.g., git commit SHA)."
+          },
+          "deployedBy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who deployed this manifest."
+          },
+          "git": {
+            "$ref": "#/components/schemas/GitContext",
+            "description": "Git context for provenance."
+          },
+          "manifestVersion": {
+            "type": "string",
+            "description": "Manifest version (e.g., \"1.0\")."
+          },
+          "metadata": {
+            "description": "Additional metadata."
+          },
+          "schedules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScheduleEntry"
+            },
+            "description": "Cron schedules (optional)."
+          }
+        }
+      },
+      "DeployManifestResponse": {
+        "type": "object",
+        "description": "Response after deploying a manifest.",
+        "required": [
+          "manifestId",
+          "workspaceId",
+          "codeVersionId",
+          "fingerprint",
+          "assetCount",
+          "deployedAt"
+        ],
+        "properties": {
+          "assetCount": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of assets in manifest.",
+            "minimum": 0
+          },
+          "codeVersionId": {
+            "type": "string",
+            "description": "Code version ID."
+          },
+          "deployedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Deployment timestamp."
+          },
+          "fingerprint": {
+            "type": "string",
+            "description": "Content fingerprint (SHA-256)."
+          },
+          "manifestId": {
+            "type": "string",
+            "description": "Manifest ID (ULID)."
+          },
+          "workspaceId": {
+            "type": "string",
+            "description": "Workspace ID."
+          }
+        }
+      },
       "EdgeDefinition": {
         "type": "object",
         "description": "Edge definition for lineage.",
@@ -1106,6 +2429,135 @@
           }
         }
       },
+      "ErrorCategory": {
+        "type": "string",
+        "description": "Error category per ADR-023.",
+        "enum": [
+          "USER_CODE",
+          "DATA_QUALITY",
+          "INFRASTRUCTURE",
+          "CONFIGURATION",
+          "TIMEOUT",
+          "CANCELLED"
+        ]
+      },
+      "GitContext": {
+        "type": "object",
+        "description": "Git context for deployment provenance.",
+        "properties": {
+          "author": {
+            "type": "string",
+            "description": "Author."
+          },
+          "branch": {
+            "type": "string",
+            "description": "Branch name."
+          },
+          "commitMessage": {
+            "type": "string",
+            "description": "Commit message."
+          },
+          "commitSha": {
+            "type": "string",
+            "description": "Commit SHA."
+          },
+          "dirty": {
+            "type": "boolean",
+            "description": "Whether working directory was dirty."
+          },
+          "repository": {
+            "type": "string",
+            "description": "Repository URL."
+          }
+        }
+      },
+      "HeartbeatRequest": {
+        "type": "object",
+        "description": "Request body for `/v1/tasks/{task_id}/heartbeat`.",
+        "required": [
+          "attempt",
+          "attemptId",
+          "workerId"
+        ],
+        "properties": {
+          "attempt": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Attempt number.",
+            "minimum": 0
+          },
+          "attemptId": {
+            "type": "string",
+            "description": "Attempt identifier (ULID) - concurrency guard."
+          },
+          "heartbeatAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When heartbeat was sent (optional, uses server time if omitted)."
+          },
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional status message."
+          },
+          "progressPct": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Optional progress percentage (0-100).",
+            "minimum": 0
+          },
+          "traceparent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional W3C traceparent for distributed tracing."
+          },
+          "workerId": {
+            "type": "string",
+            "description": "Worker identifier."
+          }
+        }
+      },
+      "HeartbeatResponse": {
+        "type": "object",
+        "description": "Response body for successful `/v1/tasks/{task_id}/heartbeat`.",
+        "required": [
+          "acknowledged",
+          "shouldCancel",
+          "serverTime"
+        ],
+        "properties": {
+          "acknowledged": {
+            "type": "boolean",
+            "description": "Whether the heartbeat was acknowledged."
+          },
+          "cancelReason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Reason for cancellation (if `should_cancel` is true)."
+          },
+          "serverTime": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server timestamp."
+          },
+          "shouldCancel": {
+            "type": "boolean",
+            "description": "Whether the worker should cancel."
+          }
+        }
+      },
       "LineageResponse": {
         "type": "object",
         "description": "Get lineage response.",
@@ -1135,6 +2587,22 @@
           }
         }
       },
+      "ListManifestsResponse": {
+        "type": "object",
+        "description": "Response for listing manifests.",
+        "required": [
+          "manifests"
+        ],
+        "properties": {
+          "manifests": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ManifestListItem"
+            },
+            "description": "List of manifests."
+          }
+        }
+      },
       "ListNamespacesResponse": {
         "type": "object",
         "description": "List namespaces response.",
@@ -1151,6 +2619,29 @@
           }
         }
       },
+      "ListRunsResponse": {
+        "type": "object",
+        "description": "Response for listing runs.",
+        "required": [
+          "runs"
+        ],
+        "properties": {
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Next page cursor."
+          },
+          "runs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RunListItem"
+            },
+            "description": "List of runs."
+          }
+        }
+      },
       "ListTablesResponse": {
         "type": "object",
         "description": "List tables response.",
@@ -1164,6 +2655,61 @@
               "$ref": "#/components/schemas/TableResponse"
             },
             "description": "List of tables."
+          }
+        }
+      },
+      "ManifestListItem": {
+        "type": "object",
+        "description": "Manifest list item.",
+        "required": [
+          "manifestId",
+          "codeVersionId",
+          "fingerprint",
+          "assetCount",
+          "deployedAt",
+          "deployedBy"
+        ],
+        "properties": {
+          "assetCount": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of assets.",
+            "minimum": 0
+          },
+          "codeVersionId": {
+            "type": "string",
+            "description": "Code version ID."
+          },
+          "deployedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Deployment timestamp."
+          },
+          "deployedBy": {
+            "type": "string",
+            "description": "Who deployed this."
+          },
+          "fingerprint": {
+            "type": "string",
+            "description": "Content fingerprint."
+          },
+          "gitBranch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Git branch (if available)."
+          },
+          "gitCommit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Git commit (if available)."
+          },
+          "manifestId": {
+            "type": "string",
+            "description": "Manifest ID."
           }
         }
       },
@@ -1255,6 +2801,24 @@
           }
         }
       },
+      "PartitionValue": {
+        "type": "object",
+        "description": "Partition key-value pair.",
+        "required": [
+          "key",
+          "value"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "Partition dimension name."
+          },
+          "value": {
+            "type": "string",
+            "description": "Partition value."
+          }
+        }
+      },
       "RegisterTableRequest": {
         "type": "object",
         "description": "Request to register a table.",
@@ -1283,6 +2847,307 @@
           }
         }
       },
+      "RunKeyBackfillRequest": {
+        "type": "object",
+        "description": "Request to backfill a `run_key` reservation fingerprint.",
+        "required": [
+          "runKey"
+        ],
+        "properties": {
+          "labels": {
+            "type": "object",
+            "description": "Additional labels for the run.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "partitions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PartitionValue"
+            },
+            "description": "Partition overrides (key=value pairs)."
+          },
+          "runKey": {
+            "type": "string",
+            "description": "Idempotency key to backfill."
+          },
+          "selection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Asset selection (asset keys to materialize)."
+          }
+        }
+      },
+      "RunKeyBackfillResponse": {
+        "type": "object",
+        "description": "Response after backfilling a `run_key` reservation.",
+        "required": [
+          "runKey",
+          "runId",
+          "requestFingerprint",
+          "updated",
+          "createdAt"
+        ],
+        "properties": {
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Reservation creation timestamp."
+          },
+          "requestFingerprint": {
+            "type": "string",
+            "description": "Fingerprint stored on the reservation."
+          },
+          "runId": {
+            "type": "string",
+            "description": "Run ID associated with the reservation."
+          },
+          "runKey": {
+            "type": "string",
+            "description": "Run key that was updated."
+          },
+          "updated": {
+            "type": "boolean",
+            "description": "Whether the reservation was updated."
+          }
+        }
+      },
+      "RunListItem": {
+        "type": "object",
+        "description": "Run list item (summary).",
+        "required": [
+          "runId",
+          "state",
+          "createdAt",
+          "taskCount",
+          "tasksSucceeded",
+          "tasksFailed"
+        ],
+        "properties": {
+          "completedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Completion timestamp."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Creation timestamp."
+          },
+          "runId": {
+            "type": "string",
+            "description": "Run ID."
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunStateResponse",
+            "description": "Current state."
+          },
+          "taskCount": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Total task count.",
+            "minimum": 0
+          },
+          "tasksFailed": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Tasks failed.",
+            "minimum": 0
+          },
+          "tasksSucceeded": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Tasks succeeded.",
+            "minimum": 0
+          }
+        }
+      },
+      "RunLogsQuery": {
+        "type": "object",
+        "description": "Query parameters for retrieving logs.",
+        "properties": {
+          "taskKey": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Filter by task key."
+          }
+        }
+      },
+      "RunLogsRequest": {
+        "type": "object",
+        "description": "Request to upload logs for a task run.",
+        "required": [
+          "taskKey",
+          "attempt"
+        ],
+        "properties": {
+          "attempt": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Attempt number (1-indexed).",
+            "minimum": 0
+          },
+          "stderr": {
+            "type": "string",
+            "description": "Captured stderr."
+          },
+          "stdout": {
+            "type": "string",
+            "description": "Captured stdout."
+          },
+          "taskKey": {
+            "type": "string",
+            "description": "Task key that produced the logs."
+          }
+        }
+      },
+      "RunLogsResponse": {
+        "type": "object",
+        "description": "Response after uploading logs.",
+        "required": [
+          "path",
+          "sizeBytes"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Stored log path (relative to workspace scope)."
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Size of the stored log payload in bytes.",
+            "minimum": 0
+          }
+        }
+      },
+      "RunResponse": {
+        "type": "object",
+        "description": "Full run details response.",
+        "required": [
+          "runId",
+          "workspaceId",
+          "planId",
+          "state",
+          "createdAt",
+          "tasks",
+          "taskCounts"
+        ],
+        "properties": {
+          "completedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Run completion timestamp."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Run creation timestamp."
+          },
+          "labels": {
+            "type": "object",
+            "description": "Run labels.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "planId": {
+            "type": "string",
+            "description": "Plan ID."
+          },
+          "runId": {
+            "type": "string",
+            "description": "Run ID."
+          },
+          "startedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Run start timestamp (when first task started)."
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunStateResponse",
+            "description": "Current state."
+          },
+          "taskCounts": {
+            "$ref": "#/components/schemas/TaskCounts",
+            "description": "Task counts by state."
+          },
+          "tasks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TaskSummary"
+            },
+            "description": "Task execution summaries."
+          },
+          "workspaceId": {
+            "type": "string",
+            "description": "Workspace ID."
+          }
+        }
+      },
+      "RunStateResponse": {
+        "type": "string",
+        "description": "Run state values.",
+        "enum": [
+          "PENDING",
+          "RUNNING",
+          "CANCELLING",
+          "SUCCEEDED",
+          "FAILED",
+          "CANCELLED",
+          "TIMED_OUT"
+        ]
+      },
+      "ScheduleEntry": {
+        "type": "object",
+        "description": "Cron schedule entry.",
+        "required": [
+          "id",
+          "cron",
+          "assets"
+        ],
+        "properties": {
+          "assets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Assets to trigger."
+          },
+          "cron": {
+            "type": "string",
+            "description": "Cron expression."
+          },
+          "id": {
+            "type": "string",
+            "description": "Schedule identifier."
+          },
+          "timezone": {
+            "type": "string",
+            "description": "Timezone."
+          }
+        }
+      },
       "SignedUrl": {
         "type": "object",
         "description": "A single signed URL.",
@@ -1298,6 +3163,80 @@
           "url": {
             "type": "string",
             "description": "Signed URL (valid for TTL)."
+          }
+        }
+      },
+      "StoredManifest": {
+        "type": "object",
+        "description": "Stored manifest metadata (what gets persisted).",
+        "required": [
+          "manifestId",
+          "tenantId",
+          "workspaceId",
+          "manifestVersion",
+          "codeVersionId",
+          "fingerprint",
+          "git",
+          "assets",
+          "schedules",
+          "deployedAt",
+          "deployedBy",
+          "metadata"
+        ],
+        "properties": {
+          "assets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AssetEntry"
+            },
+            "description": "Asset entries."
+          },
+          "codeVersionId": {
+            "type": "string",
+            "description": "Code version ID."
+          },
+          "deployedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Deployment timestamp."
+          },
+          "deployedBy": {
+            "type": "string",
+            "description": "Who deployed this."
+          },
+          "fingerprint": {
+            "type": "string",
+            "description": "Content fingerprint."
+          },
+          "git": {
+            "$ref": "#/components/schemas/GitContext",
+            "description": "Git context."
+          },
+          "manifestId": {
+            "type": "string",
+            "description": "Manifest ID."
+          },
+          "manifestVersion": {
+            "type": "string",
+            "description": "Manifest version."
+          },
+          "metadata": {
+            "description": "Additional metadata."
+          },
+          "schedules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScheduleEntry"
+            },
+            "description": "Schedules."
+          },
+          "tenantId": {
+            "type": "string",
+            "description": "Tenant ID."
+          },
+          "workspaceId": {
+            "type": "string",
+            "description": "Workspace ID."
           }
         }
       },
@@ -1349,6 +3288,492 @@
           }
         }
       },
+      "TaskCompletedRequest": {
+        "type": "object",
+        "description": "Request body for `/v1/tasks/{task_id}/completed`.",
+        "required": [
+          "attempt",
+          "attemptId",
+          "workerId",
+          "outcome"
+        ],
+        "properties": {
+          "attempt": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Attempt number.",
+            "minimum": 0
+          },
+          "attemptId": {
+            "type": "string",
+            "description": "Attempt identifier (ULID) - concurrency guard."
+          },
+          "cancelledDuringPhase": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Phase when cancellation occurred (for CANCELLED outcome)."
+          },
+          "completedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When execution completed (optional, uses server time if omitted)."
+          },
+          "error": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TaskError",
+                "description": "Error details for failed tasks."
+              }
+            ]
+          },
+          "metrics": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TaskMetrics",
+                "description": "Execution metrics."
+              }
+            ]
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/WorkerOutcome",
+            "description": "Task outcome."
+          },
+          "output": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TaskOutput",
+                "description": "Output for successful tasks."
+              }
+            ]
+          },
+          "partialProgress": {
+            "description": "Partial progress at cancellation."
+          },
+          "traceparent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional W3C traceparent for distributed tracing."
+          },
+          "workerId": {
+            "type": "string",
+            "description": "Worker identifier."
+          }
+        }
+      },
+      "TaskCompletedResponse": {
+        "type": "object",
+        "description": "Response body for successful `/v1/tasks/{task_id}/completed`.",
+        "required": [
+          "acknowledged",
+          "finalState",
+          "serverTime"
+        ],
+        "properties": {
+          "acknowledged": {
+            "type": "boolean",
+            "description": "Whether the completion was acknowledged."
+          },
+          "finalState": {
+            "type": "string",
+            "description": "Final task state."
+          },
+          "serverTime": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server timestamp."
+          }
+        }
+      },
+      "TaskCounts": {
+        "type": "object",
+        "description": "Task counts by state.",
+        "required": [
+          "total",
+          "pending",
+          "queued",
+          "running",
+          "succeeded",
+          "failed",
+          "skipped",
+          "cancelled"
+        ],
+        "properties": {
+          "cancelled": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Cancelled tasks.",
+            "minimum": 0
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Failed tasks.",
+            "minimum": 0
+          },
+          "pending": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Pending tasks.",
+            "minimum": 0
+          },
+          "queued": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Queued tasks.",
+            "minimum": 0
+          },
+          "running": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Running tasks.",
+            "minimum": 0
+          },
+          "skipped": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Skipped tasks.",
+            "minimum": 0
+          },
+          "succeeded": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Succeeded tasks.",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Total tasks.",
+            "minimum": 0
+          }
+        }
+      },
+      "TaskError": {
+        "type": "object",
+        "description": "Error details from a failed task.",
+        "required": [
+          "category",
+          "message"
+        ],
+        "properties": {
+          "category": {
+            "$ref": "#/components/schemas/ErrorCategory",
+            "description": "Error category per ADR-023."
+          },
+          "message": {
+            "type": "string",
+            "description": "Error message."
+          },
+          "retryable": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the error is retryable."
+          },
+          "stackTrace": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Stack trace (optional)."
+          }
+        }
+      },
+      "TaskMetrics": {
+        "type": "object",
+        "description": "Execution metrics from the worker.",
+        "properties": {
+          "cpuTimeMs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "CPU time in milliseconds.",
+            "minimum": 0
+          },
+          "ioReadBytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "I/O read bytes.",
+            "minimum": 0
+          },
+          "ioWriteBytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "I/O write bytes.",
+            "minimum": 0
+          },
+          "peakMemoryBytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Peak memory usage in bytes.",
+            "minimum": 0
+          }
+        }
+      },
+      "TaskOutput": {
+        "type": "object",
+        "description": "Output from a successful task.",
+        "properties": {
+          "byteSize": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Size in bytes.",
+            "minimum": 0
+          },
+          "materializationId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Materialization identifier."
+          },
+          "outputPath": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Output path."
+          },
+          "rowCount": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Number of rows produced.",
+            "minimum": 0
+          }
+        }
+      },
+      "TaskStartedRequest": {
+        "type": "object",
+        "description": "Request body for `/v1/tasks/{task_id}/started`.",
+        "required": [
+          "attempt",
+          "attemptId",
+          "workerId"
+        ],
+        "properties": {
+          "attempt": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Attempt number (1-indexed).",
+            "minimum": 0
+          },
+          "attemptId": {
+            "type": "string",
+            "description": "Attempt identifier (ULID) - concurrency guard."
+          },
+          "startedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When execution started (optional, uses server time if omitted)."
+          },
+          "traceparent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional W3C traceparent for distributed tracing."
+          },
+          "workerId": {
+            "type": "string",
+            "description": "Worker identifier."
+          }
+        }
+      },
+      "TaskStartedResponse": {
+        "type": "object",
+        "description": "Response body for successful `/v1/tasks/{task_id}/started`.",
+        "required": [
+          "acknowledged",
+          "serverTime"
+        ],
+        "properties": {
+          "acknowledged": {
+            "type": "boolean",
+            "description": "Whether the callback was acknowledged."
+          },
+          "serverTime": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server timestamp."
+          }
+        }
+      },
+      "TaskStateResponse": {
+        "type": "string",
+        "description": "Task state values.",
+        "enum": [
+          "PENDING",
+          "QUEUED",
+          "RUNNING",
+          "SUCCEEDED",
+          "FAILED",
+          "SKIPPED",
+          "CANCELLED"
+        ]
+      },
+      "TaskSummary": {
+        "type": "object",
+        "description": "Task execution summary.",
+        "required": [
+          "taskKey",
+          "state",
+          "attempt"
+        ],
+        "properties": {
+          "assetKey": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Asset key (if asset task)."
+          },
+          "attempt": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Current attempt number.",
+            "minimum": 0
+          },
+          "completedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Task completion time."
+          },
+          "errorMessage": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Error message (if failed)."
+          },
+          "startedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Task start time."
+          },
+          "state": {
+            "$ref": "#/components/schemas/TaskStateResponse",
+            "description": "Task state."
+          },
+          "taskKey": {
+            "type": "string",
+            "description": "Task key."
+          }
+        }
+      },
+      "TriggerRunRequest": {
+        "type": "object",
+        "description": "Request to trigger a new run.",
+        "properties": {
+          "labels": {
+            "type": "object",
+            "description": "Additional labels for the run.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "partitions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PartitionValue"
+            },
+            "description": "Partition overrides (key=value pairs)."
+          },
+          "runKey": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Idempotency key for deduplication (409 if reused with different payload).\nReservations created before the fingerprint cutoff remain lenient."
+          },
+          "selection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Asset selection (asset keys to materialize)."
+          }
+        }
+      },
+      "TriggerRunResponse": {
+        "type": "object",
+        "description": "Response after triggering a run.",
+        "required": [
+          "runId",
+          "planId",
+          "state",
+          "created",
+          "createdAt"
+        ],
+        "properties": {
+          "created": {
+            "type": "boolean",
+            "description": "Whether this is a new run or an existing one (`run_key` deduplication)."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Run creation timestamp."
+          },
+          "planId": {
+            "type": "string",
+            "description": "Plan ID for this run."
+          },
+          "runId": {
+            "type": "string",
+            "description": "Run ID (ULID)."
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunStateResponse",
+            "description": "Current run state."
+          }
+        }
+      },
       "UpdateTableRequest": {
         "type": "object",
         "description": "Request to update a table.",
@@ -1361,10 +3786,24 @@
             "description": "Optional new description."
           }
         }
+      },
+      "WorkerOutcome": {
+        "type": "string",
+        "description": "Worker-reported task outcome.",
+        "enum": [
+          "SUCCEEDED",
+          "FAILED",
+          "CANCELLED"
+        ]
       }
     },
     "securitySchemes": {
       "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      },
+      "taskAuth": {
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "JWT"
@@ -1387,6 +3826,18 @@
     {
       "name": "browser",
       "description": "Browser signed URL minting"
+    },
+    {
+      "name": "Orchestration",
+      "description": "Run orchestration operations"
+    },
+    {
+      "name": "Manifests",
+      "description": "Manifest deployment operations"
+    },
+    {
+      "name": "Worker Callbacks",
+      "description": "Worker task lifecycle callbacks"
     }
   ]
 }

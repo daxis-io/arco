@@ -1,7 +1,9 @@
 //! Request context extraction and authentication middleware.
 //!
 //! In debug mode, tenant/workspace are supplied via headers for local development.
-//! In production mode, tenant/workspace are extracted from a verified JWT.
+//! In production mode, tenant/workspace are extracted from a verified JWT. A user
+//! identifier claim is also required (default `sub`, configurable via
+//! `ARCO_JWT_USER_CLAIM`).
 
 use std::sync::Arc;
 
@@ -15,7 +17,7 @@ use axum::http::{HeaderMap, HeaderValue, Request};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
-use serde::Deserialize;
+use serde_json::Value;
 use ulid::Ulid;
 
 use arco_core::ScopedStorage;
@@ -34,6 +36,8 @@ pub struct RequestContext {
     pub tenant: String,
     /// Workspace identifier.
     pub workspace: String,
+    /// Optional user identifier (from JWT or debug headers).
+    pub user_id: Option<String>,
     /// Request ID for tracing/correlation.
     pub request_id: String,
     /// Optional idempotency key (safe retries).
@@ -54,12 +58,6 @@ impl RequestContext {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct Claims {
-    tenant: String,
-    workspace: String,
-}
-
 #[async_trait]
 impl FromRequestParts<Arc<AppState>> for RequestContext {
     type Rejection = ApiError;
@@ -78,7 +76,7 @@ impl FromRequestParts<Arc<AppState>> for RequestContext {
             request_id_from_headers(headers).unwrap_or_else(|| Ulid::new().to_string());
         let idempotency_key = header_string(headers, "Idempotency-Key");
 
-        let (tenant, workspace) = if state.config.debug {
+        let (tenant, workspace, user_id) = if state.config.debug {
             let tenant = header_string(headers, "X-Tenant-Id").ok_or_else(|| {
                 ApiError::unauthorized("missing X-Tenant-Id header (debug mode)")
                     .with_request_id(request_id.clone())
@@ -87,7 +85,8 @@ impl FromRequestParts<Arc<AppState>> for RequestContext {
                 ApiError::unauthorized("missing X-Workspace-Id header (debug mode)")
                     .with_request_id(request_id.clone())
             })?;
-            (tenant, workspace)
+            let user_id = user_id_from_headers(headers);
+            (tenant, workspace, user_id)
         } else {
             extract_from_jwt(headers, state, &request_id)?
         };
@@ -95,6 +94,7 @@ impl FromRequestParts<Arc<AppState>> for RequestContext {
         let ctx = Self {
             tenant,
             workspace,
+            user_id,
             request_id,
             idempotency_key,
         };
@@ -108,7 +108,7 @@ fn extract_from_jwt(
     headers: &HeaderMap,
     state: &AppState,
     request_id: &str,
-) -> Result<(String, String), ApiError> {
+) -> Result<(String, String, Option<String>), ApiError> {
     let token = bearer_token(headers)
         .ok_or_else(|| ApiError::missing_auth().with_request_id(request_id.to_string()))?;
 
@@ -123,10 +123,18 @@ fn extract_from_jwt(
         validation.set_audience(&[aud]);
     }
 
-    let data = jsonwebtoken::decode::<Claims>(&token, &decoding_key, &validation)
-    .map_err(|_| ApiError::invalid_token().with_request_id(request_id.to_string()))?;
+    let data = jsonwebtoken::decode::<Value>(&token, &decoding_key, &validation)
+        .map_err(|_| ApiError::invalid_token().with_request_id(request_id.to_string()))?;
 
-    Ok((data.claims.tenant, data.claims.workspace))
+    let Some(obj) = data.claims.as_object() else {
+        return Err(ApiError::invalid_token().with_request_id(request_id.to_string()));
+    };
+
+    let tenant = extract_required_claim(obj, &state.config.jwt.tenant_claim, request_id)?;
+    let workspace = extract_required_claim(obj, &state.config.jwt.workspace_claim, request_id)?;
+    let user_id = extract_required_claim(obj, &state.config.jwt.user_claim, request_id)?;
+
+    Ok((tenant, workspace, Some(user_id)))
 }
 
 fn jwt_decoding_key(
@@ -157,6 +165,22 @@ fn jwt_decoding_key(
 
 fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
     header_string(headers, "X-Request-Id").or_else(|| header_string(headers, "X-Request-ID"))
+}
+
+fn user_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    header_string(headers, "X-User-Id").or_else(|| header_string(headers, "X-User-ID"))
+}
+
+fn extract_required_claim(
+    obj: &serde_json::Map<String, Value>,
+    claim: &str,
+    request_id: &str,
+) -> Result<String, ApiError> {
+    obj.get(claim)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ApiError::invalid_token().with_request_id(request_id.to_string()))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {

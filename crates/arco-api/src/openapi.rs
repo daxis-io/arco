@@ -27,6 +27,19 @@ use utoipa::{Modify, OpenApi};
         crate::routes::lineage::add_edges,
         crate::routes::lineage::get_lineage,
         crate::routes::browser::mint_urls,
+        crate::routes::orchestration::trigger_run,
+        crate::routes::orchestration::list_runs,
+        crate::routes::orchestration::get_run,
+        crate::routes::orchestration::cancel_run,
+        crate::routes::orchestration::backfill_run_key,
+        crate::routes::orchestration::upload_run_logs,
+        crate::routes::orchestration::get_run_logs,
+        crate::routes::manifests::deploy_manifest,
+        crate::routes::manifests::list_manifests,
+        crate::routes::manifests::get_manifest,
+        crate::routes::tasks::task_started,
+        crate::routes::tasks::task_heartbeat,
+        crate::routes::tasks::task_completed,
     ),
     components(
         schemas(
@@ -48,6 +61,45 @@ use utoipa::{Modify, OpenApi};
             crate::routes::browser::MintUrlsRequest,
             crate::routes::browser::MintUrlsResponse,
             crate::routes::browser::SignedUrl,
+            crate::routes::orchestration::TriggerRunRequest,
+            crate::routes::orchestration::TriggerRunResponse,
+            crate::routes::orchestration::RunKeyBackfillRequest,
+            crate::routes::orchestration::RunKeyBackfillResponse,
+            crate::routes::orchestration::PartitionValue,
+            crate::routes::orchestration::RunStateResponse,
+            crate::routes::orchestration::RunResponse,
+            crate::routes::orchestration::TaskSummary,
+            crate::routes::orchestration::TaskStateResponse,
+            crate::routes::orchestration::TaskCounts,
+            crate::routes::orchestration::ListRunsResponse,
+            crate::routes::orchestration::RunListItem,
+            crate::routes::orchestration::CancelRunRequest,
+            crate::routes::orchestration::CancelRunResponse,
+            crate::routes::orchestration::RunLogsRequest,
+            crate::routes::orchestration::RunLogsResponse,
+            crate::routes::orchestration::RunLogsQuery,
+            crate::routes::manifests::DeployManifestRequest,
+            crate::routes::manifests::DeployManifestResponse,
+            crate::routes::manifests::StoredManifest,
+            crate::routes::manifests::ListManifestsResponse,
+            crate::routes::manifests::ManifestListItem,
+            crate::routes::manifests::AssetEntry,
+            crate::routes::manifests::AssetKey,
+            crate::routes::manifests::AssetDependency,
+            crate::routes::manifests::ScheduleEntry,
+            crate::routes::manifests::GitContext,
+            crate::routes::tasks::TaskStartedRequest,
+            crate::routes::tasks::TaskStartedResponse,
+            crate::routes::tasks::HeartbeatRequest,
+            crate::routes::tasks::HeartbeatResponse,
+            crate::routes::tasks::TaskCompletedRequest,
+            crate::routes::tasks::TaskCompletedResponse,
+            crate::routes::tasks::WorkerOutcome,
+            crate::routes::tasks::TaskOutput,
+            crate::routes::tasks::TaskError,
+            crate::routes::tasks::ErrorCategory,
+            crate::routes::tasks::TaskMetrics,
+            crate::routes::tasks::CallbackErrorResponse,
         )
     ),
     tags(
@@ -55,6 +107,9 @@ use utoipa::{Modify, OpenApi};
         (name = "tables", description = "Table operations"),
         (name = "lineage", description = "Lineage operations"),
         (name = "browser", description = "Browser signed URL minting"),
+        (name = "Orchestration", description = "Run orchestration operations"),
+        (name = "Manifests", description = "Manifest deployment operations"),
+        (name = "Worker Callbacks", description = "Worker task lifecycle callbacks"),
     ),
     modifiers(&SecurityAddon),
 )]
@@ -67,6 +122,15 @@ impl Modify for SecurityAddon {
         let components = openapi.components.get_or_insert_with(Default::default);
         components.add_security_scheme(
             "bearerAuth",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("JWT")
+                    .build(),
+            ),
+        );
+        components.add_security_scheme(
+            "taskAuth",
             SecurityScheme::Http(
                 HttpBuilder::new()
                     .scheme(HttpAuthScheme::Bearer)

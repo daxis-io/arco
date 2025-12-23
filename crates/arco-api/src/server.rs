@@ -242,7 +242,15 @@ impl Server {
 
         let auth_layer =
             middleware::from_fn_with_state(Arc::clone(&state), crate::context::auth_middleware);
+        let task_auth_layer = middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::routes::tasks::task_auth_middleware,
+        );
         let rate_limit_layer = middleware::from_fn_with_state(
+            Arc::clone(&state.rate_limit),
+            crate::rate_limit::rate_limit_middleware,
+        );
+        let task_rate_limit_layer = middleware::from_fn_with_state(
             Arc::clone(&state.rate_limit),
             crate::rate_limit::rate_limit_middleware,
         );
@@ -259,6 +267,12 @@ impl Server {
                 crate::routes::api_v1_routes()
                     .route_layer(rate_limit_layer)
                     .layer(auth_layer),
+            )
+            .nest(
+                "/api/v1",
+                crate::routes::api_task_routes()
+                    .route_layer(task_rate_limit_layer)
+                    .layer(task_auth_layer),
             )
             // Middleware (order matters): Metrics outermost for timing, then trace, then CORS.
             .layer(cors)

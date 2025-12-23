@@ -2,8 +2,11 @@
 
 pub mod browser;
 pub mod lineage;
+pub mod manifests;
 pub mod namespaces;
+pub mod orchestration;
 pub mod tables;
+pub mod tasks;
 
 use std::sync::Arc;
 
@@ -18,4 +21,11 @@ pub fn api_v1_routes() -> Router<Arc<AppState>> {
         .merge(tables::routes())
         .merge(lineage::routes())
         .merge(browser::routes())
+        .merge(orchestration::routes())
+        .merge(manifests::routes())
+}
+
+/// `/api/v1` task callback routes (task-authenticated).
+pub fn api_task_routes() -> Router<Arc<AppState>> {
+    tasks::routes()
 }

@@ -4,7 +4,8 @@
 //!
 //! This crate provides the API surface for Arco, handling:
 //!
-//! - **Authentication**: Tenant identification and authorization
+//! - **Authentication**: Tenant/workspace/user identity from JWTs (user claim defaults to `sub`,
+//!   configurable via `ARCO_JWT_USER_CLAIM`)
 //! - **Routing**: HTTP and gRPC endpoint configuration
 //! - **Service Wiring**: Composition of catalog and flow services
 //! - **Observability**: Metrics, tracing, and health checks
@@ -54,6 +55,7 @@ pub mod context;
 pub mod error;
 pub mod metrics;
 pub mod openapi;
+pub(crate) mod orchestration_compaction;
 pub mod rate_limit;
 pub(crate) mod redaction;
 pub mod routes;

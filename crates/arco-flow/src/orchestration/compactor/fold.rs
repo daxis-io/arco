@@ -733,7 +733,7 @@ pub struct PartitionStatusRow {
     /// When last attempted (any outcome).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_attempt_at: Option<DateTime<Utc>>,
-    /// Last attempt outcome (TaskOutcome).
+    /// Last attempt outcome (`TaskOutcome`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_attempt_outcome: Option<TaskOutcome>,
     /// When partition became stale (nullable; derived or precomputed).

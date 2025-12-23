@@ -27,6 +27,7 @@ pub mod anti_entropy;
 pub mod dispatch;
 pub mod dispatcher;
 pub mod ready_dispatch;
+pub mod schedule;
 pub mod timer;
 pub mod timer_handlers;
 
@@ -34,5 +35,6 @@ pub use anti_entropy::*;
 pub use dispatch::*;
 pub use dispatcher::*;
 pub use ready_dispatch::*;
+pub use schedule::*;
 pub use timer::*;
 pub use timer_handlers::*;

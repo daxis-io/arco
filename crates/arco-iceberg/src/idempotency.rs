@@ -10,6 +10,21 @@ use uuid::Uuid;
 
 use crate::error::IcebergErrorResponse;
 
+/// Error validating an idempotency key.
+#[derive(Debug, thiserror::Error)]
+pub enum IdempotencyKeyError {
+    /// Key is not a valid UUID.
+    #[error("Idempotency-Key must be a valid UUID")]
+    InvalidFormat,
+
+    /// Key is not UUIDv7.
+    #[error("Idempotency-Key must be UUIDv7 (RFC 9562), found version {found_version}")]
+    NotUuidV7 {
+        /// The version number found.
+        found_version: usize,
+    },
+}
+
 /// Status of an idempotency marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -159,6 +174,27 @@ impl IdempotencyMarker {
     pub fn is_stale(&self, timeout: chrono::Duration) -> bool {
         self.status == IdempotencyStatus::InProgress && self.started_at + timeout < Utc::now()
     }
+
+    /// Validates that an idempotency key is a valid UUIDv7.
+    ///
+    /// Per design doc: Idempotency-Key must be UUIDv7 (RFC 9562) in canonical string form.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is not a valid UUIDv7.
+    pub fn validate_uuidv7(key: &str) -> Result<Uuid, IdempotencyKeyError> {
+        let uuid = Uuid::parse_str(key).map_err(|_| IdempotencyKeyError::InvalidFormat)?;
+
+        // UUIDv7 has version nibble = 7 (bits 48-51)
+        let version = uuid.get_version_num();
+        if version != 7 {
+            return Err(IdempotencyKeyError::NotUuidV7 {
+                found_version: version,
+            });
+        }
+
+        Ok(uuid)
+    }
 }
 
 #[cfg(test)]
@@ -263,5 +299,25 @@ mod tests {
 
         marker.started_at = Utc::now() - timeout + chrono::Duration::seconds(10);
         assert!(!marker.is_stale(timeout));
+    }
+
+    #[test]
+    fn test_validate_uuidv7_valid() {
+        // Valid UUIDv7 (version nibble = 7, variant = 10xx)
+        let key = "01924a7c-8d9f-7000-8000-000000000001";
+        assert!(IdempotencyMarker::validate_uuidv7(key).is_ok());
+    }
+
+    #[test]
+    fn test_validate_uuidv7_invalid_version() {
+        // UUIDv4 (version nibble = 4)
+        let key = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(IdempotencyMarker::validate_uuidv7(key).is_err());
+    }
+
+    #[test]
+    fn test_validate_uuidv7_invalid_format() {
+        let key = "not-a-uuid";
+        assert!(IdempotencyMarker::validate_uuidv7(key).is_err());
     }
 }

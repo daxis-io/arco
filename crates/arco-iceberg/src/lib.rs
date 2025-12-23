@@ -43,6 +43,7 @@
 
 pub mod context;
 pub mod error;
+pub mod events;
 pub mod idempotency;
 pub mod metrics;
 pub mod openapi;

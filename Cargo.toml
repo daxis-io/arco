@@ -113,6 +113,7 @@ arrow = { version = "54", features = ["chrono-tz"] }
 bytes = "1"
 iceberg = "0.6"
 iceberg-catalog-rest = "0.6"
+serde_jcs = "0.1"
 
 # HTTP/gRPC
 axum = "0.7"

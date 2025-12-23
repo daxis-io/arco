@@ -1,0 +1,72 @@
+[package]
+name = "arco-iceberg"
+description = "Iceberg REST Catalog integration for Arco: spec-compliant catalog API with CAS-based commits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+full = ["gcp", "aws", "azure"]
+gcp = ["arco-core/gcp"]
+aws = ["arco-core/aws"]
+azure = ["arco-core/azure"]
+
+[dependencies]
+arco-core = { path = "../arco-core" }
+arco-catalog = { path = "../arco-catalog" }
+
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# HTTP
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+http = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+serde_jcs = { workspace = true }
+
+# IDs
+uuid = { workspace = true }
+ulid = { workspace = true }
+
+# Hashing/encoding
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# OpenAPI
+utoipa = { version = "5.4.0", features = ["axum_extras", "chrono", "uuid"] }
+
+# Logging
+tracing = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+
+[dev-dependencies]
+arco-test-utils = { path = "../arco-test-utils" }
+tempfile = { workspace = true }
+tokio-test = { workspace = true }
+proptest = { workspace = true }

@@ -119,4 +119,26 @@ mod tests {
         let parsed: PendingReceipt = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(receipt.table_uuid, parsed.table_uuid);
     }
+
+    #[test]
+    fn test_committed_receipt_serialization() {
+        let receipt = CommittedReceipt {
+            table_uuid: Uuid::new_v4(),
+            commit_key: CommitKey::from_metadata_location("test.json"),
+            event_id: Ulid::new(),
+            metadata_location: "new.json".to_string(),
+            snapshot_id: Some(456),
+            previous_metadata_location: Some("base.json".to_string()),
+            source: UpdateSource::IcebergRest {
+                client_info: Some("spark/3.5".to_string()),
+                principal: Some("user@example.com".to_string()),
+            },
+            committed_at: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&receipt).expect("serialize");
+        let parsed: CommittedReceipt = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(receipt.table_uuid, parsed.table_uuid);
+        assert_eq!(receipt.metadata_location, parsed.metadata_location);
+    }
 }

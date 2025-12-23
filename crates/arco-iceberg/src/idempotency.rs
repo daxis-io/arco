@@ -10,41 +10,27 @@ use uuid::Uuid;
 
 use crate::error::IcebergErrorResponse;
 
-/// Computes SHA256 hash of RFC 8785 JCS canonical JSON.
-///
-/// This produces a deterministic hash of a JSON value regardless of key order.
-/// Keys are sorted recursively before hashing.
-#[must_use]
-pub fn canonical_request_hash(value: &serde_json::Value) -> String {
-    let canonical = canonicalize_json(value);
-    let mut hasher = Sha256::new();
-    hasher.update(canonical.as_bytes());
-    hex::encode(hasher.finalize())
+/// Error canonicalizing a JSON request body for idempotency hashing.
+#[derive(Debug, thiserror::Error)]
+pub enum CanonicalizationError {
+    /// Failed to canonicalize JSON per RFC 8785.
+    #[error("Failed to canonicalize JSON: {0}")]
+    Canonicalize(#[from] serde_json::Error),
 }
 
-/// Canonicalizes a JSON value per RFC 8785 JCS.
+/// Computes SHA256 hash of RFC 8785 JCS canonical JSON.
 ///
-/// - Objects: keys sorted lexicographically
-/// - No extra whitespace
-/// - Numbers in shortest form
-fn canonicalize_json(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut sorted: Vec<_> = map.iter().collect();
-            sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
-            let entries: Vec<String> = sorted
-                .into_iter()
-                .map(|(k, v)| format!("{}:{}", serde_json::to_string(k).unwrap_or_default(), canonicalize_json(v)))
-                .collect();
-            format!("{{{}}}", entries.join(","))
-        }
-        serde_json::Value::Array(arr) => {
-            let elements: Vec<String> = arr.iter().map(canonicalize_json).collect();
-            format!("[{}]", elements.join(","))
-        }
-        // Primitives serialize normally
-        _ => serde_json::to_string(value).unwrap_or_default(),
-    }
+/// # Errors
+///
+/// Returns an error if the JSON value cannot be canonicalized.
+#[must_use]
+pub fn canonical_request_hash(
+    value: &serde_json::Value,
+) -> Result<String, CanonicalizationError> {
+    let canonical = serde_jcs::to_string(value)?;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Error validating an idempotency key.
@@ -53,6 +39,17 @@ pub enum IdempotencyKeyError {
     /// Key is not a valid UUID.
     #[error("Idempotency-Key must be a valid UUID")]
     InvalidFormat,
+
+    /// Key has a non-RFC4122 variant.
+    #[error("Idempotency-Key must use RFC4122 variant, found {found_variant:?}")]
+    InvalidVariant {
+        /// The variant found in the UUID.
+        found_variant: uuid::Variant,
+    },
+
+    /// Key is not in canonical string form.
+    #[error("Idempotency-Key must be a canonical lowercase UUID string")]
+    NotCanonical,
 
     /// Key is not UUIDv7.
     #[error("Idempotency-Key must be UUIDv7 (RFC 9562), found version {found_version}")]
@@ -222,12 +219,22 @@ impl IdempotencyMarker {
     pub fn validate_uuidv7(key: &str) -> Result<Uuid, IdempotencyKeyError> {
         let uuid = Uuid::parse_str(key).map_err(|_| IdempotencyKeyError::InvalidFormat)?;
 
+        if uuid.get_variant() != uuid::Variant::RFC4122 {
+            return Err(IdempotencyKeyError::InvalidVariant {
+                found_variant: uuid.get_variant(),
+            });
+        }
+
         // UUIDv7 has version nibble = 7 (bits 48-51)
         let version = uuid.get_version_num();
         if version != 7 {
             return Err(IdempotencyKeyError::NotUuidV7 {
                 found_version: version,
             });
+        }
+
+        if uuid.to_string() != key {
+            return Err(IdempotencyKeyError::NotCanonical);
         }
 
         Ok(uuid)
@@ -359,6 +366,20 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_uuidv7_invalid_variant() {
+        // Variant nibble is 0 (NCS), not RFC4122.
+        let key = "01924a7c-8d9f-7000-0000-000000000001";
+        assert!(IdempotencyMarker::validate_uuidv7(key).is_err());
+    }
+
+    #[test]
+    fn test_validate_uuidv7_non_canonical() {
+        // Uppercase string should be rejected by canonical string check.
+        let key = "01924A7C-8D9F-7000-8000-000000000001";
+        assert!(IdempotencyMarker::validate_uuidv7(key).is_err());
+    }
+
+    #[test]
     fn test_canonical_hash_deterministic() {
         let request1 = serde_json::json!({
             "requirements": [],
@@ -369,8 +390,8 @@ mod tests {
             "requirements": []
         });
         // Same content with different key order should produce same hash
-        let hash1 = canonical_request_hash(&request1);
-        let hash2 = canonical_request_hash(&request2);
+        let hash1 = canonical_request_hash(&request1).expect("canonical hash");
+        let hash2 = canonical_request_hash(&request2).expect("canonical hash");
         assert_eq!(hash1, hash2);
         assert_eq!(hash1.len(), 64); // SHA256 hex is 64 chars
     }
@@ -379,8 +400,8 @@ mod tests {
     fn test_canonical_hash_different_content() {
         let request1 = serde_json::json!({"a": 1});
         let request2 = serde_json::json!({"a": 2});
-        let hash1 = canonical_request_hash(&request1);
-        let hash2 = canonical_request_hash(&request2);
+        let hash1 = canonical_request_hash(&request1).expect("canonical hash");
+        let hash2 = canonical_request_hash(&request2).expect("canonical hash");
         assert_ne!(hash1, hash2);
     }
 }

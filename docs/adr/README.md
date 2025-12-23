@@ -34,3 +34,6 @@ Each ADR follows this structure:
 | [021](adr-021-cloud-tasks-naming.md) | Cloud Tasks naming convention | Accepted |
 | [022](adr-022-dependency-satisfaction.md) | Per-edge dependency satisfaction | Accepted |
 | [023](adr-023-worker-contract.md) | Worker contract specification | Accepted |
+| [024](adr-024-schedule-sensor-automation.md) | Schedule and sensor automation | Accepted |
+| [025](adr-025-backfill-controller.md) | Backfill controller | Accepted |
+| [026](adr-026-partition-status-tracking.md) | Partition status tracking | Accepted |

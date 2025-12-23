@@ -18,7 +18,10 @@ Dagster uses a long-running daemon; we need a serverless alternative.
 
 2. **Push Sensors**: Pub/Sub subscription triggers evaluation
    - Message arrives -> sensor evaluates -> emits `SensorEvaluated`
-   - Message ID is the idempotency key (exactly-once processing)
+   - **Idempotency key**: `sensor_eval:{sensor_id}:msg:{message_id}`
+   - Dedupe enforced at **ledger append** using `OrchestrationEvent.idempotency_key`
+   - Ledger rejects duplicate idempotency keys (7-day TTL window sufficient for Pub/Sub retention)
+   - Delivery is still at-least-once; duplicates are dropped by the ledger
    - Cursorless by default (message is the cursor)
    - Controller emits `SensorEvaluated` + `RunRequested` atomically
 
@@ -40,7 +43,7 @@ by controllers atomically in the same ledger segment. This ensures:
 Every schedule tick creates a `schedule_ticks` row with:
 - `tick_id`: `{schedule_id}:{scheduled_for_epoch}`
 - `run_key`: `sched:{schedule_id}:{epoch}`
-- `run_id`: Correlated from `RunRequested` event during fold
+- `run_id`: Correlated from `RunRequested` event during fold (nullable if no run requested)
 - `definition_version`: schedule definition row_version used at tick time
 - `asset_selection`: snapshot used to build the run
 - `partition_selection`: snapshot used to build the run (optional)

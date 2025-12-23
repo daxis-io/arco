@@ -44,8 +44,6 @@ PENDING -> RUNNING -> SUCCEEDED
            PAUSED -> RUNNING
               |
            FAILED
-              |
-           CANCELLED
 ```
 
 ### Pause/Resume
@@ -54,7 +52,8 @@ PENDING -> RUNNING -> SUCCEEDED
 
 ### Cancel
 - **Cancel**: Stop emitting new chunks, let active runs complete or timeout
-- Mark backfill as `CANCELLED` after all active runs complete
+- `CANCELLED` is a terminal state reachable from **PENDING**, **RUNNING**, or **PAUSED**
+- Transition to `CANCELLED` once no active runs remain (regardless of prior failures)
 
 ### Retry-Failed
 - Create NEW backfill with `parent_backfill_id`

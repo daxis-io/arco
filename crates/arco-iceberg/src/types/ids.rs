@@ -28,10 +28,40 @@ impl From<Uuid> for TableUuid {
     }
 }
 
-/// Opaque object version token.
+/// Opaque version token for CAS operations - portable across GCS/S3/ADLS.
+///
+/// - GCS: generation number as string
+/// - S3: ETag string
+/// - ADLS: ETag string
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct ObjectVersion(pub String);
+
+impl ObjectVersion {
+    /// Creates a new object version from a string.
+    #[must_use]
+    pub fn new(version: impl Into<String>) -> Self {
+        Self(version.into())
+    }
+
+    /// Returns the version as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for ObjectVersion {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for ObjectVersion {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Deterministic commit key derived from metadata location.
 ///
@@ -91,5 +121,14 @@ mod tests {
         let key1 = CommitKey::from_metadata_location("location1");
         let key2 = CommitKey::from_metadata_location("location2");
         assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_object_version_newtype() {
+        let version = ObjectVersion::new("12345");
+        assert_eq!(version.as_str(), "12345");
+
+        let version: ObjectVersion = "67890".to_string().into();
+        assert_eq!(version.as_str(), "67890");
     }
 }

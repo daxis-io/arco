@@ -58,7 +58,7 @@ pub mod routes;
 pub mod prelude {
     pub use crate::error::{IcebergError, IcebergResult};
     pub use crate::idempotency::{IdempotencyMarker, IdempotencyStatus};
-    pub use crate::pointer::{IcebergTablePointer, ObjectVersion};
+    pub use crate::pointer::IcebergTablePointer;
     pub use crate::router::iceberg_router;
     pub use crate::state::{CredentialProvider, IcebergConfig, IcebergState};
     pub use crate::types::*;

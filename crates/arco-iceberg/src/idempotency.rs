@@ -66,7 +66,7 @@ pub struct IdempotencyMarker {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_payload: Option<IcebergErrorResponse>,
 
-    /// Event ID allocated at claim time (deterministic for crash recovery).
+    /// Event ID allocated at claim time (stable for crash recovery).
     pub event_id: Ulid,
 
     /// Pointer's metadata location when marker was claimed.
@@ -131,6 +131,9 @@ impl IdempotencyMarker {
     pub fn finalize_committed(mut self, response_metadata_location: String) -> Self {
         self.status = IdempotencyStatus::Committed;
         self.committed_at = Some(Utc::now());
+        self.failed_at = None;
+        self.error_http_status = None;
+        self.error_payload = None;
         self.response_metadata_location = Some(response_metadata_location);
         self
     }
@@ -138,10 +141,16 @@ impl IdempotencyMarker {
     /// Finalizes the marker as failed.
     #[must_use]
     pub fn finalize_failed(mut self, http_status: u16, error: IcebergErrorResponse) -> Self {
+        debug_assert!(
+            (400..500).contains(&http_status),
+            "finalize_failed should only be used for terminal 4xx responses"
+        );
         self.status = IdempotencyStatus::Failed;
         self.failed_at = Some(Utc::now());
         self.error_http_status = Some(http_status);
         self.error_payload = Some(error);
+        self.committed_at = None;
+        self.response_metadata_location = None;
         self
     }
 
@@ -155,6 +164,7 @@ impl IdempotencyMarker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::IcebergError;
 
     #[test]
     fn test_hash_key_deterministic() {
@@ -191,6 +201,9 @@ mod tests {
         let committed = marker.finalize_committed("new/metadata.json".to_string());
         assert_eq!(committed.status, IdempotencyStatus::Committed);
         assert!(committed.committed_at.is_some());
+        assert!(committed.failed_at.is_none());
+        assert!(committed.error_http_status.is_none());
+        assert!(committed.error_payload.is_none());
     }
 
     #[test]
@@ -206,5 +219,49 @@ mod tests {
         let parsed: IdempotencyMarker = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(marker.idempotency_key, parsed.idempotency_key);
         assert_eq!(marker.status, parsed.status);
+    }
+
+    #[test]
+    fn test_marker_finalize_failed_clears_commit_fields() {
+        let marker = IdempotencyMarker::new_in_progress(
+            "key".to_string(),
+            Uuid::new_v4(),
+            "hash".to_string(),
+            "base.json".to_string(),
+            "new.json".to_string(),
+        );
+        let error_payload = IcebergErrorResponse::from(&IcebergError::commit_conflict("conflict"));
+
+        let failed = marker.finalize_failed(409, error_payload);
+        assert_eq!(failed.status, IdempotencyStatus::Failed);
+        assert!(failed.failed_at.is_some());
+        assert_eq!(failed.error_http_status, Some(409));
+        assert!(failed.error_payload.is_some());
+        assert!(failed.committed_at.is_none());
+        assert!(failed.response_metadata_location.is_none());
+
+        let json = serde_json::to_string(&failed).expect("serialize");
+        let parsed: IdempotencyMarker = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.status, IdempotencyStatus::Failed);
+        assert_eq!(parsed.error_http_status, Some(409));
+        assert!(parsed.error_payload.is_some());
+    }
+
+    #[test]
+    fn test_marker_staleness_boundaries() {
+        let mut marker = IdempotencyMarker::new_in_progress(
+            "key".to_string(),
+            Uuid::new_v4(),
+            "hash".to_string(),
+            "base.json".to_string(),
+            "new.json".to_string(),
+        );
+        let timeout = chrono::Duration::minutes(10);
+
+        marker.started_at = Utc::now() - timeout - chrono::Duration::seconds(1);
+        assert!(marker.is_stale(timeout));
+
+        marker.started_at = Utc::now() - timeout + chrono::Duration::seconds(10);
+        assert!(!marker.is_stale(timeout));
     }
 }

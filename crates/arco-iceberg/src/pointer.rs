@@ -8,40 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Opaque version token for CAS operations - portable across GCS/S3/ADLS.
-///
-/// - GCS: generation number as string
-/// - S3: ETag string
-/// - ADLS: ETag string
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ObjectVersion(String);
-
-impl ObjectVersion {
-    /// Creates a new object version from a string.
-    #[must_use]
-    pub fn new(version: impl Into<String>) -> Self {
-        Self(version.into())
-    }
-
-    /// Returns the version as a string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<String> for ObjectVersion {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-impl AsRef<str> for ObjectVersion {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
 /// Tracks the current state of an Iceberg table.
 ///
 /// The pointer is stored at `_catalog/iceberg_pointers/{table_uuid}.json`
@@ -308,13 +274,4 @@ mod tests {
         assert!(matches!(parsed, UpdateSource::Unknown));
     }
 
-    #[test]
-    fn test_object_version_newtype() {
-        let version = ObjectVersion::new("12345");
-        assert_eq!(version.as_str(), "12345");
-
-        // Test From<String>
-        let version: ObjectVersion = "67890".to_string().into();
-        assert_eq!(version.as_str(), "67890");
-    }
 }

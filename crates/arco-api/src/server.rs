@@ -6,18 +6,25 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
-use axum::http::{HeaderValue, Method, StatusCode, header};
-use axum::middleware;
-use axum::response::IntoResponse;
+use axum::body::Body;
+use axum::extract::{FromRequestParts, State};
+use axum::http::{header, HeaderValue, Method, Request, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
+use tower::ServiceBuilder;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
+use arco_iceberg::context::IcebergRequestContext;
+use arco_iceberg::{iceberg_router, IcebergError, IcebergState};
+
 use crate::compactor_client::CompactorClient;
 use crate::config::{Config, CorsConfig};
+use crate::context::RequestContext;
+use crate::error::ApiError;
 use crate::rate_limit::RateLimitState;
 use arco_core::Result;
 use arco_catalog::SyncCompactor;
@@ -176,6 +183,78 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
+/// Auth middleware for Iceberg REST requests.
+///
+/// Allows `/v1/config` without auth; all other endpoints require valid auth and
+/// inject an [`IcebergRequestContext`] based on the existing `RequestContext`.
+async fn iceberg_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if iceberg_public_path(req.uri().path()) {
+        return next.run(req).await;
+    }
+
+    let (mut parts, body) = req.into_parts();
+    let ctx = match RequestContext::from_request_parts(&mut parts, &state).await {
+        Ok(ctx) => ctx,
+        Err(err) => return api_error_to_iceberg_response(err),
+    };
+
+    let iceberg_ctx = IcebergRequestContext {
+        tenant: ctx.tenant.clone(),
+        workspace: ctx.workspace.clone(),
+        request_id: ctx.request_id.clone(),
+        idempotency_key: ctx.idempotency_key.clone(),
+    };
+    parts.extensions.insert(iceberg_ctx);
+
+    next.run(Request::from_parts(parts, body)).await
+}
+
+fn iceberg_public_path(path: &str) -> bool {
+    path.ends_with("/v1/config") || path.ends_with("/openapi.json")
+}
+
+fn api_error_to_iceberg_response(err: ApiError) -> Response {
+    let status = err.status();
+    let message = err.message().to_string();
+    let request_id = err.request_id().map(str::to_string);
+
+    let iceberg_error = match status {
+        StatusCode::BAD_REQUEST => IcebergError::BadRequest {
+            message,
+            error_type: "BadRequestException",
+        },
+        StatusCode::UNAUTHORIZED => IcebergError::Unauthorized { message },
+        StatusCode::FORBIDDEN => IcebergError::Forbidden { message },
+        StatusCode::NOT_FOUND => IcebergError::NotFound {
+            message,
+            error_type: "NotFoundException",
+        },
+        StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => IcebergError::Conflict {
+            message,
+            error_type: "CommitFailedException",
+        },
+        StatusCode::SERVICE_UNAVAILABLE => IcebergError::ServiceUnavailable {
+            message,
+            retry_after_seconds: None,
+        },
+        _ => IcebergError::Internal { message },
+    };
+
+    let mut response = iceberg_error.into_response();
+    if let Some(request_id) = request_id {
+        if let Ok(value) = HeaderValue::from_str(&request_id) {
+            response
+                .headers_mut()
+                .insert(header::HeaderName::from_static("x-request-id"), value);
+        }
+    }
+    response
+}
+
 // ============================================================================
 // Server
 // ============================================================================
@@ -256,7 +335,7 @@ impl Server {
         );
         let metrics_layer = middleware::from_fn(crate::metrics::metrics_middleware);
 
-        Router::new()
+        let mut router = Router::new()
             // Health, ready, and metrics endpoints (no auth required)
             .route("/health", get(health))
             .route("/ready", get(ready))
@@ -273,7 +352,27 @@ impl Server {
                 crate::routes::api_task_routes()
                     .route_layer(task_rate_limit_layer)
                     .layer(task_auth_layer),
-            )
+            );
+
+        // Mount Iceberg REST Catalog if enabled
+        // Uses nest_service since Iceberg router has its own state type
+        if state.config.iceberg.enabled {
+            let iceberg_state = IcebergState::with_config(
+                Arc::clone(&state.storage),
+                state.config.iceberg.to_iceberg_config(),
+            );
+            let iceberg_service = ServiceBuilder::new()
+                .layer(middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    iceberg_auth_middleware,
+                ))
+                .service(iceberg_router(iceberg_state).into_service::<Body>());
+
+            tracing::info!("Iceberg REST Catalog enabled at /iceberg/v1/*");
+            router = router.nest_service("/iceberg", iceberg_service);
+        }
+
+        router
             // Middleware (order matters): Metrics outermost for timing, then trace, then CORS.
             .layer(cors)
             .layer(TraceLayer::new_for_http())
@@ -294,6 +393,7 @@ impl Server {
             // Allow common methods for REST API + preflight
             .allow_methods([
                 Method::GET,
+                Method::HEAD,
                 Method::POST,
                 Method::PUT,
                 Method::DELETE,
@@ -304,16 +404,20 @@ impl Server {
                 header::AUTHORIZATION,
                 header::CONTENT_TYPE,
                 header::ACCEPT,
+                header::IF_NONE_MATCH,
                 // Custom headers for tenant scoping and idempotency
                 header::HeaderName::from_static("x-tenant-id"),
                 header::HeaderName::from_static("x-workspace-id"),
                 header::HeaderName::from_static("idempotency-key"),
                 header::HeaderName::from_static("x-request-id"),
+                // Iceberg-specific headers
+                header::HeaderName::from_static("x-iceberg-access-delegation"),
             ])
             // Expose headers the browser needs to read
             .expose_headers([
                 header::CONTENT_TYPE,
                 header::CONTENT_LENGTH,
+                header::ETAG,
                 header::HeaderName::from_static("x-request-id"),
             ])
             // Set max age for preflight caching
@@ -387,6 +491,7 @@ impl Server {
         // Initialize metrics before starting the server
         crate::metrics::init_metrics();
         arco_catalog::metrics::register_metrics();
+        arco_iceberg::metrics::register_metrics();
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.http_port));
         let router = self.create_router();
@@ -543,6 +648,13 @@ impl ServerBuilder {
         self
     }
 
+    /// Enables Iceberg REST Catalog endpoints.
+    #[must_use]
+    pub fn iceberg_enabled(mut self, enabled: bool) -> Self {
+        self.config.iceberg.enabled = enabled;
+        self
+    }
+
     /// Builds the server.
     #[must_use]
     pub fn build(self) -> Server {
@@ -603,6 +715,108 @@ mod tests {
             .context("read response body")?;
         let ready: ReadyResponse = serde_json::from_slice(&body).context("parse JSON body")?;
         assert!(ready.ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_config_endpoint() -> Result<()> {
+        let server = ServerBuilder::new().iceberg_enabled(true).build();
+        let router = server.test_router();
+
+        let request = Request::builder()
+            .uri("/iceberg/v1/config")
+            .body(Body::empty())
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 2048)
+            .await
+            .context("read response body")?;
+        let config: serde_json::Value =
+            serde_json::from_slice(&body).context("parse JSON body")?;
+
+        // Verify the response has expected structure
+        assert!(config.get("overrides").is_some());
+        assert!(config.get("defaults").is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_openapi_endpoint() -> Result<()> {
+        let server = ServerBuilder::new().iceberg_enabled(true).build();
+        let router = server.test_router();
+
+        let request = Request::builder()
+            .uri("/iceberg/openapi.json")
+            .body(Body::empty())
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        assert!(content_type.map_or(false, |value| value.starts_with("application/json")));
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .context("read response body")?;
+        let text = String::from_utf8(body.to_vec()).context("decode response body")?;
+        assert!(text.contains("Iceberg REST Catalog API"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_auth_uses_iceberg_error_schema() -> Result<()> {
+        let server = ServerBuilder::new()
+            .debug(true)
+            .iceberg_enabled(true)
+            .build();
+        let router = server.test_router();
+
+        let request = Request::builder()
+            .uri("/iceberg/v1/arco/namespaces")
+            .body(Body::empty())
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let body = axum::body::to_bytes(response.into_body(), 2048)
+            .await
+            .context("read response body")?;
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).context("parse JSON body")?;
+
+        let error = payload.get("error").context("missing error field")?;
+        assert_eq!(
+            error.get("type").and_then(|value| value.as_str()),
+            Some("UnauthorizedException")
+        );
+        assert_eq!(error.get("code").and_then(|value| value.as_u64()), Some(401));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_disabled_by_default() -> Result<()> {
+        let server = ServerBuilder::new().build();
+        let router = server.test_router();
+
+        let request = Request::builder()
+            .uri("/iceberg/v1/config")
+            .body(Body::empty())
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+
+        // When Iceberg is disabled, the route should not exist (404)
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         Ok(())
     }
 }

@@ -2207,6 +2207,26 @@ pub fn merge_timer_rows(rows: Vec<TimerRow>) -> Option<TimerRow> {
         })
 }
 
+/// Merges sensor state rows from base snapshot and L0 deltas.
+#[must_use]
+pub fn merge_sensor_state_rows(rows: Vec<SensorStateRow>) -> Option<SensorStateRow> {
+    rows.into_iter()
+        .reduce(|best, row| match row.row_version.cmp(&best.row_version) {
+            std::cmp::Ordering::Less => best,
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => row,
+        })
+}
+
+/// Merges sensor evaluation rows from base snapshot and L0 deltas.
+#[must_use]
+pub fn merge_sensor_eval_rows(rows: Vec<SensorEvalRow>) -> Option<SensorEvalRow> {
+    rows.into_iter()
+        .reduce(|best, row| match row.row_version.cmp(&best.row_version) {
+            std::cmp::Ordering::Less => best,
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => row,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -26,6 +26,7 @@ azure = ["arco-core/azure", "arco-catalog/azure", "arco-flow/azure"]
 arco-core = { path = "../arco-core" }
 arco-catalog = { path = "../arco-catalog" }
 arco-flow = { path = "../arco-flow" }
+arco-iceberg = { path = "../arco-iceberg" }
 arco-proto = { path = "../arco-proto" }
 
 # Async runtime

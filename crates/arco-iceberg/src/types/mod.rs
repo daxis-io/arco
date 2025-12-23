@@ -11,6 +11,7 @@ mod table;
 
 pub use config::*;
 pub use credentials::*;
+pub use commit::*;
 pub use ids::*;
 pub use namespace::*;
 pub use table::*;

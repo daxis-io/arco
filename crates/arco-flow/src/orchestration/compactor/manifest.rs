@@ -142,6 +142,14 @@ pub struct TablePaths {
     /// Path to `dispatch_outbox.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dispatch_outbox: Option<String>,
+
+    /// Path to `sensor_state.parquet` (relative to storage root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensor_state: Option<String>,
+
+    /// Path to `sensor_evals.parquet` (relative to storage root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensor_evals: Option<String>,
 }
 
 impl TablePaths {
@@ -163,6 +171,12 @@ impl TablePaths {
         }
         if let Some(ref p) = self.dispatch_outbox {
             paths.insert("dispatch_outbox", p.as_str());
+        }
+        if let Some(ref p) = self.sensor_state {
+            paths.insert("sensor_state", p.as_str());
+        }
+        if let Some(ref p) = self.sensor_evals {
+            paths.insert("sensor_evals", p.as_str());
         }
         paths
     }
@@ -220,13 +234,25 @@ pub struct RowCounts {
 
     /// Rows in `dispatch_outbox` table.
     pub dispatch_outbox: u32,
+
+    /// Rows in `sensor_state` table.
+    pub sensor_state: u32,
+
+    /// Rows in `sensor_evals` table.
+    pub sensor_evals: u32,
 }
 
 impl RowCounts {
     /// Total rows across all tables.
     #[must_use]
     pub fn total(&self) -> u32 {
-        self.runs + self.tasks + self.dep_satisfaction + self.timers + self.dispatch_outbox
+        self.runs
+            + self.tasks
+            + self.dep_satisfaction
+            + self.timers
+            + self.dispatch_outbox
+            + self.sensor_state
+            + self.sensor_evals
     }
 }
 
@@ -321,9 +347,11 @@ mod tests {
             dep_satisfaction: 300,
             timers: 50,
             dispatch_outbox: 40,
+            sensor_state: 5,
+            sensor_evals: 7,
         };
 
-        assert_eq!(counts.total(), 500);
+        assert_eq!(counts.total(), 512);
     }
 
     #[test]

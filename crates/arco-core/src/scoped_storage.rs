@@ -669,6 +669,55 @@ impl SignedUrlStore for ScopedStorage {
     }
 }
 
+// Allow scoped storage to satisfy StorageBackend for components that expect it.
+#[async_trait]
+impl StorageBackend for ScopedStorage {
+    async fn get(&self, path: &str) -> Result<Bytes> {
+        self.get_raw(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+        Self::validate_path(path)?;
+        self.backend.get_range(&self.scoped_path(path), range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> Result<WriteResult> {
+        self.put_raw(path, data, precondition).await
+    }
+
+    async fn delete(&self, path: &str) -> Result<()> {
+        Self::validate_path(path)?;
+        self.backend.delete(&self.scoped_path(path)).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+        let metas = self.list_meta(prefix).await?;
+        Ok(metas
+            .into_iter()
+            .map(|meta| ObjectMeta {
+                path: meta.path.to_string(),
+                size: meta.size,
+                version: meta.version,
+                last_modified: meta.last_modified,
+                etag: meta.etag,
+            })
+            .collect())
+    }
+
+    async fn head(&self, path: &str) -> Result<Option<ObjectMeta>> {
+        self.head_raw(path).await
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> Result<String> {
+        self.signed_url_raw(path, expiry).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -410,6 +410,7 @@ async fn load_idempotency_record(
         ("bearerAuth" = [])
     )
 )]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn deploy_manifest(
     State(state): State<Arc<AppState>>,
     ctx: RequestContext,

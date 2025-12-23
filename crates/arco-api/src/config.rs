@@ -54,6 +54,10 @@ pub struct Config {
     /// Reservations created before this cutoff allow missing fingerprints for backward compatibility.
     #[serde(default)]
     pub run_key_fingerprint_cutoff: Option<DateTime<Utc>>,
+
+    /// Iceberg REST Catalog configuration.
+    #[serde(default)]
+    pub iceberg: IcebergApiConfig,
 }
 
 /// CORS configuration for browser-based access.
@@ -91,6 +95,62 @@ impl Default for Config {
             compactor_url: None,
             orchestration_compactor_url: None,
             run_key_fingerprint_cutoff: None,
+            iceberg: IcebergApiConfig::default(),
+        }
+    }
+}
+
+/// Configuration for the Iceberg REST Catalog API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IcebergApiConfig {
+    /// Enable Iceberg REST endpoints at `/iceberg/v1/*`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Catalog prefix advertised in `/v1/config`.
+    #[serde(default = "default_iceberg_prefix")]
+    pub prefix: String,
+    /// Namespace separator advertised in `/v1/config` (URL-encoded).
+    #[serde(default = "default_namespace_separator")]
+    pub namespace_separator: String,
+    /// Enable write endpoints (Phase B+).
+    #[serde(default)]
+    pub allow_write: bool,
+    /// Optional concurrency limit for Iceberg handlers.
+    #[serde(default)]
+    pub concurrency_limit: Option<usize>,
+}
+
+fn default_iceberg_prefix() -> String {
+    "arco".to_string()
+}
+
+fn default_namespace_separator() -> String {
+    "%1F".to_string()
+}
+
+impl Default for IcebergApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prefix: default_iceberg_prefix(),
+            namespace_separator: default_namespace_separator(),
+            allow_write: false,
+            concurrency_limit: None,
+        }
+    }
+}
+
+impl IcebergApiConfig {
+    /// Converts to the arco-iceberg crate's config type.
+    #[must_use]
+    pub fn to_iceberg_config(&self) -> arco_iceberg::IcebergConfig {
+        arco_iceberg::IcebergConfig {
+            prefix: self.prefix.clone(),
+            namespace_separator: self.namespace_separator.clone(),
+            idempotency_key_lifetime: Some("PT1H".to_string()),
+            allow_write: self.allow_write,
+            request_timeout: None,
+            concurrency_limit: self.concurrency_limit,
         }
     }
 }
@@ -128,6 +188,11 @@ impl Config {
     /// - `ARCO_COMPACTOR_URL`
     /// - `ARCO_ORCH_COMPACTOR_URL`
     /// - `ARCO_RUN_KEY_FINGERPRINT_CUTOFF` (RFC3339, e.g. "2025-01-01T00:00:00Z")
+    /// - `ARCO_ICEBERG_ENABLED`
+    /// - `ARCO_ICEBERG_PREFIX`
+    /// - `ARCO_ICEBERG_NAMESPACE_SEPARATOR`
+    /// - `ARCO_ICEBERG_ALLOW_WRITE`
+    /// - `ARCO_ICEBERG_CONCURRENCY_LIMIT`
     ///
     /// JWTs must include tenant/workspace/user claims. The user claim defaults
     /// to `sub` unless overridden via `ARCO_JWT_USER_CLAIM`.
@@ -204,6 +269,23 @@ impl Config {
             config.run_key_fingerprint_cutoff = Some(cutoff);
         }
 
+        // Iceberg configuration
+        if let Some(enabled) = env_bool("ARCO_ICEBERG_ENABLED")? {
+            config.iceberg.enabled = enabled;
+        }
+        if let Some(prefix) = env_string("ARCO_ICEBERG_PREFIX") {
+            config.iceberg.prefix = prefix;
+        }
+        if let Some(separator) = env_string("ARCO_ICEBERG_NAMESPACE_SEPARATOR") {
+            config.iceberg.namespace_separator = separator;
+        }
+        if let Some(allow_write) = env_bool("ARCO_ICEBERG_ALLOW_WRITE")? {
+            config.iceberg.allow_write = allow_write;
+        }
+        if let Some(limit) = env_usize("ARCO_ICEBERG_CONCURRENCY_LIMIT")? {
+            config.iceberg.concurrency_limit = Some(limit);
+        }
+
         Ok(config)
     }
 }
@@ -235,6 +317,15 @@ fn env_u64(name: &str) -> Result<Option<u64>> {
     v.parse::<u64>()
         .map(Some)
         .map_err(|e| Error::InvalidInput(format!("{name} must be a u64: {e}")))
+}
+
+fn env_usize(name: &str) -> Result<Option<usize>> {
+    let Some(v) = env_string(name) else {
+        return Ok(None);
+    };
+    v.parse::<usize>()
+        .map(Some)
+        .map_err(|e| Error::InvalidInput(format!("{name} must be a usize: {e}")))
 }
 
 fn env_bool(name: &str) -> Result<Option<bool>> {

@@ -31,8 +31,8 @@ impl From<Uuid> for TableUuid {
 /// Opaque version token for CAS operations - portable across GCS/S3/ADLS.
 ///
 /// - GCS: generation number as string
-/// - S3: ETag string
-/// - ADLS: ETag string
+/// - S3: `ETag` string
+/// - ADLS: `ETag` string
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(transparent)]
 pub struct ObjectVersion(pub String);

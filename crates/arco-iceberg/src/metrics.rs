@@ -1,0 +1,153 @@
+//! Metrics middleware and instrumentation for the Iceberg REST API.
+
+use std::sync::OnceLock;
+use std::time::Instant;
+
+use axum::extract::MatchedPath;
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use axum::extract::Request;
+use metrics::{counter, describe_counter, describe_histogram, histogram};
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+/// Iceberg request duration histogram.
+pub const ICEBERG_REQUEST_DURATION: &str = "iceberg_request_duration_seconds";
+
+/// Iceberg request counter.
+pub const ICEBERG_REQUEST_TOTAL: &str = "iceberg_request_total";
+
+static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+static METRICS_REGISTERED: OnceLock<()> = OnceLock::new();
+
+/// Registers Iceberg metric descriptions.
+///
+/// Safe to call multiple times; subsequent calls are no-ops.
+pub fn register_metrics() {
+    METRICS_REGISTERED.get_or_init(|| {
+        describe_histogram!(
+            ICEBERG_REQUEST_DURATION,
+            "Duration of Iceberg REST requests in seconds"
+        );
+        describe_counter!(
+            ICEBERG_REQUEST_TOTAL,
+            "Total number of Iceberg REST requests"
+        );
+    });
+}
+
+/// Initializes the global Prometheus metrics recorder.
+///
+/// Safe to call multiple times; subsequent calls are no-ops.
+///
+/// # Panics
+///
+/// Panics if the Prometheus recorder cannot be installed. This is a
+/// critical initialization failure that should not occur in normal
+/// operation.
+#[allow(clippy::panic)]
+pub fn init_metrics() -> PrometheusHandle {
+    PROMETHEUS_HANDLE
+        .get_or_init(|| {
+            let builder = PrometheusBuilder::new();
+            let handle = builder.install_recorder().unwrap_or_else(|e| {
+                panic!("failed to install prometheus recorder: {e}")
+            });
+
+            register_metrics();
+
+            tracing::info!("Iceberg metrics recorder initialized");
+            handle
+        })
+        .clone()
+}
+
+/// Returns the global Prometheus handle, if initialized.
+#[must_use]
+pub fn prometheus_handle() -> Option<PrometheusHandle> {
+    PROMETHEUS_HANDLE.get().cloned()
+}
+
+/// Middleware that records request metrics.
+pub async fn metrics_middleware(request: Request, next: Next) -> Response {
+    let start = Instant::now();
+
+    let path = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| request.uri().path().to_string(), |mp| mp.as_str().to_string());
+    let method = request.method().to_string();
+
+    let response = next.run(request).await;
+
+    let duration = start.elapsed().as_secs_f64();
+    let status = response.status().as_u16().to_string();
+    let status_class = status_class(response.status());
+
+    let labels = [
+        ("endpoint", path.clone()),
+        ("method", method.clone()),
+        ("status", status.clone()),
+        ("status_class", status_class.to_string()),
+    ];
+
+    histogram!(ICEBERG_REQUEST_DURATION, &labels).record(duration);
+    counter!(ICEBERG_REQUEST_TOTAL, &labels).increment(1);
+
+    if duration > 1.0 {
+        tracing::warn!(
+            endpoint = %path,
+            method = %method,
+            status = %status,
+            duration_secs = %duration,
+            "Slow Iceberg request detected"
+        );
+    }
+
+    response
+}
+
+fn status_class(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "unknown",
+    }
+}
+
+/// Handler for the `/metrics` endpoint.
+#[allow(clippy::must_use_candidate)] // Route handler, return value used by framework
+pub fn serve_metrics() -> impl IntoResponse {
+    prometheus_handle().map_or_else(
+        || {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("content-type", "text/plain; charset=utf-8")],
+                "Metrics not initialized".to_string(),
+            )
+        },
+        |handle| {
+            let metrics = handle.render();
+            (
+                StatusCode::OK,
+                [("content-type", "text/plain; charset=utf-8")],
+                metrics,
+            )
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_status_class() {
+        assert_eq!(status_class(StatusCode::OK), "2xx");
+        assert_eq!(status_class(StatusCode::NOT_FOUND), "4xx");
+        assert_eq!(status_class(StatusCode::INTERNAL_SERVER_ERROR), "5xx");
+    }
+}

@@ -2,13 +2,19 @@
 //!
 //! See design doc Section 3 for the two-phase marker protocol.
 
+use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use ulid::Ulid;
 use uuid::Uuid;
 
-use crate::error::IcebergErrorResponse;
+use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
+
+use crate::error::{IcebergError, IcebergErrorResponse, IcebergResult};
+use crate::types::ObjectVersion;
 
 /// Error canonicalizing a JSON request body for idempotency hashing.
 #[derive(Debug, thiserror::Error)]
@@ -23,7 +29,6 @@ pub enum CanonicalizationError {
 /// # Errors
 ///
 /// Returns an error if the JSON value cannot be canonicalized.
-#[must_use]
 pub fn canonical_request_hash(
     value: &serde_json::Value,
 ) -> Result<String, CanonicalizationError> {
@@ -51,7 +56,7 @@ pub enum IdempotencyKeyError {
     #[error("Idempotency-Key must be a canonical lowercase UUID string")]
     NotCanonical,
 
-    /// Key is not UUIDv7.
+    /// Key is not `UUIDv7`.
     #[error("Idempotency-Key must be UUIDv7 (RFC 9562), found version {found_version}")]
     NotUuidV7 {
         /// The version number found.
@@ -209,13 +214,13 @@ impl IdempotencyMarker {
         self.status == IdempotencyStatus::InProgress && self.started_at + timeout < Utc::now()
     }
 
-    /// Validates that an idempotency key is a valid UUIDv7.
+    /// Validates that an idempotency key is a valid `UUIDv7`.
     ///
-    /// Per design doc: Idempotency-Key must be UUIDv7 (RFC 9562) in canonical string form.
+    /// Per design doc: Idempotency-Key must be `UUIDv7` (RFC 9562) in canonical string form.
     ///
     /// # Errors
     ///
-    /// Returns an error if the key is not a valid UUIDv7.
+    /// Returns an error if the key is not a valid `UUIDv7`.
     pub fn validate_uuidv7(key: &str) -> Result<Uuid, IdempotencyKeyError> {
         let uuid = Uuid::parse_str(key).map_err(|_| IdempotencyKeyError::InvalidFormat)?;
 
@@ -238,6 +243,182 @@ impl IdempotencyMarker {
         }
 
         Ok(uuid)
+    }
+}
+
+// ============================================================================
+// IdempotencyStore - Storage operations for idempotency markers
+// ============================================================================
+
+/// Result of attempting to claim an idempotency marker.
+#[derive(Debug, Clone)]
+pub enum ClaimResult {
+    /// Successfully claimed the marker (first claim).
+    Success {
+        /// Version of the written marker.
+        version: ObjectVersion,
+    },
+    /// Marker already exists (duplicate claim).
+    Exists {
+        /// The existing marker (boxed to reduce enum size).
+        marker: Box<IdempotencyMarker>,
+        /// Version of the existing marker.
+        version: ObjectVersion,
+    },
+}
+
+/// Trait for idempotency marker storage operations.
+#[async_trait]
+pub trait IdempotencyStore: Send + Sync {
+    /// Claims an idempotency marker (write with DoesNotExist precondition).
+    ///
+    /// Returns `ClaimResult::Success` if this is the first claim.
+    /// Returns `ClaimResult::Exists` if the marker already exists.
+    async fn claim(&self, marker: &IdempotencyMarker) -> IcebergResult<ClaimResult>;
+
+    /// Loads an existing marker.
+    async fn load(
+        &self,
+        table_uuid: &Uuid,
+        idempotency_key_hash: &str,
+    ) -> IcebergResult<Option<(IdempotencyMarker, ObjectVersion)>>;
+
+    /// Updates a marker with CAS (to finalize as committed/failed).
+    async fn finalize(
+        &self,
+        marker: &IdempotencyMarker,
+        expected_version: &ObjectVersion,
+    ) -> IcebergResult<FinalizeResult>;
+}
+
+/// Result of a finalize operation.
+#[derive(Debug, Clone)]
+pub enum FinalizeResult {
+    /// Successfully finalized the marker.
+    Success {
+        /// New version after finalization.
+        version: ObjectVersion,
+    },
+    /// Version mismatch (another process finalized first).
+    Conflict {
+        /// Current version that caused the conflict.
+        current_version: ObjectVersion,
+    },
+}
+
+/// Implementation of `IdempotencyStore` using `StorageBackend`.
+pub struct IdempotencyStoreImpl<S> {
+    storage: Arc<S>,
+}
+
+impl<S: StorageBackend> IdempotencyStoreImpl<S> {
+    /// Creates a new idempotency store.
+    #[must_use]
+    pub fn new(storage: Arc<S>) -> Self {
+        Self { storage }
+    }
+}
+
+#[async_trait]
+impl<S: StorageBackend> IdempotencyStore for IdempotencyStoreImpl<S> {
+    async fn claim(&self, marker: &IdempotencyMarker) -> IcebergResult<ClaimResult> {
+        let path = IdempotencyMarker::storage_path(&marker.table_uuid, &marker.idempotency_key_hash);
+        let bytes = serde_json::to_vec(marker).map_err(|e| IcebergError::Internal {
+            message: format!("Failed to serialize idempotency marker: {e}"),
+        })?;
+
+        match self
+            .storage
+            .put(&path, Bytes::from(bytes), WritePrecondition::DoesNotExist)
+            .await
+        {
+            Ok(WriteResult::Success { version }) => Ok(ClaimResult::Success {
+                version: ObjectVersion::new(version),
+            }),
+            Ok(WriteResult::PreconditionFailed { current_version }) => {
+                // Marker exists - load it to return
+                let existing = self
+                    .load(&marker.table_uuid, &marker.idempotency_key_hash)
+                    .await?;
+                match existing {
+                    Some((existing_marker, _)) => Ok(ClaimResult::Exists {
+                        marker: Box::new(existing_marker),
+                        version: ObjectVersion::new(current_version),
+                    }),
+                    None => {
+                        // Race condition: marker was deleted between precondition fail and load
+                        Err(IcebergError::Internal {
+                            message: "Idempotency marker disappeared during claim".to_string(),
+                        })
+                    }
+                }
+            }
+            Err(e) => Err(IcebergError::Internal {
+                message: format!("Failed to claim idempotency marker: {e}"),
+            }),
+        }
+    }
+
+    async fn load(
+        &self,
+        table_uuid: &Uuid,
+        idempotency_key_hash: &str,
+    ) -> IcebergResult<Option<(IdempotencyMarker, ObjectVersion)>> {
+        let path = IdempotencyMarker::storage_path(table_uuid, idempotency_key_hash);
+
+        let meta = self
+            .storage
+            .head(&path)
+            .await
+            .map_err(|e| IcebergError::Internal {
+                message: format!("Failed to check idempotency marker existence: {e}"),
+            })?;
+
+        let Some(meta) = meta else {
+            return Ok(None);
+        };
+
+        let bytes = self
+            .storage
+            .get(&path)
+            .await
+            .map_err(|e| IcebergError::Internal {
+                message: format!("Failed to read idempotency marker: {e}"),
+            })?;
+
+        let marker: IdempotencyMarker =
+            serde_json::from_slice(&bytes).map_err(|e| IcebergError::Internal {
+                message: format!("Failed to parse idempotency marker: {e}"),
+            })?;
+
+        Ok(Some((marker, ObjectVersion::new(meta.version))))
+    }
+
+    async fn finalize(
+        &self,
+        marker: &IdempotencyMarker,
+        expected_version: &ObjectVersion,
+    ) -> IcebergResult<FinalizeResult> {
+        let path = IdempotencyMarker::storage_path(&marker.table_uuid, &marker.idempotency_key_hash);
+        let bytes = serde_json::to_vec(marker).map_err(|e| IcebergError::Internal {
+            message: format!("Failed to serialize idempotency marker: {e}"),
+        })?;
+
+        let precondition = WritePrecondition::MatchesVersion(expected_version.as_str().to_string());
+
+        match self.storage.put(&path, Bytes::from(bytes), precondition).await {
+            Ok(WriteResult::Success { version }) => Ok(FinalizeResult::Success {
+                version: ObjectVersion::new(version),
+            }),
+            Ok(WriteResult::PreconditionFailed { current_version }) => {
+                Ok(FinalizeResult::Conflict {
+                    current_version: ObjectVersion::new(current_version),
+                })
+            }
+            Err(e) => Err(IcebergError::Internal {
+                message: format!("Failed to finalize idempotency marker: {e}"),
+            }),
+        }
     }
 }
 
@@ -403,5 +584,31 @@ mod tests {
         let hash1 = canonical_request_hash(&request1).expect("canonical hash");
         let hash2 = canonical_request_hash(&request2).expect("canonical hash");
         assert_ne!(hash1, hash2);
+    }
+
+    #[tokio::test]
+    async fn test_idempotency_store_claim() {
+        use arco_core::storage::MemoryBackend;
+        use std::sync::Arc;
+
+        let storage = Arc::new(MemoryBackend::new());
+        let store = IdempotencyStoreImpl::new(storage);
+
+        let table_uuid = Uuid::new_v4();
+        let marker = IdempotencyMarker::new_in_progress(
+            "01924a7c-8d9f-7000-8000-000000000001".to_string(),
+            table_uuid,
+            "request_hash".to_string(),
+            "base.json".to_string(),
+            "new.json".to_string(),
+        );
+
+        // First claim succeeds
+        let result = store.claim(&marker).await.expect("claim");
+        assert!(matches!(result, ClaimResult::Success { .. }));
+
+        // Second claim finds existing
+        let result = store.claim(&marker).await.expect("claim");
+        assert!(matches!(result, ClaimResult::Exists { .. }));
     }
 }

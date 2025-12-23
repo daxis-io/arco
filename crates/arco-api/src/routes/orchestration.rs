@@ -974,6 +974,24 @@ pub(crate) async fn manual_evaluate_sensor(
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
 
+    let warning = match load_orchestration_state(&ctx, &state).await {
+        Ok(fold_state) => fold_state.sensor_state.get(&sensor_id).and_then(|row| {
+            match row.status {
+                SensorStatus::Active => None,
+                SensorStatus::Paused => Some("Sensor is paused but manual evaluate bypasses status".to_string()),
+                SensorStatus::Error => Some("Sensor is in error but manual evaluate bypasses status".to_string()),
+            }
+        }),
+        Err(err) => {
+            tracing::warn!(
+                sensor_id = %sensor_id,
+                error = ?err,
+                "failed to load sensor state for manual evaluate warning"
+            );
+            None
+        }
+    };
+
     let message_id = request
         .message_id
         .clone()
@@ -1033,10 +1051,6 @@ pub(crate) async fn manual_evaluate_sensor(
         .map_err(|e| ApiError::internal(format!("failed to append sensor events: {e}")))?;
 
     compact_orchestration_events(&state.config, storage, event_paths).await?;
-
-    // TODO: Once sensor_state is persisted to Parquet, look up actual sensor status
-    // and set warning if paused/errored: "Sensor is paused/errored but manual evaluate bypasses status"
-    let warning: Option<String> = None;
 
     Ok((
         StatusCode::OK,

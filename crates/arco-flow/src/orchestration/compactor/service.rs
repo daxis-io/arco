@@ -22,6 +22,8 @@ use super::fold::{
     merge_dep_satisfaction_rows,
     merge_dispatch_outbox_rows,
     merge_run_rows,
+    merge_sensor_eval_rows,
+    merge_sensor_state_rows,
     merge_task_rows,
     merge_timer_rows,
     FoldState,
@@ -31,9 +33,13 @@ use super::parquet_util::{
     write_dep_satisfaction,
     write_dispatch_outbox,
     write_runs,
+    write_sensor_evals,
+    write_sensor_state,
     write_tasks,
     write_timers,
 };
+
+const SENSOR_EVAL_RETENTION_DAYS: i64 = 30;
 
 /// Micro-compactor for orchestration events.
 ///
@@ -129,6 +135,8 @@ impl MicroCompactor {
             state.fold_event(event);
         }
 
+        prune_sensor_evals(&mut state);
+
         // Compute delta state (rows changed by this batch)
         let delta_state = delta_from_states(&base_state, &state);
         let has_delta = !delta_state_is_empty(&delta_state);
@@ -149,6 +157,8 @@ impl MicroCompactor {
             dep_satisfaction: u32::try_from(delta_state.dep_satisfaction.len()).unwrap_or(u32::MAX),
             timers: u32::try_from(delta_state.timers.len()).unwrap_or(u32::MAX),
             dispatch_outbox: u32::try_from(delta_state.dispatch_outbox.len()).unwrap_or(u32::MAX),
+            sensor_state: u32::try_from(delta_state.sensor_state.len()).unwrap_or(u32::MAX),
+            sensor_evals: u32::try_from(delta_state.sensor_evals.len()).unwrap_or(u32::MAX),
         };
 
         // Create L0 delta entry when changes exist
@@ -236,6 +246,7 @@ impl MicroCompactor {
             state = merge_states(state, delta_state);
         }
 
+        prune_sensor_evals(&mut state);
         state.rebuild_dependency_graph();
 
         Ok(state)
@@ -289,6 +300,22 @@ impl MicroCompactor {
             let rows = super::parquet_util::read_dispatch_outbox(&data)?;
             for row in rows {
                 state.dispatch_outbox.insert(row.dispatch_id.clone(), row);
+            }
+        }
+
+        if let Some(ref sensor_state_path) = tables.sensor_state {
+            let data = self.storage.get_raw(sensor_state_path).await?;
+            let rows = super::parquet_util::read_sensor_state(&data)?;
+            for row in rows {
+                state.sensor_state.insert(row.sensor_id.clone(), row);
+            }
+        }
+
+        if let Some(ref sensor_evals_path) = tables.sensor_evals {
+            let data = self.storage.get_raw(sensor_evals_path).await?;
+            let rows = super::parquet_util::read_sensor_evals(&data)?;
+            for row in rows {
+                state.sensor_evals.insert(row.eval_id.clone(), row);
             }
         }
 
@@ -347,6 +374,22 @@ impl MicroCompactor {
             let path = format!("{base_path}/dispatch_outbox.parquet");
             self.write_parquet_file(&path, bytes).await?;
             paths.dispatch_outbox = Some(path);
+        }
+
+        if !state.sensor_state.is_empty() {
+            let rows: Vec<_> = state.sensor_state.values().cloned().collect();
+            let bytes = write_sensor_state(&rows)?;
+            let path = format!("{base_path}/sensor_state.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.sensor_state = Some(path);
+        }
+
+        if !state.sensor_evals.is_empty() {
+            let rows: Vec<_> = state.sensor_evals.values().cloned().collect();
+            let bytes = write_sensor_evals(&rows)?;
+            let path = format!("{base_path}/sensor_evals.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.sensor_evals = Some(path);
         }
 
         Ok(paths)
@@ -461,6 +504,30 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
             .or_insert(row);
     }
 
+    // Merge sensor state
+    for (sensor_id, row) in delta.sensor_state {
+        merged.sensor_state
+            .entry(sensor_id)
+            .and_modify(|existing| {
+                if let Some(merged_row) = merge_sensor_state_rows(vec![existing.clone(), row.clone()]) {
+                    *existing = merged_row;
+                }
+            })
+            .or_insert(row);
+    }
+
+    // Merge sensor evals
+    for (eval_id, row) in delta.sensor_evals {
+        merged.sensor_evals
+            .entry(eval_id)
+            .and_modify(|existing| {
+                if let Some(merged_row) = merge_sensor_eval_rows(vec![existing.clone(), row.clone()]) {
+                    *existing = merged_row;
+                }
+            })
+            .or_insert(row);
+    }
+
     merged
 }
 
@@ -497,6 +564,18 @@ fn delta_from_states(base: &FoldState, current: &FoldState) -> FoldState {
         }
     }
 
+    for (sensor_id, row) in &current.sensor_state {
+        if base.sensor_state.get(sensor_id) != Some(row) {
+            delta.sensor_state.insert(sensor_id.clone(), row.clone());
+        }
+    }
+
+    for (eval_id, row) in &current.sensor_evals {
+        if base.sensor_evals.get(eval_id) != Some(row) {
+            delta.sensor_evals.insert(eval_id.clone(), row.clone());
+        }
+    }
+
     delta
 }
 
@@ -506,6 +585,13 @@ fn delta_state_is_empty(state: &FoldState) -> bool {
         && state.dep_satisfaction.is_empty()
         && state.timers.is_empty()
         && state.dispatch_outbox.is_empty()
+        && state.sensor_state.is_empty()
+        && state.sensor_evals.is_empty()
+}
+
+fn prune_sensor_evals(state: &mut FoldState) {
+    let cutoff = Utc::now() - chrono::Duration::days(SENSOR_EVAL_RETENTION_DAYS);
+    state.sensor_evals.retain(|_, row| row.evaluated_at >= cutoff);
 }
 
 fn update_watermarks(
@@ -831,6 +917,8 @@ mod tests {
         assert_eq!(latest.row_counts.dep_satisfaction, 0);
         assert_eq!(latest.row_counts.timers, 0);
         assert_eq!(latest.row_counts.dispatch_outbox, 0);
+        assert_eq!(latest.row_counts.sensor_state, 0);
+        assert_eq!(latest.row_counts.sensor_evals, 0);
 
         Ok(())
     }

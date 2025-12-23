@@ -177,7 +177,7 @@ pub enum TableUpdate {
 
     /// Set table location.
     ///
-    /// **Note:** Arco rejects this update (400 BadRequest) - Arco owns storage location.
+    /// **Note:** Arco rejects this update (400 `BadRequest`) - Arco owns storage location.
     SetLocation {
         /// New location.
         location: String,
@@ -207,31 +207,26 @@ impl TableUpdate {
     pub fn is_rejected_by_guardrails(&self) -> Option<String> {
         fn is_reserved_key(key: &str) -> bool {
             key.get(..5)
-                .map(|prefix| prefix.eq_ignore_ascii_case("arco."))
-                .unwrap_or(false)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("arco."))
         }
 
         match self {
             Self::SetLocation { .. } => Some(
                 "SetLocationUpdate is rejected: Arco owns storage location".to_string(),
             ),
-            Self::SetProperties { updates } => {
-                if let Some(key) = updates.keys().find(|k| is_reserved_key(k)) {
-                    Some(format!(
+            Self::SetProperties { updates } => updates.keys().find(|k| is_reserved_key(k)).map(
+                |key| {
+                    format!(
                         "SetPropertiesUpdate with reserved key '{key}' is rejected: Arco owns the 'arco.' namespace"
-                    ))
-                } else {
-                    None
-                }
-            }
+                    )
+                },
+            ),
             Self::RemoveProperties { removals } => {
-                if let Some(key) = removals.iter().find(|k| is_reserved_key(k)) {
-                    Some(format!(
+                removals.iter().find(|k| is_reserved_key(k)).map(|key| {
+                    format!(
                         "RemovePropertiesUpdate with reserved key '{key}' is rejected: Arco owns the 'arco.' namespace"
-                    ))
-                } else {
-                    None
-                }
+                    )
+                })
             }
             _ => None,
         }

@@ -25,7 +25,13 @@ iam-smoke = []
 arco-core = { path = "../arco-core" }
 arco-catalog = { path = "../arco-catalog" }
 arco-flow = { path = "../arco-flow" }
+arco-iceberg = { path = "../arco-iceberg" }
 
 tokio = { workspace = true, features = ["full", "test-util"] }
 bytes = { workspace = true }
 ulid = { workspace = true }
+axum = { workspace = true }
+iceberg = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

@@ -580,9 +580,8 @@ pub async fn task_auth_middleware(
         request_id_from_headers(headers).unwrap_or_else(|| Ulid::new().to_string());
     let idempotency_key = header_string(headers, "Idempotency-Key");
 
-    let token = match extract_bearer_token(headers) {
-        Some(token) => token,
-        None => return unauthorized_response(&request_id, "missing bearer token"),
+    let Some(token) = extract_bearer_token(headers) else {
+        return unauthorized_response(&request_id, "missing bearer token");
     };
 
     let (tenant, workspace) = if state.config.debug {

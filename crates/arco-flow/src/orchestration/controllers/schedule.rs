@@ -98,118 +98,9 @@ impl ScheduleController {
         let mut actions_total = 0_u64;
 
         for def in definitions {
-            let schedule = match Self::parse_cron_expression(&def.cron_expression) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        schedule_id = %def.schedule_id,
-                        cron_expression = %def.cron_expression,
-                        "invalid cron expression: {e}"
-                    );
-                    let error_tick = Self::error_tick(def, &e, now);
-                    Self::record_tick_metrics(&error_tick);
-                    events.push(error_tick);
-                    actions_total = actions_total.saturating_add(1);
-                    continue;
-                }
-            };
-
-            let Ok(tz): Result<Tz, _> = def.timezone.parse() else {
-                warn!(
-                    schedule_id = %def.schedule_id,
-                    timezone = %def.timezone,
-                    "invalid timezone"
-                );
-                let error_tick = Self::error_tick(
-                    def,
-                    &format!("invalid timezone: {}", def.timezone),
-                    now,
-                );
-                Self::record_tick_metrics(&error_tick);
-                events.push(error_tick);
-                actions_total = actions_total.saturating_add(1);
-                continue;
-            };
-
-            let last_scheduled_for = state_map
-                .get(def.schedule_id.as_str())
-                .and_then(|s| s.last_scheduled_for);
-
-            let catchup_window = if def.catchup_window_minutes == 0 {
-                self.default_catchup_window
-            } else {
-                Duration::minutes(i64::from(def.catchup_window_minutes))
-            };
-
-            let ticks = Self::compute_due_ticks(
-                &schedule,
-                last_scheduled_for,
-                now,
-                def.max_catchup_ticks,
-                catchup_window,
-                tz,
-            );
-
-            for scheduled_for in ticks {
-                let tick_event = if def.enabled {
-                    Self::create_tick_event(def, scheduled_for)
-                } else {
-                    Self::create_paused_tick_event(def, scheduled_for)
-                };
-
-                // Per P0-1: Controller must emit RunRequested atomically with tick
-                // Extract values before moving tick_event
-                let (should_emit_run_req, tick_id_clone, run_key_clone, fingerprint_clone, assets_clone, partitions_clone) =
-                    if let OrchestrationEventData::ScheduleTicked {
-                        ref tick_id,
-                        ref run_key,
-                        ref request_fingerprint,
-                        ref asset_selection,
-                        ref partition_selection,
-                        status: TickStatus::Triggered,
-                        ..
-                    } = tick_event.data
-                    {
-                        (
-                            run_key.is_some(),
-                            tick_id.clone(),
-                            run_key.clone(),
-                            request_fingerprint.clone(),
-                            asset_selection.clone(),
-                            partition_selection.clone(),
-                        )
-                    } else {
-                        (false, String::new(), None, None, Vec::new(), None)
-                    };
-
-                Self::record_tick_metrics(&tick_event);
-                events.push(tick_event);
-                actions_total = actions_total.saturating_add(1);
-
-                // Emit RunRequested for triggered ticks
-                if should_emit_run_req {
-                    if let Some(rk) = run_key_clone {
-                        let run_req = OrchestrationEvent::new(
-                            &def.tenant_id,
-                            &def.workspace_id,
-                            OrchestrationEventData::RunRequested {
-                                run_key: rk,
-                                request_fingerprint: fingerprint_clone.unwrap_or_default(),
-                                asset_selection: assets_clone,
-                                partition_selection: partitions_clone,
-                                trigger_source_ref: SourceRef::Schedule {
-                                    schedule_id: def.schedule_id.clone(),
-                                    tick_id: tick_id_clone,
-                                },
-                                labels: HashMap::new(),
-                            },
-                        );
-                        events.push(run_req);
-                        Self::record_run_request_metrics();
-                        actions_total = actions_total.saturating_add(1);
-                    }
-                }
-            }
+            let (mut def_events, def_actions) = self.reconcile_definition(def, &state_map, now);
+            actions_total = actions_total.saturating_add(def_actions);
+            events.append(&mut def_events);
         }
 
         counter!(
@@ -219,6 +110,75 @@ impl ScheduleController {
         .increment(actions_total);
 
         events
+    }
+
+    fn reconcile_definition(
+        &self,
+        def: &ScheduleDefinitionRow,
+        state_map: &HashMap<&str, &ScheduleStateRow>,
+        now: DateTime<Utc>,
+    ) -> (Vec<OrchestrationEvent>, u64) {
+        let mut events = Vec::new();
+        let mut actions_total = 0_u64;
+
+        let schedule = match Self::parse_cron_expression(&def.cron_expression) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    schedule_id = %def.schedule_id,
+                    cron_expression = %def.cron_expression,
+                    "invalid cron expression: {e}"
+                );
+                let error_tick = Self::error_tick(def, &e, now);
+                Self::push_tick_event(&mut events, &mut actions_total, error_tick);
+                return (events, actions_total);
+            }
+        };
+
+        let Ok(tz): Result<Tz, _> = def.timezone.parse() else {
+            warn!(
+                schedule_id = %def.schedule_id,
+                timezone = %def.timezone,
+                "invalid timezone"
+            );
+            let error_tick = Self::error_tick(def, &format!("invalid timezone: {}", def.timezone), now);
+            Self::push_tick_event(&mut events, &mut actions_total, error_tick);
+            return (events, actions_total);
+        };
+
+        let last_scheduled_for = state_map
+            .get(def.schedule_id.as_str())
+            .and_then(|s| s.last_scheduled_for);
+
+        let catchup_window = if def.catchup_window_minutes == 0 {
+            self.default_catchup_window
+        } else {
+            Duration::minutes(i64::from(def.catchup_window_minutes))
+        };
+
+        let ticks = Self::compute_due_ticks(
+            &schedule,
+            last_scheduled_for,
+            now,
+            def.max_catchup_ticks,
+            catchup_window,
+            tz,
+        );
+
+        for scheduled_for in ticks {
+            let tick_event = if def.enabled {
+                Self::create_tick_event(def, scheduled_for)
+            } else {
+                Self::create_paused_tick_event(def, scheduled_for)
+            };
+            let run_req = Self::build_run_request(def, &tick_event);
+            Self::push_tick_event(&mut events, &mut actions_total, tick_event);
+            if let Some(run_req) = run_req {
+                Self::push_run_request_event(&mut events, &mut actions_total, run_req);
+            }
+        }
+
+        (events, actions_total)
     }
 
     /// Parses a cron expression, normalizing 5-field syntax to 6-field with seconds.
@@ -310,6 +270,61 @@ impl ScheduleController {
                 request_fingerprint: None,
             },
         )
+    }
+
+    fn push_tick_event(
+        events: &mut Vec<OrchestrationEvent>,
+        actions_total: &mut u64,
+        event: OrchestrationEvent,
+    ) {
+        Self::record_tick_metrics(&event);
+        events.push(event);
+        *actions_total = actions_total.saturating_add(1);
+    }
+
+    fn push_run_request_event(
+        events: &mut Vec<OrchestrationEvent>,
+        actions_total: &mut u64,
+        event: OrchestrationEvent,
+    ) {
+        Self::record_run_request_metrics();
+        events.push(event);
+        *actions_total = actions_total.saturating_add(1);
+    }
+
+    fn build_run_request(
+        def: &ScheduleDefinitionRow,
+        tick_event: &OrchestrationEvent,
+    ) -> Option<OrchestrationEvent> {
+        let OrchestrationEventData::ScheduleTicked {
+            tick_id,
+            run_key,
+            request_fingerprint,
+            asset_selection,
+            partition_selection,
+            status: TickStatus::Triggered,
+            ..
+        } = &tick_event.data else {
+            return None;
+        };
+
+        let run_key = run_key.as_ref()?;
+
+        Some(OrchestrationEvent::new(
+            &def.tenant_id,
+            &def.workspace_id,
+            OrchestrationEventData::RunRequested {
+                run_key: run_key.clone(),
+                request_fingerprint: request_fingerprint.clone().unwrap_or_default(),
+                asset_selection: asset_selection.clone(),
+                partition_selection: partition_selection.clone(),
+                trigger_source_ref: SourceRef::Schedule {
+                    schedule_id: def.schedule_id.clone(),
+                    tick_id: tick_id.clone(),
+                },
+                labels: HashMap::new(),
+            },
+        ))
     }
 
     fn record_tick_metrics(event: &OrchestrationEvent) {

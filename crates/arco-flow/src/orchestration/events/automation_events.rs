@@ -41,7 +41,7 @@ pub enum TriggerSource {
 
 /// Status of a sensor evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum SensorEvalStatus {
     /// Sensor triggered one or more runs.
     Triggered,
@@ -122,14 +122,13 @@ impl Default for SensorStatus {
     }
 }
 
-/// Computes a short hash of the request fingerprint for idempotency keys.
-pub fn sha256_short(input: &str) -> String {
+/// Computes a full SHA-256 hex digest for idempotency keys.
+pub fn sha256_hex(input: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     let result = hasher.finalize();
-    // Take first 8 bytes (16 hex chars) for short hash
-    hex::encode(&result[..8])
+    hex::encode(result)
 }
 
 #[cfg(test)]
@@ -166,13 +165,13 @@ mod tests {
     }
 
     #[test]
-    fn test_sha256_short() {
-        let hash1 = sha256_short("test_input");
-        let hash2 = sha256_short("test_input");
+    fn test_sha256_hex() {
+        let hash1 = sha256_hex("test_input");
+        let hash2 = sha256_hex("test_input");
         assert_eq!(hash1, hash2);
-        assert_eq!(hash1.len(), 16); // 8 bytes = 16 hex chars
+        assert_eq!(hash1.len(), 64); // Full SHA-256 hex digest
 
-        let hash3 = sha256_short("different_input");
+        let hash3 = sha256_hex("different_input");
         assert_ne!(hash1, hash3);
     }
 }

@@ -37,14 +37,9 @@ impl BackfillState {
         use BackfillState::*;
         matches!(
             (from, to),
-            (Pending, Running)
-                | (Pending, Cancelled)
-                | (Running, Paused)
-                | (Running, Succeeded)
-                | (Running, Failed)
-                | (Running, Cancelled)
-                | (Paused, Running)
-                | (Paused, Cancelled)
+            (Pending | Paused, Running)
+                | (Pending | Running | Paused, Cancelled)
+                | (Running, Paused | Succeeded | Failed)
         )
     }
 }

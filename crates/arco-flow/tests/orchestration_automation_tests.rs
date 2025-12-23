@@ -2,7 +2,7 @@
 
 use arco_flow::orchestration::events::{
     BackfillState, OrchestrationEvent, OrchestrationEventData, PartitionSelector, RunRequest,
-    SensorEvalStatus, TickStatus, TriggerSource, sha256_short,
+    SensorEvalStatus, TickStatus, TriggerSource, sha256_hex,
 };
 use chrono::{TimeZone, Utc};
 
@@ -166,7 +166,7 @@ fn test_sensor_evaluated_poll_idempotency_uses_cursor_before() {
     );
 
     // Poll sensor idempotency based on cursor_before (input), not cursor_after
-    let cursor_hash = sha256_short("cursor_v1");
+    let cursor_hash = sha256_hex("cursor_v1");
     assert!(event.idempotency_key.contains(&cursor_hash));
     assert!(event.idempotency_key.contains("poll:1736935200"));
 }

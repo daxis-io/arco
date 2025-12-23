@@ -10,7 +10,7 @@
 //! | Intent | `DispatchRequested`, `TimerRequested` | "I want this to happen" |
 //! | Acknowledgement | `DispatchEnqueued`, `TimerEnqueued` | "External system accepted" |
 //! | Worker Facts | `TaskStarted`, `TaskHeartbeat`, `TaskFinished` | "This happened" |
-//! | Automation | `ScheduleTicked`, `SensorEvaluated`, `RunRequested` | "Trigger evaluated" |
+//! | Automation | `ScheduleTicked`, `SensorEvaluated` (RunRequested in Task 1.4) | "Trigger evaluated" |
 //! | Backfill | `BackfillCreated`, `BackfillChunkPlanned`, `BackfillStateChanged` | "Backfill lifecycle" |
 //!
 //! Derived state changes (`TaskBecameReady`, `TaskSkipped`, `RunCompleted`) are
@@ -33,7 +33,7 @@ pub mod backfill_events;
 
 pub use automation_events::{
     RunRequest, SensorEvalStatus, SensorStatus, SourceRef, TickStatus, TriggerSource,
-    sha256_short,
+    sha256_hex,
 };
 pub use backfill_events::{BackfillState, ChunkState, PartitionSelector};
 
@@ -533,7 +533,7 @@ impl OrchestrationEventData {
                     TriggerSource::Poll { poll_epoch } => {
                         let cursor_hash = cursor_before
                             .as_ref()
-                            .map(|c| sha256_short(c))
+                            .map(|c| sha256_hex(c))
                             .unwrap_or_else(|| "none".to_string());
                         format!("sensor_eval:{sensor_id}:poll:{poll_epoch}:{cursor_hash}")
                     }

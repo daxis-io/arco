@@ -660,6 +660,10 @@ impl FoldState {
                 // TODO(Task 2.2): Implement fold_schedule_ticked
                 // Updates schedule_state and schedule_ticks projections
             }
+            OrchestrationEventData::SensorEvaluated { .. } => {
+                // TODO(Task 3.3): Implement fold_sensor_evaluated
+                // Updates sensor_state projection, enforces CAS for poll sensors
+            }
         }
     }
 

@@ -10,7 +10,7 @@
 //! | Intent | `DispatchRequested`, `TimerRequested` | "I want this to happen" |
 //! | Acknowledgement | `DispatchEnqueued`, `TimerEnqueued` | "External system accepted" |
 //! | Worker Facts | `TaskStarted`, `TaskHeartbeat`, `TaskFinished` | "This happened" |
-//! | Automation | `ScheduleTicked`, `SensorEvaluated` (RunRequested in Task 1.4) | "Trigger evaluated" |
+//! | Automation | `ScheduleTicked`, `SensorEvaluated`, `RunRequested` | "Trigger evaluated" |
 //! | Backfill | `BackfillCreated`, `BackfillChunkPlanned`, `BackfillStateChanged` | "Backfill lifecycle" |
 //!
 //! Derived state changes (`TaskBecameReady`, `TaskSkipped`, `RunCompleted`) are
@@ -391,6 +391,27 @@ pub enum OrchestrationEventData {
         status: SensorEvalStatus,
     },
 
+    /// A run has been requested by an automation trigger.
+    ///
+    /// Emitted atomically with `ScheduleTicked`, `SensorEvaluated`, or `BackfillChunkPlanned`.
+    /// The `run_id` is computed deterministically from `run_key` at fold time.
+    RunRequested {
+        /// Stable run key for idempotency (e.g., "sched:01HQ123:1736935200").
+        run_key: String,
+        /// Fingerprint of the request payload for conflict detection.
+        request_fingerprint: String,
+        /// Assets to materialize.
+        asset_selection: Vec<String>,
+        /// Optional partition selection.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partition_selection: Option<Vec<String>>,
+        /// Reference to what triggered this request.
+        trigger_source_ref: SourceRef,
+        /// Optional labels for the run.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        labels: HashMap<String, String>,
+    },
+
     // ========================================================================
     // Backfill Events (Layer 2)
     // ========================================================================
@@ -465,6 +486,7 @@ impl OrchestrationEventData {
             Self::TimerFired { .. } => "TimerFired",
             Self::ScheduleTicked { .. } => "ScheduleTicked",
             Self::SensorEvaluated { .. } => "SensorEvaluated",
+            Self::RunRequested { .. } => "RunRequested",
             Self::BackfillCreated { .. } => "BackfillCreated",
             Self::BackfillChunkPlanned { .. } => "BackfillChunkPlanned",
             Self::BackfillStateChanged { .. } => "BackfillStateChanged",
@@ -540,6 +562,15 @@ impl OrchestrationEventData {
                 }
             }
 
+            Self::RunRequested {
+                run_key,
+                request_fingerprint,
+                ..
+            } => {
+                let fp_hash = sha256_hex(request_fingerprint);
+                format!("runreq:{run_key}:{fp_hash}")
+            }
+
             Self::BackfillCreated {
                 client_request_id, ..
             } => format!("backfill_create:{client_request_id}"),
@@ -575,9 +606,10 @@ impl OrchestrationEventData {
             | Self::TimerEnqueued { run_id, .. }
             | Self::TimerFired { run_id, .. } => run_id.as_deref(),
 
-            // Automation events don't have direct run_id (runs are created separately)
+            // Automation events don't have direct run_id (runs are created at fold time)
             Self::ScheduleTicked { .. }
             | Self::SensorEvaluated { .. }
+            | Self::RunRequested { .. }
             | Self::BackfillCreated { .. }
             | Self::BackfillChunkPlanned { .. }
             | Self::BackfillStateChanged { .. } => None,

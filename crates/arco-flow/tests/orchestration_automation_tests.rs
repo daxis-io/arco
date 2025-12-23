@@ -315,3 +315,187 @@ fn test_backfill_events_no_run_id() {
 
     assert!(event.data.run_id().is_none());
 }
+
+// ============================================================================
+// RunRequested Event Tests
+// ============================================================================
+
+#[test]
+fn test_run_requested_stable_run_key_fingerprint_in_payload() {
+    use std::collections::HashMap;
+    use arco_flow::orchestration::events::SourceRef;
+
+    let event = OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::RunRequested {
+            run_key: "sched:01HQ123SCHEDXYZ:1736935200".into(),
+            request_fingerprint: "fingerprint_v1".into(),
+            asset_selection: vec!["analytics.summary".into()],
+            partition_selection: None,
+            trigger_source_ref: SourceRef::Schedule {
+                schedule_id: "01HQ123SCHEDXYZ".into(),
+                tick_id: "01HQ123SCHEDXYZ:1736935200".into(),
+            },
+            labels: HashMap::new(),
+        },
+    );
+
+    // run_key is stable (no fingerprint in it)
+    assert!(!event.idempotency_key.contains("fingerprint"));
+
+    // But fingerprint hash IS in the idempotency key
+    let fp_hash = sha256_hex("fingerprint_v1");
+    assert!(event.idempotency_key.contains(&fp_hash));
+}
+
+#[test]
+fn test_run_requested_idempotency_includes_fingerprint_hash() {
+    use std::collections::HashMap;
+    use arco_flow::orchestration::events::SourceRef;
+
+    let event = OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::RunRequested {
+            run_key: "sched:01HQ123:1736935200".into(),
+            request_fingerprint: "fingerprint_v1".into(),
+            asset_selection: vec!["analytics.summary".into()],
+            partition_selection: None,
+            trigger_source_ref: SourceRef::Schedule {
+                schedule_id: "01HQ123".into(),
+                tick_id: "01HQ123:1736935200".into(),
+            },
+            labels: HashMap::new(),
+        },
+    );
+
+    let fp_hash = sha256_hex("fingerprint_v1");
+    assert!(event.idempotency_key.starts_with("runreq:sched:01HQ123:1736935200:"));
+    assert!(event.idempotency_key.contains(&fp_hash));
+}
+
+#[test]
+fn test_run_requested_different_fingerprints_different_idempotency() {
+    use std::collections::HashMap;
+    use arco_flow::orchestration::events::SourceRef;
+
+    let event1 = OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::RunRequested {
+            run_key: "sched:01HQ123:1736935200".into(),
+            request_fingerprint: "fingerprint_v1".into(),
+            asset_selection: vec!["analytics.summary".into()],
+            partition_selection: None,
+            trigger_source_ref: SourceRef::Schedule {
+                schedule_id: "01HQ123".into(),
+                tick_id: "01HQ123:1736935200".into(),
+            },
+            labels: HashMap::new(),
+        },
+    );
+
+    let event2 = OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::RunRequested {
+            run_key: "sched:01HQ123:1736935200".into(), // Same run_key
+            request_fingerprint: "fingerprint_v2".into(), // Different fingerprint
+            asset_selection: vec!["analytics.summary".into()],
+            partition_selection: None,
+            trigger_source_ref: SourceRef::Schedule {
+                schedule_id: "01HQ123".into(),
+                tick_id: "01HQ123:1736935200".into(),
+            },
+            labels: HashMap::new(),
+        },
+    );
+
+    // Same run_key but different fingerprints = different idempotency keys
+    assert_ne!(event1.idempotency_key, event2.idempotency_key);
+
+    // Both should start with the same prefix (run_key)
+    assert!(event1.idempotency_key.starts_with("runreq:sched:01HQ123:1736935200:"));
+    assert!(event2.idempotency_key.starts_with("runreq:sched:01HQ123:1736935200:"));
+}
+
+#[test]
+fn test_run_requested_no_run_id() {
+    use std::collections::HashMap;
+    use arco_flow::orchestration::events::SourceRef;
+
+    // RunRequested doesn't have a direct run_id - it's computed from run_key at fold time
+    let event = OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::RunRequested {
+            run_key: "sensor:01HQ123:msg:msg_abc".into(),
+            request_fingerprint: "fp1".into(),
+            asset_selection: vec!["raw.events".into()],
+            partition_selection: None,
+            trigger_source_ref: SourceRef::Sensor {
+                sensor_id: "01HQ123".into(),
+                eval_id: "eval_xyz".into(),
+            },
+            labels: HashMap::new(),
+        },
+    );
+
+    assert!(event.data.run_id().is_none());
+    assert_eq!(event.event_type, "RunRequested");
+}
+
+#[test]
+fn test_run_requested_with_backfill_source() {
+    use std::collections::HashMap;
+    use arco_flow::orchestration::events::SourceRef;
+
+    let event = OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::RunRequested {
+            run_key: "backfill:bf_01HQ123:chunk:5".into(),
+            request_fingerprint: "fp_chunk5".into(),
+            asset_selection: vec!["analytics.summary".into()],
+            partition_selection: Some(vec!["2025-01-05".into(), "2025-01-06".into()]),
+            trigger_source_ref: SourceRef::Backfill {
+                backfill_id: "bf_01HQ123".into(),
+                chunk_id: "bf_01HQ123:5".into(),
+            },
+            labels: HashMap::new(),
+        },
+    );
+
+    assert_eq!(event.event_type, "RunRequested");
+    assert!(event.idempotency_key.starts_with("runreq:backfill:bf_01HQ123:chunk:5:"));
+}
+
+#[test]
+fn test_run_requested_with_manual_source() {
+    use std::collections::HashMap;
+    use arco_flow::orchestration::events::SourceRef;
+
+    let mut labels = HashMap::new();
+    labels.insert("priority".into(), "high".into());
+    labels.insert("reason".into(), "hotfix".into());
+
+    let event = OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::RunRequested {
+            run_key: "manual:user123:req_abc123".into(),
+            request_fingerprint: "fp_manual".into(),
+            asset_selection: vec!["critical.table".into()],
+            partition_selection: Some(vec!["2025-01-15".into()]),
+            trigger_source_ref: SourceRef::Manual {
+                user_id: "user123".into(),
+                request_id: "req_abc123".into(),
+            },
+            labels,
+        },
+    );
+
+    assert_eq!(event.event_type, "RunRequested");
+    assert!(event.idempotency_key.starts_with("runreq:manual:user123:req_abc123:"));
+}

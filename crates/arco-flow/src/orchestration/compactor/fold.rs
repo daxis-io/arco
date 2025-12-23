@@ -664,6 +664,11 @@ impl FoldState {
                 // TODO(Task 3.3): Implement fold_sensor_evaluated
                 // Updates sensor_state projection, enforces CAS for poll sensors
             }
+            OrchestrationEventData::RunRequested { .. } => {
+                // TODO(Task 6.1): Implement fold_run_requested
+                // Computes run_id from run_key, creates run projection
+                // Handles conflict detection via fingerprint comparison
+            }
             OrchestrationEventData::BackfillCreated { .. } => {
                 // TODO(Task 4.2): Implement fold_backfill_created
                 // Creates backfill row in backfills projection

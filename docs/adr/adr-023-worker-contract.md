@@ -86,10 +86,14 @@ Content-Type: application/json
 
 {
   "attempt": 1,
+  "attemptId": "01HQ123ATT",
   "workerId": "worker-abc123",
+  "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
   "startedAt": "2025-01-15T10:00:00Z"
 }
 ```
+
+`traceparent` is optional and used for end-to-end trace correlation.
 
 **Response (200 OK):**
 ```json
@@ -122,7 +126,9 @@ Content-Type: application/json
 
 {
   "attempt": 1,
+  "attemptId": "01HQ123ATT",
   "workerId": "worker-abc123",
+  "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
   "heartbeatAt": "2025-01-15T10:05:00Z",
   "progressPct": 45,
   "message": "Processing partition 5 of 10"
@@ -152,11 +158,12 @@ If `heartbeatAt` is omitted, the control plane uses receipt time.
 
 Worker MUST check `shouldCancel` and initiate graceful shutdown if true.
 
-**Response (410 Gone):** Task timed out or marked zombie.
+**Response (410 Gone):** Task is no longer active (expired or already terminal).
 ```json
 {
   "error": "task_expired",
-  "message": "Task exceeded heartbeat timeout"
+  "message": "Task is no longer active",
+  "state": "SUCCEEDED"
 }
 ```
 
@@ -174,7 +181,9 @@ Content-Type: application/json
 
 {
   "attempt": 1,
+  "attemptId": "01HQ123ATT",
   "workerId": "worker-abc123",
+  "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
   "outcome": "SUCCEEDED",
   "completedAt": "2025-01-15T10:30:00Z",
   "output": {
@@ -200,7 +209,9 @@ Content-Type: application/json
 
 {
   "attempt": 1,
+  "attemptId": "01HQ123ATT",
   "workerId": "worker-abc123",
+  "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
   "outcome": "FAILED",
   "completedAt": "2025-01-15T10:30:00Z",
   "error": {
@@ -236,6 +247,12 @@ Content-Type: application/json
 ```
 
 Late results (wrong attempt) are logged but ignored.
+
+**Payload flexibility:** The control plane records whatever fields the worker sends for observability.
+Conventions (not enforced):
+- `SUCCEEDED`: output expected, error should be `null`
+- `FAILED`: error expected, output optional (partial results allowed)
+- `CANCELLED`: output/error optional
 
 ### 4. Heartbeat Protocol
 
@@ -280,6 +297,7 @@ how to respond.
 ```json
 {
   "attempt": 1,
+  "attemptId": "01HQ123ATT",
   "workerId": "worker-abc123",
   "outcome": "CANCELLED",
   "completedAt": "2025-01-15T10:15:00Z",
@@ -306,10 +324,14 @@ Workers MUST categorize errors to enable correct retry behavior:
 
 ### 7. Attempt Guard
 
-Every callback includes `attempt` number. Control plane MUST verify:
+Every callback includes `attempt` number and `attemptId`. Control plane MUST verify:
 
 ```rust
-fn handle_callback(request: CallbackRequest, stored_attempt: u32) -> Result<Response> {
+fn handle_callback(
+    request: CallbackRequest,
+    stored_attempt: u32,
+    stored_attempt_id: &str,
+) -> Result<Response> {
     if request.attempt != stored_attempt {
         // Late result from previous attempt - ignore
         log::warn!(
@@ -317,6 +339,13 @@ fn handle_callback(request: CallbackRequest, stored_attempt: u32) -> Result<Resp
             request.attempt, stored_attempt
         );
         return Ok(Response::conflict("attempt_mismatch"));
+    }
+    if request.attempt_id != stored_attempt_id {
+        log::warn!(
+            "Ignoring late result: received attempt_id {} but current is {}",
+            request.attempt_id, stored_attempt_id
+        );
+        return Ok(Response::conflict("attempt_id_mismatch"));
     }
     // Process callback...
 }
@@ -338,6 +367,7 @@ pub struct TaskEnvelope {
     pub tenant_id: String,
     pub workspace_id: String,
     pub attempt: u32,
+    pub attempt_id: String,
     pub resources: ResourceRequirements,
     pub enqueued_at: DateTime<Utc>,
     pub deadline: Option<DateTime<Utc>>,

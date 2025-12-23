@@ -29,6 +29,7 @@ class ServoConfig(BaseSettings):
     # API configuration
     api_url: str = "https://api.servo.dev"
     api_key: SecretStr = SecretStr("")
+    task_token: SecretStr = SecretStr("")
 
     @property
     def servo_api_url(self) -> str:
@@ -38,6 +39,7 @@ class ServoConfig(BaseSettings):
     # Tenant/workspace scope
     tenant_id: str = ""
     workspace_id: str = "default"
+    user_id: str = ""
 
     # Local development
     debug: bool = False
@@ -62,7 +64,7 @@ class ServoConfig(BaseSettings):
         """
         errors: list[str] = []
 
-        if not self.api_key.get_secret_value():
+        if not self.debug and not self.api_key.get_secret_value():
             errors.append(
                 "API key not configured. "
                 "Set SERVO_API_KEY environment variable."

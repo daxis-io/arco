@@ -4,8 +4,10 @@ This module defines the top-level CLI commands:
 - servo deploy: Deploy assets to Servo
 - servo run: Trigger asset runs
 - servo status: Check run status
+- servo logs: Fetch run logs
 - servo validate: Validate asset definitions
 - servo init: Initialize a new project
+- servo worker: Run a local worker process
 """
 from __future__ import annotations
 
@@ -109,6 +111,10 @@ def run(
         list[str] | None,
         typer.Option("--partition", "-p", help="Partition value (key=value)."),
     ] = None,
+    run_key: Annotated[
+        str | None,
+        typer.Option("--run-key", help="Idempotency key for the run."),
+    ] = None,
     wait: Annotated[
         bool,
         typer.Option("--wait/--no-wait", help="Wait for completion."),
@@ -134,6 +140,7 @@ def run(
         partitions=partition or [],
         wait=wait,
         timeout=timeout,
+        run_key=run_key,
     )
 
 
@@ -166,6 +173,26 @@ def status(
     from servo.cli.commands.status import show_status  # noqa: PLC0415
 
     show_status(run_id=run_id, watch=watch, limit=limit)
+
+
+@app.command()
+def logs(
+    run_id: Annotated[str, typer.Argument(help="Run ID to fetch logs for.")],
+    task: Annotated[
+        str | None,
+        typer.Option("--task", "-t", help="Filter logs to a task key."),
+    ] = None,
+) -> None:
+    """Fetch logs for a run.
+
+    Examples:
+        servo logs 01HX9ABC...
+
+        servo logs 01HX9ABC... --task raw.events
+    """
+    from servo.cli.commands.logs import show_logs  # noqa: PLC0415
+
+    show_logs(run_id=run_id, task_key=task)
 
 
 @app.command()
@@ -206,6 +233,37 @@ def init(
     from servo.cli.commands.init import run_init  # noqa: PLC0415
 
     run_init(name=name, template=template)
+
+
+@app.command()
+def worker(
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Host interface to bind."),
+    ] = "0.0.0.0",
+    port: Annotated[
+        int,
+        typer.Option("--port", help="Port to bind."),
+    ] = 8081,
+    root: Annotated[
+        Path | None,
+        typer.Option("--root", help="Project root for asset discovery."),
+    ] = None,
+    worker_id: Annotated[
+        str | None,
+        typer.Option("--worker-id", help="Explicit worker identifier."),
+    ] = None,
+) -> None:
+    """Run a local worker HTTP server.
+
+    Examples:
+        servo worker --port 8081
+
+        servo worker --root ./my-project
+    """
+    from servo.worker.server import run_worker  # noqa: PLC0415
+
+    run_worker(host=host, port=port, root_path=root, worker_id=worker_id)
 
 
 if __name__ == "__main__":

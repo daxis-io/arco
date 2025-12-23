@@ -1,12 +1,17 @@
 """Run command implementation."""
 from __future__ import annotations
 
+import time
+
 from rich.console import Console
 
 from servo.cli.config import get_config
+from servo.client import ApiError, ServoApiClient
 
 console = Console()
 err_console = Console(stderr=True)
+
+_TERMINAL_STATES = {"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT"}
 
 
 def run_asset(
@@ -15,6 +20,7 @@ def run_asset(
     partitions: list[str],
     wait: bool,
     timeout: int,
+    run_key: str | None,
 ) -> None:
     """Execute run command.
 
@@ -47,11 +53,55 @@ def run_asset(
     if partition_dict:
         console.print(f"  Partitions: {partition_dict}")
 
-    # TODO: Implement actual run trigger via API
-    err_console.print("[red]✗[/red] Run triggering not yet implemented.")
-    err_console.print("  This will call the Servo API to trigger the asset run.")
+    partition_payload = [
+        {"key": key, "value": value} for key, value in partition_dict.items()
+    ]
 
-    if wait:
-        err_console.print(f"  Would wait up to {timeout}s for completion.")
+    try:
+        with ServoApiClient(config) as client:
+            response = client.trigger_run(
+                workspace_id=config.workspace_id,
+                selection=[asset],
+                partitions=partition_payload,
+                run_key=run_key,
+            ).payload
+    except ApiError as err:
+        err_console.print(f"[red]✗[/red] Run trigger failed: {err}")
+        raise SystemExit(1) from None
 
-    raise SystemExit(2)
+    run_id = response.get("runId")
+    plan_id = response.get("planId")
+    state = response.get("state")
+    if not run_id:
+        err_console.print("[red]✗[/red] Run response missing runId.")
+        raise SystemExit(1)
+    console.print(f"[green]✓[/green] Run created: {run_id}")
+    console.print(f"  Plan ID: {plan_id}")
+    console.print(f"  State: {state}")
+
+    if not wait:
+        return
+
+    deadline = time.time() + timeout
+    console.print(f"[blue]i[/blue] Waiting for completion (timeout {timeout}s)...")
+
+    try:
+        with ServoApiClient(config) as client:
+            while time.time() < deadline:
+                run = client.get_run(
+                    workspace_id=config.workspace_id,
+                    run_id=run_id,
+                ).payload
+                state = run.get("state")
+                if state in _TERMINAL_STATES:
+                    console.print(f"[green]✓[/green] Run finished: {state}")
+                    if state != "SUCCEEDED":
+                        raise SystemExit(1)
+                    return
+                time.sleep(2)
+    except ApiError as err:
+        err_console.print(f"[red]✗[/red] Failed to fetch run status: {err}")
+        raise SystemExit(1) from None
+
+    err_console.print("[red]✗[/red] Timed out waiting for run completion.")
+    raise SystemExit(1)

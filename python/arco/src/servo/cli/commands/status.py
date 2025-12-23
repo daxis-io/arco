@@ -1,13 +1,19 @@
 """Status command implementation."""
 from __future__ import annotations
 
+import time
+
 from rich.console import Console
+from rich.live import Live
 from rich.table import Table
 
-from servo.cli.config import get_config
+from servo.cli.config import ServoConfig, get_config
+from servo.client import ApiError, ServoApiClient
 
 console = Console()
 err_console = Console(stderr=True)
+
+_TERMINAL_STATES = {"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT"}
 
 
 def show_status(
@@ -23,15 +29,15 @@ def show_status(
         watch: Watch status in real-time.
         limit: Number of recent runs to show.
     """
-    _ = get_config()  # Ensure config is valid
+    config = get_config()
 
     if run_id:
-        _show_run_status(run_id, watch)
+        _show_run_status(config, run_id, watch)
     else:
-        _show_recent_runs(limit)
+        _show_recent_runs(config, limit)
 
 
-def _show_run_status(run_id: str, watch: bool) -> None:
+def _show_run_status(config: ServoConfig, run_id: str, watch: bool) -> None:
     """Show status of a specific run.
 
     Args:
@@ -40,16 +46,33 @@ def _show_run_status(run_id: str, watch: bool) -> None:
     """
     console.print(f"[blue]i[/blue] Checking status for run [cyan]{run_id}[/cyan]...")
 
-    # TODO: Implement actual status check via API
-    err_console.print("[red]✗[/red] Status checking not yet implemented.")
+    try:
+        with ServoApiClient(config) as client:
+            run = client.get_run(
+                workspace_id=config.workspace_id,
+                run_id=run_id,
+            ).payload
+            if not watch:
+                console.print(_render_run_table(run))
+                return
 
-    if watch:
-        err_console.print("  Would watch for status updates...")
+            with Live(_render_run_table(run), refresh_per_second=1) as live:
+                while True:
+                    state = run.get("state")
+                    if state in _TERMINAL_STATES:
+                        break
+                    time.sleep(2)
+                    run = client.get_run(
+                        workspace_id=config.workspace_id,
+                        run_id=run_id,
+                    ).payload
+                    live.update(_render_run_table(run))
+    except ApiError as err:
+        err_console.print(f"[red]✗[/red] Status check failed: {err}")
+        raise SystemExit(1) from None
 
-    raise SystemExit(2)
 
-
-def _show_recent_runs(limit: int) -> None:
+def _show_recent_runs(config: ServoConfig, limit: int) -> None:
     """Show recent runs.
 
     Args:
@@ -57,16 +80,66 @@ def _show_recent_runs(limit: int) -> None:
     """
     console.print(f"[blue]i[/blue] Showing {limit} most recent runs...")
 
-    # TODO: Implement actual run listing via API
+    try:
+        with ServoApiClient(config) as client:
+            response = client.list_runs(
+                workspace_id=config.workspace_id,
+                limit=limit,
+            ).payload
+    except ApiError as err:
+        err_console.print(f"[red]✗[/red] Run listing failed: {err}")
+        raise SystemExit(1) from None
+
+    runs = response.get("runs", [])
+    if not runs:
+        console.print("[yellow]![/yellow] No runs found.")
+        return
+
     table = Table(title="Recent Runs")
     table.add_column("Run ID", style="cyan")
-    table.add_column("Asset")
-    table.add_column("Status")
-    table.add_column("Started")
-    table.add_column("Duration")
+    table.add_column("State")
+    table.add_column("Created")
+    table.add_column("Completed")
+    table.add_column("Tasks")
+    table.add_column("Failed")
 
-    # Placeholder data
-    err_console.print("[red]✗[/red] Run listing not yet implemented.")
+    for run in runs:
+        table.add_row(
+            run.get("runId", ""),
+            run.get("state", ""),
+            run.get("createdAt", ""),
+            run.get("completedAt", "") or "-",
+            str(run.get("taskCount", "")),
+            str(run.get("tasksFailed", "")),
+        )
+
     console.print(table)
 
-    raise SystemExit(2)
+
+def _render_run_table(run: dict[str, object]) -> Table:
+    run_id = run.get("runId", "")
+    state = run.get("state", "")
+    table = Table(title=f"Run {run_id} ({state})", show_lines=True)
+    table.add_column("Task", style="cyan")
+    table.add_column("State")
+    table.add_column("Attempt")
+    table.add_column("Started")
+    table.add_column("Completed")
+    table.add_column("Error")
+
+    tasks = run.get("tasks", []) or []
+    if not tasks:
+        table.add_row("-", "-", "-", "-", "-", "-")
+        return table
+
+    for task in tasks:
+        table.add_row(
+            str(task.get("taskKey", "")),
+            str(task.get("state", "")),
+            str(task.get("attempt", "")),
+            str(task.get("startedAt", "") or "-"),
+            str(task.get("completedAt", "") or "-"),
+            str(task.get("errorMessage", "") or "-"),
+        )
+
+    return table

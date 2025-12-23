@@ -10,6 +10,7 @@ from rich.table import Table
 from rich.tree import Tree
 
 from servo.cli.config import get_config
+from servo.client import ApiError, ServoApiClient
 from servo.manifest.builder import ManifestBuilder
 from servo.manifest.discovery import AssetDiscovery, AssetDiscoveryError
 
@@ -84,10 +85,23 @@ def run_deploy(
     if dry_run:
         console.print("[blue]i[/blue] Dry run complete. Use without --dry-run to deploy.")
     else:
-        # TODO: Implement actual deployment
+        try:
+            with ServoApiClient(config) as client:
+                response = client.deploy_manifest(
+                    workspace_id=workspace_id,
+                    manifest_json=manifest.to_canonical_json(),
+                    idempotency_key=manifest.fingerprint(),
+                ).payload
+        except ApiError as err:
+            err_console.print(f"[red]✗[/red] Deploy failed: {err}")
+            raise SystemExit(1) from None
+
         console.print(
-            f"[green]✓[/green] Deployed {len(assets)} assets to {workspace_id}"
+            f"[green]✓[/green] Deployed {response.get('assetCount')} assets "
+            f"to {workspace_id}"
         )
+        console.print(f"  Manifest ID: {response.get('manifestId')}")
+        console.print(f"  Fingerprint: {response.get('fingerprint')}")
 
 
 def _print_summary(manifest: object, assets: Sequence[RegisteredAssetProtocol]) -> None:

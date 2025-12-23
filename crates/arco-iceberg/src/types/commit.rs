@@ -146,7 +146,7 @@ pub enum TableUpdate {
         ref_name: String,
         /// Reference type ("branch" or "tag").
         #[serde(rename = "type")]
-        ref_type: String,
+        ref_type: SnapshotRefType,
         /// Snapshot ID for the ref.
         #[serde(rename = "snapshot-id")]
         snapshot_id: i64,
@@ -201,24 +201,34 @@ impl TableUpdate {
     ///
     /// Per design doc Section 1.3:
     /// - `SetLocation` is always rejected (Arco owns storage location)
-    /// - `SetProperties` with `arco.*` keys is rejected (reserved namespace)
-    /// - `RemoveProperties` with `arco.*` keys is rejected (reserved namespace)
+    /// - `SetProperties` with `arco.*` keys is rejected (reserved namespace, case-insensitive)
+    /// - `RemoveProperties` with `arco.*` keys is rejected (reserved namespace, case-insensitive)
     #[must_use]
-    pub fn is_rejected_by_guardrails(&self) -> Option<&'static str> {
+    pub fn is_rejected_by_guardrails(&self) -> Option<String> {
+        fn is_reserved_key(key: &str) -> bool {
+            key.get(..5)
+                .map(|prefix| prefix.eq_ignore_ascii_case("arco."))
+                .unwrap_or(false)
+        }
+
         match self {
-            Self::SetLocation { .. } => {
-                Some("SetLocationUpdate is rejected: Arco owns storage location")
-            }
+            Self::SetLocation { .. } => Some(
+                "SetLocationUpdate is rejected: Arco owns storage location".to_string(),
+            ),
             Self::SetProperties { updates } => {
-                if updates.keys().any(|k| k.starts_with("arco.")) {
-                    Some("SetPropertiesUpdate with 'arco.*' keys is rejected: reserved namespace")
+                if let Some(key) = updates.keys().find(|k| is_reserved_key(k)) {
+                    Some(format!(
+                        "SetPropertiesUpdate with reserved key '{key}' is rejected: Arco owns the 'arco.' namespace"
+                    ))
                 } else {
                     None
                 }
             }
             Self::RemoveProperties { removals } => {
-                if removals.iter().any(|k| k.starts_with("arco.")) {
-                    Some("RemovePropertiesUpdate with 'arco.*' keys is rejected: reserved namespace")
+                if let Some(key) = removals.iter().find(|k| is_reserved_key(k)) {
+                    Some(format!(
+                        "RemovePropertiesUpdate with reserved key '{key}' is rejected: Arco owns the 'arco.' namespace"
+                    ))
                 } else {
                     None
                 }
@@ -226,6 +236,16 @@ impl TableUpdate {
             _ => None,
         }
     }
+}
+
+/// Snapshot reference type for `set-snapshot-ref`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SnapshotRefType {
+    /// Mutable branch (e.g., "main").
+    Branch,
+    /// Immutable tag.
+    Tag,
 }
 
 #[cfg(test)]
@@ -276,11 +296,23 @@ mod tests {
         let update: TableUpdate = serde_json::from_str(json).expect("deserialize");
         if let TableUpdate::SetSnapshotRef { ref_name, ref_type, snapshot_id, .. } = update {
             assert_eq!(ref_name, "main");
-            assert_eq!(ref_type, "branch");
+            assert_eq!(ref_type, SnapshotRefType::Branch);
             assert_eq!(snapshot_id, 12345);
         } else {
             panic!("wrong variant");
         }
+    }
+
+    #[test]
+    fn test_table_update_set_snapshot_ref_invalid_type() {
+        let json = r#"{
+            "action": "set-snapshot-ref",
+            "ref-name": "main",
+            "type": "invalid",
+            "snapshot-id": 12345
+        }"#;
+        let update: Result<TableUpdate, _> = serde_json::from_str(json);
+        assert!(update.is_err());
     }
 
     #[test]
@@ -298,7 +330,19 @@ mod tests {
                 .into_iter()
                 .collect(),
         };
-        assert!(update.is_rejected_by_guardrails().is_some());
+        let rejection = update.is_rejected_by_guardrails().expect("rejected");
+        assert!(rejection.contains("arco.lineage.source"));
+    }
+
+    #[test]
+    fn test_guardrail_rejects_mixed_case_arco_properties() {
+        let update = TableUpdate::SetProperties {
+            updates: [("ArCo.lineage.source".to_string(), "value".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let rejection = update.is_rejected_by_guardrails().expect("rejected");
+        assert!(rejection.contains("ArCo.lineage.source"));
     }
 
     #[test]
@@ -314,9 +358,10 @@ mod tests {
     #[test]
     fn test_guardrail_rejects_remove_arco_properties() {
         let update = TableUpdate::RemoveProperties {
-            removals: vec!["arco.governance.owner".to_string()],
+            removals: vec!["ARCO.governance.owner".to_string()],
         };
-        assert!(update.is_rejected_by_guardrails().is_some());
+        let rejection = update.is_rejected_by_guardrails().expect("rejected");
+        assert!(rejection.contains("ARCO.governance.owner"));
     }
 
     #[test]

@@ -253,13 +253,14 @@ impl SimulatedClock {
     #[must_use]
     pub fn now(&self) -> DateTime<Utc> {
         let elapsed = self.elapsed_ms.load(Ordering::Relaxed);
-        self.base + chrono::Duration::milliseconds(elapsed as i64)
+        let elapsed_ms = i64::try_from(elapsed).unwrap_or(i64::MAX);
+        self.base + chrono::Duration::milliseconds(elapsed_ms)
     }
 
     /// Advances the clock by the given duration.
     pub fn advance(&self, duration: Duration) {
         self.elapsed_ms
-            .fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
+            .fetch_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     /// Advances the clock to a specific point in time.
@@ -268,12 +269,12 @@ impl SimulatedClock {
     ///
     /// Panics if the target time is before the base or current simulated time.
     pub fn advance_to(&self, target: DateTime<Utc>) {
-        if target < self.base {
-            panic!(
-                "Cannot move clock before base: base={:?}, target={:?}",
-                self.base, target
-            );
-        }
+        assert!(
+            target >= self.base,
+            "Cannot move clock before base: base={:?}, target={:?}",
+            self.base,
+            target
+        );
         let target_ms = (target - self.base)
             .num_milliseconds()
             .try_into()
@@ -358,7 +359,7 @@ impl SimulationHarness {
     #[must_use]
     pub fn new_correlation_id(&self) -> String {
         let id = self.correlation_counter.fetch_add(1, Ordering::Relaxed);
-        format!("sim-{:08x}", id)
+        format!("sim-{id:08x}")
     }
 
     /// Determines if a fault should occur based on the given probability.
@@ -478,7 +479,7 @@ impl SimulationHarness {
     /// Returns count of retry operations.
     #[must_use]
     pub fn retry_count(&self) -> usize {
-        self.operations_where(|op| op.is_retry()).len()
+        self.operations_where(RecordedOperation::is_retry).len()
     }
 
     fn with_seed_and_clock(seed: u64, clock: SimulatedClock) -> Self {

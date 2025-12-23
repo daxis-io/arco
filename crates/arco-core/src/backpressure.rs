@@ -98,6 +98,7 @@ pub struct BackpressureState {
 
 impl BackpressureState {
     /// Creates a new backpressure state for a domain.
+    #[must_use]
     pub fn new(domain: impl Into<String>) -> Self {
         Self {
             domain: domain.into(),
@@ -109,6 +110,7 @@ impl BackpressureState {
     }
 
     /// Sets the position watermarks.
+    #[must_use]
     pub fn with_positions(mut self, written: u64, compacted: u64) -> Self {
         self.last_written_position = written;
         self.last_compacted_position = compacted;
@@ -116,6 +118,7 @@ impl BackpressureState {
     }
 
     /// Sets the soft/hard thresholds.
+    #[must_use]
     pub fn with_thresholds(mut self, soft: u64, hard: u64) -> Self {
         self.soft_threshold = soft;
         self.hard_threshold = hard;
@@ -125,6 +128,7 @@ impl BackpressureState {
     /// Computes the position lag (no listing required).
     ///
     /// Returns the number of positions behind compaction.
+    #[must_use]
     pub fn pending_lag(&self) -> u64 {
         self.last_written_position
             .saturating_sub(self.last_compacted_position)
@@ -136,6 +140,7 @@ impl BackpressureState {
     /// - `Accept`: Normal operation, lag is below soft threshold
     /// - `AcceptWithWarning`: Lag is between soft and hard thresholds
     /// - `Reject`: Lag exceeds hard threshold, return `retry_after`
+    #[must_use]
     pub fn evaluate(&self) -> BackpressureDecision {
         let lag = self.pending_lag();
 
@@ -208,11 +213,13 @@ pub enum BackpressureDecision {
 
 impl BackpressureDecision {
     /// Returns true if the request should be rejected.
+    #[must_use]
     pub fn is_rejected(&self) -> bool {
         matches!(self, Self::Reject { .. })
     }
 
     /// Returns the retry-after duration if rejected.
+    #[must_use]
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Reject { retry_after } => Some(*retry_after),
@@ -265,6 +272,7 @@ pub struct BackpressureRegistry {
 
 impl BackpressureRegistry {
     /// Creates a new registry with default thresholds.
+    #[must_use]
     pub fn new(soft_threshold: u64, hard_threshold: u64) -> Self {
         Self {
             domains: std::collections::HashMap::new(),
@@ -284,6 +292,10 @@ impl BackpressureRegistry {
     /// Evaluates backpressure for a domain.
     ///
     /// Returns `Ok(())` if the request should proceed, or `Err` if rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the domain is over the hard threshold.
     pub fn check(&mut self, domain: &str) -> Result<BackpressureDecision, BackpressureError> {
         let state = self.get_or_create(domain);
         let decision = state.evaluate();
@@ -311,6 +323,7 @@ impl BackpressureRegistry {
     }
 
     /// Returns all domains with their current lag.
+    #[must_use]
     pub fn all_lags(&self) -> Vec<(&str, u64)> {
         self.domains
             .iter()

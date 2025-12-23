@@ -13,7 +13,7 @@
 //!
 //! | Trait | Operations | Who Gets It |
 //! |-------|------------|-------------|
-//! | [`ReadStore`] | get, get_range | API, Compactor |
+//! | [`ReadStore`] | get, `get_range` | API, Compactor |
 //! | [`LedgerPutStore`] | put to ledger/ | API only |
 //! | [`StatePutStore`] | put to state/, snapshots/ | Compactor only |
 //! | [`CasStore`] | CAS to manifests/ | Compactor only |

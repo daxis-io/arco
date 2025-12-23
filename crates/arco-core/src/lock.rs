@@ -205,7 +205,7 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
         // First, try to create lock with DoesNotExist precondition
         // New locks start with sequence_number = 1
         let mut lock_info = LockInfo::new(&self.holder_id, ttl, 1);
-        lock_info.operation = operation.clone();
+        lock_info.operation.clone_from(&operation);
 
         let lock_bytes = Bytes::from(serde_json::to_vec(&lock_info).map_err(|e| {
             LockError::Storage(Error::Internal {

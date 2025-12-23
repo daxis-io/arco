@@ -158,7 +158,7 @@ impl PermitIssuer {
         self.issue_permit_with_commit_ulid(domain, expected_version, commit_ulid)
     }
 
-    /// Issues a permit for creating a new manifest (DoesNotExist precondition).
+    /// Issues a permit for creating a new manifest (`DoesNotExist` precondition).
     ///
     /// Used when initializing a domain for the first time.
     #[must_use]
@@ -246,7 +246,7 @@ pub struct PublishPermit {
     fencing_token: FencingToken,
     /// Domain being published to.
     domain: String,
-    /// Expected parent version (for CAS). None means DoesNotExist.
+    /// Expected parent version (for CAS). None means `DoesNotExist`.
     expected_version: Option<String>,
     /// Unique commit identifier for this publish.
     commit_ulid: String,

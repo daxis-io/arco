@@ -1,6 +1,6 @@
 //! Automation event types for schedules and sensors.
 //!
-//! These events are emitted by automation controllers (ScheduleController, SensorController)
+//! These events are emitted by automation controllers (`ScheduleController`, `SensorController`)
 //! and folded by the compactor to update projections.
 
 use serde::{Deserialize, Serialize};
@@ -123,6 +123,7 @@ impl Default for SensorStatus {
 }
 
 /// Computes a full SHA-256 hex digest for idempotency keys.
+#[must_use]
 pub fn sha256_hex(input: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

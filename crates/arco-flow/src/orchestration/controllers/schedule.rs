@@ -27,7 +27,10 @@ use std::str::FromStr;
 use chrono::{DateTime, Duration, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
+use metrics::{counter, histogram};
+use tracing::warn;
 
+use crate::metrics::{labels as metrics_labels, names as metrics_names, TimingGuard};
 use crate::orchestration::compactor::fold::{ScheduleDefinitionRow, ScheduleStateRow};
 use crate::orchestration::events::{
     sha256_hex, OrchestrationEvent, OrchestrationEventData, SourceRef, TickStatus,
@@ -81,29 +84,50 @@ impl ScheduleController {
         state: &[ScheduleStateRow],
         now: DateTime<Utc>,
     ) -> Vec<OrchestrationEvent> {
+        let _guard = TimingGuard::new(|duration| {
+            histogram!(
+                metrics_names::ORCH_CONTROLLER_RECONCILE_SECONDS,
+                metrics_labels::CONTROLLER => "schedule".to_string(),
+            )
+            .record(duration.as_secs_f64());
+        });
+
         let state_map: HashMap<_, _> = state.iter().map(|s| (s.schedule_id.as_str(), s)).collect();
 
         let mut events = Vec::new();
+        let mut actions_total = 0_u64;
 
         for def in definitions {
-            if !def.enabled {
-                continue;
-            }
-
-            let schedule = match Schedule::from_str(&def.cron_expression) {
+            let schedule = match Self::parse_cron_expression(&def.cron_expression) {
                 Ok(s) => s,
                 Err(e) => {
-                    events.push(Self::error_tick(def, &e.to_string(), now));
+                    warn!(
+                        schedule_id = %def.schedule_id,
+                        cron_expression = %def.cron_expression,
+                        "invalid cron expression: {e}"
+                    );
+                    let error_tick = Self::error_tick(def, &e, now);
+                    Self::record_tick_metrics(&error_tick);
+                    events.push(error_tick);
+                    actions_total = actions_total.saturating_add(1);
                     continue;
                 }
             };
 
             let Ok(tz): Result<Tz, _> = def.timezone.parse() else {
-                events.push(Self::error_tick(
+                warn!(
+                    schedule_id = %def.schedule_id,
+                    timezone = %def.timezone,
+                    "invalid timezone"
+                );
+                let error_tick = Self::error_tick(
                     def,
                     &format!("invalid timezone: {}", def.timezone),
                     now,
-                ));
+                );
+                Self::record_tick_metrics(&error_tick);
+                events.push(error_tick);
+                actions_total = actions_total.saturating_add(1);
                 continue;
             };
 
@@ -127,8 +151,11 @@ impl ScheduleController {
             );
 
             for scheduled_for in ticks {
-                // Emit ScheduleTicked
-                let tick_event = Self::create_tick_event(def, scheduled_for);
+                let tick_event = if def.enabled {
+                    Self::create_tick_event(def, scheduled_for)
+                } else {
+                    Self::create_paused_tick_event(def, scheduled_for)
+                };
 
                 // Per P0-1: Controller must emit RunRequested atomically with tick
                 // Extract values before moving tick_event
@@ -155,7 +182,9 @@ impl ScheduleController {
                         (false, String::new(), None, None, Vec::new(), None)
                     };
 
+                Self::record_tick_metrics(&tick_event);
                 events.push(tick_event);
+                actions_total = actions_total.saturating_add(1);
 
                 // Emit RunRequested for triggered ticks
                 if should_emit_run_req {
@@ -176,12 +205,35 @@ impl ScheduleController {
                             },
                         );
                         events.push(run_req);
+                        Self::record_run_request_metrics();
+                        actions_total = actions_total.saturating_add(1);
                     }
                 }
             }
         }
 
+        counter!(
+            metrics_names::ORCH_CONTROLLER_ACTIONS_TOTAL,
+            metrics_labels::CONTROLLER => "schedule".to_string(),
+        )
+        .increment(actions_total);
+
         events
+    }
+
+    /// Parses a cron expression, normalizing 5-field syntax to 6-field with seconds.
+    fn parse_cron_expression(expression: &str) -> Result<Schedule, String> {
+        let field_count = expression.split_whitespace().count();
+        let normalized = match field_count {
+            5 => format!("0 {expression}"),
+            6 => expression.to_string(),
+            _ => {
+                return Err(format!(
+                    "invalid cron expression (expected 5 or 6 fields): {expression}"
+                ));
+            }
+        };
+        Schedule::from_str(&normalized).map_err(|e| format!("invalid cron expression: {e}"))
     }
 
     /// Computes due ticks for a schedule.
@@ -193,8 +245,12 @@ impl ScheduleController {
         catchup_window: Duration,
         tz: Tz,
     ) -> Vec<DateTime<Utc>> {
-        let start = last_scheduled_for
+        let mut start = last_scheduled_for
             .map_or(now - catchup_window, |t| t + Duration::seconds(1));
+        let min_start = now - catchup_window;
+        if start < min_start {
+            start = min_start;
+        }
 
         let start_tz = start.with_timezone(&tz);
         let now_tz = now.with_timezone(&tz);
@@ -228,6 +284,59 @@ impl ScheduleController {
                 request_fingerprint: Some(fingerprint),
             },
         )
+    }
+
+    /// Creates a paused tick event for visible history.
+    fn create_paused_tick_event(
+        def: &ScheduleDefinitionRow,
+        scheduled_for: DateTime<Utc>,
+    ) -> OrchestrationEvent {
+        let tick_id = format!("{}:{}", def.schedule_id, scheduled_for.timestamp());
+
+        OrchestrationEvent::new(
+            &def.tenant_id,
+            &def.workspace_id,
+            OrchestrationEventData::ScheduleTicked {
+                schedule_id: def.schedule_id.clone(),
+                scheduled_for,
+                tick_id,
+                definition_version: def.row_version.clone(),
+                asset_selection: def.asset_selection.clone(),
+                partition_selection: None,
+                status: TickStatus::Skipped {
+                    reason: "paused".to_string(),
+                },
+                run_key: None,
+                request_fingerprint: None,
+            },
+        )
+    }
+
+    fn record_tick_metrics(event: &OrchestrationEvent) {
+        let OrchestrationEventData::ScheduleTicked { status, .. } = &event.data else {
+            return;
+        };
+        counter!(
+            metrics_names::SCHEDULE_TICKS_TOTAL,
+            metrics_labels::STATUS => Self::tick_status_label(status).to_string(),
+        )
+        .increment(1);
+    }
+
+    fn record_run_request_metrics() {
+        counter!(
+            metrics_names::RUN_REQUESTS_TOTAL,
+            metrics_labels::SOURCE => "schedule".to_string(),
+        )
+        .increment(1);
+    }
+
+    fn tick_status_label(status: &TickStatus) -> &'static str {
+        match status {
+            TickStatus::Triggered => "triggered",
+            TickStatus::Skipped { .. } => "skipped",
+            TickStatus::Failed { .. } => "failed",
+        }
     }
 
     /// Creates an error tick event for invalid schedule configuration.
@@ -323,7 +432,7 @@ mod tests {
             tenant_id: "tenant-abc".into(),
             workspace_id: "workspace-prod".into(),
             schedule_id: schedule_id.into(),
-            // cron crate uses 6-field format: sec min hour day month day-of-week
+            // Controller accepts 5- or 6-field cron (seconds optional).
             cron_expression: "0 0 10 * * *".into(), // Daily at 10:00:00
             timezone: "UTC".into(),
             catchup_window_minutes: 60 * 24, // 24 hours
@@ -382,6 +491,7 @@ mod tests {
 
         let mut def = test_definition("01HQ123SCHEDXYZ");
         def.max_catchup_ticks = 3;
+        def.catchup_window_minutes = 60 * 24 * 14; // Allow full catchup window
 
         let state = vec![ScheduleStateRow {
             tenant_id: "tenant-abc".into(),
@@ -405,14 +515,29 @@ mod tests {
     }
 
     #[test]
-    fn test_schedule_controller_skips_paused_schedule() {
+    fn test_schedule_controller_emits_paused_tick_when_disabled() {
+        let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 30, 0).unwrap();
         let mut def = test_definition("01HQ123SCHEDXYZ");
         def.enabled = false; // Paused
 
         let controller = ScheduleController::new();
-        let events = controller.reconcile(&[def], &[], Utc::now());
+        let events = controller.reconcile(&[def], &[], now);
 
-        assert!(events.is_empty(), "Should not emit events for paused schedule");
+        let has_paused_tick = events.iter().any(|e| {
+            matches!(
+                &e.data,
+                OrchestrationEventData::ScheduleTicked {
+                    status: TickStatus::Skipped { reason },
+                    ..
+                } if reason == "paused"
+            )
+        });
+        assert!(has_paused_tick, "Should emit paused ScheduleTicked event");
+
+        let has_run_req = events
+            .iter()
+            .any(|e| matches!(&e.data, OrchestrationEventData::RunRequested { .. }));
+        assert!(!has_run_req, "Paused schedule should not emit RunRequested");
     }
 
     #[test]
@@ -493,6 +618,126 @@ mod tests {
         } else {
             panic!("Expected ScheduleTicked event");
         }
+    }
+
+    #[test]
+    fn test_schedule_controller_clamps_catchup_window() {
+        let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 35, 0).unwrap();
+        let last_tick = now - Duration::hours(48);
+
+        let mut def = test_definition("01HQ123SCHEDXYZ");
+        def.cron_expression = "0 */10 * * * *".into(); // Every 10 minutes
+        def.catchup_window_minutes = 60; // 1 hour
+        def.max_catchup_ticks = 1000;
+
+        let state = vec![ScheduleStateRow {
+            tenant_id: "tenant-abc".into(),
+            workspace_id: "workspace-prod".into(),
+            schedule_id: "01HQ123SCHEDXYZ".into(),
+            last_scheduled_for: Some(last_tick),
+            last_tick_id: None,
+            last_run_key: None,
+            row_version: "state_01HQ".into(),
+        }];
+
+        let controller = ScheduleController::new();
+        let events = controller.reconcile(&[def], &state, now);
+
+        let scheduled_fors: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.data {
+                OrchestrationEventData::ScheduleTicked { scheduled_for, .. } => {
+                    Some(scheduled_for.clone())
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert!(!scheduled_fors.is_empty(), "Expected due ticks within catchup window");
+
+        let min_tick = scheduled_fors
+            .iter()
+            .min()
+            .expect("expected at least one tick");
+        assert!(
+            *min_tick >= now - Duration::minutes(60),
+            "Catchup should clamp to window start"
+        );
+    }
+
+    #[test]
+    fn test_schedule_controller_accepts_five_field_cron() {
+        let now = Utc.with_ymd_and_hms(2025, 1, 15, 10, 30, 0).unwrap();
+        let scheduled_for = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+
+        let mut def = test_definition("01HQ123SCHEDXYZ");
+        def.cron_expression = "0 10 * * *".into(); // 5-field cron
+
+        let state = vec![ScheduleStateRow {
+            tenant_id: "tenant-abc".into(),
+            workspace_id: "workspace-prod".into(),
+            schedule_id: "01HQ123SCHEDXYZ".into(),
+            last_scheduled_for: Some(scheduled_for - Duration::hours(24)),
+            last_tick_id: None,
+            last_run_key: None,
+            row_version: "state_01HQ".into(),
+        }];
+
+        let controller = ScheduleController::new();
+        let events = controller.reconcile(&[def], &state, now);
+
+        let has_tick = events.iter().any(|e| {
+            matches!(
+                &e.data,
+                OrchestrationEventData::ScheduleTicked {
+                    status: TickStatus::Triggered,
+                    ..
+                }
+            )
+        });
+        assert!(has_tick, "Should emit tick for 5-field cron");
+    }
+
+    #[test]
+    fn test_schedule_controller_handles_dst_fall_back() {
+        let now = Utc.with_ymd_and_hms(2025, 11, 2, 7, 30, 0).unwrap();
+        let last_tick = Utc.with_ymd_and_hms(2025, 11, 2, 4, 0, 0).unwrap(); // 00:00 EDT
+
+        let mut def = test_definition("01HQ123SCHEDXYZ");
+        def.cron_expression = "0 0 * * * *".into(); // Top of every hour
+        def.timezone = "America/New_York".into();
+        def.catchup_window_minutes = 360;
+        def.max_catchup_ticks = 10;
+
+        let state = vec![ScheduleStateRow {
+            tenant_id: "tenant-abc".into(),
+            workspace_id: "workspace-prod".into(),
+            schedule_id: "01HQ123SCHEDXYZ".into(),
+            last_scheduled_for: Some(last_tick),
+            last_tick_id: None,
+            last_run_key: None,
+            row_version: "state_01HQ".into(),
+        }];
+
+        let controller = ScheduleController::new();
+        let events = controller.reconcile(&[def], &state, now);
+
+        let scheduled_fors: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.data {
+                OrchestrationEventData::ScheduleTicked { scheduled_for, .. } => {
+                    Some(scheduled_for.clone())
+                }
+                _ => None,
+            })
+            .collect();
+
+        let expected = vec![
+            Utc.with_ymd_and_hms(2025, 11, 2, 5, 0, 0).unwrap(), // 01:00 EDT
+            Utc.with_ymd_and_hms(2025, 11, 2, 6, 0, 0).unwrap(), // 01:00 EST
+            Utc.with_ymd_and_hms(2025, 11, 2, 7, 0, 0).unwrap(), // 02:00 EST
+        ];
+        assert_eq!(scheduled_fors, expected, "DST fall-back should yield repeated hour ticks");
     }
 
     #[test]

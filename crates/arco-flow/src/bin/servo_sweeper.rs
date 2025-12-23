@@ -105,6 +105,7 @@ async fn health_handler() -> StatusCode {
     StatusCode::OK
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_handler(
     State(state): State<AppState>,
 ) -> std::result::Result<Json<RunSummary>, ApiError> {
@@ -279,10 +280,7 @@ fn optional_env(key: &str) -> Option<String> {
 }
 
 fn parse_bool_env(key: &str, default: bool) -> bool {
-    match std::env::var(key) {
-        Ok(value) => value.eq_ignore_ascii_case("true"),
-        Err(_) => default,
-    }
+    std::env::var(key).map_or(default, |value| value.eq_ignore_ascii_case("true"))
 }
 
 fn resolve_port() -> Result<u16> {
@@ -308,6 +306,7 @@ fn log_format_from_env() -> LogFormat {
     }
 }
 
+#[allow(clippy::unused_async)]
 async fn build_cloud_tasks(config: CloudTasksConfig) -> Result<CloudTasksDispatcher> {
     #[cfg(feature = "gcp")]
     {

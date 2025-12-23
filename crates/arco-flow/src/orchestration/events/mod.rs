@@ -555,8 +555,7 @@ impl OrchestrationEventData {
                     TriggerSource::Poll { poll_epoch } => {
                         let cursor_hash = cursor_before
                             .as_ref()
-                            .map(|c| sha256_hex(c))
-                            .unwrap_or_else(|| "none".to_string());
+                            .map_or_else(|| "none".to_string(), |c| sha256_hex(c));
                         format!("sensor_eval:{sensor_id}:poll:{poll_epoch}:{cursor_hash}")
                     }
                 }

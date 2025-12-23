@@ -17,6 +17,8 @@
 //! | `arco_flow_active_runs` | Gauge | tenant | Currently active runs per tenant |
 //! | `arco_flow_dispatch_queue_depth` | Gauge | queue | Tasks waiting in dispatch queue |
 //! | `arco_flow_quota_usage_ratio` | Gauge | tenant | Current quota utilization (0.0-1.0) |
+//! | `arco_flow_schedule_ticks_total` | Counter | status | Schedule tick outcomes |
+//! | `arco_flow_run_requests_total` | Counter | source | Run requests by trigger source |
 //!
 //! ## Usage
 //!
@@ -80,6 +82,10 @@ pub mod names {
     pub const ORCH_CONTROLLER_ACTIONS_TOTAL: &str = "arco_orch_controller_actions_total";
     /// Histogram: Orchestration controller reconcile duration in seconds.
     pub const ORCH_CONTROLLER_RECONCILE_SECONDS: &str = "arco_orch_controller_reconcile_seconds";
+    /// Counter: Schedule ticks by outcome.
+    pub const SCHEDULE_TICKS_TOTAL: &str = "arco_flow_schedule_ticks_total";
+    /// Counter: Run requests by source.
+    pub const RUN_REQUESTS_TOTAL: &str = "arco_flow_run_requests_total";
 }
 
 /// Label keys used across metrics.
@@ -102,6 +108,10 @@ pub mod labels {
     pub const HANDLER: &str = "handler";
     /// Controller name.
     pub const CONTROLLER: &str = "controller";
+    /// Outcome status (triggered, skipped, failed).
+    pub const STATUS: &str = "status";
+    /// Trigger source (schedule, sensor, backfill, manual).
+    pub const SOURCE: &str = "source";
 }
 
 /// High-level interface for recording orchestration metrics.

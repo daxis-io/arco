@@ -41,7 +41,6 @@
 
 use std::time::Duration;
 
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::{EnqueueOptions, EnqueueResult, TaskEnvelope, TaskQueue};
@@ -173,7 +172,11 @@ impl CloudTasksConfig {
 
 #[cfg(feature = "gcp")]
 mod gcp_impl {
-    use super::*;
+    use async_trait::async_trait;
+
+    use super::{
+        CloudTasksConfig, EnqueueOptions, EnqueueResult, Error, Result, TaskEnvelope, TaskQueue,
+    };
     use base64::Engine;
     use gcp_auth::TokenProvider;
     use std::collections::HashSet;
@@ -500,6 +503,7 @@ mod gcp_impl {
         /// # Errors
         ///
         /// Returns an error if the Cloud Tasks API call fails.
+        #[allow(clippy::unused_async)]
         pub async fn enqueue_http(
             &self,
             task_id: &str,
@@ -719,7 +723,11 @@ mod gcp_impl {
 
 #[cfg(not(feature = "gcp"))]
 mod placeholder_impl {
-    use super::*;
+    use async_trait::async_trait;
+
+    use super::{
+        CloudTasksConfig, EnqueueOptions, EnqueueResult, Error, Result, TaskEnvelope, TaskQueue,
+    };
 
     /// Placeholder Cloud Tasks dispatcher (GCP feature not enabled).
     ///
@@ -759,6 +767,7 @@ mod placeholder_impl {
         /// # Errors
         ///
         /// Always returns a configuration error when the `gcp` feature is disabled.
+        #[allow(clippy::unused_async)]
         pub async fn enqueue_http(
             &self,
             _task_id: &str,
@@ -806,7 +815,9 @@ pub use placeholder_impl::CloudTasksDispatcher;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::time::Duration;
+
+    use super::{CloudTasksConfig, CloudTasksDispatcher, RetryConfig};
 
     #[test]
     fn config_queue_path() {
@@ -872,7 +883,7 @@ mod tests {
 
     #[cfg(not(feature = "gcp"))]
     mod placeholder_tests {
-        use super::*;
+        use super::{CloudTasksConfig, CloudTasksDispatcher};
 
         #[test]
         fn dispatcher_validates_config() {
@@ -898,7 +909,7 @@ mod tests {
 
     #[cfg(feature = "gcp")]
     mod gcp_tests {
-        use super::*;
+        use super::CloudTasksDispatcher;
 
         #[test]
         fn task_id_from_key_is_deterministic() {

@@ -15,6 +15,7 @@ Dagster uses a long-running daemon; we need a serverless alternative.
    - Controller evaluates tick and emits `RunRequested` if due
    - Both events emitted atomically in the same ledger segment
    - Tick history persisted in `schedule_ticks.parquet`
+   - Cron expressions accept 5 or 6 fields (seconds optional)
 
 2. **Push Sensors**: Pub/Sub subscription triggers evaluation
    - Message arrives -> sensor evaluates -> emits `SensorEvaluated`

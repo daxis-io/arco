@@ -456,7 +456,7 @@ pub struct ScheduleDefinitionRow {
     pub workspace_id: String,
     /// Schedule identifier (ULID).
     pub schedule_id: String,
-    /// Cron expression (e.g., "0 10 * * *").
+    /// Cron expression (5- or 6-field, e.g., "0 10 * * *" or "0 0 10 * * *").
     pub cron_expression: String,
     /// IANA timezone (e.g., `UTC`, `America/New_York`).
     pub timezone: String,
@@ -3268,6 +3268,30 @@ mod tests {
         // Tick row should show failed status
         let tick = state.schedule_ticks.values().next().unwrap();
         assert!(matches!(tick.status, TickStatus::Failed { .. }));
+        assert!(tick.run_key.is_none());
+    }
+
+    #[test]
+    fn test_fold_schedule_ticked_skipped_status_has_no_run_key() {
+        let mut state = FoldState::new();
+
+        let event = schedule_ticked_event(
+            "daily-etl",
+            Utc::now(),
+            TickStatus::Skipped {
+                reason: "paused".into(),
+            },
+            None,
+        );
+
+        state.fold_event(&event);
+
+        let schedule_state = state.schedule_state.get("daily-etl").unwrap();
+        assert!(schedule_state.last_scheduled_for.is_some());
+        assert!(schedule_state.last_run_key.is_none());
+
+        let tick = state.schedule_ticks.values().next().unwrap();
+        assert!(matches!(tick.status, TickStatus::Skipped { .. }));
         assert!(tick.run_key.is_none());
     }
 

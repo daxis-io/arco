@@ -34,19 +34,18 @@ impl BackfillState {
     /// Validates a state transition.
     #[must_use]
     pub fn is_valid_transition(from: Self, to: Self) -> bool {
-        use BackfillState::*;
         matches!(
             (from, to),
-            (Pending | Paused, Running)
-                | (Pending | Running | Paused, Cancelled)
-                | (Running, Paused | Succeeded | Failed)
+            (Self::Pending | Self::Paused, Self::Running)
+                | (Self::Pending | Self::Running | Self::Paused, Self::Cancelled)
+                | (Self::Running, Self::Paused | Self::Succeeded | Self::Failed)
         )
     }
 }
 
 /// Selector for backfill partitions.
 ///
-/// Per P0-6, BackfillCreated uses a compact selector rather than
+/// Per P0-6, `BackfillCreated` uses a compact selector rather than
 /// embedding the full partition list.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -92,19 +91,41 @@ mod tests {
 
     #[test]
     fn test_backfill_state_transitions() {
-        use BackfillState::*;
-
         // Valid transitions
-        assert!(BackfillState::is_valid_transition(Pending, Running));
-        assert!(BackfillState::is_valid_transition(Running, Paused));
-        assert!(BackfillState::is_valid_transition(Paused, Running));
-        assert!(BackfillState::is_valid_transition(Running, Succeeded));
-        assert!(BackfillState::is_valid_transition(Running, Cancelled));
+        assert!(BackfillState::is_valid_transition(
+            BackfillState::Pending,
+            BackfillState::Running
+        ));
+        assert!(BackfillState::is_valid_transition(
+            BackfillState::Running,
+            BackfillState::Paused
+        ));
+        assert!(BackfillState::is_valid_transition(
+            BackfillState::Paused,
+            BackfillState::Running
+        ));
+        assert!(BackfillState::is_valid_transition(
+            BackfillState::Running,
+            BackfillState::Succeeded
+        ));
+        assert!(BackfillState::is_valid_transition(
+            BackfillState::Running,
+            BackfillState::Cancelled
+        ));
 
         // Invalid transitions
-        assert!(!BackfillState::is_valid_transition(Succeeded, Running));
-        assert!(!BackfillState::is_valid_transition(Failed, Running));
-        assert!(!BackfillState::is_valid_transition(Cancelled, Running));
+        assert!(!BackfillState::is_valid_transition(
+            BackfillState::Succeeded,
+            BackfillState::Running
+        ));
+        assert!(!BackfillState::is_valid_transition(
+            BackfillState::Failed,
+            BackfillState::Running
+        ));
+        assert!(!BackfillState::is_valid_transition(
+            BackfillState::Cancelled,
+            BackfillState::Running
+        ));
     }
 
     #[test]

@@ -635,6 +635,7 @@ mod manifests {
         code_version_id: String,
         fingerprint: String,
         asset_count: u32,
+        #[allow(dead_code)]
         deployed_at: String,
     }
 
@@ -777,6 +778,28 @@ mod orchestration {
     struct RunLogsResponse {
         path: String,
         size_bytes: u64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ManualSensorEvaluateResponse {
+        eval_id: String,
+        message_id: String,
+        status: String,
+        message: Option<String>,
+        #[serde(default)]
+        run_requests: Vec<RunRequestResponse>,
+        events_written: u32,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    #[allow(dead_code)]
+    struct RunRequestResponse {
+        run_key: String,
+        request_fingerprint: String,
+        asset_selection: Vec<String>,
+        partition_selection: Option<Vec<String>>,
     }
 
     #[tokio::test]
@@ -950,6 +973,44 @@ mod orchestration {
         assert!(logs_text.contains("hello stdout"));
         assert!(logs_text.contains("=== stderr ==="));
         assert!(logs_text.contains("hello stderr"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_manual_sensor_evaluate_endpoint() -> Result<()> {
+        let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let router = ServerBuilder::new()
+            .debug(true)
+            .storage_backend(backend.clone())
+            .build()
+            .test_router();
+
+        let request = serde_json::json!({
+            "payload": {
+                "bucket": "test-bucket",
+                "object": "data/file.parquet"
+            },
+            "attributes": {
+                "source": "manual"
+            }
+        });
+
+        let (status, response): (_, ManualSensorEvaluateResponse) = helpers::post_json_with_headers(
+            router,
+            "/api/v1/workspaces/test-workspace/sensors/01HQTESTSENSOR/evaluate",
+            request,
+            &[("Idempotency-Key", "manual-eval-001")],
+        )
+        .await?;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(!response.eval_id.is_empty());
+        assert_eq!(response.message_id, "manual-eval-001");
+        assert_eq!(response.status, "no_new_data");
+        assert!(response.message.is_none());
+        assert!(response.run_requests.is_empty());
+        assert_eq!(response.events_written, 1);
 
         Ok(())
     }

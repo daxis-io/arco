@@ -10,6 +10,7 @@
 //! - `POST   /workspaces/{workspace_id}/runs/{run_id}/cancel` - Cancel a run
 //! - `POST   /workspaces/{workspace_id}/runs/{run_id}/logs` - Upload task logs
 //! - `GET    /workspaces/{workspace_id}/runs/{run_id}/logs` - Get run logs
+//! - `POST   /workspaces/{workspace_id}/sensors/{sensor_id}/evaluate` - Manual sensor evaluate
 //!
 //! ## Worker Callbacks
 //!
@@ -41,8 +42,10 @@ use arco_flow::orchestration::compactor::{
     FoldState, MicroCompactor, RunRow, RunState as FoldRunState, TaskRow,
     TaskState as FoldTaskState,
 };
+use arco_flow::orchestration::controllers::{PubSubMessage, PushSensorHandler};
 use arco_flow::orchestration::events::{
-    OrchestrationEvent, OrchestrationEventData, TaskDef, TriggerInfo,
+    OrchestrationEvent, OrchestrationEventData, RunRequest, SensorEvalStatus, SensorStatus,
+    TaskDef, TriggerInfo,
 };
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::run_key::{
@@ -353,6 +356,70 @@ pub struct RunLogsQuery {
     pub task_key: Option<String>,
 }
 
+/// Request to manually evaluate a sensor.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualSensorEvaluateRequest {
+    /// Raw payload to pass to the sensor evaluator.
+    pub payload: serde_json::Value,
+    /// Message attributes to pass to the evaluator.
+    #[serde(default)]
+    pub attributes: HashMap<String, String>,
+    /// Optional message identifier for idempotency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+}
+
+/// Response after manually evaluating a sensor.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualSensorEvaluateResponse {
+    /// Evaluation identifier.
+    pub eval_id: String,
+    /// Message identifier used for idempotency.
+    pub message_id: String,
+    /// Evaluation status.
+    #[serde(flatten)]
+    pub status: SensorEvalStatusResponse,
+    /// Run requests produced by the evaluation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_requests: Vec<RunRequestResponse>,
+    /// Number of events written to the ledger.
+    pub events_written: u32,
+}
+
+/// Sensor evaluation status (API response).
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SensorEvalStatusResponse {
+    /// Sensor triggered one or more runs.
+    Triggered,
+    /// Sensor evaluated but no new data found.
+    NoNewData,
+    /// Sensor evaluation failed.
+    Error {
+        /// Error message describing the failure.
+        message: String,
+    },
+    /// Sensor evaluation was skipped due to stale cursor (CAS failed).
+    SkippedStaleCursor,
+}
+
+/// Run request returned from sensor evaluation.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RunRequestResponse {
+    /// Stable run key for idempotency.
+    pub run_key: String,
+    /// Fingerprint of the request payload for conflict detection.
+    pub request_fingerprint: String,
+    /// Assets to materialize.
+    pub asset_selection: Vec<String>,
+    /// Optional partition selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition_selection: Option<Vec<String>>,
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -614,6 +681,29 @@ fn apply_event_metadata(event: &mut OrchestrationEvent, event_id: &str, timestam
     event.timestamp = timestamp;
 }
 
+fn map_sensor_eval_status(status: &SensorEvalStatus) -> SensorEvalStatusResponse {
+    match status {
+        SensorEvalStatus::Triggered => SensorEvalStatusResponse::Triggered,
+        SensorEvalStatus::NoNewData => SensorEvalStatusResponse::NoNewData,
+        SensorEvalStatus::Error { message } => SensorEvalStatusResponse::Error {
+            message: message.clone(),
+        },
+        SensorEvalStatus::SkippedStaleCursor => SensorEvalStatusResponse::SkippedStaleCursor,
+    }
+}
+
+fn map_run_requests(run_requests: &[RunRequest]) -> Vec<RunRequestResponse> {
+    run_requests
+        .iter()
+        .map(|req| RunRequestResponse {
+            run_key: req.run_key.clone(),
+            request_fingerprint: req.request_fingerprint.clone(),
+            asset_selection: req.asset_selection.clone(),
+            partition_selection: req.partition_selection.clone(),
+        })
+        .collect()
+}
+
 // ============================================================================
 // Route Handlers
 // ============================================================================
@@ -849,6 +939,105 @@ pub(crate) async fn trigger_run(
             state: RunStateResponse::Pending,
             created: true,
             created_at: now,
+        }),
+    ))
+}
+
+/// Manually evaluate a sensor with an arbitrary payload.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/sensors/{sensor_id}/evaluate",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("sensor_id" = String, Path, description = "Sensor ID")
+    ),
+    request_body = ManualSensorEvaluateRequest,
+    responses(
+        (status = 200, description = "Sensor evaluated", body = ManualSensorEvaluateResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorBody),
+        (status = 404, description = "Workspace not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(
+        ("bearerAuth" = [])
+    )
+)]
+pub(crate) async fn manual_evaluate_sensor(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, sensor_id)): Path<(String, String)>,
+    Json(request): Json<ManualSensorEvaluateRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+
+    let message_id = request
+        .message_id
+        .clone()
+        .or_else(|| ctx.idempotency_key.clone())
+        .unwrap_or_else(|| format!("manual_{}", Ulid::new()));
+
+    let data = serde_json::to_vec(&request.payload).map_err(|e| {
+        ApiError::bad_request(format!("failed to serialize sensor payload: {e}"))
+    })?;
+
+    let message = PubSubMessage {
+        message_id: message_id.clone(),
+        data,
+        attributes: request.attributes.clone(),
+        publish_time: Utc::now(),
+    };
+
+    let handler = PushSensorHandler::new();
+    let events = handler.handle_message(
+        &sensor_id,
+        &ctx.tenant,
+        &workspace_id,
+        SensorStatus::Active,
+        &message,
+    );
+
+    let eval_summary = events.iter().find_map(|event| {
+        if let OrchestrationEventData::SensorEvaluated {
+            eval_id,
+            status,
+            run_requests,
+            ..
+        } = &event.data
+        {
+            Some((eval_id.clone(), status.clone(), run_requests.clone()))
+        } else {
+            None
+        }
+    });
+
+    let Some((eval_id, status, run_requests)) = eval_summary else {
+        return Err(ApiError::internal("sensor evaluation did not emit SensorEvaluated"));
+    };
+
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+    let ledger = LedgerWriter::new(storage.clone());
+    let event_paths: Vec<String> = events
+        .iter()
+        .map(LedgerWriter::event_path)
+        .collect();
+    let events_written = event_paths.len();
+
+    ledger
+        .append_all(events)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to append sensor events: {e}")))?;
+
+    compact_orchestration_events(&state.config, storage, event_paths).await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(ManualSensorEvaluateResponse {
+            eval_id,
+            message_id,
+            status: map_sensor_eval_status(&status),
+            run_requests: map_run_requests(&run_requests),
+            events_written: u32::try_from(events_written).unwrap_or(u32::MAX),
         }),
     ))
 }
@@ -1334,11 +1523,10 @@ pub(crate) async fn get_run_logs(
         }
     }
 
-    let prefix = if let Some(task_key) = query.task_key {
-        format!("logs/{run_id}/{task_key}/")
-    } else {
-        format!("logs/{run_id}/")
-    };
+    let prefix = query.task_key.map_or_else(
+        || format!("logs/{run_id}/"),
+        |task_key| format!("logs/{run_id}/{task_key}/"),
+    );
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
@@ -1380,6 +1568,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/workspaces/:workspace_id/runs", post(trigger_run))
         .route("/workspaces/:workspace_id/runs", get(list_runs))
         .route("/workspaces/:workspace_id/runs/:run_id", get(get_run))
+        .route(
+            "/workspaces/:workspace_id/sensors/:sensor_id/evaluate",
+            post(manual_evaluate_sensor),
+        )
         .route(
             "/workspaces/:workspace_id/runs/run-key/backfill",
             post(backfill_run_key),

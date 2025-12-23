@@ -29,6 +29,7 @@ pub mod dispatcher;
 pub mod ready_dispatch;
 pub mod schedule;
 pub mod sensor;
+pub mod sensor_evaluator;
 pub mod timer;
 pub mod timer_handlers;
 
@@ -38,5 +39,6 @@ pub use dispatcher::*;
 pub use ready_dispatch::*;
 pub use schedule::*;
 pub use sensor::*;
+pub use sensor_evaluator::*;
 pub use timer::*;
 pub use timer_handlers::*;

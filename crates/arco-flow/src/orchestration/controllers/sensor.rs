@@ -30,38 +30,28 @@
 //! 4. **CAS for poll**: Poll sensors include `expected_state_version` for cursor serialization (P0-2)
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use metrics::{counter, histogram};
 use ulid::Ulid;
 
 use crate::metrics::{labels as metrics_labels, names as metrics_names, TimingGuard};
+use crate::orchestration::controllers::sensor_evaluator::{
+    NoopSensorEvaluator, PollSensorResult, PubSubMessage, SensorEvaluator,
+};
 use crate::orchestration::compactor::fold::SensorStateRow;
 use crate::orchestration::events::{
-    OrchestrationEvent, OrchestrationEventData, RunRequest, SensorEvalStatus, SensorStatus,
-    SourceRef, TriggerSource,
+    OrchestrationEvent, OrchestrationEventData, SensorEvalStatus, SensorStatus, SourceRef,
+    TriggerSource,
 };
-
-/// Pub/Sub message for push sensor evaluation.
-#[derive(Debug, Clone)]
-pub struct PubSubMessage {
-    /// Unique message identifier (for idempotency).
-    pub message_id: String,
-    /// Message payload.
-    pub data: Vec<u8>,
-    /// Message attributes.
-    pub attributes: HashMap<String, String>,
-    /// When the message was published.
-    pub publish_time: DateTime<Utc>,
-}
 
 /// Handler for push sensor evaluations.
 ///
 /// Push sensors are triggered by Pub/Sub messages. Each message is processed
 /// exactly once using the `message_id` for idempotency.
 pub struct PushSensorHandler {
-    // Sensor evaluation logic is provided via trait or closure.
-    // For now, we use a simple callback pattern.
+    evaluator: Arc<dyn SensorEvaluator>,
 }
 
 impl Default for PushSensorHandler {
@@ -74,7 +64,13 @@ impl PushSensorHandler {
     /// Creates a new push sensor handler.
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        Self::with_evaluator(Arc::new(NoopSensorEvaluator::default()))
+    }
+
+    /// Creates a new push sensor handler with a custom evaluator.
+    #[must_use]
+    pub fn with_evaluator(evaluator: Arc<dyn SensorEvaluator>) -> Self {
+        Self { evaluator }
     }
 
     /// Handles a Pub/Sub message and returns events to emit.
@@ -84,12 +80,14 @@ impl PushSensorHandler {
     /// 2. `RunRequested` - one per run request from sensor evaluation
     ///
     /// Per P0-1, all events are emitted atomically in the same batch.
+    /// Returns an empty batch if the sensor is paused or in error.
     #[must_use]
     pub fn handle_message(
         &self,
         sensor_id: &str,
         tenant_id: &str,
         workspace_id: &str,
+        sensor_status: SensorStatus,
         message: &PubSubMessage,
     ) -> Vec<OrchestrationEvent> {
         let _guard = TimingGuard::new(|duration| {
@@ -100,16 +98,27 @@ impl PushSensorHandler {
             .record(duration.as_secs_f64());
         });
 
+        if matches!(sensor_status, SensorStatus::Paused | SensorStatus::Error) {
+            return Vec::new();
+        }
+
         let eval_id = format!("eval_{}_{}", sensor_id, Ulid::new());
 
-        // Evaluate sensor logic - in production this would call user-defined code
-        // For now, we provide a default evaluation that generates no run requests
-        let run_requests = Self::evaluate_sensor(sensor_id, message);
-
-        let status = if run_requests.is_empty() {
-            SensorEvalStatus::NoNewData
-        } else {
-            SensorEvalStatus::Triggered
+        let (run_requests, status) = match self.evaluator.evaluate_push(sensor_id, message) {
+            Ok(run_requests) => {
+                let status = if run_requests.is_empty() {
+                    SensorEvalStatus::NoNewData
+                } else {
+                    SensorEvalStatus::Triggered
+                };
+                (run_requests, status)
+            }
+            Err(err) => (
+                Vec::new(),
+                SensorEvalStatus::Error {
+                    message: err.message,
+                },
+            ),
         };
 
         let mut events = Vec::new();
@@ -156,16 +165,6 @@ impl PushSensorHandler {
         events
     }
 
-    /// Evaluates sensor logic for a message.
-    ///
-    /// In production, this would delegate to user-defined sensor code.
-    /// Returns run requests to create based on the message.
-    fn evaluate_sensor(_sensor_id: &str, _message: &PubSubMessage) -> Vec<RunRequest> {
-        // Default: no run requests
-        // Real implementation would call user-defined sensor logic
-        Vec::new()
-    }
-
     /// Manually evaluate a sensor with a sample payload (for testing/debugging).
     #[must_use]
     pub fn manual_evaluate(
@@ -182,7 +181,7 @@ impl PushSensorHandler {
             publish_time: Utc::now(),
         };
 
-        self.handle_message(sensor_id, tenant_id, workspace_id, &message)
+        self.handle_message(sensor_id, tenant_id, workspace_id, SensorStatus::Active, &message)
     }
 
     fn record_metrics(status: &SensorEvalStatus, run_request_count: usize) {
@@ -217,6 +216,8 @@ impl PushSensorHandler {
 pub struct PollSensorController {
     /// Minimum interval between evaluations.
     min_poll_interval: Duration,
+    /// Sensor evaluation logic.
+    evaluator: Arc<dyn SensorEvaluator>,
 }
 
 impl Default for PollSensorController {
@@ -229,22 +230,44 @@ impl PollSensorController {
     /// Creates a new poll sensor controller with default settings.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            min_poll_interval: Duration::seconds(30),
-        }
+        Self::with_min_interval_and_evaluator(
+            Duration::seconds(30),
+            Arc::new(NoopSensorEvaluator::default()),
+        )
     }
 
     /// Creates a poll sensor controller with custom settings.
     #[must_use]
     pub fn with_min_interval(min_poll_interval: Duration) -> Self {
-        Self { min_poll_interval }
+        Self::with_min_interval_and_evaluator(
+            min_poll_interval,
+            Arc::new(NoopSensorEvaluator::default()),
+        )
+    }
+
+    /// Creates a poll sensor controller with a custom evaluator.
+    #[must_use]
+    pub fn with_evaluator(evaluator: Arc<dyn SensorEvaluator>) -> Self {
+        Self::with_min_interval_and_evaluator(Duration::seconds(30), evaluator)
+    }
+
+    /// Creates a poll sensor controller with custom settings and evaluator.
+    #[must_use]
+    pub fn with_min_interval_and_evaluator(
+        min_poll_interval: Duration,
+        evaluator: Arc<dyn SensorEvaluator>,
+    ) -> Self {
+        Self {
+            min_poll_interval,
+            evaluator,
+        }
     }
 
     /// Checks if a sensor should be evaluated based on state and timing.
     #[must_use]
     pub fn should_evaluate(&self, state: &SensorStateRow, now: DateTime<Utc>) -> bool {
-        // Skip if paused
-        if state.status == SensorStatus::Paused {
+        // Skip if paused or error
+        if matches!(state.status, SensorStatus::Paused | SensorStatus::Error) {
             return false;
         }
 
@@ -266,6 +289,7 @@ impl PollSensorController {
     ///
     /// Per P0-1, all events are emitted atomically in the same batch.
     /// Per P0-2, includes `expected_state_version` for CAS semantics.
+    /// Returns an empty batch if the sensor is paused or in error.
     #[must_use]
     pub fn evaluate(
         &self,
@@ -283,17 +307,35 @@ impl PollSensorController {
             .record(duration.as_secs_f64());
         });
 
+        if matches!(state.status, SensorStatus::Paused | SensorStatus::Error) {
+            return Vec::new();
+        }
+
         let eval_id = format!("eval_{}_{}", sensor_id, Ulid::new());
         let cursor_before = state.cursor.clone();
 
-        // Evaluate sensor logic - in production this would call user-defined code
-        let (cursor_after, run_requests) =
-            Self::evaluate_sensor_logic(sensor_id, cursor_before.as_deref());
-
-        let status = if run_requests.is_empty() {
-            SensorEvalStatus::NoNewData
-        } else {
-            SensorEvalStatus::Triggered
+        let (cursor_after, run_requests, status) = match self
+            .evaluator
+            .evaluate_poll(sensor_id, cursor_before.as_deref())
+        {
+            Ok(PollSensorResult {
+                cursor_after,
+                run_requests,
+            }) => {
+                let status = if run_requests.is_empty() {
+                    SensorEvalStatus::NoNewData
+                } else {
+                    SensorEvalStatus::Triggered
+                };
+                (cursor_after, run_requests, status)
+            }
+            Err(err) => (
+                cursor_before.clone(),
+                Vec::new(),
+                SensorEvalStatus::Error {
+                    message: err.message,
+                },
+            ),
         };
 
         let mut events = Vec::new();
@@ -338,19 +380,6 @@ impl PollSensorController {
         events
     }
 
-    /// Evaluates sensor logic and returns new cursor and run requests.
-    ///
-    /// In production, this would delegate to user-defined sensor code.
-    fn evaluate_sensor_logic(
-        _sensor_id: &str,
-        cursor_before: Option<&str>,
-    ) -> (Option<String>, Vec<RunRequest>) {
-        // Default: advance cursor but no run requests
-        // Real implementation would call user-defined sensor logic
-        let cursor_after = cursor_before.map(|c| format!("{c}_advanced"));
-        (cursor_after, Vec::new())
-    }
-
     fn record_metrics(status: &SensorEvalStatus, run_request_count: usize) {
         let status_label = match status {
             SensorEvalStatus::Triggered => "triggered",
@@ -381,6 +410,9 @@ mod tests {
     use super::*;
     use crate::orchestration::events::sha256_hex;
 
+    use crate::orchestration::controllers::sensor_evaluator::SensorEvaluationError;
+    use crate::orchestration::events::RunRequest;
+
     fn test_message(message_id: &str) -> PubSubMessage {
         PubSubMessage {
             message_id: message_id.into(),
@@ -409,6 +441,7 @@ mod tests {
             "01HQ123SENSORXYZ",
             "tenant-abc",
             "workspace-prod",
+            SensorStatus::Active,
             &message,
         );
 
@@ -434,7 +467,7 @@ mod tests {
         let message = test_message("msg_001");
 
         let events =
-            handler.handle_message("01HQ123SENSORXYZ", "tenant-abc", "workspace-prod", &message);
+            handler.handle_message("01HQ123SENSORXYZ", "tenant-abc", "workspace-prod", SensorStatus::Active, &message);
 
         let eval_event = events
             .iter()
@@ -464,7 +497,7 @@ mod tests {
         let message = test_message("msg_abc");
 
         let events =
-            handler.handle_message("01HQ123SENSORXYZ", "tenant-abc", "workspace-prod", &message);
+            handler.handle_message("01HQ123SENSORXYZ", "tenant-abc", "workspace-prod", SensorStatus::Active, &message);
 
         // Controller must emit SensorEvaluated
         let has_eval = events
@@ -474,6 +507,30 @@ mod tests {
 
         // All events should be in the same batch (vector)
         // In production, the ledger appends all events atomically
+    }
+
+    #[test]
+    fn test_push_sensor_skips_when_paused_or_error() {
+        let handler = PushSensorHandler::new();
+        let message = test_message("msg_skip");
+
+        let paused_events = handler.handle_message(
+            "01HQ123SENSORXYZ",
+            "tenant-abc",
+            "workspace-prod",
+            SensorStatus::Paused,
+            &message,
+        );
+        assert!(paused_events.is_empty(), "Paused sensor should not emit events");
+
+        let error_events = handler.handle_message(
+            "01HQ123SENSORXYZ",
+            "tenant-abc",
+            "workspace-prod",
+            SensorStatus::Error,
+            &message,
+        );
+        assert!(error_events.is_empty(), "Error sensor should not emit events");
     }
 
     // ========================================================================
@@ -587,6 +644,95 @@ mod tests {
             !controller.should_evaluate(&state, now),
             "Should not evaluate paused sensor"
         );
+    }
+
+    #[test]
+    fn test_poll_sensor_skips_error_sensor() {
+        let controller = PollSensorController::new();
+        let now = Utc::now();
+
+        let state = SensorStateRow {
+            tenant_id: "tenant-abc".into(),
+            workspace_id: "workspace-prod".into(),
+            sensor_id: "01HQ456POLLSENSOR".into(),
+            cursor: None,
+            last_evaluation_at: None,
+            last_eval_id: None,
+            status: SensorStatus::Error,
+            state_version: 1,
+            row_version: "row_01HQ".into(),
+        };
+
+        assert!(
+            !controller.should_evaluate(&state, now),
+            "Should not evaluate error sensor"
+        );
+    }
+
+    #[derive(Debug)]
+    struct ErrorEvaluator;
+
+    impl SensorEvaluator for ErrorEvaluator {
+        fn evaluate_push(
+            &self,
+            _sensor_id: &str,
+            _message: &PubSubMessage,
+        ) -> Result<Vec<RunRequest>, SensorEvaluationError> {
+            Err(SensorEvaluationError::new("boom"))
+        }
+
+        fn evaluate_poll(
+            &self,
+            _sensor_id: &str,
+            _cursor_before: Option<&str>,
+        ) -> Result<PollSensorResult, SensorEvaluationError> {
+            Err(SensorEvaluationError::new("boom"))
+        }
+    }
+
+    #[test]
+    fn test_poll_sensor_error_preserves_cursor() {
+        let controller = PollSensorController::with_min_interval_and_evaluator(
+            Duration::seconds(30),
+            Arc::new(ErrorEvaluator),
+        );
+
+        let state = SensorStateRow {
+            tenant_id: "tenant-abc".into(),
+            workspace_id: "workspace-prod".into(),
+            sensor_id: "01HQ456POLLSENSOR".into(),
+            cursor: Some("cursor_v1".into()),
+            last_evaluation_at: None,
+            last_eval_id: None,
+            status: SensorStatus::Active,
+            state_version: 7,
+            row_version: "row_01HQ".into(),
+        };
+
+        let events = controller.evaluate(
+            "01HQ456POLLSENSOR",
+            "tenant-abc",
+            "workspace-prod",
+            &state,
+            1736935200,
+        );
+
+        let eval_event = events
+            .iter()
+            .find(|e| matches!(&e.data, OrchestrationEventData::SensorEvaluated { .. }))
+            .expect("Should have SensorEvaluated event");
+
+        if let OrchestrationEventData::SensorEvaluated {
+            cursor_after, status, ..
+        } = &eval_event.data
+        {
+            assert_eq!(
+                cursor_after.as_deref(),
+                Some("cursor_v1"),
+                "Cursor should not advance on error"
+            );
+            assert!(matches!(status, SensorEvalStatus::Error { .. }));
+        }
     }
 
     #[test]

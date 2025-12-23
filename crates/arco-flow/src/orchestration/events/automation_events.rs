@@ -165,6 +165,20 @@ mod tests {
     }
 
     #[test]
+    fn test_sensor_eval_status_serialization() {
+        let triggered = SensorEvalStatus::Triggered;
+        let json = serde_json::to_string(&triggered).unwrap();
+        assert!(json.contains(r#""status":"triggered""#));
+
+        let error = SensorEvalStatus::Error {
+            message: "boom".into(),
+        };
+        let json = serde_json::to_string(&error).unwrap();
+        assert!(json.contains(r#""status":"error""#));
+        assert!(json.contains(r#""message":"boom""#));
+    }
+
+    #[test]
     fn test_sha256_hex() {
         let hash1 = sha256_hex("test_input");
         let hash2 = sha256_hex("test_input");

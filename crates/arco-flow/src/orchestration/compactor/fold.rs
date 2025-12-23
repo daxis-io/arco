@@ -850,6 +850,46 @@ pub struct FoldState {
 
     /// Task dependents (upstream -> list of downstreams).
     task_dependents: HashMap<(String, String), Vec<String>>,
+
+    // ========================================================================
+    // Layer 2: Schedule/Sensor Automation
+    // ========================================================================
+
+    /// Schedule state rows keyed by `schedule_id`.
+    pub schedule_state: HashMap<String, ScheduleStateRow>,
+
+    /// Schedule tick rows keyed by `tick_id`.
+    pub schedule_ticks: HashMap<String, ScheduleTickRow>,
+
+    /// Sensor state rows keyed by `sensor_id`.
+    pub sensor_state: HashMap<String, SensorStateRow>,
+
+    // ========================================================================
+    // Layer 2: Backfill
+    // ========================================================================
+
+    /// Backfill rows keyed by `backfill_id`.
+    pub backfills: HashMap<String, BackfillRow>,
+
+    /// Backfill chunk rows keyed by `chunk_id`.
+    pub backfill_chunks: HashMap<String, BackfillChunkRow>,
+
+    // ========================================================================
+    // Layer 2: Partition Status
+    // ========================================================================
+
+    /// Partition status rows keyed by (`asset_key`, `partition_key`).
+    pub partition_status: HashMap<(String, String), PartitionStatusRow>,
+
+    // ========================================================================
+    // Layer 2: Run Key Index
+    // ========================================================================
+
+    /// Run key index keyed by `run_key`.
+    pub run_key_index: HashMap<String, RunKeyIndexRow>,
+
+    /// Run key conflicts keyed by `conflict_id`.
+    pub run_key_conflicts: HashMap<String, RunKeyConflictRow>,
 }
 
 impl FoldState {
@@ -1037,14 +1077,40 @@ impl FoldState {
                 self.fold_run_cancel_requested(run_id, &event.event_id, event.timestamp);
             }
 
-            // Layer 2 automation events - stubs for now, implemented in Task 2.2+
-            OrchestrationEventData::ScheduleTicked { .. }
-            | OrchestrationEventData::SensorEvaluated { .. }
+            // Layer 2 automation events
+            OrchestrationEventData::ScheduleTicked {
+                schedule_id,
+                scheduled_for,
+                tick_id,
+                definition_version,
+                asset_selection,
+                partition_selection,
+                status,
+                run_key,
+                request_fingerprint,
+            } => {
+                self.fold_schedule_ticked(
+                    &event.tenant_id,
+                    &event.workspace_id,
+                    schedule_id,
+                    *scheduled_for,
+                    tick_id,
+                    definition_version,
+                    asset_selection,
+                    partition_selection.clone(),
+                    status.clone(),
+                    run_key.clone(),
+                    request_fingerprint.clone(),
+                    &event.event_id,
+                );
+            }
+
+            // Layer 2 automation events - stubs for remaining events
+            OrchestrationEventData::SensorEvaluated { .. }
             | OrchestrationEventData::RunRequested { .. }
             | OrchestrationEventData::BackfillCreated { .. }
             | OrchestrationEventData::BackfillChunkPlanned { .. }
             | OrchestrationEventData::BackfillStateChanged { .. } => {
-                // TODO(Task 2.2): Implement fold_schedule_ticked (schedule_state + ticks).
                 // TODO(Task 3.3): Implement fold_sensor_evaluated (sensor_state + CAS).
                 // TODO(Task 6.1): Implement fold_run_requested (run_id + projection).
                 // TODO(Task 4.2): Implement fold_backfill_created (backfills projection).
@@ -1632,6 +1698,84 @@ impl FoldState {
                 row_version: event_id.to_string(),
             });
         }
+    }
+
+    // ========================================================================
+    // Layer 2: Schedule Fold Logic
+    // ========================================================================
+
+    /// Folds a `ScheduleTicked` event into state.
+    ///
+    /// Updates:
+    /// 1. `schedule_state` - Last tick info for the schedule
+    /// 2. `schedule_ticks` - Tick history row
+    ///
+    /// Per P0-1, this is pure projection - fold does NOT emit new events.
+    /// The controller emits `ScheduleTicked` + `RunRequested` atomically.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_schedule_ticked(
+        &mut self,
+        tenant_id: &str,
+        workspace_id: &str,
+        schedule_id: &str,
+        scheduled_for: DateTime<Utc>,
+        tick_id: &str,
+        definition_version: &str,
+        asset_selection: &[String],
+        partition_selection: Option<Vec<String>>,
+        status: TickStatus,
+        run_key: Option<String>,
+        request_fingerprint: Option<String>,
+        event_id: &str,
+    ) {
+        // Update schedule state
+        let state = self.schedule_state.entry(schedule_id.to_string()).or_insert_with(|| {
+            ScheduleStateRow {
+                tenant_id: tenant_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                schedule_id: schedule_id.to_string(),
+                last_scheduled_for: None,
+                last_tick_id: None,
+                last_run_key: None,
+                row_version: String::new(),
+            }
+        });
+
+        // Only update if this event is newer
+        if event_id > state.row_version.as_str() {
+            state.last_scheduled_for = Some(scheduled_for);
+            state.last_tick_id = Some(tick_id.to_string());
+            state.last_run_key.clone_from(&run_key);
+            state.row_version = event_id.to_string();
+        }
+
+        // Create or update tick history row
+        // Check for duplicate tick_id (idempotency)
+        if let Some(existing) = self.schedule_ticks.get(tick_id) {
+            // Duplicate event - only update if newer event_id
+            if event_id <= existing.row_version.as_str() {
+                return;
+            }
+        }
+
+        self.schedule_ticks.insert(
+            tick_id.to_string(),
+            ScheduleTickRow {
+                tenant_id: tenant_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                tick_id: tick_id.to_string(),
+                schedule_id: schedule_id.to_string(),
+                scheduled_for,
+                definition_version: definition_version.to_string(),
+                asset_selection: asset_selection.to_vec(),
+                partition_selection,
+                status,
+                run_key,
+                run_id: None, // Filled by fold_run_requested correlation
+                request_fingerprint,
+                row_version: event_id.to_string(),
+            },
+        );
     }
 
     fn satisfy_downstream_edges(
@@ -2982,5 +3126,178 @@ mod tests {
         assert_eq!(run.tasks_cancelled, 1);
         assert_eq!(run.tasks_completed, 2);
         assert_eq!(run.state, RunState::Cancelled); // Still cancelled because at least one task was cancelled
+    }
+
+    // ========================================================================
+    // Layer 2: Schedule Fold Tests
+    // ========================================================================
+
+    fn schedule_ticked_event(
+        schedule_id: &str,
+        scheduled_for: DateTime<Utc>,
+        status: TickStatus,
+        run_key: Option<&str>,
+    ) -> OrchestrationEvent {
+        let tick_id = format!("{}:{}", schedule_id, scheduled_for.timestamp());
+        OrchestrationEvent::new(
+            "tenant-abc",
+            "workspace-prod",
+            OrchestrationEventData::ScheduleTicked {
+                schedule_id: schedule_id.to_string(),
+                scheduled_for,
+                tick_id,
+                definition_version: "def_01HQ123".into(),
+                asset_selection: vec!["analytics.summary".into()],
+                partition_selection: None,
+                status,
+                run_key: run_key.map(ToString::to_string),
+                request_fingerprint: Some("fp_abc123".into()),
+            },
+        )
+    }
+
+    #[test]
+    fn test_fold_schedule_ticked_updates_state_and_creates_tick_row() {
+        let mut state = FoldState::new();
+        let scheduled_for = Utc::now();
+
+        let event = schedule_ticked_event(
+            "daily-etl",
+            scheduled_for,
+            TickStatus::Triggered,
+            Some("sched:daily-etl:1736935200"),
+        );
+
+        state.fold_event(&event);
+
+        // Should update schedule_state
+        let schedule_state = state.schedule_state.get("daily-etl").unwrap();
+        assert!(schedule_state.last_scheduled_for.is_some());
+        assert_eq!(
+            schedule_state.last_run_key,
+            Some("sched:daily-etl:1736935200".into())
+        );
+
+        // Should create tick history row
+        let tick_id = format!("daily-etl:{}", scheduled_for.timestamp());
+        let tick = state.schedule_ticks.get(&tick_id).unwrap();
+        assert!(matches!(tick.status, TickStatus::Triggered));
+        assert_eq!(tick.schedule_id, "daily-etl");
+        assert_eq!(tick.run_key, Some("sched:daily-etl:1736935200".to_string()));
+    }
+
+    /// NOTE: Per P0-1, fold does NOT emit events. Controllers emit all events atomically.
+    /// This test verifies fold only updates projections.
+    #[test]
+    fn test_fold_schedule_ticked_is_pure_projection() {
+        let mut state = FoldState::new();
+
+        let event = schedule_ticked_event(
+            "daily-etl",
+            Utc::now(),
+            TickStatus::Triggered,
+            Some("sched:daily-etl:1736935200"),
+        );
+
+        // fold_event returns nothing (pure projection)
+        state.fold_event(&event);
+
+        // Verify projections updated
+        assert!(state.schedule_state.contains_key("daily-etl"));
+        // RunRequested should come from controller, not fold - no runs should be created
+        assert!(state.runs.is_empty());
+    }
+
+    #[test]
+    fn test_fold_schedule_ticked_idempotent_with_same_tick_id() {
+        let mut state = FoldState::new();
+        let scheduled_for = Utc::now();
+
+        // First tick
+        let event1 = schedule_ticked_event(
+            "daily-etl",
+            scheduled_for,
+            TickStatus::Triggered,
+            Some("sched:daily-etl:run1"),
+        );
+        state.fold_event(&event1);
+
+        let tick_id = format!("daily-etl:{}", scheduled_for.timestamp());
+        let first_version = state.schedule_ticks.get(&tick_id).unwrap().row_version.clone();
+
+        // Duplicate event with older event_id (simulating replay)
+        // Create event with older ULID
+        let mut event2 = schedule_ticked_event(
+            "daily-etl",
+            scheduled_for,
+            TickStatus::Triggered,
+            Some("sched:daily-etl:run1"),
+        );
+        // Manually set to older event_id - normally events are newer, but this simulates duplicate
+        // The fold logic should ignore events with equal or older event_id
+        event2.event_id = String::new(); // Empty string is "older" than any ULID
+
+        state.fold_event(&event2);
+
+        // Version should NOT change (duplicate was ignored)
+        assert_eq!(
+            state.schedule_ticks.get(&tick_id).unwrap().row_version,
+            first_version
+        );
+    }
+
+    #[test]
+    fn test_fold_schedule_ticked_failed_status_has_no_run_key() {
+        let mut state = FoldState::new();
+
+        let event = schedule_ticked_event(
+            "daily-etl",
+            Utc::now(),
+            TickStatus::Failed {
+                error: "invalid cron".into(),
+            },
+            None, // Failed ticks have no run_key
+        );
+
+        state.fold_event(&event);
+
+        let schedule_state = state.schedule_state.get("daily-etl").unwrap();
+        assert!(schedule_state.last_scheduled_for.is_some());
+        assert!(schedule_state.last_run_key.is_none());
+
+        // Tick row should show failed status
+        let tick = state.schedule_ticks.values().next().unwrap();
+        assert!(matches!(tick.status, TickStatus::Failed { .. }));
+        assert!(tick.run_key.is_none());
+    }
+
+    #[test]
+    fn test_fold_schedule_ticked_updates_existing_state() {
+        let mut state = FoldState::new();
+
+        // First tick
+        let event1 = schedule_ticked_event(
+            "daily-etl",
+            Utc::now() - chrono::Duration::hours(1),
+            TickStatus::Triggered,
+            Some("run1"),
+        );
+        state.fold_event(&event1);
+
+        // Second tick (newer)
+        let event2 = schedule_ticked_event(
+            "daily-etl",
+            Utc::now(),
+            TickStatus::Triggered,
+            Some("run2"),
+        );
+        state.fold_event(&event2);
+
+        // State should reflect the latest tick
+        let schedule_state = state.schedule_state.get("daily-etl").unwrap();
+        assert_eq!(schedule_state.last_run_key, Some("run2".into()));
+
+        // Both ticks should be in history
+        assert_eq!(state.schedule_ticks.len(), 2);
     }
 }

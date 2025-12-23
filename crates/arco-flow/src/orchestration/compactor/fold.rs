@@ -17,8 +17,8 @@ use std::collections::{HashMap, VecDeque};
 use chrono::{DateTime, Utc};
 
 use crate::orchestration::events::{
-    OrchestrationEvent, OrchestrationEventData, TaskDef, TaskOutcome,
-    TimerType as EventTimerType,
+    BackfillState, ChunkState, OrchestrationEvent, OrchestrationEventData, PartitionSelector,
+    SensorStatus, TaskDef, TaskOutcome, TickStatus, TimerType as EventTimerType,
 };
 
 /// Task state machine states.
@@ -443,6 +443,390 @@ impl RunState {
     }
 }
 
+// ============================================================================
+// Layer 2: Schedule Schemas
+// ============================================================================
+
+/// Schedule definition (configuration, not state).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleDefinitionRow {
+    /// Tenant identifier.
+    pub tenant_id: String,
+    /// Workspace identifier.
+    pub workspace_id: String,
+    /// Schedule identifier (ULID).
+    pub schedule_id: String,
+    /// Cron expression (e.g., "0 10 * * *").
+    pub cron_expression: String,
+    /// IANA timezone (e.g., "UTC", "America/New_York").
+    pub timezone: String,
+    /// Maximum minutes to look back for missed ticks.
+    pub catchup_window_minutes: u32,
+    /// Assets to materialize when schedule fires.
+    pub asset_selection: Vec<String>,
+    /// Maximum catch-up ticks to emit.
+    pub max_catchup_ticks: u32,
+    /// Whether the schedule is enabled.
+    pub enabled: bool,
+    /// When the schedule was created.
+    pub created_at: DateTime<Utc>,
+    /// ULID of last event that modified this row.
+    pub row_version: String,
+}
+
+impl ScheduleDefinitionRow {
+    /// Returns the primary key tuple.
+    #[must_use]
+    pub fn primary_key(&self) -> (&str, &str, &str) {
+        (&self.tenant_id, &self.workspace_id, &self.schedule_id)
+    }
+}
+
+/// Schedule runtime state (separate from definition).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleStateRow {
+    /// Tenant identifier.
+    pub tenant_id: String,
+    /// Workspace identifier.
+    pub workspace_id: String,
+    /// Schedule identifier.
+    pub schedule_id: String,
+    /// Last scheduled_for timestamp that was processed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_scheduled_for: Option<DateTime<Utc>>,
+    /// Last tick ID that was processed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tick_id: Option<String>,
+    /// Last run key generated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_key: Option<String>,
+    /// ULID of last event that modified this row.
+    pub row_version: String,
+}
+
+impl ScheduleStateRow {
+    /// Returns the primary key tuple.
+    #[must_use]
+    pub fn primary_key(&self) -> (&str, &str, &str) {
+        (&self.tenant_id, &self.workspace_id, &self.schedule_id)
+    }
+}
+
+/// Schedule tick history (one row per tick).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleTickRow {
+    /// Tenant identifier.
+    pub tenant_id: String,
+    /// Workspace identifier.
+    pub workspace_id: String,
+    /// Unique tick ID: `{schedule_id}:{scheduled_for_epoch}`.
+    pub tick_id: String,
+    /// Schedule identifier.
+    pub schedule_id: String,
+    /// When this tick was scheduled for.
+    pub scheduled_for: DateTime<Utc>,
+    /// Definition version used for this tick.
+    pub definition_version: String,
+    /// Snapshot of asset selection at tick time.
+    pub asset_selection: Vec<String>,
+    /// Optional partition selection snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition_selection: Option<Vec<String>>,
+    /// Tick evaluation status.
+    pub status: TickStatus,
+    /// Run key if a run was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Run ID (correlated from RunRequested during fold).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Request fingerprint for conflict detection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_fingerprint: Option<String>,
+    /// ULID of last event that modified this row.
+    pub row_version: String,
+}
+
+impl ScheduleTickRow {
+    /// Returns the primary key tuple.
+    #[must_use]
+    pub fn primary_key(&self) -> (&str, &str, &str) {
+        (&self.tenant_id, &self.workspace_id, &self.tick_id)
+    }
+}
+
+// ============================================================================
+// Layer 2: Sensor Schemas
+// ============================================================================
+
+/// Sensor runtime state (universal for push + poll).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SensorStateRow {
+    /// Tenant identifier.
+    pub tenant_id: String,
+    /// Workspace identifier.
+    pub workspace_id: String,
+    /// Sensor identifier (ULID).
+    pub sensor_id: String,
+    /// Current cursor value (poll sensors).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Last evaluation timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_evaluation_at: Option<DateTime<Utc>>,
+    /// Last evaluation ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_eval_id: Option<String>,
+    /// Sensor status (ACTIVE/PAUSED/ERROR).
+    pub status: SensorStatus,
+    /// State version for CAS (poll sensors).
+    pub state_version: u32,
+    /// ULID of last event that modified this row.
+    pub row_version: String,
+}
+
+impl SensorStateRow {
+    /// Returns the primary key tuple.
+    #[must_use]
+    pub fn primary_key(&self) -> (&str, &str, &str) {
+        (&self.tenant_id, &self.workspace_id, &self.sensor_id)
+    }
+}
+
+// ============================================================================
+// Layer 2: Backfill Schemas
+// ============================================================================
+
+/// Backfill entity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackfillRow {
+    /// Tenant identifier.
+    pub tenant_id: String,
+    /// Workspace identifier.
+    pub workspace_id: String,
+    /// Backfill identifier (ULID).
+    pub backfill_id: String,
+    /// Assets to backfill.
+    pub asset_selection: Vec<String>,
+    /// Partition selector (compact, per P0-6).
+    pub partition_selector: PartitionSelector,
+    /// Number of partitions per chunk.
+    pub chunk_size: u32,
+    /// Maximum concurrent chunk runs.
+    pub max_concurrent_runs: u32,
+    /// Current state.
+    pub state: BackfillState,
+    /// State version (monotonic).
+    pub state_version: u32,
+    /// Total partition count.
+    pub total_partitions: u32,
+    /// Chunks that have been planned.
+    pub planned_chunks: u32,
+    /// Chunks that completed successfully.
+    pub completed_chunks: u32,
+    /// Chunks that failed.
+    pub failed_chunks: u32,
+    /// Parent backfill ID (for retry-failed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_backfill_id: Option<String>,
+    /// When the backfill was created.
+    pub created_at: DateTime<Utc>,
+    /// ULID of last event that modified this row.
+    pub row_version: String,
+}
+
+impl BackfillRow {
+    /// Returns the primary key tuple.
+    #[must_use]
+    pub fn primary_key(&self) -> (&str, &str, &str) {
+        (&self.tenant_id, &self.workspace_id, &self.backfill_id)
+    }
+}
+
+/// Backfill chunk tracking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackfillChunkRow {
+    /// Tenant identifier.
+    pub tenant_id: String,
+    /// Workspace identifier.
+    pub workspace_id: String,
+    /// Chunk ID: `{backfill_id}:{chunk_index}`.
+    pub chunk_id: String,
+    /// Backfill identifier.
+    pub backfill_id: String,
+    /// Zero-indexed chunk number.
+    pub chunk_index: u32,
+    /// Partition keys in this chunk.
+    pub partition_keys: Vec<String>,
+    /// Run key for this chunk.
+    pub run_key: String,
+    /// Run ID (filled when run resolves).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Chunk state.
+    pub state: ChunkState,
+    /// ULID of last event that modified this row.
+    pub row_version: String,
+}
+
+impl BackfillChunkRow {
+    /// Returns the primary key tuple.
+    #[must_use]
+    pub fn primary_key(&self) -> (&str, &str, &str) {
+        (&self.tenant_id, &self.workspace_id, &self.chunk_id)
+    }
+}
+
+// ============================================================================
+// Layer 2: Partition Status Schemas (per ADR-026)
+// ============================================================================
+
+/// Partition materialization status.
+///
+/// Computed display status that separates execution from data freshness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PartitionMaterializationStatus {
+    /// Partition has never been materialized.
+    NeverMaterialized,
+    /// Partition is materialized and fresh.
+    Materialized,
+    /// Partition is materialized but stale.
+    Stale,
+    /// Partition is materialized but the last attempt failed.
+    MaterializedButLastAttemptFailed,
+}
+
+impl PartitionMaterializationStatus {
+    /// Returns true if the partition has ever been successfully materialized.
+    #[must_use]
+    pub const fn is_materialized(self) -> bool {
+        !matches!(self, Self::NeverMaterialized)
+    }
+}
+
+/// Partition status tracking (per ADR-026).
+///
+/// Separates data freshness (materialization) from execution status (attempts).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionStatusRow {
+    /// Tenant identifier.
+    pub tenant_id: String,
+    /// Workspace identifier.
+    pub workspace_id: String,
+    /// Asset key.
+    pub asset_key: String,
+    /// Partition key.
+    pub partition_key: String,
+    /// Display status (computed).
+    pub status: PartitionMaterializationStatus,
+    /// Run that last materialized (success only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_materialization_run_id: Option<String>,
+    /// When last materialized (success only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_materialization_at: Option<DateTime<Utc>>,
+    /// Code version used (success only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_materialization_code_version: Option<String>,
+    /// Most recent attempt run (any outcome).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_attempt_run_id: Option<String>,
+    /// When last attempted (any outcome).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    /// Last attempt outcome (SUCCEEDED/FAILED/CANCELLED).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_attempt_outcome: Option<String>,
+    /// When partition became stale (nullable; derived or precomputed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_since: Option<DateTime<Utc>>,
+    /// Stale reason code (FRESHNESS_POLICY/UPSTREAM_CHANGED/CODE_CHANGED).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_reason_code: Option<String>,
+    /// Dimension key-values for the partition.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub partition_values: HashMap<String, String>,
+    /// ULID of last event that modified this row.
+    pub row_version: String,
+}
+
+impl PartitionStatusRow {
+    /// Returns the primary key tuple.
+    #[must_use]
+    pub fn primary_key(&self) -> (&str, &str, &str, &str) {
+        (
+            &self.tenant_id,
+            &self.workspace_id,
+            &self.asset_key,
+            &self.partition_key,
+        )
+    }
+}
+
+// ============================================================================
+// Layer 2: Run Key Index Schemas
+// ============================================================================
+
+/// Run key index for deduplication and conflict detection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunKeyIndexRow {
+    /// Tenant identifier.
+    pub tenant_id: String,
+    /// Workspace identifier.
+    pub workspace_id: String,
+    /// Stable run key (e.g., "sched:daily-etl:1736935200").
+    pub run_key: String,
+    /// Computed run ID.
+    pub run_id: String,
+    /// Request fingerprint for conflict detection.
+    pub request_fingerprint: String,
+    /// When the run was created.
+    pub created_at: DateTime<Utc>,
+    /// ULID of last event that modified this row.
+    pub row_version: String,
+}
+
+impl RunKeyIndexRow {
+    /// Returns the primary key tuple.
+    #[must_use]
+    pub fn primary_key(&self) -> (&str, &str, &str) {
+        (&self.tenant_id, &self.workspace_id, &self.run_key)
+    }
+}
+
+/// Run key conflict (when same run_key has different fingerprint).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunKeyConflictRow {
+    /// Tenant identifier.
+    pub tenant_id: String,
+    /// Workspace identifier.
+    pub workspace_id: String,
+    /// Run key that had a conflict.
+    pub run_key: String,
+    /// Fingerprint of the existing run.
+    pub existing_fingerprint: String,
+    /// Fingerprint that conflicted.
+    pub conflicting_fingerprint: String,
+    /// Event ID that caused the conflict.
+    pub conflicting_event_id: String,
+    /// When the conflict was detected.
+    pub detected_at: DateTime<Utc>,
+}
+
+impl RunKeyConflictRow {
+    /// Returns the primary key tuple.
+    #[must_use]
+    pub fn primary_key(&self) -> (&str, &str, &str, &str) {
+        (
+            &self.tenant_id,
+            &self.workspace_id,
+            &self.run_key,
+            &self.conflicting_event_id,
+        )
+    }
+}
+
 /// Fold state accumulator.
 ///
 /// Holds the current state being built from events.
@@ -656,30 +1040,18 @@ impl FoldState {
             }
 
             // Layer 2 automation events - stubs for now, implemented in Task 2.2+
-            OrchestrationEventData::ScheduleTicked { .. } => {
-                // TODO(Task 2.2): Implement fold_schedule_ticked
-                // Updates schedule_state and schedule_ticks projections
-            }
-            OrchestrationEventData::SensorEvaluated { .. } => {
-                // TODO(Task 3.3): Implement fold_sensor_evaluated
-                // Updates sensor_state projection, enforces CAS for poll sensors
-            }
-            OrchestrationEventData::RunRequested { .. } => {
-                // TODO(Task 6.1): Implement fold_run_requested
-                // Computes run_id from run_key, creates run projection
-                // Handles conflict detection via fingerprint comparison
-            }
-            OrchestrationEventData::BackfillCreated { .. } => {
-                // TODO(Task 4.2): Implement fold_backfill_created
-                // Creates backfill row in backfills projection
-            }
-            OrchestrationEventData::BackfillChunkPlanned { .. } => {
-                // TODO(Task 4.3): Implement fold_backfill_chunk_planned
-                // Creates chunk row, updates backfill progress
-            }
-            OrchestrationEventData::BackfillStateChanged { .. } => {
-                // TODO(Task 4.4): Implement fold_backfill_state_changed
-                // Updates backfill state with version check
+            OrchestrationEventData::ScheduleTicked { .. }
+            | OrchestrationEventData::SensorEvaluated { .. }
+            | OrchestrationEventData::RunRequested { .. }
+            | OrchestrationEventData::BackfillCreated { .. }
+            | OrchestrationEventData::BackfillChunkPlanned { .. }
+            | OrchestrationEventData::BackfillStateChanged { .. } => {
+                // TODO(Task 2.2): Implement fold_schedule_ticked (schedule_state + ticks).
+                // TODO(Task 3.3): Implement fold_sensor_evaluated (sensor_state + CAS).
+                // TODO(Task 6.1): Implement fold_run_requested (run_id + projection).
+                // TODO(Task 4.2): Implement fold_backfill_created (backfills projection).
+                // TODO(Task 4.3): Implement fold_backfill_chunk_planned (chunks + progress).
+                // TODO(Task 4.4): Implement fold_backfill_state_changed (versioned updates).
             }
         }
     }

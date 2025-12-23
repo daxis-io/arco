@@ -419,10 +419,7 @@ impl Tier1Writer {
                     Ok(bytes) => {
                         let record: CommitRecord = serde_json::from_slice(&bytes).map_err(|e| {
                             CatalogError::Serialization {
-                                message: format!(
-                                    "deserialize commit record '{}': {e}",
-                                    path
-                                ),
+                                message: format!("deserialize commit record '{path}': {e}"),
                             }
                         })?;
                         Some(record.compute_hash())

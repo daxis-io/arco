@@ -89,27 +89,27 @@ impl From<Tier1CompactionError> for CatalogError {
     fn from(value: Tier1CompactionError) -> Self {
         match value {
             Tier1CompactionError::StaleFencingToken { expected, provided } => {
-                CatalogError::PreconditionFailed {
+                Self::PreconditionFailed {
                     message: format!(
                         "stale fencing token: expected {expected}, got {provided}"
                     ),
                 }
             }
-            Tier1CompactionError::UnsupportedDomain { domain } => CatalogError::Validation {
+            Tier1CompactionError::UnsupportedDomain { domain } => Self::Validation {
                 message: format!("unsupported domain for sync compaction: {domain}"),
             },
             Tier1CompactionError::NotImplemented { domain, message } => {
-                CatalogError::InvariantViolation {
+                Self::InvariantViolation {
                     message: format!("sync compaction not implemented for {domain}: {message}"),
                 }
             }
-            Tier1CompactionError::EventReadError { path, message } => CatalogError::Storage {
+            Tier1CompactionError::EventReadError { path, message } => Self::Storage {
                 message: format!("failed to read event '{path}': {message}"),
             },
             Tier1CompactionError::ProcessingError { message } => {
-                CatalogError::InvariantViolation { message }
+                Self::InvariantViolation { message }
             }
-            Tier1CompactionError::PublishFailed { message } => CatalogError::CasFailed { message },
+            Tier1CompactionError::PublishFailed { message } => Self::CasFailed { message },
         }
     }
 }
@@ -131,6 +131,11 @@ impl Tier1Compactor {
     }
 
     /// Handles a synchronous compaction request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation fails, any event cannot be read, or
+    /// manifest publishing fails.
     pub async fn sync_compact(
         &self,
         domain: &str,
@@ -451,10 +456,13 @@ fn validate_event_paths(
     for path in event_paths {
         if !path.starts_with(&prefix) {
             return Err(Tier1CompactionError::ProcessingError {
-                message: format!("event path '{path}' is outside {}", prefix),
+                message: format!("event path '{path}' is outside {prefix}"),
             });
         }
-        if !path.ends_with(".json") {
+        if !std::path::Path::new(&path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
             return Err(Tier1CompactionError::ProcessingError {
                 message: format!("event path '{path}' must end with .json"),
             });
@@ -537,7 +545,11 @@ async fn read_lineage_event(
     Ok(envelope.payload)
 }
 
-fn apply_catalog_event(state: &mut crate::state::CatalogState, event: CatalogDdlEvent) -> Result<(), Tier1CompactionError> {
+#[allow(clippy::too_many_lines)]
+fn apply_catalog_event(
+    state: &mut crate::state::CatalogState,
+    event: CatalogDdlEvent,
+) -> Result<(), Tier1CompactionError> {
     match event {
         CatalogDdlEvent::NamespaceCreated { namespace } => {
             if let Some(existing) = state.namespaces.iter().find(|ns| ns.id == namespace.id) {
@@ -574,13 +586,12 @@ fn apply_catalog_event(state: &mut crate::state::CatalogState, event: CatalogDdl
                 return Ok(());
             };
 
-            let existing = &state.namespaces[index];
+            let Some(existing) = state.namespaces.get(index) else {
+                return Ok(());
+            };
             if existing.name != namespace_name {
                 return Err(Tier1CompactionError::ProcessingError {
-                    message: format!(
-                        "namespace name mismatch for {}",
-                        namespace_id
-                    ),
+                    message: format!("namespace name mismatch for {namespace_id}"),
                 });
             }
             if state
@@ -589,10 +600,7 @@ fn apply_catalog_event(state: &mut crate::state::CatalogState, event: CatalogDdl
                 .any(|table| table.namespace_id == namespace_id)
             {
                 return Err(Tier1CompactionError::ProcessingError {
-                    message: format!(
-                        "namespace '{}' contains tables",
-                        namespace_name
-                    ),
+                    message: format!("namespace '{namespace_name}' contains tables"),
                 });
             }
             state.namespaces.remove(index);
@@ -681,10 +689,12 @@ fn apply_catalog_event(state: &mut crate::state::CatalogState, event: CatalogDdl
             let Some(index) = index else {
                 return Ok(());
             };
-            let existing = &state.tables[index];
+            let Some(existing) = state.tables.get(index) else {
+                return Ok(());
+            };
             if existing.namespace_id != namespace_id || existing.name != table_name {
                 return Err(Tier1CompactionError::ProcessingError {
-                    message: format!("table identity mismatch for {}", table_id),
+                    message: format!("table identity mismatch for {table_id}"),
                 });
             }
             state.tables.remove(index);
@@ -695,6 +705,7 @@ fn apply_catalog_event(state: &mut crate::state::CatalogState, event: CatalogDdl
     Ok(())
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn apply_lineage_event(
     state: &mut crate::state::LineageState,
     event: LineageDdlEvent,

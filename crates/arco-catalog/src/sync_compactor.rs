@@ -17,7 +17,7 @@ pub trait SyncCompactor: Send + Sync {
 #[async_trait]
 impl SyncCompactor for Tier1Compactor {
     async fn sync_compact(&self, request: SyncCompactRequest) -> Result<SyncCompactResponse> {
-        let result = Tier1Compactor::sync_compact(
+        let result = Self::sync_compact(
             self,
             &request.domain,
             request.event_paths,

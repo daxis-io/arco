@@ -7,7 +7,14 @@ use crate::parquet_util;
 use crate::state::{CatalogState, LineageState};
 
 /// Loads catalog state from the current snapshot path.
-pub async fn load_catalog_state(storage: &ScopedStorage, snapshot_path: &str) -> Result<CatalogState> {
+///
+/// # Errors
+///
+/// Returns an error if Parquet decoding fails.
+pub async fn load_catalog_state(
+    storage: &ScopedStorage,
+    snapshot_path: &str,
+) -> Result<CatalogState> {
     if snapshot_path.is_empty() || snapshot_path.contains("/v0/") {
         return Ok(CatalogState::empty());
     }
@@ -50,7 +57,14 @@ pub async fn load_catalog_state(storage: &ScopedStorage, snapshot_path: &str) ->
 }
 
 /// Loads lineage state from the current snapshot path.
-pub async fn load_lineage_state(storage: &ScopedStorage, edges_path: &str) -> Result<LineageState> {
+///
+/// # Errors
+///
+/// Returns an error if Parquet decoding fails.
+pub async fn load_lineage_state(
+    storage: &ScopedStorage,
+    edges_path: &str,
+) -> Result<LineageState> {
     if edges_path.is_empty() || edges_path.contains("/v0/") {
         return Ok(LineageState::empty());
     }

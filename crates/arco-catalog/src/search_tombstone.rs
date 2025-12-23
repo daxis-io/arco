@@ -214,25 +214,29 @@ impl SearchTombstone {
     }
 
     /// Returns true if the tombstone is still valid (not expired).
+    #[must_use]
     pub fn is_valid(&self) -> bool {
         Utc::now() < self.expires_at
     }
 
     /// Returns true if the tombstone has expired.
+    #[must_use]
     pub fn is_expired(&self) -> bool {
         Utc::now() >= self.expires_at
     }
 
     /// Returns the new asset key if this is a rename.
+    #[must_use]
     pub fn new_key(&self) -> Option<&str> {
         match &self.reason {
-            TombstoneReason::Renamed { new_key } => Some(new_key),
-            TombstoneReason::Moved { new_key, .. } => Some(new_key),
+            TombstoneReason::Moved { new_key, .. }
+            | TombstoneReason::Renamed { new_key } => Some(new_key),
             _ => None,
         }
     }
 
     /// Returns the new namespace if this is a move.
+    #[must_use]
     pub fn new_namespace(&self) -> Option<&str> {
         match &self.reason {
             TombstoneReason::Moved { new_namespace, .. } => Some(new_namespace),
@@ -241,6 +245,7 @@ impl SearchTombstone {
     }
 
     /// Returns true if the asset should be re-indexed (rename/move).
+    #[must_use]
     pub fn requires_reindex(&self) -> bool {
         matches!(
             self.reason,
@@ -277,11 +282,13 @@ impl TombstoneBatch {
     }
 
     /// Returns the number of tombstones in the batch.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.tombstones.len()
     }
 
     /// Returns true if the batch is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tombstones.is_empty()
     }

@@ -254,8 +254,7 @@ impl CatalogDomainManifest {
         if let Some(ref parent_hash) = self.parent_hash {
             if parent_hash != previous_raw_hash {
                 return Err(format!(
-                    "parent hash mismatch: expected {}, got {} (concurrent modification detected)",
-                    previous_raw_hash, parent_hash
+                    "parent hash mismatch: expected {previous_raw_hash}, got {parent_hash} (concurrent modification detected)"
                 ));
             }
         }
@@ -263,8 +262,7 @@ impl CatalogDomainManifest {
         if let (Some(prev), Some(next)) = (previous.fencing_token, self.fencing_token) {
             if next < prev {
                 return Err(format!(
-                    "fencing token regression: {} -> {} (stale holder)",
-                    prev, next
+                    "fencing token regression: {prev} -> {next} (stale holder)"
                 ));
             }
         }
@@ -275,8 +273,7 @@ impl CatalogDomainManifest {
         ) {
             if next <= prev {
                 return Err(format!(
-                    "commit ulid regression: {} -> {} (non-monotonic)",
-                    prev, next
+                    "commit ulid regression: {prev} -> {next} (non-monotonic)"
                 ));
             }
         }
@@ -583,8 +580,7 @@ impl LineageManifest {
         if let Some(ref parent_hash) = self.parent_hash {
             if parent_hash != previous_raw_hash {
                 return Err(format!(
-                    "parent hash mismatch: expected {}, got {} (concurrent modification detected)",
-                    previous_raw_hash, parent_hash
+                    "parent hash mismatch: expected {previous_raw_hash}, got {parent_hash} (concurrent modification detected)"
                 ));
             }
         }
@@ -592,8 +588,7 @@ impl LineageManifest {
         if let (Some(prev), Some(next)) = (previous.fencing_token, self.fencing_token) {
             if next < prev {
                 return Err(format!(
-                    "fencing token regression: {} -> {} (stale holder)",
-                    prev, next
+                    "fencing token regression: {prev} -> {next} (stale holder)"
                 ));
             }
         }
@@ -604,8 +599,7 @@ impl LineageManifest {
         ) {
             if next <= prev {
                 return Err(format!(
-                    "commit ulid regression: {} -> {} (non-monotonic)",
-                    prev, next
+                    "commit ulid regression: {prev} -> {next} (non-monotonic)"
                 ));
             }
         }

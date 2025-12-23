@@ -14,6 +14,10 @@ use crate::parquet_util;
 use crate::state::{CatalogState, LineageState};
 
 /// Writes a catalog snapshot (namespaces/tables/columns) to storage.
+///
+/// # Errors
+///
+/// Returns an error if Parquet serialization or storage writes fail.
 pub async fn write_catalog_snapshot<S: StatePutStore + ?Sized>(
     storage: &S,
     version: u64,
@@ -60,6 +64,10 @@ pub async fn write_catalog_snapshot<S: StatePutStore + ?Sized>(
 }
 
 /// Writes a lineage snapshot (edges) to storage.
+///
+/// # Errors
+///
+/// Returns an error if Parquet serialization or storage writes fail.
 pub async fn write_lineage_snapshot<S: StatePutStore + ?Sized>(
     storage: &S,
     version: u64,

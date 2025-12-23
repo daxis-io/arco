@@ -40,7 +40,7 @@ pub struct NotificationConsumerConfig {
     /// Maximum time to wait for batch accumulation.
     pub batch_timeout: Duration,
 
-    /// Domains to process (e.g., ["catalog", "lineage", "executions"]).
+    /// Domains to process (e.g., `["catalog", "lineage", "executions"]`).
     pub domains: Vec<String>,
 }
 
@@ -153,11 +153,16 @@ impl EventNotification {
         }
 
         // Extract and validate domain
-        let domain = parts[1].to_string();
+        let domain = (*parts
+            .get(1)
+            .ok_or_else(|| NotificationParseError::InvalidPathFormat { path: path.clone() })?)
+            .to_string();
         if domain.is_empty() {
             return Err(NotificationParseError::InvalidPathFormat { path });
         }
-        let filename = parts[2];
+        let filename = parts
+            .get(2)
+            .ok_or_else(|| NotificationParseError::InvalidPathFormat { path: path.clone() })?;
 
         // Extract event ID (strip .json extension)
         let event_id = filename.strip_suffix(".json").ok_or_else(|| {
@@ -226,12 +231,12 @@ impl EventBatch {
 
     /// Returns domains with events in this batch.
     pub fn domains(&self) -> impl Iterator<Item = &str> {
-        self.events_by_domain.keys().map(|s| s.as_str())
+        self.events_by_domain.keys().map(String::as_str)
     }
 
     /// Returns events for a specific domain.
     pub fn events_for_domain(&self, domain: &str) -> Option<&[EventNotification]> {
-        self.events_by_domain.get(domain).map(|v| v.as_slice())
+        self.events_by_domain.get(domain).map(Vec::as_slice)
     }
 
     /// Drains all events for a domain (consumes them).
@@ -251,7 +256,8 @@ impl EventBatch {
     pub fn age(&self) -> Option<Duration> {
         self.first_event_at.map(|t| {
             let elapsed = chrono::Utc::now() - t;
-            Duration::from_millis(elapsed.num_milliseconds().max(0) as u64)
+            let millis = elapsed.num_milliseconds().max(0);
+            Duration::from_millis(u64::try_from(millis).unwrap_or(0))
         })
     }
 }
@@ -372,7 +378,7 @@ impl<S: Send + Sync> NotificationConsumer<S> {
     pub fn pending_for_domain(&self, domain: &str) -> usize {
         self.current_batch
             .events_for_domain(domain)
-            .map_or(0, |e| e.len())
+            .map_or(0, <[EventNotification]>::len)
     }
 
     /// Processes a batch of events for a single domain.
@@ -417,7 +423,7 @@ impl<S: Send + Sync> NotificationConsumer<S> {
     /// Events are processed domain by domain. Each domain's events are
     /// processed together to minimize manifest updates.
     pub async fn flush(&mut self) -> Result<BatchProcessingResult, NotificationConsumerError> {
-        let domains: Vec<String> = self.current_batch.domains().map(|s| s.to_string()).collect();
+        let domains: Vec<String> = self.current_batch.domains().map(ToString::to_string).collect();
 
         let mut total_events = 0;
         let mut domain_results = HashMap::new();

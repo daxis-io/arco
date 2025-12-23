@@ -288,7 +288,7 @@ impl<S: Send + Sync> AntiEntropyJob<S> {
     ///
     /// - `event_path`: Path to the event file
     /// - `watermark_position`: Current compaction watermark from manifest
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, dead_code)]
     async fn is_missed(
         &self,
         _event_path: &str,
@@ -306,10 +306,10 @@ impl<S: Send + Sync> AntiEntropyJob<S> {
     ///
     /// Missed events are sent to the notification consumer for processing.
     /// This could be via:
-    /// - Direct call to NotificationConsumer
+    /// - Direct call to `NotificationConsumer`
     /// - Publishing to a reprocessing queue
     /// - Writing to a "reprocess" ledger
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, dead_code)]
     async fn enqueue_for_reprocessing(
         &self,
         paths: &[String],

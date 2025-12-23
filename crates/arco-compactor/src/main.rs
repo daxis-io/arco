@@ -370,17 +370,14 @@ async fn anti_entropy_handler(
         );
     }
 
-    let compaction_guard = match state.compactor.compaction_lock.try_lock() {
-        Ok(guard) => guard,
-        Err(_) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "busy",
-                    "message": "Compaction or anti-entropy is already in progress"
-                })),
-            );
-        }
+    let Ok(compaction_guard) = state.compactor.compaction_lock.try_lock() else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "busy",
+                "message": "Compaction or anti-entropy is already in progress"
+            })),
+        );
     };
 
     if state
@@ -602,6 +599,7 @@ async fn run_compaction_cycle() -> Result<()> {
 // ============================================================================
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
@@ -717,14 +715,14 @@ async fn main() -> Result<()> {
         }
 
         Commands::AntiEntropy {
-            domain,
+            ref domain,
             max_objects_per_run,
         } => {
             let scoped = ScopedConfig::from_args(&args)?;
             let scoped_storage = scoped.scoped_storage()?;
 
             let config = anti_entropy::AntiEntropyConfig {
-                domain,
+                domain: domain.clone(),
                 tenant_id: scoped.tenant_id,
                 workspace_id: scoped.workspace_id,
                 max_objects_per_run,

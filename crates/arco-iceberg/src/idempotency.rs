@@ -10,6 +10,43 @@ use uuid::Uuid;
 
 use crate::error::IcebergErrorResponse;
 
+/// Computes SHA256 hash of RFC 8785 JCS canonical JSON.
+///
+/// This produces a deterministic hash of a JSON value regardless of key order.
+/// Keys are sorted recursively before hashing.
+#[must_use]
+pub fn canonical_request_hash(value: &serde_json::Value) -> String {
+    let canonical = canonicalize_json(value);
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Canonicalizes a JSON value per RFC 8785 JCS.
+///
+/// - Objects: keys sorted lexicographically
+/// - No extra whitespace
+/// - Numbers in shortest form
+fn canonicalize_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted: Vec<_> = map.iter().collect();
+            sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
+            let entries: Vec<String> = sorted
+                .into_iter()
+                .map(|(k, v)| format!("{}:{}", serde_json::to_string(k).unwrap_or_default(), canonicalize_json(v)))
+                .collect();
+            format!("{{{}}}", entries.join(","))
+        }
+        serde_json::Value::Array(arr) => {
+            let elements: Vec<String> = arr.iter().map(canonicalize_json).collect();
+            format!("[{}]", elements.join(","))
+        }
+        // Primitives serialize normally
+        _ => serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
 /// Error validating an idempotency key.
 #[derive(Debug, thiserror::Error)]
 pub enum IdempotencyKeyError {
@@ -319,5 +356,31 @@ mod tests {
     fn test_validate_uuidv7_invalid_format() {
         let key = "not-a-uuid";
         assert!(IdempotencyMarker::validate_uuidv7(key).is_err());
+    }
+
+    #[test]
+    fn test_canonical_hash_deterministic() {
+        let request1 = serde_json::json!({
+            "requirements": [],
+            "updates": [{"action": "add-snapshot"}]
+        });
+        let request2 = serde_json::json!({
+            "updates": [{"action": "add-snapshot"}],
+            "requirements": []
+        });
+        // Same content with different key order should produce same hash
+        let hash1 = canonical_request_hash(&request1);
+        let hash2 = canonical_request_hash(&request2);
+        assert_eq!(hash1, hash2);
+        assert_eq!(hash1.len(), 64); // SHA256 hex is 64 chars
+    }
+
+    #[test]
+    fn test_canonical_hash_different_content() {
+        let request1 = serde_json::json!({"a": 1});
+        let request2 = serde_json::json!({"a": 2});
+        let hash1 = canonical_request_hash(&request1);
+        let hash2 = canonical_request_hash(&request2);
+        assert_ne!(hash1, hash2);
     }
 }

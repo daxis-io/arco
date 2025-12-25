@@ -326,6 +326,7 @@ dependencies = [
  "futures",
  "gcp_auth",
  "hex",
+ "hmac",
  "humantime-serde",
  "metrics",
  "parquet 54.3.1",

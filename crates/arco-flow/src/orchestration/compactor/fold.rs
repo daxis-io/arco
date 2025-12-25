@@ -8,7 +8,7 @@
 //! - `dispatch_outbox`: Pending dispatch intents
 //!
 //! Key invariants:
-//! - Events are processed exactly once (idempotency via `row_version`)
+//! - Events are processed exactly once (idempotency key index + `row_version`)
 //! - State transitions are monotonic (can't go backward)
 //! - Duplicate events are no-ops
 
@@ -21,7 +21,7 @@ use crate::metrics::{labels as metrics_labels, names as metrics_names};
 use crate::orchestration::events::{
     BackfillState, ChunkState, OrchestrationEvent, OrchestrationEventData, PartitionSelector,
     RunRequest, SensorEvalStatus, SensorStatus, SourceRef, TaskDef, TaskOutcome, TickStatus,
-    TriggerSource, TimerType as EventTimerType,
+    TimerType as EventTimerType, TriggerSource,
 };
 
 /// Task state machine states.
@@ -76,7 +76,10 @@ impl TaskState {
     /// Returns true if this is a terminal state.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Skipped | Self::Cancelled)
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Skipped | Self::Cancelled
+        )
     }
 }
 
@@ -233,7 +236,12 @@ impl TimerRow {
 
     /// Generates the internal timer ID for heartbeat check timers.
     #[must_use]
-    pub fn heartbeat_timer_id(run_id: &str, task_key: &str, attempt: u32, fire_epoch: i64) -> String {
+    pub fn heartbeat_timer_id(
+        run_id: &str,
+        task_key: &str,
+        attempt: u32,
+        fire_epoch: i64,
+    ) -> String {
         format!("timer:heartbeat:{run_id}:{task_key}:{attempt}:{fire_epoch}")
     }
 
@@ -601,7 +609,7 @@ impl SensorStateRow {
 /// This projection tracks all sensor evaluations including stale ones (CAS failures).
 /// Used for:
 /// - Debugging overlapping poll sensor issues
-/// - Correlating RunRequested events back to their source evaluation
+/// - Correlating `RunRequested` events back to their source evaluation
 /// - Observability into sensor evaluation patterns
 ///
 /// ## Persistence Strategy
@@ -882,6 +890,39 @@ impl RunKeyConflictRow {
     }
 }
 
+/// Idempotency key index row.
+///
+/// Tracks processed idempotency keys to drop duplicate events across compaction runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdempotencyKeyRow {
+    /// Tenant identifier.
+    pub tenant_id: String,
+    /// Workspace identifier.
+    pub workspace_id: String,
+    /// Idempotency key (unique).
+    pub idempotency_key: String,
+    /// Event identifier that claimed this idempotency key.
+    pub event_id: String,
+    /// Event type that produced this idempotency key.
+    pub event_type: String,
+    /// When the event was recorded.
+    pub recorded_at: DateTime<Utc>,
+    /// ULID of last event that modified this row.
+    pub row_version: String,
+}
+
+impl IdempotencyKeyRow {
+    /// Returns the primary key tuple.
+    #[must_use]
+    pub fn primary_key(&self) -> (&str, &str, &str) {
+        (
+            &self.tenant_id,
+            &self.workspace_id,
+            &self.idempotency_key,
+        )
+    }
+}
+
 /// Fold state accumulator.
 ///
 /// Holds the current state being built from events.
@@ -911,7 +952,6 @@ pub struct FoldState {
     // ========================================================================
     // Layer 2: Schedule/Sensor Automation
     // ========================================================================
-
     /// Schedule state rows keyed by `schedule_id`.
     pub schedule_state: HashMap<String, ScheduleStateRow>,
 
@@ -927,7 +967,6 @@ pub struct FoldState {
     // ========================================================================
     // Layer 2: Backfill
     // ========================================================================
-
     /// Backfill rows keyed by `backfill_id`.
     pub backfills: HashMap<String, BackfillRow>,
 
@@ -937,19 +976,23 @@ pub struct FoldState {
     // ========================================================================
     // Layer 2: Partition Status
     // ========================================================================
-
     /// Partition status rows keyed by (`asset_key`, `partition_key`).
     pub partition_status: HashMap<(String, String), PartitionStatusRow>,
 
     // ========================================================================
     // Layer 2: Run Key Index
     // ========================================================================
-
     /// Run key index keyed by `run_key`.
     pub run_key_index: HashMap<String, RunKeyIndexRow>,
 
     /// Run key conflicts keyed by `conflict_id`.
     pub run_key_conflicts: HashMap<String, RunKeyConflictRow>,
+
+    // ========================================================================
+    // Global Idempotency Index
+    // ========================================================================
+    /// Idempotency key index keyed by `idempotency_key`.
+    pub idempotency_keys: HashMap<String, IdempotencyKeyRow>,
 }
 
 impl FoldState {
@@ -974,7 +1017,10 @@ impl FoldState {
             let upstream_key = (edge.run_id.clone(), edge.upstream_task_key.clone());
             let downstream_key = (edge.run_id.clone(), edge.downstream_task_key.clone());
 
-            let deps = self.task_dependencies.entry(downstream_key.clone()).or_default();
+            let deps = self
+                .task_dependencies
+                .entry(downstream_key.clone())
+                .or_default();
             if !deps.contains(&edge.upstream_task_key) {
                 deps.push(edge.upstream_task_key.clone());
             }
@@ -989,8 +1035,23 @@ impl FoldState {
     /// Processes an orchestration event and updates state.
     #[allow(clippy::too_many_lines)]
     pub fn fold_event(&mut self, event: &OrchestrationEvent) {
+        if self
+            .idempotency_keys
+            .contains_key(event.idempotency_key.as_str())
+        {
+            return;
+        }
+
+        self.record_idempotency_key(event);
+
         match &event.data {
-            OrchestrationEventData::RunTriggered { run_id, plan_id, run_key, labels, .. } => {
+            OrchestrationEventData::RunTriggered {
+                run_id,
+                plan_id,
+                run_key,
+                labels,
+                ..
+            } => {
                 self.fold_run_triggered(
                     run_id,
                     plan_id,
@@ -1004,7 +1065,11 @@ impl FoldState {
                 self.fold_plan_created(run_id, tasks, &event.event_id, event.timestamp);
             }
             OrchestrationEventData::TaskStarted {
-                run_id, task_key, attempt, attempt_id, ..
+                run_id,
+                task_key,
+                attempt,
+                attempt_id,
+                ..
             } => {
                 self.fold_task_started(
                     run_id,
@@ -1025,7 +1090,14 @@ impl FoldState {
             } => {
                 // heartbeat_at is optional; use event timestamp as fallback
                 let ts = heartbeat_at.unwrap_or(event.timestamp);
-                self.fold_task_heartbeat(run_id, task_key, *attempt, attempt_id, ts, &event.event_id);
+                self.fold_task_heartbeat(
+                    run_id,
+                    task_key,
+                    *attempt,
+                    attempt_id,
+                    ts,
+                    &event.event_id,
+                );
             }
             OrchestrationEventData::TaskFinished {
                 run_id,
@@ -1194,25 +1266,79 @@ impl FoldState {
 
             // Layer 2 automation events - stubs for remaining events
             OrchestrationEventData::RunRequested {
-                trigger_source_ref,
-                ..
+                trigger_source_ref, ..
             } => {
-                if self.should_drop_run_requested(trigger_source_ref) {
-                    return;
+                if !self.should_drop_run_requested(trigger_source_ref) {
+                    // TODO(Task 6.1): Implement fold_run_requested (run_id + projection).
                 }
-                // TODO(Task 6.1): Implement fold_run_requested (run_id + projection).
             }
-            | OrchestrationEventData::BackfillCreated { .. }
-            | OrchestrationEventData::BackfillChunkPlanned { .. }
-            | OrchestrationEventData::BackfillStateChanged { .. } => {
-                // TODO(Task 4.2): Implement fold_backfill_created (backfills projection).
-                // TODO(Task 4.3): Implement fold_backfill_chunk_planned (chunks + progress).
-                // TODO(Task 4.4): Implement fold_backfill_state_changed (versioned updates).
+            OrchestrationEventData::BackfillCreated {
+                backfill_id,
+                client_request_id: _,
+                asset_selection,
+                partition_selector,
+                total_partitions,
+                chunk_size,
+                max_concurrent_runs,
+                parent_backfill_id,
+            } => {
+                self.fold_backfill_created(
+                    &event.tenant_id,
+                    &event.workspace_id,
+                    backfill_id,
+                    asset_selection,
+                    partition_selector,
+                    *total_partitions,
+                    *chunk_size,
+                    *max_concurrent_runs,
+                    parent_backfill_id.as_ref(),
+                    event.timestamp,
+                    &event.event_id,
+                );
+            }
+            OrchestrationEventData::BackfillChunkPlanned {
+                backfill_id,
+                chunk_id,
+                chunk_index,
+                partition_keys,
+                run_key,
+                request_fingerprint: _,
+            } => {
+                self.fold_backfill_chunk_planned(
+                    &event.tenant_id,
+                    &event.workspace_id,
+                    backfill_id,
+                    chunk_id,
+                    *chunk_index,
+                    partition_keys,
+                    run_key,
+                    &event.event_id,
+                );
+            }
+            OrchestrationEventData::BackfillStateChanged {
+                backfill_id,
+                from_state,
+                to_state,
+                state_version,
+                changed_by: _,
+            } => {
+                self.fold_backfill_state_changed(
+                    backfill_id,
+                    *from_state,
+                    *to_state,
+                    *state_version,
+                    &event.event_id,
+                );
             }
         }
     }
 
-    fn fold_run_cancel_requested(&mut self, run_id: &str, event_id: &str, timestamp: DateTime<Utc>) {
+    fn fold_run_cancel_requested(
+        &mut self,
+        run_id: &str,
+        event_id: &str,
+        timestamp: DateTime<Utc>,
+    ) {
         // Check if run exists and is not already terminal
         let run_is_terminal = self.runs.get(run_id).is_some_and(|r| r.state.is_terminal());
         if run_is_terminal {
@@ -1231,9 +1357,7 @@ impl FoldState {
             .tasks
             .iter()
             .filter(|((r, _), task)| {
-                r == run_id
-                    && !task.state.is_terminal()
-                    && task.state != TaskState::Running
+                r == run_id && !task.state.is_terminal() && task.state != TaskState::Running
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -1274,23 +1398,26 @@ impl FoldState {
         if self.runs.contains_key(run_id) {
             return;
         }
-        self.runs.insert(run_id.to_string(), RunRow {
-            run_id: run_id.to_string(),
-            plan_id: plan_id.to_string(),
-            state: RunState::Triggered,
-            run_key,
-            labels,
-            cancel_requested: false,
-            tasks_total: 0,
-            tasks_completed: 0,
-            tasks_succeeded: 0,
-            tasks_failed: 0,
-            tasks_skipped: 0,
-            tasks_cancelled: 0,
-            triggered_at: timestamp,
-            completed_at: None,
-            row_version: event_id.to_string(),
-        });
+        self.runs.insert(
+            run_id.to_string(),
+            RunRow {
+                run_id: run_id.to_string(),
+                plan_id: plan_id.to_string(),
+                state: RunState::Triggered,
+                run_key,
+                labels,
+                cancel_requested: false,
+                tasks_total: 0,
+                tasks_completed: 0,
+                tasks_succeeded: 0,
+                tasks_failed: 0,
+                tasks_skipped: 0,
+                tasks_cancelled: 0,
+                triggered_at: timestamp,
+                completed_at: None,
+                row_version: event_id.to_string(),
+            },
+        );
     }
 
     fn fold_plan_created(
@@ -1315,10 +1442,8 @@ impl FoldState {
             let task_key = (run_id.to_string(), task_def.key.clone());
 
             // Store dependencies
-            self.task_dependencies.insert(
-                task_key.clone(),
-                task_def.depends_on.clone(),
-            );
+            self.task_dependencies
+                .insert(task_key.clone(), task_def.depends_on.clone());
 
             // Store dependents (reverse lookup)
             for upstream in &task_def.depends_on {
@@ -1352,34 +1477,35 @@ impl FoldState {
                 max_attempts: task_def.max_attempts,
                 heartbeat_timeout_sec: task_def.heartbeat_timeout_sec,
                 last_heartbeat_at: None,
-                ready_at: if initial_state == TaskState::Ready { Some(timestamp) } else { None },
+                ready_at: if initial_state == TaskState::Ready {
+                    Some(timestamp)
+                } else {
+                    None
+                },
                 asset_key: task_def.asset_key.clone(),
                 partition_key: task_def.partition_key.clone(),
                 row_version: event_id.to_string(),
             };
 
-            self.tasks.insert(
-                (run_id.to_string(), task_def.key.clone()),
-                task_row,
-            );
+            self.tasks
+                .insert((run_id.to_string(), task_def.key.clone()), task_row);
 
             // Create dependency satisfaction edges
             for upstream in &task_def.depends_on {
-                let edge_key = (
-                    run_id.to_string(),
-                    upstream.clone(),
-                    task_def.key.clone(),
+                let edge_key = (run_id.to_string(), upstream.clone(), task_def.key.clone());
+                self.dep_satisfaction.insert(
+                    edge_key,
+                    DepSatisfactionRow {
+                        run_id: run_id.to_string(),
+                        upstream_task_key: upstream.clone(),
+                        downstream_task_key: task_def.key.clone(),
+                        satisfied: false,
+                        resolution: None,
+                        satisfied_at: None,
+                        satisfying_attempt: None,
+                        row_version: event_id.to_string(),
+                    },
                 );
-                self.dep_satisfaction.insert(edge_key, DepSatisfactionRow {
-                    run_id: run_id.to_string(),
-                    upstream_task_key: upstream.clone(),
-                    downstream_task_key: task_def.key.clone(),
-                    satisfied: false,
-                    resolution: None,
-                    satisfied_at: None,
-                    satisfying_attempt: None,
-                    row_version: event_id.to_string(),
-                });
             }
         }
     }
@@ -1530,14 +1656,39 @@ impl FoldState {
 
             // Satisfy downstream dependencies (for success)
             if outcome == TaskOutcome::Succeeded {
-                self.satisfy_downstream_edges(run_id, task_key, DepResolution::Success, attempt, event_id, timestamp);
+                self.satisfy_downstream_edges(
+                    run_id,
+                    task_key,
+                    DepResolution::Success,
+                    attempt,
+                    event_id,
+                    timestamp,
+                );
             } else if outcome == TaskOutcome::Failed && new_state == TaskState::Failed {
                 // Terminal failure - propagate to downstream
-                self.propagate_failure(run_id, task_key, DepResolution::Failed, event_id, timestamp);
+                self.propagate_failure(
+                    run_id,
+                    task_key,
+                    DepResolution::Failed,
+                    event_id,
+                    timestamp,
+                );
             } else if outcome == TaskOutcome::Skipped {
-                self.propagate_failure(run_id, task_key, DepResolution::Skipped, event_id, timestamp);
+                self.propagate_failure(
+                    run_id,
+                    task_key,
+                    DepResolution::Skipped,
+                    event_id,
+                    timestamp,
+                );
             } else if outcome == TaskOutcome::Cancelled {
-                self.propagate_failure(run_id, task_key, DepResolution::Cancelled, event_id, timestamp);
+                self.propagate_failure(
+                    run_id,
+                    task_key,
+                    DepResolution::Cancelled,
+                    event_id,
+                    timestamp,
+                );
             }
         }
     }
@@ -1573,7 +1724,10 @@ impl FoldState {
 
         if let Some(task) = self.tasks.get_mut(&task_lookup_key) {
             if !task.state.is_terminal()
-                && matches!(task.state, TaskState::Ready | TaskState::RetryWait | TaskState::Dispatched)
+                && matches!(
+                    task.state,
+                    TaskState::Ready | TaskState::RetryWait | TaskState::Dispatched
+                )
                 && attempt >= task.attempt
             {
                 let desired_attempt_id = outbox_attempt_id.as_deref().unwrap_or(attempt_id);
@@ -1597,18 +1751,21 @@ impl FoldState {
             return;
         }
 
-        self.dispatch_outbox.insert(dispatch_id.to_string(), DispatchOutboxRow {
-            run_id: run_id.to_string(),
-            task_key: task_key.to_string(),
-            attempt,
-            dispatch_id: dispatch_id.to_string(),
-            cloud_task_id: None,
-            status: DispatchStatus::Pending,
-            attempt_id: attempt_id.to_string(),
-            worker_queue: worker_queue.to_string(),
-            created_at: timestamp,
-            row_version: event_id.to_string(),
-        });
+        self.dispatch_outbox.insert(
+            dispatch_id.to_string(),
+            DispatchOutboxRow {
+                run_id: run_id.to_string(),
+                task_key: task_key.to_string(),
+                attempt,
+                dispatch_id: dispatch_id.to_string(),
+                cloud_task_id: None,
+                status: DispatchStatus::Pending,
+                attempt_id: attempt_id.to_string(),
+                worker_queue: worker_queue.to_string(),
+                created_at: timestamp,
+                row_version: event_id.to_string(),
+            },
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1635,18 +1792,21 @@ impl FoldState {
         // Handle out-of-order event: create row if it doesn't exist
         // This handles the case where DispatchEnqueued arrives before DispatchRequested
         if let (Some(run_id), Some(task_key), Some(attempt)) = (run_id, task_key, attempt) {
-            self.dispatch_outbox.insert(dispatch_id.to_string(), DispatchOutboxRow {
-                run_id: run_id.to_string(),
-                task_key: task_key.to_string(),
-                attempt,
-                dispatch_id: dispatch_id.to_string(),
-                cloud_task_id: Some(cloud_task_id.to_string()),
-                status: DispatchStatus::Created,
-                attempt_id: String::new(), // Will be filled by DispatchRequested when it arrives
-                worker_queue: "default-queue".to_string(),
-                created_at: timestamp,
-                row_version: event_id.to_string(),
-            });
+            self.dispatch_outbox.insert(
+                dispatch_id.to_string(),
+                DispatchOutboxRow {
+                    run_id: run_id.to_string(),
+                    task_key: task_key.to_string(),
+                    attempt,
+                    dispatch_id: dispatch_id.to_string(),
+                    cloud_task_id: Some(cloud_task_id.to_string()),
+                    status: DispatchStatus::Created,
+                    attempt_id: String::new(), // Will be filled by DispatchRequested when it arrives
+                    worker_queue: "default-queue".to_string(),
+                    created_at: timestamp,
+                    row_version: event_id.to_string(),
+                },
+            );
         }
     }
 
@@ -1680,18 +1840,21 @@ impl FoldState {
             return;
         }
 
-        self.timers.insert(timer_id.to_string(), TimerRow {
-            timer_id: timer_id.to_string(),
-            cloud_task_id: None,
-            timer_type: map_timer_type(timer_type),
-            run_id: run_id.map(ToString::to_string),
-            task_key: task_key.map(ToString::to_string),
-            attempt,
-            fire_at,
-            state: TimerState::Scheduled,
-            payload: None,
-            row_version: event_id.to_string(),
-        });
+        self.timers.insert(
+            timer_id.to_string(),
+            TimerRow {
+                timer_id: timer_id.to_string(),
+                cloud_task_id: None,
+                timer_type: map_timer_type(timer_type),
+                run_id: run_id.map(ToString::to_string),
+                task_key: task_key.map(ToString::to_string),
+                attempt,
+                fire_at,
+                state: TimerState::Scheduled,
+                payload: None,
+                row_version: event_id.to_string(),
+            },
+        );
     }
 
     fn fold_timer_enqueued(
@@ -1724,24 +1887,26 @@ impl FoldState {
                 attempt: parsed_attempt,
             } = parsed;
 
-            let fire_at = DateTime::from_timestamp(fire_epoch, 0)
-                .unwrap_or_else(Utc::now);
+            let fire_at = DateTime::from_timestamp(fire_epoch, 0).unwrap_or_else(Utc::now);
             let resolved_run_id = run_id.map(ToString::to_string).or(parsed_run_id);
             let resolved_task_key = task_key.map(ToString::to_string).or(parsed_task_key);
             let resolved_attempt = attempt.or(parsed_attempt);
 
-            self.timers.insert(timer_id.to_string(), TimerRow {
-                timer_id: timer_id.to_string(),
-                cloud_task_id: Some(cloud_task_id.to_string()),
-                timer_type,
-                run_id: resolved_run_id,
-                task_key: resolved_task_key,
-                attempt: resolved_attempt,
-                fire_at,
-                state: TimerState::Scheduled,
-                payload: None,
-                row_version: event_id.to_string(),
-            });
+            self.timers.insert(
+                timer_id.to_string(),
+                TimerRow {
+                    timer_id: timer_id.to_string(),
+                    cloud_task_id: Some(cloud_task_id.to_string()),
+                    timer_type,
+                    run_id: resolved_run_id,
+                    task_key: resolved_task_key,
+                    attempt: resolved_attempt,
+                    fire_at,
+                    state: TimerState::Scheduled,
+                    payload: None,
+                    row_version: event_id.to_string(),
+                },
+            );
         }
     }
 
@@ -1771,24 +1936,26 @@ impl FoldState {
                 task_key: parsed_task_key,
                 attempt: parsed_attempt,
             } = parsed;
-            let fire_at = DateTime::from_timestamp(fire_epoch, 0)
-                .unwrap_or_else(Utc::now);
+            let fire_at = DateTime::from_timestamp(fire_epoch, 0).unwrap_or_else(Utc::now);
             let resolved_run_id = run_id.map(ToString::to_string).or(parsed_run_id);
             let resolved_task_key = task_key.map(ToString::to_string).or(parsed_task_key);
             let resolved_attempt = attempt.or(parsed_attempt);
 
-            self.timers.insert(timer_id.to_string(), TimerRow {
-                timer_id: timer_id.to_string(),
-                cloud_task_id: None,
-                timer_type,
-                run_id: resolved_run_id,
-                task_key: resolved_task_key,
-                attempt: resolved_attempt,
-                fire_at,
-                state: TimerState::Fired,
-                payload: None,
-                row_version: event_id.to_string(),
-            });
+            self.timers.insert(
+                timer_id.to_string(),
+                TimerRow {
+                    timer_id: timer_id.to_string(),
+                    cloud_task_id: None,
+                    timer_type,
+                    run_id: resolved_run_id,
+                    task_key: resolved_task_key,
+                    attempt: resolved_attempt,
+                    fire_at,
+                    state: TimerState::Fired,
+                    payload: None,
+                    row_version: event_id.to_string(),
+                },
+            );
         }
     }
 
@@ -1821,8 +1988,10 @@ impl FoldState {
         event_id: &str,
     ) {
         // Update schedule state
-        let state = self.schedule_state.entry(schedule_id.to_string()).or_insert_with(|| {
-            ScheduleStateRow {
+        let state = self
+            .schedule_state
+            .entry(schedule_id.to_string())
+            .or_insert_with(|| ScheduleStateRow {
                 tenant_id: tenant_id.to_string(),
                 workspace_id: workspace_id.to_string(),
                 schedule_id: schedule_id.to_string(),
@@ -1830,8 +1999,7 @@ impl FoldState {
                 last_tick_id: None,
                 last_run_key: None,
                 row_version: String::new(),
-            }
-        });
+            });
 
         // Only update if this event is newer
         if event_id > state.row_version.as_str() {
@@ -1911,7 +2079,10 @@ impl FoldState {
 
         // Get current state version without holding a mutable borrow.
         let state_version = {
-            let state = self.sensor_state.entry(sensor_id.to_string()).or_insert_with(new_state);
+            let state = self
+                .sensor_state
+                .entry(sensor_id.to_string())
+                .or_insert_with(new_state);
             state.state_version
         };
 
@@ -1950,7 +2121,10 @@ impl FoldState {
             return;
         }
 
-        let state = self.sensor_state.entry(sensor_id.to_string()).or_insert_with(new_state);
+        let state = self
+            .sensor_state
+            .entry(sensor_id.to_string())
+            .or_insert_with(new_state);
 
         // Only update if this event is newer (idempotency)
         if event_id <= state.row_version.as_str() {
@@ -1985,6 +2159,173 @@ impl FoldState {
         self.sensor_evals.insert(row.eval_id.clone(), row);
     }
 
+    // ========================================================================
+    // Layer 2: Backfill Fold Logic
+    // ========================================================================
+
+    #[allow(clippy::too_many_arguments)]
+    fn fold_backfill_created(
+        &mut self,
+        tenant_id: &str,
+        workspace_id: &str,
+        backfill_id: &str,
+        asset_selection: &[String],
+        partition_selector: &PartitionSelector,
+        total_partitions: u32,
+        chunk_size: u32,
+        max_concurrent_runs: u32,
+        parent_backfill_id: Option<&String>,
+        timestamp: DateTime<Utc>,
+        event_id: &str,
+    ) {
+        if let Some(existing) = self.backfills.get(backfill_id) {
+            if event_id <= existing.row_version.as_str() {
+                return;
+            }
+            // Do not overwrite existing backfills with the same ID.
+            return;
+        }
+
+        let mut planned_chunks = 0_u32;
+        if chunk_size > 0 {
+            loop {
+                let chunk_id = format!("{backfill_id}:{planned_chunks}");
+                if self.backfill_chunks.contains_key(&chunk_id) {
+                    planned_chunks += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        self.backfills.insert(
+            backfill_id.to_string(),
+            BackfillRow {
+                tenant_id: tenant_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                backfill_id: backfill_id.to_string(),
+                asset_selection: asset_selection.to_vec(),
+                partition_selector: partition_selector.clone(),
+                chunk_size,
+                max_concurrent_runs,
+                state: BackfillState::Running,
+                state_version: 1,
+                total_partitions,
+                planned_chunks,
+                completed_chunks: 0,
+                failed_chunks: 0,
+                parent_backfill_id: parent_backfill_id.cloned(),
+                created_at: timestamp,
+                row_version: event_id.to_string(),
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fold_backfill_chunk_planned(
+        &mut self,
+        tenant_id: &str,
+        workspace_id: &str,
+        backfill_id: &str,
+        chunk_id: &str,
+        chunk_index: u32,
+        partition_keys: &[String],
+        run_key: &str,
+        event_id: &str,
+    ) {
+        let existing_run_id = self
+            .backfill_chunks
+            .get(chunk_id)
+            .and_then(|row| row.run_id.clone());
+
+        if let Some(existing) = self.backfill_chunks.get(chunk_id) {
+            if event_id <= existing.row_version.as_str() {
+                return;
+            }
+        }
+
+        self.backfill_chunks.insert(
+            chunk_id.to_string(),
+            BackfillChunkRow {
+                tenant_id: tenant_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                chunk_id: chunk_id.to_string(),
+                backfill_id: backfill_id.to_string(),
+                chunk_index,
+                partition_keys: partition_keys.to_vec(),
+                run_key: run_key.to_string(),
+                run_id: existing_run_id,
+                state: ChunkState::Planned,
+                row_version: event_id.to_string(),
+            },
+        );
+
+        if let Some(backfill) = self.backfills.get_mut(backfill_id) {
+            let mut next_index = backfill.planned_chunks;
+            loop {
+                let contiguous_id = format!("{backfill_id}:{next_index}");
+                if self.backfill_chunks.contains_key(&contiguous_id) {
+                    next_index += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if next_index != backfill.planned_chunks {
+                backfill.planned_chunks = next_index;
+                backfill.row_version = event_id.to_string();
+            }
+        }
+    }
+
+    fn fold_backfill_state_changed(
+        &mut self,
+        backfill_id: &str,
+        from_state: BackfillState,
+        to_state: BackfillState,
+        state_version: u32,
+        event_id: &str,
+    ) {
+        let Some(backfill) = self.backfills.get_mut(backfill_id) else {
+            return;
+        };
+
+        if event_id <= backfill.row_version.as_str() {
+            return;
+        }
+
+        if backfill.state != from_state {
+            return;
+        }
+
+        if !BackfillState::is_valid_transition(backfill.state, to_state) {
+            return;
+        }
+
+        let expected_version = backfill.state_version.saturating_add(1);
+        if state_version != expected_version {
+            return;
+        }
+
+        backfill.state = to_state;
+        backfill.state_version = state_version;
+        backfill.row_version = event_id.to_string();
+    }
+
+    fn record_idempotency_key(&mut self, event: &OrchestrationEvent) {
+        self.idempotency_keys
+            .entry(event.idempotency_key.clone())
+            .or_insert_with(|| IdempotencyKeyRow {
+                tenant_id: event.tenant_id.clone(),
+                workspace_id: event.workspace_id.clone(),
+                idempotency_key: event.idempotency_key.clone(),
+                event_id: event.event_id.clone(),
+                event_type: event.event_type.clone(),
+                recorded_at: event.timestamp,
+                row_version: event.event_id.clone(),
+            });
+    }
+
     fn should_drop_run_requested(&self, trigger_source_ref: &SourceRef) -> bool {
         if let SourceRef::Sensor { eval_id, .. } = trigger_source_ref {
             if let Some(eval) = self.sensor_evals.get(eval_id) {
@@ -2004,10 +2345,18 @@ impl FoldState {
         timestamp: DateTime<Utc>,
     ) {
         let dependents_key = (run_id.to_string(), upstream_key.to_string());
-        let dependents = self.task_dependents.get(&dependents_key).cloned().unwrap_or_default();
+        let dependents = self
+            .task_dependents
+            .get(&dependents_key)
+            .cloned()
+            .unwrap_or_default();
 
         for downstream_key in dependents {
-            let edge_key = (run_id.to_string(), upstream_key.to_string(), downstream_key.clone());
+            let edge_key = (
+                run_id.to_string(),
+                upstream_key.to_string(),
+                downstream_key.clone(),
+            );
 
             // Check if edge was already satisfied (duplicate-safe per ADR-022)
             let was_satisfied = self
@@ -2016,16 +2365,19 @@ impl FoldState {
                 .is_some_and(|e| e.satisfied);
 
             // Upsert edge (idempotent)
-            self.dep_satisfaction.insert(edge_key.clone(), DepSatisfactionRow {
-                run_id: run_id.to_string(),
-                upstream_task_key: upstream_key.to_string(),
-                downstream_task_key: downstream_key.clone(),
-                satisfied: true,
-                resolution: Some(resolution),
-                satisfied_at: Some(timestamp),
-                satisfying_attempt: Some(attempt),
-                row_version: event_id.to_string(),
-            });
+            self.dep_satisfaction.insert(
+                edge_key.clone(),
+                DepSatisfactionRow {
+                    run_id: run_id.to_string(),
+                    upstream_task_key: upstream_key.to_string(),
+                    downstream_task_key: downstream_key.clone(),
+                    satisfied: true,
+                    resolution: Some(resolution),
+                    satisfied_at: Some(timestamp),
+                    satisfying_attempt: Some(attempt),
+                    row_version: event_id.to_string(),
+                },
+            );
 
             // Only increment if newly satisfied (critical for duplicate safety)
             if !was_satisfied {
@@ -2062,29 +2414,42 @@ impl FoldState {
 
         while let Some((upstream_key, edge_resolution)) = to_propagate.pop_front() {
             let dependents_key = (run_id.to_string(), upstream_key.clone());
-            let dependents = self.task_dependents.get(&dependents_key).cloned().unwrap_or_default();
+            let dependents = self
+                .task_dependents
+                .get(&dependents_key)
+                .cloned()
+                .unwrap_or_default();
 
             for downstream_key in dependents {
-                let edge_key = (run_id.to_string(), upstream_key.clone(), downstream_key.clone());
+                let edge_key = (
+                    run_id.to_string(),
+                    upstream_key.clone(),
+                    downstream_key.clone(),
+                );
 
                 // Mark edge as resolved (not satisfied)
-                self.dep_satisfaction.insert(edge_key, DepSatisfactionRow {
-                    run_id: run_id.to_string(),
-                    upstream_task_key: upstream_key.clone(),
-                    downstream_task_key: downstream_key.clone(),
-                    satisfied: false,
-                    resolution: Some(edge_resolution),
-                    satisfied_at: Some(timestamp),
-                    satisfying_attempt: None,
-                    row_version: event_id.to_string(),
-                });
+                self.dep_satisfaction.insert(
+                    edge_key,
+                    DepSatisfactionRow {
+                        run_id: run_id.to_string(),
+                        upstream_task_key: upstream_key.clone(),
+                        downstream_task_key: downstream_key.clone(),
+                        satisfied: false,
+                        resolution: Some(edge_resolution),
+                        satisfied_at: Some(timestamp),
+                        satisfying_attempt: None,
+                        row_version: event_id.to_string(),
+                    },
+                );
 
                 // Skip/cancel downstream if not already terminal
                 let task_key = (run_id.to_string(), downstream_key.clone());
                 if let Some(downstream_task) = self.tasks.get_mut(&task_key) {
                     if !downstream_task.state.is_terminal() {
                         let (new_state, next_resolution) = match edge_resolution {
-                            DepResolution::Cancelled => (TaskState::Cancelled, DepResolution::Cancelled),
+                            DepResolution::Cancelled => {
+                                (TaskState::Cancelled, DepResolution::Cancelled)
+                            }
                             _ => (TaskState::Skipped, DepResolution::Skipped),
                         };
 
@@ -2149,22 +2514,21 @@ impl FoldState {
 /// If both are equal, prefer the later row to preserve updates from newer deltas.
 #[must_use]
 pub fn merge_task_rows(rows: Vec<TaskRow>) -> Option<TaskRow> {
-    rows.into_iter()
-        .reduce(|best, row| {
-            // Compare by row_version first (ULID lexicographic ordering)
-            match row.row_version.cmp(&best.row_version) {
-                std::cmp::Ordering::Greater => row,
-                std::cmp::Ordering::Less => best,
-                std::cmp::Ordering::Equal => {
-                    // Same row_version: use state_rank as tiebreaker
-                    // Higher rank = more terminal = preferred
-                    match row.state.rank().cmp(&best.state.rank()) {
-                        std::cmp::Ordering::Less => best,
-                        std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => row,
-                    }
+    rows.into_iter().reduce(|best, row| {
+        // Compare by row_version first (ULID lexicographic ordering)
+        match row.row_version.cmp(&best.row_version) {
+            std::cmp::Ordering::Greater => row,
+            std::cmp::Ordering::Less => best,
+            std::cmp::Ordering::Equal => {
+                // Same row_version: use state_rank as tiebreaker
+                // Higher rank = more terminal = preferred
+                match row.state.rank().cmp(&best.state.rank()) {
+                    std::cmp::Ordering::Less => best,
+                    std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => row,
                 }
             }
-        })
+        }
+    })
 }
 
 /// Merges run rows from base snapshot and L0 deltas.
@@ -2227,12 +2591,21 @@ pub fn merge_sensor_eval_rows(rows: Vec<SensorEvalRow>) -> Option<SensorEvalRow>
         })
 }
 
+/// Merges idempotency key rows from base snapshot and L0 deltas.
+#[must_use]
+pub fn merge_idempotency_key_rows(rows: Vec<IdempotencyKeyRow>) -> Option<IdempotencyKeyRow> {
+    rows.into_iter()
+        .reduce(|best, row| match row.row_version.cmp(&best.row_version) {
+            std::cmp::Ordering::Less => best,
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => row,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::orchestration::events::{
-        OrchestrationEventData, SourceRef, TriggerInfo, TriggerSource,
-        TimerType as EventTimerType,
+        OrchestrationEventData, SourceRef, TimerType as EventTimerType, TriggerInfo, TriggerSource,
     };
     use ulid::Ulid;
 
@@ -2244,7 +2617,9 @@ mod tests {
         make_event(OrchestrationEventData::RunTriggered {
             run_id: run_id.to_string(),
             plan_id: "plan-01".to_string(),
-            trigger: TriggerInfo::Manual { user_id: "user@test.com".to_string() },
+            trigger: TriggerInfo::Manual {
+                user_id: "user@test.com".to_string(),
+            },
             root_assets: vec![],
             run_key: None,
             labels: HashMap::new(),
@@ -2259,7 +2634,13 @@ mod tests {
         })
     }
 
-    fn task_finished_event(run_id: &str, task_key: &str, attempt: u32, attempt_id: &str, outcome: TaskOutcome) -> OrchestrationEvent {
+    fn task_finished_event(
+        run_id: &str,
+        task_key: &str,
+        attempt: u32,
+        attempt_id: &str,
+        outcome: TaskOutcome,
+    ) -> OrchestrationEvent {
         make_event(OrchestrationEventData::TaskFinished {
             run_id: run_id.to_string(),
             task_key: task_key.to_string(),
@@ -2277,7 +2658,12 @@ mod tests {
         })
     }
 
-    fn task_started_event(run_id: &str, task_key: &str, attempt: u32, attempt_id: &str) -> OrchestrationEvent {
+    fn task_started_event(
+        run_id: &str,
+        task_key: &str,
+        attempt: u32,
+        attempt_id: &str,
+    ) -> OrchestrationEvent {
         make_event(OrchestrationEventData::TaskStarted {
             run_id: run_id.to_string(),
             task_key: task_key.to_string(),
@@ -2287,7 +2673,12 @@ mod tests {
         })
     }
 
-    fn dispatch_requested_event(run_id: &str, task_key: &str, attempt: u32, attempt_id: &str) -> OrchestrationEvent {
+    fn dispatch_requested_event(
+        run_id: &str,
+        task_key: &str,
+        attempt: u32,
+        attempt_id: &str,
+    ) -> OrchestrationEvent {
         let dispatch_id = DispatchOutboxRow::dispatch_id(run_id, task_key, attempt);
         make_event(OrchestrationEventData::DispatchRequested {
             run_id: run_id.to_string(),
@@ -2335,11 +2726,35 @@ mod tests {
         let mut state = FoldState::new();
 
         state.fold_event(&run_triggered_event("run1"));
-        state.fold_event(&plan_created_event("run1", vec![
-            TaskDef { key: "extract".into(), depends_on: vec![], asset_key: None, partition_key: None, max_attempts: 3, heartbeat_timeout_sec: 300 },
-            TaskDef { key: "transform".into(), depends_on: vec!["extract".into()], asset_key: None, partition_key: None, max_attempts: 3, heartbeat_timeout_sec: 300 },
-            TaskDef { key: "load".into(), depends_on: vec!["transform".into()], asset_key: None, partition_key: None, max_attempts: 3, heartbeat_timeout_sec: 300 },
-        ]));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![
+                TaskDef {
+                    key: "extract".into(),
+                    depends_on: vec![],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 3,
+                    heartbeat_timeout_sec: 300,
+                },
+                TaskDef {
+                    key: "transform".into(),
+                    depends_on: vec!["extract".into()],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 3,
+                    heartbeat_timeout_sec: 300,
+                },
+                TaskDef {
+                    key: "load".into(),
+                    depends_on: vec!["transform".into()],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 3,
+                    heartbeat_timeout_sec: 300,
+                },
+            ],
+        ));
 
         // Extract has no deps, should be READY
         let extract = state.tasks.get(&("run1".into(), "extract".into())).unwrap();
@@ -2347,7 +2762,10 @@ mod tests {
         assert_eq!(extract.deps_total, 0);
 
         // Transform depends on extract, should be BLOCKED
-        let transform = state.tasks.get(&("run1".into(), "transform".into())).unwrap();
+        let transform = state
+            .tasks
+            .get(&("run1".into(), "transform".into()))
+            .unwrap();
         assert_eq!(transform.state, TaskState::Blocked);
         assert_eq!(transform.deps_total, 1);
 
@@ -2357,8 +2775,16 @@ mod tests {
         assert_eq!(load.deps_total, 1);
 
         // Dep satisfaction edges should be created
-        assert!(state.dep_satisfaction.contains_key(&("run1".into(), "extract".into(), "transform".into())));
-        assert!(state.dep_satisfaction.contains_key(&("run1".into(), "transform".into(), "load".into())));
+        assert!(state.dep_satisfaction.contains_key(&(
+            "run1".into(),
+            "extract".into(),
+            "transform".into()
+        )));
+        assert!(state.dep_satisfaction.contains_key(&(
+            "run1".into(),
+            "transform".into(),
+            "load".into()
+        )));
     }
 
     #[test]
@@ -2381,10 +2807,27 @@ mod tests {
         let mut state = FoldState::new();
 
         state.fold_event(&run_triggered_event("run1"));
-        let plan = plan_created_event("run1", vec![
-            TaskDef { key: "A".into(), depends_on: vec![], asset_key: None, partition_key: None, max_attempts: 3, heartbeat_timeout_sec: 300 },
-            TaskDef { key: "B".into(), depends_on: vec!["A".into()], asset_key: None, partition_key: None, max_attempts: 3, heartbeat_timeout_sec: 300 },
-        ]);
+        let plan = plan_created_event(
+            "run1",
+            vec![
+                TaskDef {
+                    key: "A".into(),
+                    depends_on: vec![],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 3,
+                    heartbeat_timeout_sec: 300,
+                },
+                TaskDef {
+                    key: "B".into(),
+                    depends_on: vec!["A".into()],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 3,
+                    heartbeat_timeout_sec: 300,
+                },
+            ],
+        );
 
         state.fold_event(&plan);
         let task_count = state.tasks.len();
@@ -2402,23 +2845,52 @@ mod tests {
         let attempt_id = Ulid::new().to_string();
 
         state.fold_event(&run_triggered_event("run1"));
-        state.fold_event(&plan_created_event("run1", vec![
-            TaskDef { key: "A".into(), depends_on: vec![], asset_key: None, partition_key: None, max_attempts: 3, heartbeat_timeout_sec: 300 },
-            TaskDef { key: "B".into(), depends_on: vec!["A".into()], asset_key: None, partition_key: None, max_attempts: 3, heartbeat_timeout_sec: 300 },
-        ]));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![
+                TaskDef {
+                    key: "A".into(),
+                    depends_on: vec![],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 3,
+                    heartbeat_timeout_sec: 300,
+                },
+                TaskDef {
+                    key: "B".into(),
+                    depends_on: vec!["A".into()],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 3,
+                    heartbeat_timeout_sec: 300,
+                },
+            ],
+        ));
 
         // Start task A
         state.fold_event(&task_started_event("run1", "A", 1, &attempt_id));
 
         // First TaskFinished(A, succeeded)
-        state.fold_event(&task_finished_event("run1", "A", 1, &attempt_id, TaskOutcome::Succeeded));
+        state.fold_event(&task_finished_event(
+            "run1",
+            "A",
+            1,
+            &attempt_id,
+            TaskOutcome::Succeeded,
+        ));
 
         let b_after_first = state.tasks.get(&("run1".into(), "B".into())).unwrap();
         assert_eq!(b_after_first.deps_satisfied_count, 1);
         assert_eq!(b_after_first.state, TaskState::Ready);
 
         // Duplicate TaskFinished(A, succeeded) - should be no-op
-        state.fold_event(&task_finished_event("run1", "A", 1, &attempt_id, TaskOutcome::Succeeded));
+        state.fold_event(&task_finished_event(
+            "run1",
+            "A",
+            1,
+            &attempt_id,
+            TaskOutcome::Succeeded,
+        ));
 
         // Should still be 1, not 2
         let b_after_dup = state.tasks.get(&("run1".into(), "B".into())).unwrap();
@@ -2431,18 +2903,38 @@ mod tests {
         let attempt_id = Ulid::new().to_string();
 
         state.fold_event(&run_triggered_event("run1"));
-        state.fold_event(&plan_created_event("run1", vec![
-            TaskDef { key: "A".into(), depends_on: vec![], asset_key: None, partition_key: None, max_attempts: 1, heartbeat_timeout_sec: 300 },
-        ]));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "A".into(),
+                depends_on: vec![],
+                asset_key: None,
+                partition_key: None,
+                max_attempts: 1,
+                heartbeat_timeout_sec: 300,
+            }],
+        ));
 
         state.fold_event(&task_started_event("run1", "A", 1, &attempt_id));
-        state.fold_event(&task_finished_event("run1", "A", 1, &attempt_id, TaskOutcome::Succeeded));
+        state.fold_event(&task_finished_event(
+            "run1",
+            "A",
+            1,
+            &attempt_id,
+            TaskOutcome::Succeeded,
+        ));
 
         let run_after_first = state.runs.get("run1").unwrap();
         assert_eq!(run_after_first.tasks_completed, 1);
         assert_eq!(run_after_first.tasks_succeeded, 1);
 
-        state.fold_event(&task_finished_event("run1", "A", 1, &attempt_id, TaskOutcome::Succeeded));
+        state.fold_event(&task_finished_event(
+            "run1",
+            "A",
+            1,
+            &attempt_id,
+            TaskOutcome::Succeeded,
+        ));
 
         let run_after_dup = state.runs.get("run1").unwrap();
         assert_eq!(run_after_dup.tasks_completed, 1);
@@ -2455,22 +2947,57 @@ mod tests {
         let attempt_1_id = Ulid::new().to_string();
 
         state.fold_event(&run_triggered_event("run1"));
-        state.fold_event(&plan_created_event("run1", vec![
-            TaskDef { key: "extract".into(), depends_on: vec![], asset_key: None, partition_key: None, max_attempts: 3, heartbeat_timeout_sec: 300 },
-        ]));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "extract".into(),
+                depends_on: vec![],
+                asset_key: None,
+                partition_key: None,
+                max_attempts: 3,
+                heartbeat_timeout_sec: 300,
+            }],
+        ));
 
         // Start attempt 1
         state.fold_event(&task_started_event("run1", "extract", 1, &attempt_1_id));
-        assert_eq!(state.tasks.get(&("run1".into(), "extract".into())).unwrap().attempt, 1);
+        assert_eq!(
+            state
+                .tasks
+                .get(&("run1".into(), "extract".into()))
+                .unwrap()
+                .attempt,
+            1
+        );
 
         // Start attempt 2 (retry)
         let attempt_2_id = Ulid::new().to_string();
         state.fold_event(&task_started_event("run1", "extract", 2, &attempt_2_id));
-        assert_eq!(state.tasks.get(&("run1".into(), "extract".into())).unwrap().attempt, 2);
-        assert_eq!(state.tasks.get(&("run1".into(), "extract".into())).unwrap().state, TaskState::Running);
+        assert_eq!(
+            state
+                .tasks
+                .get(&("run1".into(), "extract".into()))
+                .unwrap()
+                .attempt,
+            2
+        );
+        assert_eq!(
+            state
+                .tasks
+                .get(&("run1".into(), "extract".into()))
+                .unwrap()
+                .state,
+            TaskState::Running
+        );
 
         // Late TaskFinished for attempt 1 arrives (out-of-order) - should be rejected
-        state.fold_event(&task_finished_event("run1", "extract", 1, &attempt_1_id, TaskOutcome::Failed));
+        state.fold_event(&task_finished_event(
+            "run1",
+            "extract",
+            1,
+            &attempt_1_id,
+            TaskOutcome::Failed,
+        ));
 
         // State should NOT regress - attempt 2 is still running
         let task = state.tasks.get(&("run1".into(), "extract".into())).unwrap();
@@ -2484,9 +3011,17 @@ mod tests {
         let mut state = FoldState::new();
 
         state.fold_event(&run_triggered_event("run1"));
-        state.fold_event(&plan_created_event("run1", vec![
-            TaskDef { key: "extract".into(), depends_on: vec![], asset_key: None, partition_key: None, max_attempts: 3, heartbeat_timeout_sec: 300 },
-        ]));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "extract".into(),
+                depends_on: vec![],
+                asset_key: None,
+                partition_key: None,
+                max_attempts: 3,
+                heartbeat_timeout_sec: 300,
+            }],
+        ));
 
         state.fold_event(&dispatch_requested_event("run1", "extract", 1, "att-1"));
         state.fold_event(&task_started_event("run1", "extract", 1, "att-2"));
@@ -2502,33 +3037,78 @@ mod tests {
         let attempt_id = Ulid::new().to_string();
 
         state.fold_event(&run_triggered_event("run1"));
-        state.fold_event(&plan_created_event("run1", vec![
-            TaskDef { key: "A".into(), depends_on: vec![], asset_key: None, partition_key: None, max_attempts: 1, heartbeat_timeout_sec: 300 },
-            TaskDef { key: "B".into(), depends_on: vec!["A".into()], asset_key: None, partition_key: None, max_attempts: 1, heartbeat_timeout_sec: 300 },
-            TaskDef { key: "C".into(), depends_on: vec!["B".into()], asset_key: None, partition_key: None, max_attempts: 1, heartbeat_timeout_sec: 300 },
-        ]));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![
+                TaskDef {
+                    key: "A".into(),
+                    depends_on: vec![],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 1,
+                    heartbeat_timeout_sec: 300,
+                },
+                TaskDef {
+                    key: "B".into(),
+                    depends_on: vec!["A".into()],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 1,
+                    heartbeat_timeout_sec: 300,
+                },
+                TaskDef {
+                    key: "C".into(),
+                    depends_on: vec!["B".into()],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 1,
+                    heartbeat_timeout_sec: 300,
+                },
+            ],
+        ));
 
         // Start A
         state.fold_event(&task_started_event("run1", "A", 1, &attempt_id));
 
         // A fails terminally (max_attempts = 1)
-        state.fold_event(&task_finished_event("run1", "A", 1, &attempt_id, TaskOutcome::Failed));
+        state.fold_event(&task_finished_event(
+            "run1",
+            "A",
+            1,
+            &attempt_id,
+            TaskOutcome::Failed,
+        ));
 
         // A should be FAILED
-        assert_eq!(state.tasks.get(&("run1".into(), "A".into())).unwrap().state, TaskState::Failed);
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "A".into())).unwrap().state,
+            TaskState::Failed
+        );
 
         // B should be SKIPPED (direct downstream)
-        assert_eq!(state.tasks.get(&("run1".into(), "B".into())).unwrap().state, TaskState::Skipped);
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "B".into())).unwrap().state,
+            TaskState::Skipped
+        );
 
         // C should also be SKIPPED (transitive)
-        assert_eq!(state.tasks.get(&("run1".into(), "C".into())).unwrap().state, TaskState::Skipped);
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "C".into())).unwrap().state,
+            TaskState::Skipped
+        );
 
         // dep_satisfaction edges should have correct resolution
-        let ab_edge = state.dep_satisfaction.get(&("run1".into(), "A".into(), "B".into())).unwrap();
+        let ab_edge = state
+            .dep_satisfaction
+            .get(&("run1".into(), "A".into(), "B".into()))
+            .unwrap();
         assert_eq!(ab_edge.resolution, Some(DepResolution::Failed));
         assert!(!ab_edge.satisfied);
 
-        let bc_edge = state.dep_satisfaction.get(&("run1".into(), "B".into(), "C".into())).unwrap();
+        let bc_edge = state
+            .dep_satisfaction
+            .get(&("run1".into(), "B".into(), "C".into()))
+            .unwrap();
         assert_eq!(bc_edge.resolution, Some(DepResolution::Skipped));
     }
 
@@ -2538,16 +3118,45 @@ mod tests {
         let attempt_id = Ulid::new().to_string();
 
         state.fold_event(&run_triggered_event("run1"));
-        state.fold_event(&plan_created_event("run1", vec![
-            TaskDef { key: "A".into(), depends_on: vec![], asset_key: None, partition_key: None, max_attempts: 1, heartbeat_timeout_sec: 300 },
-            TaskDef { key: "B".into(), depends_on: vec!["A".into()], asset_key: None, partition_key: None, max_attempts: 1, heartbeat_timeout_sec: 300 },
-        ]));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![
+                TaskDef {
+                    key: "A".into(),
+                    depends_on: vec![],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 1,
+                    heartbeat_timeout_sec: 300,
+                },
+                TaskDef {
+                    key: "B".into(),
+                    depends_on: vec!["A".into()],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 1,
+                    heartbeat_timeout_sec: 300,
+                },
+            ],
+        ));
 
         state.fold_event(&task_started_event("run1", "A", 1, &attempt_id));
-        state.fold_event(&task_finished_event("run1", "A", 1, &attempt_id, TaskOutcome::Cancelled));
+        state.fold_event(&task_finished_event(
+            "run1",
+            "A",
+            1,
+            &attempt_id,
+            TaskOutcome::Cancelled,
+        ));
 
-        assert_eq!(state.tasks.get(&("run1".into(), "A".into())).unwrap().state, TaskState::Cancelled);
-        assert_eq!(state.tasks.get(&("run1".into(), "B".into())).unwrap().state, TaskState::Cancelled);
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "A".into())).unwrap().state,
+            TaskState::Cancelled
+        );
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "B".into())).unwrap().state,
+            TaskState::Cancelled
+        );
 
         let run = state.runs.get("run1").unwrap();
         assert_eq!(run.tasks_completed, 2);
@@ -2555,7 +3164,10 @@ mod tests {
         assert_eq!(run.state, RunState::Cancelled);
         assert!(run.completed_at.is_some());
 
-        let ab_edge = state.dep_satisfaction.get(&("run1".into(), "A".into(), "B".into())).unwrap();
+        let ab_edge = state
+            .dep_satisfaction
+            .get(&("run1".into(), "A".into(), "B".into()))
+            .unwrap();
         assert_eq!(ab_edge.resolution, Some(DepResolution::Cancelled));
         assert!(!ab_edge.satisfied);
     }
@@ -2816,7 +3428,10 @@ mod tests {
         // Row should exist but with empty attempt_id
         let row = state.dispatch_outbox.get(&dispatch_id).expect("outbox row");
         assert_eq!(row.status, DispatchStatus::Created);
-        assert!(row.attempt_id.is_empty(), "attempt_id should be empty before DispatchRequested");
+        assert!(
+            row.attempt_id.is_empty(),
+            "attempt_id should be empty before DispatchRequested"
+        );
 
         // DispatchRequested arrives SECOND (but has older ULID)
         let mut requested = make_event(OrchestrationEventData::DispatchRequested {
@@ -2833,7 +3448,10 @@ mod tests {
 
         // Row should now have attempt_id filled in
         let row = state.dispatch_outbox.get(&dispatch_id).expect("outbox row");
-        assert_eq!(row.attempt_id, "01HQ123ATT", "attempt_id should be filled by DispatchRequested");
+        assert_eq!(
+            row.attempt_id, "01HQ123ATT",
+            "attempt_id should be filled by DispatchRequested"
+        );
         assert_eq!(row.worker_queue, "priority-queue");
         // Status should NOT regress from CREATED to PENDING
         assert_eq!(row.status, DispatchStatus::Created);
@@ -2846,9 +3464,17 @@ mod tests {
         let mut state = FoldState::new();
 
         state.fold_event(&run_triggered_event("run1"));
-        state.fold_event(&plan_created_event("run1", vec![
-            TaskDef { key: "extract".into(), depends_on: vec![], asset_key: None, partition_key: None, max_attempts: 3, heartbeat_timeout_sec: 300 },
-        ]));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "extract".into(),
+                depends_on: vec![],
+                asset_key: None,
+                partition_key: None,
+                max_attempts: 3,
+                heartbeat_timeout_sec: 300,
+            }],
+        ));
 
         let dispatch_id = DispatchOutboxRow::dispatch_id("run1", "extract", 1);
         let mut first = dispatch_requested_event("run1", "extract", 1, "att-1");
@@ -2948,7 +3574,10 @@ mod tests {
 
         // fire_at should be updated to canonical value from TimerRequested
         let row = state.timers.get(&timer_id).expect("timer row");
-        assert_eq!(row.fire_at, canonical_fire_at, "fire_at should be updated to canonical value");
+        assert_eq!(
+            row.fire_at, canonical_fire_at,
+            "fire_at should be updated to canonical value"
+        );
         // cloud_task_id should be preserved
         assert_eq!(row.cloud_task_id.as_deref(), Some("t_cloud456"));
         // State should remain SCHEDULED
@@ -3267,24 +3896,66 @@ mod tests {
         let mut state = FoldState::new();
 
         state.fold_event(&run_triggered_event("run1"));
-        state.fold_event(&plan_created_event("run1", vec![
-            TaskDef { key: "A".into(), depends_on: vec![], asset_key: None, partition_key: None, max_attempts: 3, heartbeat_timeout_sec: 300 },
-            TaskDef { key: "B".into(), depends_on: vec!["A".into()], asset_key: None, partition_key: None, max_attempts: 3, heartbeat_timeout_sec: 300 },
-            TaskDef { key: "C".into(), depends_on: vec!["B".into()], asset_key: None, partition_key: None, max_attempts: 3, heartbeat_timeout_sec: 300 },
-        ]));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![
+                TaskDef {
+                    key: "A".into(),
+                    depends_on: vec![],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 3,
+                    heartbeat_timeout_sec: 300,
+                },
+                TaskDef {
+                    key: "B".into(),
+                    depends_on: vec!["A".into()],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 3,
+                    heartbeat_timeout_sec: 300,
+                },
+                TaskDef {
+                    key: "C".into(),
+                    depends_on: vec!["B".into()],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 3,
+                    heartbeat_timeout_sec: 300,
+                },
+            ],
+        ));
 
         // A is READY, B and C are BLOCKED
-        assert_eq!(state.tasks.get(&("run1".into(), "A".into())).unwrap().state, TaskState::Ready);
-        assert_eq!(state.tasks.get(&("run1".into(), "B".into())).unwrap().state, TaskState::Blocked);
-        assert_eq!(state.tasks.get(&("run1".into(), "C".into())).unwrap().state, TaskState::Blocked);
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "A".into())).unwrap().state,
+            TaskState::Ready
+        );
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "B".into())).unwrap().state,
+            TaskState::Blocked
+        );
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "C".into())).unwrap().state,
+            TaskState::Blocked
+        );
 
         // Request cancellation
         state.fold_event(&run_cancel_requested_event("run1", "user_requested"));
 
         // All non-terminal tasks should be CANCELLED
-        assert_eq!(state.tasks.get(&("run1".into(), "A".into())).unwrap().state, TaskState::Cancelled);
-        assert_eq!(state.tasks.get(&("run1".into(), "B".into())).unwrap().state, TaskState::Cancelled);
-        assert_eq!(state.tasks.get(&("run1".into(), "C".into())).unwrap().state, TaskState::Cancelled);
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "A".into())).unwrap().state,
+            TaskState::Cancelled
+        );
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "B".into())).unwrap().state,
+            TaskState::Cancelled
+        );
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "C".into())).unwrap().state,
+            TaskState::Cancelled
+        );
 
         // Run should be CANCELLED with correct counters
         let run = state.runs.get("run1").unwrap();
@@ -3302,23 +3973,49 @@ mod tests {
         let attempt_id = Ulid::new().to_string();
 
         state.fold_event(&run_triggered_event("run1"));
-        state.fold_event(&plan_created_event("run1", vec![
-            TaskDef { key: "A".into(), depends_on: vec![], asset_key: None, partition_key: None, max_attempts: 3, heartbeat_timeout_sec: 300 },
-            TaskDef { key: "B".into(), depends_on: vec!["A".into()], asset_key: None, partition_key: None, max_attempts: 3, heartbeat_timeout_sec: 300 },
-        ]));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![
+                TaskDef {
+                    key: "A".into(),
+                    depends_on: vec![],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 3,
+                    heartbeat_timeout_sec: 300,
+                },
+                TaskDef {
+                    key: "B".into(),
+                    depends_on: vec!["A".into()],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 3,
+                    heartbeat_timeout_sec: 300,
+                },
+            ],
+        ));
 
         // Start task A (transitions to RUNNING)
         state.fold_event(&task_started_event("run1", "A", 1, &attempt_id));
-        assert_eq!(state.tasks.get(&("run1".into(), "A".into())).unwrap().state, TaskState::Running);
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "A".into())).unwrap().state,
+            TaskState::Running
+        );
 
         // Request cancellation
         state.fold_event(&run_cancel_requested_event("run1", "user_requested"));
 
         // Running task should remain RUNNING (worker will check cancel_requested on heartbeat)
-        assert_eq!(state.tasks.get(&("run1".into(), "A".into())).unwrap().state, TaskState::Running);
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "A".into())).unwrap().state,
+            TaskState::Running
+        );
 
         // Blocked task should be CANCELLED
-        assert_eq!(state.tasks.get(&("run1".into(), "B".into())).unwrap().state, TaskState::Cancelled);
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "B".into())).unwrap().state,
+            TaskState::Cancelled
+        );
 
         // Run should have cancel_requested but NOT be terminal yet (A is still running)
         let run = state.runs.get("run1").unwrap();
@@ -3335,26 +4032,58 @@ mod tests {
         let attempt_id = Ulid::new().to_string();
 
         state.fold_event(&run_triggered_event("run1"));
-        state.fold_event(&plan_created_event("run1", vec![
-            TaskDef { key: "A".into(), depends_on: vec![], asset_key: None, partition_key: None, max_attempts: 1, heartbeat_timeout_sec: 300 },
-            TaskDef { key: "B".into(), depends_on: vec!["A".into()], asset_key: None, partition_key: None, max_attempts: 1, heartbeat_timeout_sec: 300 },
-        ]));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![
+                TaskDef {
+                    key: "A".into(),
+                    depends_on: vec![],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 1,
+                    heartbeat_timeout_sec: 300,
+                },
+                TaskDef {
+                    key: "B".into(),
+                    depends_on: vec!["A".into()],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 1,
+                    heartbeat_timeout_sec: 300,
+                },
+            ],
+        ));
 
         // A succeeds
         state.fold_event(&task_started_event("run1", "A", 1, &attempt_id));
-        state.fold_event(&task_finished_event("run1", "A", 1, &attempt_id, TaskOutcome::Succeeded));
+        state.fold_event(&task_finished_event(
+            "run1",
+            "A",
+            1,
+            &attempt_id,
+            TaskOutcome::Succeeded,
+        ));
 
         // B is now READY
-        assert_eq!(state.tasks.get(&("run1".into(), "B".into())).unwrap().state, TaskState::Ready);
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "B".into())).unwrap().state,
+            TaskState::Ready
+        );
 
         // Request cancellation
         state.fold_event(&run_cancel_requested_event("run1", "user_requested"));
 
         // A should remain SUCCEEDED (not re-cancelled)
-        assert_eq!(state.tasks.get(&("run1".into(), "A".into())).unwrap().state, TaskState::Succeeded);
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "A".into())).unwrap().state,
+            TaskState::Succeeded
+        );
 
         // B should be CANCELLED (was READY)
-        assert_eq!(state.tasks.get(&("run1".into(), "B".into())).unwrap().state, TaskState::Cancelled);
+        assert_eq!(
+            state.tasks.get(&("run1".into(), "B".into())).unwrap().state,
+            TaskState::Cancelled
+        );
 
         // Run counters should reflect both states
         let run = state.runs.get("run1").unwrap();
@@ -3460,7 +4189,12 @@ mod tests {
         state.fold_event(&event1);
 
         let tick_id = format!("daily-etl:{}", scheduled_for.timestamp());
-        let first_version = state.schedule_ticks.get(&tick_id).unwrap().row_version.clone();
+        let first_version = state
+            .schedule_ticks
+            .get(&tick_id)
+            .unwrap()
+            .row_version
+            .clone();
 
         // Duplicate event with older event_id (simulating replay)
         // Create event with older ULID
@@ -3549,12 +4283,8 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
 
         // Second tick (newer)
-        let event2 = schedule_ticked_event(
-            "daily-etl",
-            Utc::now(),
-            TickStatus::Triggered,
-            Some("run2"),
-        );
+        let event2 =
+            schedule_ticked_event("daily-etl", Utc::now(), TickStatus::Triggered, Some("run2"));
         state.fold_event(&event2);
 
         // State should reflect the latest tick
@@ -3563,6 +4293,133 @@ mod tests {
 
         // Both ticks should be in history
         assert_eq!(state.schedule_ticks.len(), 2);
+    }
+
+    // ========================================================================
+    // Layer 2: Backfill Fold Tests
+    // ========================================================================
+
+    fn backfill_created_event(backfill_id: &str) -> OrchestrationEvent {
+        OrchestrationEvent::new(
+            "tenant-abc",
+            "workspace-prod",
+            OrchestrationEventData::BackfillCreated {
+                backfill_id: backfill_id.to_string(),
+                client_request_id: "client_req_001".into(),
+                asset_selection: vec!["analytics.daily".into()],
+                partition_selector: PartitionSelector::Range {
+                    start: "2025-01-01".into(),
+                    end: "2025-01-03".into(),
+                },
+                total_partitions: 3,
+                chunk_size: 2,
+                max_concurrent_runs: 2,
+                parent_backfill_id: None,
+            },
+        )
+    }
+
+    fn backfill_chunk_planned_event(backfill_id: &str, chunk_index: u32) -> OrchestrationEvent {
+        OrchestrationEvent::new(
+            "tenant-abc",
+            "workspace-prod",
+            OrchestrationEventData::BackfillChunkPlanned {
+                backfill_id: backfill_id.to_string(),
+                chunk_id: format!("{backfill_id}:{chunk_index}"),
+                chunk_index,
+                partition_keys: vec!["2025-01-01".into(), "2025-01-02".into()],
+                run_key: format!("backfill:{backfill_id}:chunk:{chunk_index}"),
+                request_fingerprint: "fp_backfill_chunk".into(),
+            },
+        )
+    }
+
+    fn backfill_state_changed_event(
+        backfill_id: &str,
+        from_state: BackfillState,
+        to_state: BackfillState,
+        state_version: u32,
+    ) -> OrchestrationEvent {
+        OrchestrationEvent::new(
+            "tenant-abc",
+            "workspace-prod",
+            OrchestrationEventData::BackfillStateChanged {
+                backfill_id: backfill_id.to_string(),
+                from_state,
+                to_state,
+                state_version,
+                changed_by: None,
+            },
+        )
+    }
+
+    #[test]
+    fn test_fold_backfill_created_inserts_backfill() {
+        let mut state = FoldState::new();
+
+        let event = backfill_created_event("bf_001");
+        state.fold_event(&event);
+
+        let backfill = state.backfills.get("bf_001").expect("backfill should exist");
+        assert_eq!(backfill.state, BackfillState::Running);
+        assert_eq!(backfill.state_version, 1);
+        assert_eq!(backfill.total_partitions, 3);
+        assert_eq!(backfill.chunk_size, 2);
+        assert_eq!(backfill.max_concurrent_runs, 2);
+    }
+
+    #[test]
+    fn test_fold_backfill_chunk_planned_updates_chunks_and_backfill() {
+        let mut state = FoldState::new();
+
+        state.fold_event(&backfill_created_event("bf_002"));
+        state.fold_event(&backfill_chunk_planned_event("bf_002", 0));
+
+        let chunk = state
+            .backfill_chunks
+            .get("bf_002:0")
+            .expect("chunk should exist");
+        assert_eq!(chunk.state, ChunkState::Planned);
+        assert_eq!(chunk.run_key, "backfill:bf_002:chunk:0");
+
+        let backfill = state.backfills.get("bf_002").expect("backfill should exist");
+        assert_eq!(backfill.planned_chunks, 1);
+    }
+
+    #[test]
+    fn test_fold_backfill_state_changed_updates_state() {
+        let mut state = FoldState::new();
+
+        state.fold_event(&backfill_created_event("bf_003"));
+        let event = backfill_state_changed_event(
+            "bf_003",
+            BackfillState::Running,
+            BackfillState::Paused,
+            2,
+        );
+        state.fold_event(&event);
+
+        let backfill = state.backfills.get("bf_003").expect("backfill should exist");
+        assert_eq!(backfill.state, BackfillState::Paused);
+        assert_eq!(backfill.state_version, 2);
+    }
+
+    #[test]
+    fn test_fold_backfill_state_changed_rejects_invalid_version() {
+        let mut state = FoldState::new();
+
+        state.fold_event(&backfill_created_event("bf_004"));
+        let event = backfill_state_changed_event(
+            "bf_004",
+            BackfillState::Running,
+            BackfillState::Paused,
+            4,
+        );
+        state.fold_event(&event);
+
+        let backfill = state.backfills.get("bf_004").expect("backfill should exist");
+        assert_eq!(backfill.state, BackfillState::Running);
+        assert_eq!(backfill.state_version, 1);
     }
 
     // ========================================================================
@@ -3678,7 +4535,9 @@ mod tests {
             Some("cursor_v1"),
             Some("cursor_v2"), // Would update cursor if accepted
             Some(1),           // Stale! Current is 2
-            TriggerSource::Poll { poll_epoch: 1736935200 },
+            TriggerSource::Poll {
+                poll_epoch: 1736935200,
+            },
         );
 
         state.fold_event(&event);
@@ -3730,7 +4589,9 @@ mod tests {
             Some("cursor_v1"),
             Some("cursor_v2"),
             Some(1),
-            TriggerSource::Poll { poll_epoch: 1736935200 },
+            TriggerSource::Poll {
+                poll_epoch: 1736935200,
+            },
         );
         state.fold_event(&event);
 
@@ -3777,7 +4638,9 @@ mod tests {
             Some("cursor_v1"),
             Some("cursor_v2"),
             Some(2), // Matches current state_version
-            TriggerSource::Poll { poll_epoch: 1736935200 },
+            TriggerSource::Poll {
+                poll_epoch: 1736935200,
+            },
         );
 
         state.fold_event(&event);

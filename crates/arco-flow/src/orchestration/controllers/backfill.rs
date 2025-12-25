@@ -30,11 +30,14 @@
 //! 3. **Concurrency control**: `max_concurrent_runs` limits active chunks
 //! 4. **Atomic emission**: `BackfillChunkPlanned` and `RunRequested` in same batch (P0-1)
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
+use metrics::{counter, histogram};
+use tracing::warn;
 
+use crate::metrics::{TimingGuard, labels as metrics_labels, names as metrics_names};
 use crate::orchestration::compactor::fold::{BackfillChunkRow, BackfillRow, RunRow};
 use crate::orchestration::compactor::manifest::Watermarks;
 use crate::orchestration::events::{
@@ -116,6 +119,9 @@ pub enum BackfillError {
     /// Backfill record could not be found.
     #[error("Backfill not found: {0}")]
     NotFound(String),
+    /// Invalid backfill request or configuration.
+    #[error("Invalid backfill request: {0}")]
+    InvalidRequest(String),
 }
 
 /// Controller for backfill lifecycle management.
@@ -162,22 +168,29 @@ impl BackfillController {
     /// Preview a backfill before creating it.
     ///
     /// Returns partition count and chunk breakdown without creating any events.
-    #[must_use]
+    ///
+    /// # Errors
+    /// Returns error if asset_key is empty, range is invalid, or partitions resolve to zero.
     pub fn preview(
         &self,
         asset_key: &str,
         partition_start: &str,
         partition_end: &str,
         chunk_size: u32,
-    ) -> BackfillPreview {
+    ) -> Result<BackfillPreview, BackfillError> {
+        self.validate_asset_key(asset_key)?;
+        self.validate_range(partition_start, partition_end)?;
+
         let total_partitions = self
             .partition_resolver
             .count_range(asset_key, partition_start, partition_end);
-        let chunk_size = if chunk_size == 0 {
-            self.default_chunk_size
-        } else {
-            chunk_size
-        };
+        if total_partitions == 0 {
+            return Err(BackfillError::InvalidRequest(
+                "partition range resolves to zero partitions".to_string(),
+            ));
+        }
+
+        let chunk_size = self.resolve_chunk_size(chunk_size)?;
         let total_chunks = total_partitions.div_ceil(chunk_size);
         let first_chunk = self.partition_resolver.list_range_chunk(
             asset_key,
@@ -186,43 +199,63 @@ impl BackfillController {
             0,
             chunk_size,
         );
+        if first_chunk.is_empty() {
+            return Err(BackfillError::InvalidRequest(
+                "partition range returned no partitions for preview".to_string(),
+            ));
+        }
 
-        BackfillPreview {
+        Ok(BackfillPreview {
             total_partitions,
             total_chunks,
             first_chunk_partitions: first_chunk,
             estimated_runs: total_chunks,
-        }
+        })
     }
 
     /// Create a backfill from a partition range.
     ///
     /// Returns a `BackfillCreated` event with a compact `PartitionSelector`.
     /// Per P0-6, the event stores the range, not the full partition list.
-    #[must_use]
-    pub fn create(&self, request: &CreateBackfillRequest<'_>) -> OrchestrationEvent {
-        let asset_key = request
-            .asset_selection
-            .first()
-            .map_or("", String::as_str);
+    ///
+    /// # Errors
+    /// Returns error if validation fails (empty assets, invalid range, zero partitions).
+    pub fn create(
+        &self,
+        request: &CreateBackfillRequest<'_>,
+    ) -> Result<OrchestrationEvent, BackfillError> {
+        let asset_key = self.ensure_single_asset(request.asset_selection)?;
+        self.validate_range(request.partition_start, request.partition_end)?;
+        self.validate_request_id(request.client_request_id, "client_request_id")?;
+        self.validate_request_id(request.backfill_id, "backfill_id")?;
+
         let total_partitions = self.partition_resolver.count_range(
             asset_key,
             request.partition_start,
             request.partition_end,
         );
+        if total_partitions == 0 {
+            return Err(BackfillError::InvalidRequest(
+                "partition range resolves to zero partitions".to_string(),
+            ));
+        }
+        let sample = self.partition_resolver.list_range_chunk(
+            asset_key,
+            request.partition_start,
+            request.partition_end,
+            0,
+            1,
+        );
+        if sample.is_empty() {
+            return Err(BackfillError::InvalidRequest(
+                "partition range returned no partitions".to_string(),
+            ));
+        }
 
-        let chunk_size = if request.chunk_size == 0 {
-            self.default_chunk_size
-        } else {
-            request.chunk_size
-        };
-        let max_concurrent_runs = if request.max_concurrent_runs == 0 {
-            self.default_max_concurrent
-        } else {
-            request.max_concurrent_runs
-        };
+        let chunk_size = self.resolve_chunk_size(request.chunk_size)?;
+        let max_concurrent_runs = self.resolve_max_concurrent(request.max_concurrent_runs)?;
 
-        OrchestrationEvent::new(
+        Ok(OrchestrationEvent::new(
             request.tenant_id,
             request.workspace_id,
             OrchestrationEventData::BackfillCreated {
@@ -238,7 +271,7 @@ impl BackfillController {
                 max_concurrent_runs,
                 parent_backfill_id: None,
             },
-        )
+        ))
     }
 
     /// Reconcile backfills and plan next chunks.
@@ -256,15 +289,34 @@ impl BackfillController {
         chunks: &HashMap<String, BackfillChunkRow>,
         runs: &HashMap<String, RunRow>,
     ) -> Vec<OrchestrationEvent> {
+        let _guard = TimingGuard::new(|duration| {
+            histogram!(
+                metrics_names::ORCH_CONTROLLER_RECONCILE_SECONDS,
+                metrics_labels::CONTROLLER => "backfill".to_string(),
+            )
+            .record(duration.as_secs_f64());
+        });
+
         // Check watermark freshness - critical guard!
         if !watermarks.is_fresh(self.max_compaction_lag) {
             return Vec::new();
         }
 
         let mut events = Vec::new();
+        let mut run_requests = 0_u64;
 
         for (backfill_id, backfill) in backfills {
             if backfill.state != BackfillState::Running {
+                continue;
+            }
+
+            if backfill.chunk_size == 0 || backfill.max_concurrent_runs == 0 {
+                warn!(
+                    backfill_id = %backfill_id,
+                    chunk_size = backfill.chunk_size,
+                    max_concurrent_runs = backfill.max_concurrent_runs,
+                    "skipping backfill planning due to invalid configuration"
+                );
                 continue;
             }
 
@@ -275,13 +327,41 @@ impl BackfillController {
             let chunks_to_plan = backfill.max_concurrent_runs.saturating_sub(active_chunks);
             let total_chunks = self.total_chunks(backfill);
 
-            for i in 0..chunks_to_plan {
-                let next_chunk_index = backfill.planned_chunks + i;
-                if next_chunk_index >= total_chunks {
+            if total_chunks == 0 || chunks_to_plan == 0 {
+                continue;
+            }
+
+            let mut planned = 0_u32;
+            let mut next_chunk_index = backfill.planned_chunks;
+
+            while planned < chunks_to_plan && next_chunk_index < total_chunks {
+                let chunk_id = format!("{backfill_id}:{next_chunk_index}");
+                if chunks.contains_key(&chunk_id) {
+                    next_chunk_index += 1;
+                    continue;
+                }
+
+                let partition_keys = match self.get_chunk_partitions(backfill, next_chunk_index) {
+                    Ok(keys) => keys,
+                    Err(err) => {
+                        warn!(
+                            backfill_id = %backfill_id,
+                            chunk_index = next_chunk_index,
+                            "skipping backfill planning due to invalid selector: {err}"
+                        );
+                        break;
+                    }
+                };
+
+                if partition_keys.is_empty() {
+                    warn!(
+                        backfill_id = %backfill_id,
+                        chunk_index = next_chunk_index,
+                        "skipping backfill planning due to empty partition selection"
+                    );
                     break;
                 }
 
-                let partition_keys = self.get_chunk_partitions(backfill, next_chunk_index);
                 let chunk_events = self.plan_chunk(
                     backfill_id,
                     next_chunk_index,
@@ -290,8 +370,40 @@ impl BackfillController {
                     &backfill.tenant_id,
                     &backfill.workspace_id,
                 );
-                events.extend(chunk_events);
+
+                if !chunk_events.is_empty() {
+                    run_requests = run_requests.saturating_add(
+                        chunk_events
+                            .iter()
+                            .filter(|e| {
+                                matches!(
+                                    &e.data,
+                                    OrchestrationEventData::RunRequested { .. }
+                                )
+                            })
+                            .count() as u64,
+                    );
+                    events.extend(chunk_events);
+                    planned += 1;
+                }
+
+                next_chunk_index += 1;
             }
+        }
+
+        let actions = u64::try_from(events.len()).unwrap_or(0);
+        counter!(
+            metrics_names::ORCH_CONTROLLER_ACTIONS_TOTAL,
+            metrics_labels::CONTROLLER => "backfill".to_string(),
+        )
+        .increment(actions);
+
+        if run_requests > 0 {
+            counter!(
+                metrics_names::RUN_REQUESTS_TOTAL,
+                metrics_labels::SOURCE => "backfill".to_string(),
+            )
+            .increment(run_requests);
         }
 
         events
@@ -310,6 +422,10 @@ impl BackfillController {
         tenant_id: &str,
         workspace_id: &str,
     ) -> Vec<OrchestrationEvent> {
+        if partition_keys.is_empty() {
+            return Vec::new();
+        }
+
         let chunk_id = format!("{backfill_id}:{chunk_index}");
         let run_key = format!("backfill:{backfill_id}:chunk:{chunk_index}");
         let fingerprint = compute_request_fingerprint(partition_keys);
@@ -350,14 +466,16 @@ impl BackfillController {
     }
 
     /// Pause a running backfill.
-    #[must_use]
+    ///
+    /// # Errors
+    /// Returns error if state transition is invalid.
     pub fn pause(
         &self,
         backfill_id: &str,
         current: &BackfillRow,
         tenant_id: &str,
         workspace_id: &str,
-    ) -> OrchestrationEvent {
+    ) -> Result<OrchestrationEvent, BackfillError> {
         self.transition(
             backfill_id,
             current,
@@ -369,14 +487,16 @@ impl BackfillController {
     }
 
     /// Resume a paused backfill.
-    #[must_use]
+    ///
+    /// # Errors
+    /// Returns error if state transition is invalid.
     pub fn resume(
         &self,
         backfill_id: &str,
         current: &BackfillRow,
         tenant_id: &str,
         workspace_id: &str,
-    ) -> OrchestrationEvent {
+    ) -> Result<OrchestrationEvent, BackfillError> {
         self.transition(
             backfill_id,
             current,
@@ -388,14 +508,16 @@ impl BackfillController {
     }
 
     /// Cancel a backfill.
-    #[must_use]
+    ///
+    /// # Errors
+    /// Returns error if state transition is invalid.
     pub fn cancel(
         &self,
         backfill_id: &str,
         current: &BackfillRow,
         tenant_id: &str,
         workspace_id: &str,
-    ) -> OrchestrationEvent {
+    ) -> Result<OrchestrationEvent, BackfillError> {
         self.transition(
             backfill_id,
             current,
@@ -413,21 +535,51 @@ impl BackfillController {
         expected_version: u32,
         current: &BackfillRow,
     ) -> Result<OrchestrationEvent, BackfillError> {
-        if current.state_version != expected_version {
-            return Err(BackfillError::VersionConflict {
-                expected: expected_version,
-                actual: current.state_version,
-            });
-        }
+        self.transition_with_version(
+            backfill_id,
+            expected_version,
+            current,
+            BackfillState::Paused,
+        )
+    }
 
-        Ok(self.pause(backfill_id, current, &current.tenant_id, &current.workspace_id))
+    /// Resume with version check for idempotent operations.
+    pub fn resume_with_version(
+        &self,
+        backfill_id: &str,
+        expected_version: u32,
+        current: &BackfillRow,
+    ) -> Result<OrchestrationEvent, BackfillError> {
+        self.transition_with_version(
+            backfill_id,
+            expected_version,
+            current,
+            BackfillState::Running,
+        )
+    }
+
+    /// Cancel with version check for idempotent operations.
+    pub fn cancel_with_version(
+        &self,
+        backfill_id: &str,
+        expected_version: u32,
+        current: &BackfillRow,
+    ) -> Result<OrchestrationEvent, BackfillError> {
+        self.transition_with_version(
+            backfill_id,
+            expected_version,
+            current,
+            BackfillState::Cancelled,
+        )
     }
 
     /// Create a retry backfill from failed chunks.
     ///
     /// Creates a new backfill with `parent_backfill_id` set, containing only
     /// the failed partitions from the parent.
-    #[must_use]
+    ///
+    /// # Errors
+    /// Returns error if parent is not FAILED, chunks don't belong to parent, or validation fails.
     pub fn retry_failed(
         &self,
         new_backfill_id: &str,
@@ -436,16 +588,58 @@ impl BackfillController {
         retry_request_id: &str,
         tenant_id: &str,
         workspace_id: &str,
-    ) -> OrchestrationEvent {
-        // Collect only failed partitions
-        let partition_keys: Vec<String> = failed_chunks
-            .iter()
-            .flat_map(|c| c.partition_keys.clone())
-            .collect();
+    ) -> Result<OrchestrationEvent, BackfillError> {
+        self.validate_request_id(new_backfill_id, "backfill_id")?;
+        self.validate_request_id(retry_request_id, "retry_request_id")?;
 
+        if parent.tenant_id != tenant_id || parent.workspace_id != workspace_id {
+            return Err(BackfillError::InvalidRequest(
+                "parent backfill tenant/workspace mismatch".to_string(),
+            ));
+        }
+        if parent.state != BackfillState::Failed {
+            return Err(BackfillError::InvalidRequest(
+                "retry_failed requires parent backfill in FAILED state".to_string(),
+            ));
+        }
+        if failed_chunks.is_empty() {
+            return Err(BackfillError::InvalidRequest(
+                "retry_failed requires at least one failed chunk".to_string(),
+            ));
+        }
+
+        let mut partitions = BTreeSet::new();
+        for chunk in failed_chunks {
+            if chunk.backfill_id != parent.backfill_id {
+                return Err(BackfillError::InvalidRequest(
+                    "failed chunk does not belong to parent backfill".to_string(),
+                ));
+            }
+            if chunk.state != ChunkState::Failed {
+                return Err(BackfillError::InvalidRequest(
+                    "retry_failed requires failed chunks only".to_string(),
+                ));
+            }
+            for key in &chunk.partition_keys {
+                if key.is_empty() {
+                    return Err(BackfillError::InvalidRequest(
+                        "partition key cannot be empty".to_string(),
+                    ));
+                }
+                partitions.insert(key.clone());
+            }
+        }
+
+        if partitions.is_empty() {
+            return Err(BackfillError::InvalidRequest(
+                "retry_failed resolved zero partitions".to_string(),
+            ));
+        }
+
+        let partition_keys: Vec<String> = partitions.into_iter().collect();
         let total_partitions = partition_keys.len() as u32;
 
-        OrchestrationEvent::new_with_idempotency_key(
+        Ok(OrchestrationEvent::new_with_idempotency_key(
             tenant_id,
             workspace_id,
             OrchestrationEventData::BackfillCreated {
@@ -460,7 +654,7 @@ impl BackfillController {
             },
             // Idempotency based on parent + retry_request_id
             format!("backfill_retry:{}:{}", parent.backfill_id, retry_request_id),
-        )
+        ))
     }
 
     fn transition(
@@ -471,10 +665,17 @@ impl BackfillController {
         tenant_id: &str,
         workspace_id: &str,
         changed_by: Option<String>,
-    ) -> OrchestrationEvent {
+    ) -> Result<OrchestrationEvent, BackfillError> {
+        if !BackfillState::is_valid_transition(current.state, to_state) {
+            return Err(BackfillError::InvalidTransition {
+                from: current.state,
+                to: to_state,
+            });
+        }
+
         let new_version = current.state_version + 1;
 
-        OrchestrationEvent::new(
+        Ok(OrchestrationEvent::new(
             tenant_id,
             workspace_id,
             OrchestrationEventData::BackfillStateChanged {
@@ -484,6 +685,30 @@ impl BackfillController {
                 state_version: new_version,
                 changed_by,
             },
+        ))
+    }
+
+    fn transition_with_version(
+        &self,
+        backfill_id: &str,
+        expected_version: u32,
+        current: &BackfillRow,
+        to_state: BackfillState,
+    ) -> Result<OrchestrationEvent, BackfillError> {
+        if current.state_version != expected_version {
+            return Err(BackfillError::VersionConflict {
+                expected: expected_version,
+                actual: current.state_version,
+            });
+        }
+
+        self.transition(
+            backfill_id,
+            current,
+            to_state,
+            &current.tenant_id,
+            &current.workspace_id,
+            None,
         )
     }
 
@@ -506,31 +731,128 @@ impl BackfillController {
             .count() as u32
     }
 
-    fn total_chunks(&self, backfill: &BackfillRow) -> u32 {
-        backfill.total_partitions.div_ceil(backfill.chunk_size)
+    fn ensure_single_asset<'a>(
+        &self,
+        asset_selection: &'a [String],
+    ) -> Result<&'a str, BackfillError> {
+        if asset_selection.is_empty() {
+            return Err(BackfillError::InvalidRequest(
+                "asset_selection cannot be empty".to_string(),
+            ));
+        }
+        if asset_selection.len() != 1 {
+            return Err(BackfillError::InvalidRequest(
+                "multi-asset backfills are not supported yet".to_string(),
+            ));
+        }
+        let asset_key = asset_selection[0].as_str();
+        self.validate_asset_key(asset_key)?;
+        Ok(asset_key)
     }
 
-    fn get_chunk_partitions(&self, backfill: &BackfillRow, chunk_index: u32) -> Vec<String> {
-        let offset = chunk_index * backfill.chunk_size;
+    fn validate_asset_key(&self, asset_key: &str) -> Result<(), BackfillError> {
+        if asset_key.trim().is_empty() {
+            return Err(BackfillError::InvalidRequest(
+                "asset_key cannot be empty".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_range(&self, partition_start: &str, partition_end: &str) -> Result<(), BackfillError> {
+        if partition_start.trim().is_empty() || partition_end.trim().is_empty() {
+            return Err(BackfillError::InvalidRequest(
+                "partition_start and partition_end are required".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_request_id(&self, value: &str, field: &str) -> Result<(), BackfillError> {
+        if value.trim().is_empty() {
+            return Err(BackfillError::InvalidRequest(format!(
+                "{field} cannot be empty"
+            )));
+        }
+        Ok(())
+    }
+
+    fn resolve_chunk_size(&self, chunk_size: u32) -> Result<u32, BackfillError> {
+        let resolved = if chunk_size == 0 {
+            self.default_chunk_size
+        } else {
+            chunk_size
+        };
+
+        if resolved == 0 {
+            return Err(BackfillError::InvalidRequest(
+                "chunk_size must be greater than zero".to_string(),
+            ));
+        }
+        Ok(resolved)
+    }
+
+    fn resolve_max_concurrent(&self, max_concurrent_runs: u32) -> Result<u32, BackfillError> {
+        let resolved = if max_concurrent_runs == 0 {
+            self.default_max_concurrent
+        } else {
+            max_concurrent_runs
+        };
+
+        if resolved == 0 {
+            return Err(BackfillError::InvalidRequest(
+                "max_concurrent_runs must be greater than zero".to_string(),
+            ));
+        }
+        Ok(resolved)
+    }
+
+    fn total_chunks(&self, backfill: &BackfillRow) -> u32 {
+        if backfill.chunk_size == 0 {
+            return 0;
+        }
+
+        let total_partitions = match &backfill.partition_selector {
+            PartitionSelector::Explicit { partition_keys } => partition_keys.len() as u32,
+            _ => backfill.total_partitions,
+        };
+
+        total_partitions.div_ceil(backfill.chunk_size)
+    }
+
+    fn get_chunk_partitions(
+        &self,
+        backfill: &BackfillRow,
+        chunk_index: u32,
+    ) -> Result<Vec<String>, BackfillError> {
+        let offset = chunk_index.saturating_mul(backfill.chunk_size);
         let limit = backfill.chunk_size;
-        let asset_key = backfill.asset_selection.first().map_or("", String::as_str);
+
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let asset_key = self.ensure_single_asset(&backfill.asset_selection)?;
 
         match &backfill.partition_selector {
             PartitionSelector::Range { start, end } => {
-                self.partition_resolver
-                    .list_range_chunk(asset_key, start, end, offset, limit)
+                Ok(self.partition_resolver.list_range_chunk(
+                    asset_key,
+                    start,
+                    end,
+                    offset,
+                    limit,
+                ))
             }
-            PartitionSelector::Explicit { partition_keys } => partition_keys
+            PartitionSelector::Explicit { partition_keys } => Ok(partition_keys
                 .iter()
                 .skip(offset as usize)
                 .take(limit as usize)
                 .cloned()
-                .collect(),
-            PartitionSelector::Filter { .. } => {
-                // Filter-based partition resolution would go here
-                // For now, return empty (filters need external resolution)
-                Vec::new()
-            }
+                .collect()),
+            PartitionSelector::Filter { .. } => Err(BackfillError::InvalidRequest(
+                "filter partition selector is not supported yet".to_string(),
+            )),
         }
     }
 }
@@ -642,7 +964,9 @@ mod tests {
     fn test_backfill_preview_returns_partition_count_and_chunks() {
         let controller = BackfillController::new(test_partition_resolver());
 
-        let preview = controller.preview("analytics.daily", "2025-01-01", "2025-01-31", 10);
+        let preview = controller
+            .preview("analytics.daily", "2025-01-01", "2025-01-31", 10)
+            .expect("preview should succeed");
 
         assert_eq!(preview.total_partitions, 31);
         assert_eq!(preview.total_chunks, 4); // ceil(31/10)
@@ -654,7 +978,9 @@ mod tests {
     fn test_backfill_preview_uses_default_chunk_size() {
         let controller = BackfillController::new(test_partition_resolver());
 
-        let preview = controller.preview("analytics.daily", "2025-01-01", "2025-01-10", 0);
+        let preview = controller
+            .preview("analytics.daily", "2025-01-01", "2025-01-10", 0)
+            .expect("preview should succeed");
 
         // Default chunk size is 10, so 10 partitions = 1 chunk
         assert_eq!(preview.total_partitions, 10);
@@ -670,7 +996,8 @@ mod tests {
         let controller = BackfillController::new(test_partition_resolver());
         let assets = vec!["analytics.daily".into()];
 
-        let event = controller.create(&CreateBackfillRequest {
+        let event = controller
+            .create(&CreateBackfillRequest {
             backfill_id: "bf_01HQ123",
             tenant_id: "tenant-abc",
             workspace_id: "workspace-prod",
@@ -680,7 +1007,8 @@ mod tests {
             chunk_size: 10,
             max_concurrent_runs: 2,
             client_request_id: "client_req_001",
-        });
+        })
+            .expect("create should succeed");
 
         if let OrchestrationEventData::BackfillCreated {
             backfill_id,
@@ -712,7 +1040,8 @@ mod tests {
         let controller = BackfillController::new(test_partition_resolver());
         let assets = vec!["analytics.daily".into()];
 
-        let event = controller.create(&CreateBackfillRequest {
+        let event = controller
+            .create(&CreateBackfillRequest {
             backfill_id: "bf_001",
             tenant_id: "tenant-abc",
             workspace_id: "workspace-prod",
@@ -722,7 +1051,8 @@ mod tests {
             chunk_size: 10,
             max_concurrent_runs: 2,
             client_request_id: "client_001",
-        });
+        })
+            .expect("create should succeed");
 
         // Per P0-6: should use Range selector, not Explicit with 365 partition keys
         if let OrchestrationEventData::BackfillCreated {
@@ -734,6 +1064,52 @@ mod tests {
                 "Should use Range selector for compact storage"
             );
         }
+    }
+
+    #[test]
+    fn test_backfill_create_rejects_empty_asset_selection() {
+        let controller = BackfillController::new(test_partition_resolver());
+        let assets: Vec<String> = Vec::new();
+
+        let result = controller.create(&CreateBackfillRequest {
+            backfill_id: "bf_001",
+            tenant_id: "tenant-abc",
+            workspace_id: "workspace-prod",
+            asset_selection: &assets,
+            partition_start: "2025-01-01",
+            partition_end: "2025-01-31",
+            chunk_size: 10,
+            max_concurrent_runs: 2,
+            client_request_id: "client_001",
+        });
+
+        assert!(matches!(
+            result,
+            Err(BackfillError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn test_backfill_create_rejects_multiple_assets() {
+        let controller = BackfillController::new(test_partition_resolver());
+        let assets = vec!["analytics.daily".into(), "analytics.weekly".into()];
+
+        let result = controller.create(&CreateBackfillRequest {
+            backfill_id: "bf_002",
+            tenant_id: "tenant-abc",
+            workspace_id: "workspace-prod",
+            asset_selection: &assets,
+            partition_start: "2025-01-01",
+            partition_end: "2025-01-31",
+            chunk_size: 10,
+            max_concurrent_runs: 2,
+            client_request_id: "client_002",
+        });
+
+        assert!(matches!(
+            result,
+            Err(BackfillError::InvalidRequest(_))
+        ));
     }
 
     // ========================================================================
@@ -830,7 +1206,9 @@ mod tests {
             ..default_backfill_row()
         };
 
-        let event = controller.pause("bf_001", &current_state, "tenant-abc", "workspace-prod");
+        let event = controller
+            .pause("bf_001", &current_state, "tenant-abc", "workspace-prod")
+            .expect("pause should succeed");
 
         if let OrchestrationEventData::BackfillStateChanged {
             from_state,
@@ -874,6 +1252,22 @@ mod tests {
     }
 
     #[test]
+    fn test_backfill_pause_rejects_invalid_transition() {
+        let controller = BackfillController::new(test_partition_resolver());
+
+        let current = BackfillRow {
+            state: BackfillState::Paused,
+            ..default_backfill_row()
+        };
+
+        let result = controller.pause("bf_001", &current, "tenant-abc", "workspace-prod");
+        assert!(matches!(
+            result,
+            Err(BackfillError::InvalidTransition { .. })
+        ));
+    }
+
+    #[test]
     fn test_backfill_resume_from_paused() {
         let controller = BackfillController::new(test_partition_resolver());
 
@@ -883,7 +1277,9 @@ mod tests {
             ..default_backfill_row()
         };
 
-        let event = controller.resume("bf_001", &current, "tenant-abc", "workspace-prod");
+        let event = controller
+            .resume("bf_001", &current, "tenant-abc", "workspace-prod")
+            .expect("resume should succeed");
 
         if let OrchestrationEventData::BackfillStateChanged {
             from_state,
@@ -908,7 +1304,9 @@ mod tests {
             ..default_backfill_row()
         };
 
-        let event = controller.cancel("bf_001", &current, "tenant-abc", "workspace-prod");
+        let event = controller
+            .cancel("bf_001", &current, "tenant-abc", "workspace-prod")
+            .expect("cancel should succeed");
 
         if let OrchestrationEventData::BackfillStateChanged {
             to_state,
@@ -962,14 +1360,16 @@ mod tests {
             },
         ];
 
-        let event = controller.retry_failed(
+        let event = controller
+            .retry_failed(
             "bf_002",
             &parent,
             &failed_chunks,
             "retry_req_001",
             "tenant-abc",
             "workspace-prod",
-        );
+        )
+            .expect("retry_failed should succeed");
 
         if let OrchestrationEventData::BackfillCreated {
             backfill_id,
@@ -1020,7 +1420,57 @@ mod tests {
             row_version: "row_001".into(),
         }];
 
-        let event1 = controller.retry_failed(
+        let event1 = controller
+            .retry_failed(
+            "bf_002",
+            &parent,
+            &failed_chunks,
+            "retry_req_001",
+            "tenant-abc",
+            "workspace-prod",
+        )
+            .expect("retry_failed should succeed");
+
+        let event2 = controller
+            .retry_failed(
+            "bf_003", // Different ID, same request
+            &parent,
+            &failed_chunks,
+            "retry_req_001", // Same request ID
+            "tenant-abc",
+            "workspace-prod",
+        )
+            .expect("retry_failed should succeed");
+
+        // Idempotency key based on parent + retry_request_id
+        assert!(event1.idempotency_key.contains("retry_req_001"));
+        assert_eq!(event1.idempotency_key, event2.idempotency_key);
+    }
+
+    #[test]
+    fn test_retry_failed_rejects_non_failed_parent() {
+        let controller = BackfillController::new(test_partition_resolver());
+
+        let parent = BackfillRow {
+            backfill_id: "bf_001".into(),
+            state: BackfillState::Running,
+            ..default_backfill_row()
+        };
+
+        let failed_chunks = vec![BackfillChunkRow {
+            tenant_id: "tenant-abc".into(),
+            workspace_id: "workspace-prod".into(),
+            chunk_id: "bf_001:2".into(),
+            backfill_id: "bf_001".into(),
+            chunk_index: 2,
+            state: ChunkState::Failed,
+            partition_keys: vec!["2025-01-03".into()],
+            run_key: "backfill:bf_001:chunk:2".into(),
+            run_id: None,
+            row_version: "row_001".into(),
+        }];
+
+        let result = controller.retry_failed(
             "bf_002",
             &parent,
             &failed_chunks,
@@ -1029,18 +1479,10 @@ mod tests {
             "workspace-prod",
         );
 
-        let event2 = controller.retry_failed(
-            "bf_003", // Different ID, same request
-            &parent,
-            &failed_chunks,
-            "retry_req_001", // Same request ID
-            "tenant-abc",
-            "workspace-prod",
-        );
-
-        // Idempotency key based on parent + retry_request_id
-        assert!(event1.idempotency_key.contains("retry_req_001"));
-        assert_eq!(event1.idempotency_key, event2.idempotency_key);
+        assert!(matches!(
+            result,
+            Err(BackfillError::InvalidRequest(_))
+        ));
     }
 
     #[test]
@@ -1076,6 +1518,32 @@ mod tests {
         assert!(
             events.is_empty(),
             "Should not plan chunks when compaction is lagging"
+        );
+    }
+
+    #[test]
+    fn test_backfill_reconcile_skips_filter_selector() {
+        let controller = BackfillController::new(test_partition_resolver());
+
+        let mut backfills = HashMap::new();
+        backfills.insert(
+            "bf_filter".into(),
+            BackfillRow {
+                backfill_id: "bf_filter".into(),
+                partition_selector: PartitionSelector::Filter {
+                    filters: HashMap::new(),
+                },
+                total_partitions: 1,
+                ..default_backfill_row()
+            },
+        );
+
+        let watermarks = fresh_watermarks();
+        let events = controller.reconcile(&watermarks, &backfills, &HashMap::new(), &HashMap::new());
+
+        assert!(
+            events.is_empty(),
+            "Should not plan chunks for unsupported filter selector"
         );
     }
 }

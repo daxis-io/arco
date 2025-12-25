@@ -32,15 +32,14 @@ pub mod automation_events;
 pub mod backfill_events;
 
 pub use automation_events::{
-    RunRequest, SensorEvalStatus, SensorStatus, SourceRef, TickStatus, TriggerSource,
-    sha256_hex,
+    RunRequest, SensorEvalStatus, SensorStatus, SourceRef, TickStatus, TriggerSource, sha256_hex,
 };
 pub use backfill_events::{BackfillState, ChunkState, PartitionSelector};
 
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use ulid::Ulid;
 
 /// Orchestration event envelope.
@@ -109,6 +108,39 @@ impl OrchestrationEvent {
             tenant_id: tenant,
             workspace_id: workspace,
             idempotency_key,
+            correlation_id,
+            causation_id: None,
+            data,
+        }
+    }
+
+    /// Creates a new orchestration event with a custom idempotency key.
+    ///
+    /// Use this when you need to override the auto-generated idempotency key,
+    /// such as for retry-failed backfills where idempotency should be based on
+    /// the parent backfill + request ID rather than the event data.
+    #[must_use]
+    pub fn new_with_idempotency_key(
+        tenant_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        data: OrchestrationEventData,
+        idempotency_key: impl Into<String>,
+    ) -> Self {
+        let tenant = tenant_id.into();
+        let workspace = workspace_id.into();
+        let event_id = Ulid::new().to_string();
+        let event_type = data.event_type().to_string();
+        let correlation_id = data.run_id().map(ToString::to_string);
+
+        Self {
+            event_id,
+            event_type,
+            event_version: 1,
+            timestamp: Utc::now(),
+            source: format!("servo/{tenant}/{workspace}"),
+            tenant_id: tenant,
+            workspace_id: workspace,
+            idempotency_key: idempotency_key.into(),
             correlation_id,
             causation_id: None,
             data,
@@ -547,19 +579,17 @@ impl OrchestrationEventData {
                 trigger_source,
                 cursor_before,
                 ..
-            } => {
-                match trigger_source {
-                    TriggerSource::Push { message_id } => {
-                        format!("sensor_eval:{sensor_id}:msg:{message_id}")
-                    }
-                    TriggerSource::Poll { poll_epoch } => {
-                        let cursor_hash = cursor_before
-                            .as_ref()
-                            .map_or_else(|| "none".to_string(), |c| sha256_hex(c));
-                        format!("sensor_eval:{sensor_id}:poll:{poll_epoch}:{cursor_hash}")
-                    }
+            } => match trigger_source {
+                TriggerSource::Push { message_id } => {
+                    format!("sensor_eval:{sensor_id}:msg:{message_id}")
                 }
-            }
+                TriggerSource::Poll { poll_epoch } => {
+                    let cursor_hash = cursor_before
+                        .as_ref()
+                        .map_or_else(|| "none".to_string(), |c| sha256_hex(c));
+                    format!("sensor_eval:{sensor_id}:poll:{poll_epoch}:{cursor_hash}")
+                }
+            },
 
             Self::RunRequested {
                 run_key,

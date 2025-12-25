@@ -101,6 +101,9 @@ fn task_finished_event(
             metrics: None,
             cancelled_during_phase: None,
             partial_progress: None,
+            asset_key: None,
+            partition_key: None,
+            code_version: None,
         },
     )
 }

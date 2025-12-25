@@ -49,6 +49,7 @@ pub mod idempotency;
 pub mod metrics;
 pub mod openapi;
 pub mod pointer;
+pub(crate) mod paths;
 pub mod reconciler;
 pub mod router;
 pub mod state;

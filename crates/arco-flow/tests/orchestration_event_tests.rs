@@ -71,6 +71,9 @@ fn test_task_finished_with_attempt_id() {
             metrics: None,
             cancelled_during_phase: None,
             partial_progress: None,
+            asset_key: None,
+            partition_key: None,
+            code_version: None,
         },
     );
 

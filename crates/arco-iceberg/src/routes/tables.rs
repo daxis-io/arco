@@ -25,6 +25,7 @@ use crate::commit::{CommitError, CommitService};
 use crate::context::IcebergRequestContext;
 use crate::error::{IcebergError, IcebergResult};
 use crate::idempotency::{IdempotencyMarker, canonical_request_hash};
+use crate::paths::resolve_metadata_path;
 use crate::pointer::IcebergTablePointer;
 use crate::pointer::UpdateSource;
 use crate::routes::utils::{ensure_prefix, join_namespace, paginate, parse_namespace};
@@ -551,35 +552,6 @@ fn normalize_etag(value: &str) -> &str {
     let value = value.trim();
     let value = value.strip_prefix("W/").unwrap_or(value);
     value.trim_matches('"')
-}
-
-fn resolve_metadata_path(location: &str, tenant: &str, workspace: &str) -> IcebergResult<String> {
-    let path = if let Some((_, rest)) = location.split_once("://") {
-        let mut parts = rest.splitn(2, '/');
-        let _bucket = parts.next();
-        parts
-            .next()
-            .ok_or_else(|| IcebergError::Internal {
-                message: format!("Invalid metadata location: {location}"),
-            })?
-            .to_string()
-    } else {
-        location.to_string()
-    };
-
-    let scoped_prefix = format!("tenant={tenant}/workspace={workspace}/");
-    let relative = path
-        .strip_prefix(&scoped_prefix)
-        .unwrap_or(path.as_str())
-        .to_string();
-
-    if relative.is_empty() {
-        return Err(IcebergError::Internal {
-            message: format!("Invalid metadata location: {location}"),
-        });
-    }
-
-    Ok(relative)
 }
 
 async fn maybe_vended_credentials(

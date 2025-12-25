@@ -339,6 +339,15 @@ pub enum OrchestrationEventData {
         /// Partial progress payload for cancellation.
         #[serde(skip_serializing_if = "Option::is_none")]
         partial_progress: Option<Value>,
+        /// Asset key if this task materialized an asset partition.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        asset_key: Option<String>,
+        /// Partition key if this task materialized a partition.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partition_key: Option<String>,
+        /// Code version (e.g., git SHA) used for this materialization.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code_version: Option<String>,
     },
 
     // ========================================================================
@@ -875,6 +884,9 @@ mod tests {
             metrics: None,
             cancelled_during_phase: None,
             partial_progress: None,
+            asset_key: None,
+            partition_key: None,
+            code_version: None,
         };
 
         assert_eq!(data.idempotency_key(), "finished:run123:extract:1");

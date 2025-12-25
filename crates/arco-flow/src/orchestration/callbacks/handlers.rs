@@ -672,6 +672,10 @@ where
             metrics,
             cancelled_during_phase,
             partial_progress,
+            // TODO: Thread asset/partition info from task metadata
+            asset_key: None,
+            partition_key: None,
+            code_version: None,
         },
     );
     event.timestamp = completed_at.unwrap_or_else(Utc::now);

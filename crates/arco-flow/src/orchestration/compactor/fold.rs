@@ -1106,6 +1106,9 @@ impl FoldState {
                 attempt_id,
                 outcome,
                 error_message,
+                asset_key,
+                partition_key,
+                code_version,
                 ..
             } => {
                 self.fold_task_finished(
@@ -1115,8 +1118,13 @@ impl FoldState {
                     attempt_id,
                     *outcome,
                     error_message.clone(),
+                    asset_key.as_deref(),
+                    partition_key.as_deref(),
+                    code_version.as_deref(),
                     &event.event_id,
                     event.timestamp,
+                    &event.tenant_id,
+                    &event.workspace_id,
                 );
             }
             OrchestrationEventData::DispatchRequested {
@@ -1574,8 +1582,13 @@ impl FoldState {
         attempt_id: &str,
         outcome: TaskOutcome,
         error_message: Option<String>,
+        asset_key: Option<&str>,
+        partition_key: Option<&str>,
+        code_version: Option<&str>,
         event_id: &str,
         timestamp: DateTime<Utc>,
+        tenant_id: &str,
+        workspace_id: &str,
     ) {
         let key = (run_id.to_string(), task_key.to_string());
 
@@ -1664,6 +1677,20 @@ impl FoldState {
                     event_id,
                     timestamp,
                 );
+
+                // Update partition status (P0-5: only on success)
+                if let (Some(asset_key), Some(partition_key)) = (asset_key, partition_key) {
+                    self.update_partition_materialization(
+                        tenant_id,
+                        workspace_id,
+                        asset_key,
+                        partition_key,
+                        run_id,
+                        code_version,
+                        &timestamp,
+                        event_id,
+                    );
+                }
             } else if outcome == TaskOutcome::Failed && new_state == TaskState::Failed {
                 // Terminal failure - propagate to downstream
                 self.propagate_failure(
@@ -1688,6 +1715,20 @@ impl FoldState {
                     DepResolution::Cancelled,
                     event_id,
                     timestamp,
+                );
+            }
+
+            // Always update last_attempt_* fields (P0-5: every attempt, regardless of outcome)
+            if let (Some(asset_key), Some(partition_key)) = (asset_key, partition_key) {
+                self.update_partition_attempt(
+                    tenant_id,
+                    workspace_id,
+                    asset_key,
+                    partition_key,
+                    run_id,
+                    outcome,
+                    &timestamp,
+                    event_id,
                 );
             }
         }
@@ -2312,6 +2353,111 @@ impl FoldState {
         backfill.row_version = event_id.to_string();
     }
 
+    // ========================================================================
+    // Partition Status Tracking (P0-5)
+    // ========================================================================
+
+    /// Update partition materialization status on successful task completion.
+    /// Per P0-5: Only updates `last_materialization_*` on SUCCESS.
+    #[allow(clippy::too_many_arguments)]
+    fn update_partition_materialization(
+        &mut self,
+        tenant_id: &str,
+        workspace_id: &str,
+        asset_key: &str,
+        partition_key: &str,
+        run_id: &str,
+        code_version: Option<&str>,
+        materialized_at: &DateTime<Utc>,
+        event_id: &str,
+    ) {
+        let key = (asset_key.to_string(), partition_key.to_string());
+
+        let row = self.partition_status.entry(key).or_insert_with(|| {
+            PartitionStatusRow {
+                tenant_id: tenant_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                asset_key: asset_key.to_string(),
+                partition_key: partition_key.to_string(),
+                last_materialization_run_id: None,
+                last_materialization_at: None,
+                last_materialization_code_version: None,
+                last_attempt_run_id: None,
+                last_attempt_at: None,
+                last_attempt_outcome: None,
+                stale_since: None,
+                stale_reason_code: None,
+                partition_values: HashMap::new(),
+                // Use empty string so first event always wins
+                row_version: String::new(),
+            }
+        });
+
+        // Only update if this event is newer (ULID comparison - lexicographic)
+        // Use < (not <=) because the same event may update both materialization and attempt fields
+        if event_id < row.row_version.as_str() {
+            return;
+        }
+
+        // Update materialization fields (success only - P0-5)
+        row.last_materialization_run_id = Some(run_id.to_string());
+        row.last_materialization_at = Some(*materialized_at);
+        row.last_materialization_code_version = code_version.map(ToString::to_string);
+        // Clear staleness since we just materialized
+        row.stale_since = None;
+        row.stale_reason_code = None;
+        row.row_version = event_id.to_string();
+    }
+
+    /// Update partition attempt status on any task completion.
+    /// Per P0-5: Updates `last_attempt_*` on EVERY outcome (success, failure, etc.).
+    #[allow(clippy::too_many_arguments)]
+    fn update_partition_attempt(
+        &mut self,
+        tenant_id: &str,
+        workspace_id: &str,
+        asset_key: &str,
+        partition_key: &str,
+        run_id: &str,
+        outcome: TaskOutcome,
+        attempted_at: &DateTime<Utc>,
+        event_id: &str,
+    ) {
+        let key = (asset_key.to_string(), partition_key.to_string());
+
+        let row = self.partition_status.entry(key).or_insert_with(|| {
+            PartitionStatusRow {
+                tenant_id: tenant_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                asset_key: asset_key.to_string(),
+                partition_key: partition_key.to_string(),
+                last_materialization_run_id: None,
+                last_materialization_at: None,
+                last_materialization_code_version: None,
+                last_attempt_run_id: None,
+                last_attempt_at: None,
+                last_attempt_outcome: None,
+                stale_since: None,
+                stale_reason_code: None,
+                partition_values: HashMap::new(),
+                // Use empty string so first event always wins
+                row_version: String::new(),
+            }
+        });
+
+        // Only update if this event is newer (ULID comparison - lexicographic)
+        // Use < (not <=) because the same event may update both materialization and attempt fields
+        if event_id < row.row_version.as_str() {
+            return;
+        }
+
+        // Update attempt fields (every attempt - P0-5)
+        row.last_attempt_run_id = Some(run_id.to_string());
+        row.last_attempt_at = Some(*attempted_at);
+        row.last_attempt_outcome = Some(outcome);
+        row.row_version = event_id.to_string();
+    }
+
     fn record_idempotency_key(&mut self, event: &OrchestrationEvent) {
         self.idempotency_keys
             .entry(event.idempotency_key.clone())
@@ -2641,6 +2787,18 @@ mod tests {
         attempt_id: &str,
         outcome: TaskOutcome,
     ) -> OrchestrationEvent {
+        task_finished_event_with_asset(run_id, task_key, attempt, attempt_id, outcome, None, None)
+    }
+
+    fn task_finished_event_with_asset(
+        run_id: &str,
+        task_key: &str,
+        attempt: u32,
+        attempt_id: &str,
+        outcome: TaskOutcome,
+        asset_key: Option<&str>,
+        partition_key: Option<&str>,
+    ) -> OrchestrationEvent {
         make_event(OrchestrationEventData::TaskFinished {
             run_id: run_id.to_string(),
             task_key: task_key.to_string(),
@@ -2655,6 +2813,9 @@ mod tests {
             metrics: None,
             cancelled_during_phase: None,
             partial_progress: None,
+            asset_key: asset_key.map(ToString::to_string),
+            partition_key: partition_key.map(ToString::to_string),
+            code_version: None,
         })
     }
 
@@ -4799,5 +4960,177 @@ mod tests {
                 .state_version,
             2
         );
+    }
+
+    // ========================================================================
+    // Partition Status Tracking Tests (Epic 5)
+    // ========================================================================
+
+    #[test]
+    fn test_partition_status_updated_on_task_success() {
+        let mut state = FoldState::new();
+        let attempt_id = Ulid::new().to_string();
+
+        state.fold_event(&run_triggered_event("run1"));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "extract".into(),
+                depends_on: vec![],
+                asset_key: Some("analytics.daily".into()),
+                partition_key: Some("2025-01-15".into()),
+                max_attempts: 1,
+                heartbeat_timeout_sec: 300,
+            }],
+        ));
+
+        state.fold_event(&task_started_event("run1", "extract", 1, &attempt_id));
+        state.fold_event(&task_finished_event_with_asset(
+            "run1",
+            "extract",
+            1,
+            &attempt_id,
+            TaskOutcome::Succeeded,
+            Some("analytics.daily"),
+            Some("2025-01-15"),
+        ));
+
+        // Verify partition status updated
+        let key = ("analytics.daily".to_string(), "2025-01-15".to_string());
+        let status = state.partition_status.get(&key).expect("partition status should exist");
+
+        assert_eq!(status.asset_key, "analytics.daily");
+        assert_eq!(status.partition_key, "2025-01-15");
+        assert!(status.last_materialization_run_id.is_some());
+        assert!(status.last_materialization_at.is_some());
+        assert!(status.last_attempt_run_id.is_some());
+        assert_eq!(status.last_attempt_outcome, Some(TaskOutcome::Succeeded));
+    }
+
+    #[test]
+    fn test_partition_status_attempt_only_on_failure() {
+        let mut state = FoldState::new();
+        let attempt_id = Ulid::new().to_string();
+
+        state.fold_event(&run_triggered_event("run1"));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "extract".into(),
+                depends_on: vec![],
+                asset_key: Some("analytics.daily".into()),
+                partition_key: Some("2025-01-15".into()),
+                max_attempts: 1,
+                heartbeat_timeout_sec: 300,
+            }],
+        ));
+
+        state.fold_event(&task_started_event("run1", "extract", 1, &attempt_id));
+        state.fold_event(&task_finished_event_with_asset(
+            "run1",
+            "extract",
+            1,
+            &attempt_id,
+            TaskOutcome::Failed,
+            Some("analytics.daily"),
+            Some("2025-01-15"),
+        ));
+
+        // Verify partition status
+        let key = ("analytics.daily".to_string(), "2025-01-15".to_string());
+        let status = state.partition_status.get(&key).expect("partition status should exist");
+
+        // Per P0-5: last_materialization_* should NOT be set on failure
+        assert!(
+            status.last_materialization_run_id.is_none(),
+            "last_materialization_run_id should be None on failure"
+        );
+        assert!(
+            status.last_materialization_at.is_none(),
+            "last_materialization_at should be None on failure"
+        );
+
+        // But last_attempt_* should always be set
+        assert!(status.last_attempt_run_id.is_some());
+        assert!(status.last_attempt_at.is_some());
+        assert_eq!(status.last_attempt_outcome, Some(TaskOutcome::Failed));
+    }
+
+    #[test]
+    fn test_partition_status_materialization_only_updates_on_success() {
+        let mut state = FoldState::new();
+        let attempt_id_1 = Ulid::new().to_string();
+
+        state.fold_event(&run_triggered_event("run1"));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "extract".into(),
+                depends_on: vec![],
+                asset_key: Some("analytics.daily".into()),
+                partition_key: Some("2025-01-15".into()),
+                max_attempts: 3,
+                heartbeat_timeout_sec: 300,
+            }],
+        ));
+
+        // First attempt: SUCCESS
+        state.fold_event(&task_started_event("run1", "extract", 1, &attempt_id_1));
+        state.fold_event(&task_finished_event_with_asset(
+            "run1",
+            "extract",
+            1,
+            &attempt_id_1,
+            TaskOutcome::Succeeded,
+            Some("analytics.daily"),
+            Some("2025-01-15"),
+        ));
+
+        let key = ("analytics.daily".to_string(), "2025-01-15".to_string());
+        let status_after_success = state.partition_status.get(&key).unwrap().clone();
+        let materialization_time = status_after_success.last_materialization_at;
+
+        // Ensure next event has larger ULID
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // Now simulate a run2 that fails
+        let attempt_id_2 = Ulid::new().to_string();
+        state.fold_event(&run_triggered_event("run2"));
+        state.fold_event(&plan_created_event(
+            "run2",
+            vec![TaskDef {
+                key: "extract".into(),
+                depends_on: vec![],
+                asset_key: Some("analytics.daily".into()),
+                partition_key: Some("2025-01-15".into()),
+                max_attempts: 1,
+                heartbeat_timeout_sec: 300,
+            }],
+        ));
+        state.fold_event(&task_started_event("run2", "extract", 1, &attempt_id_2));
+        state.fold_event(&task_finished_event_with_asset(
+            "run2",
+            "extract",
+            1,
+            &attempt_id_2,
+            TaskOutcome::Failed,
+            Some("analytics.daily"),
+            Some("2025-01-15"),
+        ));
+
+        // Verify: last_materialization_* still points to successful run1
+        let status = state.partition_status.get(&key).unwrap();
+        assert_eq!(
+            status.last_materialization_at, materialization_time,
+            "Failure should not overwrite last_materialization_at"
+        );
+
+        // But last_attempt_* should point to run2
+        assert_eq!(
+            status.last_attempt_run_id,
+            Some("run2".into()),
+            "last_attempt_run_id should be from the latest attempt"
+        );
+        assert_eq!(status.last_attempt_outcome, Some(TaskOutcome::Failed));
     }
 }

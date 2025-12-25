@@ -33,7 +33,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::{Duration, Utc};
+
 use crate::orchestration::compactor::fold::{BackfillChunkRow, BackfillRow, RunRow};
+use crate::orchestration::compactor::manifest::Watermarks;
 use crate::orchestration::events::{
     BackfillState, ChunkState, OrchestrationEvent, OrchestrationEventData, PartitionSelector,
     SourceRef,
@@ -122,6 +125,8 @@ pub struct BackfillController {
     default_chunk_size: u32,
     /// Default max concurrent runs if not specified.
     default_max_concurrent: u32,
+    /// Maximum acceptable compaction lag for reconcile actions.
+    max_compaction_lag: Duration,
     /// Partition resolver for counting and listing partitions.
     partition_resolver: Arc<dyn PartitionResolver>,
 }
@@ -133,6 +138,7 @@ impl BackfillController {
         Self {
             default_chunk_size: 10,
             default_max_concurrent: 2,
+            max_compaction_lag: Duration::seconds(30),
             partition_resolver,
         }
     }
@@ -143,10 +149,12 @@ impl BackfillController {
         partition_resolver: Arc<dyn PartitionResolver>,
         default_chunk_size: u32,
         default_max_concurrent: u32,
+        max_compaction_lag: Duration,
     ) -> Self {
         Self {
             default_chunk_size,
             default_max_concurrent,
+            max_compaction_lag,
             partition_resolver,
         }
     }
@@ -237,13 +245,22 @@ impl BackfillController {
     ///
     /// Returns events for chunks that should be planned, respecting concurrency limits.
     /// Per P0-1, each `BackfillChunkPlanned` is emitted with its `RunRequested` atomically.
+    ///
+    /// Checks watermark freshness before planning - if compaction is lagging, returns
+    /// empty to avoid making decisions on stale state.
     #[must_use]
     pub fn reconcile(
         &self,
+        watermarks: &Watermarks,
         backfills: &HashMap<String, BackfillRow>,
         chunks: &HashMap<String, BackfillChunkRow>,
         runs: &HashMap<String, RunRow>,
     ) -> Vec<OrchestrationEvent> {
+        // Check watermark freshness - critical guard!
+        if !watermarks.is_fresh(self.max_compaction_lag) {
+            return Vec::new();
+        }
+
         let mut events = Vec::new();
 
         for (backfill_id, backfill) in backfills {
@@ -296,10 +313,11 @@ impl BackfillController {
         let chunk_id = format!("{backfill_id}:{chunk_index}");
         let run_key = format!("backfill:{backfill_id}:chunk:{chunk_index}");
         let fingerprint = compute_request_fingerprint(partition_keys);
+        let emitted_at = Utc::now();
 
         // Emit BackfillChunkPlanned + RunRequested atomically (P0-1)
         vec![
-            OrchestrationEvent::new(
+            OrchestrationEvent::new_with_timestamp(
                 tenant_id,
                 workspace_id,
                 OrchestrationEventData::BackfillChunkPlanned {
@@ -310,8 +328,9 @@ impl BackfillController {
                     run_key: run_key.clone(),
                     request_fingerprint: fingerprint.clone(),
                 },
+                emitted_at,
             ),
-            OrchestrationEvent::new(
+            OrchestrationEvent::new_with_timestamp(
                 tenant_id,
                 workspace_id,
                 OrchestrationEventData::RunRequested {
@@ -325,6 +344,7 @@ impl BackfillController {
                     },
                     labels: HashMap::new(),
                 },
+                emitted_at,
             ),
         ]
     }
@@ -598,6 +618,22 @@ mod tests {
         }
     }
 
+    fn fresh_watermarks() -> Watermarks {
+        Watermarks {
+            events_processed_through: Some("01HQ123".into()),
+            last_processed_file: Some("ledger/2025-01-15/01HQ123.json".into()),
+            last_processed_at: Utc::now() - Duration::seconds(5),
+        }
+    }
+
+    fn stale_watermarks() -> Watermarks {
+        Watermarks {
+            events_processed_through: Some("01HQ100".into()),
+            last_processed_file: Some("ledger/2025-01-15/01HQ100.json".into()),
+            last_processed_at: Utc::now() - Duration::seconds(120), // 2 minutes stale
+        }
+    }
+
     // ========================================================================
     // Task 4.1: Backfill Preview Tests
     // ========================================================================
@@ -713,8 +749,9 @@ mod tests {
 
         let chunks = HashMap::new();
         let runs = HashMap::new();
+        let watermarks = fresh_watermarks();
 
-        let events = controller.reconcile(&backfills, &chunks, &runs);
+        let events = controller.reconcile(&watermarks, &backfills, &chunks, &runs);
 
         // Should plan 2 chunks (max_concurrent) with 2 events each (chunk + run)
         let chunk_events: Vec<_> = events
@@ -1020,8 +1057,25 @@ mod tests {
             },
         );
 
-        let events = controller.reconcile(&backfills, &HashMap::new(), &HashMap::new());
+        let watermarks = fresh_watermarks();
+        let events = controller.reconcile(&watermarks, &backfills, &HashMap::new(), &HashMap::new());
 
         assert!(events.is_empty(), "Should not plan chunks for paused backfill");
+    }
+
+    #[test]
+    fn test_backfill_reconcile_skips_on_stale_watermarks() {
+        let controller = BackfillController::new(test_partition_resolver());
+
+        let mut backfills = HashMap::new();
+        backfills.insert("bf_001".into(), default_backfill_row());
+
+        let watermarks = stale_watermarks();
+        let events = controller.reconcile(&watermarks, &backfills, &HashMap::new(), &HashMap::new());
+
+        assert!(
+            events.is_empty(),
+            "Should not plan chunks when compaction is lagging"
+        );
     }
 }

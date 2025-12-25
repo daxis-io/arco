@@ -21,14 +21,19 @@ use crate::context::IcebergRequestContext;
 use crate::error::{IcebergError, IcebergResult};
 use crate::routes::utils::{ensure_prefix, join_namespace, paginate, parse_namespace};
 use crate::state::IcebergState;
-use crate::types::{GetNamespaceResponse, ListNamespacesQuery, ListNamespacesResponse, NamespaceIdent};
+use crate::types::{
+    GetNamespaceResponse, ListNamespacesQuery, ListNamespacesResponse, NamespaceIdent,
+};
 use std::collections::HashMap;
 
 /// Creates namespace routes.
 pub fn routes() -> Router<IcebergState> {
     Router::new()
         .route("/namespaces", get(list_namespaces))
-        .route("/namespaces/:namespace", get(get_namespace).head(head_namespace))
+        .route(
+            "/namespaces/:namespace",
+            get(get_namespace).head(head_namespace),
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +59,10 @@ struct NamespacePath {
         (status = 200, description = "Namespaces listed", body = ListNamespacesResponse),
         (status = 400, description = "Bad request", body = crate::error::IcebergErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::error::IcebergErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::error::IcebergErrorResponse),
+        (status = 404, description = "Not found", body = crate::error::IcebergErrorResponse),
+        (status = 419, description = "Authentication timeout", body = crate::error::IcebergErrorResponse),
+        (status = 503, description = "Service unavailable", body = crate::error::IcebergErrorResponse),
         (status = 500, description = "Internal error", body = crate::error::IcebergErrorResponse),
     ),
     tag = "Namespaces"
@@ -107,6 +116,9 @@ async fn list_namespaces(
         (status = 404, description = "Not found", body = crate::error::IcebergErrorResponse),
         (status = 400, description = "Bad request", body = crate::error::IcebergErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::error::IcebergErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::error::IcebergErrorResponse),
+        (status = 419, description = "Authentication timeout", body = crate::error::IcebergErrorResponse),
+        (status = 503, description = "Service unavailable", body = crate::error::IcebergErrorResponse),
         (status = 500, description = "Internal error", body = crate::error::IcebergErrorResponse),
     ),
     tag = "Namespaces"
@@ -148,10 +160,13 @@ async fn get_namespace(
         ("namespace" = String, Path, description = "Namespace name")
     ),
     responses(
-        (status = 200, description = "Namespace exists"),
+        (status = 204, description = "Namespace exists"),
         (status = 404, description = "Not found", body = crate::error::IcebergErrorResponse),
         (status = 400, description = "Bad request", body = crate::error::IcebergErrorResponse),
         (status = 401, description = "Unauthorized", body = crate::error::IcebergErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::error::IcebergErrorResponse),
+        (status = 419, description = "Authentication timeout", body = crate::error::IcebergErrorResponse),
+        (status = 503, description = "Service unavailable", body = crate::error::IcebergErrorResponse),
         (status = 500, description = "Internal error", body = crate::error::IcebergErrorResponse),
     ),
     tag = "Namespaces"
@@ -177,7 +192,7 @@ async fn head_namespace(
         .is_some();
 
     let status = if exists {
-        StatusCode::OK
+        StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
     };
@@ -193,13 +208,13 @@ async fn head_namespace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
-    use axum::http::Request;
     use arco_catalog::CatalogWriter;
     use arco_catalog::Tier1Compactor;
     use arco_catalog::write_options::WriteOptions;
     use arco_core::ScopedStorage;
     use arco_core::storage::MemoryBackend;
+    use axum::body::Body;
+    use axum::http::Request;
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -209,12 +224,8 @@ mod tests {
     }
 
     async fn seed_namespace(state: &IcebergState, namespace: &str) {
-        let storage = ScopedStorage::new(
-            Arc::clone(&state.storage),
-            "acme",
-            "analytics",
-        )
-        .expect("scoped storage");
+        let storage = ScopedStorage::new(Arc::clone(&state.storage), "acme", "analytics")
+            .expect("scoped storage");
         let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
         let writer = CatalogWriter::new(storage).with_sync_compactor(compactor);
         writer.initialize().await.expect("init");
@@ -227,7 +238,9 @@ mod tests {
     fn app(state: IcebergState) -> Router {
         Router::new()
             .nest("/v1/:prefix", routes())
-            .layer(axum::middleware::from_fn(crate::context::context_middleware))
+            .layer(axum::middleware::from_fn(
+                crate::context::context_middleware,
+            ))
             .with_state(state)
     }
 
@@ -269,5 +282,27 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_head_namespace_exists_returns_no_content() {
+        let state = build_state();
+        seed_namespace(&state, "sales").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/v1/arco/namespaces/sales")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 }

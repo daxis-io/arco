@@ -37,7 +37,10 @@ impl BackfillState {
         matches!(
             (from, to),
             (Self::Pending | Self::Paused, Self::Running)
-                | (Self::Pending | Self::Running | Self::Paused, Self::Cancelled)
+                | (
+                    Self::Pending | Self::Running | Self::Paused,
+                    Self::Cancelled
+                )
                 | (Self::Running, Self::Paused | Self::Succeeded | Self::Failed)
         )
     }

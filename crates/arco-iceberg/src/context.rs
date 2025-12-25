@@ -45,14 +45,14 @@ impl IcebergRequestContext {
     }
 
     fn from_headers(headers: &HeaderMap) -> IcebergResult<Self> {
-        let request_id = request_id_from_headers(headers)
-            .unwrap_or_else(|| ulid::Ulid::new().to_string());
-        let tenant = header_string(headers, "X-Tenant-Id")
-            .ok_or_else(|| IcebergError::Unauthorized {
+        let request_id =
+            request_id_from_headers(headers).unwrap_or_else(|| ulid::Ulid::new().to_string());
+        let tenant =
+            header_string(headers, "X-Tenant-Id").ok_or_else(|| IcebergError::Unauthorized {
                 message: "missing X-Tenant-Id header".to_string(),
             })?;
-        let workspace = header_string(headers, "X-Workspace-Id")
-            .ok_or_else(|| IcebergError::Unauthorized {
+        let workspace =
+            header_string(headers, "X-Workspace-Id").ok_or_else(|| IcebergError::Unauthorized {
                 message: "missing X-Workspace-Id header".to_string(),
             })?;
 
@@ -95,8 +95,8 @@ pub async fn context_middleware(req: Request<Body>, next: Next) -> Response {
     }
 
     let (mut parts, body) = req.into_parts();
-    let request_id = request_id_from_headers(&parts.headers)
-        .unwrap_or_else(|| ulid::Ulid::new().to_string());
+    let request_id =
+        request_id_from_headers(&parts.headers).unwrap_or_else(|| ulid::Ulid::new().to_string());
 
     if iceberg_public_path(parts.uri.path()) {
         let mut response = next.run(Request::from_parts(parts, body)).await;

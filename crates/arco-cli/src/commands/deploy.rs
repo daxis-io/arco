@@ -37,8 +37,8 @@ pub async fn execute(args: DeployArgs, config: &Config) -> Result<()> {
         .with_context(|| format!("Failed to read manifest file: {:?}", args.manifest_file))?;
 
     // Parse manifest
-    let mut request: DeployManifestRequest = serde_json::from_str(&manifest_content)
-        .with_context(|| "Failed to parse manifest JSON")?;
+    let mut request: DeployManifestRequest =
+        serde_json::from_str(&manifest_content).with_context(|| "Failed to parse manifest JSON")?;
 
     // Override deployed_by if specified
     if let Some(deployed_by) = args.deployed_by {
@@ -65,7 +65,11 @@ pub async fn execute(args: DeployArgs, config: &Config) -> Result<()> {
         }
         OutputFormat::Text => {
             let fingerprint_preview: String = response.fingerprint.chars().take(12).collect();
-            let ellipsis = if response.fingerprint.len() > 12 { "..." } else { "" };
+            let ellipsis = if response.fingerprint.len() > 12 {
+                "..."
+            } else {
+                ""
+            };
             println!("Manifest deployed successfully!");
             println!();
             println!("  Manifest ID:     {}", response.manifest_id);

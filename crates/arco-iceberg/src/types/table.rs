@@ -80,7 +80,10 @@ pub struct LoadTableResponse {
     /// Storage credentials for accessing table data.
     ///
     /// Only present when `X-Iceberg-Access-Delegation: vended-credentials` is requested.
-    #[serde(rename = "storage-credentials", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "storage-credentials",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub storage_credentials: Option<Vec<StorageCredential>>,
 }
 
@@ -380,8 +383,12 @@ mod tests {
             }
         }"#;
 
-        let response: LoadTableResponse = serde_json::from_str(json).expect("deserialization failed");
-        assert_eq!(response.metadata_location, "gs://bucket/metadata/v1.metadata.json");
+        let response: LoadTableResponse =
+            serde_json::from_str(json).expect("deserialization failed");
+        assert_eq!(
+            response.metadata_location,
+            "gs://bucket/metadata/v1.metadata.json"
+        );
         assert_eq!(response.metadata.format_version, 2);
         assert!(response.storage_credentials.is_none());
     }

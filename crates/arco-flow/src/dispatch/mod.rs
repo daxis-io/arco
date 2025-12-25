@@ -133,9 +133,10 @@ impl EnqueueResult {
     #[must_use]
     pub fn message_id(&self) -> Option<&str> {
         match self {
-            Self::Enqueued { message_id } | Self::Deduplicated { existing_message_id: message_id } => {
-                Some(message_id)
-            }
+            Self::Enqueued { message_id }
+            | Self::Deduplicated {
+                existing_message_id: message_id,
+            } => Some(message_id),
             Self::QueueFull => None,
         }
     }
@@ -234,7 +235,11 @@ pub trait TaskQueue: Send + Sync {
     /// - `EnqueueResult::Enqueued` with message ID on success
     /// - `EnqueueResult::Deduplicated` if task was already enqueued
     /// - `EnqueueResult::QueueFull` if queue is at capacity
-    async fn enqueue(&self, envelope: TaskEnvelope, options: EnqueueOptions) -> Result<EnqueueResult>;
+    async fn enqueue(
+        &self,
+        envelope: TaskEnvelope,
+        options: EnqueueOptions,
+    ) -> Result<EnqueueResult>;
 
     /// Enqueues multiple tasks in a batch.
     ///
@@ -294,10 +299,7 @@ mod tests {
             TaskId::generate(),
             RunId::generate(),
             AssetId::generate(),
-            TaskKey::new(
-                AssetKey::new("raw", "events"),
-                TaskOperation::Materialize,
-            ),
+            TaskKey::new(AssetKey::new("raw", "events"), TaskOperation::Materialize),
             "test-tenant",
             "test-workspace",
             1,
@@ -327,15 +329,19 @@ mod tests {
 
     #[test]
     fn enqueue_result_is_enqueued() {
-        assert!(EnqueueResult::Enqueued {
-            message_id: "msg-1".to_string()
-        }
-        .is_enqueued());
+        assert!(
+            EnqueueResult::Enqueued {
+                message_id: "msg-1".to_string()
+            }
+            .is_enqueued()
+        );
 
-        assert!(!EnqueueResult::Deduplicated {
-            existing_message_id: "msg-1".to_string()
-        }
-        .is_enqueued());
+        assert!(
+            !EnqueueResult::Deduplicated {
+                existing_message_id: "msg-1".to_string()
+            }
+            .is_enqueued()
+        );
 
         assert!(!EnqueueResult::QueueFull.is_enqueued());
     }

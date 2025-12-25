@@ -70,3 +70,4 @@ arco-test-utils = { path = "../arco-test-utils" }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }
 proptest = { workspace = true }
+serde_yaml = { workspace = true }

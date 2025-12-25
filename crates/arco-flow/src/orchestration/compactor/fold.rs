@@ -4299,8 +4299,11 @@ mod tests {
     // Layer 2: Backfill Fold Tests
     // ========================================================================
 
+    // Use deterministic event IDs to avoid parallel test flakiness.
+    // Event IDs incorporate backfill_id and a sequence number to ensure
+    // proper ordering within a test and isolation across tests.
     fn backfill_created_event(backfill_id: &str) -> OrchestrationEvent {
-        OrchestrationEvent::new(
+        OrchestrationEvent::new_with_event_id(
             "tenant-abc",
             "workspace-prod",
             OrchestrationEventData::BackfillCreated {
@@ -4316,11 +4319,12 @@ mod tests {
                 max_concurrent_runs: 2,
                 parent_backfill_id: None,
             },
+            format!("evt_{backfill_id}_01_created"),
         )
     }
 
     fn backfill_chunk_planned_event(backfill_id: &str, chunk_index: u32) -> OrchestrationEvent {
-        OrchestrationEvent::new(
+        OrchestrationEvent::new_with_event_id(
             "tenant-abc",
             "workspace-prod",
             OrchestrationEventData::BackfillChunkPlanned {
@@ -4331,6 +4335,7 @@ mod tests {
                 run_key: format!("backfill:{backfill_id}:chunk:{chunk_index}"),
                 request_fingerprint: "fp_backfill_chunk".into(),
             },
+            format!("evt_{backfill_id}_02_chunk_{chunk_index}"),
         )
     }
 
@@ -4340,7 +4345,7 @@ mod tests {
         to_state: BackfillState,
         state_version: u32,
     ) -> OrchestrationEvent {
-        OrchestrationEvent::new(
+        OrchestrationEvent::new_with_event_id(
             "tenant-abc",
             "workspace-prod",
             OrchestrationEventData::BackfillStateChanged {
@@ -4350,6 +4355,8 @@ mod tests {
                 state_version,
                 changed_by: None,
             },
+            // Use state_version to ensure ordering: state changes come after creation
+            format!("evt_{backfill_id}_03_state_v{state_version}"),
         )
     }
 

@@ -32,10 +32,8 @@ async fn main() -> Result<()> {
 
     init_logging(choose_log_format(&config));
 
-    let storage: Arc<dyn StorageBackend> = if let Some(bucket) = config.storage.bucket.as_deref()
-    {
-        let backend = if bucket.trim().starts_with("s3://") || bucket.trim().starts_with("s3a://")
-        {
+    let storage: Arc<dyn StorageBackend> = if let Some(bucket) = config.storage.bucket.as_deref() {
+        let backend = if bucket.trim().starts_with("s3://") || bucket.trim().starts_with("s3a://") {
             "S3"
         } else {
             "GCS"

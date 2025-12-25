@@ -49,8 +49,8 @@
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 
-pub mod config;
 pub mod compactor_client;
+pub mod config;
 pub mod context;
 pub mod error;
 pub mod metrics;

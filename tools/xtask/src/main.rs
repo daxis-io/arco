@@ -361,12 +361,7 @@ struct GoldenField {
 }
 
 /// Expected golden schema files
-const GOLDEN_SCHEMAS: &[&str] = &[
-    "namespaces",
-    "tables",
-    "columns",
-    "lineage_edges",
-];
+const GOLDEN_SCHEMAS: &[&str] = &["namespaces", "tables", "columns", "lineage_edges"];
 
 type CheckResult = (Vec<String>, Vec<String>);
 
@@ -390,7 +385,11 @@ fn run_verify_integrity(
         match verify_golden_schema(name) {
             Ok(schema) => {
                 if verbose {
-                    println!("[ok] {} fields, version {}", schema.fields.len(), schema.version);
+                    println!(
+                        "[ok] {} fields, version {}",
+                        schema.fields.len(),
+                        schema.version
+                    );
                 } else {
                     println!("[ok]");
                 }
@@ -459,13 +458,7 @@ fn run_verify_integrity(
 
     if let (Some(tenant), Some(workspace)) = (tenant.as_deref(), workspace.as_deref()) {
         println!("\n=== Workspace Integrity ===\n");
-        match run_workspace_integrity(
-            tenant,
-            workspace,
-            bucket.as_deref(),
-            verbose,
-            lock_strict,
-        ) {
+        match run_workspace_integrity(tenant, workspace, bucket.as_deref(), verbose, lock_strict) {
             Ok((storage_errors, storage_warnings)) => {
                 errors.extend(storage_errors);
                 warnings.extend(storage_warnings);
@@ -501,7 +494,10 @@ fn run_verify_integrity(
         println!();
 
         if dry_run {
-            println!("Dry run mode: {} error(s) found but not failing.", errors.len());
+            println!(
+                "Dry run mode: {} error(s) found but not failing.",
+                errors.len()
+            );
             return Ok(());
         }
 
@@ -581,17 +577,17 @@ async fn verify_workspace(
 
     print!("  Domain manifests... ");
     let mut domain_errors = Vec::new();
-    let catalog = match read_json::<CatalogDomainManifest>(&storage, &root.catalog_manifest_path).await
-    {
-        Ok(manifest) => Some(manifest),
-        Err(e) => {
-            domain_errors.push(format!(
-                "Catalog manifest ({}): {e}",
-                root.catalog_manifest_path
-            ));
-            None
-        }
-    };
+    let catalog =
+        match read_json::<CatalogDomainManifest>(&storage, &root.catalog_manifest_path).await {
+            Ok(manifest) => Some(manifest),
+            Err(e) => {
+                domain_errors.push(format!(
+                    "Catalog manifest ({}): {e}",
+                    root.catalog_manifest_path
+                ));
+                None
+            }
+        };
     let lineage = match read_json::<LineageManifest>(&storage, &root.lineage_manifest_path).await {
         Ok(manifest) => Some(manifest),
         Err(e) => {
@@ -634,8 +630,7 @@ async fn verify_workspace(
     print!("  Commit chain (catalog)... ");
     if let Some(catalog) = &catalog {
         if let Some(last_commit_id) = catalog.last_commit_id.as_deref() {
-            let (chain_errors, commit_count) =
-                verify_commit_chain(&storage, last_commit_id).await;
+            let (chain_errors, commit_count) = verify_commit_chain(&storage, last_commit_id).await;
             if chain_errors.is_empty() {
                 if verbose {
                     println!("[ok] {commit_count} commits");
@@ -686,8 +681,7 @@ async fn verify_workspace(
 
     print!("  Executions state... ");
     if let Some(executions) = &executions {
-        let (exec_errors, exec_warnings) =
-            verify_executions_state(&storage, executions).await;
+        let (exec_errors, exec_warnings) = verify_executions_state(&storage, executions).await;
         if exec_errors.is_empty() {
             println!("[ok]");
         } else {
@@ -902,19 +896,15 @@ async fn verify_executions_state(
             }
             match storage.head_raw(snapshot_path).await {
                 Ok(Some(_)) => {}
-                Ok(None) => errors.push(format!(
-                    "Executions snapshot missing: {}",
-                    snapshot_path
-                )),
+                Ok(None) => errors.push(format!("Executions snapshot missing: {}", snapshot_path)),
                 Err(e) => errors.push(format!(
                     "Failed to read executions snapshot '{}': {e}",
                     snapshot_path
                 )),
             }
             if manifest.snapshot_version == 0 {
-                warnings.push(
-                    "Executions snapshot_path set while snapshot_version is 0".to_string(),
-                );
+                warnings
+                    .push("Executions snapshot_path set while snapshot_version is 0".to_string());
             }
         }
         None => {
@@ -946,10 +936,7 @@ fn verify_search_state(manifest: &SearchManifest) -> CheckResult {
     (errors, warnings)
 }
 
-async fn verify_snapshot_files(
-    storage: &ScopedStorage,
-    snapshot: &SnapshotInfo,
-) -> CheckResult {
+async fn verify_snapshot_files(storage: &ScopedStorage, snapshot: &SnapshotInfo) -> CheckResult {
     let mut errors = Vec::new();
     let warnings = Vec::new();
 
@@ -1111,11 +1098,7 @@ async fn verify_commit_chain(
     (errors, count)
 }
 
-async fn verify_locks(
-    storage: &ScopedStorage,
-    verbose: bool,
-    lock_strict: bool,
-) -> CheckResult {
+async fn verify_locks(storage: &ScopedStorage, verbose: bool, lock_strict: bool) -> CheckResult {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
 
@@ -1197,7 +1180,10 @@ fn join_snapshot_path(dir: &str, file: &str) -> String {
 }
 
 fn is_not_found(err: &CoreError) -> bool {
-    matches!(err, CoreError::NotFound(_) | CoreError::ResourceNotFound { .. })
+    matches!(
+        err,
+        CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }
+    )
 }
 
 fn sha256_prefixed(bytes: &[u8]) -> String {
@@ -1245,8 +1231,10 @@ fn run_schema_tests() -> Result<()> {
     let output = Command::new("cargo")
         .args([
             "test",
-            "-p", "arco-catalog",
-            "--test", "schema_contracts",
+            "-p",
+            "arco-catalog",
+            "--test",
+            "schema_contracts",
             "--",
             "--test-threads=1",
         ])
@@ -1263,8 +1251,7 @@ fn run_schema_tests() -> Result<()> {
 
 fn verify_pr_template() -> Result<()> {
     let path = ".github/pull_request_template.md";
-    let content = std::fs::read_to_string(path)
-        .context("PR template not found")?;
+    let content = std::fs::read_to_string(path).context("PR template not found")?;
 
     let required_sections = [
         "Invariant Checklist",

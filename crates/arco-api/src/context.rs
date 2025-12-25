@@ -19,6 +19,7 @@ use axum::response::{IntoResponse, Response};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde_json::Value;
 use ulid::Ulid;
+use tracing::warn;
 
 use arco_core::ScopedStorage;
 use arco_core::storage::StorageBackend;
@@ -91,6 +92,9 @@ impl FromRequestParts<Arc<AppState>> for RequestContext {
             extract_from_jwt(headers, state, &request_id)?
         };
 
+        let tenant = normalize_scope_id(&tenant, "tenant_id", &request_id)?;
+        let workspace = normalize_scope_id(&workspace, "workspace_id", &request_id)?;
+
         let ctx = Self {
             tenant,
             workspace,
@@ -137,6 +141,50 @@ fn extract_from_jwt(
     Ok((tenant, workspace, Some(user_id)))
 }
 
+fn normalize_scope_id(raw: &str, field: &str, request_id: &str) -> Result<String, ApiError> {
+    let normalized = raw.to_ascii_lowercase();
+
+    if raw != normalized {
+        warn!(
+            field = field,
+            raw = raw,
+            normalized = normalized,
+            "normalized non-canonical scope id"
+        );
+    }
+
+    if normalized.is_empty() {
+        return Err(ApiError::bad_request(format!("{field} cannot be empty"))
+            .with_request_id(request_id.to_string()));
+    }
+
+    if normalized.contains('/') || normalized.contains('\\') {
+        return Err(ApiError::bad_request(format!(
+            "{field} cannot contain path separators"
+        ))
+        .with_request_id(request_id.to_string()));
+    }
+
+    if normalized.contains('\n') || normalized.contains('\r') || normalized.contains('\0') {
+        return Err(ApiError::bad_request(format!(
+            "{field} cannot contain control characters"
+        ))
+        .with_request_id(request_id.to_string()));
+    }
+
+    if !normalized
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        return Err(ApiError::bad_request(format!(
+            "{field} contains invalid characters (allowed: a-z, 0-9, '-', '_')"
+        ))
+        .with_request_id(request_id.to_string()));
+    }
+
+    Ok(normalized)
+}
+
 fn jwt_decoding_key(
     jwt: &crate::config::JwtConfig,
     request_id: &str,
@@ -145,17 +193,20 @@ fn jwt_decoding_key(
         jwt.hs256_secret.as_deref(),
         jwt.rs256_public_key_pem.as_deref(),
     ) {
-        (Some(secret), None) => Ok((DecodingKey::from_secret(secret.as_bytes()), Algorithm::HS256)),
+        (Some(secret), None) => Ok((
+            DecodingKey::from_secret(secret.as_bytes()),
+            Algorithm::HS256,
+        )),
         (None, Some(pem)) => DecodingKey::from_rsa_pem(pem.as_bytes())
             .map(|key| (key, Algorithm::RS256))
             .map_err(|e| {
                 ApiError::internal(format!("failed to parse jwt.rs256_public_key_pem: {e}"))
                     .with_request_id(request_id.to_string())
             }),
-        (Some(_), Some(_)) => Err(
-            ApiError::internal("jwt.hs256_secret and jwt.rs256_public_key_pem are mutually exclusive")
-                .with_request_id(request_id.to_string()),
-        ),
+        (Some(_), Some(_)) => Err(ApiError::internal(
+            "jwt.hs256_secret and jwt.rs256_public_key_pem are mutually exclusive",
+        )
+        .with_request_id(request_id.to_string())),
         (None, None) => Err(ApiError::internal(
             "jwt.hs256_secret or jwt.rs256_public_key_pem is required when debug=false",
         )

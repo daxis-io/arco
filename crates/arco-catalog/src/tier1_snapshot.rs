@@ -3,10 +3,10 @@
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
-use arco_core::storage::{WriteResult};
+use arco_core::CatalogDomain;
+use arco_core::storage::WriteResult;
 use arco_core::storage_keys::StateKey;
 use arco_core::storage_traits::StatePutStore;
-use arco_core::CatalogDomain;
 
 use crate::error::{CatalogError, Result};
 use crate::manifest::{SnapshotFile, SnapshotInfo};
@@ -96,7 +96,11 @@ async fn put_state_if_absent<S: StatePutStore + ?Sized>(
     key: &StateKey,
     data: Bytes,
 ) -> Result<()> {
-    match storage.put_state(key, data).await.map_err(CatalogError::from)? {
+    match storage
+        .put_state(key, data)
+        .await
+        .map_err(CatalogError::from)?
+    {
         WriteResult::Success { .. } | WriteResult::PreconditionFailed { .. } => Ok(()),
     }
 }

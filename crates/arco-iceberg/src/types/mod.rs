@@ -9,9 +9,9 @@ mod ids;
 mod namespace;
 mod table;
 
+pub use commit::*;
 pub use config::*;
 pub use credentials::*;
-pub use commit::*;
 pub use ids::*;
 pub use namespace::*;
 pub use table::*;

@@ -9,11 +9,12 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use ulid::Ulid;
 
-use arco_core::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 use arco_core::MemoryBackend;
 use arco_core::ScopedStorage;
-use arco_flow::dispatch::{EnqueueOptions, EnqueueResult, TaskEnvelope, TaskQueue};
+use arco_core::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
+use arco_core::{AssetId, RunId, TaskId};
 use arco_flow::dispatch::memory::InMemoryTaskQueue;
+use arco_flow::dispatch::{EnqueueOptions, EnqueueResult, TaskEnvelope, TaskQueue};
 use arco_flow::error::{Error, Result};
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::MicroCompactor;
@@ -27,7 +28,6 @@ use arco_flow::orchestration::events::{
 };
 use arco_flow::plan::{AssetKey, ResourceRequirements};
 use arco_flow::task_key::{TaskKey, TaskOperation};
-use arco_core::{AssetId, RunId, TaskId};
 
 fn run_triggered_event(run_id: &str, plan_id: &str) -> OrchestrationEvent {
     OrchestrationEvent::new(
@@ -58,7 +58,12 @@ fn plan_created_event(run_id: &str, plan_id: &str, tasks: Vec<TaskDef>) -> Orche
     )
 }
 
-fn task_started_event(run_id: &str, task_key: &str, attempt: u32, attempt_id: &str) -> OrchestrationEvent {
+fn task_started_event(
+    run_id: &str,
+    task_key: &str,
+    attempt: u32,
+    attempt_id: &str,
+) -> OrchestrationEvent {
     OrchestrationEvent::new(
         "tenant",
         "workspace",
@@ -72,7 +77,13 @@ fn task_started_event(run_id: &str, task_key: &str, attempt: u32, attempt_id: &s
     )
 }
 
-fn task_finished_event(run_id: &str, task_key: &str, attempt: u32, attempt_id: &str, outcome: TaskOutcome) -> OrchestrationEvent {
+fn task_finished_event(
+    run_id: &str,
+    task_key: &str,
+    attempt: u32,
+    attempt_id: &str,
+    outcome: TaskOutcome,
+) -> OrchestrationEvent {
     OrchestrationEvent::new(
         "tenant",
         "workspace",
@@ -146,7 +157,10 @@ fn test_order_independence() -> Result<()> {
 
     assert_eq!(state_forward.runs, state_reverse.runs);
     assert_eq!(state_forward.tasks, state_reverse.tasks);
-    assert_eq!(state_forward.dep_satisfaction, state_reverse.dep_satisfaction);
+    assert_eq!(
+        state_forward.dep_satisfaction,
+        state_reverse.dep_satisfaction
+    );
     assert_eq!(state_forward.dispatch_outbox, state_reverse.dispatch_outbox);
     assert_eq!(state_forward.timers, state_reverse.timers);
 
@@ -252,17 +266,16 @@ async fn test_task_queue_idempotency() -> Result<()> {
         TaskId::generate(),
         RunId::generate(),
         AssetId::generate(),
-        TaskKey::new(
-            AssetKey::new("raw", "events"),
-            TaskOperation::Materialize,
-        ),
+        TaskKey::new(AssetKey::new("raw", "events"), TaskOperation::Materialize),
         "tenant",
         "workspace",
         1,
         ResourceRequirements::default(),
     );
 
-    let result1 = queue.enqueue(envelope.clone(), EnqueueOptions::default()).await?;
+    let result1 = queue
+        .enqueue(envelope.clone(), EnqueueOptions::default())
+        .await?;
     let result2 = queue.enqueue(envelope, EnqueueOptions::default()).await?;
 
     assert!(matches!(result1, EnqueueResult::Enqueued { .. }));
@@ -296,12 +309,7 @@ fn test_anti_entropy_recovers_orphaned_tasks() -> Result<()> {
         row_version: "01HQ123EVT".to_string(),
     };
 
-    let repairs = sweeper.scan(
-        &fresh_manifest().watermarks,
-        &[task],
-        &[],
-        now,
-    );
+    let repairs = sweeper.scan(&fresh_manifest().watermarks, &[task], &[], now);
 
     assert_eq!(repairs.len(), 1);
     assert!(matches!(
@@ -345,7 +353,13 @@ fn test_dependency_correctness() -> Result<()> {
     assert_eq!(task_b.state, TaskState::Blocked);
     assert_eq!(task_c.state, TaskState::Blocked);
 
-    state.fold_event(&task_finished_event(run_id, "A", 1, &attempt_id, TaskOutcome::Succeeded));
+    state.fold_event(&task_finished_event(
+        run_id,
+        "A",
+        1,
+        &attempt_id,
+        TaskOutcome::Succeeded,
+    ));
 
     let task_b = state
         .tasks

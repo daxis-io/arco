@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use arco_catalog::write_options::WriteOptions;
 use arco_catalog::{CatalogWriter, RegisterTableRequest, Tier1Compactor};
-use arco_core::storage::{MemoryBackend, StorageBackend, WritePrecondition};
 use arco_core::ScopedStorage;
+use arco_core::storage::{MemoryBackend, StorageBackend, WritePrecondition};
 use arco_iceberg::pointer::IcebergTablePointer;
 use arco_iceberg::router::iceberg_router;
 use arco_iceberg::state::IcebergState;
@@ -21,12 +21,8 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 async fn seed_iceberg_table(state: &IcebergState, namespace: &str, table: &str) {
-    let storage = ScopedStorage::new(
-        Arc::clone(&state.storage),
-        "acme",
-        "analytics",
-    )
-    .expect("scoped storage");
+    let storage = ScopedStorage::new(Arc::clone(&state.storage), "acme", "analytics")
+        .expect("scoped storage");
     let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
     let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
     writer.initialize().await.expect("init");
@@ -134,10 +130,7 @@ async fn test_rest_catalog_roundtrip() {
 
     let mut props = HashMap::new();
     props.insert("header.x-tenant-id".to_string(), "acme".to_string());
-    props.insert(
-        "header.x-workspace-id".to_string(),
-        "analytics".to_string(),
-    );
+    props.insert("header.x-workspace-id".to_string(), "analytics".to_string());
 
     let config = RestCatalogConfig::builder()
         .uri(format!("http://{addr}/iceberg"))
@@ -155,16 +148,10 @@ async fn test_rest_catalog_roundtrip() {
         .expect("list namespaces");
     assert!(namespaces.contains(&namespace));
 
-    let tables = catalog
-        .list_tables(&namespace)
-        .await
-        .expect("list tables");
+    let tables = catalog.list_tables(&namespace).await.expect("list tables");
     assert!(tables.contains(&table_ident));
 
-    let table = catalog
-        .load_table(&table_ident)
-        .await
-        .expect("load table");
+    let table = catalog.load_table(&table_ident).await.expect("load table");
     assert_eq!(table.identifier(), &table_ident);
 
     let _ = shutdown_tx.send(());

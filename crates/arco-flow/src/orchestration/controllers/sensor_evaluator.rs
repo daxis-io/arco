@@ -71,6 +71,10 @@ impl From<&str> for SensorEvaluationError {
 /// Interface for evaluating push and poll sensors.
 pub trait SensorEvaluator: Send + Sync {
     /// Evaluate a push sensor given a Pub/Sub message.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SensorEvaluationError` if the evaluation fails.
     fn evaluate_push(
         &self,
         sensor_id: &str,
@@ -78,6 +82,10 @@ pub trait SensorEvaluator: Send + Sync {
     ) -> Result<Vec<RunRequest>, SensorEvaluationError>;
 
     /// Evaluate a poll sensor given the current cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SensorEvaluationError` if the evaluation fails.
     fn evaluate_poll(
         &self,
         sensor_id: &str,

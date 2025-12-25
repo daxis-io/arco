@@ -50,7 +50,12 @@ pub async fn execute(args: StatusArgs, config: &Config) -> Result<()> {
     }
 }
 
-async fn list_runs(client: &ApiClient, workspace_id: &str, limit: u32, config: &Config) -> Result<()> {
+async fn list_runs(
+    client: &ApiClient,
+    workspace_id: &str,
+    limit: u32,
+    config: &Config,
+) -> Result<()> {
     let response = client.list_runs(workspace_id, Some(limit)).await?;
 
     match config.format {
@@ -69,10 +74,7 @@ async fn list_runs(client: &ApiClient, workspace_id: &str, limit: u32, config: &
                 let state_str = format_state_colored(&run.state.to_string());
                 println!(
                     "  {} {} ({}/{} tasks succeeded)",
-                    run.run_id,
-                    state_str,
-                    run.tasks_succeeded,
-                    run.task_count
+                    run.run_id, state_str, run.tasks_succeeded, run.task_count
                 );
             }
         }

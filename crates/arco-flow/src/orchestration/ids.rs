@@ -102,7 +102,10 @@ mod tests {
     fn test_deterministic_attempt_id_differs_for_different_dispatches() {
         let id1 = deterministic_attempt_id("dispatch:run1:extract:1");
         let id2 = deterministic_attempt_id("dispatch:run1:extract:2");
-        assert_ne!(id1, id2, "different dispatch_ids must produce different attempt_ids");
+        assert_ne!(
+            id1, id2,
+            "different dispatch_ids must produce different attempt_ids"
+        );
     }
 
     #[test]

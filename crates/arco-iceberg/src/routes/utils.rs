@@ -55,10 +55,12 @@ pub fn paginate<T>(
     page_size: Option<u32>,
 ) -> IcebergResult<(Vec<T>, Option<String>)> {
     let start = match page_token {
-        Some(token) => token.parse::<usize>().map_err(|_| IcebergError::BadRequest {
-            message: "Invalid pageToken".to_string(),
-            error_type: "BadRequestException",
-        })?,
+        Some(token) => token
+            .parse::<usize>()
+            .map_err(|_| IcebergError::BadRequest {
+                message: "Invalid pageToken".to_string(),
+                error_type: "BadRequestException",
+            })?,
         None => 0,
     };
     let size = match page_size {

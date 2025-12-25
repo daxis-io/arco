@@ -10,9 +10,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use arco_core::observability::{init_logging, LogFormat};
-use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 use arco_core::ScopedStorage;
+use arco_core::observability::{LogFormat, init_logging};
+use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 use arco_flow::error::{Error, Result};
 use arco_flow::orchestration::compactor::{CompactionResult, MicroCompactor};
 

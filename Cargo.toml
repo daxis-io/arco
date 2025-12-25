@@ -67,6 +67,7 @@ tokio = { version = "1.40", features = ["full"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 
 # Error handling
 thiserror = "2"
@@ -108,7 +109,7 @@ base32 = "0.5"
 petgraph = "0.7"
 
 # Data formats
-parquet = { version = "57", features = ["async"] }
+parquet = { version = "54", features = ["async"] }
 arrow = { version = "54", features = ["chrono-tz"] }
 bytes = "1"
 iceberg = "0.6"
@@ -133,7 +134,7 @@ object_store = { version = "0.11", features = ["gcp", "aws", "azure"] }
 
 # Testing
 proptest = "1"
-criterion = { version = "0.8", features = ["async_tokio"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
 tokio-test = "0.4"
 tempfile = "3"
 trybuild = "1.0"

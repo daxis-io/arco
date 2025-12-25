@@ -10,7 +10,7 @@
 //! makes each compaction `O(total_records)` I/O and CPU. This is acceptable for early workloads,
 //! but should evolve toward incremental compaction as catalog size grows.
 
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};

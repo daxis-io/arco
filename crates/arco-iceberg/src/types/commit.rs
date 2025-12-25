@@ -16,7 +16,7 @@ use super::table::{PartitionSpec, Schema, Snapshot, SortOrder, TableIdent};
 /// Iceberg table update requirement for optimistic concurrency.
 ///
 /// Requirements are checked before applying updates.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum UpdateRequirement {
     /// Assert that the table UUID matches.
@@ -74,7 +74,7 @@ pub enum UpdateRequirement {
 /// Iceberg table update action.
 ///
 /// Updates modify table metadata atomically.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum TableUpdate {
     /// Assign a new UUID to the table.
@@ -154,10 +154,16 @@ pub enum TableUpdate {
         #[serde(rename = "max-ref-age-ms", skip_serializing_if = "Option::is_none")]
         max_ref_age_ms: Option<i64>,
         /// Max snapshot age in ms (branches only).
-        #[serde(rename = "max-snapshot-age-ms", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "max-snapshot-age-ms",
+            skip_serializing_if = "Option::is_none"
+        )]
         max_snapshot_age_ms: Option<i64>,
         /// Min snapshots to keep (branches only).
-        #[serde(rename = "min-snapshots-to-keep", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "min-snapshots-to-keep",
+            skip_serializing_if = "Option::is_none"
+        )]
         min_snapshots_to_keep: Option<i32>,
     },
 
@@ -234,7 +240,7 @@ impl TableUpdate {
 }
 
 /// Snapshot reference type for `set-snapshot-ref`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SnapshotRefType {
     /// Mutable branch (e.g., "main").
@@ -244,7 +250,7 @@ pub enum SnapshotRefType {
 }
 
 /// Request body for `POST /v1/{prefix}/namespaces/{namespace}/tables/{table}`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CommitTableRequest {
     /// Table identifier (optional in body, taken from URL path).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -269,10 +275,88 @@ impl CommitTableRequest {
             .iter()
             .find_map(TableUpdate::is_rejected_by_guardrails)
     }
+
+    /// Starts building a commit request.
+    #[must_use]
+    pub fn builder() -> CommitTableRequestBuilder {
+        CommitTableRequestBuilder::default()
+    }
+}
+
+/// Builder for `CommitTableRequest`.
+///
+/// # Example
+///
+/// ```
+/// use arco_iceberg::types::{CommitTableRequest, TableUpdate};
+///
+/// let request = CommitTableRequest::builder()
+///     .add_update(TableUpdate::RemoveSnapshots { snapshot_ids: vec![1, 2] })
+///     .build();
+/// assert_eq!(request.updates.len(), 1);
+/// ```
+#[derive(Debug, Default, Clone)]
+pub struct CommitTableRequestBuilder {
+    identifier: Option<TableIdent>,
+    requirements: Vec<UpdateRequirement>,
+    updates: Vec<TableUpdate>,
+}
+
+impl CommitTableRequestBuilder {
+    /// Creates a new commit request builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the table identifier.
+    #[must_use]
+    pub fn identifier(mut self, identifier: TableIdent) -> Self {
+        self.identifier = Some(identifier);
+        self
+    }
+
+    /// Adds a single update requirement.
+    #[must_use]
+    pub fn add_requirement(mut self, requirement: UpdateRequirement) -> Self {
+        self.requirements.push(requirement);
+        self
+    }
+
+    /// Adds multiple update requirements.
+    #[must_use]
+    pub fn requirements(mut self, requirements: impl IntoIterator<Item = UpdateRequirement>) -> Self {
+        self.requirements.extend(requirements);
+        self
+    }
+
+    /// Adds a single table update.
+    #[must_use]
+    pub fn add_update(mut self, update: TableUpdate) -> Self {
+        self.updates.push(update);
+        self
+    }
+
+    /// Adds multiple table updates.
+    #[must_use]
+    pub fn updates(mut self, updates: impl IntoIterator<Item = TableUpdate>) -> Self {
+        self.updates.extend(updates);
+        self
+    }
+
+    /// Builds the commit request.
+    #[must_use]
+    pub fn build(self) -> CommitTableRequest {
+        CommitTableRequest {
+            identifier: self.identifier,
+            requirements: self.requirements,
+            updates: self.updates,
+        }
+    }
 }
 
 /// Response from `POST /v1/{prefix}/namespaces/{namespace}/tables/{table}`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CommitTableResponse {
     /// Location of the new metadata file.
     #[serde(rename = "metadata-location")]
@@ -295,7 +379,8 @@ mod tests {
 
     #[test]
     fn test_assert_table_uuid() {
-        let json = r#"{"type": "assert-table-uuid", "uuid": "550e8400-e29b-41d4-a716-446655440000"}"#;
+        let json =
+            r#"{"type": "assert-table-uuid", "uuid": "550e8400-e29b-41d4-a716-446655440000"}"#;
         let req: UpdateRequirement = serde_json::from_str(json).expect("deserialize");
         if let UpdateRequirement::AssertTableUuid { uuid } = req {
             assert_eq!(uuid.to_string(), "550e8400-e29b-41d4-a716-446655440000");
@@ -328,7 +413,13 @@ mod tests {
             "snapshot-id": 12345
         }"#;
         let update: TableUpdate = serde_json::from_str(json).expect("deserialize");
-        if let TableUpdate::SetSnapshotRef { ref_name, ref_type, snapshot_id, .. } = update {
+        if let TableUpdate::SetSnapshotRef {
+            ref_name,
+            ref_type,
+            snapshot_id,
+            ..
+        } = update
+        {
             assert_eq!(ref_name, "main");
             assert_eq!(ref_type, SnapshotRefType::Branch);
             assert_eq!(snapshot_id, 12345);
@@ -442,5 +533,23 @@ mod tests {
         };
         let json = serde_json::to_string(&response).expect("serialize");
         assert!(json.contains("metadata-location"));
+    }
+
+    #[test]
+    fn test_commit_table_request_builder() {
+        let request = CommitTableRequest::builder()
+            .identifier(TableIdent::simple("sales", "orders"))
+            .add_requirement(UpdateRequirement::AssertCurrentSchemaId {
+                current_schema_id: 0,
+            })
+            .add_update(TableUpdate::RemoveSnapshots {
+                snapshot_ids: vec![1, 2, 3],
+            })
+            .build();
+
+        let identifier = request.identifier.expect("identifier");
+        assert_eq!(identifier.name, "orders");
+        assert_eq!(request.requirements.len(), 1);
+        assert_eq!(request.updates.len(), 1);
     }
 }

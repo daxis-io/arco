@@ -151,7 +151,10 @@ impl DrrScheduler {
     /// Returns the number of tenants with tasks.
     #[must_use]
     pub fn tenant_count(&self) -> usize {
-        self.tenants.values().filter(|t| !t.tasks.is_empty()).count()
+        self.tenants
+            .values()
+            .filter(|t| !t.tasks.is_empty())
+            .count()
     }
 
     /// Returns the total number of ready tasks across all tenants.

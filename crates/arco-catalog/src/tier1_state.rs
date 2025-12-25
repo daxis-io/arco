@@ -29,8 +29,10 @@ pub async fn load_catalog_state(
         return Ok(CatalogState::empty());
     }
 
-    let ns_path = CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "namespaces.parquet");
-    let tables_path = CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "tables.parquet");
+    let ns_path =
+        CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "namespaces.parquet");
+    let tables_path =
+        CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "tables.parquet");
     let columns_path =
         CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "columns.parquet");
 
@@ -61,10 +63,7 @@ pub async fn load_catalog_state(
 /// # Errors
 ///
 /// Returns an error if Parquet decoding fails.
-pub async fn load_lineage_state(
-    storage: &ScopedStorage,
-    edges_path: &str,
-) -> Result<LineageState> {
+pub async fn load_lineage_state(storage: &ScopedStorage, edges_path: &str) -> Result<LineageState> {
     if edges_path.is_empty() || edges_path.contains("/v0/") {
         return Ok(LineageState::empty());
     }
@@ -79,7 +78,8 @@ pub async fn load_lineage_state(
         return Ok(LineageState::empty());
     }
 
-    let path = CatalogPaths::snapshot_file(CatalogDomain::Lineage, version, "lineage_edges.parquet");
+    let path =
+        CatalogPaths::snapshot_file(CatalogDomain::Lineage, version, "lineage_edges.parquet");
     let edges = match storage.get_raw(&path).await {
         Ok(bytes) => parquet_util::read_lineage_edges(&bytes)?,
         Err(_) => Vec::new(),

@@ -273,8 +273,8 @@ fn manifest_path(manifest_id: &str) -> String {
 }
 
 fn idempotency_path(idempotency_key: &str) -> String {
-    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(idempotency_key.as_bytes());
+    let encoded =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(idempotency_key.as_bytes());
     format!("manifests/idempotency/{encoded}.json")
 }
 
@@ -286,13 +286,17 @@ fn validate_manifest(request: &DeployManifestRequest) -> Result<(), ApiError> {
         return Err(ApiError::bad_request("codeVersionId is required"));
     }
     if request.assets.is_empty() {
-        return Err(ApiError::bad_request("manifest must contain at least one asset"));
+        return Err(ApiError::bad_request(
+            "manifest must contain at least one asset",
+        ));
     }
 
     let mut asset_keys = HashSet::new();
     for asset in &request.assets {
         if asset.key.namespace.trim().is_empty() || asset.key.name.trim().is_empty() {
-            return Err(ApiError::bad_request("asset key must include namespace and name"));
+            return Err(ApiError::bad_request(
+                "asset key must include namespace and name",
+            ));
         }
         if asset.id.trim().is_empty() {
             return Err(ApiError::bad_request("asset id is required"));
@@ -312,7 +316,9 @@ fn validate_manifest(request: &DeployManifestRequest) -> Result<(), ApiError> {
             return Err(ApiError::bad_request("schedule cron is required"));
         }
         if schedule.assets.is_empty() {
-            return Err(ApiError::bad_request("schedule must include at least one asset"));
+            return Err(ApiError::bad_request(
+                "schedule must include at least one asset",
+            ));
         }
         if !schedule_ids.insert(schedule.id.clone()) {
             return Err(ApiError::bad_request("duplicate schedule id in manifest"));
@@ -336,20 +342,12 @@ fn compute_fingerprint(request: &DeployManifestRequest) -> Result<String, ApiErr
 
     let mut assets = request.assets.clone();
     assets.sort_by(|a, b| {
-        (
-            &a.key.namespace,
-            &a.key.name,
-            &a.id,
-        )
-            .cmp(&(
-                &b.key.namespace,
-                &b.key.name,
-                &b.id,
-            ))
+        (&a.key.namespace, &a.key.name, &a.id).cmp(&(&b.key.namespace, &b.key.name, &b.id))
     });
 
     let mut schedules = request.schedules.clone();
-    schedules.sort_by(|a, b| (a.id.as_str(), a.cron.as_str()).cmp(&(b.id.as_str(), b.cron.as_str())));
+    schedules
+        .sort_by(|a, b| (a.id.as_str(), a.cron.as_str()).cmp(&(b.id.as_str(), b.cron.as_str())));
 
     let payload = FingerprintPayload {
         manifest_version: request.manifest_version.clone(),
@@ -374,9 +372,10 @@ async fn load_idempotency_record(
     let path = idempotency_path(idempotency_key);
     match storage.get_raw(&path).await {
         Ok(bytes) => {
-            let record: ManifestIdempotencyRecord = serde_json::from_slice(&bytes).map_err(|e| {
-                ApiError::internal(format!("failed to parse idempotency record: {e}"))
-            })?;
+            let record: ManifestIdempotencyRecord =
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    ApiError::internal(format!("failed to parse idempotency record: {e}"))
+                })?;
             Ok(Some(record))
         }
         Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => Ok(None),
@@ -480,20 +479,21 @@ pub(crate) async fn deploy_manifest(
         metadata: request.metadata.clone(),
     };
 
-    let manifest_json = serde_json::to_string_pretty(&stored).map_err(|e| {
-        ApiError::internal(format!("failed to serialize manifest: {e}"))
-    })?;
+    let manifest_json = serde_json::to_string_pretty(&stored)
+        .map_err(|e| ApiError::internal(format!("failed to serialize manifest: {e}")))?;
 
     let path = manifest_path(&manifest_id);
     let result = storage
-        .put_raw(&path, Bytes::from(manifest_json), WritePrecondition::DoesNotExist)
+        .put_raw(
+            &path,
+            Bytes::from(manifest_json),
+            WritePrecondition::DoesNotExist,
+        )
         .await
         .map_err(|e| ApiError::internal(format!("failed to store manifest: {e}")))?;
 
     if matches!(result, WriteResult::PreconditionFailed { .. }) {
-        return Err(ApiError::conflict(
-            "manifest already exists; please retry",
-        ));
+        return Err(ApiError::conflict("manifest already exists; please retry"));
     }
 
     if let Some(key) = idempotency_key {
@@ -598,9 +598,8 @@ pub(crate) async fn get_manifest(
         }
     };
 
-    let manifest: StoredManifest = serde_json::from_slice(&bytes).map_err(|e| {
-        ApiError::internal(format!("failed to parse manifest: {e}"))
-    })?;
+    let manifest: StoredManifest = serde_json::from_slice(&bytes)
+        .map_err(|e| ApiError::internal(format!("failed to parse manifest: {e}")))?;
 
     Ok(Json(manifest))
 }

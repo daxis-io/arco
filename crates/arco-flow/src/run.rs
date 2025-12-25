@@ -243,7 +243,8 @@ impl Run {
                     partition_key: task.partition_key.clone(),
                     operation: task.operation,
                 };
-                let mut exec = TaskExecution::new(task.task_id).with_metadata(task_key, task.priority);
+                let mut exec =
+                    TaskExecution::new(task.task_id).with_metadata(task_key, task.priority);
                 exec.state = TaskState::Pending;
                 exec
             })

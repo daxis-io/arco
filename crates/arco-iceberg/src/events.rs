@@ -40,7 +40,11 @@ impl PendingReceipt {
     /// Path: `events/YYYY-MM-DD/iceberg/pending/{commit_key}.json`
     #[must_use]
     pub fn storage_path(date: NaiveDate, commit_key: &CommitKey) -> String {
-        format!("events/{}/iceberg/pending/{}.json", date.format("%Y-%m-%d"), commit_key)
+        format!(
+            "events/{}/iceberg/pending/{}.json",
+            date.format("%Y-%m-%d"),
+            commit_key
+        )
     }
 }
 
@@ -73,7 +77,11 @@ impl CommittedReceipt {
     /// Path: `events/YYYY-MM-DD/iceberg/committed/{commit_key}.json`
     #[must_use]
     pub fn storage_path(date: NaiveDate, commit_key: &CommitKey) -> String {
-        format!("events/{}/iceberg/committed/{}.json", date.format("%Y-%m-%d"), commit_key)
+        format!(
+            "events/{}/iceberg/committed/{}.json",
+            date.format("%Y-%m-%d"),
+            commit_key
+        )
     }
 }
 

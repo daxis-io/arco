@@ -32,7 +32,6 @@ pub const SIGNED_URL_MINTED: &str = "signed_url_minted_total";
 /// Rate limit hit counter.
 pub const RATE_LIMIT_HITS: &str = "rate_limit_hits_total";
 
-
 // ============================================================================
 // Prometheus Recorder
 // ============================================================================
@@ -55,15 +54,12 @@ pub fn init_metrics() -> PrometheusHandle {
     PROMETHEUS_HANDLE
         .get_or_init(|| {
             let builder = PrometheusBuilder::new();
-            let handle = builder.install_recorder().unwrap_or_else(|e| {
-                panic!("failed to install prometheus recorder: {e}")
-            });
+            let handle = builder
+                .install_recorder()
+                .unwrap_or_else(|e| panic!("failed to install prometheus recorder: {e}"));
 
             // Register metric descriptions
-            describe_histogram!(
-                API_REQUEST_DURATION,
-                "Duration of API requests in seconds"
-            );
+            describe_histogram!(API_REQUEST_DURATION, "Duration of API requests in seconds");
             describe_counter!(API_REQUEST_TOTAL, "Total number of API requests");
             describe_counter!(
                 SIGNED_URL_MINTED,
@@ -99,10 +95,10 @@ pub async fn metrics_middleware(request: Request, next: Next) -> Response {
     let start = Instant::now();
 
     // Extract the matched path (e.g., "/api/v1/namespaces/:namespace_id")
-    let path = request
-        .extensions()
-        .get::<MatchedPath>()
-        .map_or_else(|| request.uri().path().to_string(), |mp| mp.as_str().to_string());
+    let path = request.extensions().get::<MatchedPath>().map_or_else(
+        || request.uri().path().to_string(),
+        |mp| mp.as_str().to_string(),
+    );
 
     let method = request.method().to_string();
 

@@ -4,10 +4,10 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use axum::extract::MatchedPath;
+use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::extract::Request;
 use metrics::{counter, describe_counter, describe_histogram, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
@@ -16,6 +16,12 @@ pub const ICEBERG_REQUEST_DURATION: &str = "iceberg_request_duration_seconds";
 
 /// Iceberg request counter.
 pub const ICEBERG_REQUEST_TOTAL: &str = "iceberg_request_total";
+
+/// Iceberg request error counter (4xx/5xx responses).
+pub const ICEBERG_REQUEST_ERROR_TOTAL: &str = "iceberg_request_error_total";
+
+/// Iceberg CAS conflict counter for write operations.
+pub const ICEBERG_CAS_CONFLICT_TOTAL: &str = "iceberg_cas_conflict_total";
 
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 static METRICS_REGISTERED: OnceLock<()> = OnceLock::new();
@@ -32,6 +38,14 @@ pub fn register_metrics() {
         describe_counter!(
             ICEBERG_REQUEST_TOTAL,
             "Total number of Iceberg REST requests"
+        );
+        describe_counter!(
+            ICEBERG_REQUEST_ERROR_TOTAL,
+            "Total number of Iceberg REST requests returning 4xx/5xx"
+        );
+        describe_counter!(
+            ICEBERG_CAS_CONFLICT_TOTAL,
+            "Total number of Iceberg CAS conflicts"
         );
     });
 }
@@ -50,9 +64,9 @@ pub fn init_metrics() -> PrometheusHandle {
     PROMETHEUS_HANDLE
         .get_or_init(|| {
             let builder = PrometheusBuilder::new();
-            let handle = builder.install_recorder().unwrap_or_else(|e| {
-                panic!("failed to install prometheus recorder: {e}")
-            });
+            let handle = builder
+                .install_recorder()
+                .unwrap_or_else(|e| panic!("failed to install prometheus recorder: {e}"));
 
             register_metrics();
 
@@ -72,10 +86,10 @@ pub fn prometheus_handle() -> Option<PrometheusHandle> {
 pub async fn metrics_middleware(request: Request, next: Next) -> Response {
     let start = Instant::now();
 
-    let path = request
-        .extensions()
-        .get::<MatchedPath>()
-        .map_or_else(|| request.uri().path().to_string(), |mp| mp.as_str().to_string());
+    let path = request.extensions().get::<MatchedPath>().map_or_else(
+        || request.uri().path().to_string(),
+        |mp| mp.as_str().to_string(),
+    );
     let method = request.method().to_string();
 
     let response = next.run(request).await;
@@ -93,6 +107,9 @@ pub async fn metrics_middleware(request: Request, next: Next) -> Response {
 
     histogram!(ICEBERG_REQUEST_DURATION, &labels).record(duration);
     counter!(ICEBERG_REQUEST_TOTAL, &labels).increment(1);
+    if should_record_error(response.status()) {
+        counter!(ICEBERG_REQUEST_ERROR_TOTAL, &labels).increment(1);
+    }
 
     if duration > 1.0 {
         tracing::warn!(
@@ -107,6 +124,17 @@ pub async fn metrics_middleware(request: Request, next: Next) -> Response {
     response
 }
 
+/// Records a CAS conflict for an Iceberg write operation.
+pub fn record_cas_conflict(endpoint: &str, method: &str, operation: &str) {
+    register_metrics();
+    let labels = [
+        ("endpoint", endpoint.to_string()),
+        ("method", method.to_string()),
+        ("operation", operation.to_string()),
+    ];
+    counter!(ICEBERG_CAS_CONFLICT_TOTAL, &labels).increment(1);
+}
+
 fn status_class(status: StatusCode) -> &'static str {
     match status.as_u16() {
         100..=199 => "1xx",
@@ -116,6 +144,10 @@ fn status_class(status: StatusCode) -> &'static str {
         500..=599 => "5xx",
         _ => "unknown",
     }
+}
+
+fn should_record_error(status: StatusCode) -> bool {
+    status.is_client_error() || status.is_server_error()
 }
 
 /// Handler for the `/metrics` endpoint.
@@ -149,5 +181,13 @@ mod tests {
         assert_eq!(status_class(StatusCode::OK), "2xx");
         assert_eq!(status_class(StatusCode::NOT_FOUND), "4xx");
         assert_eq!(status_class(StatusCode::INTERNAL_SERVER_ERROR), "5xx");
+    }
+
+    #[test]
+    fn test_should_record_error() {
+        assert!(!should_record_error(StatusCode::OK));
+        assert!(!should_record_error(StatusCode::NO_CONTENT));
+        assert!(should_record_error(StatusCode::BAD_REQUEST));
+        assert!(should_record_error(StatusCode::INTERNAL_SERVER_ERROR));
     }
 }

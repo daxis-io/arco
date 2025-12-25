@@ -23,10 +23,10 @@
 use chrono::{DateTime, Duration, Utc};
 use metrics::{counter, histogram};
 
+use crate::metrics::{TimingGuard, labels as metrics_labels, names as metrics_names};
 use crate::orchestration::compactor::fold::{TimerRow, TimerState, TimerType};
 use crate::orchestration::compactor::manifest::OrchestrationManifest;
 use crate::orchestration::ids::cloud_task_id;
-use crate::metrics::{labels as metrics_labels, names as metrics_names, TimingGuard};
 
 /// Action returned by the timer reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,10 +107,7 @@ impl TimerController {
 
         // Check watermark freshness
         let actions: Vec<TimerAction> = if manifest.watermarks.is_fresh(self.max_compaction_lag) {
-            timer_rows
-                .iter()
-                .map(Self::reconcile_row)
-                .collect()
+            timer_rows.iter().map(Self::reconcile_row).collect()
         } else {
             timer_rows
                 .iter()
@@ -215,20 +212,23 @@ mod tests {
         let controller = TimerController::with_defaults();
         let manifest = fresh_manifest();
 
-        let timer_rows = vec![
-            make_timer_row(
-                "timer:retry:run1:extract:1:1705320000",
-                TimerType::Retry,
-                TimerState::Scheduled,
-                None,
-            ),
-        ];
+        let timer_rows = vec![make_timer_row(
+            "timer:retry:run1:extract:1:1705320000",
+            TimerType::Retry,
+            TimerState::Scheduled,
+            None,
+        )];
 
         let actions = controller.reconcile(&manifest, &timer_rows);
 
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            TimerAction::CreateTimer { timer_id, cloud_task_id, timer_type, .. } => {
+            TimerAction::CreateTimer {
+                timer_id,
+                cloud_task_id,
+                timer_type,
+                ..
+            } => {
                 assert_eq!(timer_id, "timer:retry:run1:extract:1:1705320000");
                 assert!(cloud_task_id.starts_with("t_"));
                 assert_eq!(*timer_type, TimerType::Retry);
@@ -242,14 +242,12 @@ mod tests {
         let controller = TimerController::with_defaults();
         let manifest = fresh_manifest();
 
-        let timer_rows = vec![
-            make_timer_row(
-                "timer:retry:run1:extract:1:1705320000",
-                TimerType::Retry,
-                TimerState::Scheduled,
-                Some("t_abc123".to_string()),
-            ),
-        ];
+        let timer_rows = vec![make_timer_row(
+            "timer:retry:run1:extract:1:1705320000",
+            TimerType::Retry,
+            TimerState::Scheduled,
+            Some("t_abc123".to_string()),
+        )];
 
         let actions = controller.reconcile(&manifest, &timer_rows);
 
@@ -267,14 +265,12 @@ mod tests {
         let controller = TimerController::with_defaults();
         let manifest = fresh_manifest();
 
-        let timer_rows = vec![
-            make_timer_row(
-                "timer:retry:run1:extract:1:1705320000",
-                TimerType::Retry,
-                TimerState::Fired,
-                Some("t_abc123".to_string()),
-            ),
-        ];
+        let timer_rows = vec![make_timer_row(
+            "timer:retry:run1:extract:1:1705320000",
+            TimerType::Retry,
+            TimerState::Fired,
+            Some("t_abc123".to_string()),
+        )];
 
         let actions = controller.reconcile(&manifest, &timer_rows);
 
@@ -292,14 +288,12 @@ mod tests {
         let controller = TimerController::with_defaults();
         let manifest = stale_manifest();
 
-        let timer_rows = vec![
-            make_timer_row(
-                "timer:retry:run1:extract:1:1705320000",
-                TimerType::Retry,
-                TimerState::Scheduled,
-                None,
-            ),
-        ];
+        let timer_rows = vec![make_timer_row(
+            "timer:retry:run1:extract:1:1705320000",
+            TimerType::Retry,
+            TimerState::Scheduled,
+            None,
+        )];
 
         let actions = controller.reconcile(&manifest, &timer_rows);
 

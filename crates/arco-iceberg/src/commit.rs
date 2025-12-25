@@ -4,7 +4,7 @@
 
 use bytes::Bytes;
 use chrono::{Duration, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -13,10 +13,18 @@ use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
 use crate::error::{IcebergError, IcebergErrorResponse, IcebergResult};
 use crate::events::{CommittedReceipt, PendingReceipt};
 use crate::idempotency::{
-    ClaimResult, FinalizeResult, IdempotencyMarker, IdempotencyStatus, IdempotencyStoreImpl,
+    ClaimResult, FinalizeResult, IdempotencyMarker, IdempotencyStatus, IdempotencyStore,
+    IdempotencyStoreImpl,
 };
-use crate::pointer::{CasResult, IcebergTablePointer, PointerStoreImpl, SnapshotRef, SnapshotRefType, UpdateSource};
-use crate::types::commit::{CommitTableRequest, SnapshotRefType as UpdateSnapshotRefType, TableUpdate, UpdateRequirement};
+use crate::metrics;
+use crate::pointer::{
+    CasResult, IcebergTablePointer, PointerStore, PointerStoreImpl, SnapshotRef, SnapshotRefType,
+    UpdateSource,
+};
+use crate::types::commit::{
+    CommitTableRequest, CommitTableResponse, SnapshotRefType as UpdateSnapshotRefType, TableUpdate,
+    UpdateRequirement,
+};
 use crate::types::{
     CommitKey, MetadataLogEntry, SnapshotLogEntry, SnapshotRefMetadata, TableMetadata, TableUuid,
 };
@@ -36,7 +44,10 @@ pub fn validate_requirements(
     Ok(())
 }
 
-fn validate_requirement(metadata: &TableMetadata, requirement: &UpdateRequirement) -> IcebergResult<()> {
+fn validate_requirement(
+    metadata: &TableMetadata,
+    requirement: &UpdateRequirement,
+) -> IcebergResult<()> {
     match requirement {
         UpdateRequirement::AssertTableUuid { uuid } => {
             if metadata.table_uuid.as_uuid() != uuid {
@@ -51,13 +62,18 @@ fn validate_requirement(metadata: &TableMetadata, requirement: &UpdateRequiremen
             ref_name,
             snapshot_id,
         } => {
-            let current_snapshot_id = metadata.refs.get(ref_name).map(|r| r.snapshot_id).or_else(|| {
-                if ref_name == "main" {
-                    metadata.current_snapshot_id
-                } else {
-                    None
-                }
-            });
+            let current_snapshot_id =
+                metadata
+                    .refs
+                    .get(ref_name)
+                    .map(|r| r.snapshot_id)
+                    .or_else(|| {
+                        if ref_name == "main" {
+                            metadata.current_snapshot_id
+                        } else {
+                            None
+                        }
+                    });
 
             if current_snapshot_id != *snapshot_id {
                 return Err(IcebergError::commit_conflict(format!(
@@ -117,6 +133,8 @@ fn validate_requirement(metadata: &TableMetadata, requirement: &UpdateRequiremen
 
 const IN_PROGRESS_TIMEOUT: Duration = Duration::minutes(10);
 const MAX_TAKEOVER_ATTEMPTS: usize = 3;
+const COMMIT_ENDPOINT: &str = "/v1/{prefix}/namespaces/{namespace}/tables/{table}";
+const COMMIT_METHOD: &str = "POST";
 
 /// Commit flow error that may carry a cached error response.
 #[derive(Debug)]
@@ -124,9 +142,17 @@ pub enum CommitError {
     /// Standard Iceberg error response.
     Iceberg(IcebergError),
     /// Cached error response from a failed idempotency marker.
-    CachedFailure { status: u16, payload: IcebergErrorResponse },
+    CachedFailure {
+        /// Cached HTTP status for the failed commit.
+        status: u16,
+        /// Cached error payload for the failed commit.
+        payload: IcebergErrorResponse,
+    },
     /// Temporary failure - retry after the specified seconds.
-    RetryAfter { seconds: u32 },
+    RetryAfter {
+        /// Suggested retry delay in seconds.
+        seconds: u32,
+    },
 }
 
 impl From<IcebergError> for CommitError {
@@ -152,7 +178,13 @@ impl<S: StorageBackend> CommitService<S> {
     }
 
     /// Executes the 12-step commit flow for `commit_table`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `CommitError` when commit preconditions fail or when storage
+    /// operations cannot be completed.
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn commit_table(
         &self,
         table_uuid: Uuid,
@@ -200,13 +232,11 @@ impl<S: StorageBackend> CommitService<S> {
                 new_metadata_location.clone(),
             );
 
-            let (mut marker_version, existing_marker) = match idempotency_store
-                .claim(&marker)
-                .await?
-            {
-                ClaimResult::Success { version } => (version, None),
-                ClaimResult::Exists { marker, version } => (version, Some(*marker)),
-            };
+            let (mut marker_version, existing_marker) =
+                match idempotency_store.claim(&marker).await? {
+                    ClaimResult::Success { version } => (version, None),
+                    ClaimResult::Exists { marker, version } => (version, Some(*marker)),
+                };
 
             if let Some(existing) = existing_marker {
                 // Same idempotency key but different payload - deterministic conflict.
@@ -235,9 +265,7 @@ impl<S: StorageBackend> CommitService<S> {
                             .ok_or_else(|| IcebergError::table_not_found(namespace, table))?
                             .0;
 
-                        if current_pointer.current_metadata_location
-                            == existing.metadata_location
-                        {
+                        if current_pointer.current_metadata_location == existing.metadata_location {
                             let response = self
                                 .response_from_location(
                                     &existing.metadata_location,
@@ -272,10 +300,7 @@ impl<S: StorageBackend> CommitService<S> {
                                 ..existing
                             };
 
-                            match idempotency_store
-                                .finalize(&marker, &marker_version)
-                                .await?
-                            {
+                            match idempotency_store.finalize(&marker, &marker_version).await? {
                                 FinalizeResult::Success { version } => {
                                     marker_version = version;
                                     // proceed with commit
@@ -287,7 +312,7 @@ impl<S: StorageBackend> CommitService<S> {
                             }
                         } else {
                             return Err(CommitError::RetryAfter {
-                                seconds: self.in_progress_timeout.num_seconds() as u32,
+                                seconds: self.retry_after_seconds(),
                             });
                         }
                     }
@@ -310,18 +335,22 @@ impl<S: StorageBackend> CommitService<S> {
             // Step 7: Write new metadata file
             let metadata_path =
                 resolve_metadata_path(&marker.metadata_location, tenant, workspace)?;
-            let metadata_bytes = serde_json::to_vec(&new_metadata).map_err(|e| {
-                IcebergError::Internal {
+            let metadata_bytes =
+                serde_json::to_vec(&new_metadata).map_err(|e| IcebergError::Internal {
                     message: format!("Failed to serialize table metadata: {e}"),
-                }
-            })?;
+                })?;
             match self
                 .storage
-                .put(&metadata_path, Bytes::from(metadata_bytes), WritePrecondition::DoesNotExist)
+                .put(
+                    &metadata_path,
+                    Bytes::from(metadata_bytes),
+                    WritePrecondition::DoesNotExist,
+                )
                 .await
             {
                 Ok(WriteResult::Success { .. }) => {}
                 Ok(WriteResult::PreconditionFailed { .. }) => {
+                    metrics::record_cas_conflict(COMMIT_ENDPOINT, COMMIT_METHOD, "metadata_write");
                     let err = IcebergError::commit_conflict(
                         "Metadata file already exists for this commit",
                     );
@@ -350,13 +379,14 @@ impl<S: StorageBackend> CommitService<S> {
                 .await;
 
             // Step 9: Pointer CAS
-            let new_pointer = pointer_from_metadata(&pointer, &new_metadata, &marker, source)?;
+            let new_pointer = pointer_from_metadata(&pointer, &new_metadata, &marker, &source)?;
             match pointer_store
                 .compare_and_swap(&table_uuid, &pointer_version, &new_pointer)
                 .await?
             {
                 CasResult::Success { .. } => {}
                 CasResult::Conflict { .. } => {
+                    metrics::record_cas_conflict(COMMIT_ENDPOINT, COMMIT_METHOD, "pointer_cas");
                     let err = IcebergError::commit_conflict(
                         "Table pointer was updated by another writer",
                     );
@@ -367,10 +397,11 @@ impl<S: StorageBackend> CommitService<S> {
             }
 
             // Step 10: Write committed receipt (best effort)
+            let metadata_location = marker.metadata_location.clone();
             let _ = self
                 .write_committed_receipt(
                     &marker,
-                    &marker.metadata_location,
+                    &metadata_location,
                     pointer.previous_metadata_location.clone(),
                     new_metadata.current_snapshot_id,
                     source.clone(),
@@ -378,30 +409,29 @@ impl<S: StorageBackend> CommitService<S> {
                 .await;
 
             // Step 11: Finalize idempotency marker
-            let finalized =
-                marker.finalize_committed(marker.metadata_location.clone());
-            self.finalize_committed_marker(
-                &idempotency_store,
-                &finalized,
-                &marker_version,
-            )
-            .await?;
+            let finalized = marker.finalize_committed(metadata_location.clone());
+            self.finalize_committed_marker(&idempotency_store, &finalized, &marker_version)
+                .await?;
 
             // Step 12: Return response
-            let metadata_value = serde_json::to_value(&new_metadata).map_err(|e| {
-                IcebergError::Internal {
+            let metadata_value =
+                serde_json::to_value(&new_metadata).map_err(|e| IcebergError::Internal {
                     message: format!("Failed to serialize metadata response: {e}"),
-                }
-            })?;
+                })?;
             return Ok(CommitTableResponse {
-                metadata_location: marker.metadata_location,
+                metadata_location,
                 metadata: metadata_value,
             });
         }
 
         Err(CommitError::RetryAfter {
-            seconds: self.in_progress_timeout.num_seconds() as u32,
+            seconds: self.retry_after_seconds(),
         })
+    }
+
+    fn retry_after_seconds(&self) -> u32 {
+        let seconds = self.in_progress_timeout.num_seconds().max(0);
+        u32::try_from(seconds).unwrap_or(u32::MAX)
     }
 
     async fn load_metadata(
@@ -411,9 +441,13 @@ impl<S: StorageBackend> CommitService<S> {
         workspace: &str,
     ) -> IcebergResult<TableMetadata> {
         let path = resolve_metadata_path(location, tenant, workspace)?;
-        let bytes = self.storage.get(&path).await.map_err(|err| IcebergError::Internal {
-            message: err.to_string(),
-        })?;
+        let bytes = self
+            .storage
+            .get(&path)
+            .await
+            .map_err(|err| IcebergError::Internal {
+                message: err.to_string(),
+            })?;
         serde_json::from_slice(&bytes).map_err(|err| IcebergError::Internal {
             message: format!("Failed to parse table metadata: {err}"),
         })
@@ -429,7 +463,8 @@ impl<S: StorageBackend> CommitService<S> {
             .response_metadata_location
             .as_deref()
             .unwrap_or(&marker.metadata_location);
-        self.response_from_location(location, tenant, workspace).await
+        self.response_from_location(location, tenant, workspace)
+            .await
     }
 
     async fn response_from_location(
@@ -439,14 +474,17 @@ impl<S: StorageBackend> CommitService<S> {
         workspace: &str,
     ) -> Result<CommitTableResponse, CommitError> {
         let path = resolve_metadata_path(location, tenant, workspace)?;
-        let bytes = self.storage.get(&path).await.map_err(|err| IcebergError::Internal {
-            message: err.to_string(),
-        })?;
-        let metadata: serde_json::Value = serde_json::from_slice(&bytes).map_err(|err| {
-            IcebergError::Internal {
+        let bytes = self
+            .storage
+            .get(&path)
+            .await
+            .map_err(|err| IcebergError::Internal {
+                message: err.to_string(),
+            })?;
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|err| IcebergError::Internal {
                 message: format!("Failed to parse metadata response: {err}"),
-            }
-        })?;
+            })?;
         Ok(CommitTableResponse {
             metadata_location: location.to_string(),
             metadata,
@@ -499,8 +537,7 @@ impl<S: StorageBackend> CommitService<S> {
             source,
             committed_at: Utc::now(),
         };
-        let path =
-            CommittedReceipt::storage_path(Utc::now().date_naive(), &receipt.commit_key);
+        let path = CommittedReceipt::storage_path(Utc::now().date_naive(), &receipt.commit_key);
         let bytes = serde_json::to_vec(&receipt).map_err(|e| IcebergError::Internal {
             message: format!("Failed to serialize committed receipt: {e}"),
         })?;
@@ -522,11 +559,13 @@ impl<S: StorageBackend> CommitService<S> {
             return Ok(());
         }
         let error_payload = IcebergErrorResponse::from(err);
-        let failed = marker.clone().finalize_failed(err.status_code().as_u16(), error_payload);
+        let failed = marker
+            .clone()
+            .finalize_failed(err.status_code().as_u16(), error_payload);
         match store.finalize(&failed, marker_version).await? {
             FinalizeResult::Success { .. } => Ok(()),
             FinalizeResult::Conflict { .. } => Err(CommitError::RetryAfter {
-                seconds: self.in_progress_timeout.num_seconds() as u32,
+                seconds: self.retry_after_seconds(),
             }),
         }
     }
@@ -550,7 +589,7 @@ impl<S: StorageBackend> CommitService<S> {
                     }
                 }
                 Err(CommitError::RetryAfter {
-                    seconds: self.in_progress_timeout.num_seconds() as u32,
+                    seconds: self.retry_after_seconds(),
                 })
             }
         }
@@ -580,6 +619,7 @@ fn apply_updates(metadata: &mut TableMetadata, updates: &[TableUpdate]) -> Icebe
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_update(metadata: &mut TableMetadata, update: &TableUpdate) -> IcebergResult<()> {
     match update {
         TableUpdate::AssignUuid { uuid } => {
@@ -616,7 +656,10 @@ fn apply_update(metadata: &mut TableMetadata, update: &TableUpdate) -> IcebergRe
             }
         }
         TableUpdate::SetCurrentSchema { schema_id } => {
-            let exists = metadata.schemas.iter().any(|schema| schema.schema_id == *schema_id);
+            let exists = metadata
+                .schemas
+                .iter()
+                .any(|schema| schema.schema_id == *schema_id);
             if !exists {
                 return Err(IcebergError::BadRequest {
                     message: format!("Schema {schema_id} does not exist"),
@@ -635,7 +678,10 @@ fn apply_update(metadata: &mut TableMetadata, update: &TableUpdate) -> IcebergRe
             metadata.partition_specs.push(spec.clone());
         }
         TableUpdate::SetDefaultSpec { spec_id } => {
-            let exists = metadata.partition_specs.iter().any(|spec| spec.spec_id == *spec_id);
+            let exists = metadata
+                .partition_specs
+                .iter()
+                .any(|spec| spec.spec_id == *spec_id);
             if !exists {
                 return Err(IcebergError::BadRequest {
                     message: format!("Partition spec {spec_id} does not exist"),
@@ -648,7 +694,10 @@ fn apply_update(metadata: &mut TableMetadata, update: &TableUpdate) -> IcebergRe
             metadata.sort_orders.push(sort_order.clone());
         }
         TableUpdate::SetDefaultSortOrder { sort_order_id } => {
-            let exists = metadata.sort_orders.iter().any(|order| order.order_id == *sort_order_id);
+            let exists = metadata
+                .sort_orders
+                .iter()
+                .any(|order| order.order_id == *sort_order_id);
             if !exists {
                 return Err(IcebergError::BadRequest {
                     message: format!("Sort order {sort_order_id} does not exist"),
@@ -658,9 +707,8 @@ fn apply_update(metadata: &mut TableMetadata, update: &TableUpdate) -> IcebergRe
             metadata.default_sort_order_id = *sort_order_id;
         }
         TableUpdate::AddSnapshot { snapshot } => {
-            metadata.last_sequence_number = metadata
-                .last_sequence_number
-                .max(snapshot.sequence_number);
+            metadata.last_sequence_number =
+                metadata.last_sequence_number.max(snapshot.sequence_number);
             metadata.snapshots.push(snapshot.clone());
         }
         TableUpdate::SetSnapshotRef {
@@ -695,12 +743,14 @@ fn apply_update(metadata: &mut TableMetadata, update: &TableUpdate) -> IcebergRe
             }
         }
         TableUpdate::RemoveSnapshots { snapshot_ids } => {
-            let ids: HashMap<i64, ()> = snapshot_ids.iter().copied().map(|id| (id, ())).collect();
-            metadata.snapshots.retain(|snap| !ids.contains_key(&snap.snapshot_id));
-            metadata.refs.retain(|_, r| !ids.contains_key(&r.snapshot_id));
+            let ids: HashSet<i64> = snapshot_ids.iter().copied().collect();
+            metadata
+                .snapshots
+                .retain(|snap| !ids.contains(&snap.snapshot_id));
+            metadata.refs.retain(|_, r| !ids.contains(&r.snapshot_id));
             if metadata
                 .current_snapshot_id
-                .is_some_and(|id| ids.contains_key(&id))
+                .is_some_and(|id| ids.contains(&id))
             {
                 metadata.current_snapshot_id = None;
             }
@@ -736,7 +786,7 @@ fn finalize_metadata(
     if metadata
         .metadata_log
         .last()
-        .map_or(true, |entry| entry.metadata_file != previous)
+        .is_none_or(|entry| entry.metadata_file != previous)
     {
         metadata.metadata_log.push(MetadataLogEntry {
             metadata_file: previous,
@@ -744,9 +794,7 @@ fn finalize_metadata(
         });
     }
 
-    metadata.last_sequence_number = metadata
-        .last_sequence_number
-        .max(next_sequence);
+    metadata.last_sequence_number = metadata.last_sequence_number.max(next_sequence);
     metadata.last_updated_ms = Utc::now().timestamp_millis();
 }
 
@@ -754,7 +802,7 @@ fn pointer_from_metadata(
     pointer: &IcebergTablePointer,
     metadata: &TableMetadata,
     marker: &IdempotencyMarker,
-    source: UpdateSource,
+    source: &UpdateSource,
 ) -> IcebergResult<IcebergTablePointer> {
     let refs = metadata
         .refs
@@ -791,7 +839,7 @@ fn pointer_from_metadata(
         last_sequence_number: metadata.last_sequence_number,
         previous_metadata_location: Some(pointer.current_metadata_location.clone()),
         updated_at: Utc::now(),
-        updated_by: source,
+        updated_by: source.clone(),
     })
 }
 

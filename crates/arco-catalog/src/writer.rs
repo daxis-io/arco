@@ -396,11 +396,11 @@ impl CatalogWriter {
     }
 
     fn sync_compactor(&self) -> Result<&Arc<dyn SyncCompactor>> {
-        self.sync_compactor.as_ref().ok_or_else(|| {
-            CatalogError::InvariantViolation {
+        self.sync_compactor
+            .as_ref()
+            .ok_or_else(|| CatalogError::InvariantViolation {
                 message: "sync compactor is not configured (Tier-1 DDL is disabled)".to_string(),
-            }
-        })
+            })
     }
 
     // ========================================================================
@@ -481,8 +481,7 @@ impl CatalogWriter {
 
         let manifest = self.tier1.read_manifest().await?;
         let state =
-            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path)
-                .await?;
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
         // Check for duplicate
         if state.namespaces.iter().any(|ns| ns.name == name) {
@@ -559,8 +558,7 @@ impl CatalogWriter {
 
         let manifest = self.tier1.read_manifest().await?;
         let state =
-            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path)
-                .await?;
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
         // Find namespace
         let ns_idx = state
@@ -652,8 +650,7 @@ impl CatalogWriter {
 
         let manifest = self.tier1.read_manifest().await?;
         let state =
-            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path)
-                .await?;
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
         // Find namespace
         let ns = state
@@ -776,8 +773,7 @@ impl CatalogWriter {
 
         let manifest = self.tier1.read_manifest().await?;
         let mut state =
-            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path)
-                .await?;
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
         // Find namespace
         let ns = state
@@ -876,8 +872,7 @@ impl CatalogWriter {
 
         let manifest = self.tier1.read_manifest().await?;
         let state =
-            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path)
-                .await?;
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
         // Find namespace
         let ns = state
@@ -1068,10 +1063,10 @@ impl CatalogWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tier1_compactor::Tier1Compactor;
     use arco_core::storage::MemoryBackend;
     use std::sync::Arc;
     use ulid::Ulid;
-    use crate::tier1_compactor::Tier1Compactor;
 
     fn setup() -> CatalogWriter {
         let backend = Arc::new(MemoryBackend::new());

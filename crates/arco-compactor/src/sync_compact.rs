@@ -22,8 +22,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use arco_core::ScopedStorage;
 use arco_catalog::{Tier1CompactionError, Tier1Compactor};
+use arco_core::ScopedStorage;
 
 // Re-export request/response types for use by main.rs handlers.
 pub use arco_core::sync_compact::{SyncCompactRequest, SyncCompactResponse};

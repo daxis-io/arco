@@ -44,10 +44,10 @@ pub mod observability;
 pub mod partition;
 pub mod publish;
 pub mod scoped_storage;
-pub mod sync_compact;
 pub mod storage;
 pub mod storage_keys;
 pub mod storage_traits;
+pub mod sync_compact;
 pub mod tenant;
 
 /// Prelude module for convenient imports.
@@ -62,7 +62,9 @@ pub mod prelude {
     pub use crate::catalog_paths::{CatalogDomain, CatalogPaths};
     pub use crate::error::{Error, Result};
     pub use crate::id::{AssetId, EventId, MaterializationId, RunId, TaskId};
+    pub use crate::lock::{DistributedLock, LockGuard, LockInfo};
     pub use crate::partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
+    pub use crate::publish::{FencingToken, PermitIssuer, PublishPermit, Publisher};
     pub use crate::scoped_storage::ScopedStorage;
     pub use crate::storage::{
         MemoryBackend, ObjectMeta, ObjectStoreBackend, StorageBackend, WritePrecondition,
@@ -77,8 +79,6 @@ pub mod prelude {
         SignedUrlStore, StatePutStore,
     };
     pub use crate::sync_compact::{SyncCompactRequest, SyncCompactResponse};
-    pub use crate::publish::{FencingToken, PermitIssuer, PublishPermit, Publisher};
-    pub use crate::lock::{DistributedLock, LockGuard, LockInfo};
     pub use crate::tenant::TenantId;
 }
 
@@ -91,8 +91,8 @@ pub use lock::{DistributedLock, LockGuard, LockInfo};
 pub use observability::{LogFormat, Redacted, init_logging};
 pub use partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
 pub use scoped_storage::ScopedStorage;
-pub use sync_compact::{SyncCompactRequest, SyncCompactResponse};
 pub use storage::{
     MemoryBackend, ObjectMeta, ObjectStoreBackend, StorageBackend, WritePrecondition, WriteResult,
 };
+pub use sync_compact::{SyncCompactRequest, SyncCompactResponse};
 pub use tenant::TenantId;

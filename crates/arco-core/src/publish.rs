@@ -153,7 +153,11 @@ impl PermitIssuer {
     /// - `domain`: The catalog domain being published
     /// - `expected_version`: The manifest version for CAS precondition
     #[must_use]
-    pub fn issue_permit(&self, domain: impl Into<String>, expected_version: String) -> PublishPermit {
+    pub fn issue_permit(
+        &self,
+        domain: impl Into<String>,
+        expected_version: String,
+    ) -> PublishPermit {
         let commit_ulid = ulid::Ulid::new().to_string();
         self.issue_permit_with_commit_ulid(domain, expected_version, commit_ulid)
     }

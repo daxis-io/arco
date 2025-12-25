@@ -66,11 +66,11 @@ pub trait PartitionResolver: Send + Sync + std::fmt::Debug {
 pub struct BackfillPreview {
     /// Total number of partitions to materialize.
     pub total_partitions: u32,
-    /// Total number of chunks (ceil(total_partitions / chunk_size)).
+    /// Total number of chunks (`total_partitions.div_ceil(chunk_size)`).
     pub total_chunks: u32,
     /// First chunk partition keys (for preview).
     pub first_chunk_partitions: Vec<String>,
-    /// Estimated number of runs (equals total_chunks).
+    /// Estimated number of runs (equals `total_chunks`).
     pub estimated_runs: u32,
 }
 
@@ -170,7 +170,7 @@ impl BackfillController {
     /// Returns partition count and chunk breakdown without creating any events.
     ///
     /// # Errors
-    /// Returns error if asset_key is empty, range is invalid, or partitions resolve to zero.
+    /// Returns error if `asset_key` is empty, range is invalid, or partitions resolve to zero.
     pub fn preview(
         &self,
         asset_key: &str,
@@ -282,6 +282,7 @@ impl BackfillController {
     /// Checks watermark freshness before planning - if compaction is lagging, returns
     /// empty to avoid making decisions on stale state.
     #[must_use]
+    #[allow(clippy::cognitive_complexity)]
     pub fn reconcile(
         &self,
         watermarks: &Watermarks,
@@ -529,6 +530,9 @@ impl BackfillController {
     }
 
     /// Pause with version check for idempotent operations.
+    ///
+    /// # Errors
+    /// Returns error if version mismatch or invalid state transition.
     pub fn pause_with_version(
         &self,
         backfill_id: &str,
@@ -544,6 +548,9 @@ impl BackfillController {
     }
 
     /// Resume with version check for idempotent operations.
+    ///
+    /// # Errors
+    /// Returns error if version mismatch or invalid state transition.
     pub fn resume_with_version(
         &self,
         backfill_id: &str,
@@ -559,6 +566,9 @@ impl BackfillController {
     }
 
     /// Cancel with version check for idempotent operations.
+    ///
+    /// # Errors
+    /// Returns error if version mismatch or invalid state transition.
     pub fn cancel_with_version(
         &self,
         backfill_id: &str,
@@ -637,6 +647,7 @@ impl BackfillController {
         }
 
         let partition_keys: Vec<String> = partitions.into_iter().collect();
+        #[allow(clippy::cast_possible_truncation)]
         let total_partitions = partition_keys.len() as u32;
 
         Ok(OrchestrationEvent::new_with_idempotency_key(
@@ -657,6 +668,7 @@ impl BackfillController {
         ))
     }
 
+    #[allow(clippy::unused_self)]
     fn transition(
         &self,
         backfill_id: &str,
@@ -712,23 +724,25 @@ impl BackfillController {
         )
     }
 
+    #[allow(clippy::unused_self)]
     fn count_active_chunks(
         &self,
         backfill_id: &str,
         chunks: &HashMap<String, BackfillChunkRow>,
         runs: &HashMap<String, RunRow>,
     ) -> u32 {
-        chunks
+        #[allow(clippy::cast_possible_truncation)]
+        let count = chunks
             .values()
             .filter(|c| c.backfill_id == backfill_id)
             .filter(|c| {
                 matches!(c.state, ChunkState::Planned | ChunkState::Running)
-                    || c.run_id
-                        .as_ref()
-                        .map(|id| runs.get(id).map(|r| !r.state.is_terminal()).unwrap_or(false))
-                        .unwrap_or(false)
+                    || c.run_id.as_ref().is_some_and(|id| {
+                        runs.get(id).is_some_and(|r| !r.state.is_terminal())
+                    })
             })
-            .count() as u32
+            .count() as u32;
+        count
     }
 
     fn ensure_single_asset<'a>(
@@ -745,11 +759,14 @@ impl BackfillController {
                 "multi-asset backfills are not supported yet".to_string(),
             ));
         }
-        let asset_key = asset_selection[0].as_str();
+        // Safe: we just checked len() == 1 above
+        #[allow(clippy::expect_used)]
+        let asset_key = asset_selection.first().expect("checked non-empty").as_str();
         self.validate_asset_key(asset_key)?;
         Ok(asset_key)
     }
 
+    #[allow(clippy::unused_self)]
     fn validate_asset_key(&self, asset_key: &str) -> Result<(), BackfillError> {
         if asset_key.trim().is_empty() {
             return Err(BackfillError::InvalidRequest(
@@ -759,6 +776,7 @@ impl BackfillController {
         Ok(())
     }
 
+    #[allow(clippy::unused_self)]
     fn validate_range(&self, partition_start: &str, partition_end: &str) -> Result<(), BackfillError> {
         if partition_start.trim().is_empty() || partition_end.trim().is_empty() {
             return Err(BackfillError::InvalidRequest(
@@ -768,6 +786,7 @@ impl BackfillController {
         Ok(())
     }
 
+    #[allow(clippy::unused_self)]
     fn validate_request_id(&self, value: &str, field: &str) -> Result<(), BackfillError> {
         if value.trim().is_empty() {
             return Err(BackfillError::InvalidRequest(format!(
@@ -807,11 +826,13 @@ impl BackfillController {
         Ok(resolved)
     }
 
+    #[allow(clippy::unused_self)]
     fn total_chunks(&self, backfill: &BackfillRow) -> u32 {
         if backfill.chunk_size == 0 {
             return 0;
         }
 
+        #[allow(clippy::cast_possible_truncation)]
         let total_partitions = match &backfill.partition_selector {
             PartitionSelector::Explicit { partition_keys } => partition_keys.len() as u32,
             _ => backfill.total_partitions,

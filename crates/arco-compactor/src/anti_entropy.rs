@@ -213,10 +213,7 @@ impl<S: Send + Sync> AntiEntropyJob<S> {
 
     /// Returns the cursor storage path.
     fn cursor_path(&self) -> String {
-        format!(
-            "state/anti_entropy/{}/cursor.json",
-            self.config.domain
-        )
+        format!("state/anti_entropy/{}/cursor.json", self.config.domain)
     }
 
     /// Loads cursor from durable storage.
@@ -310,10 +307,7 @@ impl<S: Send + Sync> AntiEntropyJob<S> {
     /// - Publishing to a reprocessing queue
     /// - Writing to a "reprocess" ledger
     #[allow(clippy::unused_async, dead_code)]
-    async fn enqueue_for_reprocessing(
-        &self,
-        paths: &[String],
-    ) -> Result<(), AntiEntropyError> {
+    async fn enqueue_for_reprocessing(&self, paths: &[String]) -> Result<(), AntiEntropyError> {
         if paths.is_empty() {
             return Ok(());
         }
@@ -412,11 +406,17 @@ mod tests {
         assert_eq!(cursor.completed_scans, 0);
 
         // Advance through pages
-        cursor.advance(Some("page2".to_string()), Some("ledger/catalog/evt1.json".to_string()));
+        cursor.advance(
+            Some("page2".to_string()),
+            Some("ledger/catalog/evt1.json".to_string()),
+        );
         assert!(!cursor.is_at_start());
         assert_eq!(cursor.token, Some("page2".to_string()));
 
-        cursor.advance(Some("page3".to_string()), Some("ledger/catalog/evt50.json".to_string()));
+        cursor.advance(
+            Some("page3".to_string()),
+            Some("ledger/catalog/evt50.json".to_string()),
+        );
         assert_eq!(cursor.token, Some("page3".to_string()));
 
         // Complete scan
@@ -504,7 +504,8 @@ mod tests {
         // A full scan completes over multiple runs
         // With 10,000 events and 500 per run, it takes 20 runs
         let total_events = 10_000;
-        let runs_needed = (total_events + config.max_objects_per_run - 1) / config.max_objects_per_run;
+        let runs_needed =
+            (total_events + config.max_objects_per_run - 1) / config.max_objects_per_run;
         assert_eq!(runs_needed, 20);
     }
 }

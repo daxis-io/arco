@@ -23,11 +23,11 @@ use chrono::{DateTime, Duration, Utc};
 use metrics::{counter, histogram};
 use std::collections::HashSet;
 
+use crate::metrics::{TimingGuard, labels as metrics_labels, names as metrics_names};
 use crate::orchestration::compactor::fold::{
     DispatchOutboxRow, DispatchStatus, TaskRow, TaskState,
 };
 use crate::orchestration::compactor::manifest::Watermarks;
-use crate::metrics::{labels as metrics_labels, names as metrics_names, TimingGuard};
 
 /// Repair action emitted by the anti-entropy sweeper.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +83,11 @@ pub struct AntiEntropySweeper {
 impl AntiEntropySweeper {
     /// Creates a new anti-entropy sweeper.
     #[must_use]
-    pub fn new(ready_timeout: Duration, dispatch_timeout: Duration, max_compaction_lag: Duration) -> Self {
+    pub fn new(
+        ready_timeout: Duration,
+        dispatch_timeout: Duration,
+        max_compaction_lag: Duration,
+    ) -> Self {
         Self {
             ready_timeout,
             dispatch_timeout,
@@ -151,7 +155,12 @@ impl AntiEntropySweeper {
             // Build set of tasks with active dispatches
             let dispatched_tasks: HashSet<(String, String, u32)> = outbox
                 .iter()
-                .filter(|o| matches!(o.status, DispatchStatus::Pending | DispatchStatus::Created | DispatchStatus::Acked))
+                .filter(|o| {
+                    matches!(
+                        o.status,
+                        DispatchStatus::Pending | DispatchStatus::Created | DispatchStatus::Acked
+                    )
+                })
                 .map(|o| (o.run_id.clone(), o.task_key.clone(), o.attempt))
                 .collect();
 
@@ -179,10 +188,9 @@ impl AntiEntropySweeper {
     /// Checks if a task might need repair (before watermark check).
     fn needs_repair(&self, task: &TaskRow, now: DateTime<Utc>) -> bool {
         match task.state {
-            TaskState::Ready => {
-                task.ready_at
-                    .is_some_and(|ready_at| now - ready_at > self.ready_timeout)
-            }
+            TaskState::Ready => task
+                .ready_at
+                .is_some_and(|ready_at| now - ready_at > self.ready_timeout),
             TaskState::Dispatched => true, // Will check dispatch age
             _ => false,
         }
@@ -229,10 +237,7 @@ impl AntiEntropySweeper {
             run_id: task.run_id.clone(),
             task_key: task.task_key.clone(),
             attempt: next_attempt,
-            reason: format!(
-                "stuck_ready_{}s",
-                (now - ready_at).num_seconds()
-            ),
+            reason: format!("stuck_ready_{}s", (now - ready_at).num_seconds()),
         })
     }
 
@@ -244,13 +249,9 @@ impl AntiEntropySweeper {
         now: DateTime<Utc>,
     ) -> Option<Repair> {
         // Find the dispatch for this task
-        let dispatch = outbox
-            .iter()
-            .find(|o| {
-                o.run_id == task.run_id
-                    && o.task_key == task.task_key
-                    && o.attempt == task.attempt
-            });
+        let dispatch = outbox.iter().find(|o| {
+            o.run_id == task.run_id && o.task_key == task.task_key && o.attempt == task.attempt
+        });
 
         let Some(dispatch) = dispatch else {
             return Some(Repair::CreateDispatchOutbox {
@@ -358,13 +359,11 @@ mod tests {
         let sweeper = AntiEntropySweeper::with_defaults();
         let watermarks = fresh_watermarks(now);
 
-        let tasks = vec![
-            make_task_row(
-                "extract",
-                TaskState::Ready,
-                Some(now - Duration::minutes(10)), // Stuck for 10 min
-            ),
-        ];
+        let tasks = vec![make_task_row(
+            "extract",
+            TaskState::Ready,
+            Some(now - Duration::minutes(10)), // Stuck for 10 min
+        )];
 
         let outbox = vec![]; // No dispatch outbox entry
 
@@ -372,7 +371,12 @@ mod tests {
 
         assert_eq!(repairs.len(), 1);
         match &repairs[0] {
-            Repair::CreateDispatchOutbox { task_key, attempt, reason, .. } => {
+            Repair::CreateDispatchOutbox {
+                task_key,
+                attempt,
+                reason,
+                ..
+            } => {
                 assert_eq!(task_key, "extract");
                 assert_eq!(*attempt, 1);
                 assert!(reason.contains("stuck_ready"));
@@ -387,13 +391,11 @@ mod tests {
         let sweeper = AntiEntropySweeper::with_defaults();
         let watermarks = fresh_watermarks(now);
 
-        let tasks = vec![
-            make_task_row(
-                "extract",
-                TaskState::Ready,
-                Some(now - Duration::minutes(2)), // Only 2 min, not stuck yet
-            ),
-        ];
+        let tasks = vec![make_task_row(
+            "extract",
+            TaskState::Ready,
+            Some(now - Duration::minutes(2)), // Only 2 min, not stuck yet
+        )];
 
         let outbox = vec![];
 
@@ -409,17 +411,18 @@ mod tests {
         let sweeper = AntiEntropySweeper::with_defaults();
         let watermarks = fresh_watermarks(now);
 
-        let tasks = vec![
-            make_task_row(
-                "extract",
-                TaskState::Ready,
-                Some(now - Duration::minutes(10)),
-            ),
-        ];
+        let tasks = vec![make_task_row(
+            "extract",
+            TaskState::Ready,
+            Some(now - Duration::minutes(10)),
+        )];
 
-        let outbox = vec![
-            make_outbox_row("extract", 1, DispatchStatus::Pending, now - Duration::minutes(5)),
-        ];
+        let outbox = vec![make_outbox_row(
+            "extract",
+            1,
+            DispatchStatus::Pending,
+            now - Duration::minutes(5),
+        )];
 
         let repairs = sweeper.scan(&watermarks, &tasks, &outbox, now);
 
@@ -433,17 +436,18 @@ mod tests {
         let sweeper = AntiEntropySweeper::with_defaults();
         let watermarks = fresh_watermarks(now);
 
-        let tasks = vec![
-            make_task_row(
-                "extract",
-                TaskState::Ready,
-                Some(now - Duration::minutes(10)),
-            ),
-        ];
+        let tasks = vec![make_task_row(
+            "extract",
+            TaskState::Ready,
+            Some(now - Duration::minutes(10)),
+        )];
 
-        let outbox = vec![
-            make_outbox_row("extract", 1, DispatchStatus::Acked, now - Duration::minutes(5)),
-        ];
+        let outbox = vec![make_outbox_row(
+            "extract",
+            1,
+            DispatchStatus::Acked,
+            now - Duration::minutes(5),
+        )];
 
         let repairs = sweeper.scan(&watermarks, &tasks, &outbox, now);
 
@@ -457,29 +461,28 @@ mod tests {
         let sweeper = AntiEntropySweeper::with_defaults();
         let watermarks = fresh_watermarks(now);
 
-        let mut task = make_task_row(
-            "extract",
-            TaskState::Dispatched,
-            None,
-        );
+        let mut task = make_task_row("extract", TaskState::Dispatched, None);
         task.attempt = 1;
 
         let tasks = vec![task];
 
-        let outbox = vec![
-            make_outbox_row(
-                "extract",
-                1,
-                DispatchStatus::Created,
-                now - Duration::minutes(15), // Stuck for 15 min
-            ),
-        ];
+        let outbox = vec![make_outbox_row(
+            "extract",
+            1,
+            DispatchStatus::Created,
+            now - Duration::minutes(15), // Stuck for 15 min
+        )];
 
         let repairs = sweeper.scan(&watermarks, &tasks, &outbox, now);
 
         assert_eq!(repairs.len(), 1);
         match &repairs[0] {
-            Repair::RedispatchStuckTask { task_key, attempt, reason, .. } => {
+            Repair::RedispatchStuckTask {
+                task_key,
+                attempt,
+                reason,
+                ..
+            } => {
                 assert_eq!(task_key, "extract");
                 assert_eq!(*attempt, 1);
                 assert!(reason.contains("stuck_dispatched"));
@@ -504,7 +507,12 @@ mod tests {
 
         assert_eq!(repairs.len(), 1);
         match &repairs[0] {
-            Repair::CreateDispatchOutbox { task_key, attempt, reason, .. } => {
+            Repair::CreateDispatchOutbox {
+                task_key,
+                attempt,
+                reason,
+                ..
+            } => {
                 assert_eq!(task_key, "extract");
                 assert_eq!(*attempt, 1);
                 assert_eq!(reason, "missing_dispatch_outbox");
@@ -523,15 +531,23 @@ mod tests {
         task.attempt = 1;
 
         let tasks = vec![task];
-        let outbox = vec![
-            make_outbox_row("extract", 1, DispatchStatus::Failed, now - Duration::seconds(5)),
-        ];
+        let outbox = vec![make_outbox_row(
+            "extract",
+            1,
+            DispatchStatus::Failed,
+            now - Duration::seconds(5),
+        )];
 
         let repairs = sweeper.scan(&watermarks, &tasks, &outbox, now);
 
         assert_eq!(repairs.len(), 1);
         match &repairs[0] {
-            Repair::RedispatchStuckTask { task_key, attempt, reason, .. } => {
+            Repair::RedispatchStuckTask {
+                task_key,
+                attempt,
+                reason,
+                ..
+            } => {
                 assert_eq!(task_key, "extract");
                 assert_eq!(*attempt, 1);
                 assert_eq!(reason, "dispatch_failed");
@@ -546,13 +562,11 @@ mod tests {
         let sweeper = AntiEntropySweeper::with_defaults();
         let watermarks = stale_watermarks(now);
 
-        let tasks = vec![
-            make_task_row(
-                "extract",
-                TaskState::Ready,
-                Some(now - Duration::minutes(10)),
-            ),
-        ];
+        let tasks = vec![make_task_row(
+            "extract",
+            TaskState::Ready,
+            Some(now - Duration::minutes(10)),
+        )];
 
         let outbox = vec![];
 
@@ -589,9 +603,7 @@ mod tests {
         let sweeper = AntiEntropySweeper::with_defaults();
         let watermarks = fresh_watermarks(now);
 
-        let tasks = vec![
-            make_task_row("extract", TaskState::Running, None),
-        ];
+        let tasks = vec![make_task_row("extract", TaskState::Running, None)];
 
         let outbox = vec![];
 

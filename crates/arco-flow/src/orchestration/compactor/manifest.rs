@@ -150,6 +150,10 @@ pub struct TablePaths {
     /// Path to `sensor_evals.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sensor_evals: Option<String>,
+
+    /// Path to `idempotency_keys.parquet` (relative to storage root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_keys: Option<String>,
 }
 
 impl TablePaths {
@@ -177,6 +181,9 @@ impl TablePaths {
         }
         if let Some(ref p) = self.sensor_evals {
             paths.insert("sensor_evals", p.as_str());
+        }
+        if let Some(ref p) = self.idempotency_keys {
+            paths.insert("idempotency_keys", p.as_str());
         }
         paths
     }
@@ -240,6 +247,9 @@ pub struct RowCounts {
 
     /// Rows in `sensor_evals` table.
     pub sensor_evals: u32,
+
+    /// Rows in `idempotency_keys` table.
+    pub idempotency_keys: u32,
 }
 
 impl RowCounts {
@@ -253,6 +263,7 @@ impl RowCounts {
             + self.dispatch_outbox
             + self.sensor_state
             + self.sensor_evals
+            + self.idempotency_keys
     }
 }
 
@@ -349,9 +360,10 @@ mod tests {
             dispatch_outbox: 40,
             sensor_state: 5,
             sensor_evals: 7,
+            idempotency_keys: 8,
         };
 
-        assert_eq!(counts.total(), 512);
+        assert_eq!(counts.total(), 520);
     }
 
     #[test]

@@ -100,7 +100,12 @@ impl HeartbeatHandler {
     ///
     /// Action to take based on the heartbeat status.
     #[must_use]
-    pub fn check(&self, watermarks: &Watermarks, task: &TaskRow, now: DateTime<Utc>) -> HeartbeatAction {
+    pub fn check(
+        &self,
+        watermarks: &Watermarks,
+        task: &TaskRow,
+        now: DateTime<Utc>,
+    ) -> HeartbeatAction {
         // Check if task is still running
         if task.state.is_terminal() {
             return HeartbeatAction::NoOp {
@@ -295,7 +300,11 @@ impl RetryHandler {
 mod tests {
     use super::*;
 
-    fn make_task_row(state: TaskState, attempt: u32, last_heartbeat: Option<DateTime<Utc>>) -> TaskRow {
+    fn make_task_row(
+        state: TaskState,
+        attempt: u32,
+        last_heartbeat: Option<DateTime<Utc>>,
+    ) -> TaskRow {
         TaskRow {
             run_id: "run1".to_string(),
             task_key: "extract".to_string(),
@@ -343,16 +352,14 @@ mod tests {
         let handler = HeartbeatHandler::with_defaults();
         let watermarks = stale_watermarks(now);
 
-        let task = make_task_row(
-            TaskState::Running,
-            1,
-            Some(now - Duration::seconds(30)),
-        );
+        let task = make_task_row(TaskState::Running, 1, Some(now - Duration::seconds(30)));
 
         let action = handler.check(&watermarks, &task, now);
 
         // Should reschedule, not fail (compaction lag too high)
-        assert!(matches!(action, HeartbeatAction::Reschedule { reason, .. } if reason.contains("compaction_lag")));
+        assert!(
+            matches!(action, HeartbeatAction::Reschedule { reason, .. } if reason.contains("compaction_lag"))
+        );
     }
 
     #[test]
@@ -370,7 +377,9 @@ mod tests {
         let action = handler.check(&watermarks, &task, now);
 
         // Should fail (compaction is fresh, task is genuinely stale)
-        assert!(matches!(action, HeartbeatAction::FailTask { reason, .. } if reason.contains("heartbeat_timeout")));
+        assert!(
+            matches!(action, HeartbeatAction::FailTask { reason, .. } if reason.contains("heartbeat_timeout"))
+        );
     }
 
     #[test]
@@ -379,16 +388,14 @@ mod tests {
         let handler = HeartbeatHandler::with_defaults();
         let watermarks = fresh_watermarks(now);
 
-        let mut task = make_task_row(
-            TaskState::Running,
-            1,
-            Some(now - Duration::seconds(120)),
-        );
+        let mut task = make_task_row(TaskState::Running, 1, Some(now - Duration::seconds(120)));
         task.attempt_id = None;
 
         let action = handler.check(&watermarks, &task, now);
 
-        assert!(matches!(action, HeartbeatAction::Reschedule { reason, .. } if reason == "missing_attempt_id"));
+        assert!(
+            matches!(action, HeartbeatAction::Reschedule { reason, .. } if reason == "missing_attempt_id")
+        );
     }
 
     #[test]
@@ -406,7 +413,9 @@ mod tests {
         let action = handler.check(&watermarks, &task, now);
 
         // Should reschedule (task is healthy)
-        assert!(matches!(action, HeartbeatAction::Reschedule { reason, .. } if reason == "task_healthy"));
+        assert!(
+            matches!(action, HeartbeatAction::Reschedule { reason, .. } if reason == "task_healthy")
+        );
     }
 
     #[test]
@@ -415,11 +424,7 @@ mod tests {
         let handler = HeartbeatHandler::with_defaults();
         let watermarks = fresh_watermarks(now);
 
-        let task = make_task_row(
-            TaskState::Succeeded,
-            1,
-            Some(now - Duration::seconds(10)),
-        );
+        let task = make_task_row(TaskState::Succeeded, 1, Some(now - Duration::seconds(10)));
 
         let action = handler.check(&watermarks, &task, now);
 
@@ -436,7 +441,9 @@ mod tests {
 
         let action = handler.check(&watermarks, &task, now);
 
-        assert!(matches!(action, HeartbeatAction::Reschedule { reason, .. } if reason == "no_heartbeat_yet"));
+        assert!(
+            matches!(action, HeartbeatAction::Reschedule { reason, .. } if reason == "no_heartbeat_yet")
+        );
     }
 
     // ========================================================================
@@ -454,7 +461,9 @@ mod tests {
         let action = handler.fire(&watermarks, &task, now);
 
         // Should reschedule, NOT increment attempt (compaction lag too high)
-        assert!(matches!(action, RetryAction::Reschedule { reason, .. } if reason.contains("compaction_lag")));
+        assert!(
+            matches!(action, RetryAction::Reschedule { reason, .. } if reason.contains("compaction_lag"))
+        );
     }
 
     #[test]
@@ -468,7 +477,10 @@ mod tests {
         let action = handler.fire(&watermarks, &task, now);
 
         // Compaction is fresh, safe to increment attempt
-        assert!(matches!(action, RetryAction::IncrementAttempt { new_attempt: 2, .. }));
+        assert!(matches!(
+            action,
+            RetryAction::IncrementAttempt { new_attempt: 2, .. }
+        ));
     }
 
     #[test]
@@ -494,7 +506,9 @@ mod tests {
 
         let action = handler.fire(&watermarks, &task, now);
 
-        assert!(matches!(action, RetryAction::NoOp { reason } if reason.contains("not in RetryWait")));
+        assert!(
+            matches!(action, RetryAction::NoOp { reason } if reason.contains("not in RetryWait"))
+        );
     }
 
     #[test]
@@ -508,7 +522,9 @@ mod tests {
 
         let action = handler.fire(&watermarks, &task, now);
 
-        assert!(matches!(action, RetryAction::NoOp { reason } if reason.contains("max_attempts_reached")));
+        assert!(
+            matches!(action, RetryAction::NoOp { reason } if reason.contains("max_attempts_reached"))
+        );
     }
 
     #[test]
@@ -525,11 +541,22 @@ mod tests {
         // Same input should produce same attempt_id (deterministic for idempotency)
         match (action1, action2) {
             (
-                RetryAction::IncrementAttempt { new_attempt_id: id1, new_attempt: a1, .. },
-                RetryAction::IncrementAttempt { new_attempt_id: id2, new_attempt: a2, .. },
+                RetryAction::IncrementAttempt {
+                    new_attempt_id: id1,
+                    new_attempt: a1,
+                    ..
+                },
+                RetryAction::IncrementAttempt {
+                    new_attempt_id: id2,
+                    new_attempt: a2,
+                    ..
+                },
             ) => {
                 assert_eq!(a1, a2, "Same attempt number");
-                assert_eq!(id1, id2, "Deterministic attempt_id for controller idempotency");
+                assert_eq!(
+                    id1, id2,
+                    "Deterministic attempt_id for controller idempotency"
+                );
             }
             _ => panic!("Expected IncrementAttempt actions"),
         }
@@ -550,11 +577,22 @@ mod tests {
         // Different attempt numbers should produce different attempt_ids
         match (action1, action2) {
             (
-                RetryAction::IncrementAttempt { new_attempt_id: id1, new_attempt: a1, .. },
-                RetryAction::IncrementAttempt { new_attempt_id: id2, new_attempt: a2, .. },
+                RetryAction::IncrementAttempt {
+                    new_attempt_id: id1,
+                    new_attempt: a1,
+                    ..
+                },
+                RetryAction::IncrementAttempt {
+                    new_attempt_id: id2,
+                    new_attempt: a2,
+                    ..
+                },
             ) => {
                 assert_ne!(a1, a2, "Different attempt numbers");
-                assert_ne!(id1, id2, "Different attempts should have different attempt_ids");
+                assert_ne!(
+                    id1, id2,
+                    "Different attempts should have different attempt_ids"
+                );
             }
             _ => panic!("Expected IncrementAttempt actions"),
         }

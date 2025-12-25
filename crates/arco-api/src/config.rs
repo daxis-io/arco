@@ -347,7 +347,9 @@ fn env_datetime(name: &str) -> Result<Option<DateTime<Utc>>> {
         return Ok(None);
     };
     let parsed = DateTime::parse_from_rfc3339(&v).map_err(|e| {
-        Error::InvalidInput(format!("{name} must be RFC3339 (e.g. 2025-01-01T00:00:00Z): {e}"))
+        Error::InvalidInput(format!(
+            "{name} must be RFC3339 (e.g. 2025-01-01T00:00:00Z): {e}"
+        ))
     })?;
     Ok(Some(parsed.with_timezone(&Utc)))
 }

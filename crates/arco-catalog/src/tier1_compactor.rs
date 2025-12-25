@@ -18,7 +18,7 @@ use arco_core::{CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths, 
 
 use crate::error::{CatalogError, Result as CatalogResult};
 use crate::manifest::{
-    compute_manifest_hash, CatalogDomainManifest, CommitRecord, LineageManifest, RootManifest,
+    CatalogDomainManifest, CommitRecord, LineageManifest, RootManifest, compute_manifest_hash,
 };
 use crate::sync_compact_permit_issuer;
 use crate::tier1_events::{CatalogDdlEvent, LineageDdlEvent};
@@ -90,19 +90,15 @@ impl From<Tier1CompactionError> for CatalogError {
         match value {
             Tier1CompactionError::StaleFencingToken { expected, provided } => {
                 Self::PreconditionFailed {
-                    message: format!(
-                        "stale fencing token: expected {expected}, got {provided}"
-                    ),
+                    message: format!("stale fencing token: expected {expected}, got {provided}"),
                 }
             }
             Tier1CompactionError::UnsupportedDomain { domain } => Self::Validation {
                 message: format!("unsupported domain for sync compaction: {domain}"),
             },
-            Tier1CompactionError::NotImplemented { domain, message } => {
-                Self::InvariantViolation {
-                    message: format!("sync compaction not implemented for {domain}: {message}"),
-                }
-            }
+            Tier1CompactionError::NotImplemented { domain, message } => Self::InvariantViolation {
+                message: format!("sync compaction not implemented for {domain}: {message}"),
+            },
             Tier1CompactionError::EventReadError { path, message } => Self::Storage {
                 message: format!("failed to read event '{path}': {message}"),
             },
@@ -173,12 +169,12 @@ impl Tier1Compactor {
 
         let lock_path = self.storage.lock(domain);
         let lock = DistributedLock::new(self.storage.backend().clone(), &lock_path);
-        let lock_info = lock
-            .read_lock_info()
-            .await
-            .map_err(|e| Tier1CompactionError::ProcessingError {
-                message: format!("failed to read lock info: {e}"),
-            })?;
+        let lock_info =
+            lock.read_lock_info()
+                .await
+                .map_err(|e| Tier1CompactionError::ProcessingError {
+                    message: format!("failed to read lock info: {e}"),
+                })?;
 
         let Some(lock_info) = lock_info else {
             return Err(Tier1CompactionError::StaleFencingToken {
@@ -232,10 +228,7 @@ impl Tier1Compactor {
                 .await
                 .map_err(map_processing_error)?
                 .ok_or_else(|| Tier1CompactionError::ProcessingError {
-                    message: format!(
-                        "missing catalog manifest at {}",
-                        root.catalog_manifest_path
-                    ),
+                    message: format!("missing catalog manifest at {}", root.catalog_manifest_path),
                 })?;
 
             let prev_bytes = self
@@ -258,9 +251,10 @@ impl Tier1Compactor {
             }
 
             let next_version = manifest.snapshot_version + 1;
-            let snapshot = tier1_snapshot::write_catalog_snapshot(&self.storage, next_version, &state)
-                .await
-                .map_err(map_processing_error)?;
+            let snapshot =
+                tier1_snapshot::write_catalog_snapshot(&self.storage, next_version, &state)
+                    .await
+                    .map_err(map_processing_error)?;
 
             let commit_ulid = next_commit_ulid(prev_manifest.commit_ulid.as_deref())?;
 
@@ -276,8 +270,8 @@ impl Tier1Compactor {
                 .validate_succession(&prev_manifest, &prev_raw_hash)
                 .map_err(|message| Tier1CompactionError::ProcessingError { message })?;
 
-            let commit = build_commit_record(&self.storage, &prev_manifest, &manifest, &commit_ulid)
-                .await?;
+            let commit =
+                build_commit_record(&self.storage, &prev_manifest, &manifest, &commit_ulid).await?;
             manifest.last_commit_id = Some(commit.commit_id.clone());
 
             let bytes = serde_json::to_vec(&manifest).map_err(map_processing_error)?;
@@ -290,7 +284,11 @@ impl Tier1Compactor {
             revalidate_lock(lock, fencing_token).await?;
 
             match publisher
-                .publish(permit, &ManifestKey::domain(CatalogDomain::Catalog), Bytes::from(bytes))
+                .publish(
+                    permit,
+                    &ManifestKey::domain(CatalogDomain::Catalog),
+                    Bytes::from(bytes),
+                )
                 .await
                 .map_err(map_publish_error)?
             {
@@ -341,10 +339,7 @@ impl Tier1Compactor {
                 .await
                 .map_err(map_processing_error)?
                 .ok_or_else(|| Tier1CompactionError::ProcessingError {
-                    message: format!(
-                        "missing lineage manifest at {}",
-                        root.lineage_manifest_path
-                    ),
+                    message: format!("missing lineage manifest at {}", root.lineage_manifest_path),
                 })?;
 
             let prev_bytes = self
@@ -401,7 +396,11 @@ impl Tier1Compactor {
             revalidate_lock(lock, fencing_token).await?;
 
             match publisher
-                .publish(permit, &ManifestKey::domain(CatalogDomain::Lineage), Bytes::from(bytes))
+                .publish(
+                    permit,
+                    &ManifestKey::domain(CatalogDomain::Lineage),
+                    Bytes::from(bytes),
+                )
                 .await
                 .map_err(map_publish_error)?
             {
@@ -557,18 +556,12 @@ fn apply_catalog_event(
                     return Ok(());
                 }
                 return Err(Tier1CompactionError::ProcessingError {
-                    message: format!(
-                        "namespace id collision for {}",
-                        namespace.id
-                    ),
+                    message: format!("namespace id collision for {}", namespace.id),
                 });
             }
             if state.namespaces.iter().any(|ns| ns.name == namespace.name) {
                 return Err(Tier1CompactionError::ProcessingError {
-                    message: format!(
-                        "namespace '{}' already exists",
-                        namespace.name
-                    ),
+                    message: format!("namespace '{}' already exists", namespace.name),
                 });
             }
             state.namespaces.push(namespace);
@@ -577,10 +570,7 @@ fn apply_catalog_event(
             namespace_id,
             namespace_name,
         } => {
-            let index = state
-                .namespaces
-                .iter()
-                .position(|ns| ns.id == namespace_id);
+            let index = state.namespaces.iter().position(|ns| ns.id == namespace_id);
 
             let Some(index) = index else {
                 return Ok(());
@@ -612,10 +602,7 @@ fn apply_catalog_event(
                 .any(|ns| ns.id == table.namespace_id)
             {
                 return Err(Tier1CompactionError::ProcessingError {
-                    message: format!(
-                        "namespace '{}' not found",
-                        table.namespace_id
-                    ),
+                    message: format!("namespace '{}' not found", table.namespace_id),
                 });
             }
 
@@ -624,10 +611,7 @@ fn apply_catalog_event(
                     return Ok(());
                 }
                 return Err(Tier1CompactionError::ProcessingError {
-                    message: format!(
-                        "table id collision for {}",
-                        table.id
-                    ),
+                    message: format!("table id collision for {}", table.id),
                 });
             }
 
@@ -649,10 +633,7 @@ fn apply_catalog_event(
             for column in columns {
                 if column.table_id != table.id {
                     return Err(Tier1CompactionError::ProcessingError {
-                        message: format!(
-                            "column '{}' belongs to different table",
-                            column.id
-                        ),
+                        message: format!("column '{}' belongs to different table", column.id),
                     });
                 }
                 if state.columns.iter().any(|c| c.id == column.id) {
@@ -729,12 +710,12 @@ async fn revalidate_lock(
     lock: &DistributedLock<dyn StorageBackend>,
     fencing_token: u64,
 ) -> Result<(), Tier1CompactionError> {
-    let lock_info = lock
-        .read_lock_info()
-        .await
-        .map_err(|e| Tier1CompactionError::ProcessingError {
-            message: format!("failed to read lock info: {e}"),
-        })?;
+    let lock_info =
+        lock.read_lock_info()
+            .await
+            .map_err(|e| Tier1CompactionError::ProcessingError {
+                message: format!("failed to read lock info: {e}"),
+            })?;
 
     let Some(lock_info) = lock_info else {
         return Err(Tier1CompactionError::StaleFencingToken {
@@ -795,7 +776,7 @@ async fn build_commit_record(
                 Err(e) => {
                     return Err(Tier1CompactionError::ProcessingError {
                         message: format!("failed to read commit '{path}': {e}"),
-                    })
+                    });
                 }
             }
         }
@@ -834,7 +815,7 @@ async fn build_lineage_commit_record(
                 Err(e) => {
                     return Err(Tier1CompactionError::ProcessingError {
                         message: format!("failed to read commit '{path}': {e}"),
-                    })
+                    });
                 }
             }
         }
@@ -858,17 +839,20 @@ fn next_commit_ulid(previous: Option<&str>) -> Result<String, Tier1CompactionErr
         return Ok(candidate.to_string());
     };
 
-    let previous = Ulid::from_string(previous).map_err(|e| Tier1CompactionError::ProcessingError {
-        message: format!("invalid previous commit_ulid '{previous}': {e}"),
-    })?;
+    let previous =
+        Ulid::from_string(previous).map_err(|e| Tier1CompactionError::ProcessingError {
+            message: format!("invalid previous commit_ulid '{previous}': {e}"),
+        })?;
 
     if candidate > previous {
         return Ok(candidate.to_string());
     }
 
-    let next = previous.increment().ok_or_else(|| Tier1CompactionError::ProcessingError {
-        message: "commit_ulid overflow while generating monotonic successor".to_string(),
-    })?;
+    let next = previous
+        .increment()
+        .ok_or_else(|| Tier1CompactionError::ProcessingError {
+            message: "commit_ulid overflow while generating monotonic successor".to_string(),
+        })?;
     Ok(next.to_string())
 }
 

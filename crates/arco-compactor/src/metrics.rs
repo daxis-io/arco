@@ -51,9 +51,9 @@ pub fn init_metrics() -> PrometheusHandle {
     PROMETHEUS_HANDLE
         .get_or_init(|| {
             let builder = PrometheusBuilder::new();
-            let handle = builder.install_recorder().unwrap_or_else(|e| {
-                panic!("failed to install prometheus recorder: {e}")
-            });
+            let handle = builder
+                .install_recorder()
+                .unwrap_or_else(|e| panic!("failed to install prometheus recorder: {e}"));
 
             // Register metric descriptions
             describe_histogram!(

@@ -11,14 +11,14 @@ use std::future::Future;
 
 use bytes::Bytes;
 use chrono::Utc;
-use futures::stream;
 use futures::TryStreamExt;
+use futures::stream;
 use ulid::Ulid;
 
 use arco_core::{ScopedStorage, WritePrecondition, WriteResult};
 
-use crate::error::{Error, Result};
 use super::events::OrchestrationEvent;
+use crate::error::{Error, Result};
 
 /// Trait for writing orchestration events to the ledger.
 ///
@@ -147,9 +147,7 @@ impl LedgerWriter {
 
 impl OrchestrationLedgerWriter for LedgerWriter {
     async fn write_event(&self, event: &OrchestrationEvent) -> std::result::Result<(), String> {
-        self.append(event.clone())
-            .await
-            .map_err(|e| format!("{e}"))
+        self.append(event.clone()).await.map_err(|e| format!("{e}"))
     }
 }
 
@@ -190,8 +188,8 @@ mod tests {
 
         // Verify the event was written
         let data = storage.get_raw(&expected_path).await?;
-        let parsed: OrchestrationEvent = serde_json::from_slice(&data)
-            .map_err(|e| Error::Serialization {
+        let parsed: OrchestrationEvent =
+            serde_json::from_slice(&data).map_err(|e| Error::Serialization {
                 message: format!("failed to parse stored event: {e}"),
             })?;
 

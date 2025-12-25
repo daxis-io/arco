@@ -152,10 +152,12 @@ mod tests {
     fn cas_result_is_success() {
         assert!(CasResult::Success.is_success());
         assert!(!CasResult::NotFound.is_success());
-        assert!(!CasResult::StateMismatch {
-            actual: TaskState::Running
-        }
-        .is_success());
+        assert!(
+            !CasResult::StateMismatch {
+                actual: TaskState::Running
+            }
+            .is_success()
+        );
     }
 
     #[test]

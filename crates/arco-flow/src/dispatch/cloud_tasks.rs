@@ -335,7 +335,9 @@ mod gcp_impl {
                 return Err(Error::configuration("service_url cannot be empty"));
             }
             if config.task_timeout.is_zero() {
-                return Err(Error::configuration("task_timeout must be greater than zero"));
+                return Err(Error::configuration(
+                    "task_timeout must be greater than zero",
+                ));
             }
 
             // Initialize GCP authentication using the provider() function
@@ -426,7 +428,9 @@ mod gcp_impl {
                 max_attempts: self.config.retry_config.max_attempts,
                 min_backoff: Self::format_duration(self.config.retry_config.min_backoff),
                 max_backoff: Self::format_duration(self.config.retry_config.max_backoff),
-                max_retry_duration: Self::format_duration(self.config.retry_config.max_retry_duration),
+                max_retry_duration: Self::format_duration(
+                    self.config.retry_config.max_retry_duration,
+                ),
             }
         }
 
@@ -461,7 +465,8 @@ mod gcp_impl {
                     .await
                     .unwrap_or_else(|_| "unknown error".to_string());
 
-                if let Ok(error_response) = serde_json::from_str::<CloudTasksErrorResponse>(&error_body)
+                if let Ok(error_response) =
+                    serde_json::from_str::<CloudTasksErrorResponse>(&error_body)
                 {
                     Err(Error::configuration(format!(
                         "Cloud Tasks queue update error: {} ({})",
@@ -519,12 +524,14 @@ mod gcp_impl {
 
             let body_base64 = base64::engine::general_purpose::STANDARD.encode(body);
 
-            let oidc_token = self.config.service_account_email.as_ref().map(|email| {
-                OidcToken {
+            let oidc_token = self
+                .config
+                .service_account_email
+                .as_ref()
+                .map(|email| OidcToken {
                     service_account_email: email.clone(),
                     audience: Some(audience.unwrap_or(target_url).to_string()),
-                }
-            });
+                });
 
             let request = CreateTaskRequest {
                 task: CloudTask {
@@ -534,7 +541,8 @@ mod gcp_impl {
                         http_method: "POST".to_string(),
                         headers: Some({
                             let mut headers = std::collections::HashMap::new();
-                            headers.insert("Content-Type".to_string(), "application/json".to_string());
+                            headers
+                                .insert("Content-Type".to_string(), "application/json".to_string());
                             headers
                         }),
                         body: Some(body_base64),
@@ -546,10 +554,7 @@ mod gcp_impl {
             };
 
             let access_token = self.get_access_token().await?;
-            let api_url = format!(
-                "https://cloudtasks.googleapis.com/v2/{}/tasks",
-                queue_path
-            );
+            let api_url = format!("https://cloudtasks.googleapis.com/v2/{}/tasks", queue_path);
 
             let response = self
                 .client
@@ -563,10 +568,9 @@ mod gcp_impl {
             let status = response.status();
 
             if status.is_success() {
-                let success: CloudTasksSuccessResponse = response
-                    .json()
-                    .await
-                    .map_err(|e| Error::dispatch(format!("Failed to parse success response: {e}")))?;
+                let success: CloudTasksSuccessResponse = response.json().await.map_err(|e| {
+                    Error::dispatch(format!("Failed to parse success response: {e}"))
+                })?;
 
                 return Ok(EnqueueResult::Enqueued {
                     message_id: success.name,
@@ -582,7 +586,8 @@ mod gcp_impl {
                 .await
                 .unwrap_or_else(|_| "unknown error".to_string());
 
-            if let Ok(error_response) = serde_json::from_str::<CloudTasksErrorResponse>(&error_body) {
+            if let Ok(error_response) = serde_json::from_str::<CloudTasksErrorResponse>(&error_body)
+            {
                 return Err(Error::dispatch(format!(
                     "Cloud Tasks API error: {} ({})",
                     error_response.error.message, error_response.error.status
@@ -620,12 +625,14 @@ mod gcp_impl {
             let body_base64 = base64::engine::general_purpose::STANDARD.encode(&body_bytes);
 
             // Build OIDC token if service account is configured
-            let oidc_token = self.config.service_account_email.as_ref().map(|email| {
-                OidcToken {
+            let oidc_token = self
+                .config
+                .service_account_email
+                .as_ref()
+                .map(|email| OidcToken {
                     service_account_email: email.clone(),
                     audience: Some(self.config.service_url.clone()),
-                }
-            });
+                });
 
             // Build the request
             let request = CreateTaskRequest {
@@ -636,7 +643,8 @@ mod gcp_impl {
                         http_method: "POST".to_string(),
                         headers: Some({
                             let mut headers = std::collections::HashMap::new();
-                            headers.insert("Content-Type".to_string(), "application/json".to_string());
+                            headers
+                                .insert("Content-Type".to_string(), "application/json".to_string());
                             headers
                         }),
                         body: Some(body_base64),
@@ -651,10 +659,7 @@ mod gcp_impl {
             let access_token = self.get_access_token().await?;
 
             // Make the API call
-            let api_url = format!(
-                "https://cloudtasks.googleapis.com/v2/{}/tasks",
-                queue_path
-            );
+            let api_url = format!("https://cloudtasks.googleapis.com/v2/{}/tasks", queue_path);
 
             let response = self
                 .client
@@ -669,15 +674,16 @@ mod gcp_impl {
 
             if status.is_success() {
                 // Task created successfully
-                let success: CloudTasksSuccessResponse = response
-                    .json()
-                    .await
-                    .map_err(|e| Error::dispatch(format!("Failed to parse success response: {e}")))?;
+                let success: CloudTasksSuccessResponse = response.json().await.map_err(|e| {
+                    Error::dispatch(format!("Failed to parse success response: {e}"))
+                })?;
 
                 Ok(EnqueueResult::Enqueued {
                     message_id: success.name,
                 })
-            } else if let Some(result) = super::enqueue_result_for_status(status.as_u16(), &task_name) {
+            } else if let Some(result) =
+                super::enqueue_result_for_status(status.as_u16(), &task_name)
+            {
                 Ok(result)
             } else {
                 // Other error
@@ -687,7 +693,9 @@ mod gcp_impl {
                     .unwrap_or_else(|_| "unknown error".to_string());
 
                 // Try to parse as structured error
-                if let Ok(error_response) = serde_json::from_str::<CloudTasksErrorResponse>(&error_body) {
+                if let Ok(error_response) =
+                    serde_json::from_str::<CloudTasksErrorResponse>(&error_body)
+                {
                     Err(Error::dispatch(format!(
                         "Cloud Tasks API error: {} ({})",
                         error_response.error.message, error_response.error.status
@@ -923,7 +931,10 @@ mod tests {
             let id = CloudTasksDispatcher::task_id_from_key("run_123/task_456/1");
             assert!(id.starts_with("t_"));
             assert_eq!(id.len(), 28);
-            assert!(id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'));
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            );
         }
 
         #[test]

@@ -11,35 +11,29 @@
 
 use bytes::Bytes;
 use chrono::Utc;
+use std::cmp::Ordering;
 use ulid::Ulid;
 
 use arco_core::{ScopedStorage, WritePrecondition, WriteResult};
 
 use crate::error::{Error, Result};
-use crate::orchestration::events::OrchestrationEvent;
+use crate::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
 
 use super::fold::{
-    merge_dep_satisfaction_rows,
-    merge_dispatch_outbox_rows,
-    merge_run_rows,
-    merge_sensor_eval_rows,
-    merge_sensor_state_rows,
-    merge_task_rows,
-    merge_timer_rows,
-    FoldState,
+    FoldState, merge_dep_satisfaction_rows, merge_dispatch_outbox_rows,
+    merge_idempotency_key_rows, merge_run_rows, merge_sensor_eval_rows,
+    merge_sensor_state_rows, merge_task_rows, merge_timer_rows,
 };
-use super::manifest::{EventRange, L0Delta, OrchestrationManifest, RowCounts, TablePaths, Watermarks};
+use super::manifest::{
+    EventRange, L0Delta, OrchestrationManifest, RowCounts, TablePaths, Watermarks,
+};
 use super::parquet_util::{
-    write_dep_satisfaction,
-    write_dispatch_outbox,
-    write_runs,
-    write_sensor_evals,
-    write_sensor_state,
-    write_tasks,
-    write_timers,
+    write_dep_satisfaction, write_dispatch_outbox, write_idempotency_keys, write_runs,
+    write_sensor_evals, write_sensor_state, write_tasks, write_timers,
 };
 
 const SENSOR_EVAL_RETENTION_DAYS: i64 = 30;
+const IDEMPOTENCY_KEY_RETENTION_DAYS: i64 = 30;
 
 /// Micro-compactor for orchestration events.
 ///
@@ -97,6 +91,7 @@ impl MicroCompactor {
     ///
     /// Returns an error if storage reads/writes or Parquet encoding fail.
     #[tracing::instrument(skip(self, event_paths), fields(event_count = event_paths.len()))]
+    #[allow(clippy::too_many_lines)]
     pub async fn compact_events(&self, event_paths: Vec<String>) -> Result<CompactionResult> {
         // Load current manifest + version for CAS
         let (mut manifest, manifest_version) = self.read_manifest_with_version().await?;
@@ -120,15 +115,27 @@ impl MicroCompactor {
         let mut events = Vec::new();
         for path in &event_paths {
             let data = self.storage.get_raw(path).await?;
-            let event: OrchestrationEvent = serde_json::from_slice(&data)
-                .map_err(|e| Error::Serialization {
+            let event: OrchestrationEvent =
+                serde_json::from_slice(&data).map_err(|e| Error::Serialization {
                     message: format!("failed to parse event at {path}: {e}"),
                 })?;
             events.push((path.clone(), event));
         }
 
-        // Sort by event_id (ULID provides lexicographic time ordering)
-        events.sort_by(|a, b| a.1.event_id.cmp(&b.1.event_id));
+        // Sort by timestamp with a stable ordering for atomic batches.
+        events.sort_by(|a, b| {
+            let a_event = &a.1;
+            let b_event = &b.1;
+            let ordering = a_event.timestamp.cmp(&b_event.timestamp);
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+            let ordering = event_priority(&a_event.data).cmp(&event_priority(&b_event.data));
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+            a_event.event_id.cmp(&b_event.event_id)
+        });
 
         // Fold events into state
         for (_, event) in &events {
@@ -136,6 +143,7 @@ impl MicroCompactor {
         }
 
         prune_sensor_evals(&mut state);
+        prune_idempotency_keys(&mut state);
 
         // Compute delta state (rows changed by this batch)
         let delta_state = delta_from_states(&base_state, &state);
@@ -146,7 +154,9 @@ impl MicroCompactor {
         let mut delta_paths = TablePaths::default();
         if has_delta {
             let new_delta_id = Ulid::new().to_string();
-            delta_paths = self.write_delta_parquet(&new_delta_id, &delta_state).await?;
+            delta_paths = self
+                .write_delta_parquet(&new_delta_id, &delta_state)
+                .await?;
             delta_id = Some(new_delta_id);
         }
 
@@ -159,11 +169,18 @@ impl MicroCompactor {
             dispatch_outbox: u32::try_from(delta_state.dispatch_outbox.len()).unwrap_or(u32::MAX),
             sensor_state: u32::try_from(delta_state.sensor_state.len()).unwrap_or(u32::MAX),
             sensor_evals: u32::try_from(delta_state.sensor_evals.len()).unwrap_or(u32::MAX),
+            idempotency_keys: u32::try_from(delta_state.idempotency_keys.len()).unwrap_or(u32::MAX),
         };
 
         // Create L0 delta entry when changes exist
-        let first_event = events.first().map(|e| e.1.event_id.clone()).unwrap_or_default();
-        let last_event = events.last().map(|e| e.1.event_id.clone()).unwrap_or_default();
+        let first_event = events
+            .first()
+            .map(|e| e.1.event_id.clone())
+            .unwrap_or_default();
+        let last_event = events
+            .last()
+            .map(|e| e.1.event_id.clone())
+            .unwrap_or_default();
         let mut manifest_changed = false;
 
         if let Some(delta_id) = delta_id.clone() {
@@ -193,7 +210,8 @@ impl MicroCompactor {
             let new_revision = Ulid::new().to_string();
             manifest.revision_ulid.clone_from(&new_revision);
             manifest.published_at = Utc::now();
-            self.publish_manifest(&manifest, manifest_version.as_deref()).await?;
+            self.publish_manifest(&manifest, manifest_version.as_deref())
+                .await?;
             new_revision
         } else {
             manifest.revision_ulid.clone()
@@ -207,16 +225,14 @@ impl MicroCompactor {
     }
 
     /// Reads the current manifest and version for CAS publishing.
-    async fn read_manifest_with_version(
-        &self,
-    ) -> Result<(OrchestrationManifest, Option<String>)> {
+    async fn read_manifest_with_version(&self) -> Result<(OrchestrationManifest, Option<String>)> {
         let manifest_path = "state/orchestration/manifest.json";
 
         match self.storage.head_raw(manifest_path).await? {
             Some(meta) => {
                 let data = self.storage.get_raw(manifest_path).await?;
-                let manifest: OrchestrationManifest = serde_json::from_slice(&data)
-                    .map_err(|e| Error::Serialization {
+                let manifest: OrchestrationManifest =
+                    serde_json::from_slice(&data).map_err(|e| Error::Serialization {
                         message: format!("failed to parse manifest: {e}"),
                     })?;
                 Ok((manifest, Some(meta.version)))
@@ -237,16 +253,21 @@ impl MicroCompactor {
 
         // Load base snapshot if exists
         if let Some(ref snapshot_id) = manifest.base_snapshot.snapshot_id {
-            state = self.load_snapshot_state(snapshot_id, &manifest.base_snapshot.tables).await?;
+            state = self
+                .load_snapshot_state(snapshot_id, &manifest.base_snapshot.tables)
+                .await?;
         }
 
         // Apply L0 deltas in order
         for delta in &manifest.l0_deltas {
-            let delta_state = self.load_delta_state(&delta.delta_id, &delta.tables).await?;
+            let delta_state = self
+                .load_delta_state(&delta.delta_id, &delta.tables)
+                .await?;
             state = merge_states(state, delta_state);
         }
 
         prune_sensor_evals(&mut state);
+        prune_idempotency_keys(&mut state);
         state.rebuild_dependency_graph();
 
         Ok(state)
@@ -272,7 +293,9 @@ impl MicroCompactor {
             let data = self.storage.get_raw(tasks_path).await?;
             let rows = super::parquet_util::read_tasks(&data)?;
             for row in rows {
-                state.tasks.insert((row.run_id.clone(), row.task_key.clone()), row);
+                state
+                    .tasks
+                    .insert((row.run_id.clone(), row.task_key.clone()), row);
             }
         }
 
@@ -281,7 +304,11 @@ impl MicroCompactor {
             let rows = super::parquet_util::read_dep_satisfaction(&data)?;
             for row in rows {
                 state.dep_satisfaction.insert(
-                    (row.run_id.clone(), row.upstream_task_key.clone(), row.downstream_task_key.clone()),
+                    (
+                        row.run_id.clone(),
+                        row.upstream_task_key.clone(),
+                        row.downstream_task_key.clone(),
+                    ),
                     row,
                 );
             }
@@ -316,6 +343,16 @@ impl MicroCompactor {
             let rows = super::parquet_util::read_sensor_evals(&data)?;
             for row in rows {
                 state.sensor_evals.insert(row.eval_id.clone(), row);
+            }
+        }
+
+        if let Some(ref idempotency_keys_path) = tables.idempotency_keys {
+            let data = self.storage.get_raw(idempotency_keys_path).await?;
+            let rows = super::parquet_util::read_idempotency_keys(&data)?;
+            for row in rows {
+                state
+                    .idempotency_keys
+                    .insert(row.idempotency_key.clone(), row);
             }
         }
 
@@ -392,12 +429,21 @@ impl MicroCompactor {
             paths.sensor_evals = Some(path);
         }
 
+        if !state.idempotency_keys.is_empty() {
+            let rows: Vec<_> = state.idempotency_keys.values().cloned().collect();
+            let bytes = write_idempotency_keys(&rows)?;
+            let path = format!("{base_path}/idempotency_keys.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.idempotency_keys = Some(path);
+        }
+
         Ok(paths)
     }
 
     /// Writes a Parquet file to storage.
     async fn write_parquet_file(&self, path: &str, bytes: Bytes) -> Result<()> {
-        let result = self.storage
+        let result = self
+            .storage
             .put_raw(path, bytes, WritePrecondition::None)
             .await?;
 
@@ -417,17 +463,16 @@ impl MicroCompactor {
         current_version: Option<&str>,
     ) -> Result<()> {
         let manifest_path = "state/orchestration/manifest.json";
-        let json = serde_json::to_string_pretty(manifest)
-            .map_err(|e| Error::Serialization {
-                message: format!("failed to serialize manifest: {e}"),
-            })?;
+        let json = serde_json::to_string_pretty(manifest).map_err(|e| Error::Serialization {
+            message: format!("failed to serialize manifest: {e}"),
+        })?;
 
-        let precondition = current_version.map_or(
-            WritePrecondition::DoesNotExist,
-            |version| WritePrecondition::MatchesVersion(version.to_string()),
-        );
+        let precondition = current_version.map_or(WritePrecondition::DoesNotExist, |version| {
+            WritePrecondition::MatchesVersion(version.to_string())
+        });
 
-        let result = self.storage
+        let result = self
+            .storage
             .put_raw(manifest_path, Bytes::from(json), precondition)
             .await?;
 
@@ -446,7 +491,8 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
 
     // Merge runs (newer row_version wins)
     for (run_id, row) in delta.runs {
-        merged.runs
+        merged
+            .runs
             .entry(run_id)
             .and_modify(|existing| {
                 if let Some(merged_row) = merge_run_rows(vec![existing.clone(), row.clone()]) {
@@ -458,7 +504,8 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
 
     // Merge tasks
     for (key, row) in delta.tasks {
-        merged.tasks
+        merged
+            .tasks
             .entry(key)
             .and_modify(|existing| {
                 if let Some(merged_row) = merge_task_rows(vec![existing.clone(), row.clone()]) {
@@ -470,10 +517,13 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
 
     // Merge dep_satisfaction
     for (key, row) in delta.dep_satisfaction {
-        merged.dep_satisfaction
+        merged
+            .dep_satisfaction
             .entry(key)
             .and_modify(|existing| {
-                if let Some(merged_row) = merge_dep_satisfaction_rows(vec![existing.clone(), row.clone()]) {
+                if let Some(merged_row) =
+                    merge_dep_satisfaction_rows(vec![existing.clone(), row.clone()])
+                {
                     *existing = merged_row;
                 }
             })
@@ -482,7 +532,8 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
 
     // Merge timers
     for (timer_id, row) in delta.timers {
-        merged.timers
+        merged
+            .timers
             .entry(timer_id)
             .and_modify(|existing| {
                 if let Some(merged_row) = merge_timer_rows(vec![existing.clone(), row.clone()]) {
@@ -494,10 +545,13 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
 
     // Merge dispatch outbox
     for (dispatch_id, row) in delta.dispatch_outbox {
-        merged.dispatch_outbox
+        merged
+            .dispatch_outbox
             .entry(dispatch_id)
             .and_modify(|existing| {
-                if let Some(merged_row) = merge_dispatch_outbox_rows(vec![existing.clone(), row.clone()]) {
+                if let Some(merged_row) =
+                    merge_dispatch_outbox_rows(vec![existing.clone(), row.clone()])
+                {
                     *existing = merged_row;
                 }
             })
@@ -506,10 +560,13 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
 
     // Merge sensor state
     for (sensor_id, row) in delta.sensor_state {
-        merged.sensor_state
+        merged
+            .sensor_state
             .entry(sensor_id)
             .and_modify(|existing| {
-                if let Some(merged_row) = merge_sensor_state_rows(vec![existing.clone(), row.clone()]) {
+                if let Some(merged_row) =
+                    merge_sensor_state_rows(vec![existing.clone(), row.clone()])
+                {
                     *existing = merged_row;
                 }
             })
@@ -518,10 +575,28 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
 
     // Merge sensor evals
     for (eval_id, row) in delta.sensor_evals {
-        merged.sensor_evals
+        merged
+            .sensor_evals
             .entry(eval_id)
             .and_modify(|existing| {
-                if let Some(merged_row) = merge_sensor_eval_rows(vec![existing.clone(), row.clone()]) {
+                if let Some(merged_row) =
+                    merge_sensor_eval_rows(vec![existing.clone(), row.clone()])
+                {
+                    *existing = merged_row;
+                }
+            })
+            .or_insert(row);
+    }
+
+    // Merge idempotency keys
+    for (idempotency_key, row) in delta.idempotency_keys {
+        merged
+            .idempotency_keys
+            .entry(idempotency_key)
+            .and_modify(|existing| {
+                if let Some(merged_row) =
+                    merge_idempotency_key_rows(vec![existing.clone(), row.clone()])
+                {
                     *existing = merged_row;
                 }
             })
@@ -560,7 +635,9 @@ fn delta_from_states(base: &FoldState, current: &FoldState) -> FoldState {
 
     for (dispatch_id, row) in &current.dispatch_outbox {
         if base.dispatch_outbox.get(dispatch_id) != Some(row) {
-            delta.dispatch_outbox.insert(dispatch_id.clone(), row.clone());
+            delta
+                .dispatch_outbox
+                .insert(dispatch_id.clone(), row.clone());
         }
     }
 
@@ -576,6 +653,14 @@ fn delta_from_states(base: &FoldState, current: &FoldState) -> FoldState {
         }
     }
 
+    for (idempotency_key, row) in &current.idempotency_keys {
+        if base.idempotency_keys.get(idempotency_key) != Some(row) {
+            delta
+                .idempotency_keys
+                .insert(idempotency_key.clone(), row.clone());
+        }
+    }
+
     delta
 }
 
@@ -587,11 +672,21 @@ fn delta_state_is_empty(state: &FoldState) -> bool {
         && state.dispatch_outbox.is_empty()
         && state.sensor_state.is_empty()
         && state.sensor_evals.is_empty()
+        && state.idempotency_keys.is_empty()
 }
 
 fn prune_sensor_evals(state: &mut FoldState) {
     let cutoff = Utc::now() - chrono::Duration::days(SENSOR_EVAL_RETENTION_DAYS);
-    state.sensor_evals.retain(|_, row| row.evaluated_at >= cutoff);
+    state
+        .sensor_evals
+        .retain(|_, row| row.evaluated_at >= cutoff);
+}
+
+fn prune_idempotency_keys(state: &mut FoldState) {
+    let cutoff = Utc::now() - chrono::Duration::days(IDEMPOTENCY_KEY_RETENTION_DAYS);
+    state
+        .idempotency_keys
+        .retain(|_, row| row.recorded_at >= cutoff);
 }
 
 fn update_watermarks(
@@ -622,13 +717,27 @@ fn update_watermarks(
     false
 }
 
+fn event_priority(data: &OrchestrationEventData) -> u8 {
+    match data {
+        // Fold trigger evaluations before emitted RunRequested events at the same timestamp.
+        OrchestrationEventData::ScheduleTicked { .. }
+        | OrchestrationEventData::SensorEvaluated { .. }
+        | OrchestrationEventData::BackfillChunkPlanned { .. } => 0,
+        OrchestrationEventData::RunRequested { .. } => 1,
+        _ => 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::orchestration::compactor::fold::{DispatchOutboxRow, TimerRow};
-    use crate::orchestration::events::{OrchestrationEventData, TaskDef, TimerType, TriggerInfo};
+    use crate::orchestration::events::{
+        OrchestrationEventData, SourceRef, TaskDef, TickStatus, TimerType, TriggerInfo,
+    };
     use arco_core::MemoryBackend;
     use chrono::DateTime;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use ulid::Ulid;
 
@@ -639,8 +748,13 @@ mod tests {
         Ok((compactor, storage))
     }
 
+    // Use deterministic event IDs to avoid parallel test flakiness.
+    // Event IDs are ordered to match the expected sort order (by timestamp, then priority).
+    // RunTriggered has priority 1, PlanCreated has priority 2, so PlanCreated sorts last.
+    // The event_ids are ordered so that PlanCreated (sorted last) has the larger event_id,
+    // which is what the compact_orders_watermarks_by_event_id test expects.
     fn make_run_triggered_event() -> OrchestrationEvent {
-        OrchestrationEvent::new(
+        OrchestrationEvent::new_with_event_id(
             "tenant",
             "workspace",
             OrchestrationEventData::RunTriggered {
@@ -651,13 +765,14 @@ mod tests {
                 },
                 root_assets: vec!["analytics.report".to_string()],
                 run_key: None,
-                labels: std::collections::HashMap::new(),
+                labels: HashMap::new(),
             },
+            "evt_01_run_triggered",
         )
     }
 
     fn make_plan_created_event() -> OrchestrationEvent {
-        OrchestrationEvent::new(
+        OrchestrationEvent::new_with_event_id(
             "tenant",
             "workspace",
             OrchestrationEventData::PlanCreated {
@@ -682,6 +797,7 @@ mod tests {
                     },
                 ],
             },
+            "evt_02_plan_created",
         )
     }
 
@@ -786,17 +902,21 @@ mod tests {
         let path1 = format!("ledger/orchestration/2025-01-15/{}.json", event1.event_id);
         let path2 = format!("ledger/orchestration/2025-01-15/{}.json", event2.event_id);
 
-        storage.put_raw(
-            &path1,
-            Bytes::from(serde_json::to_string(&event1).expect("serialize")),
-            WritePrecondition::None,
-        ).await?;
+        storage
+            .put_raw(
+                &path1,
+                Bytes::from(serde_json::to_string(&event1).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
 
-        storage.put_raw(
-            &path2,
-            Bytes::from(serde_json::to_string(&event2).expect("serialize")),
-            WritePrecondition::None,
-        ).await?;
+        storage
+            .put_raw(
+                &path2,
+                Bytes::from(serde_json::to_string(&event2).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
 
         // Compact events
         let result = compactor.compact_events(vec![path1, path2]).await?;
@@ -806,7 +926,8 @@ mod tests {
 
         // Verify manifest was updated
         let manifest_data = storage.get_raw("state/orchestration/manifest.json").await?;
-        let manifest: OrchestrationManifest = serde_json::from_slice(&manifest_data).expect("parse");
+        let manifest: OrchestrationManifest =
+            serde_json::from_slice(&manifest_data).expect("parse");
 
         assert_eq!(manifest.l0_count, 1);
         assert_eq!(manifest.l0_deltas.len(), 1);
@@ -826,8 +947,20 @@ mod tests {
         let path1 = format!("ledger/orchestration/2025-01-15/{}.json", event1.event_id);
         let path2 = format!("ledger/orchestration/2025-01-15/{}.json", event2.event_id);
 
-        storage.put_raw(&path1, Bytes::from(serde_json::to_string(&event1).expect("serialize")), WritePrecondition::None).await?;
-        storage.put_raw(&path2, Bytes::from(serde_json::to_string(&event2).expect("serialize")), WritePrecondition::None).await?;
+        storage
+            .put_raw(
+                &path1,
+                Bytes::from(serde_json::to_string(&event1).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
+        storage
+            .put_raw(
+                &path2,
+                Bytes::from(serde_json::to_string(&event2).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
 
         compactor.compact_events(vec![path1, path2]).await?;
 
@@ -839,8 +972,16 @@ mod tests {
         assert_eq!(state.runs.len(), 1);
         assert!(state.runs.contains_key("run_01"));
         assert_eq!(state.tasks.len(), 2);
-        assert!(state.tasks.contains_key(&("run_01".to_string(), "extract".to_string())));
-        assert!(state.tasks.contains_key(&("run_01".to_string(), "transform".to_string())));
+        assert!(
+            state
+                .tasks
+                .contains_key(&("run_01".to_string(), "extract".to_string()))
+        );
+        assert!(
+            state
+                .tasks
+                .contains_key(&("run_01".to_string(), "transform".to_string()))
+        );
         assert_eq!(state.dep_satisfaction.len(), 1);
 
         Ok(())
@@ -858,21 +999,28 @@ mod tests {
         let path1 = format!("ledger/orchestration/2025-01-15/{}.json", event1_id);
         let path2 = format!("ledger/orchestration/2025-01-15/{}.json", event2_id);
 
-        storage.put_raw(
-            &path1,
-            Bytes::from(serde_json::to_string(&event1).expect("serialize")),
-            WritePrecondition::None,
-        ).await?;
-        storage.put_raw(
-            &path2,
-            Bytes::from(serde_json::to_string(&event2).expect("serialize")),
-            WritePrecondition::None,
-        ).await?;
+        storage
+            .put_raw(
+                &path1,
+                Bytes::from(serde_json::to_string(&event1).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
+        storage
+            .put_raw(
+                &path2,
+                Bytes::from(serde_json::to_string(&event2).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
 
-        compactor.compact_events(vec![path2.clone(), path1.clone()]).await?;
+        compactor
+            .compact_events(vec![path2.clone(), path1.clone()])
+            .await?;
 
         let manifest_data = storage.get_raw("state/orchestration/manifest.json").await?;
-        let manifest: OrchestrationManifest = serde_json::from_slice(&manifest_data).expect("parse");
+        let manifest: OrchestrationManifest =
+            serde_json::from_slice(&manifest_data).expect("parse");
 
         let (expected_event, expected_path) = if event1_id > event2_id {
             (event1_id, path1)
@@ -880,8 +1028,14 @@ mod tests {
             (event2_id, path2)
         };
 
-        assert_eq!(manifest.watermarks.events_processed_through.as_deref(), Some(expected_event.as_str()));
-        assert_eq!(manifest.watermarks.last_processed_file.as_deref(), Some(expected_path.as_str()));
+        assert_eq!(
+            manifest.watermarks.events_processed_through.as_deref(),
+            Some(expected_event.as_str())
+        );
+        assert_eq!(
+            manifest.watermarks.last_processed_file.as_deref(),
+            Some(expected_path.as_str())
+        );
 
         Ok(())
     }
@@ -896,20 +1050,39 @@ mod tests {
         let path1 = format!("ledger/orchestration/2025-01-15/{}.json", event1.event_id);
         let path2 = format!("ledger/orchestration/2025-01-15/{}.json", event2.event_id);
 
-        storage.put_raw(&path1, Bytes::from(serde_json::to_string(&event1).expect("serialize")), WritePrecondition::None).await?;
-        storage.put_raw(&path2, Bytes::from(serde_json::to_string(&event2).expect("serialize")), WritePrecondition::None).await?;
+        storage
+            .put_raw(
+                &path1,
+                Bytes::from(serde_json::to_string(&event1).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
+        storage
+            .put_raw(
+                &path2,
+                Bytes::from(serde_json::to_string(&event2).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
 
         compactor.compact_events(vec![path1, path2]).await?;
 
         let attempt_id = Ulid::new().to_string();
         let event3 = make_task_started_event(&attempt_id);
         let path3 = format!("ledger/orchestration/2025-01-15/{}.json", event3.event_id);
-        storage.put_raw(&path3, Bytes::from(serde_json::to_string(&event3).expect("serialize")), WritePrecondition::None).await?;
+        storage
+            .put_raw(
+                &path3,
+                Bytes::from(serde_json::to_string(&event3).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
 
         compactor.compact_events(vec![path3]).await?;
 
         let manifest_data = storage.get_raw("state/orchestration/manifest.json").await?;
-        let manifest: OrchestrationManifest = serde_json::from_slice(&manifest_data).expect("parse");
+        let manifest: OrchestrationManifest =
+            serde_json::from_slice(&manifest_data).expect("parse");
 
         let latest = manifest.l0_deltas.last().expect("delta");
         assert_eq!(latest.row_counts.runs, 0);
@@ -919,6 +1092,8 @@ mod tests {
         assert_eq!(latest.row_counts.dispatch_outbox, 0);
         assert_eq!(latest.row_counts.sensor_state, 0);
         assert_eq!(latest.row_counts.sensor_evals, 0);
+        // Each event records an idempotency key; this delta has 1 TaskStarted event
+        assert_eq!(latest.row_counts.idempotency_keys, 1);
 
         Ok(())
     }
@@ -933,22 +1108,29 @@ mod tests {
         let mut enqueued = make_dispatch_enqueued_event(&dispatch_id);
         enqueued.event_id = "01B".to_string();
         let path1 = format!("ledger/orchestration/2025-01-15/{}.json", enqueued.event_id);
-        storage.put_raw(
-            &path1,
-            Bytes::from(serde_json::to_string(&enqueued).expect("serialize")),
-            WritePrecondition::None,
-        ).await?;
+        storage
+            .put_raw(
+                &path1,
+                Bytes::from(serde_json::to_string(&enqueued).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
         compactor.compact_events(vec![path1]).await?;
 
         // DispatchRequested arrives later but with older ULID
         let mut requested = make_dispatch_requested_event("run_01", "extract", 1, "01HQ123ATT");
         requested.event_id = "01A".to_string();
-        let path2 = format!("ledger/orchestration/2025-01-15/{}.json", requested.event_id);
-        storage.put_raw(
-            &path2,
-            Bytes::from(serde_json::to_string(&requested).expect("serialize")),
-            WritePrecondition::None,
-        ).await?;
+        let path2 = format!(
+            "ledger/orchestration/2025-01-15/{}.json",
+            requested.event_id
+        );
+        storage
+            .put_raw(
+                &path2,
+                Bytes::from(serde_json::to_string(&requested).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
         compactor.compact_events(vec![path2]).await?;
 
         // Load merged state and verify attempt_id was persisted
@@ -973,23 +1155,30 @@ mod tests {
         let mut enqueued = make_timer_enqueued_event(&timer_id);
         enqueued.event_id = "01B".to_string();
         let path1 = format!("ledger/orchestration/2025-01-15/{}.json", enqueued.event_id);
-        storage.put_raw(
-            &path1,
-            Bytes::from(serde_json::to_string(&enqueued).expect("serialize")),
-            WritePrecondition::None,
-        ).await?;
+        storage
+            .put_raw(
+                &path1,
+                Bytes::from(serde_json::to_string(&enqueued).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
         compactor.compact_events(vec![path1]).await?;
 
         // TimerRequested arrives later but with older ULID (canonical fire_at differs)
         let canonical_fire_at = DateTime::from_timestamp(fire_epoch + 30, 0).unwrap();
         let mut requested = make_timer_requested_event(&timer_id, canonical_fire_at);
         requested.event_id = "01A".to_string();
-        let path2 = format!("ledger/orchestration/2025-01-15/{}.json", requested.event_id);
-        storage.put_raw(
-            &path2,
-            Bytes::from(serde_json::to_string(&requested).expect("serialize")),
-            WritePrecondition::None,
-        ).await?;
+        let path2 = format!(
+            "ledger/orchestration/2025-01-15/{}.json",
+            requested.event_id
+        );
+        storage
+            .put_raw(
+                &path2,
+                Bytes::from(serde_json::to_string(&requested).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
         compactor.compact_events(vec![path2]).await?;
 
         // Load merged state and verify fire_at was updated
@@ -1008,25 +1197,60 @@ mod tests {
         let (compactor, storage) = create_test_compactor().await?;
 
         let manifest = OrchestrationManifest::new("01HQXYZ123REV");
-        storage.put_raw(
-            "state/orchestration/manifest.json",
-            Bytes::from(serde_json::to_string(&manifest).expect("serialize")),
-            WritePrecondition::None,
-        ).await?;
+        storage
+            .put_raw(
+                "state/orchestration/manifest.json",
+                Bytes::from(serde_json::to_string(&manifest).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
 
         let (_current, version) = compactor.read_manifest_with_version().await?;
         let version = version.expect("version");
 
         let bumped = OrchestrationManifest::new("01HQXYZ124REV");
-        storage.put_raw(
-            "state/orchestration/manifest.json",
-            Bytes::from(serde_json::to_string(&bumped).expect("serialize")),
-            WritePrecondition::None,
-        ).await?;
+        storage
+            .put_raw(
+                "state/orchestration/manifest.json",
+                Bytes::from(serde_json::to_string(&bumped).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
 
-        let err = compactor.publish_manifest(&manifest, Some(&version)).await.unwrap_err();
+        let err = compactor
+            .publish_manifest(&manifest, Some(&version))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("manifest publish failed"));
 
         Ok(())
+    }
+
+    #[test]
+    fn event_priority_orders_trigger_before_run_requested() {
+        let tick = OrchestrationEventData::ScheduleTicked {
+            schedule_id: "sched-01".to_string(),
+            scheduled_for: Utc::now(),
+            tick_id: "sched-01:1".to_string(),
+            definition_version: "v1".to_string(),
+            asset_selection: vec!["asset.a".to_string()],
+            partition_selection: None,
+            status: TickStatus::Triggered,
+            run_key: Some("sched:1".to_string()),
+            request_fingerprint: Some("fp-1".to_string()),
+        };
+        let run_requested = OrchestrationEventData::RunRequested {
+            run_key: "sched:1".to_string(),
+            request_fingerprint: "fp-1".to_string(),
+            asset_selection: vec!["asset.a".to_string()],
+            partition_selection: None,
+            trigger_source_ref: SourceRef::Schedule {
+                schedule_id: "sched-01".to_string(),
+                tick_id: "sched-01:1".to_string(),
+            },
+            labels: HashMap::new(),
+        };
+
+        assert!(event_priority(&tick) < event_priority(&run_requested));
     }
 }

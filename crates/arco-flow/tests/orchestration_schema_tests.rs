@@ -2,8 +2,8 @@
 
 use arco_flow::orchestration::compactor::{
     BackfillChunkRow, BackfillRow, PartitionMaterializationStatus, PartitionStatusRow,
-    RunKeyConflictRow, RunKeyIndexRow, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
-    SensorStateRow,
+    IdempotencyKeyRow, RunKeyConflictRow, RunKeyIndexRow, ScheduleDefinitionRow, ScheduleStateRow,
+    ScheduleTickRow, SensorEvalRow, SensorStateRow,
 };
 use arco_flow::orchestration::events::TaskOutcome;
 use chrono::{TimeZone, Utc};
@@ -107,6 +107,56 @@ fn test_sensor_state_row_schema() {
     );
 }
 
+#[test]
+fn test_sensor_eval_row_schema() {
+    use arco_flow::orchestration::events::{RunRequest, SensorEvalStatus, TriggerSource};
+
+    let row = SensorEvalRow {
+        tenant_id: "tenant-abc".into(),
+        workspace_id: "workspace-prod".into(),
+        eval_id: "eval_01HQ123".into(),
+        sensor_id: "file-sensor".into(),
+        cursor_before: Some("cursor_v0".into()),
+        cursor_after: Some("cursor_v1".into()),
+        expected_state_version: Some(5),
+        trigger_source: TriggerSource::Poll {
+            poll_epoch: 1_736_931_200,
+        },
+        run_requests: vec![RunRequest {
+            run_key: "sensor:eval_01HQ123".into(),
+            request_fingerprint: "fp_123".into(),
+            asset_selection: vec!["analytics.summary".into()],
+            partition_selection: None,
+        }],
+        status: SensorEvalStatus::Triggered,
+        evaluated_at: Utc.with_ymd_and_hms(2025, 1, 15, 10, 10, 0).unwrap(),
+        row_version: "01HQ303".into(),
+    };
+
+    assert_eq!(
+        row.primary_key(),
+        ("tenant-abc", "workspace-prod", "eval_01HQ123")
+    );
+}
+
+#[test]
+fn test_idempotency_key_row_schema() {
+    let row = IdempotencyKeyRow {
+        tenant_id: "tenant-abc".into(),
+        workspace_id: "workspace-prod".into(),
+        idempotency_key: "sensor_eval:01HQ123:msg:abc".into(),
+        event_id: "01HQ999".into(),
+        event_type: "SensorEvaluated".into(),
+        recorded_at: Utc.with_ymd_and_hms(2025, 1, 15, 10, 10, 0).unwrap(),
+        row_version: "01HQ999".into(),
+    };
+
+    assert_eq!(
+        row.primary_key(),
+        ("tenant-abc", "workspace-prod", "sensor_eval:01HQ123:msg:abc")
+    );
+}
+
 // ============================================================================
 // Backfill Schema Tests
 // ============================================================================
@@ -194,7 +244,12 @@ fn test_partition_status_row_schema() {
 
     assert_eq!(
         row.primary_key(),
-        ("tenant-abc", "workspace-prod", "analytics.summary", "2025-01-15")
+        (
+            "tenant-abc",
+            "workspace-prod",
+            "analytics.summary",
+            "2025-01-15"
+        )
     );
 }
 

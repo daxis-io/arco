@@ -67,7 +67,10 @@ impl ApiClient {
     ///
     /// Returns an error if the request fails or the response cannot be parsed.
     pub async fn get_run(&self, workspace_id: &str, run_id: &str) -> Result<RunResponse> {
-        let url = format!("{}/api/v1/workspaces/{workspace_id}/runs/{run_id}", self.base_url);
+        let url = format!(
+            "{}/api/v1/workspaces/{workspace_id}/runs/{run_id}",
+            self.base_url
+        );
 
         let mut req = self.client.get(&url);
         if let Some(token) = &self.token {

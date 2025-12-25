@@ -15,11 +15,8 @@
 //! This allows human-readable debugging while ensuring Cloud Tasks compliance.
 
 pub use crate::orchestration::ids::{
-    cloud_task_id,
-    dispatch_internal_id,
+    cloud_task_id, cron_timer_internal_id, dispatch_internal_id, heartbeat_timer_internal_id,
     retry_timer_internal_id,
-    heartbeat_timer_internal_id,
-    cron_timer_internal_id,
 };
 
 #[cfg(test)]
@@ -98,7 +95,10 @@ mod tests {
 
         // Cloud Tasks allows: [A-Za-z0-9_-]
         // Our IDs use only: [a-z0-9_] (lowercase hex + underscore)
-        assert!(id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'));
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        );
     }
 
     #[test]

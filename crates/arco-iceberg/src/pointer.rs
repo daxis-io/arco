@@ -217,10 +217,17 @@ pub enum CasResult {
 #[async_trait]
 pub trait PointerStore: Send + Sync {
     /// Loads a pointer and its version.
-    async fn load(&self, table_uuid: &Uuid) -> IcebergResult<Option<(IcebergTablePointer, ObjectVersion)>>;
+    async fn load(
+        &self,
+        table_uuid: &Uuid,
+    ) -> IcebergResult<Option<(IcebergTablePointer, ObjectVersion)>>;
 
     /// Creates a new pointer (fails if already exists).
-    async fn create(&self, table_uuid: &Uuid, pointer: &IcebergTablePointer) -> IcebergResult<CasResult>;
+    async fn create(
+        &self,
+        table_uuid: &Uuid,
+        pointer: &IcebergTablePointer,
+    ) -> IcebergResult<CasResult>;
 
     /// Updates a pointer with CAS.
     async fn compare_and_swap(
@@ -231,7 +238,16 @@ pub trait PointerStore: Send + Sync {
     ) -> IcebergResult<CasResult>;
 
     /// Deletes a pointer with version check.
-    async fn delete(&self, table_uuid: &Uuid, expected_version: &ObjectVersion) -> IcebergResult<CasResult>;
+    async fn delete(
+        &self,
+        table_uuid: &Uuid,
+        expected_version: &ObjectVersion,
+    ) -> IcebergResult<CasResult>;
+
+    /// Lists all table UUIDs that have pointers.
+    ///
+    /// This is used by the reconciler to enumerate all tables for reconciliation.
+    async fn list_all(&self) -> IcebergResult<Vec<Uuid>>;
 }
 
 /// Implementation of `PointerStore` using `StorageBackend`.
@@ -249,42 +265,61 @@ impl<S: StorageBackend> PointerStoreImpl<S> {
 
 #[async_trait]
 impl<S: StorageBackend> PointerStore for PointerStoreImpl<S> {
-    async fn load(&self, table_uuid: &Uuid) -> IcebergResult<Option<(IcebergTablePointer, ObjectVersion)>> {
+    async fn load(
+        &self,
+        table_uuid: &Uuid,
+    ) -> IcebergResult<Option<(IcebergTablePointer, ObjectVersion)>> {
         let path = IcebergTablePointer::storage_path(table_uuid);
 
-        let meta = self.storage.head(&path).await.map_err(|e| IcebergError::Internal {
-            message: format!("Failed to check pointer existence: {e}"),
-        })?;
+        let meta = self
+            .storage
+            .head(&path)
+            .await
+            .map_err(|e| IcebergError::Internal {
+                message: format!("Failed to check pointer existence: {e}"),
+            })?;
 
         let Some(meta) = meta else {
             return Ok(None);
         };
 
-        let bytes = self.storage.get(&path).await.map_err(|e| IcebergError::Internal {
-            message: format!("Failed to read pointer: {e}"),
-        })?;
-
-        let pointer: IcebergTablePointer = serde_json::from_slice(&bytes)
+        let bytes = self
+            .storage
+            .get(&path)
+            .await
             .map_err(|e| IcebergError::Internal {
+                message: format!("Failed to read pointer: {e}"),
+            })?;
+
+        let pointer: IcebergTablePointer =
+            serde_json::from_slice(&bytes).map_err(|e| IcebergError::Internal {
                 message: format!("Failed to parse pointer: {e}"),
             })?;
 
         Ok(Some((pointer, ObjectVersion::new(meta.version))))
     }
 
-    async fn create(&self, table_uuid: &Uuid, pointer: &IcebergTablePointer) -> IcebergResult<CasResult> {
+    async fn create(
+        &self,
+        table_uuid: &Uuid,
+        pointer: &IcebergTablePointer,
+    ) -> IcebergResult<CasResult> {
         let path = IcebergTablePointer::storage_path(table_uuid);
         let bytes = serde_json::to_vec(pointer).map_err(|e| IcebergError::Internal {
             message: format!("Failed to serialize pointer: {e}"),
         })?;
 
-        match self.storage.put(&path, Bytes::from(bytes), WritePrecondition::DoesNotExist).await {
-            Ok(WriteResult::Success { version }) => {
-                Ok(CasResult::Success { new_version: ObjectVersion::new(version) })
-            }
-            Ok(WriteResult::PreconditionFailed { current_version }) => {
-                Ok(CasResult::Conflict { current_version: ObjectVersion::new(current_version) })
-            }
+        match self
+            .storage
+            .put(&path, Bytes::from(bytes), WritePrecondition::DoesNotExist)
+            .await
+        {
+            Ok(WriteResult::Success { version }) => Ok(CasResult::Success {
+                new_version: ObjectVersion::new(version),
+            }),
+            Ok(WriteResult::PreconditionFailed { current_version }) => Ok(CasResult::Conflict {
+                current_version: ObjectVersion::new(current_version),
+            }),
             Err(e) => Err(IcebergError::Internal {
                 message: format!("Failed to create pointer: {e}"),
             }),
@@ -304,32 +339,44 @@ impl<S: StorageBackend> PointerStore for PointerStoreImpl<S> {
 
         let precondition = WritePrecondition::MatchesVersion(expected_version.as_str().to_string());
 
-        match self.storage.put(&path, Bytes::from(bytes), precondition).await {
-            Ok(WriteResult::Success { version }) => {
-                Ok(CasResult::Success { new_version: ObjectVersion::new(version) })
-            }
-            Ok(WriteResult::PreconditionFailed { current_version }) => {
-                Ok(CasResult::Conflict { current_version: ObjectVersion::new(current_version) })
-            }
+        match self
+            .storage
+            .put(&path, Bytes::from(bytes), precondition)
+            .await
+        {
+            Ok(WriteResult::Success { version }) => Ok(CasResult::Success {
+                new_version: ObjectVersion::new(version),
+            }),
+            Ok(WriteResult::PreconditionFailed { current_version }) => Ok(CasResult::Conflict {
+                current_version: ObjectVersion::new(current_version),
+            }),
             Err(e) => Err(IcebergError::Internal {
                 message: format!("Failed to CAS pointer: {e}"),
             }),
         }
     }
 
-    async fn delete(&self, table_uuid: &Uuid, expected_version: &ObjectVersion) -> IcebergResult<CasResult> {
+    async fn delete(
+        &self,
+        table_uuid: &Uuid,
+        expected_version: &ObjectVersion,
+    ) -> IcebergResult<CasResult> {
         // Note: Most object stores don't support conditional delete.
         // For now, we read-check-delete which has a race window.
         // A proper implementation would use versioned delete if available.
         let path = IcebergTablePointer::storage_path(table_uuid);
 
-        let meta = self.storage.head(&path).await.map_err(|e| IcebergError::Internal {
-            message: format!("Failed to check pointer: {e}"),
-        })?;
+        let meta = self
+            .storage
+            .head(&path)
+            .await
+            .map_err(|e| IcebergError::Internal {
+                message: format!("Failed to check pointer: {e}"),
+            })?;
 
         let Some(meta) = meta else {
             return Ok(CasResult::Conflict {
-                current_version: ObjectVersion::new("0")
+                current_version: ObjectVersion::new("0"),
             });
         };
 
@@ -339,17 +386,50 @@ impl<S: StorageBackend> PointerStore for PointerStoreImpl<S> {
             });
         }
 
-        self.storage.delete(&path).await.map_err(|e| IcebergError::Internal {
-            message: format!("Failed to delete pointer: {e}"),
-        })?;
+        self.storage
+            .delete(&path)
+            .await
+            .map_err(|e| IcebergError::Internal {
+                message: format!("Failed to delete pointer: {e}"),
+            })?;
 
-        Ok(CasResult::Success { new_version: ObjectVersion::new("0") })
+        Ok(CasResult::Success {
+            new_version: ObjectVersion::new("0"),
+        })
+    }
+
+    async fn list_all(&self) -> IcebergResult<Vec<Uuid>> {
+        let prefix = "_catalog/iceberg_pointers/";
+
+        let entries = self
+            .storage
+            .list(prefix)
+            .await
+            .map_err(|e| IcebergError::Internal {
+                message: format!("Failed to list pointers: {e}"),
+            })?;
+
+        let mut uuids = Vec::new();
+        for entry in entries {
+            // Extract UUID from path like "_catalog/iceberg_pointers/{uuid}.json"
+            if let Some(filename) = entry.path.strip_prefix(prefix) {
+                if let Some(uuid_str) = filename.strip_suffix(".json") {
+                    if let Ok(uuid) = Uuid::parse_str(uuid_str) {
+                        uuids.push(uuid);
+                    }
+                }
+            }
+        }
+
+        Ok(uuids)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use tokio_test::block_on;
 
     #[test]
     fn test_pointer_serialization_roundtrip() {
@@ -440,10 +520,8 @@ mod tests {
         let store = PointerStoreImpl::new(storage);
 
         let table_uuid = Uuid::new_v4();
-        let pointer = IcebergTablePointer::new(
-            table_uuid,
-            "gs://bucket/metadata/00000.json".to_string(),
-        );
+        let pointer =
+            IcebergTablePointer::new(table_uuid, "gs://bucket/metadata/00000.json".to_string());
 
         let result = store.create(&table_uuid, &pointer).await.expect("create");
         assert!(matches!(result, CasResult::Success { .. }));
@@ -458,10 +536,8 @@ mod tests {
         let store = PointerStoreImpl::new(storage);
 
         let table_uuid = Uuid::new_v4();
-        let pointer = IcebergTablePointer::new(
-            table_uuid,
-            "gs://bucket/metadata/00000.json".to_string(),
-        );
+        let pointer =
+            IcebergTablePointer::new(table_uuid, "gs://bucket/metadata/00000.json".to_string());
 
         // Create initial pointer
         let result = store.create(&table_uuid, &pointer).await.expect("create");
@@ -472,11 +548,104 @@ mod tests {
         // Update with correct version succeeds
         let mut updated = pointer.clone();
         updated.current_metadata_location = "gs://bucket/metadata/00001.json".to_string();
-        let result = store.compare_and_swap(&table_uuid, &new_version, &updated).await.expect("cas");
+        let result = store
+            .compare_and_swap(&table_uuid, &new_version, &updated)
+            .await
+            .expect("cas");
         assert!(matches!(result, CasResult::Success { .. }));
 
         // Update with stale version fails
-        let result = store.compare_and_swap(&table_uuid, &new_version, &updated).await.expect("cas");
+        let result = store
+            .compare_and_swap(&table_uuid, &new_version, &updated)
+            .await
+            .expect("cas");
         assert!(matches!(result, CasResult::Conflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_pointer_store_list_all() {
+        use arco_core::storage::MemoryBackend;
+        use std::sync::Arc;
+
+        let storage = Arc::new(MemoryBackend::new());
+        let store = PointerStoreImpl::new(storage);
+
+        // Initially empty
+        let uuids = store.list_all().await.expect("list_all");
+        assert!(uuids.is_empty());
+
+        // Create three pointers
+        let uuid1 = Uuid::new_v4();
+        let uuid2 = Uuid::new_v4();
+        let uuid3 = Uuid::new_v4();
+
+        let pointer1 = IcebergTablePointer::new(uuid1, "gs://bucket/table1/metadata.json".to_string());
+        let pointer2 = IcebergTablePointer::new(uuid2, "gs://bucket/table2/metadata.json".to_string());
+        let pointer3 = IcebergTablePointer::new(uuid3, "gs://bucket/table3/metadata.json".to_string());
+
+        store.create(&uuid1, &pointer1).await.expect("create1");
+        store.create(&uuid2, &pointer2).await.expect("create2");
+        store.create(&uuid3, &pointer3).await.expect("create3");
+
+        // List should return all three
+        let mut uuids = store.list_all().await.expect("list_all");
+        uuids.sort();
+
+        let mut expected = vec![uuid1, uuid2, uuid3];
+        expected.sort();
+
+        assert_eq!(uuids, expected);
+    }
+
+    proptest! {
+        #[test]
+        fn prop_pointer_store_cas_roundtrip(
+            uuid_bytes in proptest::array::uniform16(any::<u8>()),
+            location in "[a-z0-9/_\\.-]{1,32}",
+            suffix in "[a-z0-9]{1,8}"
+        ) {
+            use arco_core::storage::MemoryBackend;
+            use std::sync::Arc;
+
+            let storage = Arc::new(MemoryBackend::new());
+            let store = PointerStoreImpl::new(Arc::clone(&storage));
+
+            let table_uuid = Uuid::from_bytes(uuid_bytes);
+            let initial_location = format!("gs://bucket/{location}");
+            let pointer = IcebergTablePointer::new(table_uuid, initial_location.clone());
+
+            let result = block_on(store.create(&table_uuid, &pointer)).expect("create");
+            let CasResult::Success { new_version } = result else {
+                panic!("expected success");
+            };
+
+            let mut updated = pointer.clone();
+            updated.current_metadata_location = format!("gs://bucket/{location}/{suffix}");
+            updated.previous_metadata_location = Some(initial_location);
+            updated.last_sequence_number = pointer.last_sequence_number + 1;
+            updated.updated_at = Utc::now();
+
+            let result = block_on(store.compare_and_swap(&table_uuid, &new_version, &updated))
+                .expect("cas");
+            prop_assert!(
+                matches!(result, CasResult::Success { .. }),
+                "cas result: {:?}",
+                result
+            );
+
+            let stale_version = ObjectVersion::new(format!("{}-stale", new_version.as_str()));
+            let result = block_on(store.compare_and_swap(&table_uuid, &stale_version, &updated))
+                .expect("cas");
+            prop_assert!(
+                matches!(result, CasResult::Conflict { .. }),
+                "cas result: {:?}",
+                result
+            );
+
+            let loaded = block_on(store.load(&table_uuid))
+                .expect("load")
+                .expect("pointer");
+            prop_assert_eq!(loaded.0.current_metadata_location, updated.current_metadata_location);
+        }
     }
 }

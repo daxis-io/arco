@@ -92,26 +92,7 @@ impl OrchestrationEvent {
         workspace_id: impl Into<String>,
         data: OrchestrationEventData,
     ) -> Self {
-        let tenant = tenant_id.into();
-        let workspace = workspace_id.into();
-        let event_id = Ulid::new().to_string();
-        let event_type = data.event_type().to_string();
-        let idempotency_key = data.idempotency_key();
-        let correlation_id = data.run_id().map(ToString::to_string);
-
-        Self {
-            event_id,
-            event_type,
-            event_version: 1,
-            timestamp: Utc::now(),
-            source: format!("servo/{tenant}/{workspace}"),
-            tenant_id: tenant,
-            workspace_id: workspace,
-            idempotency_key,
-            correlation_id,
-            causation_id: None,
-            data,
-        }
+        Self::new_with_timestamp(tenant_id, workspace_id, data, Utc::now())
     }
 
     /// Creates a new orchestration event with a custom idempotency key.
@@ -126,6 +107,54 @@ impl OrchestrationEvent {
         data: OrchestrationEventData,
         idempotency_key: impl Into<String>,
     ) -> Self {
+        Self::new_with_timestamp_and_idempotency_key(
+            tenant_id,
+            workspace_id,
+            data,
+            idempotency_key,
+            Utc::now(),
+        )
+    }
+
+    /// Creates a new orchestration event with a fixed timestamp.
+    #[must_use]
+    pub fn new_with_timestamp(
+        tenant_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        data: OrchestrationEventData,
+        timestamp: DateTime<Utc>,
+    ) -> Self {
+        let tenant = tenant_id.into();
+        let workspace = workspace_id.into();
+        let event_id = Ulid::new().to_string();
+        let event_type = data.event_type().to_string();
+        let idempotency_key = data.idempotency_key();
+        let correlation_id = data.run_id().map(ToString::to_string);
+
+        Self {
+            event_id,
+            event_type,
+            event_version: 1,
+            timestamp,
+            source: format!("servo/{tenant}/{workspace}"),
+            tenant_id: tenant,
+            workspace_id: workspace,
+            idempotency_key,
+            correlation_id,
+            causation_id: None,
+            data,
+        }
+    }
+
+    /// Creates a new orchestration event with a custom idempotency key and timestamp.
+    #[must_use]
+    pub fn new_with_timestamp_and_idempotency_key(
+        tenant_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        data: OrchestrationEventData,
+        idempotency_key: impl Into<String>,
+        timestamp: DateTime<Utc>,
+    ) -> Self {
         let tenant = tenant_id.into();
         let workspace = workspace_id.into();
         let event_id = Ulid::new().to_string();
@@ -136,11 +165,45 @@ impl OrchestrationEvent {
             event_id,
             event_type,
             event_version: 1,
-            timestamp: Utc::now(),
+            timestamp,
             source: format!("servo/{tenant}/{workspace}"),
             tenant_id: tenant,
             workspace_id: workspace,
             idempotency_key: idempotency_key.into(),
+            correlation_id,
+            causation_id: None,
+            data,
+        }
+    }
+
+    /// Creates an event with explicit event_id for deterministic testing.
+    ///
+    /// In production, use `new()` or `new_with_timestamp()` which generate ULIDs.
+    /// This constructor is useful for tests where event ordering must be
+    /// deterministic regardless of parallel execution timing.
+    #[cfg(test)]
+    #[must_use]
+    pub fn new_with_event_id(
+        tenant_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        data: OrchestrationEventData,
+        event_id: impl Into<String>,
+    ) -> Self {
+        let tenant = tenant_id.into();
+        let workspace = workspace_id.into();
+        let event_type = data.event_type().to_string();
+        let idempotency_key = data.idempotency_key();
+        let correlation_id = data.run_id().map(ToString::to_string);
+
+        Self {
+            event_id: event_id.into(),
+            event_type,
+            event_version: 1,
+            timestamp: Utc::now(),
+            source: format!("servo/{tenant}/{workspace}"),
+            tenant_id: tenant,
+            workspace_id: workspace,
+            idempotency_key,
             correlation_id,
             causation_id: None,
             data,

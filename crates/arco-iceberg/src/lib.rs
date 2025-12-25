@@ -49,6 +49,7 @@ pub mod idempotency;
 pub mod metrics;
 pub mod openapi;
 pub mod pointer;
+pub mod reconciler;
 pub mod router;
 pub mod state;
 pub mod types;
@@ -68,7 +69,7 @@ pub mod prelude {
 
 // Re-export key types at crate root
 pub use error::{IcebergError, IcebergResult};
-pub use openapi::{openapi, openapi_json, IcebergApiDoc};
+pub use openapi::{IcebergApiDoc, openapi, openapi_json};
 pub use pointer::IcebergTablePointer;
 pub use router::iceberg_router;
 pub use state::{CredentialProvider, IcebergConfig, IcebergState};

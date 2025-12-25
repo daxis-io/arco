@@ -35,7 +35,11 @@ pub struct TableCredentialsResponse {
 impl StorageCredential {
     /// Creates a GCS credential with `OAuth2` token.
     #[must_use]
-    pub fn gcs(prefix: impl Into<String>, token: impl Into<String>, expires_at: impl Into<String>) -> Self {
+    pub fn gcs(
+        prefix: impl Into<String>,
+        token: impl Into<String>,
+        expires_at: impl Into<String>,
+    ) -> Self {
         Self {
             prefix: prefix.into(),
             config: HashMap::from([
@@ -67,7 +71,11 @@ impl StorageCredential {
 
     /// Creates an ADLS credential with SAS token.
     #[must_use]
-    pub fn adls(prefix: impl Into<String>, sas_token: impl Into<String>, expires_at: impl Into<String>) -> Self {
+    pub fn adls(
+        prefix: impl Into<String>,
+        sas_token: impl Into<String>,
+        expires_at: impl Into<String>,
+    ) -> Self {
         Self {
             prefix: prefix.into(),
             config: HashMap::from([
@@ -136,7 +144,10 @@ mod tests {
         );
 
         assert_eq!(cred.prefix, "gs://bucket/warehouse/");
-        assert_eq!(cred.config.get("gcs.oauth2.token"), Some(&"ya29.token".to_string()));
+        assert_eq!(
+            cred.config.get("gcs.oauth2.token"),
+            Some(&"ya29.token".to_string())
+        );
         assert!(cred.config.contains_key("gcs.oauth2.token-expires-at"));
     }
 
@@ -150,8 +161,14 @@ mod tests {
             "us-east-1",
         );
 
-        assert_eq!(cred.config.get("s3.access-key-id"), Some(&"AKIAIOSFODNN7EXAMPLE".to_string()));
-        assert_eq!(cred.config.get("client.region"), Some(&"us-east-1".to_string()));
+        assert_eq!(
+            cred.config.get("s3.access-key-id"),
+            Some(&"AKIAIOSFODNN7EXAMPLE".to_string())
+        );
+        assert_eq!(
+            cred.config.get("client.region"),
+            Some(&"us-east-1".to_string())
+        );
     }
 
     #[test]

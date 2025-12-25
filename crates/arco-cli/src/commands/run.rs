@@ -155,7 +155,13 @@ mod tests {
             args: RunArgs,
         }
 
-        let cli = TestCli::parse_from(["test", "--asset", "analytics/users", "--run-key", "test-key"]);
+        let cli = TestCli::parse_from([
+            "test",
+            "--asset",
+            "analytics/users",
+            "--run-key",
+            "test-key",
+        ]);
         assert_eq!(cli.args.assets, vec!["analytics/users"]);
         assert_eq!(cli.args.run_key, Some("test-key".to_string()));
         assert!(!cli.args.wait);
@@ -178,10 +184,7 @@ mod tests {
             "--asset",
             "analytics/orders",
         ]);
-        assert_eq!(
-            cli.args.assets,
-            vec!["analytics/users", "analytics/orders"]
-        );
+        assert_eq!(cli.args.assets, vec!["analytics/users", "analytics/orders"]);
     }
 
     #[test]
@@ -195,9 +198,6 @@ mod tests {
         }
 
         let cli = TestCli::parse_from(["test", "--asset", "analytics/users,analytics/orders"]);
-        assert_eq!(
-            cli.args.assets,
-            vec!["analytics/users", "analytics/orders"]
-        );
+        assert_eq!(cli.args.assets, vec!["analytics/users", "analytics/orders"]);
     }
 }

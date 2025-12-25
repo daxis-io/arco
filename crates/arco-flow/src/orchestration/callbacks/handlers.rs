@@ -116,7 +116,11 @@ fn record_callback_metrics<T>(handler: &str, result: &CallbackResult<T>, tenant_
     }
 }
 
-fn finish_callback<T>(handler: &str, result: CallbackResult<T>, tenant_id: &str) -> CallbackResult<T> {
+fn finish_callback<T>(
+    handler: &str,
+    result: CallbackResult<T>,
+    tenant_id: &str,
+) -> CallbackResult<T> {
     record_callback_metrics(handler, &result, tenant_id);
     result
 }
@@ -181,10 +185,7 @@ where
     if attempt == 0 {
         return finish_callback(
             "task_started",
-            CallbackResult::BadRequest(CallbackError::invalid_argument(
-                "attempt",
-                "must be >= 1",
-            )),
+            CallbackResult::BadRequest(CallbackError::invalid_argument("attempt", "must be >= 1")),
             &ctx.tenant_id,
         );
     }
@@ -229,10 +230,7 @@ where
     if attempt != state.attempt {
         return finish_callback(
             "task_started",
-            CallbackResult::Conflict(CallbackError::attempt_mismatch(
-                state.attempt,
-                attempt,
-            )),
+            CallbackResult::Conflict(CallbackError::attempt_mismatch(state.attempt, attempt)),
             &ctx.tenant_id,
         );
     }
@@ -354,10 +352,7 @@ where
     if attempt == 0 {
         return finish_callback(
             "heartbeat",
-            CallbackResult::BadRequest(CallbackError::invalid_argument(
-                "attempt",
-                "must be >= 1",
-            )),
+            CallbackResult::BadRequest(CallbackError::invalid_argument("attempt", "must be >= 1")),
             &ctx.tenant_id,
         );
     }
@@ -413,10 +408,7 @@ where
     if attempt != state.attempt {
         return finish_callback(
             "heartbeat",
-            CallbackResult::Conflict(CallbackError::attempt_mismatch(
-                state.attempt,
-                attempt,
-            )),
+            CallbackResult::Conflict(CallbackError::attempt_mismatch(state.attempt, attempt)),
             &ctx.tenant_id,
         );
     }
@@ -542,10 +534,7 @@ where
     if attempt == 0 {
         return finish_callback(
             "task_completed",
-            CallbackResult::BadRequest(CallbackError::invalid_argument(
-                "attempt",
-                "must be >= 1",
-            )),
+            CallbackResult::BadRequest(CallbackError::invalid_argument("attempt", "must be >= 1")),
             &ctx.tenant_id,
         );
     }
@@ -590,10 +579,7 @@ where
     if attempt != state.attempt {
         return finish_callback(
             "task_completed",
-            CallbackResult::Conflict(CallbackError::attempt_mismatch(
-                state.attempt,
-                attempt,
-            )),
+            CallbackResult::Conflict(CallbackError::attempt_mismatch(state.attempt, attempt)),
             &ctx.tenant_id,
         );
     }
@@ -627,9 +613,7 @@ where
             Err(e) => {
                 return finish_callback(
                     "task_completed",
-                    CallbackResult::InternalError(format!(
-                        "Failed to serialize task output: {e}"
-                    )),
+                    CallbackResult::InternalError(format!("Failed to serialize task output: {e}")),
                     &ctx.tenant_id,
                 );
             }
@@ -649,9 +633,7 @@ where
             Err(e) => {
                 return finish_callback(
                     "task_completed",
-                    CallbackResult::InternalError(format!(
-                        "Failed to serialize task error: {e}"
-                    )),
+                    CallbackResult::InternalError(format!("Failed to serialize task error: {e}")),
                     &ctx.tenant_id,
                 );
             }
@@ -664,9 +646,7 @@ where
             Err(e) => {
                 return finish_callback(
                     "task_completed",
-                    CallbackResult::InternalError(format!(
-                        "Failed to serialize task metrics: {e}"
-                    )),
+                    CallbackResult::InternalError(format!("Failed to serialize task metrics: {e}")),
                     &ctx.tenant_id,
                 );
             }

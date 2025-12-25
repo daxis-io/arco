@@ -27,13 +27,13 @@
 use chrono::Duration;
 use metrics::{counter, histogram};
 
+use crate::metrics::{TimingGuard, labels as metrics_labels, names as metrics_names};
 use crate::orchestration::compactor::fold::{
     DispatchOutboxRow, DispatchStatus, FoldState, TaskRow, TaskState,
 };
-use crate::orchestration::ids::deterministic_attempt_id;
 use crate::orchestration::compactor::manifest::OrchestrationManifest;
 use crate::orchestration::events::OrchestrationEventData;
-use crate::metrics::{labels as metrics_labels, names as metrics_names, TimingGuard};
+use crate::orchestration::ids::deterministic_attempt_id;
 
 /// Action returned by the ready dispatch reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,15 +249,10 @@ impl ReadyDispatchController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use crate::orchestration::compactor::fold::{RunRow, RunState};
+    use chrono::Utc;
 
-    fn make_task_row(
-        run_id: &str,
-        task_key: &str,
-        state: TaskState,
-        attempt: u32,
-    ) -> TaskRow {
+    fn make_task_row(run_id: &str, task_key: &str, state: TaskState, attempt: u32) -> TaskRow {
         TaskRow {
             run_id: run_id.to_string(),
             task_key: task_key.to_string(),
@@ -334,8 +329,8 @@ mod tests {
 
     #[test]
     fn test_ready_dispatch_emits_for_ready_tasks() {
-        let controller = ReadyDispatchController::with_defaults()
-            .with_worker_queue("priority-queue");
+        let controller =
+            ReadyDispatchController::with_defaults().with_worker_queue("priority-queue");
         let manifest = fresh_manifest();
 
         let mut state = FoldState::new();
@@ -404,7 +399,9 @@ mod tests {
 
         // Add pending dispatch
         let outbox = make_outbox_row("run1", "extract", 1, DispatchStatus::Pending);
-        state.dispatch_outbox.insert(outbox.dispatch_id.clone(), outbox);
+        state
+            .dispatch_outbox
+            .insert(outbox.dispatch_id.clone(), outbox);
 
         let actions = controller.reconcile(&manifest, &state);
 
@@ -429,12 +426,16 @@ mod tests {
         );
 
         let outbox = make_outbox_row("run1", "extract", 1, DispatchStatus::Created);
-        state.dispatch_outbox.insert(outbox.dispatch_id.clone(), outbox);
+        state
+            .dispatch_outbox
+            .insert(outbox.dispatch_id.clone(), outbox);
 
         let actions = controller.reconcile(&manifest, &state);
 
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], ReadyDispatchAction::Skip { reason, .. } if reason.contains("Created")));
+        assert!(
+            matches!(&actions[0], ReadyDispatchAction::Skip { reason, .. } if reason.contains("Created"))
+        );
     }
 
     #[test]
@@ -499,11 +500,22 @@ mod tests {
         // Both should emit dispatch with the SAME attempt_id (deterministic for idempotency)
         match (&actions1[0], &actions2[0]) {
             (
-                ReadyDispatchAction::EmitDispatchRequested { attempt_id: id1, dispatch_id: d1, .. },
-                ReadyDispatchAction::EmitDispatchRequested { attempt_id: id2, dispatch_id: d2, .. },
+                ReadyDispatchAction::EmitDispatchRequested {
+                    attempt_id: id1,
+                    dispatch_id: d1,
+                    ..
+                },
+                ReadyDispatchAction::EmitDispatchRequested {
+                    attempt_id: id2,
+                    dispatch_id: d2,
+                    ..
+                },
             ) => {
                 assert_eq!(d1, d2, "Same dispatch_id for same task/attempt");
-                assert_eq!(id1, id2, "Deterministic attempt_id for controller idempotency");
+                assert_eq!(
+                    id1, id2,
+                    "Deterministic attempt_id for controller idempotency"
+                );
             }
             _ => panic!("Expected EmitDispatchRequested actions"),
         }
@@ -534,7 +546,10 @@ mod tests {
             .collect();
 
         assert_eq!(attempt_ids.len(), 2);
-        assert_ne!(attempt_ids[0], attempt_ids[1], "Different tasks should have different attempt_ids");
+        assert_ne!(
+            attempt_ids[0], attempt_ids[1],
+            "Different tasks should have different attempt_ids"
+        );
     }
 
     #[test]
@@ -610,9 +625,8 @@ mod tests {
 
     #[test]
     fn test_dispatch_requested_idempotency_key() {
-        let key = ReadyDispatchController::dispatch_requested_idempotency_key(
-            "dispatch:run1:extract:1",
-        );
+        let key =
+            ReadyDispatchController::dispatch_requested_idempotency_key("dispatch:run1:extract:1");
         assert_eq!(key, "dispatch_req:dispatch:run1:extract:1");
     }
 }

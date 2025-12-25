@@ -144,7 +144,10 @@ impl QuotaManager for InMemoryQuotaManager {
             });
         };
 
-        let available = state.quota.max_concurrent_tasks.saturating_sub(state.active_tasks);
+        let available = state
+            .quota
+            .max_concurrent_tasks
+            .saturating_sub(state.active_tasks);
 
         if task_count <= available {
             drop(tenants);
@@ -214,9 +217,10 @@ impl QuotaManager for InMemoryQuotaManager {
         let state = if let Some(state) = tenants.get_mut(tenant_id) {
             state
         } else {
-            let default_quota = self.default_quota.clone().ok_or_else(|| {
-                Error::configuration(format!("unknown tenant: {tenant_id}"))
-            })?;
+            let default_quota = self
+                .default_quota
+                .clone()
+                .ok_or_else(|| Error::configuration(format!("unknown tenant: {tenant_id}")))?;
             tenants.insert(
                 tenant_id.to_string(),
                 TenantState {
@@ -280,10 +284,8 @@ mod tests {
 
     #[tokio::test]
     async fn allows_dispatch_under_quota() -> Result<()> {
-        let manager = InMemoryQuotaManager::with_quotas(vec![(
-            "tenant-1".to_string(),
-            TenantQuota::new(10),
-        )]);
+        let manager =
+            InMemoryQuotaManager::with_quotas(vec![("tenant-1".to_string(), TenantQuota::new(10))]);
 
         let decision = manager.can_dispatch("tenant-1", 5).await?;
         assert!(decision.is_allowed());
@@ -293,10 +295,8 @@ mod tests {
 
     #[tokio::test]
     async fn try_dispatch_reserves_quota() -> Result<()> {
-        let manager = InMemoryQuotaManager::with_quotas(vec![(
-            "tenant-1".to_string(),
-            TenantQuota::new(5),
-        )]);
+        let manager =
+            InMemoryQuotaManager::with_quotas(vec![("tenant-1".to_string(), TenantQuota::new(5))]);
 
         let decision = manager.try_dispatch("tenant-1", 3).await?;
         assert!(decision.is_allowed());
@@ -322,10 +322,8 @@ mod tests {
 
     #[tokio::test]
     async fn denies_dispatch_over_quota() -> Result<()> {
-        let manager = InMemoryQuotaManager::with_quotas(vec![(
-            "tenant-1".to_string(),
-            TenantQuota::new(5),
-        )]);
+        let manager =
+            InMemoryQuotaManager::with_quotas(vec![("tenant-1".to_string(), TenantQuota::new(5))]);
 
         // Record some active tasks
         manager.record_dispatch("tenant-1", 4).await?;
@@ -337,7 +335,10 @@ mod tests {
         if let QuotaDecision::Denied { reason } = decision {
             assert!(matches!(
                 reason,
-                QuotaDenialReason::MaxConcurrentTasks { current: 4, limit: 5 }
+                QuotaDenialReason::MaxConcurrentTasks {
+                    current: 4,
+                    limit: 5
+                }
             ));
         } else {
             panic!("Expected Denied");
@@ -382,10 +383,8 @@ mod tests {
 
     #[tokio::test]
     async fn record_dispatch_and_completion() -> Result<()> {
-        let manager = InMemoryQuotaManager::with_quotas(vec![(
-            "tenant-1".to_string(),
-            TenantQuota::new(10),
-        )]);
+        let manager =
+            InMemoryQuotaManager::with_quotas(vec![("tenant-1".to_string(), TenantQuota::new(10))]);
 
         assert_eq!(manager.active_tasks("tenant-1").await?, 0);
 
@@ -419,10 +418,8 @@ mod tests {
 
     #[tokio::test]
     async fn completion_doesnt_go_negative() -> Result<()> {
-        let manager = InMemoryQuotaManager::with_quotas(vec![(
-            "tenant-1".to_string(),
-            TenantQuota::new(10),
-        )]);
+        let manager =
+            InMemoryQuotaManager::with_quotas(vec![("tenant-1".to_string(), TenantQuota::new(10))]);
 
         // Record more completions than dispatches
         manager.record_completion("tenant-1", 100).await?;

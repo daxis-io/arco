@@ -4,7 +4,7 @@
 //! private to the lock module while allowing catalog code to use it.
 
 pub use arco_core::lock::{
-    DistributedLock, LockGuard, LockInfo, DEFAULT_LOCK_TTL, DEFAULT_MAX_RETRIES,
+    DEFAULT_LOCK_TTL, DEFAULT_MAX_RETRIES, DistributedLock, LockGuard, LockInfo,
 };
 
 /// Path constants for lock files.

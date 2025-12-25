@@ -159,7 +159,9 @@ fn test_sensor_evaluated_poll_idempotency_uses_cursor_before() {
             cursor_before: Some("cursor_v1".into()),
             cursor_after: Some("cursor_v2".into()),
             expected_state_version: Some(7),
-            trigger_source: TriggerSource::Poll { poll_epoch: 1736935200 },
+            trigger_source: TriggerSource::Poll {
+                poll_epoch: 1736935200,
+            },
             run_requests: vec![],
             status: SensorEvalStatus::NoNewData,
         },
@@ -183,7 +185,9 @@ fn test_sensor_evaluated_poll_with_cas_version() {
             cursor_before: Some("cursor_v3".into()),
             cursor_after: Some("cursor_v4".into()),
             expected_state_version: Some(42), // CAS field
-            trigger_source: TriggerSource::Poll { poll_epoch: 1736935300 },
+            trigger_source: TriggerSource::Poll {
+                poll_epoch: 1736935300,
+            },
             run_requests: vec![RunRequest {
                 run_key: "sensor:01HQ123POLLSENS:poll:record_123".into(),
                 request_fingerprint: "fp_poll".into(),
@@ -246,7 +250,11 @@ fn test_backfill_chunk_planned_idempotency() {
     );
 
     assert_eq!(event.event_type, "BackfillChunkPlanned");
-    assert!(event.idempotency_key.contains("backfill_chunk:bf_01HQ123:0"));
+    assert!(
+        event
+            .idempotency_key
+            .contains("backfill_chunk:bf_01HQ123:0")
+    );
 }
 
 #[test]
@@ -264,7 +272,11 @@ fn test_backfill_state_changed_uses_state_version() {
     );
 
     // Idempotency uses state_version (monotonic)
-    assert!(event.idempotency_key.contains("backfill_state:bf_01HQ123:3"));
+    assert!(
+        event
+            .idempotency_key
+            .contains("backfill_state:bf_01HQ123:3")
+    );
 }
 
 #[test]
@@ -322,8 +334,8 @@ fn test_backfill_events_no_run_id() {
 
 #[test]
 fn test_run_requested_stable_run_key_fingerprint_in_payload() {
-    use std::collections::HashMap;
     use arco_flow::orchestration::events::SourceRef;
+    use std::collections::HashMap;
 
     let event = OrchestrationEvent::new(
         "tenant-abc",
@@ -351,8 +363,8 @@ fn test_run_requested_stable_run_key_fingerprint_in_payload() {
 
 #[test]
 fn test_run_requested_idempotency_includes_fingerprint_hash() {
-    use std::collections::HashMap;
     use arco_flow::orchestration::events::SourceRef;
+    use std::collections::HashMap;
 
     let event = OrchestrationEvent::new(
         "tenant-abc",
@@ -371,14 +383,18 @@ fn test_run_requested_idempotency_includes_fingerprint_hash() {
     );
 
     let fp_hash = sha256_hex("fingerprint_v1");
-    assert!(event.idempotency_key.starts_with("runreq:sched:01HQ123:1736935200:"));
+    assert!(
+        event
+            .idempotency_key
+            .starts_with("runreq:sched:01HQ123:1736935200:")
+    );
     assert!(event.idempotency_key.contains(&fp_hash));
 }
 
 #[test]
 fn test_run_requested_different_fingerprints_different_idempotency() {
-    use std::collections::HashMap;
     use arco_flow::orchestration::events::SourceRef;
+    use std::collections::HashMap;
 
     let event1 = OrchestrationEvent::new(
         "tenant-abc",
@@ -416,14 +432,22 @@ fn test_run_requested_different_fingerprints_different_idempotency() {
     assert_ne!(event1.idempotency_key, event2.idempotency_key);
 
     // Both should start with the same prefix (run_key)
-    assert!(event1.idempotency_key.starts_with("runreq:sched:01HQ123:1736935200:"));
-    assert!(event2.idempotency_key.starts_with("runreq:sched:01HQ123:1736935200:"));
+    assert!(
+        event1
+            .idempotency_key
+            .starts_with("runreq:sched:01HQ123:1736935200:")
+    );
+    assert!(
+        event2
+            .idempotency_key
+            .starts_with("runreq:sched:01HQ123:1736935200:")
+    );
 }
 
 #[test]
 fn test_run_requested_no_run_id() {
-    use std::collections::HashMap;
     use arco_flow::orchestration::events::SourceRef;
+    use std::collections::HashMap;
 
     // RunRequested doesn't have a direct run_id - it's computed from run_key at fold time
     let event = OrchestrationEvent::new(
@@ -448,8 +472,8 @@ fn test_run_requested_no_run_id() {
 
 #[test]
 fn test_run_requested_with_backfill_source() {
-    use std::collections::HashMap;
     use arco_flow::orchestration::events::SourceRef;
+    use std::collections::HashMap;
 
     let event = OrchestrationEvent::new(
         "tenant-abc",
@@ -468,13 +492,17 @@ fn test_run_requested_with_backfill_source() {
     );
 
     assert_eq!(event.event_type, "RunRequested");
-    assert!(event.idempotency_key.starts_with("runreq:backfill:bf_01HQ123:chunk:5:"));
+    assert!(
+        event
+            .idempotency_key
+            .starts_with("runreq:backfill:bf_01HQ123:chunk:5:")
+    );
 }
 
 #[test]
 fn test_run_requested_with_manual_source() {
-    use std::collections::HashMap;
     use arco_flow::orchestration::events::SourceRef;
+    use std::collections::HashMap;
 
     let mut labels = HashMap::new();
     labels.insert("priority".into(), "high".into());
@@ -497,5 +525,9 @@ fn test_run_requested_with_manual_source() {
     );
 
     assert_eq!(event.event_type, "RunRequested");
-    assert!(event.idempotency_key.starts_with("runreq:manual:user123:req_abc123:"));
+    assert!(
+        event
+            .idempotency_key
+            .starts_with("runreq:manual:user123:req_abc123:")
+    );
 }

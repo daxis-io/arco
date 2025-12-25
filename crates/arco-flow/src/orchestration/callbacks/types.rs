@@ -206,10 +206,7 @@ impl ErrorCategory {
     /// Returns whether this error category is retryable by default.
     #[must_use]
     pub fn default_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::UserCode | Self::Infrastructure | Self::Timeout
-        )
+        matches!(self, Self::UserCode | Self::Infrastructure | Self::Timeout)
     }
 }
 

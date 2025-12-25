@@ -1,7 +1,7 @@
 //! Handler for Iceberg `OpenAPI` specification.
 
-use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 
 use crate::error::IcebergError;

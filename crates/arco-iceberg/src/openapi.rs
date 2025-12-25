@@ -26,6 +26,7 @@ use utoipa::OpenApi;
         crate::routes::tables::load_table,
         crate::routes::tables::head_table,
         crate::routes::tables::get_credentials,
+        crate::routes::tables::commit_table,
     ),
     components(
         schemas(
@@ -47,6 +48,11 @@ use utoipa::OpenApi;
             crate::types::SnapshotLogEntry,
             crate::types::MetadataLogEntry,
             crate::types::SnapshotRefMetadata,
+            crate::types::CommitTableRequest,
+            crate::types::CommitTableResponse,
+            crate::types::UpdateRequirement,
+            crate::types::TableUpdate,
+            crate::types::SnapshotRefType,
             crate::types::TableUuid,
             crate::types::TableCredentialsResponse,
             crate::types::StorageCredential,
@@ -85,6 +91,12 @@ mod tests {
         let spec = openapi();
         assert_eq!(spec.info.title, "Iceberg REST Catalog API");
         assert!(spec.paths.paths.contains_key("/v1/config"));
+        let table_path = spec
+            .paths
+            .paths
+            .get("/v1/{prefix}/namespaces/{namespace}/tables/{table}")
+            .expect("table path");
+        assert!(table_path.post.is_some());
     }
 
     #[test]

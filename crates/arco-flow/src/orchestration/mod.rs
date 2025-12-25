@@ -48,6 +48,6 @@ pub use callbacks::{
 };
 pub use ledger::{LedgerWriter, OrchestrationLedgerWriter};
 pub use run_key::{
-    FingerprintPolicy, ReservationResult, RunKeyReservation, get_reservation,
-    reserve_run_key, reservation_path,
+    FingerprintPolicy, ReservationResult, RunKeyReservation, get_reservation, reservation_path,
+    reserve_run_key,
 };

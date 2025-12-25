@@ -104,7 +104,10 @@ mod tests {
             namespace: vec!["prod".to_string(), "analytics".to_string()],
             properties: HashMap::from([
                 ("owner".to_string(), "data-team".to_string()),
-                ("location".to_string(), "gs://bucket/prod/analytics".to_string()),
+                (
+                    "location".to_string(),
+                    "gs://bucket/prod/analytics".to_string(),
+                ),
             ]),
         };
 
@@ -118,7 +121,11 @@ mod tests {
     #[test]
     fn test_namespace_ident_nested() {
         // Verify nested namespaces serialize as arrays
-        let ns: NamespaceIdent = vec!["level1".to_string(), "level2".to_string(), "level3".to_string()];
+        let ns: NamespaceIdent = vec![
+            "level1".to_string(),
+            "level2".to_string(),
+            "level3".to_string(),
+        ];
         let json = serde_json::to_string(&ns).expect("serialization failed");
         assert_eq!(json, r#"["level1","level2","level3"]"#);
     }

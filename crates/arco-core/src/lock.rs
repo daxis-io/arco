@@ -215,11 +215,7 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
 
         match self
             .storage
-            .put(
-                &self.lock_path,
-                lock_bytes,
-                WritePrecondition::DoesNotExist,
-            )
+            .put(&self.lock_path, lock_bytes, WritePrecondition::DoesNotExist)
             .await
             .map_err(LockError::Storage)?
         {
@@ -360,7 +356,6 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
     pub async fn read_lock_info(&self) -> Result<Option<LockInfo>> {
         self.read_lock().await
     }
-
 }
 
 #[cfg(feature = "sync-compaction")]

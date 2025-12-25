@@ -177,9 +177,7 @@ pub async fn reserve_run_key(
                     ) {
                         (Some(a), Some(b)) => a == b,
                         (None, None) => true,
-                        (None, Some(_)) => {
-                            fingerprint_policy.allows_missing(existing.created_at)
-                        }
+                        (None, Some(_)) => fingerprint_policy.allows_missing(existing.created_at),
                         (Some(_), None) => false,
                     };
 
@@ -301,7 +299,11 @@ mod tests {
         assert!(path.starts_with("run_keys/"));
         assert!(path.ends_with(".json"));
         // 40 hex chars between prefix and suffix
-        let hash_part = path.strip_prefix("run_keys/").unwrap().strip_suffix(".json").unwrap();
+        let hash_part = path
+            .strip_prefix("run_keys/")
+            .unwrap()
+            .strip_suffix(".json")
+            .unwrap();
         assert_eq!(hash_part.len(), 40);
     }
 
@@ -311,8 +313,7 @@ mod tests {
         let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
 
         let reservation = make_reservation("test-run-key");
-        let result =
-            reserve_run_key(&storage, &reservation, FingerprintPolicy::lenient()).await?;
+        let result = reserve_run_key(&storage, &reservation, FingerprintPolicy::lenient()).await?;
 
         assert!(matches!(result, ReservationResult::Reserved));
         Ok(())
@@ -338,7 +339,10 @@ mod tests {
                 assert_eq!(existing.run_id, reservation1.run_id);
                 assert_eq!(existing.plan_id, reservation1.plan_id);
                 assert_eq!(existing.plan_event_id, reservation1.plan_event_id);
-                assert_eq!(existing.request_fingerprint, reservation1.request_fingerprint);
+                assert_eq!(
+                    existing.request_fingerprint,
+                    reservation1.request_fingerprint
+                );
             }
             ReservationResult::Reserved => {
                 panic!("expected AlreadyExists, got Reserved");
@@ -373,7 +377,10 @@ mod tests {
         assert_eq!(retrieved.run_id, reservation.run_id);
         assert_eq!(retrieved.run_key, "test-key");
         assert_eq!(retrieved.plan_event_id, reservation.plan_event_id);
-        assert_eq!(retrieved.request_fingerprint, reservation.request_fingerprint);
+        assert_eq!(
+            retrieved.request_fingerprint,
+            reservation.request_fingerprint
+        );
         Ok(())
     }
 
@@ -400,8 +407,14 @@ mod tests {
 
         // Should detect fingerprint mismatch
         match result2 {
-            ReservationResult::FingerprintMismatch { existing, requested_fingerprint } => {
-                assert_eq!(existing.request_fingerprint, Some("fingerprint-A".to_string()));
+            ReservationResult::FingerprintMismatch {
+                existing,
+                requested_fingerprint,
+            } => {
+                assert_eq!(
+                    existing.request_fingerprint,
+                    Some("fingerprint-A".to_string())
+                );
                 assert_eq!(requested_fingerprint, Some("fingerprint-B".to_string()));
             }
             ReservationResult::AlreadyExists(_) => {
@@ -487,15 +500,13 @@ mod tests {
         let mut reservation1 = make_reservation("test-run-key");
         reservation1.request_fingerprint = None;
         reservation1.created_at = cutoff - Duration::hours(1);
-        let result1 =
-            reserve_run_key(&storage, &reservation1, policy).await?;
+        let result1 = reserve_run_key(&storage, &reservation1, policy).await?;
         assert!(matches!(result1, ReservationResult::Reserved));
 
         // Second reservation HAS a fingerprint
         let mut reservation2 = make_reservation("test-run-key");
         reservation2.request_fingerprint = Some("new-fingerprint".to_string());
-        let result2 =
-            reserve_run_key(&storage, &reservation2, policy).await?;
+        let result2 = reserve_run_key(&storage, &reservation2, policy).await?;
 
         // Should be lenient and return AlreadyExists (not mismatch)
         // This maintains backward compatibility with old reservations
@@ -516,18 +527,19 @@ mod tests {
         let mut reservation1 = make_reservation("test-run-key");
         reservation1.request_fingerprint = None;
         reservation1.created_at = cutoff + Duration::hours(1);
-        let result1 =
-            reserve_run_key(&storage, &reservation1, policy).await?;
+        let result1 = reserve_run_key(&storage, &reservation1, policy).await?;
         assert!(matches!(result1, ReservationResult::Reserved));
 
         // Second reservation HAS a fingerprint
         let mut reservation2 = make_reservation("test-run-key");
         reservation2.request_fingerprint = Some("new-fingerprint".to_string());
-        let result2 =
-            reserve_run_key(&storage, &reservation2, policy).await?;
+        let result2 = reserve_run_key(&storage, &reservation2, policy).await?;
 
         match result2 {
-            ReservationResult::FingerprintMismatch { existing, requested_fingerprint } => {
+            ReservationResult::FingerprintMismatch {
+                existing,
+                requested_fingerprint,
+            } => {
                 assert_eq!(existing.request_fingerprint, None);
                 assert_eq!(requested_fingerprint, Some("new-fingerprint".to_string()));
             }

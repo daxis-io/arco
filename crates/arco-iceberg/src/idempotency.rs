@@ -29,9 +29,7 @@ pub enum CanonicalizationError {
 /// # Errors
 ///
 /// Returns an error if the JSON value cannot be canonicalized.
-pub fn canonical_request_hash(
-    value: &serde_json::Value,
-) -> Result<String, CanonicalizationError> {
+pub fn canonical_request_hash(value: &serde_json::Value) -> Result<String, CanonicalizationError> {
     let canonical = serde_jcs::to_string(value)?;
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
@@ -322,7 +320,8 @@ impl<S: StorageBackend> IdempotencyStoreImpl<S> {
 #[async_trait]
 impl<S: StorageBackend> IdempotencyStore for IdempotencyStoreImpl<S> {
     async fn claim(&self, marker: &IdempotencyMarker) -> IcebergResult<ClaimResult> {
-        let path = IdempotencyMarker::storage_path(&marker.table_uuid, &marker.idempotency_key_hash);
+        let path =
+            IdempotencyMarker::storage_path(&marker.table_uuid, &marker.idempotency_key_hash);
         let bytes = serde_json::to_vec(marker).map_err(|e| IcebergError::Internal {
             message: format!("Failed to serialize idempotency marker: {e}"),
         })?;
@@ -399,14 +398,19 @@ impl<S: StorageBackend> IdempotencyStore for IdempotencyStoreImpl<S> {
         marker: &IdempotencyMarker,
         expected_version: &ObjectVersion,
     ) -> IcebergResult<FinalizeResult> {
-        let path = IdempotencyMarker::storage_path(&marker.table_uuid, &marker.idempotency_key_hash);
+        let path =
+            IdempotencyMarker::storage_path(&marker.table_uuid, &marker.idempotency_key_hash);
         let bytes = serde_json::to_vec(marker).map_err(|e| IcebergError::Internal {
             message: format!("Failed to serialize idempotency marker: {e}"),
         })?;
 
         let precondition = WritePrecondition::MatchesVersion(expected_version.as_str().to_string());
 
-        match self.storage.put(&path, Bytes::from(bytes), precondition).await {
+        match self
+            .storage
+            .put(&path, Bytes::from(bytes), precondition)
+            .await
+        {
             Ok(WriteResult::Success { version }) => Ok(FinalizeResult::Success {
                 version: ObjectVersion::new(version),
             }),
@@ -426,6 +430,8 @@ impl<S: StorageBackend> IdempotencyStore for IdempotencyStoreImpl<S> {
 mod tests {
     use super::*;
     use crate::error::IcebergError;
+    use proptest::prelude::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_hash_key_deterministic() {
@@ -586,6 +592,39 @@ mod tests {
         assert_ne!(hash1, hash2);
     }
 
+    fn ordered_object(map: &HashMap<String, u64>, order: &[String]) -> serde_json::Value {
+        let mut object = serde_json::Map::new();
+        for key in order {
+            let value = map
+                .get(key)
+                .copied()
+                .unwrap_or_default()
+                .into();
+            object.insert(key.clone(), serde_json::Value::Number(value));
+        }
+        serde_json::Value::Object(object)
+    }
+
+    proptest! {
+        #[test]
+        fn prop_canonical_hash_order_invariant(
+            map in proptest::collection::hash_map("[a-z]{1,6}", 0u64..1_000_000, 1..8)
+        ) {
+            let mut keys: Vec<String> = map.keys().cloned().collect();
+            keys.sort();
+            let mut reversed = keys.clone();
+            reversed.reverse();
+
+            let value1 = ordered_object(&map, &keys);
+            let value2 = ordered_object(&map, &reversed);
+
+            let hash1 = canonical_request_hash(&value1).expect("canonical hash");
+            let hash2 = canonical_request_hash(&value2).expect("canonical hash");
+
+            prop_assert_eq!(hash1, hash2);
+        }
+    }
+
     #[tokio::test]
     async fn test_idempotency_store_claim() {
         use arco_core::storage::MemoryBackend;
@@ -610,5 +649,36 @@ mod tests {
         // Second claim finds existing
         let result = store.claim(&marker).await.expect("claim");
         assert!(matches!(result, ClaimResult::Exists { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_idempotency_store_finalize_conflict() {
+        use arco_core::storage::MemoryBackend;
+        use std::sync::Arc;
+
+        let storage = Arc::new(MemoryBackend::new());
+        let store = IdempotencyStoreImpl::new(storage);
+
+        let table_uuid = Uuid::new_v4();
+        let marker = IdempotencyMarker::new_in_progress(
+            "01924a7c-8d9f-7000-8000-000000000001".to_string(),
+            table_uuid,
+            "request_hash".to_string(),
+            "base.json".to_string(),
+            "new.json".to_string(),
+        );
+
+        let result = store.claim(&marker).await.expect("claim");
+        let ClaimResult::Success { .. } = result else {
+            panic!("expected success");
+        };
+
+        let finalized = marker.finalize_committed("new.json".to_string());
+        let stale_version = ObjectVersion::new("stale");
+        let result = store
+            .finalize(&finalized, &stale_version)
+            .await
+            .expect("finalize");
+        assert!(matches!(result, FinalizeResult::Conflict { .. }));
     }
 }

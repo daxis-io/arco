@@ -259,8 +259,10 @@ impl SimulatedClock {
 
     /// Advances the clock by the given duration.
     pub fn advance(&self, duration: Duration) {
-        self.elapsed_ms
-            .fetch_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        self.elapsed_ms.fetch_add(
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// Advances the clock to a specific point in time.

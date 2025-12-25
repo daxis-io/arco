@@ -159,7 +159,9 @@ mod tests {
         assert!(json.contains("push"));
         assert!(json.contains("msg_123"));
 
-        let poll = TriggerSource::Poll { poll_epoch: 1736935200 };
+        let poll = TriggerSource::Poll {
+            poll_epoch: 1736935200,
+        };
         let json = serde_json::to_string(&poll).unwrap();
         assert!(json.contains("poll"));
         assert!(json.contains("1736935200"));

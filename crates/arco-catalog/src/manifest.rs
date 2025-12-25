@@ -267,10 +267,9 @@ impl CatalogDomainManifest {
             }
         }
 
-        if let (Some(prev), Some(next)) = (
-            previous.commit_ulid.as_deref(),
-            self.commit_ulid.as_deref(),
-        ) {
+        if let (Some(prev), Some(next)) =
+            (previous.commit_ulid.as_deref(), self.commit_ulid.as_deref())
+        {
             if next <= prev {
                 return Err(format!(
                     "commit ulid regression: {prev} -> {next} (non-monotonic)"
@@ -593,10 +592,9 @@ impl LineageManifest {
             }
         }
 
-        if let (Some(prev), Some(next)) = (
-            previous.commit_ulid.as_deref(),
-            self.commit_ulid.as_deref(),
-        ) {
+        if let (Some(prev), Some(next)) =
+            (previous.commit_ulid.as_deref(), self.commit_ulid.as_deref())
+        {
             if next <= prev {
                 return Err(format!(
                     "commit ulid regression: {prev} -> {next} (non-monotonic)"

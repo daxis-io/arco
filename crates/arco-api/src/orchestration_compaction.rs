@@ -3,10 +3,10 @@
 use serde::Serialize;
 
 use arco_core::ScopedStorage;
+use arco_flow::orchestration::OrchestrationLedgerWriter;
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_flow::orchestration::events::OrchestrationEvent;
 use arco_flow::orchestration::ledger::LedgerWriter;
-use arco_flow::orchestration::OrchestrationLedgerWriter;
 
 use crate::config::Config;
 use crate::error::ApiError;
@@ -34,7 +34,9 @@ pub async fn compact_orchestration_events(
             .json(&CompactRequest { event_paths })
             .send()
             .await
-            .map_err(|e| ApiError::internal(format!("orchestration compaction request failed: {e}")))?;
+            .map_err(|e| {
+                ApiError::internal(format!("orchestration compaction request failed: {e}"))
+            })?;
 
         if response.status().is_success() {
             return Ok(());
@@ -47,7 +49,12 @@ pub async fn compact_orchestration_events(
             .map_err(|e| ApiError::internal(format!("compaction error body read failed: {e}")))?;
         let message = serde_json::from_slice::<serde_json::Value>(&body)
             .ok()
-            .and_then(|value| value.get("error").and_then(|v| v.as_str()).map(str::to_string))
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| String::from_utf8_lossy(&body).to_string());
 
         return Err(ApiError::internal(format!(

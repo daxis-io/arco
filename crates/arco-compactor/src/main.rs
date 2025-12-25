@@ -304,7 +304,10 @@ async fn ready(State(state): State<Arc<ServiceState>>) -> impl IntoResponse {
     let ready = state.compactor.ready.load(Ordering::Acquire);
     let healthy = state.compactor.is_healthy();
     let last_successful = state.compactor.last_successful_compaction();
-    let successful_compactions = state.compactor.successful_compactions.load(Ordering::Relaxed);
+    let successful_compactions = state
+        .compactor
+        .successful_compactions
+        .load(Ordering::Relaxed);
     let failed_compactions = state.compactor.failed_compactions.load(Ordering::Relaxed);
     let compaction_in_progress = state
         .compactor
@@ -360,7 +363,11 @@ async fn anti_entropy_handler(
     Json(request): Json<anti_entropy::AntiEntropyConfig>,
 ) -> impl IntoResponse {
     // Check if anti-entropy is already running
-    if state.compactor.compaction_in_progress.load(Ordering::Acquire) {
+    if state
+        .compactor
+        .compaction_in_progress
+        .load(Ordering::Acquire)
+    {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -646,9 +653,10 @@ async fn main() -> Result<()> {
                 let start = Utc::now();
                 loop {
                     let now = Utc::now();
-                    let lag_seconds = lag_state
-                        .last_successful_compaction()
-                        .map_or_else(|| (now - start).num_seconds(), |ts| (now - ts).num_seconds());
+                    let lag_seconds = lag_state.last_successful_compaction().map_or_else(
+                        || (now - start).num_seconds(),
+                        |ts| (now - ts).num_seconds(),
+                    );
                     let lag_seconds = u64::try_from(lag_seconds.max(0)).unwrap_or(u64::MAX);
                     #[allow(clippy::cast_precision_loss)]
                     let lag_seconds = lag_seconds as f64;
@@ -731,11 +739,10 @@ async fn main() -> Result<()> {
 
             let mut job = anti_entropy::AntiEntropyJob::new(scoped_storage, config);
 
-            let result = job.run_pass().await.map_err(|err| {
-                anyhow!(
-                    "anti-entropy run failed: {err}"
-                )
-            })?;
+            let result = job
+                .run_pass()
+                .await
+                .map_err(|err| anyhow!("anti-entropy run failed: {err}"))?;
 
             tracing::info!(
                 objects_scanned = result.objects_scanned,

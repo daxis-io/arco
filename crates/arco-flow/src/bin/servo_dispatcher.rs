@@ -11,19 +11,19 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use arco_core::observability::{init_logging, LogFormat};
-use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 use arco_core::ScopedStorage;
-use arco_flow::dispatch::{EnqueueOptions, EnqueueResult};
+use arco_core::observability::{LogFormat, init_logging};
+use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 use arco_flow::dispatch::cloud_tasks::{CloudTasksConfig, CloudTasksDispatcher};
+use arco_flow::dispatch::{EnqueueOptions, EnqueueResult};
 use arco_flow::error::{Error, Result};
+use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_flow::orchestration::controllers::{
-    DispatchAction, DispatchPayload, DispatcherController, ReadyDispatchController,
-    TimerAction, TimerController,
+    DispatchAction, DispatchPayload, DispatcherController, ReadyDispatchController, TimerAction,
+    TimerController,
 };
 use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
-use arco_flow::orchestration::LedgerWriter;
 
 #[derive(Clone)]
 struct AppState {
@@ -168,7 +168,8 @@ async fn run_handler(
             attempt,
             attempt_id,
             worker_queue,
-        } = action else {
+        } = action
+        else {
             continue;
         };
 
@@ -276,7 +277,8 @@ async fn run_handler(
             task_key,
             attempt,
             ..
-        } = action else {
+        } = action
+        else {
             continue;
         };
 
@@ -296,10 +298,7 @@ async fn run_handler(
             .map_err(|e| Error::serialization(format!("timer payload error: {e}")))?;
 
         let now = Utc::now();
-        let delay = fire_at
-            .signed_duration_since(now)
-            .to_std()
-            .ok();
+        let delay = fire_at.signed_duration_since(now).to_std().ok();
 
         let mut options = EnqueueOptions::new();
         if let Some(delay) = delay {
@@ -451,7 +450,8 @@ async fn main() -> Result<()> {
     let dispatch_target_url = required_env("ARCO_SERVO_DISPATCH_TARGET_URL")?;
     let project_id = required_env("ARCO_GCP_PROJECT_ID")?;
     let location = required_env("ARCO_GCP_LOCATION")?;
-    let queue_name = optional_env("ARCO_SERVO_QUEUE").unwrap_or_else(|| "servo-dispatch".to_string());
+    let queue_name =
+        optional_env("ARCO_SERVO_QUEUE").unwrap_or_else(|| "servo-dispatch".to_string());
     let timer_target_url = optional_env("ARCO_SERVO_TIMER_TARGET_URL");
     let timer_queue = optional_env("ARCO_SERVO_TIMER_QUEUE");
     let service_account_email = optional_env("ARCO_SERVO_SERVICE_ACCOUNT_EMAIL");

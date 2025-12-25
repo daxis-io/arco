@@ -12,20 +12,18 @@ use axum::{Json, Router};
 use chrono::Utc;
 use serde::Serialize;
 
-use arco_core::observability::{init_logging, LogFormat};
-use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 use arco_core::ScopedStorage;
-use arco_flow::dispatch::{EnqueueOptions, EnqueueResult};
+use arco_core::observability::{LogFormat, init_logging};
+use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 use arco_flow::dispatch::cloud_tasks::{CloudTasksConfig, CloudTasksDispatcher};
+use arco_flow::dispatch::{EnqueueOptions, EnqueueResult};
 use arco_flow::error::{Error, Result};
+use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::MicroCompactor;
-use arco_flow::orchestration::controllers::{
-    AntiEntropySweeper, DispatchPayload, Repair,
-};
+use arco_flow::orchestration::compactor::fold::DispatchOutboxRow;
+use arco_flow::orchestration::controllers::{AntiEntropySweeper, DispatchPayload, Repair};
 use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
 use arco_flow::orchestration::ids::{cloud_task_id, deterministic_attempt_id};
-use arco_flow::orchestration::LedgerWriter;
-use arco_flow::orchestration::compactor::fold::DispatchOutboxRow;
 
 #[derive(Clone)]
 struct AppState {
@@ -172,12 +170,8 @@ async fn run_handler(
                     .filter(|id| !id.is_empty())
                     .unwrap_or_else(|| deterministic_attempt_id(&original_dispatch_id));
 
-                let payload = DispatchPayload::new(
-                    run_id.clone(),
-                    task_key.clone(),
-                    attempt,
-                    attempt_id,
-                );
+                let payload =
+                    DispatchPayload::new(run_id.clone(), task_key.clone(), attempt, attempt_id);
 
                 let body = payload
                     .to_json()
@@ -329,7 +323,8 @@ async fn main() -> Result<()> {
     let dispatch_target_url = required_env("ARCO_SERVO_DISPATCH_TARGET_URL")?;
     let project_id = required_env("ARCO_GCP_PROJECT_ID")?;
     let location = required_env("ARCO_GCP_LOCATION")?;
-    let queue_name = optional_env("ARCO_SERVO_QUEUE").unwrap_or_else(|| "servo-dispatch".to_string());
+    let queue_name =
+        optional_env("ARCO_SERVO_QUEUE").unwrap_or_else(|| "servo-dispatch".to_string());
     let service_account_email = optional_env("ARCO_SERVO_SERVICE_ACCOUNT_EMAIL");
     let port = resolve_port()?;
 

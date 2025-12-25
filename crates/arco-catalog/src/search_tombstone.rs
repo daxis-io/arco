@@ -183,7 +183,12 @@ impl SearchTombstone {
     }
 
     /// Creates a new tombstone with the given reason.
-    fn new(asset_id: String, namespace: String, asset_key: String, reason: TombstoneReason) -> Self {
+    fn new(
+        asset_id: String,
+        namespace: String,
+        asset_key: String,
+        reason: TombstoneReason,
+    ) -> Self {
         let now = Utc::now();
         let expires_at = now + Duration::days(DEFAULT_EXPIRY_DAYS);
 
@@ -229,8 +234,9 @@ impl SearchTombstone {
     #[must_use]
     pub fn new_key(&self) -> Option<&str> {
         match &self.reason {
-            TombstoneReason::Moved { new_key, .. }
-            | TombstoneReason::Renamed { new_key } => Some(new_key),
+            TombstoneReason::Moved { new_key, .. } | TombstoneReason::Renamed { new_key } => {
+                Some(new_key)
+            }
             _ => None,
         }
     }
@@ -410,8 +416,8 @@ mod tests {
 
     #[test]
     fn test_tombstone_serialization() {
-        let tombstone = SearchTombstone::renamed("asset-1", "ns", "old", "new")
-            .with_correlation_id("corr-123");
+        let tombstone =
+            SearchTombstone::renamed("asset-1", "ns", "old", "new").with_correlation_id("corr-123");
 
         let json = serde_json::to_string(&tombstone).expect("serialize");
         let parsed: SearchTombstone = serde_json::from_str(&json).expect("deserialize");

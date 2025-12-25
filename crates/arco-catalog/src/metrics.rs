@@ -4,9 +4,7 @@
 //! These metrics complement the structured logging approach already in place.
 
 use arco_core::CatalogDomain;
-use metrics::{
-    counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
-};
+use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 
 // ============================================================================
 // GC Metrics

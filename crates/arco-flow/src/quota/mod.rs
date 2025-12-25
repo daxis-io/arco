@@ -98,10 +98,7 @@ impl std::fmt::Display for QuotaDenialReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MaxConcurrentTasks { current, limit } => {
-                write!(
-                    f,
-                    "max concurrent tasks reached: {current}/{limit}"
-                )
+                write!(f, "max concurrent tasks reached: {current}/{limit}")
             }
             Self::UnknownTenant => write!(f, "unknown tenant"),
             Self::GlobalCapacityExhausted => write!(f, "global capacity exhausted"),
@@ -194,10 +191,12 @@ mod tests {
     #[test]
     fn quota_decision_is_allowed() {
         assert!(QuotaDecision::Allowed.is_allowed());
-        assert!(!QuotaDecision::Denied {
-            reason: QuotaDenialReason::UnknownTenant
-        }
-        .is_allowed());
+        assert!(
+            !QuotaDecision::Denied {
+                reason: QuotaDenialReason::UnknownTenant
+            }
+            .is_allowed()
+        );
     }
 
     #[test]

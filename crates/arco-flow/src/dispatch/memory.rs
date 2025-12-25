@@ -155,7 +155,11 @@ impl InMemoryTaskQueue {
 
 #[async_trait]
 impl TaskQueue for InMemoryTaskQueue {
-    async fn enqueue(&self, envelope: TaskEnvelope, options: EnqueueOptions) -> Result<EnqueueResult> {
+    async fn enqueue(
+        &self,
+        envelope: TaskEnvelope,
+        options: EnqueueOptions,
+    ) -> Result<EnqueueResult> {
         let idempotency_key = envelope.idempotency_key();
 
         let mut state = self.state.write().map_err(poison_err)?;
@@ -210,10 +214,7 @@ mod tests {
             TaskId::generate(),
             RunId::generate(),
             AssetId::generate(),
-            TaskKey::new(
-                AssetKey::new("raw", "events"),
-                TaskOperation::Materialize,
-            ),
+            TaskKey::new(AssetKey::new("raw", "events"), TaskOperation::Materialize),
             "test-tenant",
             "test-workspace",
             1,

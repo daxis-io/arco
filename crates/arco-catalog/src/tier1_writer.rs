@@ -28,8 +28,8 @@ use crate::error::{CatalogError, Result};
 use crate::lock::LockGuard;
 use crate::lock::{DEFAULT_LOCK_TTL, DEFAULT_MAX_RETRIES, DistributedLock};
 use crate::manifest::{
-    compute_manifest_hash, CatalogDomainManifest, CatalogManifest, CommitRecord, ExecutionsManifest,
-    LineageManifest, RootManifest, SearchManifest,
+    CatalogDomainManifest, CatalogManifest, CommitRecord, ExecutionsManifest, LineageManifest,
+    RootManifest, SearchManifest, compute_manifest_hash,
 };
 
 /// Maximum CAS retries for manifest writes.
@@ -471,9 +471,11 @@ fn next_commit_ulid(previous: Option<&str>) -> Result<String> {
         return Ok(candidate.to_string());
     }
 
-    let next = previous.increment().ok_or_else(|| CatalogError::InvariantViolation {
-        message: "commit_ulid overflow while generating monotonic successor".to_string(),
-    })?;
+    let next = previous
+        .increment()
+        .ok_or_else(|| CatalogError::InvariantViolation {
+            message: "commit_ulid overflow while generating monotonic successor".to_string(),
+        })?;
     Ok(next.to_string())
 }
 

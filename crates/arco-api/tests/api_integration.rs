@@ -156,15 +156,11 @@ mod helpers {
         Ok((status, json))
     }
 
-    pub async fn get_text(
-        router: axum::Router,
-        uri: &str,
-    ) -> Result<(StatusCode, String)> {
+    pub async fn get_text(router: axum::Router, uri: &str) -> Result<(StatusCode, String)> {
         let request = make_request(Method::GET, uri, None)?;
         let response = send(router, request).await?;
         let (status, body) = response_body(response).await?;
-        let text = String::from_utf8(body.to_vec())
-            .context("parse text response")?;
+        let text = String::from_utf8(body.to_vec()).context("parse text response")?;
         Ok((status, text))
     }
 
@@ -685,14 +681,13 @@ mod manifests {
         assert_eq!(deploy.asset_count, 1);
         assert!(!deploy.fingerprint.is_empty());
 
-        let (status, deploy_repeat): (_, DeployManifestResponse) =
-            helpers::post_json_with_headers(
-                router.clone(),
-                "/api/v1/workspaces/test-workspace/manifests",
-                request,
-                &[("Idempotency-Key", "idem-001")],
-            )
-            .await?;
+        let (status, deploy_repeat): (_, DeployManifestResponse) = helpers::post_json_with_headers(
+            router.clone(),
+            "/api/v1/workspaces/test-workspace/manifests",
+            request,
+            &[("Idempotency-Key", "idem-001")],
+        )
+        .await?;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(deploy_repeat.manifest_id, deploy.manifest_id);
@@ -712,10 +707,11 @@ mod manifests {
         )
         .await?;
         assert_eq!(status, StatusCode::OK);
-        assert!(list
-            .manifests
-            .iter()
-            .any(|item| item.manifest_id == deploy.manifest_id));
+        assert!(
+            list.manifests
+                .iter()
+                .any(|item| item.manifest_id == deploy.manifest_id)
+        );
 
         let (status, _): (_, serde_json::Value) = helpers::get_json(
             router,
@@ -743,8 +739,11 @@ mod orchestration {
     use arco_core::storage::{MemoryBackend, StorageBackend};
     use arco_flow::orchestration::LedgerWriter;
     use arco_flow::orchestration::compactor::MicroCompactor;
+    use arco_flow::orchestration::controllers::{
+        PollSensorResult, PubSubMessage, SensorEvaluationError, SensorEvaluator,
+    };
     use arco_flow::orchestration::controllers::ReadyDispatchController;
-    use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
+    use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData, RunRequest};
 
     #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -802,6 +801,35 @@ mod orchestration {
         partition_selection: Option<Vec<String>>,
     }
 
+    #[derive(Debug)]
+    struct ManualSensorEvaluator;
+
+    impl SensorEvaluator for ManualSensorEvaluator {
+        fn evaluate_push(
+            &self,
+            _sensor_id: &str,
+            _message: &PubSubMessage,
+        ) -> Result<Vec<RunRequest>, SensorEvaluationError> {
+            Ok(vec![RunRequest {
+                run_key: "sensor:manual:run_01".to_string(),
+                request_fingerprint: "fp_manual".to_string(),
+                asset_selection: vec!["analytics.summary".to_string()],
+                partition_selection: None,
+            }])
+        }
+
+        fn evaluate_poll(
+            &self,
+            _sensor_id: &str,
+            _cursor_before: Option<&str>,
+        ) -> Result<PollSensorResult, SensorEvaluationError> {
+            Ok(PollSensorResult {
+                cursor_after: None,
+                run_requests: Vec::new(),
+            })
+        }
+    }
+
     #[tokio::test]
     async fn test_servo_deploy_run_callbacks_and_logs() -> Result<()> {
         let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
@@ -848,15 +876,8 @@ mod orchestration {
         .await?;
         assert_eq!(status, StatusCode::CREATED);
 
-        let run_path = format!(
-            "/api/v1/workspaces/test-workspace/runs/{}",
-            trigger.run_id
-        );
-        let (status, run): (_, RunResponse) = helpers::get_json(
-            router.clone(),
-            &run_path,
-        )
-        .await?;
+        let run_path = format!("/api/v1/workspaces/test-workspace/runs/{}", trigger.run_id);
+        let (status, run): (_, RunResponse) = helpers::get_json(router.clone(), &run_path).await?;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(run.run_id, trigger.run_id);
         let task = run.tasks.first().context("expected run task")?;
@@ -888,10 +909,7 @@ mod orchestration {
             })
             .context("expected DispatchRequested event for task")?;
 
-        let event_paths: Vec<_> = ready_events
-            .iter()
-            .map(LedgerWriter::event_path)
-            .collect();
+        let event_paths: Vec<_> = ready_events.iter().map(LedgerWriter::event_path).collect();
         ledger.append_all(ready_events).await?;
         compactor.compact_events(event_paths).await?;
 
@@ -947,11 +965,8 @@ mod orchestration {
         assert_eq!(status, StatusCode::OK);
         assert!(completed.acknowledged);
 
-        let (status, finished): (_, RunResponse) = helpers::get_json(
-            router.clone(),
-            &run_path,
-        )
-        .await?;
+        let (status, finished): (_, RunResponse) =
+            helpers::get_json(router.clone(), &run_path).await?;
         assert_eq!(status, StatusCode::OK);
         let finished_task = finished
             .tasks
@@ -983,6 +998,7 @@ mod orchestration {
         let router = ServerBuilder::new()
             .debug(true)
             .storage_backend(backend.clone())
+            .sensor_evaluator(Arc::new(ManualSensorEvaluator))
             .build()
             .test_router();
 
@@ -996,21 +1012,23 @@ mod orchestration {
             }
         });
 
-        let (status, response): (_, ManualSensorEvaluateResponse) = helpers::post_json_with_headers(
-            router,
-            "/api/v1/workspaces/test-workspace/sensors/01HQTESTSENSOR/evaluate",
-            request,
-            &[("Idempotency-Key", "manual-eval-001")],
-        )
-        .await?;
+        let (status, response): (_, ManualSensorEvaluateResponse) =
+            helpers::post_json_with_headers(
+                router,
+                "/api/v1/workspaces/test-workspace/sensors/01HQTESTSENSOR/evaluate",
+                request,
+                &[("Idempotency-Key", "manual-eval-001")],
+            )
+            .await?;
 
         assert_eq!(status, StatusCode::OK);
         assert!(!response.eval_id.is_empty());
         assert_eq!(response.message_id, "manual-eval-001");
-        assert_eq!(response.status, "no_new_data");
+        assert_eq!(response.status, "triggered");
         assert!(response.message.is_none());
-        assert!(response.run_requests.is_empty());
-        assert_eq!(response.events_written, 1);
+        assert_eq!(response.run_requests.len(), 1);
+        assert_eq!(response.run_requests[0].run_key, "sensor:manual:run_01");
+        assert_eq!(response.events_written, 2);
 
         Ok(())
     }

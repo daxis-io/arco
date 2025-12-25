@@ -26,7 +26,10 @@ pub struct ConfigResponse {
     /// Lifetime of idempotency keys in ISO 8601 duration format.
     ///
     /// Example: "PT1H" for 1 hour.
-    #[serde(rename = "idempotency-key-lifetime", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "idempotency-key-lifetime",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub idempotency_key_lifetime: Option<String>,
 
     /// List of supported endpoints.
@@ -58,9 +61,7 @@ impl ConfigResponse {
         }
 
         if config.allow_write && COMMIT_ENDPOINT_SUPPORTED {
-            endpoints.push(
-                "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string(),
-            );
+            endpoints.push("POST /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string());
         }
 
         if config.allow_write && WRITE_ENDPOINTS_SUPPORTED {
@@ -132,7 +133,10 @@ mod tests {
 
         assert!(endpoints.contains(&"GET /v1/config".to_string()));
         assert!(endpoints.contains(&"GET /v1/{prefix}/namespaces".to_string()));
-        assert!(endpoints.contains(&"GET /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string()));
+        assert!(
+            endpoints
+                .contains(&"GET /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string())
+        );
 
         // Should NOT have write endpoints in default (Phase A)
         assert!(!endpoints.contains(&"POST /v1/{prefix}/namespaces".to_string()));
@@ -146,9 +150,13 @@ mod tests {
         let endpoints = config.endpoints.expect("endpoints should be present");
 
         // Only commit_table is advertised; other write endpoints stay hidden.
-        assert!(endpoints
-            .contains(&"POST /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string()));
+        assert!(
+            endpoints
+                .contains(&"POST /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string())
+        );
         assert!(!endpoints.contains(&"POST /v1/{prefix}/namespaces".to_string()));
-        assert!(!endpoints.contains(&"POST /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string()));
+        assert!(
+            !endpoints.contains(&"POST /v1/{prefix}/namespaces/{namespace}/tables".to_string())
+        );
     }
 }

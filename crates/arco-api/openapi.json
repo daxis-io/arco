@@ -1927,6 +1927,82 @@
           }
         ]
       }
+    },
+    "/api/v1/workspaces/{workspace_id}/sensors/{sensor_id}/evaluate": {
+      "post": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "Manually evaluate a sensor with an arbitrary payload.",
+        "operationId": "manual_evaluate_sensor",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sensor_id",
+            "in": "path",
+            "description": "Sensor ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ManualSensorEvaluateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Sensor evaluated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManualSensorEvaluateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workspace not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -2713,6 +2789,82 @@
           }
         }
       },
+      "ManualSensorEvaluateRequest": {
+        "type": "object",
+        "description": "Request to manually evaluate a sensor.",
+        "required": [
+          "payload"
+        ],
+        "properties": {
+          "attributes": {
+            "type": "object",
+            "description": "Message attributes to pass to the evaluator.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "messageId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional message identifier for idempotency."
+          },
+          "payload": {
+            "description": "Raw payload to pass to the sensor evaluator."
+          }
+        }
+      },
+      "ManualSensorEvaluateResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SensorEvalStatusResponse",
+            "description": "Evaluation status."
+          },
+          {
+            "type": "object",
+            "required": [
+              "evalId",
+              "messageId",
+              "eventsWritten"
+            ],
+            "properties": {
+              "evalId": {
+                "type": "string",
+                "description": "Evaluation identifier."
+              },
+              "eventsWritten": {
+                "type": "integer",
+                "format": "int32",
+                "description": "Number of events written to the ledger.",
+                "minimum": 0
+              },
+              "messageId": {
+                "type": "string",
+                "description": "Message identifier used for idempotency."
+              },
+              "runRequests": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/RunRequestResponse"
+                },
+                "description": "Run requests produced by the evaluation."
+              },
+              "warning": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Warning if manual evaluate bypassed sensor status (paused/error).\nManual evaluate always runs regardless of sensor operational state."
+              }
+            }
+          }
+        ],
+        "description": "Response after manually evaluating a sensor."
+      },
       "MintUrlsRequest": {
         "type": "object",
         "description": "Request to mint signed URLs.",
@@ -3032,6 +3184,42 @@
           }
         }
       },
+      "RunRequestResponse": {
+        "type": "object",
+        "description": "Run request returned from sensor evaluation.",
+        "required": [
+          "runKey",
+          "requestFingerprint",
+          "assetSelection"
+        ],
+        "properties": {
+          "assetSelection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Assets to materialize."
+          },
+          "partitionSelection": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional partition selection."
+          },
+          "requestFingerprint": {
+            "type": "string",
+            "description": "Fingerprint of the request payload for conflict detection."
+          },
+          "runKey": {
+            "type": "string",
+            "description": "Stable run key for idempotency."
+          }
+        }
+      },
       "RunResponse": {
         "type": "object",
         "description": "Full run details response.",
@@ -3147,6 +3335,76 @@
             "description": "Timezone."
           }
         }
+      },
+      "SensorEvalStatusResponse": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Sensor triggered one or more runs.",
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "triggered"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Sensor evaluated but no new data found.",
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "no_new_data"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Sensor evaluation failed.",
+            "required": [
+              "message",
+              "status"
+            ],
+            "properties": {
+              "message": {
+                "type": "string",
+                "description": "Error message describing the failure."
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "error"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Sensor evaluation was skipped due to stale cursor (CAS failed).",
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "skipped_stale_cursor"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Sensor evaluation status (API response)."
       },
       "SignedUrl": {
         "type": "object",

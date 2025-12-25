@@ -83,14 +83,20 @@ impl std::fmt::Display for NotificationParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidPrefix { path } => {
-                write!(f, "invalid notification path '{path}': expected prefix 'ledger/'")
+                write!(
+                    f,
+                    "invalid notification path '{path}': expected prefix 'ledger/'"
+                )
             }
             Self::InvalidPathFormat { path } => write!(
                 f,
                 "invalid notification path '{path}': expected format 'ledger/{{domain}}/{{event_id}}.json'"
             ),
             Self::InvalidExtension { path } => {
-                write!(f, "invalid notification path '{path}': expected '.json' event file")
+                write!(
+                    f,
+                    "invalid notification path '{path}': expected '.json' event file"
+                )
             }
         }
     }
@@ -156,7 +162,7 @@ impl EventNotification {
         let domain = (*parts
             .get(1)
             .ok_or_else(|| NotificationParseError::InvalidPathFormat { path: path.clone() })?)
-            .to_string();
+        .to_string();
         if domain.is_empty() {
             return Err(NotificationParseError::InvalidPathFormat { path });
         }
@@ -165,11 +171,9 @@ impl EventNotification {
             .ok_or_else(|| NotificationParseError::InvalidPathFormat { path: path.clone() })?;
 
         // Extract event ID (strip .json extension)
-        let event_id = filename.strip_suffix(".json").ok_or_else(|| {
-            NotificationParseError::InvalidExtension {
-                path: path.clone(),
-            }
-        })?;
+        let event_id = filename
+            .strip_suffix(".json")
+            .ok_or_else(|| NotificationParseError::InvalidExtension { path: path.clone() })?;
         if event_id.is_empty() {
             return Err(NotificationParseError::InvalidPathFormat { path });
         }
@@ -423,7 +427,11 @@ impl<S: Send + Sync> NotificationConsumer<S> {
     /// Events are processed domain by domain. Each domain's events are
     /// processed together to minimize manifest updates.
     pub async fn flush(&mut self) -> Result<BatchProcessingResult, NotificationConsumerError> {
-        let domains: Vec<String> = self.current_batch.domains().map(ToString::to_string).collect();
+        let domains: Vec<String> = self
+            .current_batch
+            .domains()
+            .map(ToString::to_string)
+            .collect();
 
         let mut total_events = 0;
         let mut domain_results = HashMap::new();
@@ -513,7 +521,10 @@ impl std::fmt::Display for NotificationConsumerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotImplemented { domain, message } => {
-                write!(f, "notification consumer not implemented for {domain}: {message}")
+                write!(
+                    f,
+                    "notification consumer not implemented for {domain}: {message}"
+                )
             }
             Self::EventReadError { path, message } => {
                 write!(f, "failed to read event '{path}': {message}")

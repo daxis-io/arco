@@ -36,11 +36,11 @@ use chrono::{DateTime, Duration, Utc};
 use metrics::{counter, histogram};
 use ulid::Ulid;
 
-use crate::metrics::{labels as metrics_labels, names as metrics_names, TimingGuard};
+use crate::metrics::{TimingGuard, labels as metrics_labels, names as metrics_names};
+use crate::orchestration::compactor::fold::SensorStateRow;
 use crate::orchestration::controllers::sensor_evaluator::{
     NoopSensorEvaluator, PollSensorResult, PubSubMessage, SensorEvaluator,
 };
-use crate::orchestration::compactor::fold::SensorStateRow;
 use crate::orchestration::events::{
     OrchestrationEvent, OrchestrationEventData, SensorEvalStatus, SensorStatus, SourceRef,
     TriggerSource,
@@ -64,7 +64,7 @@ impl PushSensorHandler {
     /// Creates a new push sensor handler.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_evaluator(Arc::new(NoopSensorEvaluator::default()))
+        Self::with_evaluator(Arc::new(NoopSensorEvaluator))
     }
 
     /// Creates a new push sensor handler with a custom evaluator.
@@ -122,9 +122,10 @@ impl PushSensorHandler {
         };
 
         let mut events = Vec::new();
+        let emitted_at = Utc::now();
 
         // Emit SensorEvaluated event
-        events.push(OrchestrationEvent::new(
+        events.push(OrchestrationEvent::new_with_timestamp(
             tenant_id,
             workspace_id,
             OrchestrationEventData::SensorEvaluated {
@@ -139,11 +140,12 @@ impl PushSensorHandler {
                 run_requests: run_requests.clone(),
                 status: status.clone(),
             },
+            emitted_at,
         ));
 
         // Emit RunRequested for each run request (atomic with SensorEvaluated per P0-1)
         for req in &run_requests {
-            events.push(OrchestrationEvent::new(
+            events.push(OrchestrationEvent::new_with_timestamp(
                 tenant_id,
                 workspace_id,
                 OrchestrationEventData::RunRequested {
@@ -157,6 +159,7 @@ impl PushSensorHandler {
                     },
                     labels: HashMap::new(),
                 },
+                emitted_at,
             ));
         }
 
@@ -181,7 +184,13 @@ impl PushSensorHandler {
             publish_time: Utc::now(),
         };
 
-        self.handle_message(sensor_id, tenant_id, workspace_id, SensorStatus::Active, &message)
+        self.handle_message(
+            sensor_id,
+            tenant_id,
+            workspace_id,
+            SensorStatus::Active,
+            &message,
+        )
     }
 
     fn record_metrics(status: &SensorEvalStatus, run_request_count: usize) {
@@ -230,19 +239,13 @@ impl PollSensorController {
     /// Creates a new poll sensor controller with default settings.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_min_interval_and_evaluator(
-            Duration::seconds(30),
-            Arc::new(NoopSensorEvaluator::default()),
-        )
+        Self::with_min_interval_and_evaluator(Duration::seconds(30), Arc::new(NoopSensorEvaluator))
     }
 
     /// Creates a poll sensor controller with custom settings.
     #[must_use]
     pub fn with_min_interval(min_poll_interval: Duration) -> Self {
-        Self::with_min_interval_and_evaluator(
-            min_poll_interval,
-            Arc::new(NoopSensorEvaluator::default()),
-        )
+        Self::with_min_interval_and_evaluator(min_poll_interval, Arc::new(NoopSensorEvaluator))
     }
 
     /// Creates a poll sensor controller with a custom evaluator.
@@ -339,9 +342,10 @@ impl PollSensorController {
         };
 
         let mut events = Vec::new();
+        let emitted_at = Utc::now();
 
         // Emit SensorEvaluated event with CAS fields (P0-2)
-        events.push(OrchestrationEvent::new(
+        events.push(OrchestrationEvent::new_with_timestamp(
             tenant_id,
             workspace_id,
             OrchestrationEventData::SensorEvaluated {
@@ -354,11 +358,12 @@ impl PollSensorController {
                 run_requests: run_requests.clone(),
                 status: status.clone(),
             },
+            emitted_at,
         ));
 
         // Emit RunRequested for each run request (atomic with SensorEvaluated per P0-1)
         for req in &run_requests {
-            events.push(OrchestrationEvent::new(
+            events.push(OrchestrationEvent::new_with_timestamp(
                 tenant_id,
                 workspace_id,
                 OrchestrationEventData::RunRequested {
@@ -372,6 +377,7 @@ impl PollSensorController {
                     },
                     labels: HashMap::new(),
                 },
+                emitted_at,
             ));
         }
 
@@ -466,8 +472,13 @@ mod tests {
         let handler = PushSensorHandler::new();
         let message = test_message("msg_001");
 
-        let events =
-            handler.handle_message("01HQ123SENSORXYZ", "tenant-abc", "workspace-prod", SensorStatus::Active, &message);
+        let events = handler.handle_message(
+            "01HQ123SENSORXYZ",
+            "tenant-abc",
+            "workspace-prod",
+            SensorStatus::Active,
+            &message,
+        );
 
         let eval_event = events
             .iter()
@@ -481,7 +492,10 @@ mod tests {
         } = &eval_event.data
         {
             // Push sensors don't track cursor (message is the cursor)
-            assert!(cursor_before.is_none(), "cursor_before should be None for push sensor");
+            assert!(
+                cursor_before.is_none(),
+                "cursor_before should be None for push sensor"
+            );
             // Push sensors don't use CAS
             assert!(
                 expected_state_version.is_none(),
@@ -496,8 +510,13 @@ mod tests {
         let handler = PushSensorHandler::new();
         let message = test_message("msg_abc");
 
-        let events =
-            handler.handle_message("01HQ123SENSORXYZ", "tenant-abc", "workspace-prod", SensorStatus::Active, &message);
+        let events = handler.handle_message(
+            "01HQ123SENSORXYZ",
+            "tenant-abc",
+            "workspace-prod",
+            SensorStatus::Active,
+            &message,
+        );
 
         // Controller must emit SensorEvaluated
         let has_eval = events
@@ -521,7 +540,10 @@ mod tests {
             SensorStatus::Paused,
             &message,
         );
-        assert!(paused_events.is_empty(), "Paused sensor should not emit events");
+        assert!(
+            paused_events.is_empty(),
+            "Paused sensor should not emit events"
+        );
 
         let error_events = handler.handle_message(
             "01HQ123SENSORXYZ",
@@ -530,7 +552,10 @@ mod tests {
             SensorStatus::Error,
             &message,
         );
-        assert!(error_events.is_empty(), "Error sensor should not emit events");
+        assert!(
+            error_events.is_empty(),
+            "Error sensor should not emit events"
+        );
     }
 
     // ========================================================================
@@ -723,7 +748,9 @@ mod tests {
             .expect("Should have SensorEvaluated event");
 
         if let OrchestrationEventData::SensorEvaluated {
-            cursor_after, status, ..
+            cursor_after,
+            status,
+            ..
         } = &eval_event.data
         {
             assert_eq!(
@@ -782,7 +809,12 @@ mod tests {
                 "expected_state_version should be set for CAS"
             );
             assert!(
-                matches!(trigger_source, TriggerSource::Poll { poll_epoch: 1736935200 }),
+                matches!(
+                    trigger_source,
+                    TriggerSource::Poll {
+                        poll_epoch: 1736935200
+                    }
+                ),
                 "trigger_source should be Poll with correct epoch"
             );
         }

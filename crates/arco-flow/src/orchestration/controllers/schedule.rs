@@ -30,10 +30,10 @@ use cron::Schedule;
 use metrics::{counter, histogram};
 use tracing::warn;
 
-use crate::metrics::{labels as metrics_labels, names as metrics_names, TimingGuard};
+use crate::metrics::{TimingGuard, labels as metrics_labels, names as metrics_names};
 use crate::orchestration::compactor::fold::{ScheduleDefinitionRow, ScheduleStateRow};
 use crate::orchestration::events::{
-    sha256_hex, OrchestrationEvent, OrchestrationEventData, SourceRef, TickStatus,
+    OrchestrationEvent, OrchestrationEventData, SourceRef, TickStatus, sha256_hex,
 };
 
 /// Schedule controller for reconciling schedule definitions to tick events.
@@ -141,7 +141,8 @@ impl ScheduleController {
                 timezone = %def.timezone,
                 "invalid timezone"
             );
-            let error_tick = Self::error_tick(def, &format!("invalid timezone: {}", def.timezone), now);
+            let error_tick =
+                Self::error_tick(def, &format!("invalid timezone: {}", def.timezone), now);
             Self::push_tick_event(&mut events, &mut actions_total, error_tick);
             return (events, actions_total);
         };
@@ -166,10 +167,11 @@ impl ScheduleController {
         );
 
         for scheduled_for in ticks {
+            let emitted_at = Utc::now();
             let tick_event = if def.enabled {
-                Self::create_tick_event(def, scheduled_for)
+                Self::create_tick_event(def, scheduled_for, emitted_at)
             } else {
-                Self::create_paused_tick_event(def, scheduled_for)
+                Self::create_paused_tick_event(def, scheduled_for, emitted_at)
             };
             let run_req = Self::build_run_request(def, &tick_event);
             Self::push_tick_event(&mut events, &mut actions_total, tick_event);
@@ -205,8 +207,8 @@ impl ScheduleController {
         catchup_window: Duration,
         tz: Tz,
     ) -> Vec<DateTime<Utc>> {
-        let mut start = last_scheduled_for
-            .map_or(now - catchup_window, |t| t + Duration::seconds(1));
+        let mut start =
+            last_scheduled_for.map_or(now - catchup_window, |t| t + Duration::seconds(1));
         let min_start = now - catchup_window;
         if start < min_start {
             start = min_start;
@@ -224,12 +226,16 @@ impl ScheduleController {
     }
 
     /// Creates a triggered tick event.
-    fn create_tick_event(def: &ScheduleDefinitionRow, scheduled_for: DateTime<Utc>) -> OrchestrationEvent {
+    fn create_tick_event(
+        def: &ScheduleDefinitionRow,
+        scheduled_for: DateTime<Utc>,
+        emitted_at: DateTime<Utc>,
+    ) -> OrchestrationEvent {
         let tick_id = format!("{}:{}", def.schedule_id, scheduled_for.timestamp());
         let run_key = format!("sched:{}:{}", def.schedule_id, scheduled_for.timestamp());
         let fingerprint = compute_request_fingerprint(&def.asset_selection, None);
 
-        OrchestrationEvent::new(
+        OrchestrationEvent::new_with_timestamp(
             &def.tenant_id,
             &def.workspace_id,
             OrchestrationEventData::ScheduleTicked {
@@ -243,6 +249,7 @@ impl ScheduleController {
                 run_key: Some(run_key),
                 request_fingerprint: Some(fingerprint),
             },
+            emitted_at,
         )
     }
 
@@ -250,10 +257,11 @@ impl ScheduleController {
     fn create_paused_tick_event(
         def: &ScheduleDefinitionRow,
         scheduled_for: DateTime<Utc>,
+        emitted_at: DateTime<Utc>,
     ) -> OrchestrationEvent {
         let tick_id = format!("{}:{}", def.schedule_id, scheduled_for.timestamp());
 
-        OrchestrationEvent::new(
+        OrchestrationEvent::new_with_timestamp(
             &def.tenant_id,
             &def.workspace_id,
             OrchestrationEventData::ScheduleTicked {
@@ -269,6 +277,7 @@ impl ScheduleController {
                 run_key: None,
                 request_fingerprint: None,
             },
+            emitted_at,
         )
     }
 
@@ -304,13 +313,14 @@ impl ScheduleController {
             partition_selection,
             status: TickStatus::Triggered,
             ..
-        } = &tick_event.data else {
+        } = &tick_event.data
+        else {
             return None;
         };
 
         let run_key = run_key.as_ref()?;
 
-        Some(OrchestrationEvent::new(
+        Some(OrchestrationEvent::new_with_timestamp(
             &def.tenant_id,
             &def.workspace_id,
             OrchestrationEventData::RunRequested {
@@ -324,6 +334,7 @@ impl ScheduleController {
                 },
                 labels: HashMap::new(),
             },
+            tick_event.timestamp,
         ))
     }
 
@@ -355,10 +366,14 @@ impl ScheduleController {
     }
 
     /// Creates an error tick event for invalid schedule configuration.
-    fn error_tick(def: &ScheduleDefinitionRow, error: &str, now: DateTime<Utc>) -> OrchestrationEvent {
+    fn error_tick(
+        def: &ScheduleDefinitionRow,
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> OrchestrationEvent {
         let tick_id = format!("{}:error:{}", def.schedule_id, now.timestamp());
 
-        OrchestrationEvent::new(
+        OrchestrationEvent::new_with_timestamp(
             &def.tenant_id,
             &def.workspace_id,
             OrchestrationEventData::ScheduleTicked {
@@ -374,6 +389,7 @@ impl ScheduleController {
                 run_key: None,
                 request_fingerprint: None,
             },
+            now,
         )
     }
 
@@ -381,12 +397,16 @@ impl ScheduleController {
     ///
     /// Creates a triggered tick with a special `manual:` prefix in the `tick_id`.
     #[must_use]
-    pub fn manual_trigger(def: &ScheduleDefinitionRow, now: DateTime<Utc>) -> Vec<OrchestrationEvent> {
+    pub fn manual_trigger(
+        def: &ScheduleDefinitionRow,
+        now: DateTime<Utc>,
+    ) -> Vec<OrchestrationEvent> {
         let tick_id = format!("{}:manual:{}", def.schedule_id, now.timestamp());
         let run_key = format!("sched:{}:manual:{}", def.schedule_id, now.timestamp());
         let fingerprint = compute_request_fingerprint(&def.asset_selection, None);
+        let emitted_at = Utc::now();
 
-        let tick_event = OrchestrationEvent::new(
+        let tick_event = OrchestrationEvent::new_with_timestamp(
             &def.tenant_id,
             &def.workspace_id,
             OrchestrationEventData::ScheduleTicked {
@@ -400,9 +420,10 @@ impl ScheduleController {
                 run_key: Some(run_key.clone()),
                 request_fingerprint: Some(fingerprint.clone()),
             },
+            emitted_at,
         );
 
-        let run_req = OrchestrationEvent::new(
+        let run_req = OrchestrationEvent::new_with_timestamp(
             &def.tenant_id,
             &def.workspace_id,
             OrchestrationEventData::RunRequested {
@@ -416,6 +437,7 @@ impl ScheduleController {
                 },
                 labels: HashMap::new(),
             },
+            emitted_at,
         );
 
         vec![tick_event, run_req]
@@ -526,7 +548,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(&e.data, OrchestrationEventData::ScheduleTicked { .. }))
             .count();
-        assert_eq!(tick_count, 3, "Should only emit max_catchup_ticks (3) ticks");
+        assert_eq!(
+            tick_count, 3,
+            "Should only emit max_catchup_ticks (3) ticks"
+        );
     }
 
     #[test]
@@ -582,7 +607,10 @@ mod tests {
             .find(|e| matches!(&e.data, OrchestrationEventData::RunRequested { .. }));
 
         if let Some(e) = run_req {
-            if let OrchestrationEventData::RunRequested { asset_selection, .. } = &e.data {
+            if let OrchestrationEventData::RunRequested {
+                asset_selection, ..
+            } = &e.data
+            {
                 assert_eq!(asset_selection, &vec!["asset_b".to_string()]);
             }
         }
@@ -595,7 +623,11 @@ mod tests {
 
         let events = ScheduleController::manual_trigger(&def, now);
 
-        assert_eq!(events.len(), 2, "Manual trigger should emit tick + run request");
+        assert_eq!(
+            events.len(),
+            2,
+            "Manual trigger should emit tick + run request"
+        );
 
         let has_tick = events.iter().any(|e| {
             matches!(
@@ -627,8 +659,14 @@ mod tests {
         assert_eq!(events.len(), 1, "Should emit one error tick");
 
         let event = &events[0];
-        if let OrchestrationEventData::ScheduleTicked { status, run_key, .. } = &event.data {
-            assert!(matches!(status, TickStatus::Failed { .. }), "Should be failed status");
+        if let OrchestrationEventData::ScheduleTicked {
+            status, run_key, ..
+        } = &event.data
+        {
+            assert!(
+                matches!(status, TickStatus::Failed { .. }),
+                "Should be failed status"
+            );
             assert!(run_key.is_none(), "Failed tick should have no run_key");
         } else {
             panic!("Expected ScheduleTicked event");
@@ -668,7 +706,10 @@ mod tests {
             })
             .collect();
 
-        assert!(!scheduled_fors.is_empty(), "Expected due ticks within catchup window");
+        assert!(
+            !scheduled_fors.is_empty(),
+            "Expected due ticks within catchup window"
+        );
 
         let min_tick = scheduled_fors
             .iter()
@@ -752,7 +793,10 @@ mod tests {
             Utc.with_ymd_and_hms(2025, 11, 2, 6, 0, 0).unwrap(), // 01:00 EST
             Utc.with_ymd_and_hms(2025, 11, 2, 7, 0, 0).unwrap(), // 02:00 EST
         ];
-        assert_eq!(scheduled_fors, expected, "DST fall-back should yield repeated hour ticks");
+        assert_eq!(
+            scheduled_fors, expected,
+            "DST fall-back should yield repeated hour ticks"
+        );
     }
 
     #[test]
@@ -793,6 +837,9 @@ mod tests {
         assert_eq!(fp1, fp2, "Fingerprint should be deterministic");
 
         let fp3 = compute_request_fingerprint(&assets, Some(&["p1".to_string()]));
-        assert_ne!(fp1, fp3, "Different partitions should produce different fingerprint");
+        assert_ne!(
+            fp1, fp3,
+            "Different partitions should produce different fingerprint"
+        );
     }
 }

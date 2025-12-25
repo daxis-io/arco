@@ -43,16 +43,11 @@ use arco_flow::orchestration::callbacks::{
 };
 use arco_flow::orchestration::compactor::{FoldState, MicroCompactor, TaskState as FoldTaskState};
 use arco_flow::orchestration::{
-    ErrorCategory as FlowErrorCategory,
-    HeartbeatRequest as FlowHeartbeatRequest,
-    HeartbeatResponse as FlowHeartbeatResponse,
-    TaskCompletedRequest as FlowTaskCompletedRequest,
-    TaskCompletedResponse as FlowTaskCompletedResponse,
-    TaskError as FlowTaskError,
-    TaskMetrics as FlowTaskMetrics,
-    TaskOutput as FlowTaskOutput,
-    TaskStartedRequest as FlowTaskStartedRequest,
-    TaskStartedResponse as FlowTaskStartedResponse,
+    ErrorCategory as FlowErrorCategory, HeartbeatRequest as FlowHeartbeatRequest,
+    HeartbeatResponse as FlowHeartbeatResponse, TaskCompletedRequest as FlowTaskCompletedRequest,
+    TaskCompletedResponse as FlowTaskCompletedResponse, TaskError as FlowTaskError,
+    TaskMetrics as FlowTaskMetrics, TaskOutput as FlowTaskOutput,
+    TaskStartedRequest as FlowTaskStartedRequest, TaskStartedResponse as FlowTaskStartedResponse,
     WorkerOutcome as FlowWorkerOutcome,
 };
 use ulid::Ulid;
@@ -309,7 +304,12 @@ struct JwtTaskTokenValidator {
 }
 
 impl JwtTaskTokenValidator {
-    fn new(config: &JwtConfig, tenant: &str, workspace: &str, debug: bool) -> Result<Self, ApiError> {
+    fn new(
+        config: &JwtConfig,
+        tenant: &str,
+        workspace: &str,
+        debug: bool,
+    ) -> Result<Self, ApiError> {
         if debug {
             return Ok(Self {
                 decoding_key: None,
@@ -468,10 +468,15 @@ fn jwt_decoding_key(config: &JwtConfig) -> Result<(DecodingKey, Algorithm), ApiE
         config.hs256_secret.as_deref(),
         config.rs256_public_key_pem.as_deref(),
     ) {
-        (Some(secret), None) => Ok((DecodingKey::from_secret(secret.as_bytes()), Algorithm::HS256)),
+        (Some(secret), None) => Ok((
+            DecodingKey::from_secret(secret.as_bytes()),
+            Algorithm::HS256,
+        )),
         (None, Some(pem)) => DecodingKey::from_rsa_pem(pem.as_bytes())
             .map(|key| (key, Algorithm::RS256))
-            .map_err(|e| ApiError::internal(format!("failed to parse jwt.rs256_public_key_pem: {e}"))),
+            .map_err(|e| {
+                ApiError::internal(format!("failed to parse jwt.rs256_public_key_pem: {e}"))
+            }),
         (Some(_), Some(_)) => Err(ApiError::internal(
             "jwt.hs256_secret and jwt.rs256_public_key_pem are mutually exclusive",
         )),
@@ -493,25 +498,31 @@ fn callback_error_response(error: CallbackError) -> CallbackErrorResponse {
     }
 }
 
-fn callback_result_response<T, U>(result: CallbackResult<T>) -> Result<axum::response::Response, ApiError>
+fn callback_result_response<T, U>(
+    result: CallbackResult<T>,
+) -> Result<axum::response::Response, ApiError>
 where
     T: Into<U>,
     U: Serialize,
 {
     let response = match result {
         CallbackResult::Ok(payload) => (StatusCode::OK, Json(payload.into())).into_response(),
-        CallbackResult::BadRequest(error) => {
-            (StatusCode::BAD_REQUEST, Json(callback_error_response(error))).into_response()
-        }
+        CallbackResult::BadRequest(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(callback_error_response(error)),
+        )
+            .into_response(),
         CallbackResult::Conflict(error) => {
             (StatusCode::CONFLICT, Json(callback_error_response(error))).into_response()
         }
         CallbackResult::Gone(error) => {
             (StatusCode::GONE, Json(callback_error_response(error))).into_response()
         }
-        CallbackResult::Unauthorized(error) => {
-            (StatusCode::UNAUTHORIZED, Json(callback_error_response(error))).into_response()
-        }
+        CallbackResult::Unauthorized(error) => (
+            StatusCode::UNAUTHORIZED,
+            Json(callback_error_response(error)),
+        )
+            .into_response(),
         CallbackResult::NotFound(error) => {
             (StatusCode::NOT_FOUND, Json(callback_error_response(error))).into_response()
         }
@@ -536,7 +547,11 @@ fn header_value_to_string(value: &HeaderValue) -> Option<String> {
 
 fn unauthorized_response(request_id: &str, message: &str) -> axum::response::Response {
     let error = CallbackError::invalid_token(message);
-    let mut response = (StatusCode::UNAUTHORIZED, Json(callback_error_response(error))).into_response();
+    let mut response = (
+        StatusCode::UNAUTHORIZED,
+        Json(callback_error_response(error)),
+    )
+        .into_response();
 
     if let Ok(value) = HeaderValue::from_str(request_id) {
         response
@@ -548,8 +563,7 @@ fn unauthorized_response(request_id: &str, message: &str) -> axum::response::Res
 }
 
 fn decode_task_claims(config: &JwtConfig, token: &str) -> Result<TaskTokenClaims, String> {
-    let (decoding_key, algorithm) =
-        jwt_decoding_key(config).map_err(|err| format!("{err:?}"))?;
+    let (decoding_key, algorithm) = jwt_decoding_key(config).map_err(|err| format!("{err:?}"))?;
     let mut validation = Validation::new(algorithm);
     validation.validate_nbf = true;
 
@@ -576,8 +590,7 @@ pub async fn task_auth_middleware(
     let (mut parts, body) = req.into_parts();
     let headers = &parts.headers;
 
-    let request_id =
-        request_id_from_headers(headers).unwrap_or_else(|| Ulid::new().to_string());
+    let request_id = request_id_from_headers(headers).unwrap_or_else(|| Ulid::new().to_string());
     let idempotency_key = header_string(headers, "Idempotency-Key");
 
     let Some(token) = extract_bearer_token(headers) else {
@@ -585,10 +598,8 @@ pub async fn task_auth_middleware(
     };
 
     let (tenant, workspace) = if state.config.debug {
-        let tenant = header_string(headers, "X-Tenant-Id")
-            .unwrap_or_default();
-        let workspace = header_string(headers, "X-Workspace-Id")
-            .unwrap_or_default();
+        let tenant = header_string(headers, "X-Tenant-Id").unwrap_or_default();
+        let workspace = header_string(headers, "X-Workspace-Id").unwrap_or_default();
         if tenant.is_empty() || workspace.is_empty() {
             return unauthorized_response(&request_id, "missing tenant/workspace headers");
         }
@@ -633,29 +644,25 @@ pub async fn task_auth_middleware(
 async fn build_callback_dependencies(
     ctx: &RequestContext,
     state: &AppState,
-) -> Result<(
-    CallbackContext<CompactingLedgerWriter, JwtTaskTokenValidator>,
-    ParquetTaskStateLookup,
-), ApiError> {
+) -> Result<
+    (
+        CallbackContext<CompactingLedgerWriter, JwtTaskTokenValidator>,
+        ParquetTaskStateLookup,
+    ),
+    ApiError,
+> {
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
     let lookup = ParquetTaskStateLookup::load(storage.clone()).await?;
-    let ledger = Arc::new(CompactingLedgerWriter::new(
-        storage,
-        state.config.clone(),
-    ));
+    let ledger = Arc::new(CompactingLedgerWriter::new(storage, state.config.clone()));
     let validator = Arc::new(JwtTaskTokenValidator::new(
         &state.config.jwt,
         &ctx.tenant,
         &ctx.workspace,
         state.config.debug,
     )?);
-    let callback_ctx = CallbackContext::new(
-        ledger,
-        validator,
-        ctx.tenant.clone(),
-        ctx.workspace.clone(),
-    );
+    let callback_ctx =
+        CallbackContext::new(ledger, validator, ctx.tenant.clone(), ctx.workspace.clone());
 
     Ok((callback_ctx, lookup))
 }
@@ -848,14 +855,8 @@ pub(crate) async fn task_started(
     };
 
     let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state).await?;
-    let result = handle_task_started(
-        &callback_ctx,
-        &task_id,
-        &token,
-        request.into(),
-        &lookup,
-    )
-    .await;
+    let result =
+        handle_task_started(&callback_ctx, &task_id, &token, request.into(), &lookup).await;
 
     callback_result_response::<FlowTaskStartedResponse, TaskStartedResponse>(result)
 }
@@ -906,14 +907,7 @@ pub(crate) async fn task_heartbeat(
     };
 
     let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state).await?;
-    let result = handle_heartbeat(
-        &callback_ctx,
-        &task_id,
-        &token,
-        request.into(),
-        &lookup,
-    )
-    .await;
+    let result = handle_heartbeat(&callback_ctx, &task_id, &token, request.into(), &lookup).await;
 
     callback_result_response::<FlowHeartbeatResponse, HeartbeatResponse>(result)
 }
@@ -963,14 +957,8 @@ pub(crate) async fn task_completed(
     };
 
     let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state).await?;
-    let result = handle_task_completed(
-        &callback_ctx,
-        &task_id,
-        &token,
-        request.into(),
-        &lookup,
-    )
-    .await;
+    let result =
+        handle_task_completed(&callback_ctx, &task_id, &token, request.into(), &lookup).await;
 
     callback_result_response::<FlowTaskCompletedResponse, TaskCompletedResponse>(result)
 }
@@ -991,10 +979,10 @@ pub fn routes() -> Router<Arc<AppState>> {
 mod tests {
     use super::*;
     use anyhow::Result;
-    use jsonwebtoken::{EncodingKey, Header};
-    use axum::routing::get;
     use axum::body::Body as AxumBody;
     use axum::http::Request as AxumRequest;
+    use axum::routing::get;
+    use jsonwebtoken::{EncodingKey, Header};
     use tower::ServiceExt;
 
     #[test]
@@ -1031,7 +1019,10 @@ mod tests {
         let request: HeartbeatRequest = serde_json::from_str(json).expect("deserialize");
         assert_eq!(request.attempt, 1);
         assert_eq!(request.progress_pct, Some(50));
-        assert_eq!(request.message, Some("Processing batch 5 of 10".to_string()));
+        assert_eq!(
+            request.message,
+            Some("Processing batch 5 of 10".to_string())
+        );
         assert!(request.traceparent.is_none());
     }
 
@@ -1111,8 +1102,8 @@ mod tests {
         let mut config = JwtConfig::default();
         config.hs256_secret = Some("test-secret".to_string());
 
-        let validator =
-            JwtTaskTokenValidator::new(&config, "tenant-1", "workspace-1", false).expect("validator");
+        let validator = JwtTaskTokenValidator::new(&config, "tenant-1", "workspace-1", false)
+            .expect("validator");
 
         let exp = (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize;
         let claims = serde_json::json!({
@@ -1137,8 +1128,8 @@ mod tests {
         let mut config = JwtConfig::default();
         config.hs256_secret = Some("test-secret".to_string());
 
-        let validator =
-            JwtTaskTokenValidator::new(&config, "tenant-1", "workspace-1", false).expect("validator");
+        let validator = JwtTaskTokenValidator::new(&config, "tenant-1", "workspace-1", false)
+            .expect("validator");
 
         let exp = (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize;
         let claims = serde_json::json!({

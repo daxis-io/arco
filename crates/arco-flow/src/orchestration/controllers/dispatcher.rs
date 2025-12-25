@@ -19,10 +19,10 @@
 use chrono::{DateTime, Utc};
 use metrics::{counter, histogram};
 
+use crate::metrics::{TimingGuard, labels as metrics_labels, names as metrics_names};
 use crate::orchestration::compactor::fold::{DispatchOutboxRow, DispatchStatus};
 use crate::orchestration::compactor::manifest::OrchestrationManifest;
 use crate::orchestration::ids::cloud_task_id;
-use crate::metrics::{labels as metrics_labels, names as metrics_names, TimingGuard};
 
 /// Action returned by the dispatcher reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,10 +144,7 @@ impl DispatcherController {
         // Check watermark freshness
         let actions: Vec<DispatchAction> = if manifest.watermarks.is_fresh(self.max_compaction_lag)
         {
-            outbox_rows
-                .iter()
-                .map(Self::reconcile_row)
-                .collect()
+            outbox_rows.iter().map(Self::reconcile_row).collect()
         } else {
             // Compaction is behind - skip dispatching to avoid stale decisions
             outbox_rows
@@ -280,10 +277,7 @@ impl DispatchPayload {
 mod tests {
     use super::*;
 
-    fn make_outbox_row(
-        dispatch_id: &str,
-        status: DispatchStatus,
-    ) -> DispatchOutboxRow {
+    fn make_outbox_row(dispatch_id: &str, status: DispatchStatus) -> DispatchOutboxRow {
         DispatchOutboxRow {
             run_id: "run1".to_string(),
             task_key: "extract".to_string(),
@@ -315,15 +309,20 @@ mod tests {
         let dispatcher = DispatcherController::with_defaults();
         let manifest = fresh_manifest();
 
-        let outbox_rows = vec![
-            make_outbox_row("dispatch:run1:extract:1", DispatchStatus::Pending),
-        ];
+        let outbox_rows = vec![make_outbox_row(
+            "dispatch:run1:extract:1",
+            DispatchStatus::Pending,
+        )];
 
         let actions = dispatcher.reconcile(&manifest, &outbox_rows);
 
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            DispatchAction::CreateCloudTask { dispatch_id, cloud_task_id, .. } => {
+            DispatchAction::CreateCloudTask {
+                dispatch_id,
+                cloud_task_id,
+                ..
+            } => {
                 assert_eq!(dispatch_id, "dispatch:run1:extract:1");
                 assert!(cloud_task_id.starts_with("d_"));
                 assert_eq!(cloud_task_id.len(), 28);
@@ -337,15 +336,19 @@ mod tests {
         let dispatcher = DispatcherController::with_defaults();
         let manifest = fresh_manifest();
 
-        let outbox_rows = vec![
-            make_outbox_row("dispatch:run1:extract:1", DispatchStatus::Created),
-        ];
+        let outbox_rows = vec![make_outbox_row(
+            "dispatch:run1:extract:1",
+            DispatchStatus::Created,
+        )];
 
         let actions = dispatcher.reconcile(&manifest, &outbox_rows);
 
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            DispatchAction::Skip { dispatch_id, reason } => {
+            DispatchAction::Skip {
+                dispatch_id,
+                reason,
+            } => {
                 assert_eq!(dispatch_id, "dispatch:run1:extract:1");
                 assert_eq!(reason, "already_created");
             }
@@ -358,9 +361,10 @@ mod tests {
         let dispatcher = DispatcherController::with_defaults();
         let manifest = fresh_manifest();
 
-        let outbox_rows = vec![
-            make_outbox_row("dispatch:run1:extract:1", DispatchStatus::Acked),
-        ];
+        let outbox_rows = vec![make_outbox_row(
+            "dispatch:run1:extract:1",
+            DispatchStatus::Acked,
+        )];
 
         let actions = dispatcher.reconcile(&manifest, &outbox_rows);
 
@@ -378,9 +382,10 @@ mod tests {
         let dispatcher = DispatcherController::with_defaults();
         let manifest = stale_manifest();
 
-        let outbox_rows = vec![
-            make_outbox_row("dispatch:run1:extract:1", DispatchStatus::Pending),
-        ];
+        let outbox_rows = vec![make_outbox_row(
+            "dispatch:run1:extract:1",
+            DispatchStatus::Pending,
+        )];
 
         let actions = dispatcher.reconcile(&manifest, &outbox_rows);
 
@@ -399,9 +404,10 @@ mod tests {
         let dispatcher = DispatcherController::with_defaults();
         let manifest = fresh_manifest();
 
-        let outbox_rows = vec![
-            make_outbox_row("dispatch:run1:extract:1", DispatchStatus::Pending),
-        ];
+        let outbox_rows = vec![make_outbox_row(
+            "dispatch:run1:extract:1",
+            DispatchStatus::Pending,
+        )];
 
         let actions1 = dispatcher.reconcile(&manifest, &outbox_rows);
         let actions2 = dispatcher.reconcile(&manifest, &outbox_rows);
@@ -412,9 +418,8 @@ mod tests {
 
     #[test]
     fn test_dispatch_enqueued_idempotency_key() {
-        let key = DispatcherController::dispatch_enqueued_idempotency_key(
-            "dispatch:run1:extract:1",
-        );
+        let key =
+            DispatcherController::dispatch_enqueued_idempotency_key("dispatch:run1:extract:1");
         assert_eq!(key, "dispatch_enqueued:dispatch:run1:extract:1");
     }
 
@@ -461,7 +466,9 @@ mod tests {
         let cloud_ids: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
-                DispatchAction::CreateCloudTask { cloud_task_id, .. } => Some(cloud_task_id.clone()),
+                DispatchAction::CreateCloudTask { cloud_task_id, .. } => {
+                    Some(cloud_task_id.clone())
+                }
                 _ => None,
             })
             .collect();

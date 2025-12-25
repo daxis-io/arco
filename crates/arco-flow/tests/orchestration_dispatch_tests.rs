@@ -9,8 +9,12 @@ use arco_flow::error::Result;
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_flow::orchestration::compactor::fold::DispatchStatus;
-use arco_flow::orchestration::controllers::{DispatchAction, DispatcherController, ReadyDispatchController};
-use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData, TaskDef, TriggerInfo};
+use arco_flow::orchestration::controllers::{
+    DispatchAction, DispatcherController, ReadyDispatchController,
+};
+use arco_flow::orchestration::events::{
+    OrchestrationEvent, OrchestrationEventData, TaskDef, TriggerInfo,
+};
 
 #[tokio::test]
 async fn dispatch_e2e_loop_creates_outbox_and_enqueued_event() -> Result<()> {
@@ -66,34 +70,31 @@ async fn dispatch_e2e_loop_creates_outbox_and_enqueued_event() -> Result<()> {
     let actions = ready_dispatch.reconcile(&manifest, &state);
     assert_eq!(actions.len(), 1);
 
-    let (dispatch_id, attempt_id, attempt, event_data) = match actions
-        .into_iter()
-        .next()
-        .expect("dispatch action")
-    {
-        arco_flow::orchestration::controllers::ReadyDispatchAction::EmitDispatchRequested {
-            run_id: action_run_id,
-            task_key: action_task_key,
-            attempt,
-            attempt_id,
-            worker_queue: action_worker_queue,
-            dispatch_id,
-        } => {
-            assert_eq!(action_run_id, run_id);
-            assert_eq!(action_task_key, task_key);
-            assert_eq!(action_worker_queue, "default-queue");
-            let event_data = OrchestrationEventData::DispatchRequested {
+    let (dispatch_id, attempt_id, attempt, event_data) =
+        match actions.into_iter().next().expect("dispatch action") {
+            arco_flow::orchestration::controllers::ReadyDispatchAction::EmitDispatchRequested {
                 run_id: action_run_id,
                 task_key: action_task_key,
                 attempt,
-                attempt_id: attempt_id.clone(),
+                attempt_id,
                 worker_queue: action_worker_queue,
-                dispatch_id: dispatch_id.clone(),
-            };
-            (dispatch_id, attempt_id, attempt, event_data)
-        }
-        _ => panic!("expected EmitDispatchRequested action"),
-    };
+                dispatch_id,
+            } => {
+                assert_eq!(action_run_id, run_id);
+                assert_eq!(action_task_key, task_key);
+                assert_eq!(action_worker_queue, "default-queue");
+                let event_data = OrchestrationEventData::DispatchRequested {
+                    run_id: action_run_id,
+                    task_key: action_task_key,
+                    attempt,
+                    attempt_id: attempt_id.clone(),
+                    worker_queue: action_worker_queue,
+                    dispatch_id: dispatch_id.clone(),
+                };
+                (dispatch_id, attempt_id, attempt, event_data)
+            }
+            _ => panic!("expected EmitDispatchRequested action"),
+        };
 
     let dispatch_requested = OrchestrationEvent::new("tenant", "workspace", event_data);
     let dispatch_path = LedgerWriter::event_path(&dispatch_requested);
@@ -146,7 +147,10 @@ async fn dispatch_e2e_loop_creates_outbox_and_enqueued_event() -> Result<()> {
     let (_manifest, state) = compactor.load_state().await?;
     let outbox_row = state.dispatch_outbox.get(&dispatch_id).expect("outbox row");
     assert_eq!(outbox_row.status, DispatchStatus::Created);
-    assert_eq!(outbox_row.cloud_task_id.as_deref(), Some(cloud_task_id.as_str()));
+    assert_eq!(
+        outbox_row.cloud_task_id.as_deref(),
+        Some(cloud_task_id.as_str())
+    );
 
     Ok(())
 }

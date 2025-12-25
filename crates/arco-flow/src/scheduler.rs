@@ -17,7 +17,7 @@ use arco_core::{RunId, TaskId};
 use crate::dispatch::{EnqueueOptions, EnqueueResult, TaskEnvelope, TaskQueue};
 use crate::error::{Error, Result};
 use crate::events::EventBuilder;
-use crate::metrics::{time_scheduler_tick, FlowMetrics};
+use crate::metrics::{FlowMetrics, time_scheduler_tick};
 use crate::outbox::EventSink;
 use crate::plan::{Plan, TaskSpec};
 use crate::quota::drr::FairTaskSelector;
@@ -285,7 +285,8 @@ impl Scheduler {
 
         if ready_specs.is_empty() {
             self.record_queue_depth(queue, &metrics).await;
-            self.record_quota_usage(quota, &run.tenant_id, &metrics).await;
+            self.record_quota_usage(quota, &run.tenant_id, &metrics)
+                .await;
             return Ok(report);
         }
 
@@ -293,11 +294,9 @@ impl Scheduler {
         let mut ready_execs = Vec::with_capacity(ready_specs.len());
         for spec in ready_specs {
             spec_by_id.insert(spec.task_id, spec);
-            let exec = run
-                .get_task(&spec.task_id)
-                .ok_or(Error::TaskNotFound {
-                    task_id: spec.task_id,
-                })?;
+            let exec = run.get_task(&spec.task_id).ok_or(Error::TaskNotFound {
+                task_id: spec.task_id,
+            })?;
             ready_execs.push(exec.clone());
         }
 
@@ -326,9 +325,7 @@ impl Scheduler {
                 continue;
             }
 
-            let attempt = run
-                .get_task(&task_id)
-                .map_or(1, |exec| exec.attempt);
+            let attempt = run.get_task(&task_id).map_or(1, |exec| exec.attempt);
             let envelope = Self::build_task_envelope(run, spec, attempt);
             let options = Self::enqueue_options_for(spec);
 
@@ -379,7 +376,8 @@ impl Scheduler {
         }
 
         self.record_queue_depth(queue, &metrics).await;
-        self.record_quota_usage(quota, &run.tenant_id, &metrics).await;
+        self.record_quota_usage(quota, &run.tenant_id, &metrics)
+            .await;
 
         Ok(report)
     }
@@ -536,12 +534,7 @@ impl Scheduler {
 
             let from_state = exec.state;
             exec.transition_to(TaskState::Dispatched)?;
-            record_transition(
-                &metrics,
-                &tenant_id,
-                from_state,
-                TaskState::Dispatched,
-            );
+            record_transition(&metrics, &tenant_id, from_state, TaskState::Dispatched);
             exec.worker_id = Some(worker_id.to_string());
             exec.attempt
         };
@@ -1159,10 +1152,10 @@ impl Scheduler {
             return;
         }
 
-        let operation = self.plan.get_task(task_id).map_or_else(
-            || "unknown".to_string(),
-            |spec| spec.operation.to_string(),
-        );
+        let operation = self
+            .plan
+            .get_task(task_id)
+            .map_or_else(|| "unknown".to_string(), |spec| spec.operation.to_string());
 
         #[allow(clippy::cast_precision_loss)]
         let duration_secs = duration_ms as f64 / 1000.0;
@@ -1172,7 +1165,9 @@ impl Scheduler {
     fn build_task_envelope(run: &Run, spec: &TaskSpec, attempt: u32) -> TaskEnvelope {
         let task_key = spec.partition_key.clone().map_or_else(
             || TaskKey::new(spec.asset_key.clone(), spec.operation),
-            |partition_key| TaskKey::with_partition(spec.asset_key.clone(), partition_key, spec.operation),
+            |partition_key| {
+                TaskKey::with_partition(spec.asset_key.clone(), partition_key, spec.operation)
+            },
         );
 
         TaskEnvelope::new(
@@ -1234,8 +1229,8 @@ mod tests {
     use crate::dispatch::memory::InMemoryTaskQueue;
     use crate::outbox::InMemoryOutbox;
     use crate::plan::{AssetKey, PlanBuilder, ResourceRequirements, TaskSpec};
-    use crate::quota::memory::InMemoryQuotaManager;
     use crate::quota::TenantQuota;
+    use crate::quota::memory::InMemoryQuotaManager;
     use crate::task_key::TaskOperation;
     use arco_core::AssetId;
 
@@ -1648,5 +1643,4 @@ mod tests {
 
         Ok(())
     }
-
 }

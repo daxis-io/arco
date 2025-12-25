@@ -3,9 +3,9 @@
 //! This module provides error types that align with the Iceberg REST Catalog
 //! specification's error response format.
 
+use arco_catalog::error::CatalogError;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use arco_catalog::error::CatalogError;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -140,7 +140,9 @@ impl IcebergError {
     #[must_use]
     pub const fn error_type(&self) -> &'static str {
         match self {
-            Self::BadRequest { error_type, .. } | Self::NotFound { error_type, .. } | Self::Conflict { error_type, .. } => error_type,
+            Self::BadRequest { error_type, .. }
+            | Self::NotFound { error_type, .. }
+            | Self::Conflict { error_type, .. } => error_type,
             Self::Unauthorized { .. } => "UnauthorizedException",
             Self::Forbidden { .. } => "ForbiddenException",
             Self::ServiceUnavailable { .. } => "ServiceUnavailableException",

@@ -180,7 +180,9 @@ impl Store for InMemoryStore {
             runs.get(run_id).map_or_else(Vec::new, |run| {
                 run.task_executions
                     .iter()
-                    .filter(|t| t.state == TaskState::RetryWait && t.retry_at.is_some_and(|r| r <= now))
+                    .filter(|t| {
+                        t.state == TaskState::RetryWait && t.retry_at.is_some_and(|r| r <= now)
+                    })
                     .map(|t| t.task_id)
                     .collect()
             })
@@ -426,10 +428,7 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
-            result,
-            Err(Error::InvalidStateTransition { .. })
-        ));
+        assert!(matches!(result, Err(Error::InvalidStateTransition { .. })));
 
         Ok(())
     }

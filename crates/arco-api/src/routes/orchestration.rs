@@ -21,8 +21,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
 use axum::extract::Query as AxumQuery;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -38,6 +38,7 @@ use crate::error::{ApiError, ApiErrorBody};
 use crate::orchestration_compaction::compact_orchestration_events;
 use crate::server::AppState;
 use arco_core::{WritePrecondition, WriteResult};
+use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::{
     FoldState, MicroCompactor, RunRow, RunState as FoldRunState, TaskRow,
     TaskState as FoldTaskState,
@@ -47,10 +48,9 @@ use arco_flow::orchestration::events::{
     OrchestrationEvent, OrchestrationEventData, RunRequest, SensorEvalStatus, SensorStatus,
     TaskDef, TriggerInfo,
 };
-use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::run_key::{
-    FingerprintPolicy, ReservationResult, RunKeyReservation, get_reservation,
-    reservation_path, reserve_run_key,
+    FingerprintPolicy, ReservationResult, RunKeyReservation, get_reservation, reservation_path,
+    reserve_run_key,
 };
 use ulid::Ulid;
 
@@ -479,9 +479,7 @@ async fn append_run_events(
         OrchestrationEventData::RunTriggered {
             run_id: run_id.to_string(),
             plan_id: plan_id.to_string(),
-            trigger: TriggerInfo::Manual {
-                user_id,
-            },
+            trigger: TriggerInfo::Manual { user_id },
             root_assets,
             run_key,
             labels,
@@ -489,7 +487,11 @@ async fn append_run_events(
     );
 
     if let Some(ref overrides) = overrides {
-        apply_event_metadata(&mut run_triggered, &overrides.run_event_id, overrides.created_at);
+        apply_event_metadata(
+            &mut run_triggered,
+            &overrides.run_event_id,
+            overrides.created_at,
+        );
     }
 
     let run_event_path = LedgerWriter::event_path(&run_triggered);
@@ -509,7 +511,11 @@ async fn append_run_events(
     );
 
     if let Some(ref overrides) = overrides {
-        apply_event_metadata(&mut plan_created, &overrides.plan_event_id, overrides.created_at);
+        apply_event_metadata(
+            &mut plan_created,
+            &overrides.plan_event_id,
+            overrides.created_at,
+        );
     }
 
     let plan_event_path = LedgerWriter::event_path(&plan_created);
@@ -559,7 +565,9 @@ fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
 
     for task in tasks {
         match task.state {
-            FoldTaskState::Planned | FoldTaskState::Blocked | FoldTaskState::RetryWait => pending += 1,
+            FoldTaskState::Planned | FoldTaskState::Blocked | FoldTaskState::RetryWait => {
+                pending += 1
+            }
             FoldTaskState::Ready | FoldTaskState::Dispatched => queued += 1,
             FoldTaskState::Running => running += 1,
             _ => {}
@@ -643,9 +651,9 @@ fn is_valid_task_key(task_key: &str) -> bool {
     if task_key.is_empty() {
         return false;
     }
-    task_key.chars().all(|c| {
-        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.'
-    })
+    task_key
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.')
 }
 
 fn build_request_fingerprint(request: &TriggerRunRequest) -> Result<String, ApiError> {
@@ -674,7 +682,9 @@ fn build_request_fingerprint(request: &TriggerRunRequest) -> Result<String, ApiE
         labels,
     };
     let json = serde_json::to_vec(&payload).map_err(|e| {
-        ApiError::internal(format!("failed to serialize trigger request fingerprint: {e}"))
+        ApiError::internal(format!(
+            "failed to serialize trigger request fingerprint: {e}"
+        ))
     })?;
     let hash = Sha256::digest(&json);
     Ok(hex::encode(hash))
@@ -790,9 +800,8 @@ pub(crate) async fn trigger_run(
             created_at: now,
         };
 
-        let fingerprint_policy = FingerprintPolicy::from_cutoff(
-            state.config.run_key_fingerprint_cutoff,
-        );
+        let fingerprint_policy =
+            FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff);
         match reserve_run_key(&storage, &reservation, fingerprint_policy)
             .await
             .map_err(|e| ApiError::internal(format!("failed to reserve run_key: {e}")))?
@@ -881,12 +890,8 @@ pub(crate) async fn trigger_run(
                     )
                     .await?;
 
-                    compact_orchestration_events(
-                        &state.config,
-                        storage.clone(),
-                        event_paths,
-                    )
-                    .await?;
+                    compact_orchestration_events(&state.config, storage.clone(), event_paths)
+                        .await?;
                 }
 
                 return Ok((
@@ -900,7 +905,10 @@ pub(crate) async fn trigger_run(
                     }),
                 ));
             }
-            ReservationResult::FingerprintMismatch { existing, requested_fingerprint } => {
+            ReservationResult::FingerprintMismatch {
+                existing,
+                requested_fingerprint,
+            } => {
                 // The run_key was reserved with a different trigger payload.
                 // This is a client error - return 409 Conflict.
                 tracing::warn!(
@@ -975,13 +983,20 @@ pub(crate) async fn manual_evaluate_sensor(
     ensure_workspace(&ctx, &workspace_id)?;
 
     let warning = match load_orchestration_state(&ctx, &state).await {
-        Ok(fold_state) => fold_state.sensor_state.get(&sensor_id).and_then(|row| {
-            match row.status {
-                SensorStatus::Active => None,
-                SensorStatus::Paused => Some("Sensor is paused but manual evaluate bypasses status".to_string()),
-                SensorStatus::Error => Some("Sensor is in error but manual evaluate bypasses status".to_string()),
-            }
-        }),
+        Ok(fold_state) => {
+            fold_state
+                .sensor_state
+                .get(&sensor_id)
+                .and_then(|row| match row.status {
+                    SensorStatus::Active => None,
+                    SensorStatus::Paused => {
+                        Some("Sensor is paused but manual evaluate bypasses status".to_string())
+                    }
+                    SensorStatus::Error => {
+                        Some("Sensor is in error but manual evaluate bypasses status".to_string())
+                    }
+                })
+        }
         Err(err) => {
             tracing::warn!(
                 sensor_id = %sensor_id,
@@ -998,9 +1013,8 @@ pub(crate) async fn manual_evaluate_sensor(
         .or_else(|| ctx.idempotency_key.clone())
         .unwrap_or_else(|| format!("manual_{}", Ulid::new()));
 
-    let data = serde_json::to_vec(&request.payload).map_err(|e| {
-        ApiError::bad_request(format!("failed to serialize sensor payload: {e}"))
-    })?;
+    let data = serde_json::to_vec(&request.payload)
+        .map_err(|e| ApiError::bad_request(format!("failed to serialize sensor payload: {e}")))?;
 
     let message = PubSubMessage {
         message_id: message_id.clone(),
@@ -1009,7 +1023,7 @@ pub(crate) async fn manual_evaluate_sensor(
         publish_time: Utc::now(),
     };
 
-    let handler = PushSensorHandler::new();
+    let handler = PushSensorHandler::with_evaluator(state.sensor_evaluator());
     let events = handler.handle_message(
         &sensor_id,
         &ctx.tenant,
@@ -1033,16 +1047,15 @@ pub(crate) async fn manual_evaluate_sensor(
     });
 
     let Some((eval_id, status, run_requests)) = eval_summary else {
-        return Err(ApiError::internal("sensor evaluation did not emit SensorEvaluated"));
+        return Err(ApiError::internal(
+            "sensor evaluation did not emit SensorEvaluated",
+        ));
     };
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
     let ledger = LedgerWriter::new(storage.clone());
-    let event_paths: Vec<String> = events
-        .iter()
-        .map(LedgerWriter::event_path)
-        .collect();
+    let event_paths: Vec<String> = events.iter().map(LedgerWriter::event_path).collect();
     let events_written = event_paths.len();
 
     ledger
@@ -1160,12 +1173,15 @@ pub(crate) async fn backfill_run_key(
 
     let mut updated = existing.clone();
     updated.request_fingerprint = Some(request_fingerprint.clone());
-    let json = serde_json::to_string(&updated).map_err(|e| {
-        ApiError::internal(format!("failed to serialize run_key reservation: {e}"))
-    })?;
+    let json = serde_json::to_string(&updated)
+        .map_err(|e| ApiError::internal(format!("failed to serialize run_key reservation: {e}")))?;
 
     let result = storage
-        .put_raw(&path, Bytes::from(json), WritePrecondition::MatchesVersion(meta.version))
+        .put_raw(
+            &path,
+            Bytes::from(json),
+            WritePrecondition::MatchesVersion(meta.version),
+        )
         .await
         .map_err(|e| ApiError::internal(format!("failed to update run_key reservation: {e}")))?;
 
@@ -1430,10 +1446,9 @@ pub(crate) async fn cancel_run(
     );
 
     let event_path = LedgerWriter::event_path(&cancel_event);
-    ledger
-        .append(cancel_event)
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to write RunCancelRequested event: {e}")))?;
+    ledger.append(cancel_event).await.map_err(|e| {
+        ApiError::internal(format!("failed to write RunCancelRequested event: {e}"))
+    })?;
 
     compact_orchestration_events(&state.config, storage, vec![event_path]).await?;
 
@@ -1616,10 +1631,10 @@ pub fn routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::StatusCode;
-    use anyhow::{anyhow, Result};
-    use chrono::Duration;
+    use anyhow::{Result, anyhow};
     use arco_core::partition::{PartitionKey, ScalarValue};
+    use axum::http::StatusCode;
+    use chrono::Duration;
 
     #[test]
     fn test_trigger_request_deserialization() {
@@ -1822,7 +1837,11 @@ mod tests {
                 labels: request.labels.clone(),
             },
         );
-        apply_event_metadata(&mut run_event, &reservation.event_id, reservation.created_at);
+        apply_event_metadata(
+            &mut run_event,
+            &reservation.event_id,
+            reservation.created_at,
+        );
         let run_path = LedgerWriter::event_path(&run_event);
         let run_bytes = storage.get_raw(&run_path).await?;
         let stored_run: OrchestrationEvent = serde_json::from_slice(&run_bytes)?;

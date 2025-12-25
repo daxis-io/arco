@@ -26,9 +26,9 @@ use arco_core::storage::{
 };
 use arco_core::{Error as CoreError, Result as CoreResult, ScopedStorage};
 
-use arco_catalog::{CatalogWriter, Tier1Compactor};
 use arco_catalog::manifest::{CatalogDomainManifest, RootManifest};
 use arco_catalog::write_options::WriteOptions;
+use arco_catalog::{CatalogWriter, Tier1Compactor};
 
 // ============================================================================
 // FailingBackend - Configurable failure injection

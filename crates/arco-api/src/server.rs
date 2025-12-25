@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{FromRequestParts, State};
-use axum::http::{header, HeaderValue, Method, Request, StatusCode};
+use axum::http::{HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -18,16 +18,17 @@ use tower::ServiceBuilder;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
+use arco_flow::orchestration::controllers::{NoopSensorEvaluator, SensorEvaluator};
 use arco_iceberg::context::IcebergRequestContext;
-use arco_iceberg::{iceberg_router, IcebergError, IcebergState};
+use arco_iceberg::{IcebergError, IcebergState, iceberg_router};
 
 use crate::compactor_client::CompactorClient;
 use crate::config::{Config, CorsConfig};
 use crate::context::RequestContext;
 use crate::error::ApiError;
 use crate::rate_limit::RateLimitState;
-use arco_core::Result;
 use arco_catalog::SyncCompactor;
+use arco_core::Result;
 
 // ============================================================================
 // Health and Ready Responses
@@ -67,6 +68,8 @@ pub struct AppState {
     rate_limit: Arc<RateLimitState>,
     /// Sync compaction client (Tier-1 DDL).
     sync_compactor: Option<Arc<dyn SyncCompactor>>,
+    /// Sensor evaluator used by manual sensor evaluate.
+    sensor_evaluator: Arc<dyn SensorEvaluator>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -76,6 +79,7 @@ impl std::fmt::Debug for AppState {
             .field("storage", &"<StorageBackend>")
             .field("rate_limit", &"<RateLimitState>")
             .field("sync_compactor", &self.sync_compactor.is_some())
+            .field("sensor_evaluator", &"<SensorEvaluator>")
             .finish()
     }
 }
@@ -84,10 +88,19 @@ impl AppState {
     /// Creates new application state with the given storage backend.
     #[must_use]
     pub fn new(config: Config, storage: Arc<dyn arco_core::storage::StorageBackend>) -> Self {
+        Self::new_with_evaluator(config, storage, Arc::new(NoopSensorEvaluator))
+    }
+
+    /// Creates new application state with an explicit sensor evaluator.
+    #[must_use]
+    pub fn new_with_evaluator(
+        config: Config,
+        storage: Arc<dyn arco_core::storage::StorageBackend>,
+        sensor_evaluator: Arc<dyn SensorEvaluator>,
+    ) -> Self {
         let rate_limit = Arc::new(RateLimitState::new(config.rate_limit.clone()));
         let sync_compactor = config.compactor_url.as_ref().map(|url| {
-            let client: Arc<dyn SyncCompactor> =
-                Arc::new(CompactorClient::new(url.clone()));
+            let client: Arc<dyn SyncCompactor> = Arc::new(CompactorClient::new(url.clone()));
             client
         });
         Self {
@@ -95,15 +108,24 @@ impl AppState {
             storage,
             rate_limit,
             sync_compactor,
+            sensor_evaluator,
         }
     }
 
     /// Creates new application state with in-memory storage (for testing).
     #[must_use]
     pub fn with_memory_storage(config: Config) -> Self {
+        Self::with_memory_storage_and_evaluator(config, Arc::new(NoopSensorEvaluator))
+    }
+
+    /// Creates new application state with in-memory storage and a custom evaluator.
+    #[must_use]
+    pub fn with_memory_storage_and_evaluator(
+        config: Config,
+        sensor_evaluator: Arc<dyn SensorEvaluator>,
+    ) -> Self {
         let sync_compactor = config.compactor_url.as_ref().map(|url| {
-            let client: Arc<dyn SyncCompactor> =
-                Arc::new(CompactorClient::new(url.clone()));
+            let client: Arc<dyn SyncCompactor> = Arc::new(CompactorClient::new(url.clone()));
             client
         });
         Self {
@@ -111,6 +133,7 @@ impl AppState {
             config,
             storage: Arc::new(arco_core::storage::MemoryBackend::new()),
             sync_compactor,
+            sensor_evaluator,
         }
     }
 
@@ -127,6 +150,12 @@ impl AppState {
     #[must_use]
     pub fn sync_compactor(&self) -> Option<Arc<dyn SyncCompactor>> {
         self.sync_compactor.clone()
+    }
+
+    /// Returns the configured sensor evaluator.
+    #[must_use]
+    pub fn sensor_evaluator(&self) -> Arc<dyn SensorEvaluator> {
+        Arc::clone(&self.sensor_evaluator)
     }
 }
 
@@ -199,7 +228,7 @@ async fn iceberg_auth_middleware(
     let (mut parts, body) = req.into_parts();
     let ctx = match RequestContext::from_request_parts(&mut parts, &state).await {
         Ok(ctx) => ctx,
-        Err(err) => return api_error_to_iceberg_response(err),
+        Err(err) => return api_error_to_iceberg_response(&err),
     };
 
     let iceberg_ctx = IcebergRequestContext {
@@ -217,7 +246,7 @@ fn iceberg_public_path(path: &str) -> bool {
     path.ends_with("/v1/config") || path.ends_with("/openapi.json")
 }
 
-fn api_error_to_iceberg_response(err: ApiError) -> Response {
+fn api_error_to_iceberg_response(err: &ApiError) -> Response {
     let status = err.status();
     let message = err.message().to_string();
     let request_id = err.request_id().map(str::to_string);
@@ -265,6 +294,7 @@ fn api_error_to_iceberg_response(err: ApiError) -> Response {
 pub struct Server {
     config: Config,
     storage: Arc<dyn arco_core::storage::StorageBackend>,
+    sensor_evaluator: Arc<dyn SensorEvaluator>,
 }
 
 impl std::fmt::Debug for Server {
@@ -272,6 +302,7 @@ impl std::fmt::Debug for Server {
         f.debug_struct("Server")
             .field("config", &self.config)
             .field("storage", &"<StorageBackend>")
+            .field("sensor_evaluator", &"<SensorEvaluator>")
             .finish()
     }
 }
@@ -285,6 +316,7 @@ impl Server {
         Self {
             config,
             storage: Arc::new(arco_core::storage::MemoryBackend::new()),
+            sensor_evaluator: Arc::new(NoopSensorEvaluator),
         }
     }
 
@@ -294,7 +326,11 @@ impl Server {
         config: Config,
         storage: Arc<dyn arco_core::storage::StorageBackend>,
     ) -> Self {
-        Self { config, storage }
+        Self {
+            config,
+            storage,
+            sensor_evaluator: Arc::new(NoopSensorEvaluator),
+        }
     }
 
     /// Creates a new `ServerBuilder`.
@@ -311,9 +347,10 @@ impl Server {
 
     /// Creates the router with all routes and middleware.
     fn create_router(&self) -> Router {
-        let state = Arc::new(AppState::new(
+        let state = Arc::new(AppState::new_with_evaluator(
             self.config.clone(),
             Arc::clone(&self.storage),
+            Arc::clone(&self.sensor_evaluator),
         ));
 
         // Build CORS layer from config
@@ -580,6 +617,7 @@ impl Server {
 pub struct ServerBuilder {
     config: Config,
     storage: Arc<dyn arco_core::storage::StorageBackend>,
+    sensor_evaluator: Arc<dyn SensorEvaluator>,
 }
 
 impl std::fmt::Debug for ServerBuilder {
@@ -587,6 +625,7 @@ impl std::fmt::Debug for ServerBuilder {
         f.debug_struct("ServerBuilder")
             .field("config", &self.config)
             .field("storage", &"<StorageBackend>")
+            .field("sensor_evaluator", &"<SensorEvaluator>")
             .finish()
     }
 }
@@ -596,6 +635,7 @@ impl Default for ServerBuilder {
         Self {
             config: Config::default(),
             storage: Arc::new(arco_core::storage::MemoryBackend::new()),
+            sensor_evaluator: Arc::new(NoopSensorEvaluator),
         }
     }
 }
@@ -648,6 +688,13 @@ impl ServerBuilder {
         self
     }
 
+    /// Sets the sensor evaluator used for manual sensor evaluate.
+    #[must_use]
+    pub fn sensor_evaluator(mut self, evaluator: Arc<dyn SensorEvaluator>) -> Self {
+        self.sensor_evaluator = evaluator;
+        self
+    }
+
     /// Enables Iceberg REST Catalog endpoints.
     #[must_use]
     pub fn iceberg_enabled(mut self, enabled: bool) -> Self {
@@ -658,7 +705,11 @@ impl ServerBuilder {
     /// Builds the server.
     #[must_use]
     pub fn build(self) -> Server {
-        Server::with_storage_backend(self.config, self.storage)
+        Server {
+            config: self.config,
+            storage: self.storage,
+            sensor_evaluator: self.sensor_evaluator,
+        }
     }
 }
 
@@ -735,8 +786,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), 2048)
             .await
             .context("read response body")?;
-        let config: serde_json::Value =
-            serde_json::from_slice(&body).context("parse JSON body")?;
+        let config: serde_json::Value = serde_json::from_slice(&body).context("parse JSON body")?;
 
         // Verify the response has expected structure
         assert!(config.get("overrides").is_some());
@@ -799,7 +849,10 @@ mod tests {
             error.get("type").and_then(|value| value.as_str()),
             Some("UnauthorizedException")
         );
-        assert_eq!(error.get("code").and_then(|value| value.as_u64()), Some(401));
+        assert_eq!(
+            error.get("code").and_then(|value| value.as_u64()),
+            Some(401)
+        );
         Ok(())
     }
 

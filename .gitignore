@@ -53,3 +53,4 @@ coverage/
 # Claude/AI config and planning
 .claude/
 docs/plans/
+.worktrees/

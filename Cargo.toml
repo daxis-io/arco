@@ -110,7 +110,7 @@ petgraph = "0.7"
 
 # Data formats
 parquet = { version = "54", features = ["async"] }
-arrow = { version = "54", features = ["chrono-tz"] }
+arrow = { version = "56", features = ["chrono-tz"] }
 bytes = "1"
 iceberg = "0.6"
 iceberg-catalog-rest = "0.6"

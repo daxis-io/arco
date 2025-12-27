@@ -51,6 +51,8 @@ pub enum StalenessReason {
     FreshnessPolicy,
     /// Upstream partition materialized more recently.
     UpstreamChanged,
+    /// One or more upstream partitions have never materialized.
+    UpstreamNeverMaterialized,
     /// Code version changed since last materialization.
     CodeChanged,
 }
@@ -120,6 +122,7 @@ pub fn compute_staleness(
 /// # Arguments
 /// - `partition`: The downstream partition status row to check
 /// - `upstreams`: Upstream partition status rows
+/// - `policy`: Freshness policy to apply
 /// - `current_code_version`: Current code version (e.g., git SHA)
 /// - `now`: Current time for deadline computation
 ///
@@ -129,6 +132,7 @@ pub fn compute_staleness(
 pub fn compute_staleness_with_upstreams(
     partition: &PartitionStatusRow,
     upstreams: &[PartitionStatusRow],
+    policy: &FreshnessPolicy,
     current_code_version: Option<&str>,
     now: DateTime<Utc>,
 ) -> StalenessResult {
@@ -155,6 +159,18 @@ pub fn compute_staleness_with_upstreams(
         }
     }
 
+    // Check for upstreams that never materialized
+    if upstreams
+        .iter()
+        .any(|upstream| upstream.last_materialization_at.is_none())
+    {
+        return StalenessResult {
+            is_stale: true,
+            reason: Some(StalenessReason::UpstreamNeverMaterialized),
+            stale_since: None,
+        };
+    }
+
     // Check if any upstream materialized after this partition
     for upstream in upstreams {
         if let Some(upstream_mat) = upstream.last_materialization_at {
@@ -166,6 +182,16 @@ pub fn compute_staleness_with_upstreams(
                 };
             }
         }
+    }
+
+    // Check freshness policy
+    let deadline = last_mat + Duration::minutes(i64::from(policy.maximum_lag_minutes));
+    if now > deadline {
+        return StalenessResult {
+            is_stale: true,
+            reason: Some(StalenessReason::FreshnessPolicy),
+            stale_since: Some(deadline),
+        };
     }
 
     StalenessResult {
@@ -297,10 +323,43 @@ mod tests {
             Some("v1"),
         );
 
-        let result = compute_staleness_with_upstreams(&downstream, &[upstream], Some("v1"), now);
+        let policy = FreshnessPolicy::default();
+        let result = compute_staleness_with_upstreams(
+            &downstream,
+            &[upstream],
+            &policy,
+            Some("v1"),
+            now,
+        );
 
         assert!(result.is_stale);
         assert_eq!(result.reason, Some(StalenessReason::UpstreamChanged));
+    }
+
+    #[test]
+    fn test_staleness_detects_upstream_never_materialized() {
+        let now = Utc::now();
+
+        let downstream = make_partition(
+            "analytics.summary",
+            "2025-01",
+            Some(now - Duration::hours(2)),
+            Some("v1"),
+        );
+
+        let upstream = make_partition("analytics.daily", "2025-01-15", None, Some("v1"));
+
+        let policy = FreshnessPolicy::default();
+        let result = compute_staleness_with_upstreams(
+            &downstream,
+            &[upstream],
+            &policy,
+            Some("v1"),
+            now,
+        );
+
+        assert!(result.is_stale);
+        assert_eq!(result.reason, Some(StalenessReason::UpstreamNeverMaterialized));
     }
 
     #[test]
@@ -321,9 +380,49 @@ mod tests {
             Some("v1"),
         );
 
-        let result = compute_staleness_with_upstreams(&downstream, &[upstream], Some("v1"), now);
+        let policy = FreshnessPolicy::default();
+        let result = compute_staleness_with_upstreams(
+            &downstream,
+            &[upstream],
+            &policy,
+            Some("v1"),
+            now,
+        );
 
         assert!(!result.is_stale);
         assert!(result.reason.is_none());
+    }
+
+    #[test]
+    fn test_staleness_with_upstreams_checks_freshness_policy() {
+        let now = Utc::now();
+
+        let downstream = make_partition(
+            "analytics.summary",
+            "2025-01",
+            Some(now - Duration::hours(30)),
+            Some("v1"),
+        );
+
+        let upstream = make_partition(
+            "analytics.daily",
+            "2025-01-15",
+            Some(now - Duration::hours(40)),
+            Some("v1"),
+        );
+
+        let policy = FreshnessPolicy {
+            maximum_lag_minutes: 60 * 24, // 24 hours
+        };
+        let result = compute_staleness_with_upstreams(
+            &downstream,
+            &[upstream],
+            &policy,
+            Some("v1"),
+            now,
+        );
+
+        assert!(result.is_stale);
+        assert_eq!(result.reason, Some(StalenessReason::FreshnessPolicy));
     }
 }

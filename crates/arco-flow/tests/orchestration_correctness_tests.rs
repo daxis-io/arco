@@ -24,7 +24,7 @@ use arco_flow::orchestration::controllers::{
     AntiEntropySweeper, DispatcherController, ReadyDispatchController,
 };
 use arco_flow::orchestration::events::{
-    OrchestrationEvent, OrchestrationEventData, TaskDef, TaskOutcome, TriggerInfo,
+    OrchestrationEvent, OrchestrationEventData, SourceRef, TaskDef, TaskOutcome, TriggerInfo,
 };
 use arco_flow::plan::{AssetKey, ResourceRequirements};
 use arco_flow::task_key::{TaskKey, TaskOperation};
@@ -42,6 +42,7 @@ fn run_triggered_event(run_id: &str, plan_id: &str) -> OrchestrationEvent {
             root_assets: Vec::new(),
             run_key: None,
             labels: std::collections::HashMap::new(),
+            code_version: None,
         },
     )
 }
@@ -482,4 +483,88 @@ impl StorageBackend for CountingBackend {
     ) -> arco_core::error::Result<String> {
         self.inner.signed_url(path, expiry).await
     }
+}
+
+// ============================================================================
+// Run Key Index + Conflict Detection Tests (Task 6.2)
+// ============================================================================
+
+fn run_requested_event(run_key: &str, fingerprint: &str) -> OrchestrationEvent {
+    OrchestrationEvent::new(
+        "tenant",
+        "workspace",
+        OrchestrationEventData::RunRequested {
+            run_key: run_key.to_string(),
+            request_fingerprint: fingerprint.to_string(),
+            asset_selection: vec!["analytics.daily".to_string()],
+            partition_selection: None,
+            trigger_source_ref: SourceRef::Schedule {
+                schedule_id: "sched_01".to_string(),
+                tick_id: "tick_01".to_string(),
+            },
+            labels: std::collections::HashMap::new(),
+        },
+    )
+}
+
+#[test]
+fn test_fold_run_requested_creates_run_key_index() {
+    let mut state = FoldState::new();
+
+    let event = run_requested_event("sched:daily-etl:1736935200", "fingerprint_v1");
+
+    state.fold_event(&event);
+
+    // Should create run_key_index entry
+    let index = state.run_key_index.get("sched:daily-etl:1736935200");
+    assert!(index.is_some(), "run_key_index entry should exist");
+
+    let index = index.unwrap();
+    assert_eq!(index.request_fingerprint, "fingerprint_v1");
+    assert!(!index.run_id.is_empty(), "run_id should be generated");
+}
+
+#[test]
+fn test_fold_run_requested_detects_conflict_on_fingerprint_mismatch() {
+    let mut state = FoldState::new();
+
+    // First request
+    let event1 = run_requested_event("sched:daily-etl:1736935200", "fingerprint_v1");
+    state.fold_event(&event1);
+
+    // Second request with same run_key but different fingerprint
+    let event2 = run_requested_event("sched:daily-etl:1736935200", "fingerprint_v2");
+    state.fold_event(&event2);
+
+    // Should record conflict
+    assert_eq!(state.run_key_conflicts.len(), 1, "should have one conflict");
+
+    let conflict = state.run_key_conflicts.values().next().unwrap();
+    assert_eq!(conflict.run_key, "sched:daily-etl:1736935200");
+    assert_eq!(conflict.existing_fingerprint, "fingerprint_v1");
+    assert_eq!(conflict.conflicting_fingerprint, "fingerprint_v2");
+}
+
+#[test]
+fn test_fold_run_requested_is_idempotent_on_same_fingerprint() {
+    let mut state = FoldState::new();
+
+    let event = run_requested_event("sched:daily-etl:1736935200", "fingerprint_v1");
+
+    // Process twice
+    state.fold_event(&event.clone());
+    let index_after_first = state.run_key_index.len();
+
+    state.fold_event(&event);
+    let index_after_second = state.run_key_index.len();
+
+    // Should not create duplicate entry
+    assert_eq!(
+        index_after_first, index_after_second,
+        "duplicate event should not create new index entry"
+    );
+    assert!(
+        state.run_key_conflicts.is_empty(),
+        "same fingerprint should not create conflict"
+    );
 }

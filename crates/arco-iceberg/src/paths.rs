@@ -6,7 +6,7 @@ use crate::error::{IcebergError, IcebergResult};
 ///
 /// Accepts absolute URIs (e.g. `gs://bucket/tenant=.../workspace=.../path`)
 /// and scoped locations, returning a path relative to the tenant/workspace scope.
-pub(crate) fn resolve_metadata_path(
+pub fn resolve_metadata_path(
     location: &str,
     tenant: &str,
     workspace: &str,

@@ -121,6 +121,11 @@ resource "google_cloud_run_v2_service" "api" {
         value = var.environment
       }
 
+      env {
+        name  = "ARCO_CODE_VERSION"
+        value = var.api_code_version
+      }
+
       # JWT secret from Secret Manager (if configured)
       dynamic "env" {
         for_each = var.jwt_secret_name != "" ? [1] : []

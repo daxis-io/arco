@@ -33,6 +33,12 @@ variable "api_image" {
   type        = string
 }
 
+variable "api_code_version" {
+  description = "Code version stamped on runs (e.g., git SHA or release tag)"
+  type        = string
+  default     = ""
+}
+
 variable "compactor_image" {
   description = "Container image for Arco Compactor service"
   type        = string

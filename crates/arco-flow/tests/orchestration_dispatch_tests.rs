@@ -39,6 +39,7 @@ async fn dispatch_e2e_loop_creates_outbox_and_enqueued_event() -> Result<()> {
             root_assets: vec![],
             run_key: None,
             labels: std::collections::HashMap::new(),
+            code_version: None,
         },
     );
 

@@ -17,6 +17,7 @@ fn test_event_envelope_serialization() {
             root_assets: vec!["analytics.daily_summary".into()],
             run_key: None,
             labels: std::collections::HashMap::new(),
+            code_version: None,
         },
     );
 
@@ -43,6 +44,7 @@ fn test_run_triggered_idempotency_key() {
             root_assets: vec!["analytics.daily_summary".into()],
             run_key: Some("daily-etl:2025-01-15".into()),
             labels: std::collections::HashMap::new(),
+            code_version: None,
         },
     );
 
@@ -243,6 +245,7 @@ fn test_event_version_is_set() {
             root_assets: vec![],
             run_key: None,
             labels: std::collections::HashMap::new(),
+            code_version: None,
         },
     );
 

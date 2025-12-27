@@ -21,15 +21,16 @@ use crate::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
 
 use super::fold::{
     FoldState, merge_dep_satisfaction_rows, merge_dispatch_outbox_rows,
-    merge_idempotency_key_rows, merge_run_rows, merge_sensor_eval_rows,
-    merge_sensor_state_rows, merge_task_rows, merge_timer_rows,
+    merge_idempotency_key_rows, merge_partition_status_rows, merge_run_rows,
+    merge_sensor_eval_rows, merge_sensor_state_rows, merge_task_rows, merge_timer_rows,
 };
 use super::manifest::{
     EventRange, L0Delta, OrchestrationManifest, RowCounts, TablePaths, Watermarks,
 };
 use super::parquet_util::{
-    write_dep_satisfaction, write_dispatch_outbox, write_idempotency_keys, write_runs,
-    write_sensor_evals, write_sensor_state, write_tasks, write_timers,
+    read_partition_status, write_dep_satisfaction, write_dispatch_outbox, write_idempotency_keys,
+    write_partition_status, write_runs, write_sensor_evals, write_sensor_state, write_tasks,
+    write_timers,
 };
 
 const SENSOR_EVAL_RETENTION_DAYS: i64 = 30;
@@ -42,6 +43,7 @@ const IDEMPOTENCY_KEY_RETENTION_DAYS: i64 = 30;
 #[derive(Clone)]
 pub struct MicroCompactor {
     storage: ScopedStorage,
+    tenant_secret: Vec<u8>,
 }
 
 /// Result of a micro-compaction run.
@@ -59,7 +61,19 @@ impl MicroCompactor {
     /// Creates a new micro-compactor.
     #[must_use]
     pub fn new(storage: ScopedStorage) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            tenant_secret: Vec::new(),
+        }
+    }
+
+    /// Creates a new micro-compactor with a tenant HMAC secret.
+    #[must_use]
+    pub fn with_tenant_secret(storage: ScopedStorage, tenant_secret: Vec<u8>) -> Self {
+        Self {
+            storage,
+            tenant_secret,
+        }
     }
 
     /// Loads the current manifest and fold state (base snapshot + L0 deltas).
@@ -72,7 +86,8 @@ impl MicroCompactor {
     /// Returns an error if the manifest or Parquet files cannot be read.
     pub async fn load_state(&self) -> Result<(OrchestrationManifest, FoldState)> {
         let (manifest, _) = self.read_manifest_with_version().await?;
-        let state = self.load_current_state(&manifest).await?;
+        let mut state = self.load_current_state(&manifest).await?;
+        state.tenant_secret = self.tenant_secret.clone();
         Ok((manifest, state))
     }
 
@@ -109,6 +124,7 @@ impl MicroCompactor {
 
         // Load current fold state from base + L0 deltas
         let mut state = self.load_current_state(&manifest).await?;
+        state.tenant_secret = self.tenant_secret.clone();
         let base_state = state.clone();
 
         // Process events
@@ -169,6 +185,7 @@ impl MicroCompactor {
             dispatch_outbox: u32::try_from(delta_state.dispatch_outbox.len()).unwrap_or(u32::MAX),
             sensor_state: u32::try_from(delta_state.sensor_state.len()).unwrap_or(u32::MAX),
             sensor_evals: u32::try_from(delta_state.sensor_evals.len()).unwrap_or(u32::MAX),
+            partition_status: u32::try_from(delta_state.partition_status.len()).unwrap_or(u32::MAX),
             idempotency_keys: u32::try_from(delta_state.idempotency_keys.len()).unwrap_or(u32::MAX),
         };
 
@@ -346,6 +363,15 @@ impl MicroCompactor {
             }
         }
 
+        if let Some(ref partition_status_path) = tables.partition_status {
+            let data = self.storage.get_raw(partition_status_path).await?;
+            let rows = read_partition_status(&data)?;
+            for row in rows {
+                let key = (row.asset_key.clone(), row.partition_key.clone());
+                state.partition_status.insert(key, row);
+            }
+        }
+
         if let Some(ref idempotency_keys_path) = tables.idempotency_keys {
             let data = self.storage.get_raw(idempotency_keys_path).await?;
             let rows = super::parquet_util::read_idempotency_keys(&data)?;
@@ -429,6 +455,14 @@ impl MicroCompactor {
             paths.sensor_evals = Some(path);
         }
 
+        if !state.partition_status.is_empty() {
+            let rows: Vec<_> = state.partition_status.values().cloned().collect();
+            let bytes = write_partition_status(&rows)?;
+            let path = format!("{base_path}/partition_status.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.partition_status = Some(path);
+        }
+
         if !state.idempotency_keys.is_empty() {
             let rows: Vec<_> = state.idempotency_keys.values().cloned().collect();
             let bytes = write_idempotency_keys(&rows)?;
@@ -486,6 +520,7 @@ impl MicroCompactor {
 }
 
 /// Merges two fold states, preferring newer row versions.
+#[allow(clippy::too_many_lines)]
 fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
     let mut merged = base;
 
@@ -588,6 +623,21 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
             .or_insert(row);
     }
 
+    // Merge partition status
+    for (key, row) in delta.partition_status {
+        merged
+            .partition_status
+            .entry(key)
+            .and_modify(|existing| {
+                if let Some(merged_row) =
+                    merge_partition_status_rows(vec![existing.clone(), row.clone()])
+                {
+                    *existing = merged_row;
+                }
+            })
+            .or_insert(row);
+    }
+
     // Merge idempotency keys
     for (idempotency_key, row) in delta.idempotency_keys {
         merged
@@ -653,6 +703,12 @@ fn delta_from_states(base: &FoldState, current: &FoldState) -> FoldState {
         }
     }
 
+    for (key, row) in &current.partition_status {
+        if base.partition_status.get(key) != Some(row) {
+            delta.partition_status.insert(key.clone(), row.clone());
+        }
+    }
+
     for (idempotency_key, row) in &current.idempotency_keys {
         if base.idempotency_keys.get(idempotency_key) != Some(row) {
             delta
@@ -672,6 +728,7 @@ fn delta_state_is_empty(state: &FoldState) -> bool {
         && state.dispatch_outbox.is_empty()
         && state.sensor_state.is_empty()
         && state.sensor_evals.is_empty()
+        && state.partition_status.is_empty()
         && state.idempotency_keys.is_empty()
 }
 
@@ -766,6 +823,7 @@ mod tests {
                 root_assets: vec!["analytics.report".to_string()],
                 run_key: None,
                 labels: HashMap::new(),
+                code_version: None,
             },
             "evt_01_run_triggered",
         )
@@ -1092,6 +1150,7 @@ mod tests {
         assert_eq!(latest.row_counts.dispatch_outbox, 0);
         assert_eq!(latest.row_counts.sensor_state, 0);
         assert_eq!(latest.row_counts.sensor_evals, 0);
+        assert_eq!(latest.row_counts.partition_status, 0);
         // Each event records an idempotency key; this delta has 1 TaskStarted event
         assert_eq!(latest.row_counts.idempotency_keys, 1);
 

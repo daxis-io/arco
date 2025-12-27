@@ -57,6 +57,12 @@ pub struct TaskState {
     pub attempt_id: String,
     /// Run ID this task belongs to.
     pub run_id: String,
+    /// Asset key for this task (if any).
+    pub asset_key: Option<String>,
+    /// Partition key for this task (if any).
+    pub partition_key: Option<String>,
+    /// Code version for the run (if available).
+    pub code_version: Option<String>,
     /// Whether cancellation has been requested.
     pub cancel_requested: bool,
 }
@@ -672,10 +678,9 @@ where
             metrics,
             cancelled_during_phase,
             partial_progress,
-            // TODO: Thread asset/partition info from task metadata
-            asset_key: None,
-            partition_key: None,
-            code_version: None,
+            asset_key: state.asset_key.clone(),
+            partition_key: state.partition_key.clone(),
+            code_version: state.code_version.clone(),
         },
     );
     event.timestamp = completed_at.unwrap_or_else(Utc::now);
@@ -784,6 +789,9 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                asset_key: Some("analytics.daily".to_string()),
+                partition_key: Some("2025-01-15".to_string()),
+                code_version: Some("v1.2.3".to_string()),
                 cancel_requested: false,
             },
         );
@@ -850,6 +858,9 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
                 cancel_requested: false,
             },
         );
@@ -886,6 +897,9 @@ mod tests {
                 attempt: 2,
                 attempt_id: "att-2".to_string(),
                 run_id: "run-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
                 cancel_requested: false,
             },
         );
@@ -924,6 +938,9 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                asset_key: Some("analytics.daily".to_string()),
+                partition_key: Some("2025-01-15".to_string()),
+                code_version: Some("v1.2.3".to_string()),
                 cancel_requested: false,
             },
         );
@@ -962,6 +979,9 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
                 cancel_requested: true,
             },
         );
@@ -999,6 +1019,9 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
                 cancel_requested: true, // Cancellation requested
             },
         );
@@ -1039,6 +1062,9 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
                 cancel_requested: false,
             },
         );
@@ -1077,6 +1103,9 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
                 cancel_requested: false,
             },
         );
@@ -1115,6 +1144,9 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
                 cancel_requested: false,
             },
         );
@@ -1154,6 +1186,9 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
                 cancel_requested: false,
             },
         );
@@ -1199,6 +1234,9 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                asset_key: Some("analytics.daily".to_string()),
+                partition_key: Some("2025-01-15".to_string()),
+                code_version: Some("v1.2.3".to_string()),
                 cancel_requested: false,
             },
         );
@@ -1236,6 +1274,19 @@ mod tests {
         let events = ledger.events.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "TaskFinished");
+        if let OrchestrationEventData::TaskFinished {
+            asset_key,
+            partition_key,
+            code_version,
+            ..
+        } = &events[0].data
+        {
+            assert_eq!(asset_key.as_deref(), Some("analytics.daily"));
+            assert_eq!(partition_key.as_deref(), Some("2025-01-15"));
+            assert_eq!(code_version.as_deref(), Some("v1.2.3"));
+        } else {
+            panic!("Expected TaskFinished event");
+        }
     }
 
     #[tokio::test]
@@ -1252,6 +1303,9 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
                 cancel_requested: false,
             },
         );
@@ -1294,6 +1348,9 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
                 cancel_requested: false,
             },
         );
@@ -1342,6 +1399,9 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
                 cancel_requested: false,
             },
         );

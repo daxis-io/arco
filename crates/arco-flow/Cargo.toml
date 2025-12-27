@@ -18,7 +18,7 @@ workspace = true
 [features]
 default = []
 full = ["gcp", "aws", "azure"]
-gcp = ["arco-core/gcp", "dep:reqwest", "dep:gcp_auth", "dep:base64"]
+gcp = ["arco-core/gcp", "dep:reqwest", "dep:gcp_auth"]
 aws = ["arco-core/aws"]
 azure = ["arco-core/azure"]
 test-utils = ["arco-core/test-utils", "dep:proptest", "dep:tempfile"]
@@ -73,7 +73,7 @@ tempfile = { workspace = true, optional = true }
 # Optional GCP Cloud Tasks support
 reqwest = { workspace = true, optional = true }
 gcp_auth = { workspace = true, optional = true }
-base64 = { workspace = true, optional = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

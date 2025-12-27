@@ -433,15 +433,17 @@ impl TaskStateLookup for ParquetTaskStateLookup {
             let Some(row) = matches.first() else {
                 return Ok(None);
             };
-            let cancel_requested = state
-                .runs
-                .get(&row.run_id)
-                .is_some_and(|run| run.cancel_requested);
+            let run = state.runs.get(&row.run_id);
+            let cancel_requested = run.is_some_and(|run| run.cancel_requested);
+            let code_version = run.and_then(|run| run.code_version.clone());
             Ok(Some(CallbackTaskState {
                 state: fold_task_state_label(row.state).to_string(),
                 attempt: row.attempt,
                 attempt_id: row.attempt_id.clone().unwrap_or_default(),
                 run_id: row.run_id.clone(),
+                asset_key: row.asset_key.clone(),
+                partition_key: row.partition_key.clone(),
+                code_version,
                 cancel_requested,
             }))
         }

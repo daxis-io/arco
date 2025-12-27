@@ -8,6 +8,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 
 use arco_core::ScopedStorage;
@@ -111,6 +113,50 @@ fn log_format_from_env() -> LogFormat {
     }
 }
 
+fn parse_bool_env(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
+fn load_tenant_secret() -> Result<Vec<u8>> {
+    let require_secret = parse_bool_env("ARCO_REQUIRE_TENANT_SECRET");
+    let raw = std::env::var("ARCO_TENANT_SECRET_B64").ok();
+    let secret = match raw {
+        Some(value) => match STANDARD.decode(value.as_bytes()) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "invalid ARCO_TENANT_SECRET_B64; using empty secret"
+                );
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+
+    if secret.is_empty() {
+        if require_secret {
+            return Err(Error::configuration(
+                "ARCO_TENANT_SECRET_B64 required when ARCO_REQUIRE_TENANT_SECRET=true",
+            ));
+        }
+        if !cfg!(test) {
+            tracing::warn!(
+                "ARCO_TENANT_SECRET_B64 not set; run_id HMAC uses empty secret"
+            );
+        }
+    }
+
+    Ok(secret)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging(log_format_from_env());
@@ -119,13 +165,14 @@ async fn main() -> Result<()> {
     let workspace_id = required_env("ARCO_WORKSPACE_ID")?;
     let bucket = required_env("ARCO_STORAGE_BUCKET")?;
     let port = resolve_port()?;
+    let tenant_secret = load_tenant_secret()?;
 
     let backend = ObjectStoreBackend::from_bucket(&bucket)?;
     let backend: Arc<dyn StorageBackend> = Arc::new(backend);
     let storage = ScopedStorage::new(backend, tenant_id, workspace_id)?;
 
     let state = AppState {
-        compactor: MicroCompactor::new(storage),
+        compactor: MicroCompactor::with_tenant_secret(storage, tenant_secret),
     };
 
     let app = Router::new()

@@ -171,6 +171,7 @@ mod tests {
                 root_assets: vec!["analytics.daily_report".to_string()],
                 run_key: None,
                 labels: std::collections::HashMap::new(),
+                code_version: None,
             },
         )
     }

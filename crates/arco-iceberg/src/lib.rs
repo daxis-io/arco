@@ -45,6 +45,7 @@ pub mod commit;
 pub mod context;
 pub mod error;
 pub mod events;
+pub mod gc;
 pub mod idempotency;
 pub mod metrics;
 pub mod openapi;
@@ -52,6 +53,7 @@ pub mod pointer;
 pub(crate) mod paths;
 pub mod reconciler;
 pub mod router;
+pub mod schema_projection;
 pub mod state;
 pub mod types;
 
@@ -60,11 +62,35 @@ pub mod routes;
 
 /// Prelude module for convenient imports.
 pub mod prelude {
+    // Error types
     pub use crate::error::{IcebergError, IcebergResult};
+
+    // Pointer and idempotency
     pub use crate::idempotency::{IdempotencyMarker, IdempotencyStatus};
-    pub use crate::pointer::IcebergTablePointer;
+    pub use crate::pointer::{IcebergTablePointer, PointerStore};
+
+    // Router and state
     pub use crate::router::iceberg_router;
     pub use crate::state::{CredentialProvider, IcebergConfig, IcebergState};
+
+    // Events
+    pub use crate::events::{CommittedReceipt, PendingReceipt};
+
+    // Reconciler
+    pub use crate::reconciler::{
+        IcebergReconciler, ReconciliationReport, Reconciler, TableReconciliationResult,
+    };
+
+    // GC
+    pub use crate::gc::{
+        EventReceiptGarbageCollector, IdempotencyGarbageCollector, MetadataGcPlan,
+        MetadataGcPlanner, MetadataGcResult, MetadataRetentionPolicy, OrphanMetadataCleaner,
+    };
+
+    // Schema projection
+    pub use crate::schema_projection::{ColumnRecord, IcebergTypeMapper, SchemaProjector};
+
+    // All types
     pub use crate::types::*;
 }
 
@@ -74,3 +100,15 @@ pub use openapi::{IcebergApiDoc, openapi, openapi_json};
 pub use pointer::IcebergTablePointer;
 pub use router::iceberg_router;
 pub use state::{CredentialProvider, IcebergConfig, IcebergState};
+
+// Re-export reconciler types
+pub use reconciler::{IcebergReconciler, ReconciliationReport, Reconciler};
+
+// Re-export GC types
+pub use gc::{
+    EventReceiptGarbageCollector, IdempotencyGarbageCollector, MetadataGcPlan, MetadataGcPlanner,
+    MetadataGcResult, MetadataRetentionPolicy, OrphanMetadataCleaner,
+};
+
+// Re-export schema projection types
+pub use schema_projection::{ColumnRecord, IcebergTypeMapper, SchemaProjector};

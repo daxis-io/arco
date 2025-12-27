@@ -469,6 +469,7 @@ async fn append_run_events(
     plan_id: &str,
     run_key: Option<String>,
     labels: HashMap<String, String>,
+    code_version: Option<String>,
     root_assets: Vec<String>,
     tasks: Vec<TaskDef>,
     overrides: Option<RunEventOverrides>,
@@ -483,6 +484,7 @@ async fn append_run_events(
             root_assets,
             run_key,
             labels,
+            code_version,
         },
     );
 
@@ -880,6 +882,7 @@ pub(crate) async fn trigger_run(
                         &existing.plan_id,
                         Some(existing.run_key.clone()),
                         request.labels.clone(),
+                        state.config.code_version.clone(),
                         root_assets.clone(),
                         tasks.clone(),
                         Some(RunEventOverrides {
@@ -935,6 +938,7 @@ pub(crate) async fn trigger_run(
         &plan_id,
         request.run_key.clone(),
         request.labels.clone(),
+        state.config.code_version.clone(),
         root_assets,
         tasks,
         run_event_overrides,
@@ -1835,6 +1839,7 @@ mod tests {
                 root_assets: vec!["analytics/users".to_string()],
                 run_key: Some(reservation.run_key.clone()),
                 labels: request.labels.clone(),
+                code_version: None,
             },
         );
         apply_event_metadata(

@@ -10,6 +10,7 @@ environment = "dev"
 # Container images (update with your registry)
 api_image       = "gcr.io/your-project/arco-api:latest"
 compactor_image = "gcr.io/your-project/arco-compactor:latest"
+api_code_version = "local-dev"
 
 # Cloud Run scaling (dev: scale to zero)
 api_min_instances       = 0

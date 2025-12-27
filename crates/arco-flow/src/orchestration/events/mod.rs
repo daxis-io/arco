@@ -241,6 +241,9 @@ pub enum OrchestrationEventData {
         /// Optional labels for the run.
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         labels: HashMap<String, String>,
+        /// Code version for this run (e.g., deployment version or git SHA).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code_version: Option<String>,
     },
 
     /// Plan has been created with task graph.
@@ -842,6 +845,7 @@ mod tests {
                 root_assets: vec!["asset1".into()],
                 run_key: None,
                 labels: HashMap::new(),
+                code_version: None,
             },
         );
 
@@ -863,6 +867,7 @@ mod tests {
             root_assets: vec![],
             run_key: Some("daily:2025-01-15".into()),
             labels: HashMap::new(),
+            code_version: None,
         };
 
         assert_eq!(data.idempotency_key(), "run:daily:2025-01-15");

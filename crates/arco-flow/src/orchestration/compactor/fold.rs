@@ -305,7 +305,7 @@ impl TimerRow {
 // Cloud Tasks ID Generation (ADR-021)
 // ============================================================================
 
-use crate::orchestration::ids::cloud_task_id;
+use crate::orchestration::ids::{cloud_task_id, run_id_from_run_key};
 
 /// Generates a Cloud Tasks-safe dispatch ID.
 #[must_use]
@@ -406,6 +406,9 @@ pub struct RunRow {
     /// Run labels (optional metadata).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
+    /// Code version for this run (e.g., deployment version or git SHA).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_version: Option<String>,
     /// Whether cancellation has been requested.
     #[serde(default)]
     pub cancel_requested: bool,
@@ -993,6 +996,13 @@ pub struct FoldState {
     // ========================================================================
     /// Idempotency key index keyed by `idempotency_key`.
     pub idempotency_keys: HashMap<String, IdempotencyKeyRow>,
+
+    // ========================================================================
+    // Configuration
+    // ========================================================================
+    /// Tenant secret for HMAC-based run_id generation.
+    /// Default is empty (for testing); should be set in production.
+    pub tenant_secret: Vec<u8>,
 }
 
 impl FoldState {
@@ -1050,6 +1060,7 @@ impl FoldState {
                 plan_id,
                 run_key,
                 labels,
+                code_version,
                 ..
             } => {
                 self.fold_run_triggered(
@@ -1057,6 +1068,7 @@ impl FoldState {
                     plan_id,
                     run_key.clone(),
                     labels.clone(),
+                    code_version.clone(),
                     &event.event_id,
                     event.timestamp,
                 );
@@ -1272,12 +1284,28 @@ impl FoldState {
                 );
             }
 
-            // Layer 2 automation events - stubs for remaining events
+            // Layer 2 automation events
             OrchestrationEventData::RunRequested {
-                trigger_source_ref, ..
+                run_key,
+                request_fingerprint,
+                asset_selection,
+                partition_selection,
+                trigger_source_ref,
+                labels,
             } => {
                 if !self.should_drop_run_requested(trigger_source_ref) {
-                    // TODO(Task 6.1): Implement fold_run_requested (run_id + projection).
+                    self.fold_run_requested(
+                        &event.tenant_id,
+                        &event.workspace_id,
+                        run_key,
+                        request_fingerprint,
+                        asset_selection,
+                        partition_selection.as_ref(),
+                        trigger_source_ref,
+                        labels,
+                        event.timestamp,
+                        &event.event_id,
+                    );
                 }
             }
             OrchestrationEventData::BackfillCreated {
@@ -1394,12 +1422,14 @@ impl FoldState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fold_run_triggered(
         &mut self,
         run_id: &str,
         plan_id: &str,
         run_key: Option<String>,
         labels: HashMap<String, String>,
+        code_version: Option<String>,
         event_id: &str,
         timestamp: DateTime<Utc>,
     ) {
@@ -1414,6 +1444,7 @@ impl FoldState {
                 state: RunState::Triggered,
                 run_key,
                 labels,
+                code_version,
                 cancel_requested: false,
                 tasks_total: 0,
                 tasks_completed: 0,
@@ -2201,6 +2232,109 @@ impl FoldState {
     }
 
     // ========================================================================
+    // Layer 2: RunRequested Fold Logic
+    // ========================================================================
+
+    /// Fold a `RunRequested` event.
+    ///
+    /// Implements L2-INV-4 (idempotent) and L2-INV-5 (conflict detection):
+    /// - Same run_key + fingerprint = idempotent (no-op)
+    /// - Same run_key + different fingerprint = conflict recorded
+    /// - New run_key = creates run_key_index entry
+    ///
+    /// Note: This creates the run_key_index entry for deduplication and conflict
+    /// detection. The actual RunRow is created by fold_run_triggered when the
+    /// run is actually triggered (with a plan_id).
+    #[allow(clippy::too_many_arguments)]
+    fn fold_run_requested(
+        &mut self,
+        tenant_id: &str,
+        workspace_id: &str,
+        run_key: &str,
+        request_fingerprint: &str,
+        _asset_selection: &[String],
+        _partition_selection: Option<&Vec<String>>,
+        trigger_source_ref: &SourceRef,
+        _labels: &HashMap<String, String>,
+        timestamp: DateTime<Utc>,
+        event_id: &str,
+    ) {
+        // Check if run_key already exists
+        if let Some(existing) = self.run_key_index.get(run_key) {
+            // Check for fingerprint conflict
+            if existing.request_fingerprint != request_fingerprint {
+                // Conflict: same run_key but different fingerprint
+                let conflict_id = format!("conflict:{run_key}:{event_id}");
+                self.run_key_conflicts.insert(
+                    conflict_id.clone(),
+                    RunKeyConflictRow {
+                        tenant_id: tenant_id.to_string(),
+                        workspace_id: workspace_id.to_string(),
+                        run_key: run_key.to_string(),
+                        existing_fingerprint: existing.request_fingerprint.clone(),
+                        conflicting_fingerprint: request_fingerprint.to_string(),
+                        conflicting_event_id: event_id.to_string(),
+                        detected_at: timestamp,
+                    },
+                );
+            }
+            // Same fingerprint = idempotent, skip
+            return;
+        }
+
+        // Generate deterministic run_id using HMAC
+        let run_id = run_id_from_run_key(
+            tenant_id,
+            workspace_id,
+            run_key,
+            &self.tenant_secret,
+        );
+
+        // Create run_key_index entry (the actual RunRow is created by RunTriggered)
+        self.run_key_index.insert(
+            run_key.to_string(),
+            RunKeyIndexRow {
+                tenant_id: tenant_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                run_key: run_key.to_string(),
+                run_id: run_id.clone(),
+                request_fingerprint: request_fingerprint.to_string(),
+                created_at: timestamp,
+                row_version: event_id.to_string(),
+            },
+        );
+
+        // Correlate back to source (schedule tick, sensor eval, or backfill chunk)
+        self.correlate_run_to_source(run_key, &run_id, trigger_source_ref);
+    }
+
+    /// Correlates a run_id back to its trigger source.
+    fn correlate_run_to_source(&mut self, _run_key: &str, run_id: &str, source: &SourceRef) {
+        match source {
+            SourceRef::Schedule { tick_id, .. } => {
+                if let Some(tick) = self.schedule_ticks.get_mut(tick_id) {
+                    tick.run_id = Some(run_id.to_string());
+                }
+            }
+            SourceRef::Backfill { chunk_id, .. } => {
+                if let Some(chunk) = self.backfill_chunks.get_mut(chunk_id) {
+                    chunk.run_id = Some(run_id.to_string());
+                }
+            }
+            SourceRef::Sensor { eval_id, .. } => {
+                if let Some(eval) = self.sensor_evals.get_mut(eval_id) {
+                    // The eval already has run_requests tracked, but we could
+                    // add additional correlation if needed.
+                    let _ = eval; // Avoid unused warning
+                }
+            }
+            SourceRef::Manual { .. } => {
+                // Manual triggers don't need correlation back
+            }
+        }
+    }
+
+    // ========================================================================
     // Layer 2: Backfill Fold Logic
     // ========================================================================
 
@@ -2747,6 +2881,18 @@ pub fn merge_idempotency_key_rows(rows: Vec<IdempotencyKeyRow>) -> Option<Idempo
         })
 }
 
+/// Merges partition status rows from base snapshot and L0 deltas.
+#[must_use]
+pub fn merge_partition_status_rows(
+    rows: Vec<PartitionStatusRow>,
+) -> Option<PartitionStatusRow> {
+    rows.into_iter()
+        .reduce(|best, row| match row.row_version.cmp(&best.row_version) {
+            std::cmp::Ordering::Less => best,
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => row,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2769,6 +2915,7 @@ mod tests {
             root_assets: vec![],
             run_key: None,
             labels: HashMap::new(),
+            code_version: None,
         })
     }
 

@@ -302,6 +302,7 @@ mod tests {
             state: RunState::Running,
             run_key: None,
             labels: std::collections::HashMap::new(),
+            code_version: None,
             cancel_requested,
             tasks_total: 1,
             tasks_completed: 0,

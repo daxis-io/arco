@@ -8,6 +8,7 @@
 //! - `dispatch_outbox.parquet`
 //! - `sensor_state.parquet`
 //! - `sensor_evals.parquet`
+//! - `partition_status.parquet`
 //! - `idempotency_keys.parquet`
 //!
 //! These schemas are the contract for orchestration controllers reading state.
@@ -28,11 +29,13 @@ use parquet::format::KeyValue;
 
 use super::fold::{
     DepResolution, DepSatisfactionRow, DispatchOutboxRow, DispatchStatus, IdempotencyKeyRow,
-    RunRow, RunState, SensorEvalRow, SensorStateRow, TaskRow, TaskState, TimerRow, TimerState,
-    TimerType,
+    PartitionStatusRow, RunRow, RunState, SensorEvalRow, SensorStateRow, TaskRow, TaskState,
+    TimerRow, TimerState, TimerType,
 };
 use crate::error::{Error, Result};
-use crate::orchestration::events::{RunRequest, SensorEvalStatus, SensorStatus, TriggerSource};
+use crate::orchestration::events::{
+    RunRequest, SensorEvalStatus, SensorStatus, TaskOutcome, TriggerSource,
+};
 
 // ============================================================================
 // Schema Definitions
@@ -54,6 +57,7 @@ fn runs_schema() -> Arc<Schema> {
         Field::new("triggered_at", DataType::Int64, false),
         Field::new("completed_at", DataType::Int64, true),
         Field::new("labels", DataType::Utf8, true),
+        Field::new("code_version", DataType::Utf8, true),
         Field::new("row_version", DataType::Utf8, false),
     ]))
 }
@@ -154,6 +158,25 @@ fn sensor_evals_schema() -> Arc<Schema> {
     ]))
 }
 
+fn partition_status_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("tenant_id", DataType::Utf8, false),
+        Field::new("workspace_id", DataType::Utf8, false),
+        Field::new("asset_key", DataType::Utf8, false),
+        Field::new("partition_key", DataType::Utf8, false),
+        Field::new("last_materialization_run_id", DataType::Utf8, true),
+        Field::new("last_materialization_at", DataType::Int64, true),
+        Field::new("last_materialization_code_version", DataType::Utf8, true),
+        Field::new("last_attempt_run_id", DataType::Utf8, true),
+        Field::new("last_attempt_at", DataType::Int64, true),
+        Field::new("last_attempt_outcome", DataType::Utf8, true),
+        Field::new("stale_since", DataType::Int64, true),
+        Field::new("stale_reason_code", DataType::Utf8, true),
+        Field::new("partition_values", DataType::Utf8, true),
+        Field::new("row_version", DataType::Utf8, false),
+    ]))
+}
+
 fn idempotency_keys_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("tenant_id", DataType::Utf8, false),
@@ -210,6 +233,12 @@ pub fn sensor_state_parquet_schema() -> Schema {
 #[must_use]
 pub fn sensor_evals_parquet_schema() -> Schema {
     (*sensor_evals_schema()).clone()
+}
+
+/// Returns the `partition_status` schema for golden file comparison.
+#[must_use]
+pub fn partition_status_parquet_schema() -> Schema {
+    (*partition_status_schema()).clone()
 }
 
 /// Returns the Parquet schema for idempotency keys table.
@@ -311,6 +340,11 @@ pub fn write_runs(rows: &[RunRow]) -> Result<Bytes> {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::parquet(format!("failed to serialize run labels: {e}")))?;
     let labels = StringArray::from(labels);
+    let code_versions = StringArray::from(
+        rows.iter()
+            .map(|r| r.code_version.as_deref())
+            .collect::<Vec<_>>(),
+    );
     let row_versions = StringArray::from(
         rows.iter()
             .map(|r| Some(r.row_version.as_str()))
@@ -334,6 +368,7 @@ pub fn write_runs(rows: &[RunRow]) -> Result<Bytes> {
             Arc::new(triggered_at),
             Arc::new(completed_at),
             Arc::new(labels),
+            Arc::new(code_versions),
             Arc::new(row_versions),
         ],
     )
@@ -826,6 +861,116 @@ pub fn write_sensor_evals(rows: &[SensorEvalRow]) -> Result<Bytes> {
     write_single_batch(schema, &batch)
 }
 
+/// Writes `partition_status.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet serialization fails.
+pub fn write_partition_status(rows: &[PartitionStatusRow]) -> Result<Bytes> {
+    let schema = partition_status_schema();
+
+    let tenant_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.tenant_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let workspace_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.workspace_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let asset_keys = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.asset_key.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let partition_keys = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.partition_key.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let last_materialization_run_ids = StringArray::from(
+        rows.iter()
+            .map(|r| r.last_materialization_run_id.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let last_materialization_at = Int64Array::from(
+        rows.iter()
+            .map(|r| r.last_materialization_at.map(|t| t.timestamp_millis()))
+            .collect::<Vec<_>>(),
+    );
+    let last_materialization_code_versions = StringArray::from(
+        rows.iter()
+            .map(|r| r.last_materialization_code_version.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let last_attempt_run_ids = StringArray::from(
+        rows.iter()
+            .map(|r| r.last_attempt_run_id.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let last_attempt_at = Int64Array::from(
+        rows.iter()
+            .map(|r| r.last_attempt_at.map(|t| t.timestamp_millis()))
+            .collect::<Vec<_>>(),
+    );
+    let last_attempt_outcomes = StringArray::from(
+        rows.iter()
+            .map(|r| r.last_attempt_outcome.map(task_outcome_to_str))
+            .collect::<Vec<_>>(),
+    );
+    let stale_since = Int64Array::from(
+        rows.iter()
+            .map(|r| r.stale_since.map(|t| t.timestamp_millis()))
+            .collect::<Vec<_>>(),
+    );
+    let stale_reason_codes = StringArray::from(
+        rows.iter()
+            .map(|r| r.stale_reason_code.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let partition_values = rows
+        .iter()
+        .map(|r| {
+            if r.partition_values.is_empty() {
+                Ok(None)
+            } else {
+                serde_json::to_string(&r.partition_values).map(Some)
+            }
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::parquet(format!("failed to serialize partition values: {e}")))?;
+    let partition_values = StringArray::from(partition_values);
+    let row_versions = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.row_version.as_str()))
+            .collect::<Vec<_>>(),
+    );
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(tenant_ids),
+            Arc::new(workspace_ids),
+            Arc::new(asset_keys),
+            Arc::new(partition_keys),
+            Arc::new(last_materialization_run_ids),
+            Arc::new(last_materialization_at),
+            Arc::new(last_materialization_code_versions),
+            Arc::new(last_attempt_run_ids),
+            Arc::new(last_attempt_at),
+            Arc::new(last_attempt_outcomes),
+            Arc::new(stale_since),
+            Arc::new(stale_reason_codes),
+            Arc::new(partition_values),
+            Arc::new(row_versions),
+        ],
+    )
+    .map_err(|e| Error::parquet(format!("record batch build failed: {e}")))?;
+
+    write_single_batch(schema, &batch)
+}
+
 /// Writes `idempotency_keys.parquet`.
 ///
 /// # Errors
@@ -997,6 +1142,7 @@ pub fn read_runs(bytes: &Bytes) -> Result<Vec<RunRow>> {
         let triggered_at = col_i64(&batch, "triggered_at")?;
         let completed_at = col_i64(&batch, "completed_at")?;
         let labels = col_string_opt(&batch, "labels");
+        let code_version = col_string_opt(&batch, "code_version");
         let row_version = col_string(&batch, "row_version")?;
 
         for row in 0..batch.num_rows() {
@@ -1036,6 +1182,13 @@ pub fn read_runs(bytes: &Bytes) -> Result<Vec<RunRow>> {
                 } else {
                     Some(millis_to_datetime(completed_at.value(row)))
                 },
+                code_version: code_version.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
                 row_version: row_version.value(row).to_string(),
             });
         }
@@ -1065,8 +1218,8 @@ pub fn read_tasks(bytes: &Bytes) -> Result<Vec<TaskRow>> {
         let heartbeat_timeout_sec = col_u32(&batch, "heartbeat_timeout_sec")?;
         let last_heartbeat_at = col_i64(&batch, "last_heartbeat_at")?;
         let ready_at = col_i64(&batch, "ready_at")?;
-        let asset_key = col_string(&batch, "asset_key")?;
-        let partition_key = col_string(&batch, "partition_key")?;
+        let asset_key = col_string_opt(&batch, "asset_key");
+        let partition_key = col_string_opt(&batch, "partition_key");
         let row_version = col_string(&batch, "row_version")?;
 
         for row in 0..batch.num_rows() {
@@ -1115,16 +1268,20 @@ pub fn read_tasks(bytes: &Bytes) -> Result<Vec<TaskRow>> {
                 } else {
                     Some(millis_to_datetime(ready_at.value(row)))
                 },
-                asset_key: if asset_key.is_null(row) {
-                    None
-                } else {
-                    Some(asset_key.value(row).to_string())
-                },
-                partition_key: if partition_key.is_null(row) {
-                    None
-                } else {
-                    Some(partition_key.value(row).to_string())
-                },
+                asset_key: asset_key.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                partition_key: partition_key.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
                 row_version: row_version.value(row).to_string(),
             });
         }
@@ -1405,6 +1562,119 @@ pub fn read_sensor_evals(bytes: &Bytes) -> Result<Vec<SensorEvalRow>> {
     Ok(out)
 }
 
+/// Reads `partition_status.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet decoding fails or required columns are missing.
+#[allow(clippy::too_many_lines)]
+pub fn read_partition_status(bytes: &Bytes) -> Result<Vec<PartitionStatusRow>> {
+    let mut out = Vec::new();
+    for batch in read_batches(bytes)? {
+        let tenant_id = col_string(&batch, "tenant_id")?;
+        let workspace_id = col_string(&batch, "workspace_id")?;
+        let asset_key = col_string(&batch, "asset_key")?;
+        let partition_key = col_string(&batch, "partition_key")?;
+        let last_materialization_run_id = col_string_opt(&batch, "last_materialization_run_id");
+        let last_materialization_at = col_i64_opt(&batch, "last_materialization_at");
+        let last_materialization_code_version =
+            col_string_opt(&batch, "last_materialization_code_version");
+        let last_attempt_run_id = col_string_opt(&batch, "last_attempt_run_id");
+        let last_attempt_at = col_i64_opt(&batch, "last_attempt_at");
+        let last_attempt_outcome = col_string_opt(&batch, "last_attempt_outcome");
+        let stale_since = col_i64_opt(&batch, "stale_since");
+        let stale_reason_code = col_string_opt(&batch, "stale_reason_code");
+        let partition_values = col_string_opt(&batch, "partition_values");
+        let row_version = col_string(&batch, "row_version")?;
+
+        for row in 0..batch.num_rows() {
+            let partition_values = if let Some(col) = partition_values {
+                if col.is_null(row) {
+                    HashMap::new()
+                } else {
+                    serde_json::from_str::<HashMap<String, String>>(col.value(row)).map_err(|e| {
+                        Error::parquet(format!("failed to parse partition values: {e}"))
+                    })?
+                }
+            } else {
+                HashMap::new()
+            };
+
+            let last_attempt_outcome = if let Some(col) = last_attempt_outcome {
+                if col.is_null(row) {
+                    None
+                } else {
+                    Some(str_to_task_outcome(col.value(row))?)
+                }
+            } else {
+                None
+            };
+
+            out.push(PartitionStatusRow {
+                tenant_id: tenant_id.value(row).to_string(),
+                workspace_id: workspace_id.value(row).to_string(),
+                asset_key: asset_key.value(row).to_string(),
+                partition_key: partition_key.value(row).to_string(),
+                last_materialization_run_id: last_materialization_run_id.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                last_materialization_at: last_materialization_at.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(millis_to_datetime(col.value(row)))
+                    }
+                }),
+                last_materialization_code_version: last_materialization_code_version
+                    .as_ref()
+                    .and_then(|col| {
+                        if col.is_null(row) {
+                            None
+                        } else {
+                            Some(col.value(row).to_string())
+                        }
+                    }),
+                last_attempt_run_id: last_attempt_run_id.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                last_attempt_at: last_attempt_at.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(millis_to_datetime(col.value(row)))
+                    }
+                }),
+                last_attempt_outcome,
+                stale_since: stale_since.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(millis_to_datetime(col.value(row)))
+                    }
+                }),
+                stale_reason_code: stale_reason_code.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                partition_values,
+                row_version: row_version.value(row).to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Reads `idempotency_keys.parquet`.
 ///
 /// # Errors
@@ -1489,6 +1759,25 @@ fn str_to_task_state(s: &str) -> Result<TaskState> {
         "FAILED" => Ok(TaskState::Failed),
         "SUCCEEDED" => Ok(TaskState::Succeeded),
         _ => Err(Error::parquet(format!("unknown task state '{s}'"))),
+    }
+}
+
+fn task_outcome_to_str(outcome: TaskOutcome) -> &'static str {
+    match outcome {
+        TaskOutcome::Succeeded => "SUCCEEDED",
+        TaskOutcome::Failed => "FAILED",
+        TaskOutcome::Skipped => "SKIPPED",
+        TaskOutcome::Cancelled => "CANCELLED",
+    }
+}
+
+fn str_to_task_outcome(s: &str) -> Result<TaskOutcome> {
+    match s {
+        "SUCCEEDED" => Ok(TaskOutcome::Succeeded),
+        "FAILED" => Ok(TaskOutcome::Failed),
+        "SKIPPED" => Ok(TaskOutcome::Skipped),
+        "CANCELLED" => Ok(TaskOutcome::Cancelled),
+        _ => Err(Error::parquet(format!("unknown task outcome '{s}'"))),
     }
 }
 
@@ -1586,7 +1875,7 @@ fn str_to_sensor_status(s: &str) -> Result<SensorStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn test_runs_roundtrip() {
@@ -1596,6 +1885,7 @@ mod tests {
             state: RunState::Running,
             run_key: Some("daily-etl:2025-01-15".to_string()),
             labels: HashMap::from([("team".to_string(), "analytics".to_string())]),
+            code_version: None,
             cancel_requested: false,
             tasks_total: 5,
             tasks_completed: 2,
@@ -1619,6 +1909,41 @@ mod tests {
         assert_eq!(
             parsed[0].labels.get("team").map(String::as_str),
             Some("analytics")
+        );
+    }
+
+    #[test]
+    fn test_partition_status_roundtrip() {
+        let mut partition_values = HashMap::new();
+        partition_values.insert("date".to_string(), "2025-01-15".to_string());
+
+        let rows = vec![PartitionStatusRow {
+            tenant_id: "tenant".to_string(),
+            workspace_id: "workspace".to_string(),
+            asset_key: "analytics.daily".to_string(),
+            partition_key: "2025-01-15".to_string(),
+            last_materialization_run_id: Some("run_01".to_string()),
+            last_materialization_at: Some(Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap()),
+            last_materialization_code_version: Some("v1".to_string()),
+            last_attempt_run_id: Some("run_02".to_string()),
+            last_attempt_at: Some(Utc.with_ymd_and_hms(2025, 1, 15, 11, 0, 0).unwrap()),
+            last_attempt_outcome: Some(TaskOutcome::Failed),
+            stale_since: None,
+            stale_reason_code: None,
+            partition_values,
+            row_version: "01HQXYZ789".to_string(),
+        }];
+
+        let bytes = write_partition_status(&rows).expect("write");
+        let parsed = read_partition_status(&bytes).expect("read");
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].asset_key, "analytics.daily");
+        assert_eq!(parsed[0].partition_key, "2025-01-15");
+        assert_eq!(parsed[0].last_attempt_outcome, Some(TaskOutcome::Failed));
+        assert_eq!(
+            parsed[0].partition_values.get("date").map(String::as_str),
+            Some("2025-01-15")
         );
     }
 
@@ -1866,6 +2191,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![0])),
                 Arc::new(Int64Array::from(vec![None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 Arc::new(StringArray::from(vec![Some("01A")])),
             ],
         )
@@ -1906,5 +2232,49 @@ mod tests {
         let bytes = write_single_batch(schema, &batch).expect("write");
         let err = read_tasks(&bytes).unwrap_err();
         assert!(err.to_string().contains("unknown task state"));
+    }
+
+    #[test]
+    fn test_read_tasks_defaults_asset_partition_when_missing_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("run_id", DataType::Utf8, false),
+            Field::new("task_key", DataType::Utf8, false),
+            Field::new("state", DataType::Utf8, false),
+            Field::new("attempt", DataType::UInt32, false),
+            Field::new("attempt_id", DataType::Utf8, true),
+            Field::new("deps_total", DataType::UInt32, false),
+            Field::new("deps_satisfied_count", DataType::UInt32, false),
+            Field::new("max_attempts", DataType::UInt32, false),
+            Field::new("heartbeat_timeout_sec", DataType::UInt32, false),
+            Field::new("last_heartbeat_at", DataType::Int64, true),
+            Field::new("ready_at", DataType::Int64, true),
+            Field::new("row_version", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("run_01")])),
+                Arc::new(StringArray::from(vec![Some("extract")])),
+                Arc::new(StringArray::from(vec![Some("READY")])),
+                Arc::new(UInt32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![Some("att_01")])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![3])),
+                Arc::new(UInt32Array::from(vec![300])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(StringArray::from(vec![Some("01A")])),
+            ],
+        )
+        .expect("record batch");
+
+        let bytes = write_single_batch(schema, &batch).expect("write");
+        let parsed = read_tasks(&bytes).expect("read");
+
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].asset_key.is_none());
+        assert!(parsed[0].partition_key.is_none());
     }
 }

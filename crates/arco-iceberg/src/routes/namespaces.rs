@@ -235,6 +235,30 @@ mod tests {
             .expect("create namespace");
     }
 
+    async fn seed_namespace_with_description(
+        state: &IcebergState,
+        namespace: &str,
+        description: &str,
+    ) {
+        let storage = ScopedStorage::new(Arc::clone(&state.storage), "acme", "analytics")
+            .expect("scoped storage");
+        let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+        let writer = CatalogWriter::new(storage).with_sync_compactor(compactor);
+        writer.initialize().await.expect("init");
+        writer
+            .create_namespace(namespace, Some(description), WriteOptions::default())
+            .await
+            .expect("create namespace");
+    }
+
+    async fn init_catalog(state: &IcebergState) {
+        let storage = ScopedStorage::new(Arc::clone(&state.storage), "acme", "analytics")
+            .expect("scoped storage");
+        let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+        let writer = CatalogWriter::new(storage).with_sync_compactor(compactor);
+        writer.initialize().await.expect("init");
+    }
+
     fn app(state: IcebergState) -> Router {
         Router::new()
             .nest("/v1/:prefix", routes())
@@ -266,6 +290,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_namespaces_empty_returns_empty_list() {
+        let state = build_state();
+        init_catalog(&state).await;
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body read failed");
+        let list: ListNamespacesResponse =
+            serde_json::from_slice(&body).expect("json parse failed");
+
+        assert!(list.namespaces.is_empty());
+        assert!(list.next_page_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_namespaces_pagination() {
+        let state = build_state();
+        seed_namespace(&state, "beta").await;
+        seed_namespace(&state, "alpha").await;
+        seed_namespace(&state, "gamma").await;
+
+        let app = app(state);
+        let response = app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces?pageSize=1")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body read failed");
+        let list: ListNamespacesResponse =
+            serde_json::from_slice(&body).expect("json parse failed");
+        assert_eq!(list.namespaces, vec![vec!["alpha".to_string()]]);
+        assert_eq!(list.next_page_token.as_deref(), Some("1"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces?pageSize=1&pageToken=1")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body read failed");
+        let list: ListNamespacesResponse =
+            serde_json::from_slice(&body).expect("json parse failed");
+        assert_eq!(list.namespaces, vec![vec!["beta".to_string()]]);
+        assert_eq!(list.next_page_token.as_deref(), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn test_list_namespaces_parent_filter() {
+        let state = build_state();
+        seed_namespace(&state, "sales").await;
+        seed_namespace(&state, "sales\u{1F}north").await;
+        seed_namespace(&state, "sales\u{1F}south").await;
+        seed_namespace(&state, "sales\u{1F}north\u{1F}east").await;
+        seed_namespace(&state, "marketing").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces?parent=sales")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body read failed");
+        let list: ListNamespacesResponse =
+            serde_json::from_slice(&body).expect("json parse failed");
+
+        assert_eq!(
+            list.namespaces,
+            vec![
+                vec!["sales".to_string(), "north".to_string()],
+                vec!["sales".to_string(), "south".to_string()],
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn test_head_namespace_not_found() {
         let app = app(build_state());
         let response = app
@@ -282,6 +419,98 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_namespace_returns_properties() {
+        let state = build_state();
+        seed_namespace_with_description(&state, "sales", "Sales data").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces/sales")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body read failed");
+        let response: GetNamespaceResponse =
+            serde_json::from_slice(&body).expect("json parse failed");
+
+        assert!(response.properties.contains_key("arco.id"));
+        assert_eq!(
+            response.properties.get("comment"),
+            Some(&"Sales data".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_namespace_missing_returns_404() {
+        let app = app(build_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces/missing")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_namespace_url_decoding() {
+        let state = build_state();
+        seed_namespace(&state, "sales team").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces/sales%20team")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_namespace_separator_decoding() {
+        let state = build_state();
+        seed_namespace(&state, "sales\u{1F}north").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces/sales%1Fnorth")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -304,5 +533,30 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_head_namespace_returns_empty_body() {
+        let state = build_state();
+        seed_namespace(&state, "sales").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/v1/arco/namespaces/sales")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body read failed");
+        assert!(body.is_empty());
     }
 }

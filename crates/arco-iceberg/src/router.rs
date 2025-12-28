@@ -63,7 +63,11 @@ pub fn iceberg_router(state: IcebergState) -> Router {
 mod tests {
     use super::*;
     use arco_core::storage::MemoryBackend;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http::StatusCode;
     use std::sync::Arc;
+    use tower::ServiceExt;
 
     #[test]
     fn test_router_creation() {
@@ -71,5 +75,43 @@ mod tests {
         let state = IcebergState::new(storage);
         let _router = iceberg_router(state);
         // Router should be created without panicking
+    }
+
+    #[tokio::test]
+    async fn test_router_serves_config() {
+        let storage = Arc::new(MemoryBackend::new());
+        let state = IcebergState::new(storage);
+        let app = iceberg_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/config")
+                    .body(Body::empty())
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_router_nested_serves_config() {
+        let storage = Arc::new(MemoryBackend::new());
+        let state = IcebergState::new(storage);
+        let app = Router::new().nest("/iceberg", iceberg_router(state));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/iceberg/v1/config")
+                    .body(Body::empty())
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

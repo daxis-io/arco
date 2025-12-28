@@ -207,4 +207,16 @@ mod tests {
         assert!(json.contains("\"config\""));
         assert!(json.contains("gcs.oauth2.token"));
     }
+
+    #[test]
+    fn test_table_credentials_roundtrip() {
+        let json = r#"{"storage-credentials":[{"prefix":"s3://bucket/warehouse/","config":{"client.region":"us-east-1","s3.access-key-id":"AKIAIOSFODNN7EXAMPLE","s3.secret-access-key":"secret","s3.session-token":"session"}}]}"#;
+
+        let value: serde_json::Value = serde_json::from_str(json).expect("parse failed");
+        let parsed: TableCredentialsResponse =
+            serde_json::from_value(value.clone()).expect("deserialization failed");
+        let roundtrip = serde_json::to_value(&parsed).expect("serialization failed");
+
+        assert_eq!(roundtrip, value);
+    }
 }

@@ -430,4 +430,40 @@ mod tests {
         assert!(json.contains("storage-credentials"));
         assert!(json.contains("gcs.oauth2.token"));
     }
+
+    #[test]
+    fn test_list_tables_roundtrip() {
+        let json = r#"{"identifiers":[{"namespace":["db"],"name":"table1"},{"namespace":["db","schema"],"name":"table2"}],"next-page-token":"token-1"}"#;
+
+        let value: serde_json::Value = serde_json::from_str(json).expect("parse failed");
+        let parsed: ListTablesResponse =
+            serde_json::from_value(value.clone()).expect("deserialization failed");
+        let roundtrip = serde_json::to_value(&parsed).expect("serialization failed");
+
+        assert_eq!(roundtrip, value);
+    }
+
+    #[test]
+    fn test_list_tables_empty_roundtrip() {
+        let json = r#"{"identifiers":[]}"#;
+
+        let value: serde_json::Value = serde_json::from_str(json).expect("parse failed");
+        let parsed: ListTablesResponse =
+            serde_json::from_value(value.clone()).expect("deserialization failed");
+        let roundtrip = serde_json::to_value(&parsed).expect("serialization failed");
+
+        assert_eq!(roundtrip, value);
+    }
+
+    #[test]
+    fn test_load_table_response_roundtrip() {
+        let json = r#"{"metadata-location":"gs://bucket/metadata/v1.metadata.json","metadata":{"format-version":2,"table-uuid":"550e8400-e29b-41d4-a716-446655440000","location":"gs://bucket/table","last-sequence-number":0,"last-updated-ms":1234567890000,"last-column-id":3,"current-schema-id":0,"schemas":[],"current-snapshot-id":null,"snapshots":[],"snapshot-log":[],"metadata-log":[],"properties":{},"default-spec-id":0,"partition-specs":[],"last-partition-id":0,"refs":{},"default-sort-order-id":0,"sort-orders":[]},"config":{"read.default.name-mapping":"true"},"storage-credentials":[{"prefix":"gs://bucket/","config":{"gcs.oauth2.token":"token","gcs.oauth2.token-expires-at":"2025-01-15T15:00:00Z"}}]}"#;
+
+        let value: serde_json::Value = serde_json::from_str(json).expect("parse failed");
+        let parsed: LoadTableResponse =
+            serde_json::from_value(value.clone()).expect("deserialization failed");
+        let roundtrip = serde_json::to_value(&parsed).expect("serialization failed");
+
+        assert_eq!(roundtrip, value);
+    }
 }

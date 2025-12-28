@@ -597,6 +597,40 @@ mod tests {
         assert_eq!(uuids, expected);
     }
 
+    #[tokio::test]
+    async fn test_pointer_store_load_missing_returns_none() {
+        use arco_core::storage::MemoryBackend;
+        use std::sync::Arc;
+
+        let storage = Arc::new(MemoryBackend::new());
+        let store = PointerStoreImpl::new(storage);
+        let table_uuid = Uuid::new_v4();
+
+        let loaded = store.load(&table_uuid).await.expect("load");
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pointer_store_load_returns_pointer_and_version() {
+        use arco_core::storage::MemoryBackend;
+        use std::sync::Arc;
+
+        let storage = Arc::new(MemoryBackend::new());
+        let store = PointerStoreImpl::new(storage);
+        let table_uuid = Uuid::new_v4();
+        let pointer =
+            IcebergTablePointer::new(table_uuid, "gs://bucket/metadata/00000.json".to_string());
+
+        let result = store.create(&table_uuid, &pointer).await.expect("create");
+        let CasResult::Success { new_version } = result else {
+            panic!("expected success");
+        };
+
+        let loaded = store.load(&table_uuid).await.expect("load").expect("pointer");
+        assert_eq!(loaded.0, pointer);
+        assert_eq!(loaded.1.as_str(), new_version.as_str());
+    }
+
     proptest! {
         #[test]
         fn prop_pointer_store_cas_roundtrip(

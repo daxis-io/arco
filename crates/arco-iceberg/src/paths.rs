@@ -45,7 +45,8 @@ mod tests {
 
     #[test]
     fn test_resolve_metadata_path_with_scheme_and_scope() {
-        let location = "gs://bucket/tenant=acme/workspace=prod/warehouse/table/metadata/v1.metadata.json";
+        let location =
+            "gs://bucket/tenant=acme/workspace=prod/warehouse/table/metadata/v1.metadata.json";
         let path = resolve_metadata_path(location, "acme", "prod").expect("resolve");
         assert_eq!(path, "warehouse/table/metadata/v1.metadata.json");
     }

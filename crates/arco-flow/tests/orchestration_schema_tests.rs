@@ -1,8 +1,8 @@
 //! Tests for Layer 2 Parquet schema row types.
 
 use arco_flow::orchestration::compactor::{
-    BackfillChunkRow, BackfillRow, PartitionMaterializationStatus, PartitionStatusRow,
-    IdempotencyKeyRow, RunKeyConflictRow, RunKeyIndexRow, ScheduleDefinitionRow, ScheduleStateRow,
+    BackfillChunkRow, BackfillRow, IdempotencyKeyRow, PartitionMaterializationStatus,
+    PartitionStatusRow, RunKeyConflictRow, RunKeyIndexRow, ScheduleDefinitionRow, ScheduleStateRow,
     ScheduleTickRow, SensorEvalRow, SensorStateRow,
 };
 use arco_flow::orchestration::events::TaskOutcome;
@@ -153,7 +153,11 @@ fn test_idempotency_key_row_schema() {
 
     assert_eq!(
         row.primary_key(),
-        ("tenant-abc", "workspace-prod", "sensor_eval:01HQ123:msg:abc")
+        (
+            "tenant-abc",
+            "workspace-prod",
+            "sensor_eval:01HQ123:msg:abc"
+        )
     );
 }
 

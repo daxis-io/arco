@@ -49,8 +49,8 @@ pub mod gc;
 pub mod idempotency;
 pub mod metrics;
 pub mod openapi;
-pub mod pointer;
 pub(crate) mod paths;
+pub mod pointer;
 pub mod reconciler;
 pub mod router;
 pub mod schema_projection;
@@ -78,7 +78,7 @@ pub mod prelude {
 
     // Reconciler
     pub use crate::reconciler::{
-        IcebergReconciler, ReconciliationReport, Reconciler, TableReconciliationResult,
+        IcebergReconciler, Reconciler, ReconciliationReport, TableReconciliationResult,
     };
 
     // GC
@@ -102,7 +102,7 @@ pub use router::iceberg_router;
 pub use state::{CredentialProvider, IcebergConfig, IcebergState};
 
 // Re-export reconciler types
-pub use reconciler::{IcebergReconciler, ReconciliationReport, Reconciler};
+pub use reconciler::{IcebergReconciler, Reconciler, ReconciliationReport};
 
 // Re-export GC types
 pub use gc::{

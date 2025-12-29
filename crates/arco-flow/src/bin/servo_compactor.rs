@@ -114,32 +114,24 @@ fn log_format_from_env() -> LogFormat {
 }
 
 fn parse_bool_env(key: &str) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|value| {
-            value == "1"
-                || value.eq_ignore_ascii_case("true")
-                || value.eq_ignore_ascii_case("yes")
-        })
-        .unwrap_or(false)
+    std::env::var(key).ok().is_some_and(|value| {
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+    })
 }
 
 fn load_tenant_secret() -> Result<Vec<u8>> {
     let require_secret = parse_bool_env("ARCO_REQUIRE_TENANT_SECRET");
     let raw = std::env::var("ARCO_TENANT_SECRET_B64").ok();
-    let secret = match raw {
-        Some(value) => match STANDARD.decode(value.as_bytes()) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "invalid ARCO_TENANT_SECRET_B64; using empty secret"
-                );
-                Vec::new()
-            }
-        },
-        None => Vec::new(),
-    };
+    let secret = raw.map_or_else(Vec::new, |value| match STANDARD.decode(value.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "invalid ARCO_TENANT_SECRET_B64; using empty secret"
+            );
+            Vec::new()
+        }
+    });
 
     if secret.is_empty() {
         if require_secret {
@@ -148,9 +140,7 @@ fn load_tenant_secret() -> Result<Vec<u8>> {
             ));
         }
         if !cfg!(test) {
-            tracing::warn!(
-                "ARCO_TENANT_SECRET_B64 not set; run_id HMAC uses empty secret"
-            );
+            tracing::warn!("ARCO_TENANT_SECRET_B64 not set; run_id HMAC uses empty secret");
         }
     }
 

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arco_core::storage::{MemoryBackend, StorageBackend, WritePrecondition};
 use arco_iceberg::gc::{
     EventReceiptGarbageCollector, EventReceiptGcConfig, IdempotencyGarbageCollector,
-    OrphanMetadataCleaner, OrphanGcConfig,
+    OrphanGcConfig, OrphanMetadataCleaner,
 };
 use arco_iceberg::pointer::{CasResult, IcebergTablePointer, PointerStore, PointerStoreImpl};
 use arco_iceberg::reconciler::{IcebergReconciler, Reconciler};
@@ -311,21 +311,27 @@ async fn test_orphan_cleanup_flow() {
     assert_eq!(result.orphans_deleted, 1);
 
     // Verify orphan is deleted but valid files remain
-    assert!(storage
-        .head("metadata/v1.metadata.json")
-        .await
-        .expect("head")
-        .is_some());
-    assert!(storage
-        .head("metadata/v2.metadata.json")
-        .await
-        .expect("head")
-        .is_some());
-    assert!(storage
-        .head("metadata/orphan.metadata.json")
-        .await
-        .expect("head")
-        .is_none());
+    assert!(
+        storage
+            .head("metadata/v1.metadata.json")
+            .await
+            .expect("head")
+            .is_some()
+    );
+    assert!(
+        storage
+            .head("metadata/v2.metadata.json")
+            .await
+            .expect("head")
+            .is_some()
+    );
+    assert!(
+        storage
+            .head("metadata/orphan.metadata.json")
+            .await
+            .expect("head")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -365,16 +371,20 @@ async fn test_event_receipt_gc_flow() {
     assert_eq!(result.files_scanned, 2);
 
     // Verify receipts are deleted
-    assert!(storage
-        .head("events/2025-01-15/iceberg/pending/receipt1.json")
-        .await
-        .expect("head")
-        .is_none());
-    assert!(storage
-        .head("events/2025-01-15/iceberg/committed/receipt2.json")
-        .await
-        .expect("head")
-        .is_none());
+    assert!(
+        storage
+            .head("events/2025-01-15/iceberg/pending/receipt1.json")
+            .await
+            .expect("head")
+            .is_none()
+    );
+    assert!(
+        storage
+            .head("events/2025-01-15/iceberg/committed/receipt2.json")
+            .await
+            .expect("head")
+            .is_none()
+    );
 }
 
 // ============================================================================

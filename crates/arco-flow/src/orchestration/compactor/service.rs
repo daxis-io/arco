@@ -20,9 +20,9 @@ use crate::error::{Error, Result};
 use crate::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
 
 use super::fold::{
-    FoldState, merge_dep_satisfaction_rows, merge_dispatch_outbox_rows,
-    merge_idempotency_key_rows, merge_partition_status_rows, merge_run_rows,
-    merge_sensor_eval_rows, merge_sensor_state_rows, merge_task_rows, merge_timer_rows,
+    FoldState, merge_dep_satisfaction_rows, merge_dispatch_outbox_rows, merge_idempotency_key_rows,
+    merge_partition_status_rows, merge_run_rows, merge_sensor_eval_rows, merge_sensor_state_rows,
+    merge_task_rows, merge_timer_rows,
 };
 use super::manifest::{
     EventRange, L0Delta, OrchestrationManifest, RowCounts, TablePaths, Watermarks,
@@ -87,7 +87,7 @@ impl MicroCompactor {
     pub async fn load_state(&self) -> Result<(OrchestrationManifest, FoldState)> {
         let (manifest, _) = self.read_manifest_with_version().await?;
         let mut state = self.load_current_state(&manifest).await?;
-        state.tenant_secret = self.tenant_secret.clone();
+        state.tenant_secret.clone_from(&self.tenant_secret);
         Ok((manifest, state))
     }
 
@@ -124,7 +124,7 @@ impl MicroCompactor {
 
         // Load current fold state from base + L0 deltas
         let mut state = self.load_current_state(&manifest).await?;
-        state.tenant_secret = self.tenant_secret.clone();
+        state.tenant_secret.clone_from(&self.tenant_secret);
         let base_state = state.clone();
 
         // Process events

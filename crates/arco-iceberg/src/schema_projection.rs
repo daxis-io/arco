@@ -330,7 +330,13 @@ impl SchemaProjector {
         let identifier_set: std::collections::HashSet<i32> =
             schema.identifier_field_ids.iter().copied().collect();
 
-        Self::project_fields(table_uuid, &schema.fields, prefix, schema.schema_id, &identifier_set)
+        Self::project_fields(
+            table_uuid,
+            &schema.fields,
+            prefix,
+            schema.schema_id,
+            &identifier_set,
+        )
     }
 
     /// Recursively projects fields with optional prefix.
@@ -363,7 +369,10 @@ impl SchemaProjector {
             });
 
             // Recursively project nested struct fields
-            if let IcebergType::Complex(IcebergComplexType::Struct { fields: nested_fields }) = &field.field_type {
+            if let IcebergType::Complex(IcebergComplexType::Struct {
+                fields: nested_fields,
+            }) = &field.field_type
+            {
                 let nested_prefix = if prefix.is_empty() {
                     field.name.clone()
                 } else {
@@ -475,7 +484,10 @@ mod tests {
 
     #[test]
     fn test_map_decimal() {
-        let t = IcebergType::Primitive(IcebergPrimitiveType::Decimal { precision: 10, scale: 2 });
+        let t = IcebergType::Primitive(IcebergPrimitiveType::Decimal {
+            precision: 10,
+            scale: 2,
+        });
         assert_eq!(IcebergTypeMapper::map_type(&t), "decimal(10,2)");
     }
 
@@ -549,7 +561,10 @@ mod tests {
             })),
             element_required: true,
         });
-        assert_eq!(IcebergTypeMapper::map_type(&t), "list<struct<name:string, age:int32>>");
+        assert_eq!(
+            IcebergTypeMapper::map_type(&t),
+            "list<struct<name:string, age:int32>>"
+        );
     }
 
     // ========================================================================
@@ -574,7 +589,10 @@ mod tests {
         let id1 = ColumnRecord::generate_column_id(table_uuid, 1);
         let id2 = ColumnRecord::generate_column_id(table_uuid, 2);
 
-        assert_ne!(id1, id2, "Different field IDs should produce different column IDs");
+        assert_ne!(
+            id1, id2,
+            "Different field IDs should produce different column IDs"
+        );
     }
 
     #[test]
@@ -585,7 +603,10 @@ mod tests {
         let id1 = ColumnRecord::generate_column_id(table1, 1);
         let id2 = ColumnRecord::generate_column_id(table2, 1);
 
-        assert_ne!(id1, id2, "Different tables should produce different column IDs");
+        assert_ne!(
+            id1, id2,
+            "Different tables should produce different column IDs"
+        );
     }
 
     #[test]
@@ -761,7 +782,10 @@ mod tests {
         // Iceberg uses "decimal(p, s)" string format in JSON
         // Note: Full JSON deserialization would need custom deserializer
         // For now, test the programmatic construction
-        let t = IcebergPrimitiveType::Decimal { precision: 10, scale: 2 };
+        let t = IcebergPrimitiveType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
         assert_eq!(IcebergTypeMapper::map_primitive(&t), "decimal(10,2)");
     }
 

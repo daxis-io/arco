@@ -1592,9 +1592,9 @@ pub fn read_partition_status(bytes: &Bytes) -> Result<Vec<PartitionStatusRow>> {
                 if col.is_null(row) {
                     HashMap::new()
                 } else {
-                    serde_json::from_str::<HashMap<String, String>>(col.value(row)).map_err(|e| {
-                        Error::parquet(format!("failed to parse partition values: {e}"))
-                    })?
+                    serde_json::from_str::<HashMap<String, String>>(col.value(row)).map_err(
+                        |e| Error::parquet(format!("failed to parse partition values: {e}")),
+                    )?
                 }
             } else {
                 HashMap::new()

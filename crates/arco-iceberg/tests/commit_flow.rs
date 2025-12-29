@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arco_core::storage::{StorageBackend, WritePrecondition};
 use arco_core::ScopedStorage;
+use arco_core::storage::{StorageBackend, WritePrecondition};
 use arco_iceberg::commit::CommitService;
 use arco_iceberg::idempotency::{
-    canonical_request_hash, IdempotencyMarker, IdempotencyStatus, IdempotencyStore,
-    IdempotencyStoreImpl,
+    IdempotencyMarker, IdempotencyStatus, IdempotencyStore, IdempotencyStoreImpl,
+    canonical_request_hash,
 };
 use arco_iceberg::pointer::{IcebergTablePointer, PointerStore, PointerStoreImpl, UpdateSource};
 use arco_iceberg::types::commit::{CommitTableRequest, SnapshotRefType, TableUpdate};
@@ -41,15 +41,18 @@ impl Fixture {
         let storage = Arc::new(storage);
         let table = "orders".to_string();
         let table_uuid = Uuid::new_v4();
-        let table_location =
-            format!("tenant={tenant}/workspace={workspace}/warehouse/{table}");
+        let table_location = format!("tenant={tenant}/workspace={workspace}/warehouse/{table}");
         let metadata_location = format!("{table_location}/metadata/00000.metadata.json");
 
         let metadata = base_metadata(table_uuid, table_location.clone());
         let metadata_path = format!("warehouse/{table}/metadata/00000.metadata.json");
         let metadata_bytes = serde_json::to_vec(&metadata).expect("serialize metadata");
         storage
-            .put(&metadata_path, Bytes::from(metadata_bytes), WritePrecondition::None)
+            .put(
+                &metadata_path,
+                Bytes::from(metadata_bytes),
+                WritePrecondition::None,
+            )
             .await
             .expect("put metadata");
 
@@ -57,7 +60,11 @@ impl Fixture {
         let pointer_path = IcebergTablePointer::storage_path(&table_uuid);
         let pointer_bytes = serde_json::to_vec(&pointer).expect("serialize pointer");
         storage
-            .put(&pointer_path, Bytes::from(pointer_bytes), WritePrecondition::DoesNotExist)
+            .put(
+                &pointer_path,
+                Bytes::from(pointer_bytes),
+                WritePrecondition::DoesNotExist,
+            )
             .await
             .expect("put pointer");
 
@@ -214,13 +221,16 @@ async fn test_commit_table_success_persists_state() {
     let pending_suffix = format!("iceberg/pending/{commit_key}.json");
     let committed_suffix = format!("iceberg/committed/{commit_key}.json");
 
-    assert!(stored_paths
-        .iter()
-        .any(|path| path.ends_with(&pending_suffix)));
-    assert!(stored_paths
-        .iter()
-        .any(|path| path.ends_with(&committed_suffix)));
-
+    assert!(
+        stored_paths
+            .iter()
+            .any(|path| path.ends_with(&pending_suffix))
+    );
+    assert!(
+        stored_paths
+            .iter()
+            .any(|path| path.ends_with(&committed_suffix))
+    );
 }
 
 #[tokio::test]

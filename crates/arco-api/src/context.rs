@@ -18,8 +18,8 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde_json::Value;
-use ulid::Ulid;
 use tracing::warn;
+use ulid::Ulid;
 
 use arco_core::ScopedStorage;
 use arco_core::storage::StorageBackend;
@@ -159,17 +159,17 @@ fn normalize_scope_id(raw: &str, field: &str, request_id: &str) -> Result<String
     }
 
     if normalized.contains('/') || normalized.contains('\\') {
-        return Err(ApiError::bad_request(format!(
-            "{field} cannot contain path separators"
-        ))
-        .with_request_id(request_id.to_string()));
+        return Err(
+            ApiError::bad_request(format!("{field} cannot contain path separators"))
+                .with_request_id(request_id.to_string()),
+        );
     }
 
     if normalized.contains('\n') || normalized.contains('\r') || normalized.contains('\0') {
-        return Err(ApiError::bad_request(format!(
-            "{field} cannot contain control characters"
-        ))
-        .with_request_id(request_id.to_string()));
+        return Err(
+            ApiError::bad_request(format!("{field} cannot contain control characters"))
+                .with_request_id(request_id.to_string()),
+        );
     }
 
     if !normalized

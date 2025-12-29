@@ -595,11 +595,7 @@ mod tests {
     fn ordered_object(map: &HashMap<String, u64>, order: &[String]) -> serde_json::Value {
         let mut object = serde_json::Map::new();
         for key in order {
-            let value = map
-                .get(key)
-                .copied()
-                .unwrap_or_default()
-                .into();
+            let value = map.get(key).copied().unwrap_or_default().into();
             object.insert(key.clone(), serde_json::Value::Number(value));
         }
         serde_json::Value::Object(object)

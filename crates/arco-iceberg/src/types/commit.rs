@@ -325,7 +325,10 @@ impl CommitTableRequestBuilder {
 
     /// Adds multiple update requirements.
     #[must_use]
-    pub fn requirements(mut self, requirements: impl IntoIterator<Item = UpdateRequirement>) -> Self {
+    pub fn requirements(
+        mut self,
+        requirements: impl IntoIterator<Item = UpdateRequirement>,
+    ) -> Self {
         self.requirements.extend(requirements);
         self
     }

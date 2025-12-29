@@ -117,7 +117,9 @@ fn test_openapi_paths_align_with_official_spec() {
         assert!(
             spec_responses.is_subset(&ours_responses),
             "response mismatch for {method} {path}: missing {:?}",
-            spec_responses.difference(&ours_responses).collect::<Vec<_>>()
+            spec_responses
+                .difference(&ours_responses)
+                .collect::<Vec<_>>()
         );
     }
 }

@@ -181,7 +181,11 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
 
     /// Creates a new garbage collector with custom configuration.
     #[must_use]
-    pub fn with_config(storage: Arc<S>, pointer_store: Arc<P>, config: IdempotencyGcConfig) -> Self {
+    pub fn with_config(
+        storage: Arc<S>,
+        pointer_store: Arc<P>,
+        config: IdempotencyGcConfig,
+    ) -> Self {
         let idempotency_store = IdempotencyStoreImpl::new(Arc::clone(&storage));
         Self {
             storage,
@@ -443,7 +447,10 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
         match marker.status {
             IdempotencyStatus::Committed | IdempotencyStatus::Failed => {
                 // Eligible after lifetime + grace period from finalization time
-                let finalized_at = marker.committed_at.or(marker.failed_at).unwrap_or(marker.started_at);
+                let finalized_at = marker
+                    .committed_at
+                    .or(marker.failed_at)
+                    .unwrap_or(marker.started_at);
                 finalized_at + self.config.marker_lifetime + self.config.grace_period < now
             }
             IdempotencyStatus::InProgress => {
@@ -489,11 +496,7 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
     /// Cleans up a single marker.
     ///
     /// Returns the action taken (deleted, skipped, or failed).
-    async fn clean_marker(
-        &self,
-        entry: &MarkerListEntry,
-        now: DateTime<Utc>,
-    ) -> CleanupOutcome {
+    async fn clean_marker(&self, entry: &MarkerListEntry, now: DateTime<Utc>) -> CleanupOutcome {
         if !self.is_eligible_for_gc(&entry.marker, now) {
             return CleanupOutcome::skipped();
         }
@@ -799,13 +802,13 @@ impl<S: StorageBackend> OrphanMetadataCleaner<S> {
         metadata_prefix: &str,
         allowlist: &HashSet<String>,
     ) -> IcebergResult<OrphanScanResult> {
-        let objects = self
-            .storage
-            .list(metadata_prefix)
-            .await
-            .map_err(|e| IcebergError::Internal {
-                message: format!("Failed to list metadata files: {e}"),
-            })?;
+        let objects =
+            self.storage
+                .list(metadata_prefix)
+                .await
+                .map_err(|e| IcebergError::Internal {
+                    message: format!("Failed to list metadata files: {e}"),
+                })?;
 
         let mut orphans = Vec::new();
         let mut files_scanned = 0;
@@ -1064,13 +1067,13 @@ impl<S: StorageBackend, P: PointerStore> MetadataGcPlanner<S, P> {
 
         let current_path =
             resolve_metadata_path(&pointer.current_metadata_location, tenant, workspace)?;
-        let metadata_bytes = self
-            .storage
-            .get(&current_path)
-            .await
-            .map_err(|e| IcebergError::Internal {
-                message: format!("Failed to read metadata file: {e}"),
-            })?;
+        let metadata_bytes =
+            self.storage
+                .get(&current_path)
+                .await
+                .map_err(|e| IcebergError::Internal {
+                    message: format!("Failed to read metadata file: {e}"),
+                })?;
 
         let metadata: TableMetadata =
             serde_json::from_slice(&metadata_bytes).map_err(|e| IcebergError::Internal {
@@ -1100,7 +1103,9 @@ impl<S: StorageBackend, P: PointerStore> MetadataGcPlanner<S, P> {
         log_entries.sort_by_key(|entry| entry.timestamp_ms);
 
         let entries_to_keep = if policy.delete_after_commit {
-            let start = log_entries.len().saturating_sub(policy.previous_versions_max);
+            let start = log_entries
+                .len()
+                .saturating_sub(policy.previous_versions_max);
             // start is always <= log_entries.len() due to saturating_sub
             log_entries.get(start..).unwrap_or(&[])
         } else {
@@ -1283,9 +1288,13 @@ impl<S: StorageBackend> EventReceiptGarbageCollector<S> {
     /// # Errors
     ///
     /// Returns error if storage listing or deletion fails.
-    pub async fn clean_pending_receipts(&self, date: chrono::NaiveDate) -> IcebergResult<ReceiptCleanupResult> {
+    pub async fn clean_pending_receipts(
+        &self,
+        date: chrono::NaiveDate,
+    ) -> IcebergResult<ReceiptCleanupResult> {
         let prefix = format!("events/{}/iceberg/pending/", date.format("%Y-%m-%d"));
-        self.clean_receipts_in_prefix(&prefix, self.config.pending_retention).await
+        self.clean_receipts_in_prefix(&prefix, self.config.pending_retention)
+            .await
     }
 
     /// Cleans committed receipts older than the retention period.
@@ -1295,9 +1304,13 @@ impl<S: StorageBackend> EventReceiptGarbageCollector<S> {
     /// # Errors
     ///
     /// Returns error if storage listing or deletion fails.
-    pub async fn clean_committed_receipts(&self, date: chrono::NaiveDate) -> IcebergResult<ReceiptCleanupResult> {
+    pub async fn clean_committed_receipts(
+        &self,
+        date: chrono::NaiveDate,
+    ) -> IcebergResult<ReceiptCleanupResult> {
         let prefix = format!("events/{}/iceberg/committed/", date.format("%Y-%m-%d"));
-        self.clean_receipts_in_prefix(&prefix, self.config.committed_retention).await
+        self.clean_receipts_in_prefix(&prefix, self.config.committed_retention)
+            .await
     }
 
     /// Cleans all eligible receipts for a specific date.
@@ -1309,7 +1322,10 @@ impl<S: StorageBackend> EventReceiptGarbageCollector<S> {
     /// Returns error if receipt cleaning fails.
     #[allow(clippy::cast_possible_truncation)]
     #[tracing::instrument(skip(self), fields(date = %date))]
-    pub async fn clean_receipts_for_date(&self, date: chrono::NaiveDate) -> IcebergResult<EventReceiptGcResult> {
+    pub async fn clean_receipts_for_date(
+        &self,
+        date: chrono::NaiveDate,
+    ) -> IcebergResult<EventReceiptGcResult> {
         let start = Instant::now();
 
         let pending_result = self.clean_pending_receipts(date).await?;
@@ -1620,8 +1636,14 @@ mod tests {
 
         assert_eq!(result.total_count, 5);
         assert_eq!(result.by_table.len(), 2);
-        assert_eq!(result.by_table.get(&table1).map(|v| v.len()).unwrap_or(0), 2);
-        assert_eq!(result.by_table.get(&table2).map(|v| v.len()).unwrap_or(0), 3);
+        assert_eq!(
+            result.by_table.get(&table1).map(|v| v.len()).unwrap_or(0),
+            2
+        );
+        assert_eq!(
+            result.by_table.get(&table2).map(|v| v.len()).unwrap_or(0),
+            3
+        );
     }
 
     #[tokio::test]
@@ -1765,16 +1787,13 @@ mod tests {
 
     #[test]
     fn test_idempotency_gc_config_parses_lifetime() {
-        let config = IdempotencyGcConfig::default()
-            .with_idempotency_key_lifetime(Some("PT2H"));
+        let config = IdempotencyGcConfig::default().with_idempotency_key_lifetime(Some("PT2H"));
         assert_eq!(config.marker_lifetime, Duration::hours(2));
 
-        let config = IdempotencyGcConfig::default()
-            .with_idempotency_key_lifetime(Some("P1DT1H"));
+        let config = IdempotencyGcConfig::default().with_idempotency_key_lifetime(Some("P1DT1H"));
         assert_eq!(config.marker_lifetime, Duration::hours(25));
 
-        let config = IdempotencyGcConfig::default()
-            .with_idempotency_key_lifetime(Some("P1M"));
+        let config = IdempotencyGcConfig::default().with_idempotency_key_lifetime(Some("P1M"));
         assert_eq!(config.marker_lifetime, Duration::hours(24));
     }
 
@@ -2407,16 +2426,20 @@ mod tests {
         assert_eq!(result.orphans_skipped, 0);
 
         // Verify orphan is deleted but valid file remains
-        assert!(storage
-            .head("metadata/v1.metadata.json")
-            .await
-            .expect("head")
-            .is_some());
-        assert!(storage
-            .head("metadata/orphan.metadata.json")
-            .await
-            .expect("head")
-            .is_none());
+        assert!(
+            storage
+                .head("metadata/v1.metadata.json")
+                .await
+                .expect("head")
+                .is_some()
+        );
+        assert!(
+            storage
+                .head("metadata/orphan.metadata.json")
+                .await
+                .expect("head")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2450,11 +2473,13 @@ mod tests {
         assert_eq!(result.orphans_skipped, 1);
 
         // Orphan should still exist
-        assert!(storage
-            .head("metadata/orphan.metadata.json")
-            .await
-            .expect("head")
-            .is_some());
+        assert!(
+            storage
+                .head("metadata/orphan.metadata.json")
+                .await
+                .expect("head")
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -2506,19 +2531,23 @@ mod tests {
 
         // Valid files remain
         for i in 1..=3 {
-            assert!(storage
-                .head(&format!("metadata/v{i}.metadata.json"))
-                .await
-                .expect("head")
-                .is_some());
+            assert!(
+                storage
+                    .head(&format!("metadata/v{i}.metadata.json"))
+                    .await
+                    .expect("head")
+                    .is_some()
+            );
         }
         // Orphans are deleted
         for i in 1..=2 {
-            assert!(storage
-                .head(&format!("metadata/orphan{i}.metadata.json"))
-                .await
-                .expect("head")
-                .is_none());
+            assert!(
+                storage
+                    .head(&format!("metadata/orphan{i}.metadata.json"))
+                    .await
+                    .expect("head")
+                    .is_none()
+            );
         }
     }
 
@@ -2602,10 +2631,8 @@ mod tests {
             .await
             .expect("put metadata");
 
-        let pointer = crate::pointer::IcebergTablePointer::new(
-            table_uuid,
-            current_location.to_string(),
-        );
+        let pointer =
+            crate::pointer::IcebergTablePointer::new(table_uuid, current_location.to_string());
         pointer_store
             .create(&table_uuid, &pointer)
             .await
@@ -2618,12 +2645,15 @@ mod tests {
             .expect("plan");
 
         assert!(plan.allowlist.contains(current_location));
-        assert!(plan
-            .allowlist
-            .contains("warehouse/table/metadata/v2.metadata.json"));
-        assert!(!plan
-            .allowlist
-            .contains("warehouse/table/metadata/v1.metadata.json"));
+        assert!(
+            plan.allowlist
+                .contains("warehouse/table/metadata/v2.metadata.json")
+        );
+        assert!(
+            !plan
+                .allowlist
+                .contains("warehouse/table/metadata/v1.metadata.json")
+        );
         assert_eq!(plan.metadata_prefix, "warehouse/table/metadata/");
     }
 
@@ -2648,10 +2678,8 @@ mod tests {
             .await
             .expect("put metadata");
 
-        let pointer = crate::pointer::IcebergTablePointer::new(
-            table_uuid,
-            current_location.to_string(),
-        );
+        let pointer =
+            crate::pointer::IcebergTablePointer::new(table_uuid, current_location.to_string());
         pointer_store
             .create(&table_uuid, &pointer)
             .await
@@ -2708,10 +2736,8 @@ mod tests {
             .await
             .expect("put orphan");
 
-        let pointer = crate::pointer::IcebergTablePointer::new(
-            table_uuid,
-            current_location.to_string(),
-        );
+        let pointer =
+            crate::pointer::IcebergTablePointer::new(table_uuid, current_location.to_string());
         pointer_store
             .create(&table_uuid, &pointer)
             .await
@@ -2728,16 +2754,20 @@ mod tests {
 
         let orphan_result = result.orphan_result.expect("orphan result");
         assert_eq!(orphan_result.orphans_deleted, 1);
-        assert!(storage
-            .head("warehouse/table/metadata/orphan.metadata.json")
-            .await
-            .expect("head")
-            .is_none());
-        assert!(storage
-            .head(current_location)
-            .await
-            .expect("head")
-            .is_some());
+        assert!(
+            storage
+                .head("warehouse/table/metadata/orphan.metadata.json")
+                .await
+                .expect("head")
+                .is_none()
+        );
+        assert!(
+            storage
+                .head(current_location)
+                .await
+                .expect("head")
+                .is_some()
+        );
     }
 
     // ========================================================================
@@ -2788,11 +2818,13 @@ mod tests {
         assert_eq!(result.files_scanned, 1);
 
         // File should still exist
-        assert!(storage
-            .head("events/2025-01-15/iceberg/pending/abc123.json")
-            .await
-            .expect("head")
-            .is_some());
+        assert!(
+            storage
+                .head("events/2025-01-15/iceberg/pending/abc123.json")
+                .await
+                .expect("head")
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -2823,11 +2855,13 @@ mod tests {
         assert_eq!(result.skipped, 0);
 
         // File should be deleted
-        assert!(storage
-            .head("events/2025-01-15/iceberg/pending/abc123.json")
-            .await
-            .expect("head")
-            .is_none());
+        assert!(
+            storage
+                .head("events/2025-01-15/iceberg/pending/abc123.json")
+                .await
+                .expect("head")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2914,7 +2948,10 @@ mod tests {
 
         let start = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
         let end = chrono::NaiveDate::from_ymd_opt(2025, 1, 17).expect("valid date");
-        let result = gc.clean_receipts_for_date_range(start, end).await.expect("clean");
+        let result = gc
+            .clean_receipts_for_date_range(start, end)
+            .await
+            .expect("clean");
 
         assert_eq!(result.pending_deleted, 3);
         assert_eq!(result.files_scanned, 3);
@@ -2949,10 +2986,12 @@ mod tests {
         assert_eq!(result.files_scanned, 1);
 
         // File should still exist
-        assert!(storage
-            .head("events/2025-01-15/iceberg/pending/readme.txt")
-            .await
-            .expect("head")
-            .is_some());
+        assert!(
+            storage
+                .head("events/2025-01-15/iceberg/pending/readme.txt")
+                .await
+                .expect("head")
+                .is_some()
+        );
     }
 }

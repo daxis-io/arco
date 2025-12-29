@@ -1003,10 +1003,7 @@ mod tests {
             .expect("walk");
 
         assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0].metadata_location,
-            "metadata/v1.metadata.json"
-        );
+        assert_eq!(entries[0].metadata_location, "metadata/v1.metadata.json");
         assert_eq!(entries[0].timestamp_ms, 1234567890000);
         assert!(entries[0].previous_metadata_location.is_none());
     }
@@ -1061,15 +1058,21 @@ mod tests {
         let refs = &entries[0].refs;
         assert_eq!(refs.len(), 2);
         assert_eq!(refs.get("main").map(|r| r.snapshot_id), Some(42));
-        assert_eq!(refs.get("main").map(|r| r.ref_type.as_str()), Some("branch"));
+        assert_eq!(
+            refs.get("main").map(|r| r.ref_type.as_str()),
+            Some("branch")
+        );
         assert_eq!(refs.get("release").map(|r| r.snapshot_id), Some(84));
-        assert_eq!(refs.get("release").map(|r| r.ref_type.as_str()), Some("tag"));
+        assert_eq!(
+            refs.get("release").map(|r| r.ref_type.as_str()),
+            Some("tag")
+        );
     }
 
     #[tokio::test]
     async fn test_metadata_log_walker_resolves_scoped_uri() {
-        use arco_core::storage::{MemoryBackend, StorageBackend, WritePrecondition};
         use arco_core::ScopedStorage;
+        use arco_core::storage::{MemoryBackend, StorageBackend, WritePrecondition};
         use bytes::Bytes;
 
         let tenant = "acme";
@@ -1575,7 +1578,11 @@ mod tests {
         // Verify the receipt was written to the correct path
         let expected_path = format!("events/2024-01-01/iceberg/committed/{}.json", commit_key);
         let result = storage.head(&expected_path).await.expect("head");
-        assert!(result.is_some(), "Receipt should exist at {}", expected_path);
+        assert!(
+            result.is_some(),
+            "Receipt should exist at {}",
+            expected_path
+        );
     }
 
     #[tokio::test]
@@ -1620,8 +1627,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconciler_reconcile_table_with_missing_pointer() {
-        use arco_core::storage::MemoryBackend;
         use crate::pointer::PointerStoreImpl;
+        use arco_core::storage::MemoryBackend;
 
         let storage = Arc::new(MemoryBackend::new());
         let pointer_store = Arc::new(PointerStoreImpl::new(Arc::clone(&storage)));
@@ -1639,8 +1646,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconciler_reconcile_table_success() {
+        use crate::pointer::{CasResult, IcebergTablePointer, PointerStoreImpl};
         use arco_core::storage::MemoryBackend;
-        use crate::pointer::{IcebergTablePointer, PointerStoreImpl, CasResult};
         use bytes::Bytes;
 
         let storage = Arc::new(MemoryBackend::new());
@@ -1648,7 +1655,8 @@ mod tests {
 
         // Create metadata file
         let table_uuid = Uuid::new_v4();
-        let metadata_json = format!(r#"{{
+        let metadata_json = format!(
+            r#"{{
             "format-version": 2,
             "table-uuid": "{}",
             "location": "gs://bucket/table",
@@ -1666,7 +1674,9 @@ mod tests {
             "last-partition-id": 0,
             "default-sort-order-id": 0,
             "sort-orders": []
-        }}"#, table_uuid);
+        }}"#,
+            table_uuid
+        );
 
         storage
             .put(
@@ -1678,11 +1688,11 @@ mod tests {
             .expect("put metadata");
 
         // Create pointer
-        let pointer = IcebergTablePointer::new(
-            table_uuid,
-            "metadata/v1.metadata.json".to_string(),
-        );
-        let result = pointer_store.create(&table_uuid, &pointer).await.expect("create pointer");
+        let pointer = IcebergTablePointer::new(table_uuid, "metadata/v1.metadata.json".to_string());
+        let result = pointer_store
+            .create(&table_uuid, &pointer)
+            .await
+            .expect("create pointer");
         assert!(matches!(result, CasResult::Success { .. }));
 
         // Reconcile
@@ -1701,8 +1711,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconciler_reconcile_all_multiple_tables() {
+        use crate::pointer::{CasResult, IcebergTablePointer, PointerStoreImpl};
         use arco_core::storage::MemoryBackend;
-        use crate::pointer::{IcebergTablePointer, PointerStoreImpl, CasResult};
         use bytes::Bytes;
 
         let storage = Arc::new(MemoryBackend::new());
@@ -1713,7 +1723,8 @@ mod tests {
         let table2 = Uuid::new_v4();
 
         for (i, table_uuid) in [table1, table2].iter().enumerate() {
-            let metadata_json = format!(r#"{{
+            let metadata_json = format!(
+                r#"{{
                 "format-version": 2,
                 "table-uuid": "{}",
                 "location": "gs://bucket/table{}",
@@ -1731,7 +1742,11 @@ mod tests {
                 "last-partition-id": 0,
                 "default-sort-order-id": 0,
                 "sort-orders": []
-            }}"#, table_uuid, i, 1704067200000_i64 + (i as i64 * 86400000));
+            }}"#,
+                table_uuid,
+                i,
+                1704067200000_i64 + (i as i64 * 86400000)
+            );
 
             let path = format!("metadata/table{}/v1.json", i);
             storage
@@ -1740,7 +1755,10 @@ mod tests {
                 .expect("put metadata");
 
             let pointer = IcebergTablePointer::new(*table_uuid, path);
-            let result = pointer_store.create(table_uuid, &pointer).await.expect("create pointer");
+            let result = pointer_store
+                .create(table_uuid, &pointer)
+                .await
+                .expect("create pointer");
             assert!(matches!(result, CasResult::Success { .. }));
         }
 
@@ -1760,8 +1778,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconciler_reconcile_all_empty() {
-        use arco_core::storage::MemoryBackend;
         use crate::pointer::PointerStoreImpl;
+        use arco_core::storage::MemoryBackend;
 
         let storage = Arc::new(MemoryBackend::new());
         let pointer_store = Arc::new(PointerStoreImpl::new(Arc::clone(&storage)));

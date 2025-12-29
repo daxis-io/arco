@@ -568,7 +568,7 @@ fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
     for task in tasks {
         match task.state {
             FoldTaskState::Planned | FoldTaskState::Blocked | FoldTaskState::RetryWait => {
-                pending += 1
+                pending += 1;
             }
             FoldTaskState::Ready | FoldTaskState::Dispatched => queued += 1,
             FoldTaskState::Running => running += 1,

@@ -181,9 +181,9 @@ impl BackfillController {
         self.validate_asset_key(asset_key)?;
         self.validate_range(partition_start, partition_end)?;
 
-        let total_partitions = self
-            .partition_resolver
-            .count_range(asset_key, partition_start, partition_end);
+        let total_partitions =
+            self.partition_resolver
+                .count_range(asset_key, partition_start, partition_end);
         if total_partitions == 0 {
             return Err(BackfillError::InvalidRequest(
                 "partition range resolves to zero partitions".to_string(),
@@ -377,10 +377,7 @@ impl BackfillController {
                         chunk_events
                             .iter()
                             .filter(|e| {
-                                matches!(
-                                    &e.data,
-                                    OrchestrationEventData::RunRequested { .. }
-                                )
+                                matches!(&e.data, OrchestrationEventData::RunRequested { .. })
                             })
                             .count() as u64,
                     );
@@ -737,9 +734,9 @@ impl BackfillController {
             .filter(|c| c.backfill_id == backfill_id)
             .filter(|c| {
                 matches!(c.state, ChunkState::Planned | ChunkState::Running)
-                    || c.run_id.as_ref().is_some_and(|id| {
-                        runs.get(id).is_some_and(|r| !r.state.is_terminal())
-                    })
+                    || c.run_id
+                        .as_ref()
+                        .is_some_and(|id| runs.get(id).is_some_and(|r| !r.state.is_terminal()))
             })
             .count() as u32;
         count
@@ -777,7 +774,11 @@ impl BackfillController {
     }
 
     #[allow(clippy::unused_self)]
-    fn validate_range(&self, partition_start: &str, partition_end: &str) -> Result<(), BackfillError> {
+    fn validate_range(
+        &self,
+        partition_start: &str,
+        partition_end: &str,
+    ) -> Result<(), BackfillError> {
         if partition_start.trim().is_empty() || partition_end.trim().is_empty() {
             return Err(BackfillError::InvalidRequest(
                 "partition_start and partition_end are required".to_string(),
@@ -856,15 +857,9 @@ impl BackfillController {
         let asset_key = self.ensure_single_asset(&backfill.asset_selection)?;
 
         match &backfill.partition_selector {
-            PartitionSelector::Range { start, end } => {
-                Ok(self.partition_resolver.list_range_chunk(
-                    asset_key,
-                    start,
-                    end,
-                    offset,
-                    limit,
-                ))
-            }
+            PartitionSelector::Range { start, end } => Ok(self
+                .partition_resolver
+                .list_range_chunk(asset_key, start, end, offset, limit)),
             PartitionSelector::Explicit { partition_keys } => Ok(partition_keys
                 .iter()
                 .skip(offset as usize)
@@ -1019,16 +1014,16 @@ mod tests {
 
         let event = controller
             .create(&CreateBackfillRequest {
-            backfill_id: "bf_01HQ123",
-            tenant_id: "tenant-abc",
-            workspace_id: "workspace-prod",
-            asset_selection: &assets,
-            partition_start: "2025-01-01",
-            partition_end: "2025-01-31",
-            chunk_size: 10,
-            max_concurrent_runs: 2,
-            client_request_id: "client_req_001",
-        })
+                backfill_id: "bf_01HQ123",
+                tenant_id: "tenant-abc",
+                workspace_id: "workspace-prod",
+                asset_selection: &assets,
+                partition_start: "2025-01-01",
+                partition_end: "2025-01-31",
+                chunk_size: 10,
+                max_concurrent_runs: 2,
+                client_request_id: "client_req_001",
+            })
             .expect("create should succeed");
 
         if let OrchestrationEventData::BackfillCreated {
@@ -1063,16 +1058,16 @@ mod tests {
 
         let event = controller
             .create(&CreateBackfillRequest {
-            backfill_id: "bf_001",
-            tenant_id: "tenant-abc",
-            workspace_id: "workspace-prod",
-            asset_selection: &assets,
-            partition_start: "2025-01-01",
-            partition_end: "2025-12-31", // 365 partitions
-            chunk_size: 10,
-            max_concurrent_runs: 2,
-            client_request_id: "client_001",
-        })
+                backfill_id: "bf_001",
+                tenant_id: "tenant-abc",
+                workspace_id: "workspace-prod",
+                asset_selection: &assets,
+                partition_start: "2025-01-01",
+                partition_end: "2025-12-31", // 365 partitions
+                chunk_size: 10,
+                max_concurrent_runs: 2,
+                client_request_id: "client_001",
+            })
             .expect("create should succeed");
 
         // Per P0-6: should use Range selector, not Explicit with 365 partition keys
@@ -1104,10 +1099,7 @@ mod tests {
             client_request_id: "client_001",
         });
 
-        assert!(matches!(
-            result,
-            Err(BackfillError::InvalidRequest(_))
-        ));
+        assert!(matches!(result, Err(BackfillError::InvalidRequest(_))));
     }
 
     #[test]
@@ -1127,10 +1119,7 @@ mod tests {
             client_request_id: "client_002",
         });
 
-        assert!(matches!(
-            result,
-            Err(BackfillError::InvalidRequest(_))
-        ));
+        assert!(matches!(result, Err(BackfillError::InvalidRequest(_))));
     }
 
     // ========================================================================
@@ -1383,13 +1372,13 @@ mod tests {
 
         let event = controller
             .retry_failed(
-            "bf_002",
-            &parent,
-            &failed_chunks,
-            "retry_req_001",
-            "tenant-abc",
-            "workspace-prod",
-        )
+                "bf_002",
+                &parent,
+                &failed_chunks,
+                "retry_req_001",
+                "tenant-abc",
+                "workspace-prod",
+            )
             .expect("retry_failed should succeed");
 
         if let OrchestrationEventData::BackfillCreated {
@@ -1443,24 +1432,24 @@ mod tests {
 
         let event1 = controller
             .retry_failed(
-            "bf_002",
-            &parent,
-            &failed_chunks,
-            "retry_req_001",
-            "tenant-abc",
-            "workspace-prod",
-        )
+                "bf_002",
+                &parent,
+                &failed_chunks,
+                "retry_req_001",
+                "tenant-abc",
+                "workspace-prod",
+            )
             .expect("retry_failed should succeed");
 
         let event2 = controller
             .retry_failed(
-            "bf_003", // Different ID, same request
-            &parent,
-            &failed_chunks,
-            "retry_req_001", // Same request ID
-            "tenant-abc",
-            "workspace-prod",
-        )
+                "bf_003", // Different ID, same request
+                &parent,
+                &failed_chunks,
+                "retry_req_001", // Same request ID
+                "tenant-abc",
+                "workspace-prod",
+            )
             .expect("retry_failed should succeed");
 
         // Idempotency key based on parent + retry_request_id
@@ -1500,10 +1489,7 @@ mod tests {
             "workspace-prod",
         );
 
-        assert!(matches!(
-            result,
-            Err(BackfillError::InvalidRequest(_))
-        ));
+        assert!(matches!(result, Err(BackfillError::InvalidRequest(_))));
     }
 
     #[test]
@@ -1521,9 +1507,13 @@ mod tests {
         );
 
         let watermarks = fresh_watermarks();
-        let events = controller.reconcile(&watermarks, &backfills, &HashMap::new(), &HashMap::new());
+        let events =
+            controller.reconcile(&watermarks, &backfills, &HashMap::new(), &HashMap::new());
 
-        assert!(events.is_empty(), "Should not plan chunks for paused backfill");
+        assert!(
+            events.is_empty(),
+            "Should not plan chunks for paused backfill"
+        );
     }
 
     #[test]
@@ -1534,7 +1524,8 @@ mod tests {
         backfills.insert("bf_001".into(), default_backfill_row());
 
         let watermarks = stale_watermarks();
-        let events = controller.reconcile(&watermarks, &backfills, &HashMap::new(), &HashMap::new());
+        let events =
+            controller.reconcile(&watermarks, &backfills, &HashMap::new(), &HashMap::new());
 
         assert!(
             events.is_empty(),
@@ -1560,7 +1551,8 @@ mod tests {
         );
 
         let watermarks = fresh_watermarks();
-        let events = controller.reconcile(&watermarks, &backfills, &HashMap::new(), &HashMap::new());
+        let events =
+            controller.reconcile(&watermarks, &backfills, &HashMap::new(), &HashMap::new());
 
         assert!(
             events.is_empty(),

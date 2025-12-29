@@ -191,7 +191,10 @@ mod tests {
             b"test-secret",
         );
 
-        assert!(run_id.starts_with("run_"), "run_id should start with 'run_'");
+        assert!(
+            run_id.starts_with("run_"),
+            "run_id should start with 'run_'"
+        );
         assert_eq!(run_id.len(), 30, "run_id should be 30 chars: 'run_' + 26");
         // Base32 uses lowercase a-z and digits 2-7
         assert!(
@@ -218,7 +221,10 @@ mod tests {
             secret,
         );
 
-        assert_ne!(id1, id2, "Different run_keys should produce different run_ids");
+        assert_ne!(
+            id1, id2,
+            "Different run_keys should produce different run_ids"
+        );
     }
 
     #[test]
@@ -229,7 +235,10 @@ mod tests {
         let id1 = run_id_from_run_key("tenant-abc", "workspace-prod", run_key, secret);
         let id2 = run_id_from_run_key("tenant-xyz", "workspace-prod", run_key, secret);
 
-        assert_ne!(id1, id2, "Different tenants should produce different run_ids");
+        assert_ne!(
+            id1, id2,
+            "Different tenants should produce different run_ids"
+        );
     }
 
     #[test]
@@ -240,7 +249,10 @@ mod tests {
         let id1 = run_id_from_run_key("tenant-abc", "workspace-prod", run_key, secret);
         let id2 = run_id_from_run_key("tenant-abc", "workspace-dev", run_key, secret);
 
-        assert_ne!(id1, id2, "Different workspaces should produce different run_ids");
+        assert_ne!(
+            id1, id2,
+            "Different workspaces should produce different run_ids"
+        );
     }
 
     #[test]
@@ -250,6 +262,9 @@ mod tests {
         let id1 = run_id_from_run_key("tenant-abc", "workspace-prod", run_key, b"secret-1");
         let id2 = run_id_from_run_key("tenant-abc", "workspace-prod", run_key, b"secret-2");
 
-        assert_ne!(id1, id2, "Different secrets should produce different run_ids");
+        assert_ne!(
+            id1, id2,
+            "Different secrets should produce different run_ids"
+        );
     }
 }

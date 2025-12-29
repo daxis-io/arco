@@ -918,11 +918,7 @@ impl IdempotencyKeyRow {
     /// Returns the primary key tuple.
     #[must_use]
     pub fn primary_key(&self) -> (&str, &str, &str) {
-        (
-            &self.tenant_id,
-            &self.workspace_id,
-            &self.idempotency_key,
-        )
+        (&self.tenant_id, &self.workspace_id, &self.idempotency_key)
     }
 }
 
@@ -1000,7 +996,7 @@ pub struct FoldState {
     // ========================================================================
     // Configuration
     // ========================================================================
-    /// Tenant secret for HMAC-based run_id generation.
+    /// Tenant secret for HMAC-based `run_id` generation.
     /// Default is empty (for testing); should be set in production.
     pub tenant_secret: Vec<u8>,
 }
@@ -1605,6 +1601,7 @@ impl FoldState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     fn fold_task_finished(
         &mut self,
         run_id: &str,
@@ -2238,13 +2235,12 @@ impl FoldState {
     /// Fold a `RunRequested` event.
     ///
     /// Implements L2-INV-4 (idempotent) and L2-INV-5 (conflict detection):
-    /// - Same run_key + fingerprint = idempotent (no-op)
-    /// - Same run_key + different fingerprint = conflict recorded
-    /// - New run_key = creates run_key_index entry
+    /// - Same `run_key` + fingerprint = idempotent (no-op)
+    /// - Same `run_key` + different fingerprint = conflict recorded
+    /// - New `run_key` = creates `run_key_index` entry
     ///
-    /// Note: This creates the run_key_index entry for deduplication and conflict
-    /// detection. The actual RunRow is created by fold_run_triggered when the
-    /// run is actually triggered (with a plan_id).
+    /// Creates the `run_key_index` entry used for deduplication and conflict detection.
+    /// The `RunRow` is created by `fold_run_triggered` when the run is triggered (with a `plan_id`).
     #[allow(clippy::too_many_arguments)]
     fn fold_run_requested(
         &mut self,
@@ -2266,7 +2262,7 @@ impl FoldState {
                 // Conflict: same run_key but different fingerprint
                 let conflict_id = format!("conflict:{run_key}:{event_id}");
                 self.run_key_conflicts.insert(
-                    conflict_id.clone(),
+                    conflict_id,
                     RunKeyConflictRow {
                         tenant_id: tenant_id.to_string(),
                         workspace_id: workspace_id.to_string(),
@@ -2283,12 +2279,7 @@ impl FoldState {
         }
 
         // Generate deterministic run_id using HMAC
-        let run_id = run_id_from_run_key(
-            tenant_id,
-            workspace_id,
-            run_key,
-            &self.tenant_secret,
-        );
+        let run_id = run_id_from_run_key(tenant_id, workspace_id, run_key, &self.tenant_secret);
 
         // Create run_key_index entry (the actual RunRow is created by RunTriggered)
         self.run_key_index.insert(
@@ -2308,7 +2299,7 @@ impl FoldState {
         self.correlate_run_to_source(run_key, &run_id, trigger_source_ref);
     }
 
-    /// Correlates a run_id back to its trigger source.
+    /// Correlates a `run_id` back to its trigger source.
     fn correlate_run_to_source(&mut self, _run_key: &str, run_id: &str, source: &SourceRef) {
         match source {
             SourceRef::Schedule { tick_id, .. } => {
@@ -2883,9 +2874,7 @@ pub fn merge_idempotency_key_rows(rows: Vec<IdempotencyKeyRow>) -> Option<Idempo
 
 /// Merges partition status rows from base snapshot and L0 deltas.
 #[must_use]
-pub fn merge_partition_status_rows(
-    rows: Vec<PartitionStatusRow>,
-) -> Option<PartitionStatusRow> {
+pub fn merge_partition_status_rows(rows: Vec<PartitionStatusRow>) -> Option<PartitionStatusRow> {
     rows.into_iter()
         .reduce(|best, row| match row.row_version.cmp(&best.row_version) {
             std::cmp::Ordering::Less => best,
@@ -4675,7 +4664,10 @@ mod tests {
         let event = backfill_created_event("bf_001");
         state.fold_event(&event);
 
-        let backfill = state.backfills.get("bf_001").expect("backfill should exist");
+        let backfill = state
+            .backfills
+            .get("bf_001")
+            .expect("backfill should exist");
         assert_eq!(backfill.state, BackfillState::Running);
         assert_eq!(backfill.state_version, 1);
         assert_eq!(backfill.total_partitions, 3);
@@ -4697,7 +4689,10 @@ mod tests {
         assert_eq!(chunk.state, ChunkState::Planned);
         assert_eq!(chunk.run_key, "backfill:bf_002:chunk:0");
 
-        let backfill = state.backfills.get("bf_002").expect("backfill should exist");
+        let backfill = state
+            .backfills
+            .get("bf_002")
+            .expect("backfill should exist");
         assert_eq!(backfill.planned_chunks, 1);
     }
 
@@ -4714,7 +4709,10 @@ mod tests {
         );
         state.fold_event(&event);
 
-        let backfill = state.backfills.get("bf_003").expect("backfill should exist");
+        let backfill = state
+            .backfills
+            .get("bf_003")
+            .expect("backfill should exist");
         assert_eq!(backfill.state, BackfillState::Paused);
         assert_eq!(backfill.state_version, 2);
     }
@@ -4732,7 +4730,10 @@ mod tests {
         );
         state.fold_event(&event);
 
-        let backfill = state.backfills.get("bf_004").expect("backfill should exist");
+        let backfill = state
+            .backfills
+            .get("bf_004")
+            .expect("backfill should exist");
         assert_eq!(backfill.state, BackfillState::Running);
         assert_eq!(backfill.state_version, 1);
     }
@@ -5144,7 +5145,10 @@ mod tests {
 
         // Verify partition status updated
         let key = ("analytics.daily".to_string(), "2025-01-15".to_string());
-        let status = state.partition_status.get(&key).expect("partition status should exist");
+        let status = state
+            .partition_status
+            .get(&key)
+            .expect("partition status should exist");
 
         assert_eq!(status.asset_key, "analytics.daily");
         assert_eq!(status.partition_key, "2025-01-15");
@@ -5185,7 +5189,10 @@ mod tests {
 
         // Verify partition status
         let key = ("analytics.daily".to_string(), "2025-01-15".to_string());
-        let status = state.partition_status.get(&key).expect("partition status should exist");
+        let status = state
+            .partition_status
+            .get(&key)
+            .expect("partition status should exist");
 
         // Per P0-5: last_materialization_* should NOT be set on failure
         assert!(

@@ -579,9 +579,12 @@ mod tests {
         let uuid2 = Uuid::new_v4();
         let uuid3 = Uuid::new_v4();
 
-        let pointer1 = IcebergTablePointer::new(uuid1, "gs://bucket/table1/metadata.json".to_string());
-        let pointer2 = IcebergTablePointer::new(uuid2, "gs://bucket/table2/metadata.json".to_string());
-        let pointer3 = IcebergTablePointer::new(uuid3, "gs://bucket/table3/metadata.json".to_string());
+        let pointer1 =
+            IcebergTablePointer::new(uuid1, "gs://bucket/table1/metadata.json".to_string());
+        let pointer2 =
+            IcebergTablePointer::new(uuid2, "gs://bucket/table2/metadata.json".to_string());
+        let pointer3 =
+            IcebergTablePointer::new(uuid3, "gs://bucket/table3/metadata.json".to_string());
 
         store.create(&uuid1, &pointer1).await.expect("create1");
         store.create(&uuid2, &pointer2).await.expect("create2");

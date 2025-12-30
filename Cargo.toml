@@ -124,7 +124,7 @@ tonic = "0.14"
 prost = "0.13"
 prost-types = "0.13"
 http = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 
 # GCP authentication
 gcp_auth = "0.12"

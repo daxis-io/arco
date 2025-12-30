@@ -42,7 +42,7 @@ chrono = { workspace = true }
 
 # Output formatting
 tabled = "0.17"
-colored = "2"
+owo-colors = "4"
 
 # Logging
 tracing = { workspace = true }

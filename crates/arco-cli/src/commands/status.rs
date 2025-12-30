@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::Args;
-use colored::Colorize;
+use owo_colors::OwoColorize;
 
 use crate::client::ApiClient;
 use crate::{Config, OutputFormat};

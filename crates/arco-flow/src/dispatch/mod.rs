@@ -16,6 +16,9 @@
 pub mod cloud_tasks;
 pub mod memory;
 
+pub use cloud_tasks::CloudTasksDispatcher;
+pub use memory::InMemoryTaskQueue;
+
 use std::time::Duration;
 
 use async_trait::async_trait;

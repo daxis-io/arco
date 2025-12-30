@@ -21,6 +21,8 @@
 
 pub mod memory;
 
+pub use memory::InMemoryLeaderElector;
+
 use std::time::Duration;
 
 use async_trait::async_trait;

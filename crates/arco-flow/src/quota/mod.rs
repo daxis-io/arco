@@ -15,6 +15,8 @@
 pub mod drr;
 pub mod memory;
 
+pub use drr::DrrScheduler;
+
 use async_trait::async_trait;
 
 use crate::error::Result;

@@ -495,29 +495,33 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn sorts_object_keys_and_has_no_whitespace() {
-        // Insertion order: tenant then date
+    fn sorts_object_keys_and_has_no_whitespace() -> TestResult {
         let v = json!({"tenant":"acme","date":"2025-01-15"});
-        let s = to_canonical_string(&v).unwrap_or_else(|e| panic!("canonicalize failed: {e}"));
+        let s = to_canonical_string(&v)?;
         assert_eq!(s, r#"{"date":"2025-01-15","tenant":"acme"}"#);
+        Ok(())
     }
 
     #[test]
-    fn sorts_nested_objects_recursively() {
+    fn sorts_nested_objects_recursively() -> TestResult {
         let v = json!({
             "b": { "d": 2, "c": 1 },
             "a": 0
         });
-        let s = to_canonical_string(&v).unwrap_or_else(|e| panic!("canonicalize failed: {e}"));
+        let s = to_canonical_string(&v)?;
         assert_eq!(s, r#"{"a":0,"b":{"c":1,"d":2}}"#);
+        Ok(())
     }
 
     #[test]
-    fn preserves_array_order() {
+    fn preserves_array_order() -> TestResult {
         let v = json!([3, 2, 1]);
-        let s = to_canonical_string(&v).unwrap_or_else(|e| panic!("canonicalize failed: {e}"));
+        let s = to_canonical_string(&v)?;
         assert_eq!(s, "[3,2,1]");
+        Ok(())
     }
 
     #[test]
@@ -531,76 +535,81 @@ mod tests {
     }
 
     #[test]
-    fn allows_integers() {
+    fn allows_integers() -> TestResult {
         let v = json!({"x": 125, "y": -42});
-        let s = to_canonical_string(&v).unwrap_or_else(|e| panic!("canonicalize failed: {e}"));
+        let s = to_canonical_string(&v)?;
         assert_eq!(s, r#"{"x":125,"y":-42}"#);
+        Ok(())
     }
 
     #[test]
-    fn rejects_float_like_integers() {
-        // 1.0 may be serialized as a float even though it is mathematically integral.
-        // Canonical JSON forbids floats entirely (ADR-010).
-        let v: Value = serde_json::from_str(r#"{"x": 1.0}"#)
-            .unwrap_or_else(|e| panic!("failed to parse test JSON: {e}"));
+    fn rejects_float_like_integers() -> TestResult {
+        let v: Value = serde_json::from_str(r#"{"x": 1.0}"#)?;
         assert!(matches!(
             to_canonical_string(&v),
             Err(CanonicalJsonError::FloatNotAllowed)
         ));
+        Ok(())
     }
 
     #[test]
-    fn string_escaping_is_stable() {
+    fn string_escaping_is_stable() -> TestResult {
         let v = json!({"s": "a\"b\nc"});
-        // Exact escaping is deterministic; serde_json escapes quotes and newlines.
-        let s = to_canonical_string(&v).unwrap_or_else(|e| panic!("canonicalize failed: {e}"));
+        let s = to_canonical_string(&v)?;
         assert_eq!(s, r#"{"s":"a\"b\nc"}"#);
+        Ok(())
     }
 
     #[test]
-    fn handles_empty_object() {
+    fn handles_empty_object() -> TestResult {
         let v = json!({});
-        let s = to_canonical_string(&v).unwrap_or_else(|e| panic!("canonicalize failed: {e}"));
+        let s = to_canonical_string(&v)?;
         assert_eq!(s, "{}");
+        Ok(())
     }
 
     #[test]
-    fn handles_empty_array() {
+    fn handles_empty_array() -> TestResult {
         let v = json!([]);
-        let s = to_canonical_string(&v).unwrap_or_else(|e| panic!("canonicalize failed: {e}"));
+        let s = to_canonical_string(&v)?;
         assert_eq!(s, "[]");
+        Ok(())
     }
 
     #[test]
-    fn handles_null() {
+    fn handles_null() -> TestResult {
         let v = json!(null);
-        let s = to_canonical_string(&v).unwrap_or_else(|e| panic!("canonicalize failed: {e}"));
+        let s = to_canonical_string(&v)?;
         assert_eq!(s, "null");
+        Ok(())
     }
 
     #[test]
-    fn handles_booleans() {
+    fn handles_booleans() -> TestResult {
         let v = json!({"a": true, "b": false});
-        let s = to_canonical_string(&v).unwrap_or_else(|e| panic!("canonicalize failed: {e}"));
+        let s = to_canonical_string(&v)?;
         assert_eq!(s, r#"{"a":true,"b":false}"#);
+        Ok(())
     }
 
     #[test]
-    fn handles_negative_integers() {
+    fn handles_negative_integers() -> TestResult {
         let v = json!({"n": -42});
-        let s = to_canonical_string(&v).unwrap_or_else(|e| panic!("canonicalize failed: {e}"));
+        let s = to_canonical_string(&v)?;
         assert_eq!(s, r#"{"n":-42}"#);
+        Ok(())
     }
 
     #[test]
-    fn handles_large_integers() {
+    fn handles_large_integers() -> TestResult {
         let v = json!({"big": 9_223_372_036_854_775_807_i64});
-        let s = to_canonical_string(&v).unwrap_or_else(|e| panic!("canonicalize failed: {e}"));
+        let s = to_canonical_string(&v)?;
         assert_eq!(s, r#"{"big":9223372036854775807}"#);
+        Ok(())
     }
 
     #[test]
-    fn deeply_nested_structure() {
+    fn deeply_nested_structure() -> TestResult {
         let v = json!({
             "z": {
                 "y": {
@@ -609,26 +618,25 @@ mod tests {
             },
             "a": "first"
         });
-        let s = to_canonical_string(&v).unwrap_or_else(|e| panic!("canonicalize failed: {e}"));
+        let s = to_canonical_string(&v)?;
         assert_eq!(s, r#"{"a":"first","z":{"y":{"x":[1,2,{"v":4,"w":3}]}}}"#);
+        Ok(())
     }
 
     #[test]
     #[allow(deprecated)]
-    fn canonical_partition_key_sorts_dimensions() {
+    fn canonical_partition_key_sorts_dimensions() -> TestResult {
         let mut dims = HashMap::new();
         dims.insert("date".to_string(), "2025-01-15".to_string());
         dims.insert("region".to_string(), "us-west".to_string());
 
-        let canonical =
-            canonical_partition_key(&dims).unwrap_or_else(|e| panic!("canonicalize failed: {e}"));
-        // Keys sorted: date < region
+        let canonical = canonical_partition_key(&dims)?;
         assert_eq!(canonical, r#"{"date":"2025-01-15","region":"us-west"}"#);
+        Ok(())
     }
 
     #[test]
-    fn rejects_explicit_floats() {
-        // ADR-010: All floats must be rejected (including exponent notation).
+    fn rejects_explicit_floats() -> TestResult {
         let cases = [
             r#"{"x": 1.25}"#,
             r#"{"x": 0.1}"#,
@@ -638,17 +646,15 @@ mod tests {
         ];
 
         for case in cases {
-            let v: Value = serde_json::from_str(case)
-                .unwrap_or_else(|e| panic!("failed to parse test JSON case {case}: {e}"));
-            let err = match to_canonical_string(&v) {
-                Ok(s) => panic!("case {case} should fail, got: {s}"),
-                Err(e) => e,
-            };
+            let v: Value = serde_json::from_str(case)?;
+            let result = to_canonical_string(&v);
             assert!(
-                matches!(err, CanonicalJsonError::FloatNotAllowed),
-                "case {case} should fail with FloatNotAllowed, got: {err}",
+                matches!(result, Err(CanonicalJsonError::FloatNotAllowed)),
+                "case {case} should fail with FloatNotAllowed, got: {result:?}",
             );
         }
+
+        Ok(())
     }
 
     #[test]
@@ -695,10 +701,12 @@ mod tests {
                 let btreemap: BTreeMap<String, String> = pairs.iter().cloned().collect();
 
                 // Both should produce identical canonical JSON
-                let from_hash = to_canonical_string(&hashmap)
-                    .unwrap_or_else(|e| panic!("failed to canonicalize hashmap: {e}"));
-                let from_btree = to_canonical_string(&btreemap)
-                    .unwrap_or_else(|e| panic!("failed to canonicalize btreemap: {e}"));
+                let from_hash = to_canonical_string(&hashmap).map_err(|e| {
+                    TestCaseError::fail(format!("failed to canonicalize hashmap: {e}"))
+                })?;
+                let from_btree = to_canonical_string(&btreemap).map_err(|e| {
+                    TestCaseError::fail(format!("failed to canonicalize btreemap: {e}"))
+                })?;
 
                 prop_assert_eq!(from_hash, from_btree);
             }
@@ -713,10 +721,12 @@ mod tests {
                 let map1: BTreeMap<String, i64> = pairs.iter().cloned().collect();
                 let map2: BTreeMap<String, i64> = pairs.iter().cloned().collect();
 
-                let bytes1 = to_canonical_bytes(&map1)
-                    .unwrap_or_else(|e| panic!("failed to canonicalize map1: {e}"));
-                let bytes2 = to_canonical_bytes(&map2)
-                    .unwrap_or_else(|e| panic!("failed to canonicalize map2: {e}"));
+                let bytes1 = to_canonical_bytes(&map1).map_err(|e| {
+                    TestCaseError::fail(format!("failed to canonicalize map1: {e}"))
+                })?;
+                let bytes2 = to_canonical_bytes(&map2).map_err(|e| {
+                    TestCaseError::fail(format!("failed to canonicalize map2: {e}"))
+                })?;
 
                 prop_assert_eq!(bytes1, bytes2);
             }

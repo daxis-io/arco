@@ -365,13 +365,10 @@ mod tests {
             .with_positions(1000, 800)
             .with_thresholds(100, 500);
 
-        // Lag is 200, between soft (100) and hard (500) -> Warning
-        match state.evaluate() {
-            BackpressureDecision::AcceptWithWarning { pending_lag } => {
-                assert_eq!(pending_lag, 200);
-            }
-            other => panic!("expected warning, got {other:?}"),
-        }
+        assert!(matches!(
+            state.evaluate(),
+            BackpressureDecision::AcceptWithWarning { pending_lag: 200 }
+        ));
     }
 
     #[test]
@@ -380,13 +377,11 @@ mod tests {
             .with_positions(10000, 0)
             .with_thresholds(100, 500);
 
-        // Lag is 10000, above hard (500) -> Reject
-        match state.evaluate() {
-            BackpressureDecision::Reject { retry_after } => {
-                assert!(retry_after >= Duration::from_secs(5));
-            }
-            other => panic!("expected reject, got {other:?}"),
-        }
+        assert!(matches!(
+            state.evaluate(),
+            BackpressureDecision::Reject { retry_after }
+                if retry_after >= Duration::from_secs(5)
+        ));
     }
 
     #[test]
@@ -415,10 +410,9 @@ mod tests {
         for _ in 0..100 {
             registry.record_write("catalog");
         }
-        let decision = registry.check("catalog").expect("should accept");
         assert!(matches!(
-            decision,
-            BackpressureDecision::AcceptWithWarning { .. }
+            registry.check("catalog"),
+            Ok(BackpressureDecision::AcceptWithWarning { .. })
         ));
     }
 
@@ -430,9 +424,11 @@ mod tests {
             registry.record_write("catalog");
         }
 
-        let err = registry.check("catalog").expect_err("should reject");
-        assert_eq!(err.domain, "catalog");
-        assert!(err.retry_after >= Duration::from_secs(5));
+        assert!(matches!(
+            registry.check("catalog"),
+            Err(BackpressureError { domain, retry_after, .. })
+                if domain == "catalog" && retry_after >= Duration::from_secs(5)
+        ));
     }
 
     #[test]
@@ -473,16 +469,13 @@ mod tests {
             .with_positions(50000, 0)
             .with_thresholds(100, 500);
 
-        match (state_low.evaluate(), state_high.evaluate()) {
+        assert!(matches!(
+            (state_low.evaluate(), state_high.evaluate()),
             (
                 BackpressureDecision::Reject { retry_after: low },
-                BackpressureDecision::Reject { retry_after: high },
-            ) => {
-                // High lag should have longer retry
-                assert!(high >= low);
-            }
-            _ => panic!("both should reject"),
-        }
+                BackpressureDecision::Reject { retry_after: high }
+            ) if high >= low
+        ));
     }
 
     #[test]

@@ -41,10 +41,10 @@ Include:
 
 ### Supply Chain Security
 
-- All dependencies audited via `cargo-deny`
-- License compliance enforced (Apache-2.0/MIT compatible only)
-- Automated vulnerability scanning in CI
-- SBOM generation for releases
+- Dependency policy enforced via `cargo-deny` (licenses/sources/bans)
+- License allowlist enforced via `cargo-deny` (with explicit exceptions)
+- Automated vulnerability scanning via `cargo-deny advisories` and scheduled `pip-audit`
+- SBOM generation for releases via `cargo sbom` (SPDX + CycloneDX)
 
 ### Code Security
 

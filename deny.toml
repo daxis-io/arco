@@ -31,12 +31,15 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
+    "OpenSSL",
     "Zlib",
     "0BSD",
     "Unicode-3.0",
 ]
 confidence-threshold = 0.93
-exceptions = []
+exceptions = [
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+]
 
 # Workspace crates are private (not published) - exempt from license checks
 [licenses.private]

@@ -914,6 +914,8 @@ mod tests {
 
     #[cfg(feature = "gcp")]
     mod gcp_tests {
+        use std::time::Duration;
+
         use super::CloudTasksDispatcher;
 
         #[test]

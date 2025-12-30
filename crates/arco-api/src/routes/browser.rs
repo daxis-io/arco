@@ -24,7 +24,7 @@
 //!
 //! Only safe metadata is logged: tenant, workspace, domain, path count, TTL.
 //!
-//! For internal handling of sensitive URL data, use [`crate::redaction::RedactedUrl`].
+//! For internal handling of sensitive URL data, use `crate::redaction::RedactedUrl`.
 //!
 //! ## Routes
 //!

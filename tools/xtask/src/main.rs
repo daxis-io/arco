@@ -26,7 +26,7 @@ use arco_core::{CatalogDomain, CatalogPaths, Error as CoreError, ScopedStorage};
 /// Expected tool versions (should match CI)
 mod versions {
     pub const RUST_CHANNEL: &str = "1.85";
-    pub const CARGO_DENY_MIN: &str = "0.18.0";
+    pub const CARGO_DENY_MIN: &str = "0.18.9";
     pub const BUF_VERSION: &str = "1.47.2";
 }
 
@@ -123,14 +123,19 @@ fn run_ci() -> Result<()> {
     )?;
     run_cmd(
         "cargo",
+        &["test", "-p", "arco-flow", "--all-features", "--no-run"],
+    )?;
+    run_cmd(
+        "cargo",
         &["test", "-p", "arco-flow", "--features", "test-utils"],
     )?;
     run_cmd_with_env(
         "cargo",
-        &["doc", "--workspace", "--no-deps"],
+        &["doc", "--workspace", "--all-features", "--no-deps"],
         &[("RUSTDOCFLAGS", "-D warnings")],
     )?;
-    run_cmd("cargo", &["deny", "check"])?;
+    run_cmd("cargo", &["deny", "check", "bans", "licenses", "sources"])?;
+    run_cmd("cargo", &["deny", "check", "advisories"])?;
 
     println!("\nAll CI checks passed!");
     Ok(())

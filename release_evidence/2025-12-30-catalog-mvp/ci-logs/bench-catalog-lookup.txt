@@ -1,0 +1,33 @@
+Command: cargo bench --manifest-path /Users/ethanurbanski/arco/Cargo.toml -p arco-catalog --bench catalog_lookup
+
+   Compiling serde_json v1.0.146
+   Compiling tracing v0.1.44
+   Compiling tower v0.5.2
+   Compiling digest v0.10.7
+   Compiling md-5 v0.10.6
+   Compiling sha2 v0.10.9
+   Compiling h2 v0.4.12
+   Compiling tower-http v0.6.8
+   Compiling arrow-json v54.3.1
+   Compiling tracing-subscriber v0.3.22
+   Compiling tinytemplate v1.2.1
+   Compiling hyper v1.8.1
+   Compiling criterion v0.5.1
+   Compiling arrow v54.3.1
+   Compiling hyper-util v0.1.19
+   Compiling hyper-rustls v0.27.7
+   Compiling reqwest v0.12.28
+   Compiling object_store v0.11.2
+   Compiling arco-core v0.1.0 (/Users/ethanurbanski/arco/crates/arco-core)
+   Compiling arco-catalog v0.1.0 (/Users/ethanurbanski/arco/crates/arco-catalog)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 28.86s
+     Running benches/catalog_lookup.rs (arco/target/release/deps/catalog_lookup-05d0eaab28a8a3ca)
+Gnuplot not found, using plotters backend
+Benchmarking catalog_lookup/empty_catalog_list
+Benchmarking catalog_lookup/empty_catalog_list: Warming up for 3.0000 s
+Benchmarking catalog_lookup/empty_catalog_list: Collecting 100 samples in estimated 5.0000 s (22B iterations)
+Benchmarking catalog_lookup/empty_catalog_list: Analyzing
+catalog_lookup/empty_catalog_list
+                        time:   [234.20 ps 235.86 ps 237.90 ps]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild

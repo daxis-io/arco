@@ -6,6 +6,7 @@ the Protobuf schema exactly, including:
 - Required fields
 - Value formats
 """
+
 from __future__ import annotations
 
 import json
@@ -19,9 +20,9 @@ class TestAssetDefinitionContract:
 
     def test_required_fields_present(self) -> None:
         """Serialized AssetDefinition has all required fields."""
-        from servo.manifest.model import AssetEntry
-        from servo.manifest.serialization import serialize_to_manifest_json
-        from servo.types import AssetDefinition, AssetId, AssetKey, CodeLocation
+        from arco_flow.manifest.model import AssetEntry
+        from arco_flow.manifest.serialization import serialize_to_manifest_json
+        from arco_flow.types import AssetDefinition, AssetId, AssetKey, CodeLocation
 
         definition = AssetDefinition(
             key=AssetKey("raw", "events"),
@@ -55,9 +56,9 @@ class TestAssetDefinitionContract:
 
     def test_key_structure(self) -> None:
         """AssetKey serializes with namespace and name fields."""
-        from servo.manifest.model import AssetEntry
-        from servo.manifest.serialization import serialize_to_manifest_json
-        from servo.types import AssetDefinition, AssetId, AssetKey, CodeLocation
+        from arco_flow.manifest.model import AssetEntry
+        from arco_flow.manifest.serialization import serialize_to_manifest_json
+        from arco_flow.types import AssetDefinition, AssetId, AssetKey, CodeLocation
 
         definition = AssetDefinition(
             key=AssetKey("staging", "users"),
@@ -74,9 +75,9 @@ class TestAssetDefinitionContract:
 
     def test_camel_case_fields(self) -> None:
         """All fields use camelCase naming."""
-        from servo.manifest.model import AssetEntry
-        from servo.manifest.serialization import serialize_to_manifest_json
-        from servo.types import AssetDefinition, AssetId, AssetKey, CodeLocation
+        from arco_flow.manifest.model import AssetEntry
+        from arco_flow.manifest.serialization import serialize_to_manifest_json
+        from arco_flow.types import AssetDefinition, AssetId, AssetKey, CodeLocation
 
         definition = AssetDefinition(
             key=AssetKey("raw", "events"),
@@ -114,7 +115,7 @@ class TestPartitionKeyContract:
         - No whitespace
         - JSON format with type prefixes (s: for strings, i: for integers, etc.)
         """
-        from servo.types.partition import PartitionKey
+        from arco_flow.types.partition import PartitionKey
 
         pk = PartitionKey({"date": "2025-01-15", "tenant": "acme"})
         canonical = pk.to_canonical()
@@ -130,7 +131,7 @@ class TestScalarValueContract:
 
     def test_type_tags_match_proto(self) -> None:
         """ScalarValue kinds match proto ScalarValue oneof cases."""
-        from servo.types.scalar import ScalarValue
+        from arco_flow.types.scalar import ScalarValue
 
         # String
         sv_str = ScalarValue.from_value("hello")
@@ -160,7 +161,7 @@ class TestScalarValueContract:
 
     def test_float_prohibited(self) -> None:
         """Float values are prohibited per canonical serialization rules."""
-        from servo.types.scalar import ScalarValue
+        from arco_flow.types.scalar import ScalarValue
 
         with pytest.raises(ValueError, match=r"[Ff]loat"):
             ScalarValue.from_value(3.14)
@@ -171,7 +172,7 @@ class TestManifestContract:
 
     def test_manifest_structure(self) -> None:
         """Manifest JSON has correct structure."""
-        from servo.manifest.model import AssetManifest, GitContext
+        from arco_flow.manifest.model import AssetManifest, GitContext
 
         manifest = AssetManifest(
             tenant_id="acme",
@@ -193,7 +194,7 @@ class TestManifestContract:
 
     def test_git_context_fields(self) -> None:
         """Git context has expected fields."""
-        from servo.manifest.model import AssetManifest, GitContext
+        from arco_flow.manifest.model import AssetManifest, GitContext
 
         manifest = AssetManifest(
             git=GitContext(

@@ -3,6 +3,8 @@
 //! The checked-in spec is used to generate external clients (TS / Rust) and to
 //! detect breaking API changes in CI.
 
+#![allow(clippy::needless_for_each)]
+
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
@@ -27,6 +29,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::lineage::add_edges,
         crate::routes::lineage::get_lineage,
         crate::routes::browser::mint_urls,
+        crate::routes::query::query,
         crate::routes::orchestration::trigger_run,
         crate::routes::orchestration::list_runs,
         crate::routes::orchestration::get_run,
@@ -62,6 +65,7 @@ use utoipa::{Modify, OpenApi};
             crate::routes::browser::MintUrlsRequest,
             crate::routes::browser::MintUrlsResponse,
             crate::routes::browser::SignedUrl,
+            crate::routes::query::QueryRequest,
             crate::routes::orchestration::TriggerRunRequest,
             crate::routes::orchestration::TriggerRunResponse,
             crate::routes::orchestration::RunKeyBackfillRequest,
@@ -112,6 +116,7 @@ use utoipa::{Modify, OpenApi};
         (name = "tables", description = "Table operations"),
         (name = "lineage", description = "Lineage operations"),
         (name = "browser", description = "Browser signed URL minting"),
+        (name = "query", description = "SQL query execution"),
         (name = "Orchestration", description = "Run orchestration operations"),
         (name = "Manifests", description = "Manifest deployment operations"),
         (name = "Worker Callbacks", description = "Worker task lifecycle callbacks"),

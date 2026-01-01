@@ -1,12 +1,13 @@
 """Tests for partition types."""
+
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from servo.types.partition import DailyPartition, PartitionKey, PartitionStrategy
-from servo.types.scalar import ScalarValue
+from arco_flow.types.partition import DailyPartition, PartitionKey, PartitionStrategy
+from arco_flow.types.scalar import ScalarValue
 
 
 class TestScalarValue:
@@ -77,21 +78,25 @@ class TestPartitionKey:
 
     def test_from_dict_mixed_types(self) -> None:
         """PartitionKey accepts dict with mixed value types."""
-        pk = PartitionKey({
-            "date": date(2025, 1, 15),
-            "region": "us-east-1",
-            "version": 42,
-        })
+        pk = PartitionKey(
+            {
+                "date": date(2025, 1, 15),
+                "region": "us-east-1",
+                "version": 42,
+            }
+        )
 
         assert len(pk.dimensions) == 3
 
     def test_to_proto_dict_returns_string_values(self) -> None:
         """to_proto_dict() returns dict with all string values (proto compliance)."""
-        pk = PartitionKey({
-            "date": date(2025, 1, 15),
-            "region": "us-east-1",
-            "version": 42,
-        })
+        pk = PartitionKey(
+            {
+                "date": date(2025, 1, 15),
+                "region": "us-east-1",
+                "version": 42,
+            }
+        )
 
         proto_dict = pk.to_proto_dict()
 
@@ -104,12 +109,14 @@ class TestPartitionKey:
 
     def test_from_proto_dict_roundtrip(self) -> None:
         """Can roundtrip through proto dict format."""
-        original = PartitionKey({
-            "date": date(2025, 1, 15),
-            "region": "us-east-1",
-            "version": 42,
-            "active": True,
-        })
+        original = PartitionKey(
+            {
+                "date": date(2025, 1, 15),
+                "region": "us-east-1",
+                "version": 42,
+                "active": True,
+            }
+        )
 
         proto_dict = original.to_proto_dict()
         restored = PartitionKey.from_proto_dict(proto_dict)

@@ -56,6 +56,7 @@ pub mod error;
 pub mod metrics;
 pub mod openapi;
 pub(crate) mod orchestration_compaction;
+pub(crate) mod paths;
 pub mod rate_limit;
 pub(crate) mod redaction;
 pub mod routes;

@@ -276,7 +276,6 @@ impl EventWriter {
                             if attempt == Self::SEQUENCE_CAS_MAX_RETRIES {
                                 break;
                             }
-                            continue;
                         }
                     }
                 }

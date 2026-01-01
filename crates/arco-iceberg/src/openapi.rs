@@ -3,9 +3,12 @@
 //! The generated spec can be used to validate compliance with the
 //! Apache Iceberg REST Catalog specification.
 
+#![allow(clippy::needless_for_each)]
+
 use utoipa::OpenApi;
 
 /// `OpenAPI` documentation for the Iceberg REST Catalog API.
+#[allow(clippy::needless_for_each)]
 #[derive(OpenApi)]
 #[openapi(
     info(

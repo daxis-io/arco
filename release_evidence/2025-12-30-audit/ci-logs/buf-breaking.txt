@@ -1,0 +1,4 @@
+Command: buf breaking --config proto/buf.yaml --against .git#branch=main --path proto
+
+Output:
+proto/arco/v1/catalog.proto:10:8:import "arco/v1/common.proto": file does not exist

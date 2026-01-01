@@ -1,0 +1,6 @@
+Command: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+Output:
+ Documenting arco-api v0.1.0 (/Users/ethanurbanski/arco/crates/arco-api)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.45s
+   Generated /Users/ethanurbanski/arco/target/doc/arco_api/index.html and 15 other files

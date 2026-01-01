@@ -27,13 +27,14 @@ locals {
   # Use an anchored regex so the protected prefix must occur at the expected path boundary.
   tenant_workspace_prefix_regex = "^${local.bucket_objects_prefix}tenant=[^/]+/workspace=[^/]+/"
 
-  ledger_prefix_regex    = "${local.tenant_workspace_prefix_regex}ledger/"
-  locks_prefix_regex     = "${local.tenant_workspace_prefix_regex}locks/"
-  commits_prefix_regex   = "${local.tenant_workspace_prefix_regex}commits/"
-  manifests_prefix_regex = "${local.tenant_workspace_prefix_regex}manifests/"
-  snapshots_prefix_regex = "${local.tenant_workspace_prefix_regex}snapshots/"
-  state_prefix_regex     = "${local.tenant_workspace_prefix_regex}state/"
-  l0_prefix_regex        = "${local.tenant_workspace_prefix_regex}l0/"
+  ledger_prefix_regex             = "${local.tenant_workspace_prefix_regex}ledger/"
+  locks_prefix_regex              = "${local.tenant_workspace_prefix_regex}locks/"
+  commits_prefix_regex            = "${local.tenant_workspace_prefix_regex}commits/"
+  manifests_prefix_regex          = "${local.tenant_workspace_prefix_regex}manifests/"
+  snapshots_prefix_regex          = "${local.tenant_workspace_prefix_regex}snapshots/"
+  state_prefix_regex              = "${local.tenant_workspace_prefix_regex}state/"
+  anti_entropy_state_prefix_regex = "${local.tenant_workspace_prefix_regex}state/anti_entropy/"
+  l0_prefix_regex                 = "${local.tenant_workspace_prefix_regex}l0/"
 }
 
 # ============================================================================
@@ -212,4 +213,18 @@ resource "google_storage_bucket_iam_member" "compactor_antientropy_read_all" {
   bucket = google_storage_bucket.catalog.name
   role   = google_project_iam_custom_role.storage_object_reader_no_list.name
   member = "serviceAccount:${google_service_account.compactor_antientropy.email}"
+}
+
+resource "google_storage_bucket_iam_member" "compactor_antientropy_write_cursor" {
+  bucket = google_storage_bucket.catalog.name
+  role   = "roles/storage.objectUser"
+  member = "serviceAccount:${google_service_account.compactor_antientropy.email}"
+
+  condition {
+    title       = "CompactorAntiEntropyWriteCursor"
+    description = "Gate 5: Anti-entropy can update state/anti_entropy cursor"
+    expression  = <<-EOT
+      resource.name.matches("${local.anti_entropy_state_prefix_regex}")
+    EOT
+  }
 }

@@ -1,4 +1,4 @@
-//! Event-driven orchestration for Servo.
+//! Event-driven orchestration for Arco Flow.
 //!
 //! This module implements the orchestration domain following the unified platform
 //! pattern (ADR-020). It provides:

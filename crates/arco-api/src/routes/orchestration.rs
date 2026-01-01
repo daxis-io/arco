@@ -1082,7 +1082,7 @@ pub(crate) async fn manual_evaluate_sensor(
     ))
 }
 
-/// Backfill missing run_key fingerprints.
+/// Backfill missing `run_key` fingerprints.
 ///
 /// Allows updating legacy reservations that were created before fingerprints
 /// were introduced, enabling strict payload validation moving forward.
@@ -1590,7 +1590,9 @@ pub(crate) async fn get_run_logs(
             .await
             .map_err(|e| ApiError::internal(format!("failed to read log: {e}")))?;
         let chunk = String::from_utf8_lossy(&bytes);
-        output.push_str(&format!("--- {} ---\n", path.as_str()));
+        output.push_str("--- ");
+        output.push_str(path.as_str());
+        output.push_str(" ---\n");
         output.push_str(&chunk);
         if !chunk.ends_with('\n') {
             output.push('\n');

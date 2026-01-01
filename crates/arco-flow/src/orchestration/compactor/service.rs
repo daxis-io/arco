@@ -18,6 +18,7 @@ use arco_core::{ScopedStorage, WritePrecondition, WriteResult};
 
 use crate::error::{Error, Result};
 use crate::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
+use crate::paths::{orchestration_l0_dir, orchestration_manifest_path};
 
 use super::fold::{
     FoldState, merge_dep_satisfaction_rows, merge_dispatch_outbox_rows, merge_idempotency_key_rows,
@@ -198,9 +199,7 @@ impl MicroCompactor {
             .last()
             .map(|e| e.1.event_id.clone())
             .unwrap_or_default();
-        let mut manifest_changed = false;
-
-        if let Some(delta_id) = delta_id.clone() {
+        let delta_changed = if let Some(delta_id) = delta_id.clone() {
             let delta = L0Delta {
                 delta_id,
                 created_at: Utc::now(),
@@ -216,12 +215,13 @@ impl MicroCompactor {
             // Update manifest
             manifest.l0_deltas.push(delta);
             manifest.l0_count += 1;
-            manifest_changed = true;
-        }
+            true
+        } else {
+            false
+        };
 
-        if update_watermarks(&mut manifest, &events, &last_event) {
-            manifest_changed = true;
-        }
+        let watermark_changed = update_watermarks(&mut manifest, &events, &last_event);
+        let manifest_changed = delta_changed || watermark_changed;
 
         let manifest_revision = if manifest_changed {
             let new_revision = Ulid::new().to_string();
@@ -243,7 +243,7 @@ impl MicroCompactor {
 
     /// Reads the current manifest and version for CAS publishing.
     async fn read_manifest_with_version(&self) -> Result<(OrchestrationManifest, Option<String>)> {
-        let manifest_path = "state/orchestration/manifest.json";
+        let manifest_path = orchestration_manifest_path();
 
         match self.storage.head_raw(manifest_path).await? {
             Some(meta) => {
@@ -266,14 +266,12 @@ impl MicroCompactor {
 
     /// Loads current fold state from base snapshot + L0 deltas.
     async fn load_current_state(&self, manifest: &OrchestrationManifest) -> Result<FoldState> {
-        let mut state = FoldState::new();
-
-        // Load base snapshot if exists
-        if let Some(ref snapshot_id) = manifest.base_snapshot.snapshot_id {
-            state = self
-                .load_snapshot_state(snapshot_id, &manifest.base_snapshot.tables)
-                .await?;
-        }
+        let mut state = if let Some(ref snapshot_id) = manifest.base_snapshot.snapshot_id {
+            self.load_snapshot_state(snapshot_id, &manifest.base_snapshot.tables)
+                .await?
+        } else {
+            FoldState::new()
+        };
 
         // Apply L0 deltas in order
         for delta in &manifest.l0_deltas {
@@ -394,7 +392,7 @@ impl MicroCompactor {
     /// Writes fold state to L0 delta Parquet files.
     async fn write_delta_parquet(&self, delta_id: &str, state: &FoldState) -> Result<TablePaths> {
         let mut paths = TablePaths::default();
-        let base_path = format!("state/orchestration/l0/{delta_id}");
+        let base_path = orchestration_l0_dir(delta_id);
 
         // Write runs
         if !state.runs.is_empty() {
@@ -496,7 +494,7 @@ impl MicroCompactor {
         manifest: &OrchestrationManifest,
         current_version: Option<&str>,
     ) -> Result<()> {
-        let manifest_path = "state/orchestration/manifest.json";
+        let manifest_path = orchestration_manifest_path();
         let json = serde_json::to_string_pretty(manifest).map_err(|e| Error::Serialization {
             message: format!("failed to serialize manifest: {e}"),
         })?;
@@ -792,6 +790,7 @@ mod tests {
     use crate::orchestration::events::{
         OrchestrationEventData, SourceRef, TaskDef, TickStatus, TimerType, TriggerInfo,
     };
+    use crate::paths::orchestration_event_path;
     use arco_core::MemoryBackend;
     use chrono::DateTime;
     use std::collections::HashMap;
@@ -957,8 +956,8 @@ mod tests {
         let event1 = make_run_triggered_event();
         let event2 = make_plan_created_event();
 
-        let path1 = format!("ledger/orchestration/2025-01-15/{}.json", event1.event_id);
-        let path2 = format!("ledger/orchestration/2025-01-15/{}.json", event2.event_id);
+        let path1 = orchestration_event_path("2025-01-15", &event1.event_id);
+        let path2 = orchestration_event_path("2025-01-15", &event2.event_id);
 
         storage
             .put_raw(
@@ -983,7 +982,7 @@ mod tests {
         assert!(result.delta_id.is_some());
 
         // Verify manifest was updated
-        let manifest_data = storage.get_raw("state/orchestration/manifest.json").await?;
+        let manifest_data = storage.get_raw(orchestration_manifest_path()).await?;
         let manifest: OrchestrationManifest =
             serde_json::from_slice(&manifest_data).expect("parse");
 
@@ -1002,8 +1001,8 @@ mod tests {
         let event1 = make_run_triggered_event();
         let event2 = make_plan_created_event();
 
-        let path1 = format!("ledger/orchestration/2025-01-15/{}.json", event1.event_id);
-        let path2 = format!("ledger/orchestration/2025-01-15/{}.json", event2.event_id);
+        let path1 = orchestration_event_path("2025-01-15", &event1.event_id);
+        let path2 = orchestration_event_path("2025-01-15", &event2.event_id);
 
         storage
             .put_raw(
@@ -1054,8 +1053,8 @@ mod tests {
 
         let event1_id = event1.event_id.clone();
         let event2_id = event2.event_id.clone();
-        let path1 = format!("ledger/orchestration/2025-01-15/{}.json", event1_id);
-        let path2 = format!("ledger/orchestration/2025-01-15/{}.json", event2_id);
+        let path1 = orchestration_event_path("2025-01-15", &event1_id);
+        let path2 = orchestration_event_path("2025-01-15", &event2_id);
 
         storage
             .put_raw(
@@ -1076,7 +1075,7 @@ mod tests {
             .compact_events(vec![path2.clone(), path1.clone()])
             .await?;
 
-        let manifest_data = storage.get_raw("state/orchestration/manifest.json").await?;
+        let manifest_data = storage.get_raw(orchestration_manifest_path()).await?;
         let manifest: OrchestrationManifest =
             serde_json::from_slice(&manifest_data).expect("parse");
 
@@ -1105,8 +1104,8 @@ mod tests {
         let event1 = make_run_triggered_event();
         let event2 = make_plan_created_event();
 
-        let path1 = format!("ledger/orchestration/2025-01-15/{}.json", event1.event_id);
-        let path2 = format!("ledger/orchestration/2025-01-15/{}.json", event2.event_id);
+        let path1 = orchestration_event_path("2025-01-15", &event1.event_id);
+        let path2 = orchestration_event_path("2025-01-15", &event2.event_id);
 
         storage
             .put_raw(
@@ -1127,7 +1126,7 @@ mod tests {
 
         let attempt_id = Ulid::new().to_string();
         let event3 = make_task_started_event(&attempt_id);
-        let path3 = format!("ledger/orchestration/2025-01-15/{}.json", event3.event_id);
+        let path3 = orchestration_event_path("2025-01-15", &event3.event_id);
         storage
             .put_raw(
                 &path3,
@@ -1138,7 +1137,7 @@ mod tests {
 
         compactor.compact_events(vec![path3]).await?;
 
-        let manifest_data = storage.get_raw("state/orchestration/manifest.json").await?;
+        let manifest_data = storage.get_raw(orchestration_manifest_path()).await?;
         let manifest: OrchestrationManifest =
             serde_json::from_slice(&manifest_data).expect("parse");
 
@@ -1166,7 +1165,7 @@ mod tests {
         // DispatchEnqueued arrives first (newer ULID)
         let mut enqueued = make_dispatch_enqueued_event(&dispatch_id);
         enqueued.event_id = "01B".to_string();
-        let path1 = format!("ledger/orchestration/2025-01-15/{}.json", enqueued.event_id);
+        let path1 = orchestration_event_path("2025-01-15", &enqueued.event_id);
         storage
             .put_raw(
                 &path1,
@@ -1179,10 +1178,7 @@ mod tests {
         // DispatchRequested arrives later but with older ULID
         let mut requested = make_dispatch_requested_event("run_01", "extract", 1, "01HQ123ATT");
         requested.event_id = "01A".to_string();
-        let path2 = format!(
-            "ledger/orchestration/2025-01-15/{}.json",
-            requested.event_id
-        );
+        let path2 = orchestration_event_path("2025-01-15", &requested.event_id);
         storage
             .put_raw(
                 &path2,
@@ -1213,7 +1209,7 @@ mod tests {
         // TimerEnqueued arrives first (newer ULID)
         let mut enqueued = make_timer_enqueued_event(&timer_id);
         enqueued.event_id = "01B".to_string();
-        let path1 = format!("ledger/orchestration/2025-01-15/{}.json", enqueued.event_id);
+        let path1 = orchestration_event_path("2025-01-15", &enqueued.event_id);
         storage
             .put_raw(
                 &path1,
@@ -1227,10 +1223,7 @@ mod tests {
         let canonical_fire_at = DateTime::from_timestamp(fire_epoch + 30, 0).unwrap();
         let mut requested = make_timer_requested_event(&timer_id, canonical_fire_at);
         requested.event_id = "01A".to_string();
-        let path2 = format!(
-            "ledger/orchestration/2025-01-15/{}.json",
-            requested.event_id
-        );
+        let path2 = orchestration_event_path("2025-01-15", &requested.event_id);
         storage
             .put_raw(
                 &path2,
@@ -1258,7 +1251,7 @@ mod tests {
         let manifest = OrchestrationManifest::new("01HQXYZ123REV");
         storage
             .put_raw(
-                "state/orchestration/manifest.json",
+                orchestration_manifest_path(),
                 Bytes::from(serde_json::to_string(&manifest).expect("serialize")),
                 WritePrecondition::None,
             )
@@ -1270,7 +1263,7 @@ mod tests {
         let bumped = OrchestrationManifest::new("01HQXYZ124REV");
         storage
             .put_raw(
-                "state/orchestration/manifest.json",
+                orchestration_manifest_path(),
                 Bytes::from(serde_json::to_string(&bumped).expect("serialize")),
                 WritePrecondition::None,
             )

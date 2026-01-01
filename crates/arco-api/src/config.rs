@@ -45,7 +45,7 @@ pub struct Config {
     #[serde(default)]
     pub compactor_url: Option<String>,
 
-    /// Orchestration compactor base URL for sync compaction (e.g., `<http://servo-compactor:8080>`).
+    /// Orchestration compactor base URL for sync compaction (e.g., `<http://arco-flow-compactor:8080>`).
     #[serde(default)]
     pub orchestration_compactor_url: Option<String>,
 

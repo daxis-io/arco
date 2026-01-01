@@ -894,6 +894,7 @@ fn compute_request_fingerprint(partition_keys: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::orchestration_event_path;
     use chrono::{Duration, NaiveDate, Utc};
 
     /// Test partition resolver that generates daily partitions.
@@ -959,7 +960,7 @@ mod tests {
     fn fresh_watermarks() -> Watermarks {
         Watermarks {
             events_processed_through: Some("01HQ123".into()),
-            last_processed_file: Some("ledger/2025-01-15/01HQ123.json".into()),
+            last_processed_file: Some(orchestration_event_path("2025-01-15", "01HQ123")),
             last_processed_at: Utc::now() - Duration::seconds(5),
         }
     }
@@ -967,7 +968,7 @@ mod tests {
     fn stale_watermarks() -> Watermarks {
         Watermarks {
             events_processed_through: Some("01HQ100".into()),
-            last_processed_file: Some("ledger/2025-01-15/01HQ100.json".into()),
+            last_processed_file: Some(orchestration_event_path("2025-01-15", "01HQ100")),
             last_processed_at: Utc::now() - Duration::seconds(120), // 2 minutes stale
         }
     }

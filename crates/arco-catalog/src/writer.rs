@@ -1055,7 +1055,8 @@ impl CatalogWriter {
         match domain {
             CatalogDomain::Catalog => Ok(manifest.catalog.snapshot),
             CatalogDomain::Lineage => Ok(manifest.lineage.snapshot),
-            _ => Ok(None),
+            CatalogDomain::Search => Ok(manifest.search.snapshot),
+            CatalogDomain::Executions => Ok(None),
         }
     }
 }

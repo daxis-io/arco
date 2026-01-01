@@ -737,7 +737,7 @@ impl Scheduler {
             TaskResult::Cancelled => {
                 self.record_task_cancelled(run, task_id, outbox)?;
             }
-        };
+        }
 
         self.process_task_completion(run, task_id, outbox)
     }

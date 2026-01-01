@@ -1,4 +1,5 @@
 """Tests for asset ID lockfile persistence."""
+
 from __future__ import annotations
 
 import json
@@ -13,16 +14,16 @@ class TestLockfile:
 
     def test_load_empty_when_missing(self, tmp_path: Path) -> None:
         """Missing lockfile returns empty state."""
-        from servo.manifest.lockfile import Lockfile
+        from arco_flow.manifest.lockfile import Lockfile
 
-        lf = Lockfile.load(tmp_path / ".servo" / "state.json")
+        lf = Lockfile.load(tmp_path / ".arco-flow" / "state.json")
         assert lf.asset_ids == {}
 
     def test_save_and_load_roundtrip(self, tmp_path: Path) -> None:
         """Lockfile persists and loads correctly."""
-        from servo.manifest.lockfile import Lockfile
+        from arco_flow.manifest.lockfile import Lockfile
 
-        path = tmp_path / ".servo" / "state.json"
+        path = tmp_path / ".arco-flow" / "state.json"
 
         lf = Lockfile()
         lf.asset_ids["raw.events"] = "01ABCDEF"
@@ -34,8 +35,8 @@ class TestLockfile:
 
     def test_get_or_create_returns_existing(self) -> None:
         """get_or_create returns existing ID if present."""
-        from servo.manifest.lockfile import Lockfile
-        from servo.types.asset import AssetKey
+        from arco_flow.manifest.lockfile import Lockfile
+        from arco_flow.types.asset import AssetKey
 
         lf = Lockfile()
         lf.asset_ids["raw.events"] = "01EXISTING"
@@ -48,8 +49,8 @@ class TestLockfile:
 
     def test_get_or_create_generates_new(self) -> None:
         """get_or_create generates new ID if not present."""
-        from servo.manifest.lockfile import Lockfile
-        from servo.types.asset import AssetKey
+        from arco_flow.manifest.lockfile import Lockfile
+        from arco_flow.types.asset import AssetKey
 
         lf = Lockfile()
         key = AssetKey(namespace="raw", name="events")
@@ -63,9 +64,9 @@ class TestLockfile:
 
     def test_lockfile_format_valid_json(self, tmp_path: Path) -> None:
         """Lockfile is valid JSON with expected structure."""
-        from servo.manifest.lockfile import Lockfile
+        from arco_flow.manifest.lockfile import Lockfile
 
-        path = tmp_path / ".servo" / "state.json"
+        path = tmp_path / ".arco-flow" / "state.json"
 
         lf = Lockfile()
         lf.asset_ids["raw.events"] = "01ABCDEF"
@@ -81,7 +82,7 @@ class TestLockfile:
 
     def test_update_from_server(self) -> None:
         """update_from_server merges server-assigned IDs."""
-        from servo.manifest.lockfile import Lockfile
+        from arco_flow.manifest.lockfile import Lockfile
 
         lf = Lockfile()
         lf.asset_ids["raw.events"] = "01LOCAL"

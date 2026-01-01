@@ -1,0 +1,3 @@
+Command: gcloud config get-value project
+
+dataverse-dev-471815

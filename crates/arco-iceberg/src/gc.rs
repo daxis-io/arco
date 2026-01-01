@@ -25,7 +25,10 @@ use crate::idempotency::{
     FinalizeResult, IdempotencyMarker, IdempotencyStatus, IdempotencyStore, IdempotencyStoreImpl,
 };
 use crate::metrics;
-use crate::paths::resolve_metadata_path;
+use crate::paths::{
+    ICEBERG_IDEMPOTENCY_PREFIX, iceberg_committed_receipt_prefix, iceberg_idempotency_table_prefix,
+    iceberg_pending_receipt_prefix, resolve_metadata_path,
+};
 use crate::pointer::PointerStore;
 use crate::types::{ObjectVersion, TableMetadata};
 
@@ -224,7 +227,7 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
     ///
     /// Returns error if storage listing or marker reading fails.
     pub async fn list_markers(&self, table_uuid: &Uuid) -> IcebergResult<Vec<MarkerListEntry>> {
-        let prefix = format!("_catalog/iceberg_idempotency/{table_uuid}/");
+        let prefix = iceberg_idempotency_table_prefix(table_uuid);
         let result = self.list_markers_with_prefix(&prefix).await?;
         if result.stats.read_errors > 0
             || result.stats.parse_errors > 0
@@ -247,8 +250,8 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
     ///
     /// Returns error if storage listing fails.
     pub async fn list_all_markers(&self) -> IcebergResult<AllMarkersResult> {
-        let prefix = "_catalog/iceberg_idempotency/";
-        let list_result = self.list_markers_with_prefix(prefix).await?;
+        let prefix = format!("{ICEBERG_IDEMPOTENCY_PREFIX}/");
+        let list_result = self.list_markers_with_prefix(&prefix).await?;
         let entries = list_result.entries;
 
         let mut by_table = std::collections::HashMap::new();
@@ -349,8 +352,8 @@ struct MarkerListResult {
 }
 
 fn table_uuid_from_marker_path(path: &str) -> Option<Uuid> {
-    let prefix = "_catalog/iceberg_idempotency/";
-    let rest = path.strip_prefix(prefix)?;
+    let prefix = format!("{ICEBERG_IDEMPOTENCY_PREFIX}/");
+    let rest = path.strip_prefix(&prefix)?;
     let table_part = rest.split('/').next()?;
     Uuid::parse_str(table_part).ok()
 }
@@ -1292,7 +1295,7 @@ impl<S: StorageBackend> EventReceiptGarbageCollector<S> {
         &self,
         date: chrono::NaiveDate,
     ) -> IcebergResult<ReceiptCleanupResult> {
-        let prefix = format!("events/{}/iceberg/pending/", date.format("%Y-%m-%d"));
+        let prefix = iceberg_pending_receipt_prefix(date);
         self.clean_receipts_in_prefix(&prefix, self.config.pending_retention)
             .await
     }
@@ -1308,7 +1311,7 @@ impl<S: StorageBackend> EventReceiptGarbageCollector<S> {
         &self,
         date: chrono::NaiveDate,
     ) -> IcebergResult<ReceiptCleanupResult> {
-        let prefix = format!("events/{}/iceberg/committed/", date.format("%Y-%m-%d"));
+        let prefix = iceberg_committed_receipt_prefix(date);
         self.clean_receipts_in_prefix(&prefix, self.config.committed_retention)
             .await
     }
@@ -1677,7 +1680,10 @@ mod tests {
         // Create a non-JSON file in the same directory
         storage
             .put(
-                &format!("_catalog/iceberg_idempotency/{table_uuid}/ab/some_file.txt"),
+                &format!(
+                    "{}ab/some_file.txt",
+                    iceberg_idempotency_table_prefix(&table_uuid)
+                ),
                 Bytes::from("not a marker"),
                 arco_core::storage::WritePrecondition::None,
             )
@@ -1725,7 +1731,10 @@ mod tests {
         // Create an invalid JSON file
         storage
             .put(
-                &format!("_catalog/iceberg_idempotency/{table_uuid}/ba/invalid.json"),
+                &format!(
+                    "{}ba/invalid.json",
+                    iceberg_idempotency_table_prefix(&table_uuid)
+                ),
                 Bytes::from("not valid json"),
                 arco_core::storage::WritePrecondition::None,
             )
@@ -2798,10 +2807,12 @@ mod tests {
     async fn test_clean_pending_receipts_skips_recent() {
         let storage = Arc::new(MemoryBackend::new());
 
-        // Create a pending receipt (will have recent timestamp)
+        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
+        let pending_path = format!("{}abc123.json", iceberg_pending_receipt_prefix(date));
+
         storage
             .put(
-                "events/2025-01-15/iceberg/pending/abc123.json",
+                &pending_path,
                 Bytes::from("{}"),
                 arco_core::storage::WritePrecondition::None,
             )
@@ -2809,69 +2820,55 @@ mod tests {
             .expect("put");
 
         let gc = EventReceiptGarbageCollector::new(Arc::clone(&storage));
-        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
         let result = gc.clean_pending_receipts(date).await.expect("clean");
 
-        // Should skip (too recent)
         assert_eq!(result.deleted, 0);
         assert_eq!(result.skipped, 1);
         assert_eq!(result.files_scanned, 1);
 
-        // File should still exist
-        assert!(
-            storage
-                .head("events/2025-01-15/iceberg/pending/abc123.json")
-                .await
-                .expect("head")
-                .is_some()
-        );
+        assert!(storage.head(&pending_path).await.expect("head").is_some());
     }
 
     #[tokio::test]
     async fn test_clean_pending_receipts_deletes_old() {
         let storage = Arc::new(MemoryBackend::new());
 
-        // Create a pending receipt
+        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
+        let pending_path = format!("{}abc123.json", iceberg_pending_receipt_prefix(date));
+
         storage
             .put(
-                "events/2025-01-15/iceberg/pending/abc123.json",
+                &pending_path,
                 Bytes::from("{}"),
                 arco_core::storage::WritePrecondition::None,
             )
             .await
             .expect("put");
 
-        // Use zero retention for testing
         let config = EventReceiptGcConfig {
             pending_retention: Duration::zero(),
             committed_retention: Duration::zero(),
         };
         let gc = EventReceiptGarbageCollector::with_config(Arc::clone(&storage), config);
 
-        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
         let result = gc.clean_pending_receipts(date).await.expect("clean");
 
         assert_eq!(result.deleted, 1);
         assert_eq!(result.skipped, 0);
 
-        // File should be deleted
-        assert!(
-            storage
-                .head("events/2025-01-15/iceberg/pending/abc123.json")
-                .await
-                .expect("head")
-                .is_none()
-        );
+        assert!(storage.head(&pending_path).await.expect("head").is_none());
     }
 
     #[tokio::test]
     async fn test_clean_committed_receipts_respects_90_day_retention() {
         let storage = Arc::new(MemoryBackend::new());
 
-        // Create committed receipts
+        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
+        let committed_path = format!("{}abc123.json", iceberg_committed_receipt_prefix(date));
+
         storage
             .put(
-                "events/2025-01-15/iceberg/committed/abc123.json",
+                &committed_path,
                 Bytes::from("{}"),
                 arco_core::storage::WritePrecondition::None,
             )
@@ -2879,7 +2876,6 @@ mod tests {
             .expect("put");
 
         let gc = EventReceiptGarbageCollector::new(Arc::clone(&storage));
-        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
         let result = gc.clean_committed_receipts(date).await.expect("clean");
 
         // Should skip (too recent, less than 90 days)
@@ -2891,10 +2887,13 @@ mod tests {
     async fn test_clean_receipts_for_date_combines_results() {
         let storage = Arc::new(MemoryBackend::new());
 
-        // Create pending and committed receipts
+        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
+        let pending_path = format!("{}pending1.json", iceberg_pending_receipt_prefix(date));
+        let committed_path = format!("{}committed1.json", iceberg_committed_receipt_prefix(date));
+
         storage
             .put(
-                "events/2025-01-15/iceberg/pending/pending1.json",
+                &pending_path,
                 Bytes::from("{}"),
                 arco_core::storage::WritePrecondition::None,
             )
@@ -2902,21 +2901,19 @@ mod tests {
             .expect("put");
         storage
             .put(
-                "events/2025-01-15/iceberg/committed/committed1.json",
+                &committed_path,
                 Bytes::from("{}"),
                 arco_core::storage::WritePrecondition::None,
             )
             .await
             .expect("put");
 
-        // Zero retention deletes both
         let config = EventReceiptGcConfig {
             pending_retention: Duration::zero(),
             committed_retention: Duration::zero(),
         };
         let gc = EventReceiptGarbageCollector::with_config(Arc::clone(&storage), config);
 
-        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
         let result = gc.clean_receipts_for_date(date).await.expect("clean");
 
         assert_eq!(result.pending_deleted, 1);
@@ -2928,11 +2925,12 @@ mod tests {
     async fn test_clean_receipts_for_date_range() {
         let storage = Arc::new(MemoryBackend::new());
 
-        // Create receipts for multiple days
         for day in 15..=17 {
+            let date = chrono::NaiveDate::from_ymd_opt(2025, 1, day).expect("valid date");
+            let path = format!("{}receipt.json", iceberg_pending_receipt_prefix(date));
             storage
                 .put(
-                    &format!("events/2025-01-{day:02}/iceberg/pending/receipt.json"),
+                    &path,
                     Bytes::from("{}"),
                     arco_core::storage::WritePrecondition::None,
                 )
@@ -2961,10 +2959,12 @@ mod tests {
     async fn test_event_receipt_gc_ignores_non_json() {
         let storage = Arc::new(MemoryBackend::new());
 
-        // Create non-JSON file
+        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
+        let path = format!("{}readme.txt", iceberg_pending_receipt_prefix(date));
+
         storage
             .put(
-                "events/2025-01-15/iceberg/pending/readme.txt",
+                &path,
                 Bytes::from("text"),
                 arco_core::storage::WritePrecondition::None,
             )
@@ -2977,21 +2977,12 @@ mod tests {
         };
         let gc = EventReceiptGarbageCollector::with_config(Arc::clone(&storage), config);
 
-        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
         let result = gc.clean_pending_receipts(date).await.expect("clean");
 
-        // Should scan but not delete (not a JSON file)
         assert_eq!(result.deleted, 0);
         assert_eq!(result.skipped, 0);
         assert_eq!(result.files_scanned, 1);
 
-        // File should still exist
-        assert!(
-            storage
-                .head("events/2025-01-15/iceberg/pending/readme.txt")
-                .await
-                .expect("head")
-                .is_some()
-        );
+        assert!(storage.head(&path).await.expect("head").is_some());
     }
 }

@@ -1,0 +1,12 @@
+Command: gcloud auth list --format="json"
+
+[
+  {
+    "account": "ethan@daxistech.io",
+    "status": ""
+  },
+  {
+    "account": "ethan@urbanskitech.com",
+    "status": "ACTIVE"
+  }
+]

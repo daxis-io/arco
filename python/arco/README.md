@@ -1,18 +1,18 @@
-# Arco Servo Python SDK
+# Arco Flow Python SDK
 
-Python SDK for defining data assets and orchestrating pipelines with Arco Servo.
+Python SDK for defining data assets and orchestrating pipelines with Arco Flow.
 
 ## Installation
 
 ```bash
-pip install arco-servo
+pip install arco-flow
 ```
 
 ## Quick Start
 
 ```python
-from servo import asset, AssetIn, AssetContext
-from servo.types import DailyPartition
+from arco_flow import asset, AssetIn, AssetContext
+from arco_flow.types import DailyPartition
 
 @asset(
     description="Daily user metrics",

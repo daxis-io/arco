@@ -49,11 +49,17 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use arco_catalog::Compactor;
+use arco_core::CatalogDomain;
 use arco_core::scoped_storage::ScopedStorage;
 use arco_core::storage::{ObjectStoreBackend, StorageBackend};
+
+use crate::notification_consumer::{
+    EventNotification, NotificationConsumer, NotificationConsumerConfig,
+};
 
 // ============================================================================
 // CLI Arguments
@@ -127,12 +133,47 @@ enum Commands {
     /// Run a single anti-entropy pass.
     AntiEntropy {
         /// Domain to scan (e.g., "catalog", "lineage").
-        #[arg(long, default_value = "catalog")]
+        #[arg(long, default_value = "executions")]
         domain: String,
 
         /// Maximum objects to scan per run.
         #[arg(long, default_value = "1000")]
         max_objects_per_run: usize,
+
+        #[arg(
+            long,
+            env = "ARCO_COMPACTOR_URL",
+            help = "Base URL for the compactor service (used for /internal/notify)."
+        )]
+        compactor_url: Option<String>,
+
+        #[arg(
+            long,
+            env = "ARCO_COMPACTOR_AUDIENCE",
+            help = "Override audience for compactor identity tokens."
+        )]
+        compactor_audience: Option<String>,
+
+        #[arg(
+            long,
+            env = "ARCO_COMPACTOR_ID_TOKEN",
+            help = "Precomputed identity token for compactor invocation."
+        )]
+        compactor_id_token: Option<String>,
+
+        #[arg(
+            long,
+            env = "ARCO_ANTI_ENTROPY_REPROCESS_BATCH_SIZE",
+            help = "Maximum paths per reprocessing request."
+        )]
+        reprocess_batch_size: Option<usize>,
+
+        #[arg(
+            long,
+            env = "ARCO_ANTI_ENTROPY_REPROCESS_TIMEOUT_SECS",
+            help = "HTTP timeout for reprocessing requests in seconds."
+        )]
+        reprocess_timeout_secs: Option<u64>,
     },
 }
 
@@ -266,6 +307,17 @@ impl CompactorState {
 struct ServiceState {
     compactor: Arc<CompactorState>,
     storage: ScopedStorage,
+    tenant_id: String,
+    workspace_id: String,
+    notification_consumer: Arc<Mutex<NotificationConsumer>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotifyRequest {
+    event_paths: Vec<String>,
+    #[serde(default)]
+    flush: bool,
 }
 
 // ============================================================================
@@ -402,8 +454,7 @@ async fn anti_entropy_handler(
         );
     }
 
-    // Run anti-entropy pass
-    let mut job = anti_entropy::AntiEntropyJob::new((), request);
+    let mut job = anti_entropy::AntiEntropyJob::new(state.storage.clone(), request);
     let response = match job.run_pass().await {
         Ok(result) => (
             StatusCode::OK,
@@ -438,6 +489,98 @@ async fn anti_entropy_handler(
     drop(compaction_guard);
 
     response
+}
+
+async fn notify_handler(
+    State(state): State<Arc<ServiceState>>,
+    Json(request): Json<NotifyRequest>,
+) -> impl IntoResponse {
+    if request.event_paths.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_request",
+                "message": "event_paths must not be empty"
+            })),
+        );
+    }
+
+    let mut consumer = state.notification_consumer.lock().await;
+    let mut should_flush = request.flush;
+    let mut notifications = Vec::with_capacity(request.event_paths.len());
+
+    for path in request.event_paths {
+        let notification = match EventNotification::from_path(
+            path,
+            state.tenant_id.clone(),
+            state.workspace_id.clone(),
+        ) {
+            Ok(notification) => notification,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_path",
+                        "message": err.to_string()
+                    })),
+                );
+            }
+        };
+
+        if !consumer.accepts_domain(&notification.domain) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "unsupported_domain",
+                    "message": format!("domain '{}' is not configured", notification.domain)
+                })),
+            );
+        }
+
+        notifications.push(notification);
+    }
+
+    for notification in notifications {
+        if consumer.add_event(notification) {
+            should_flush = true;
+        }
+    }
+
+    if should_flush {
+        match consumer.flush().await {
+            Ok(result) => {
+                let has_errors = result
+                    .domain_results
+                    .values()
+                    .any(|domain_result| domain_result.error.is_some());
+                if has_errors {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "processing_error",
+                            "result": result
+                        })),
+                    );
+                }
+                (StatusCode::OK, Json(serde_json::json!(result)))
+            }
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "processing_error",
+                    "message": err.to_string()
+                })),
+            ),
+        }
+    } else {
+        (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "queued",
+                "pending": consumer.pending_count()
+            })),
+        )
+    }
 }
 
 /// POST /internal/sync-compact - Synchronous compaction for Tier-1 DDL (ADR-018).
@@ -512,7 +655,7 @@ async fn compact(State(state): State<Arc<ServiceState>>) -> impl IntoResponse {
         );
     }
 
-    let state_clone = Arc::clone(&state.compactor);
+    let state_clone = Arc::clone(&state);
     tokio::spawn(async move {
         run_compaction_cycle_guarded(&state_clone).await;
     });
@@ -526,19 +669,18 @@ async fn compact(State(state): State<Arc<ServiceState>>) -> impl IntoResponse {
     )
 }
 
-// ============================================================================
 // Compaction Loop
 // ============================================================================
 
 /// Runs the compaction loop in service mode.
-async fn run_compaction_loop(state: Arc<CompactorState>, interval: Duration) {
+async fn run_compaction_loop(state: Arc<ServiceState>, interval: Duration) {
     let mut interval_timer = tokio::time::interval(interval);
 
     // Mark as ready after first tick (startup complete).
     //
     // Note: the first `tick()` completes immediately to align the interval.
     interval_timer.tick().await;
-    state.mark_ready();
+    state.compactor.mark_ready();
     tracing::info!("Compactor ready, starting compaction loop");
 
     // Run a compaction cycle immediately on startup so readiness can become healthy
@@ -554,48 +696,58 @@ async fn run_compaction_loop(state: Arc<CompactorState>, interval: Duration) {
     }
 }
 
-async fn run_compaction_cycle_guarded(state: &Arc<CompactorState>) {
-    let _guard = state.compaction_lock.lock().await;
+async fn run_compaction_cycle_guarded(state: &Arc<ServiceState>) {
+    let _guard = state.compactor.compaction_lock.lock().await;
 
     // If this cycle was started by the periodic loop, `compaction_in_progress` may be false.
     // If it was started by `/compact`, it is already true. Either way, ensure it's true while
     // work is running and reset it at the end.
-    state.compaction_in_progress.store(true, Ordering::Release);
+    state
+        .compactor
+        .compaction_in_progress
+        .store(true, Ordering::Release);
 
-    match run_compaction_cycle().await {
+    match run_compaction_cycle(state).await {
         Ok(()) => {
-            state.record_success();
+            state.compactor.record_success();
             tracing::info!("Compaction cycle completed successfully");
         }
         Err(e) => {
-            state.record_failure();
+            state.compactor.record_failure();
             metrics::record_compaction_error("all");
             tracing::error!(error = %e, "Compaction cycle failed");
         }
     }
 
-    state.compaction_in_progress.store(false, Ordering::Release);
+    state
+        .compactor
+        .compaction_in_progress
+        .store(false, Ordering::Release);
 }
 
 /// Runs a single compaction cycle.
-async fn run_compaction_cycle() -> Result<()> {
-    // TODO: Implement actual compaction logic
-    // This will call arco_catalog::Compactor::compact_domain() for each domain
-    //
-    // When implemented, use metrics::CompactionTimer for each domain:
-    //   let timer = metrics::CompactionTimer::start("catalog");
-    //   let result = compact_domain("catalog").await;
-    //   timer.finish(events_processed);
+async fn run_compaction_cycle(state: &Arc<ServiceState>) -> Result<()> {
+    let mut consumer = state.notification_consumer.lock().await;
+    if consumer.pending_count() == 0 {
+        return Ok(());
+    }
+    if !consumer.should_flush() {
+        return Ok(());
+    }
 
-    // For now, record a simulated compaction for all domains
-    for domain in COMPACTION_DOMAINS {
-        let timer = metrics::CompactionTimer::start(domain);
+    let result = consumer.flush().await?;
+    drop(consumer);
+    let mut has_errors = false;
 
-        // Simulate some work per domain
-        tokio::time::sleep(Duration::from_millis(25)).await;
+    for (domain, domain_result) in &result.domain_results {
+        if domain_result.error.is_some() {
+            metrics::record_compaction_error(domain);
+            has_errors = true;
+        }
+    }
 
-        // Record simulated metrics (0 events processed for now)
-        timer.finish(0);
+    if has_errors {
+        return Err(anyhow!("compaction cycle completed with errors"));
     }
 
     Ok(())
@@ -642,9 +794,16 @@ async fn main() -> Result<()> {
             );
 
             let compactor_state = Arc::new(CompactorState::new(unhealthy_threshold_secs));
+            let notification_consumer = NotificationConsumer::new(
+                scoped_storage.clone(),
+                NotificationConsumerConfig::default(),
+            );
             let state = Arc::new(ServiceState {
                 compactor: Arc::clone(&compactor_state),
                 storage: scoped_storage,
+                tenant_id: scoped.tenant_id.clone(),
+                workspace_id: scoped.workspace_id.clone(),
+                notification_consumer: Arc::new(Mutex::new(notification_consumer)),
             });
 
             // Update compaction lag gauge periodically using last successful compaction as proxy.
@@ -679,12 +838,13 @@ async fn main() -> Result<()> {
                 .route("/ready", get(ready))
                 .route("/metrics", get(metrics::serve_metrics))
                 .route("/compact", post(compact))
+                .route("/internal/notify", post(notify_handler))
                 .route("/internal/sync-compact", post(sync_compact_handler))
                 .route("/internal/anti-entropy", post(anti_entropy_handler))
                 .with_state(Arc::clone(&state));
 
             // Spawn compaction loop
-            let state_clone = Arc::clone(&compactor_state);
+            let state_clone = Arc::clone(&state);
             let interval = Duration::from_secs(interval_secs);
             tokio::spawn(async move {
                 run_compaction_loop(state_clone, interval).await;
@@ -699,7 +859,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Compact {
-            tenant,
+            ref tenant,
             all,
             dry_run,
             min_events,
@@ -712,29 +872,51 @@ async fn main() -> Result<()> {
                 "Starting manual compaction"
             );
 
+            let scoped = ScopedConfig::from_args(&args)?;
+            let scoped_storage = scoped.scoped_storage()?;
+
             if dry_run {
                 tracing::info!("Dry run mode - no changes will be made");
+                return Ok(());
             }
 
-            // TODO: Implement actual compaction logic
-            run_compaction_cycle().await?;
+            let compactor = Compactor::new(scoped_storage);
+            let result = compactor.compact_domain(CatalogDomain::Executions).await?;
 
-            tracing::info!("Compaction complete");
+            tracing::info!(
+                events_processed = result.events_processed,
+                parquet_files_written = result.parquet_files_written,
+                new_watermark = result.new_watermark,
+                "Compaction complete"
+            );
         }
 
         Commands::AntiEntropy {
             ref domain,
             max_objects_per_run,
+            ref compactor_url,
+            ref compactor_audience,
+            ref compactor_id_token,
+            reprocess_batch_size,
+            reprocess_timeout_secs,
         } => {
             let scoped = ScopedConfig::from_args(&args)?;
             let scoped_storage = scoped.scoped_storage()?;
 
+            let default_config = anti_entropy::AntiEntropyConfig::default();
             let config = anti_entropy::AntiEntropyConfig {
                 domain: domain.clone(),
                 tenant_id: scoped.tenant_id,
                 workspace_id: scoped.workspace_id,
                 max_objects_per_run,
-                ..anti_entropy::AntiEntropyConfig::default()
+                compactor_url: compactor_url.clone(),
+                compactor_audience: compactor_audience.clone(),
+                compactor_id_token: compactor_id_token.clone(),
+                reprocess_batch_size: reprocess_batch_size
+                    .unwrap_or(default_config.reprocess_batch_size),
+                reprocess_timeout_secs: reprocess_timeout_secs
+                    .unwrap_or(default_config.reprocess_timeout_secs),
+                ..default_config
             };
 
             let mut job = anti_entropy::AntiEntropyJob::new(scoped_storage, config);

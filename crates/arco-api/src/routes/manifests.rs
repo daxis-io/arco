@@ -15,7 +15,6 @@ use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use base64::Engine;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -25,6 +24,9 @@ use utoipa::ToSchema;
 
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
+use crate::paths::{
+    MANIFEST_IDEMPOTENCY_PREFIX, MANIFEST_PREFIX, manifest_idempotency_path, manifest_path,
+};
 use crate::server::AppState;
 use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
 
@@ -268,16 +270,6 @@ fn ensure_workspace(ctx: &RequestContext, workspace_id: &str) -> Result<(), ApiE
     Ok(())
 }
 
-fn manifest_path(manifest_id: &str) -> String {
-    format!("manifests/{manifest_id}.json")
-}
-
-fn idempotency_path(idempotency_key: &str) -> String {
-    let encoded =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(idempotency_key.as_bytes());
-    format!("manifests/idempotency/{encoded}.json")
-}
-
 fn validate_manifest(request: &DeployManifestRequest) -> Result<(), ApiError> {
     if request.manifest_version.trim().is_empty() {
         return Err(ApiError::bad_request("manifestVersion is required"));
@@ -369,7 +361,7 @@ async fn load_idempotency_record(
     storage: &ScopedStorage,
     idempotency_key: &str,
 ) -> Result<Option<ManifestIdempotencyRecord>, ApiError> {
-    let path = idempotency_path(idempotency_key);
+    let path = manifest_idempotency_path(idempotency_key);
     match storage.get_raw(&path).await {
         Ok(bytes) => {
             let record: ManifestIdempotencyRecord =
@@ -510,7 +502,7 @@ pub(crate) async fn deploy_manifest(
         let record_json = serde_json::to_string(&record).map_err(|e| {
             ApiError::internal(format!("failed to serialize idempotency record: {e}"))
         })?;
-        let record_path = idempotency_path(&key);
+        let record_path = manifest_idempotency_path(&key);
         let record_result = storage
             .put_raw(
                 &record_path,
@@ -638,7 +630,7 @@ pub(crate) async fn list_manifests(
     let storage = ctx.scoped_storage(backend)?;
 
     // List manifest files
-    let prefix = "manifests/";
+    let prefix = MANIFEST_PREFIX;
     let entries = storage
         .list_meta(prefix)
         .await
@@ -651,7 +643,10 @@ pub(crate) async fn list_manifests(
         let is_json = std::path::Path::new(path)
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
-        if !is_json || path.ends_with("_index.json") || path.starts_with("manifests/idempotency/") {
+        if !is_json
+            || path.ends_with("_index.json")
+            || path.starts_with(MANIFEST_IDEMPOTENCY_PREFIX)
+        {
             continue;
         }
 

@@ -66,6 +66,7 @@
 
 // Internal modules - not exposed in public API.
 pub(crate) mod dag;
+pub(crate) mod paths;
 
 pub mod dispatch;
 

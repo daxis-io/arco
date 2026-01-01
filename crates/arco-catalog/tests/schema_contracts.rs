@@ -549,3 +549,101 @@ fn contract_lineage_edges_roundtrip_preserves_schema() {
     assert_eq!(first.id, "edge_001");
     assert_eq!(first.run_id, Some("run_123".into()));
 }
+
+#[test]
+fn contract_namespaces_parquet_write_is_deterministic() {
+    use arco_catalog::parquet_util::{NamespaceRecord, write_namespaces};
+
+    let records = vec![
+        NamespaceRecord {
+            id: "ns_001".into(),
+            name: "default".into(),
+            description: Some("Default namespace".into()),
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+        },
+        NamespaceRecord {
+            id: "ns_002".into(),
+            name: "analytics".into(),
+            description: None,
+            created_at: 1_700_000_001_000,
+            updated_at: 1_700_000_001_000,
+        },
+    ];
+
+    let bytes_one = write_namespaces(&records).expect("write one");
+    let bytes_two = write_namespaces(&records).expect("write two");
+
+    assert_eq!(bytes_one, bytes_two);
+}
+
+#[test]
+fn contract_tables_parquet_write_is_deterministic() {
+    use arco_catalog::parquet_util::{TableRecord, write_tables};
+
+    let records = vec![TableRecord {
+        id: "tbl_001".into(),
+        namespace_id: "ns_001".into(),
+        name: "users".into(),
+        description: Some("User table".into()),
+        location: Some("s3://bucket/users".into()),
+        format: Some("parquet".into()),
+        created_at: 1_700_000_000_000,
+        updated_at: 1_700_000_000_000,
+    }];
+
+    let bytes_one = write_tables(&records).expect("write one");
+    let bytes_two = write_tables(&records).expect("write two");
+
+    assert_eq!(bytes_one, bytes_two);
+}
+
+#[test]
+fn contract_columns_parquet_write_is_deterministic() {
+    use arco_catalog::parquet_util::{ColumnRecord, write_columns};
+
+    let records = vec![
+        ColumnRecord {
+            id: "col_001".into(),
+            table_id: "tbl_001".into(),
+            name: "user_id".into(),
+            data_type: "INT64".into(),
+            is_nullable: false,
+            ordinal: 0,
+            description: Some("Primary key".into()),
+        },
+        ColumnRecord {
+            id: "col_002".into(),
+            table_id: "tbl_001".into(),
+            name: "email".into(),
+            data_type: "STRING".into(),
+            is_nullable: true,
+            ordinal: 1,
+            description: None,
+        },
+    ];
+
+    let bytes_one = write_columns(&records).expect("write one");
+    let bytes_two = write_columns(&records).expect("write two");
+
+    assert_eq!(bytes_one, bytes_two);
+}
+
+#[test]
+fn contract_lineage_edges_parquet_write_is_deterministic() {
+    use arco_catalog::parquet_util::{LineageEdgeRecord, write_lineage_edges};
+
+    let records = vec![LineageEdgeRecord {
+        id: "edge_001".into(),
+        source_id: "tbl_a".into(),
+        target_id: "tbl_b".into(),
+        edge_type: "derives_from".into(),
+        run_id: Some("run_123".into()),
+        created_at: 1_700_000_000_000,
+    }];
+
+    let bytes_one = write_lineage_edges(&records).expect("write one");
+    let bytes_two = write_lineage_edges(&records).expect("write two");
+
+    assert_eq!(bytes_one, bytes_two);
+}

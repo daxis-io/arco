@@ -60,7 +60,7 @@ pub struct OrchestrationEvent {
     /// When the event was created.
     pub timestamp: DateTime<Utc>,
 
-    /// Event origin URI (e.g., "servo/tenant-abc/workspace-prod").
+    /// Event origin URI (e.g., "arco-flow/tenant-abc/workspace-prod").
     pub source: String,
 
     /// Tenant identifier.
@@ -136,7 +136,7 @@ impl OrchestrationEvent {
             event_type,
             event_version: 1,
             timestamp,
-            source: format!("servo/{tenant}/{workspace}"),
+            source: format!("arco-flow/{tenant}/{workspace}"),
             tenant_id: tenant,
             workspace_id: workspace,
             idempotency_key,
@@ -166,7 +166,7 @@ impl OrchestrationEvent {
             event_type,
             event_version: 1,
             timestamp,
-            source: format!("servo/{tenant}/{workspace}"),
+            source: format!("arco-flow/{tenant}/{workspace}"),
             tenant_id: tenant,
             workspace_id: workspace,
             idempotency_key: idempotency_key.into(),
@@ -200,7 +200,7 @@ impl OrchestrationEvent {
             event_type,
             event_version: 1,
             timestamp: Utc::now(),
-            source: format!("servo/{tenant}/{workspace}"),
+            source: format!("arco-flow/{tenant}/{workspace}"),
             tenant_id: tenant,
             workspace_id: workspace,
             idempotency_key,

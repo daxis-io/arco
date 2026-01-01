@@ -320,6 +320,7 @@ fn parse_range(
     Ok(Some((start, size.saturating_sub(1))))
 }
 
+#[allow(clippy::result_large_err)]
 fn verify(
     state: &ServerState,
     path: &str,

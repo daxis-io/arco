@@ -48,6 +48,10 @@ tonic = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
+arrow = { workspace = true }
+arrow-json = { workspace = true }
+parquet = { workspace = true }
+datafusion = "46"
 
 # IDs
 ulid = { workspace = true }

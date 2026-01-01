@@ -14,6 +14,7 @@ use arco_core::{ScopedStorage, WritePrecondition, WriteResult};
 
 use crate::error::{Error, Result};
 use crate::events::EventEnvelope;
+use crate::paths::flow_event_path;
 
 /// A sink for execution events emitted by orchestration operations.
 ///
@@ -106,7 +107,7 @@ impl LedgerWriter {
         let event_time = chrono::DateTime::from_timestamp_millis(ms_i64).unwrap_or_else(Utc::now);
         let date = event_time.format("%Y-%m-%d").to_string();
 
-        let path = format!("ledger/flow/{}/{}/{}.json", self.domain, date, event.id);
+        let path = flow_event_path(&self.domain, &date, &event.id);
         tracing::Span::current().record("path", tracing::field::display(&path));
 
         let json = serde_json::to_string(&event).map_err(|e| Error::Serialization {
@@ -174,7 +175,7 @@ mod tests {
         let event_time = chrono::DateTime::from_timestamp_millis(ms_i64).unwrap_or_else(Utc::now);
         let date = event_time.format("%Y-%m-%d").to_string();
 
-        let path = format!("ledger/flow/executions/{date}/01ARZ3NDEKTSV4RRFFQ69G5FAV.json");
+        let path = flow_event_path("executions", &date, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let data = storage.get_raw(&path).await?;
         let parsed: EventEnvelope =
             serde_json::from_slice(&data).map_err(|e| Error::Serialization {

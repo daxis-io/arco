@@ -294,6 +294,7 @@ impl Reconciler {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn load_expected_paths(
         &self,
         domain: CatalogDomain,
@@ -392,8 +393,6 @@ impl Reconciler {
                 Ok(Some((version, expected, snapshot_prefix)))
             }
             CatalogDomain::Search => {
-                // Search snapshots are not yet implemented. We can still validate that the
-                // manifest exists, but we don't have a manifest-driven allowlist of files.
                 let Some(manifest) = self
                     .get_json::<crate::manifest::SearchManifest>(&domain_path)
                     .await?
@@ -402,7 +401,20 @@ impl Reconciler {
                 };
 
                 let version = manifest.snapshot_version;
-                let expected = Vec::new();
+                let expected = expected_from_snapshot_info(manifest.snapshot.as_ref());
+
+                let expected = if !expected.is_empty() {
+                    expected
+                } else if version == 0 {
+                    Vec::new()
+                } else {
+                    vec![CatalogPaths::snapshot_file(
+                        CatalogDomain::Search,
+                        version,
+                        "token_postings.parquet",
+                    )]
+                };
+
                 let snapshot_prefix = format!("snapshots/{}/", domain.as_str());
                 Ok(Some((version, expected, snapshot_prefix)))
             }
@@ -556,6 +568,7 @@ mod tests {
             snapshot_version: 1,
             snapshot_path: snapshot_path.clone(),
             snapshot: Some(snapshot),
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: None,
             commit_ulid: None,

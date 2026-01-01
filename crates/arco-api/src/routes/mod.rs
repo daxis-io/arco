@@ -5,6 +5,7 @@ pub mod lineage;
 pub mod manifests;
 pub mod namespaces;
 pub mod orchestration;
+pub mod query;
 pub mod tables;
 pub mod tasks;
 
@@ -21,6 +22,7 @@ pub fn api_v1_routes() -> Router<Arc<AppState>> {
         .merge(tables::routes())
         .merge(lineage::routes())
         .merge(browser::routes())
+        .merge(query::routes())
         .merge(orchestration::routes())
         .merge(manifests::routes())
 }

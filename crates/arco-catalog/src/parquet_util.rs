@@ -12,7 +12,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use arrow::array::{Array as _, BooleanArray, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array as _, BooleanArray, Float32Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -96,6 +96,23 @@ pub struct LineageEdgeRecord {
     pub created_at: i64,
 }
 
+/// Record stored in `token_postings.parquet`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchPostingRecord {
+    /// Token as indexed.
+    pub token: String,
+    /// Normalized token (lowercase).
+    pub token_norm: String,
+    /// Document type (namespace/table/column).
+    pub doc_type: String,
+    /// Document identifier.
+    pub doc_id: String,
+    /// Field the token came from (name/description).
+    pub field: String,
+    /// Relevance score for ranking.
+    pub score: f32,
+}
+
 fn namespaces_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -142,6 +159,17 @@ fn lineage_schema() -> Arc<Schema> {
     ]))
 }
 
+fn search_postings_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("token", DataType::Utf8, false),
+        Field::new("token_norm", DataType::Utf8, false),
+        Field::new("doc_type", DataType::Utf8, false),
+        Field::new("doc_id", DataType::Utf8, false),
+        Field::new("field", DataType::Utf8, false),
+        Field::new("score", DataType::Float32, false),
+    ]))
+}
+
 // ============================================================================
 // Public Schema Accessors (for tests and external consumers)
 // ============================================================================
@@ -168,6 +196,12 @@ pub fn column_schema() -> Schema {
 #[must_use]
 pub fn lineage_edge_schema() -> Schema {
     (*lineage_schema()).clone()
+}
+
+/// Returns the search posting schema for golden file comparison.
+#[must_use]
+pub fn search_posting_schema() -> Schema {
+    (*search_postings_schema()).clone()
 }
 
 fn writer_properties() -> WriterProperties {
@@ -390,6 +424,58 @@ pub fn write_lineage_edges(rows: &[LineageEdgeRecord]) -> Result<Bytes> {
     write_single_batch(schema, &batch)
 }
 
+/// Writes `token_postings.parquet`.
+///
+/// # Errors
+/// Returns an error if record batch construction or parquet serialization fails.
+pub fn write_search_postings(rows: &[SearchPostingRecord]) -> Result<Bytes> {
+    let schema = search_postings_schema();
+
+    let tokens = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.token.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let token_norms = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.token_norm.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let doc_types = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.doc_type.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let doc_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.doc_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let fields = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.field.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let scores = Float32Array::from(rows.iter().map(|r| r.score).collect::<Vec<_>>());
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(tokens),
+            Arc::new(token_norms),
+            Arc::new(doc_types),
+            Arc::new(doc_ids),
+            Arc::new(fields),
+            Arc::new(scores),
+        ],
+    )
+    .map_err(|e| CatalogError::Parquet {
+        message: format!("record batch build failed: {e}"),
+    })?;
+
+    write_single_batch(schema, &batch)
+}
+
 fn read_batches(bytes: &Bytes) -> Result<Vec<RecordBatch>> {
     let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
         .map_err(|e| CatalogError::Parquet {
@@ -458,6 +544,23 @@ fn col_i32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int32Array> {
         .downcast_ref::<Int32Array>()
         .ok_or_else(|| CatalogError::InvariantViolation {
             message: format!("column '{name}' is not Int32Array"),
+        })
+}
+
+fn col_f32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Float32Array> {
+    let idx = batch
+        .schema()
+        .index_of(name)
+        .map_err(|e| CatalogError::InvariantViolation {
+            message: format!("missing column '{name}': {e}"),
+        })?;
+
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| CatalogError::InvariantViolation {
+            message: format!("column '{name}' is not Float32Array"),
         })
 }
 
@@ -620,6 +723,34 @@ pub fn read_lineage_edges(bytes: &Bytes) -> Result<Vec<LineageEdgeRecord>> {
                     Some(run_id.value(row).to_string())
                 },
                 created_at: created_at.value(row),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Reads `token_postings.parquet`.
+///
+/// # Errors
+/// Returns an error if parquet deserialization or column extraction fails.
+pub fn read_search_postings(bytes: &Bytes) -> Result<Vec<SearchPostingRecord>> {
+    let mut out = Vec::new();
+    for batch in read_batches(bytes)? {
+        let token = col_string(&batch, "token")?;
+        let token_norm = col_string(&batch, "token_norm")?;
+        let doc_type = col_string(&batch, "doc_type")?;
+        let doc_id = col_string(&batch, "doc_id")?;
+        let field = col_string(&batch, "field")?;
+        let score = col_f32(&batch, "score")?;
+
+        for row in 0..batch.num_rows() {
+            out.push(SearchPostingRecord {
+                token: token.value(row).to_string(),
+                token_norm: token_norm.value(row).to_string(),
+                doc_type: doc_type.value(row).to_string(),
+                doc_id: doc_id.value(row).to_string(),
+                field: field.value(row).to_string(),
+                score: score.value(row),
             });
         }
     }

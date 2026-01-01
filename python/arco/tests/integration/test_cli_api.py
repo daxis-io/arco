@@ -1,4 +1,5 @@
 """CLI integration tests for API wiring."""
+
 from __future__ import annotations
 
 import json
@@ -13,8 +14,8 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from typer.testing import CliRunner
 
-from servo.cli.config import clear_config_cache
-from servo.cli.main import app
+from arco_flow.cli.config import clear_config_cache
+from arco_flow.cli.main import app
 
 
 @dataclass
@@ -156,11 +157,11 @@ def api_server() -> dict[str, Any]:
 
 
 @pytest.fixture()
-def servo_env(monkeypatch: pytest.MonkeyPatch, api_server: dict[str, Any]) -> None:
-    monkeypatch.setenv("SERVO_API_URL", api_server["base_url"])
-    monkeypatch.setenv("SERVO_TENANT_ID", "test-tenant")
-    monkeypatch.setenv("SERVO_WORKSPACE_ID", "test-workspace")
-    monkeypatch.setenv("SERVO_DEBUG", "1")
+def arco_flow_env(monkeypatch: pytest.MonkeyPatch, api_server: dict[str, Any]) -> None:
+    monkeypatch.setenv("ARCO_FLOW_API_URL", api_server["base_url"])
+    monkeypatch.setenv("ARCO_FLOW_TENANT_ID", "test-tenant")
+    monkeypatch.setenv("ARCO_FLOW_WORKSPACE_ID", "test-workspace")
+    monkeypatch.setenv("ARCO_FLOW_DEBUG", "1")
     clear_config_cache()
     yield None
     clear_config_cache()
@@ -172,21 +173,24 @@ def project_with_assets(tmp_path: Path) -> Path:
     (tmp_path / "assets").mkdir()
     (tmp_path / "assets" / "__init__.py").write_text("")
 
-    (tmp_path / "assets" / "raw.py").write_text(dedent("""
-        from servo import asset
-        from servo.context import AssetContext
-        from servo.types import AssetOut, DailyPartition
+    (tmp_path / "assets" / "raw.py").write_text(
+        dedent("""
+        from arco_flow import asset
+        from arco_flow.context import AssetContext
+        from arco_flow.types import AssetOut, DailyPartition
 
         @asset(namespace="raw", partitions=DailyPartition("date"))
         def events(ctx: AssetContext) -> AssetOut:
             '''Raw event data.'''
             return ctx.output([])
-    """))
+    """)
+    )
 
-    (tmp_path / "assets" / "staging.py").write_text(dedent("""
-        from servo import asset
-        from servo.context import AssetContext
-        from servo.types import AssetIn, AssetOut, DailyPartition, row_count
+    (tmp_path / "assets" / "staging.py").write_text(
+        dedent("""
+        from arco_flow import asset
+        from arco_flow.context import AssetContext
+        from arco_flow.types import AssetIn, AssetOut, DailyPartition, row_count
 
         @asset(
             namespace="staging",
@@ -196,7 +200,8 @@ def project_with_assets(tmp_path: Path) -> Path:
         def cleaned_events(ctx: AssetContext, raw: AssetIn["raw.events"]) -> AssetOut:
             '''Cleaned events.'''
             return ctx.output([])
-    """))
+    """)
+    )
 
     return tmp_path
 
@@ -214,7 +219,7 @@ def _find_request(
     raise AssertionError(msg)
 
 
-def test_cli_run_status_logs(api_server: dict[str, Any], servo_env: None) -> None:
+def test_cli_run_status_logs(api_server: dict[str, Any], arco_flow_env: None) -> None:
     runner = CliRunner()
 
     result = runner.invoke(
@@ -264,7 +269,7 @@ def test_cli_run_status_logs(api_server: dict[str, Any], servo_env: None) -> Non
 
 def test_cli_deploy_hits_api(
     api_server: dict[str, Any],
-    servo_env: None,
+    arco_flow_env: None,
     project_with_assets: Path,
 ) -> None:
     runner = CliRunner()

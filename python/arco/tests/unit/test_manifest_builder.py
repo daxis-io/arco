@@ -1,4 +1,5 @@
 """Tests for manifest builder."""
+
 from __future__ import annotations
 
 import subprocess
@@ -14,12 +15,12 @@ class TestManifestBuilder:
 
     def test_build_empty_manifest(self, tmp_path: Path) -> None:
         """Building with no assets creates empty manifest."""
-        from servo.manifest.builder import ManifestBuilder
+        from arco_flow.manifest.builder import ManifestBuilder
 
         builder = ManifestBuilder(
             tenant_id="test",
             workspace_id="dev",
-            lockfile_path=tmp_path / ".servo" / "state.json",
+            lockfile_path=tmp_path / ".arco-flow" / "state.json",
         )
         manifest = builder.build([])
 
@@ -29,14 +30,14 @@ class TestManifestBuilder:
 
     def test_build_with_assets(self, tmp_path: Path) -> None:
         """Building with assets includes them in manifest."""
-        from servo.asset import RegisteredAsset
-        from servo.manifest.builder import ManifestBuilder
-        from servo.types import AssetDefinition, AssetId, AssetKey, CodeLocation
+        from arco_flow.asset import RegisteredAsset
+        from arco_flow.manifest.builder import ManifestBuilder
+        from arco_flow.types import AssetDefinition, AssetId, AssetKey, CodeLocation
 
         builder = ManifestBuilder(
             tenant_id="test",
             workspace_id="dev",
-            lockfile_path=tmp_path / ".servo" / "state.json",
+            lockfile_path=tmp_path / ".arco-flow" / "state.json",
         )
 
         definition = AssetDefinition(
@@ -54,12 +55,12 @@ class TestManifestBuilder:
 
     def test_build_generates_code_version_id(self, tmp_path: Path) -> None:
         """Build generates a code version ID."""
-        from servo.manifest.builder import ManifestBuilder
+        from arco_flow.manifest.builder import ManifestBuilder
 
         builder = ManifestBuilder(
             tenant_id="test",
             workspace_id="dev",
-            lockfile_path=tmp_path / ".servo" / "state.json",
+            lockfile_path=tmp_path / ".arco-flow" / "state.json",
         )
         manifest = builder.build([])
 
@@ -68,13 +69,13 @@ class TestManifestBuilder:
 
     def test_build_sets_deployed_by(self, tmp_path: Path) -> None:
         """Build sets deployed_by from environment or default."""
-        from servo.manifest.builder import ManifestBuilder
+        from arco_flow.manifest.builder import ManifestBuilder
 
         builder = ManifestBuilder(
             tenant_id="test",
             workspace_id="dev",
             deployed_by="user@example.com",
-            lockfile_path=tmp_path / ".servo" / "state.json",
+            lockfile_path=tmp_path / ".arco-flow" / "state.json",
         )
         manifest = builder.build([])
 
@@ -82,12 +83,12 @@ class TestManifestBuilder:
 
     def test_build_persists_assigned_asset_ids(self, tmp_path: Path) -> None:
         """Build assigns stable asset IDs and persists them to the lockfile."""
-        from servo.asset import RegisteredAsset
-        from servo.manifest.builder import ManifestBuilder
-        from servo.manifest.lockfile import Lockfile
-        from servo.types import AssetDefinition, AssetId, AssetKey, CodeLocation
+        from arco_flow.asset import RegisteredAsset
+        from arco_flow.manifest.builder import ManifestBuilder
+        from arco_flow.manifest.lockfile import Lockfile
+        from arco_flow.types import AssetDefinition, AssetId, AssetKey, CodeLocation
 
-        lockfile_path = tmp_path / ".servo" / "state.json"
+        lockfile_path = tmp_path / ".arco-flow" / "state.json"
         builder = ManifestBuilder(
             tenant_id="test",
             workspace_id="dev",
@@ -108,12 +109,12 @@ class TestManifestBuilder:
 
     def test_build_reuses_existing_lockfile_id(self, tmp_path: Path) -> None:
         """Existing lockfile IDs are reused for stable deploy identity."""
-        from servo.asset import RegisteredAsset
-        from servo.manifest.builder import ManifestBuilder
-        from servo.manifest.lockfile import Lockfile
-        from servo.types import AssetDefinition, AssetId, AssetKey, CodeLocation
+        from arco_flow.asset import RegisteredAsset
+        from arco_flow.manifest.builder import ManifestBuilder
+        from arco_flow.manifest.lockfile import Lockfile
+        from arco_flow.types import AssetDefinition, AssetId, AssetKey, CodeLocation
 
-        lockfile_path = tmp_path / ".servo" / "state.json"
+        lockfile_path = tmp_path / ".arco-flow" / "state.json"
         lf = Lockfile()
         lf.asset_ids["raw.events"] = "01EXISTING"
         lf.save(lockfile_path)
@@ -138,10 +139,10 @@ class TestManifestBuilder:
 class TestGitContextExtraction:
     """Tests for Git context extraction."""
 
-    @patch("servo.manifest.builder._run_git_command")
+    @patch("arco_flow.manifest.builder._run_git_command")
     def test_extracts_git_info(self, mock_run: Any) -> None:
         """Extracts Git information from git command outputs."""
-        from servo.manifest.builder import extract_git_context
+        from arco_flow.manifest.builder import extract_git_context
 
         def mock_git(cmd: list[str]) -> str:
             outputs: dict[tuple[str, ...], str] = {
@@ -181,10 +182,10 @@ class TestGitContextExtraction:
         assert git_ctx.author == "dev@example.com"
         assert git_ctx.dirty is False
 
-    @patch("servo.manifest.builder._run_git_command")
+    @patch("arco_flow.manifest.builder._run_git_command")
     def test_handles_git_errors_gracefully(self, mock_run: Any) -> None:
         """Returns empty GitContext on git errors."""
-        from servo.manifest.builder import extract_git_context
+        from arco_flow.manifest.builder import extract_git_context
 
         mock_run.side_effect = subprocess.CalledProcessError(1, "git")
 
@@ -193,10 +194,10 @@ class TestGitContextExtraction:
         assert git_ctx.repository == ""
         assert git_ctx.branch == ""
 
-    @patch("servo.manifest.builder._run_git_command")
+    @patch("arco_flow.manifest.builder._run_git_command")
     def test_detects_dirty_repo(self, mock_run: Any) -> None:
         """Detects when working directory has uncommitted changes."""
-        from servo.manifest.builder import extract_git_context
+        from arco_flow.manifest.builder import extract_git_context
 
         def mock_git(cmd: list[str]) -> str:
             if "status" in cmd:

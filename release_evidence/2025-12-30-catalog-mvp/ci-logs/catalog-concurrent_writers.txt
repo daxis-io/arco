@@ -1,0 +1,23 @@
+Command: cargo test --manifest-path /Users/ethanurbanski/arco/Cargo.toml -p arco-catalog --test concurrent_writers --all-features
+
+   Compiling regex v1.12.2
+   Compiling hyper-rustls v0.27.7
+   Compiling tower-http v0.6.8
+   Compiling tracing-subscriber v0.3.22
+   Compiling arrow-csv v54.3.1
+   Compiling arrow-string v54.3.1
+   Compiling criterion v0.5.1
+   Compiling reqwest v0.12.28
+   Compiling arrow v54.3.1
+   Compiling object_store v0.11.2
+   Compiling arco-core v0.1.0 (/Users/ethanurbanski/arco/crates/arco-core)
+   Compiling arco-catalog v0.1.0 (/Users/ethanurbanski/arco/crates/arco-catalog)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.59s
+     Running tests/concurrent_writers.rs (arco/target/debug/deps/concurrent_writers-c5ff8e8ff6538559)
+
+running 3 tests
+test test_two_writers_initialize_race ... ok
+test test_loser_can_retry ... ok
+test test_many_concurrent_updates ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

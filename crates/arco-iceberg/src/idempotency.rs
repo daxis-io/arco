@@ -14,6 +14,7 @@ use uuid::Uuid;
 use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
 
 use crate::error::{IcebergError, IcebergErrorResponse, IcebergResult};
+use crate::paths::iceberg_idempotency_marker_path;
 use crate::types::ObjectVersion;
 
 /// Error canonicalizing a JSON request body for idempotency hashing.
@@ -146,8 +147,7 @@ impl IdempotencyMarker {
     /// Path: `_catalog/iceberg_idempotency/{table_uuid}/{hash_prefix}/{key_hash}.json`
     #[must_use]
     pub fn storage_path(table_uuid: &Uuid, idempotency_key_hash: &str) -> String {
-        let prefix = &idempotency_key_hash[..2.min(idempotency_key_hash.len())];
-        format!("_catalog/iceberg_idempotency/{table_uuid}/{prefix}/{idempotency_key_hash}.json")
+        iceberg_idempotency_marker_path(table_uuid, idempotency_key_hash)
     }
 
     /// Creates a new in-progress marker.
@@ -268,7 +268,7 @@ pub enum ClaimResult {
 /// Trait for idempotency marker storage operations.
 #[async_trait]
 pub trait IdempotencyStore: Send + Sync {
-    /// Claims an idempotency marker (write with DoesNotExist precondition).
+    /// Claims an idempotency marker (write with `DoesNotExist` precondition).
     ///
     /// Returns `ClaimResult::Success` if this is the first claim.
     /// Returns `ClaimResult::Exists` if the marker already exists.
@@ -430,6 +430,7 @@ impl<S: StorageBackend> IdempotencyStore for IdempotencyStoreImpl<S> {
 mod tests {
     use super::*;
     use crate::error::IcebergError;
+    use crate::paths::ICEBERG_IDEMPOTENCY_PREFIX;
     use proptest::prelude::*;
     use std::collections::HashMap;
 
@@ -447,10 +448,8 @@ mod tests {
         let table_uuid = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
         let key_hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
         let path = IdempotencyMarker::storage_path(&table_uuid, key_hash);
-        assert_eq!(
-            path,
-            "_catalog/iceberg_idempotency/550e8400-e29b-41d4-a716-446655440000/ab/abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890.json"
-        );
+        let expected = format!("{ICEBERG_IDEMPOTENCY_PREFIX}/{table_uuid}/ab/{key_hash}.json");
+        assert_eq!(path, expected);
     }
 
     #[test]

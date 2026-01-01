@@ -65,7 +65,7 @@ message CatalogEvent {
   // Event timestamp (server-side)
   google.protobuf.Timestamp timestamp = 4;
 
-  // Event source (e.g., "servo", "ui", "profiler")
+  // Event source (e.g., "arco-flow", "ui", "profiler")
   string source = 5;
 
   // Tenant context

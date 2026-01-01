@@ -18,8 +18,10 @@ use arco_core::{CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths, 
 
 use crate::error::{CatalogError, Result as CatalogResult};
 use crate::manifest::{
-    CatalogDomainManifest, CommitRecord, LineageManifest, RootManifest, compute_manifest_hash,
+    CatalogDomainManifest, CommitRecord, LineageManifest, RootManifest, SearchManifest,
+    compute_manifest_hash,
 };
+use crate::parquet_util::SearchPostingRecord;
 use crate::sync_compact_permit_issuer;
 use crate::tier1_events::{CatalogDdlEvent, LineageDdlEvent};
 use crate::tier1_snapshot;
@@ -141,25 +143,18 @@ impl Tier1Compactor {
         let domain = parse_domain(domain)?;
 
         // Reject unsupported domains early (before lock validation).
-        // Executions is async-only; search is not yet implemented.
         match domain {
             CatalogDomain::Executions => {
                 return Err(Tier1CompactionError::UnsupportedDomain {
                     domain: domain.as_str().to_string(),
                 });
             }
-            CatalogDomain::Search => {
-                return Err(Tier1CompactionError::NotImplemented {
-                    domain: domain.as_str().to_string(),
-                    message: "search compaction is not yet available".to_string(),
-                });
-            }
-            CatalogDomain::Catalog | CatalogDomain::Lineage => {}
+            CatalogDomain::Catalog | CatalogDomain::Lineage | CatalogDomain::Search => {}
         }
 
         let mut event_paths = validate_event_paths(domain, event_paths)?;
 
-        if event_paths.is_empty() {
+        if event_paths.is_empty() && domain != CatalogDomain::Search {
             return Err(Tier1CompactionError::ProcessingError {
                 message: "no event paths provided".to_string(),
             });
@@ -201,8 +196,12 @@ impl Tier1Compactor {
                 self.sync_compact_lineage(event_paths, &lock, &issuer, fencing_token)
                     .await
             }
+            CatalogDomain::Search => {
+                self.sync_compact_search(event_paths, &lock, &issuer, fencing_token)
+                    .await
+            }
             // Early rejection cases handled above - these are unreachable.
-            CatalogDomain::Search | CatalogDomain::Executions => unreachable!(),
+            CatalogDomain::Executions => unreachable!(),
         }
     }
 
@@ -214,6 +213,11 @@ impl Tier1Compactor {
         fencing_token: u64,
     ) -> Result<Tier1CompactionResult, Tier1CompactionError> {
         let events_processed = event_paths.len();
+        let last_event_id = event_paths
+            .last()
+            .and_then(|path| path.rsplit('/').next())
+            .and_then(|name| name.strip_suffix(".json"))
+            .map(str::to_string);
         let publisher = Publisher::new(&self.storage);
 
         for attempt in 1..=self.cas_max_retries {
@@ -265,6 +269,7 @@ impl Tier1Compactor {
             manifest.parent_hash = Some(prev_raw_hash.clone());
             manifest.fencing_token = Some(fencing_token);
             manifest.commit_ulid = Some(commit_ulid.clone());
+            manifest.watermark_event_id.clone_from(&last_event_id);
 
             manifest
                 .validate_succession(&prev_manifest, &prev_raw_hash)
@@ -325,6 +330,11 @@ impl Tier1Compactor {
         fencing_token: u64,
     ) -> Result<Tier1CompactionResult, Tier1CompactionError> {
         let events_processed = event_paths.len();
+        let last_event_id = event_paths
+            .last()
+            .and_then(|path| path.rsplit('/').next())
+            .and_then(|name| name.strip_suffix(".json"))
+            .map(str::to_string);
         let publisher = Publisher::new(&self.storage);
 
         for attempt in 1..=self.cas_max_retries {
@@ -376,6 +386,7 @@ impl Tier1Compactor {
             manifest.parent_hash = Some(prev_raw_hash.clone());
             manifest.fencing_token = Some(fencing_token);
             manifest.commit_ulid = Some(commit_ulid.clone());
+            manifest.watermark_event_id.clone_from(&last_event_id);
 
             manifest
                 .validate_succession(&prev_manifest, &prev_raw_hash)
@@ -427,6 +438,131 @@ impl Tier1Compactor {
 
         Err(Tier1CompactionError::PublishFailed {
             message: "lineage manifest update lost CAS race after max retries".to_string(),
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn sync_compact_search(
+        &self,
+        event_paths: Vec<String>,
+        lock: &DistributedLock<dyn StorageBackend>,
+        issuer: &arco_core::publish::PermitIssuer,
+        fencing_token: u64,
+    ) -> Result<Tier1CompactionResult, Tier1CompactionError> {
+        let events_processed = event_paths.len();
+        let last_event_id = event_paths
+            .last()
+            .and_then(|path| path.rsplit('/').next())
+            .and_then(|name| name.strip_suffix(".json"))
+            .map(str::to_string);
+        let publisher = Publisher::new(&self.storage);
+
+        for attempt in 1..=self.cas_max_retries {
+            let mut root: RootManifest = read_json(&self.storage, CatalogPaths::ROOT_MANIFEST)
+                .await
+                .map_err(map_processing_error)?;
+            root.normalize_paths();
+
+            let meta = self
+                .storage
+                .head_raw(&root.search_manifest_path)
+                .await
+                .map_err(map_processing_error)?
+                .ok_or_else(|| Tier1CompactionError::ProcessingError {
+                    message: format!("missing search manifest at {}", root.search_manifest_path),
+                })?;
+
+            let prev_bytes = self
+                .storage
+                .get_raw(&root.search_manifest_path)
+                .await
+                .map_err(map_processing_error)?;
+            let prev_raw_hash = compute_manifest_hash(&prev_bytes);
+            let mut manifest: SearchManifest =
+                serde_json::from_slice(&prev_bytes).map_err(map_processing_error)?;
+            let prev_manifest = manifest.clone();
+
+            let catalog_bytes = self
+                .storage
+                .get_raw(&root.catalog_manifest_path)
+                .await
+                .map_err(map_processing_error)?;
+            let catalog_manifest: CatalogDomainManifest =
+                serde_json::from_slice(&catalog_bytes).map_err(map_processing_error)?;
+
+            let catalog_state =
+                tier1_state::load_catalog_state(&self.storage, &catalog_manifest.snapshot_path)
+                    .await
+                    .map_err(map_processing_error)?;
+            let search_state = build_search_state(&catalog_state);
+
+            let next_version = manifest.snapshot_version + 1;
+            let snapshot =
+                tier1_snapshot::write_search_snapshot(&self.storage, next_version, &search_state)
+                    .await
+                    .map_err(map_processing_error)?;
+
+            let commit_ulid = next_commit_ulid(prev_manifest.commit_ulid.as_deref())?;
+
+            manifest.snapshot_version = snapshot.version;
+            manifest.base_path.clone_from(&snapshot.path);
+            manifest.snapshot = Some(snapshot.clone());
+            manifest.updated_at = Utc::now();
+            manifest.parent_hash = Some(prev_raw_hash.clone());
+            manifest.fencing_token = Some(fencing_token);
+            manifest.commit_ulid = Some(commit_ulid.clone());
+            manifest.watermark_event_id.clone_from(&last_event_id);
+
+            manifest
+                .validate_succession(&prev_manifest, &prev_raw_hash)
+                .map_err(|message| Tier1CompactionError::ProcessingError { message })?;
+
+            let commit =
+                build_search_commit_record(&self.storage, &prev_manifest, &manifest, &commit_ulid)
+                    .await?;
+            manifest.last_commit_id = Some(commit.commit_id.clone());
+
+            let bytes = serde_json::to_vec(&manifest).map_err(map_processing_error)?;
+            let permit = issuer.issue_permit_with_commit_ulid(
+                CatalogDomain::Search.as_str(),
+                meta.version.clone(),
+                commit_ulid.clone(),
+            );
+
+            revalidate_lock(lock, fencing_token).await?;
+
+            match publisher
+                .publish(
+                    permit,
+                    &ManifestKey::domain(CatalogDomain::Search),
+                    Bytes::from(bytes),
+                )
+                .await
+                .map_err(map_publish_error)?
+            {
+                WriteResult::Success { version } => {
+                    persist_commit_record(&self.storage, CatalogDomain::Search, &commit).await?;
+                    return Ok(Tier1CompactionResult {
+                        manifest_version: version,
+                        commit_ulid,
+                        events_processed,
+                        snapshot_version: manifest.snapshot_version,
+                    });
+                }
+                WriteResult::PreconditionFailed { .. } => {
+                    if attempt == self.cas_max_retries {
+                        return Err(Tier1CompactionError::PublishFailed {
+                            message: "search manifest update lost CAS race after max retries"
+                                .to_string(),
+                        });
+                    }
+                    continue;
+                }
+            }
+        }
+
+        Err(Tier1CompactionError::PublishFailed {
+            message: "search manifest update lost CAS race after max retries".to_string(),
         })
     }
 }
@@ -706,6 +842,84 @@ fn apply_lineage_event(
     Ok(())
 }
 
+fn build_search_state(catalog: &crate::state::CatalogState) -> crate::state::SearchState {
+    let mut postings = Vec::new();
+
+    for ns in &catalog.namespaces {
+        append_tokens(&mut postings, "namespace", &ns.id, "name", 1.0, &ns.name);
+        if let Some(description) = &ns.description {
+            append_tokens(
+                &mut postings,
+                "namespace",
+                &ns.id,
+                "description",
+                0.5,
+                description,
+            );
+        }
+    }
+
+    for table in &catalog.tables {
+        append_tokens(&mut postings, "table", &table.id, "name", 1.0, &table.name);
+        if let Some(description) = &table.description {
+            append_tokens(
+                &mut postings,
+                "table",
+                &table.id,
+                "description",
+                0.5,
+                description,
+            );
+        }
+    }
+
+    for column in &catalog.columns {
+        append_tokens(
+            &mut postings,
+            "column",
+            &column.id,
+            "name",
+            1.0,
+            &column.name,
+        );
+        if let Some(description) = &column.description {
+            append_tokens(
+                &mut postings,
+                "column",
+                &column.id,
+                "description",
+                0.5,
+                description,
+            );
+        }
+    }
+
+    crate::state::SearchState { postings }
+}
+
+fn append_tokens(
+    postings: &mut Vec<SearchPostingRecord>,
+    doc_type: &str,
+    doc_id: &str,
+    field: &str,
+    score: f32,
+    text: &str,
+) {
+    for token in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        if token.len() < 2 {
+            continue;
+        }
+        postings.push(SearchPostingRecord {
+            token: token.to_string(),
+            token_norm: token.to_ascii_lowercase(),
+            doc_type: doc_type.to_string(),
+            doc_id: doc_id.to_string(),
+            field: field.to_string(),
+            score,
+        });
+    }
+}
+
 async fn revalidate_lock(
     lock: &DistributedLock<dyn StorageBackend>,
     fencing_token: u64,
@@ -832,6 +1046,45 @@ async fn build_lineage_commit_record(
     })
 }
 
+async fn build_search_commit_record(
+    storage: &ScopedStorage,
+    prev: &SearchManifest,
+    next: &SearchManifest,
+    commit_id: &str,
+) -> Result<CommitRecord, Tier1CompactionError> {
+    let payload_hash = sha256_prefixed(&serde_json::to_vec(next).map_err(map_processing_error)?);
+    let prev_commit_id = prev.last_commit_id.clone();
+
+    let prev_commit_hash = match &prev_commit_id {
+        Some(id) => {
+            let path = CatalogPaths::commit(CatalogDomain::Search, id);
+            match storage.get_raw(&path).await {
+                Ok(bytes) => {
+                    let record: CommitRecord =
+                        serde_json::from_slice(&bytes).map_err(map_processing_error)?;
+                    Some(record.compute_hash())
+                }
+                Err(arco_core::Error::NotFound(_)) => None,
+                Err(e) => {
+                    return Err(Tier1CompactionError::ProcessingError {
+                        message: format!("failed to read commit '{path}': {e}"),
+                    });
+                }
+            }
+        }
+        None => None,
+    };
+
+    Ok(CommitRecord {
+        commit_id: commit_id.to_string(),
+        prev_commit_id,
+        prev_commit_hash,
+        operation: "SyncCompact".into(),
+        payload_hash,
+        created_at: Utc::now(),
+    })
+}
+
 fn next_commit_ulid(previous: Option<&str>) -> Result<String, Tier1CompactionError> {
     let candidate = Ulid::new();
 
@@ -880,5 +1133,121 @@ fn map_processing_error<E: std::fmt::Display>(err: E) -> Tier1CompactionError {
 fn map_publish_error<E: std::fmt::Display>(err: E) -> Tier1CompactionError {
     Tier1CompactionError::PublishFailed {
         message: err.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parquet_util::{ColumnRecord, NamespaceRecord, TableRecord};
+    use crate::tier1_snapshot;
+    use crate::tier1_writer::Tier1Writer;
+    use arco_core::storage::{MemoryBackend, WritePrecondition};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn sync_compact_search_writes_snapshot() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await.expect("initialize");
+
+        let now = Utc::now().timestamp_millis();
+        let state = crate::state::CatalogState {
+            namespaces: vec![NamespaceRecord {
+                id: "ns-1".to_string(),
+                name: "sales".to_string(),
+                description: Some("Sales".to_string()),
+                created_at: now,
+                updated_at: now,
+            }],
+            tables: vec![TableRecord {
+                id: "tbl-1".to_string(),
+                namespace_id: "ns-1".to_string(),
+                name: "orders".to_string(),
+                description: Some("Orders".to_string()),
+                location: None,
+                format: None,
+                created_at: now,
+                updated_at: now,
+            }],
+            columns: vec![ColumnRecord {
+                id: "col-1".to_string(),
+                table_id: "tbl-1".to_string(),
+                name: "order_id".to_string(),
+                data_type: "string".to_string(),
+                is_nullable: false,
+                ordinal: 0,
+                description: None,
+            }],
+        };
+
+        let snapshot = tier1_snapshot::write_catalog_snapshot(&storage, 1, &state)
+            .await
+            .expect("snapshot");
+
+        let root_bytes = storage
+            .get_raw(CatalogPaths::ROOT_MANIFEST)
+            .await
+            .expect("root manifest");
+        let mut root: RootManifest = serde_json::from_slice(&root_bytes).expect("parse root");
+        root.normalize_paths();
+
+        let catalog_manifest = CatalogDomainManifest {
+            snapshot_version: snapshot.version,
+            snapshot_path: snapshot.path.clone(),
+            snapshot: Some(snapshot),
+            watermark_event_id: None,
+            last_commit_id: None,
+            fencing_token: None,
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: Utc::now(),
+        };
+        let catalog_bytes = serde_json::to_vec(&catalog_manifest).expect("serialize catalog");
+        storage
+            .put_raw(
+                &root.catalog_manifest_path,
+                Bytes::from(catalog_bytes),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write catalog manifest");
+
+        let lock_path = storage.lock(CatalogDomain::Search);
+        let lock = DistributedLock::new(storage.backend().clone(), &lock_path);
+        let guard = lock
+            .acquire(Duration::from_secs(30), 1)
+            .await
+            .expect("lock");
+        let fencing_token = guard.fencing_token().sequence();
+
+        let compactor = Tier1Compactor::new(storage.clone());
+        let result = compactor
+            .sync_compact("search", Vec::new(), fencing_token)
+            .await
+            .expect("search compaction");
+
+        let search_bytes = storage
+            .get_raw(&root.search_manifest_path)
+            .await
+            .expect("search manifest");
+        let search_manifest: SearchManifest =
+            serde_json::from_slice(&search_bytes).expect("parse search manifest");
+        assert_eq!(search_manifest.snapshot_version, result.snapshot_version);
+        assert!(search_manifest.snapshot.is_some());
+
+        let postings_path = CatalogPaths::snapshot_file(
+            CatalogDomain::Search,
+            result.snapshot_version,
+            "token_postings.parquet",
+        );
+        let postings_bytes = storage.get_raw(&postings_path).await.expect("postings");
+        let postings =
+            crate::parquet_util::read_search_postings(&postings_bytes).expect("read postings");
+        assert!(!postings.is_empty());
+
+        guard.release().await.expect("release");
     }
 }

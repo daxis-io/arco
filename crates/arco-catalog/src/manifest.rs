@@ -170,6 +170,10 @@ pub struct CatalogDomainManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<SnapshotInfo>,
 
+    /// Last compacted event identifier for file-based watermarks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark_event_id: Option<String>,
+
     /// Last commit ID for hash chain integrity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_commit_id: Option<String>,
@@ -207,6 +211,7 @@ impl CatalogDomainManifest {
             snapshot_version: 0,
             snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 0),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: None,
             commit_ulid: None,
@@ -519,6 +524,10 @@ pub struct LineageManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<SnapshotInfo>,
 
+    /// Last compacted event identifier for file-based watermarks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark_event_id: Option<String>,
+
     /// Hash of the previous raw manifest (tamper-evident chain).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_hash: Option<String>,
@@ -547,6 +556,7 @@ impl LineageManifest {
             snapshot_version: 0,
             edges_path: CatalogPaths::snapshot_dir(CatalogDomain::Lineage, 0),
             snapshot: None,
+            watermark_event_id: None,
             parent_hash: None,
             fencing_token: None,
             commit_ulid: None,
@@ -624,6 +634,18 @@ pub struct SearchManifest {
     /// Path to search Parquet files.
     pub base_path: String,
 
+    /// Optional enhanced snapshot metadata (per-file checksums, sizes, row counts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotInfo>,
+
+    /// Last compacted event identifier for file-based watermarks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark_event_id: Option<String>,
+
+    /// Hash of the previous raw manifest (tamper-evident chain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_hash: Option<String>,
+
     /// Fencing token for distributed lock validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fencing_token: Option<u64>,
@@ -631,6 +653,10 @@ pub struct SearchManifest {
     /// Commit ULID for audit correlation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_ulid: Option<String>,
+
+    /// Last commit ID for audit trail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_commit_id: Option<String>,
 
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
@@ -643,10 +669,59 @@ impl SearchManifest {
         Self {
             snapshot_version: 0,
             base_path: CatalogPaths::snapshot_dir(CatalogDomain::Search, 0),
+            snapshot: None,
+            watermark_event_id: None,
+            parent_hash: None,
             fencing_token: None,
             commit_ulid: None,
+            last_commit_id: None,
             updated_at: Utc::now(),
         }
+    }
+
+    /// Validates that this manifest can succeed the previous manifest.
+    ///
+    /// # Errors
+    /// Returns an error if succession is invalid (version regression, hash mismatch, or fencing token regression).
+    pub fn validate_succession(
+        &self,
+        previous: &Self,
+        previous_raw_hash: &str,
+    ) -> Result<(), String> {
+        if self.snapshot_version < previous.snapshot_version {
+            return Err(format!(
+                "version regression: {} -> {} (rollback not allowed)",
+                previous.snapshot_version, self.snapshot_version
+            ));
+        }
+
+        if let Some(ref parent_hash) = self.parent_hash {
+            if parent_hash != previous_raw_hash {
+                return Err(format!(
+                    "parent hash mismatch: expected {previous_raw_hash}, got {parent_hash} (concurrent modification detected)"
+                ));
+            }
+        }
+
+        if let (Some(prev), Some(next)) = (previous.fencing_token, self.fencing_token) {
+            if next < prev {
+                return Err(format!(
+                    "fencing token regression: {prev} -> {next} (stale holder)"
+                ));
+            }
+        }
+
+        if let (Some(prev), Some(next)) =
+            (previous.commit_ulid.as_deref(), self.commit_ulid.as_deref())
+        {
+            if next <= prev {
+                return Err(format!(
+                    "commit ulid regression: {prev} -> {next} (non-monotonic)"
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -928,6 +1003,7 @@ mod tests {
             snapshot_version: 42,
             snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 42),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: Some("commit_abc".into()),
             fencing_token: None,
             commit_ulid: None,
@@ -1116,6 +1192,7 @@ mod tests {
             snapshot_version: 5,
             snapshot_path: "state/catalog/v5/".into(),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: None,
             commit_ulid: None,
@@ -1128,6 +1205,7 @@ mod tests {
             snapshot_version: 3,
             snapshot_path: "state/catalog/v3/".into(),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: None,
             commit_ulid: None,
@@ -1149,6 +1227,7 @@ mod tests {
             snapshot_version: 5,
             snapshot_path: "state/catalog/v5/".into(),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: None,
             commit_ulid: None,
@@ -1161,6 +1240,7 @@ mod tests {
             snapshot_version: 6,
             snapshot_path: "state/catalog/v6/".into(),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: None,
             commit_ulid: None,
@@ -1182,6 +1262,7 @@ mod tests {
             snapshot_version: 5,
             snapshot_path: "state/catalog/v5/".into(),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: Some(5),
             commit_ulid: None,
@@ -1193,6 +1274,7 @@ mod tests {
             snapshot_version: 6,
             snapshot_path: "state/catalog/v6/".into(),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: Some(4),
             commit_ulid: None,
@@ -1212,6 +1294,7 @@ mod tests {
             snapshot_version: 5,
             snapshot_path: "state/catalog/v5/".into(),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: None,
             commit_ulid: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".into()),
@@ -1223,6 +1306,7 @@ mod tests {
             snapshot_version: 6,
             snapshot_path: "state/catalog/v6/".into(),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: None,
             commit_ulid: Some("01ARZ3NDEKTSV4RRFFQ69G5FAU".into()),
@@ -1242,6 +1326,7 @@ mod tests {
             snapshot_version: 5,
             snapshot_path: "state/catalog/v5/".into(),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: None,
             commit_ulid: None,
@@ -1254,6 +1339,7 @@ mod tests {
             snapshot_version: 6,
             snapshot_path: "state/catalog/v6/".into(),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: None,
             commit_ulid: None,
@@ -1274,6 +1360,7 @@ mod tests {
             snapshot_version: 5,
             snapshot_path: "state/catalog/v5/".into(),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: None,
             commit_ulid: None,
@@ -1286,6 +1373,7 @@ mod tests {
             snapshot_version: 5,
             snapshot_path: "state/catalog/v5/".into(),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: None,
             commit_ulid: None,
@@ -1306,6 +1394,7 @@ mod tests {
             snapshot_version: 5,
             snapshot_path: "state/catalog/v5/".into(),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: None,
             commit_ulid: None,
@@ -1318,6 +1407,7 @@ mod tests {
             snapshot_version: 6,
             snapshot_path: "state/catalog/v6/".into(),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: None,
             commit_ulid: None,
@@ -1339,6 +1429,7 @@ mod tests {
             snapshot_version: 1,
             snapshot_path: "state/catalog/v1/".into(),
             snapshot: None,
+            watermark_event_id: None,
             last_commit_id: None,
             fencing_token: None,
             commit_ulid: None,

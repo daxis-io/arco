@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-Servo orchestration needs storage for runs, tasks, timers, and dispatch outbox.
+Arco Flow orchestration needs storage for runs, tasks, timers, and dispatch outbox.
 The current MVP uses a Postgres-backed scheduler, but this doesn't align with
 Arco's serverless, Parquet-native architecture established in ADR-018.
 

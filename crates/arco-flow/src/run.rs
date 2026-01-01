@@ -34,10 +34,11 @@ use crate::task::{TaskExecution, TaskState};
 use crate::task_key::TaskKey;
 
 /// Run state machine states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RunState {
     /// Created, waiting to start.
+    #[default]
     Pending,
     /// Actively executing tasks.
     Running,
@@ -78,12 +79,6 @@ impl RunState {
     }
 }
 
-impl Default for RunState {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
-
 impl std::fmt::Display for RunState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -99,10 +94,11 @@ impl std::fmt::Display for RunState {
 }
 
 /// Trigger type enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TriggerType {
     /// User-initiated.
+    #[default]
     Manual,
     /// Cron/schedule-based.
     Scheduled,
@@ -110,12 +106,6 @@ pub enum TriggerType {
     Sensor,
     /// Historical data backfill.
     Backfill,
-}
-
-impl Default for TriggerType {
-    fn default() -> Self {
-        Self::Manual
-    }
 }
 
 impl std::fmt::Display for TriggerType {

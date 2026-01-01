@@ -1,4 +1,5 @@
 """Tests for CLI main entry point."""
+
 from __future__ import annotations
 
 from typer.testing import CliRunner
@@ -11,16 +12,16 @@ class TestCLIMain:
 
     def test_version_flag(self) -> None:
         """--version shows version and exits."""
-        from servo.cli.main import app
+        from arco_flow.cli.main import app
 
         result = runner.invoke(app, ["--version"])
 
         assert result.exit_code == 0
-        assert "servo" in result.stdout.lower()
+        assert "arco-flow" in result.stdout.lower()
 
     def test_help_flag(self) -> None:
         """--help shows help text."""
-        from servo.cli.main import app
+        from arco_flow.cli.main import app
 
         result = runner.invoke(app, ["--help"])
 
@@ -31,7 +32,7 @@ class TestCLIMain:
 
     def test_deploy_help(self) -> None:
         """deploy --help shows deploy options."""
-        from servo.cli.main import app
+        from arco_flow.cli.main import app
 
         result = runner.invoke(app, ["deploy", "--help"])
 
@@ -40,7 +41,7 @@ class TestCLIMain:
 
     def test_run_help(self) -> None:
         """run --help shows run options."""
-        from servo.cli.main import app
+        from arco_flow.cli.main import app
 
         result = runner.invoke(app, ["run", "--help"])
 
@@ -49,7 +50,7 @@ class TestCLIMain:
 
     def test_status_help(self) -> None:
         """status --help shows status options."""
-        from servo.cli.main import app
+        from arco_flow.cli.main import app
 
         result = runner.invoke(app, ["status", "--help"])
 

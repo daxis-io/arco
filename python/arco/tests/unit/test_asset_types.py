@@ -1,11 +1,12 @@
 """Tests for asset types."""
+
 from __future__ import annotations
 
 from typing import get_type_hints
 
 import pytest
 
-from servo.types.asset import AssetIn, AssetKey, DependencyMapping
+from arco_flow.types.asset import AssetIn, AssetKey, DependencyMapping
 
 
 class TestAssetKey:
@@ -92,6 +93,7 @@ class TestAssetIn:
 
     def test_typing_get_type_hints_compatibility(self) -> None:
         """AssetIn works with typing.get_type_hints()."""
+
         def fn(ctx: object, upstream: AssetIn["raw.events"]) -> None:  # noqa: UP037
             pass
 

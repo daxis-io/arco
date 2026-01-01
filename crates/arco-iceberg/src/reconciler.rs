@@ -830,6 +830,7 @@ enum BackfillEntryResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::iceberg_committed_receipt_path;
 
     #[test]
     fn test_reconciliation_report_new() {
@@ -1576,7 +1577,8 @@ mod tests {
         backfiller.backfill(&table_uuid, &entries).await;
 
         // Verify the receipt was written to the correct path
-        let expected_path = format!("events/2024-01-01/iceberg/committed/{}.json", commit_key);
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date");
+        let expected_path = iceberg_committed_receipt_path(date, &commit_key);
         let result = storage.head(&expected_path).await.expect("head");
         assert!(
             result.is_some(),
@@ -1606,7 +1608,8 @@ mod tests {
         backfiller.backfill(&table_uuid, &entries).await;
 
         // Read and verify the receipt content
-        let path = format!("events/2024-01-01/iceberg/committed/{}.json", commit_key);
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date");
+        let path = iceberg_committed_receipt_path(date, &commit_key);
         let bytes = storage.get(&path).await.expect("get");
         let receipt: CommittedReceipt =
             serde_json::from_slice(&bytes).expect("deserialize receipt");

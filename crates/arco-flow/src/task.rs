@@ -181,10 +181,11 @@ const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 300;
 ///                                                                      │ READY │
 ///                                                                      └───────┘
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TaskState {
     /// Exists in plan, scheduler hasn't evaluated yet.
+    #[default]
     Planned,
     /// Scheduler evaluated, blocked on dependencies.
     Pending,
@@ -292,12 +293,6 @@ impl TaskState {
     }
 }
 
-impl Default for TaskState {
-    fn default() -> Self {
-        Self::Planned
-    }
-}
-
 impl std::fmt::Display for TaskState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -317,7 +312,7 @@ impl std::fmt::Display for TaskState {
 }
 
 /// Task error categories.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TaskErrorCategory {
     /// Error in user asset code.
@@ -329,13 +324,8 @@ pub enum TaskErrorCategory {
     /// Invalid configuration or missing secrets.
     Configuration,
     /// Unknown error category.
+    #[default]
     Unknown,
-}
-
-impl Default for TaskErrorCategory {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 /// Task error information.

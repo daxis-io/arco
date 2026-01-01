@@ -38,6 +38,16 @@ resource "google_cloud_run_v2_job" "compactor_antientropy" {
         }
 
         env {
+          name  = "ARCO_COMPACTOR_URL"
+          value = google_cloud_run_v2_service.compactor.uri
+        }
+
+        env {
+          name  = "ARCO_COMPACTOR_AUDIENCE"
+          value = google_cloud_run_v2_service.compactor.uri
+        }
+
+        env {
           name  = "ARCO_ENVIRONMENT"
           value = var.environment
         }

@@ -1,4 +1,5 @@
 """End-to-end integration tests."""
+
 from __future__ import annotations
 
 import json
@@ -17,21 +18,24 @@ def project_with_assets(tmp_path: Path) -> Path:
     (tmp_path / "assets").mkdir()
     (tmp_path / "assets" / "__init__.py").write_text("")
 
-    (tmp_path / "assets" / "raw.py").write_text(dedent("""
-        from servo import asset
-        from servo.context import AssetContext
-        from servo.types import AssetOut, DailyPartition
+    (tmp_path / "assets" / "raw.py").write_text(
+        dedent("""
+        from arco_flow import asset
+        from arco_flow.context import AssetContext
+        from arco_flow.types import AssetOut, DailyPartition
 
         @asset(namespace="raw", partitions=DailyPartition("date"))
         def events(ctx: AssetContext) -> AssetOut:
             '''Raw event data.'''
             return ctx.output([])
-    """))
+    """)
+    )
 
-    (tmp_path / "assets" / "staging.py").write_text(dedent("""
-        from servo import asset
-        from servo.context import AssetContext
-        from servo.types import AssetIn, AssetOut, DailyPartition, row_count
+    (tmp_path / "assets" / "staging.py").write_text(
+        dedent("""
+        from arco_flow import asset
+        from arco_flow.context import AssetContext
+        from arco_flow.types import AssetIn, AssetOut, DailyPartition, row_count
 
         @asset(
             namespace="staging",
@@ -41,7 +45,8 @@ def project_with_assets(tmp_path: Path) -> Path:
         def cleaned_events(ctx: AssetContext, raw: AssetIn["raw.events"]) -> AssetOut:
             '''Cleaned events.'''
             return ctx.output([])
-    """))
+    """)
+    )
 
     return tmp_path
 
@@ -51,7 +56,7 @@ class TestDiscoveryE2E:
 
     def test_discovers_all_assets(self, project_with_assets: Path) -> None:
         """Discovery finds all @asset decorated functions."""
-        from servo.manifest.discovery import AssetDiscovery
+        from arco_flow.manifest.discovery import AssetDiscovery
 
         discovery = AssetDiscovery(root_path=project_with_assets)
         assets = discovery.discover()
@@ -62,7 +67,7 @@ class TestDiscoveryE2E:
 
     def test_dependency_extraction(self, project_with_assets: Path) -> None:
         """Dependencies are correctly extracted."""
-        from servo.manifest.discovery import AssetDiscovery
+        from arco_flow.manifest.discovery import AssetDiscovery
 
         discovery = AssetDiscovery(root_path=project_with_assets)
         assets = discovery.discover()
@@ -73,7 +78,7 @@ class TestDiscoveryE2E:
 
     def test_partition_extraction(self, project_with_assets: Path) -> None:
         """Partitioning is correctly extracted."""
-        from servo.manifest.discovery import AssetDiscovery
+        from arco_flow.manifest.discovery import AssetDiscovery
 
         discovery = AssetDiscovery(root_path=project_with_assets)
         assets = discovery.discover()
@@ -88,8 +93,8 @@ class TestManifestE2E:
 
     def test_generates_valid_manifest(self, project_with_assets: Path) -> None:
         """Manifest generation produces valid JSON."""
-        from servo.manifest.builder import ManifestBuilder
-        from servo.manifest.discovery import AssetDiscovery
+        from arco_flow.manifest.builder import ManifestBuilder
+        from arco_flow.manifest.discovery import AssetDiscovery
 
         discovery = AssetDiscovery(root_path=project_with_assets)
         assets = discovery.discover()
@@ -97,7 +102,7 @@ class TestManifestE2E:
         builder = ManifestBuilder(
             tenant_id="test",
             workspace_id="dev",
-            lockfile_path=project_with_assets / ".servo" / "state.json",
+            lockfile_path=project_with_assets / ".arco-flow" / "state.json",
         )
         manifest = builder.build(assets)
 
@@ -110,8 +115,8 @@ class TestManifestE2E:
 
     def test_manifest_has_git_context(self, project_with_assets: Path) -> None:
         """Manifest includes Git context."""
-        from servo.manifest.builder import ManifestBuilder
-        from servo.manifest.discovery import AssetDiscovery
+        from arco_flow.manifest.builder import ManifestBuilder
+        from arco_flow.manifest.discovery import AssetDiscovery
 
         discovery = AssetDiscovery(root_path=project_with_assets)
         assets = discovery.discover()
@@ -119,7 +124,7 @@ class TestManifestE2E:
         builder = ManifestBuilder(
             tenant_id="test",
             workspace_id="dev",
-            lockfile_path=project_with_assets / ".servo" / "state.json",
+            lockfile_path=project_with_assets / ".arco-flow" / "state.json",
         )
         manifest = builder.build(assets)
 
@@ -128,8 +133,8 @@ class TestManifestE2E:
 
     def test_manifest_fingerprint_stable(self, project_with_assets: Path) -> None:
         """Manifest fingerprint is stable."""
-        from servo.manifest.builder import ManifestBuilder
-        from servo.manifest.discovery import AssetDiscovery
+        from arco_flow.manifest.builder import ManifestBuilder
+        from arco_flow.manifest.discovery import AssetDiscovery
 
         discovery = AssetDiscovery(root_path=project_with_assets)
         assets = discovery.discover()
@@ -138,7 +143,7 @@ class TestManifestE2E:
             tenant_id="test",
             workspace_id="dev",
             include_git=False,
-            lockfile_path=project_with_assets / ".servo" / "state.json",
+            lockfile_path=project_with_assets / ".arco-flow" / "state.json",
         )
         manifest1 = builder.build(assets)
         manifest2 = builder.build(assets)
@@ -164,7 +169,7 @@ class TestCLIE2E:
         """Full deploy dry-run flow works."""
         from typer.testing import CliRunner
 
-        from servo.cli.main import app
+        from arco_flow.cli.main import app
 
         runner = CliRunner()
 
@@ -181,7 +186,7 @@ class TestCLIE2E:
         """Full validate flow works."""
         from typer.testing import CliRunner
 
-        from servo.cli.main import app
+        from arco_flow.cli.main import app
 
         runner = CliRunner()
 

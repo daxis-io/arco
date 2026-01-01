@@ -11,7 +11,7 @@ use arco_core::storage_traits::StatePutStore;
 use crate::error::{CatalogError, Result};
 use crate::manifest::{SnapshotFile, SnapshotInfo};
 use crate::parquet_util;
-use crate::state::{CatalogState, LineageState};
+use crate::state::{CatalogState, LineageState, SearchState};
 
 /// Writes a catalog snapshot (namespaces/tables/columns) to storage.
 ///
@@ -85,6 +85,33 @@ pub async fn write_lineage_snapshot<S: StatePutStore + ?Sized>(
         checksum_sha256: sha256_hex(&bytes),
         byte_size: bytes.len() as u64,
         row_count: state.edges.len() as u64,
+        position_range: None,
+    });
+
+    Ok(info)
+}
+
+/// Writes a search snapshot (token postings) to storage.
+///
+/// # Errors
+/// Returns an error if serialization or storage write fails.
+pub async fn write_search_snapshot<S: StatePutStore + ?Sized>(
+    storage: &S,
+    version: u64,
+    state: &SearchState,
+) -> Result<SnapshotInfo> {
+    let snapshot_dir = StateKey::snapshot_dir(CatalogDomain::Search, version);
+    let bytes = parquet_util::write_search_postings(&state.postings)?;
+    let key = StateKey::snapshot_file(CatalogDomain::Search, version, "token_postings.parquet");
+
+    put_state_if_absent(storage, &key, bytes.clone()).await?;
+
+    let mut info = SnapshotInfo::new(version, snapshot_dir.as_ref().to_string());
+    info.add_file(SnapshotFile {
+        path: "token_postings.parquet".to_string(),
+        checksum_sha256: sha256_hex(&bytes),
+        byte_size: bytes.len() as u64,
+        row_count: state.postings.len() as u64,
         position_range: None,
     });
 

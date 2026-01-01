@@ -4,9 +4,9 @@ requires = ["hatchling>=1.18.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "arco-servo"
+name = "arco-flow"
 version = "0.1.0-alpha"
-description = "Python SDK for Arco Servo orchestration platform"
+description = "Python SDK for Arco Flow orchestration platform"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
@@ -46,17 +46,17 @@ dev = [
 ]
 
 [project.scripts]
-servo = "servo.cli.main:app"
+arco-flow = "arco_flow.cli.main:app"
 
 [project.urls]
-Documentation = "https://docs.arco.dev/servo"
+Documentation = "https://docs.arco.dev/arco-flow"
 Repository = "https://github.com/arco/arco"
 
 [tool.hatch.build.targets.sdist]
 include = ["/src"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/servo"]
+packages = ["src/arco_flow"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -68,7 +68,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["src/servo"]
+source = ["src/arco_flow"]
 branch = true
 
 [tool.coverage.report]

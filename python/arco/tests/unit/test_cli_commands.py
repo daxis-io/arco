@@ -1,4 +1,5 @@
 """Tests for CLI commands."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -15,7 +16,7 @@ class TestDeployCommand:
 
     def test_deploy_dry_run_no_assets(self, tmp_path: Path) -> None:
         """Deploy dry-run with no assets shows message."""
-        from servo.cli.main import app
+        from arco_flow.cli.main import app
 
         with runner.isolated_filesystem(temp_dir=tmp_path):
             result = runner.invoke(app, ["deploy", "--dry-run"])
@@ -25,20 +26,22 @@ class TestDeployCommand:
 
     def test_deploy_dry_run_with_assets(self, tmp_path: Path) -> None:
         """Deploy dry-run discovers and displays assets."""
-        from servo.cli.main import app
+        from arco_flow.cli.main import app
 
         with runner.isolated_filesystem(temp_dir=tmp_path):
             # Create asset file
             Path("assets").mkdir()
             Path("assets/__init__.py").write_text("")
-            Path("assets/raw.py").write_text(dedent("""
-                from servo import asset
-                from servo.context import AssetContext
+            Path("assets/raw.py").write_text(
+                dedent("""
+                from arco_flow import asset
+                from arco_flow.context import AssetContext
 
                 @asset(namespace="raw")
                 def events(ctx: AssetContext) -> None:
                     pass
-            """))
+            """)
+            )
 
             result = runner.invoke(app, ["deploy", "--dry-run"])
 
@@ -46,19 +49,21 @@ class TestDeployCommand:
 
     def test_deploy_writes_manifest_file(self, tmp_path: Path) -> None:
         """Deploy --output writes manifest to file."""
-        from servo.cli.main import app
+        from arco_flow.cli.main import app
 
         with runner.isolated_filesystem(temp_dir=tmp_path):
             Path("assets").mkdir()
             Path("assets/__init__.py").write_text("")
-            Path("assets/raw.py").write_text(dedent("""
-                from servo import asset
-                from servo.context import AssetContext
+            Path("assets/raw.py").write_text(
+                dedent("""
+                from arco_flow import asset
+                from arco_flow.context import AssetContext
 
                 @asset(namespace="raw")
                 def events(ctx: AssetContext) -> None:
                     pass
-            """))
+            """)
+            )
 
             result = runner.invoke(app, ["deploy", "--dry-run", "--output", "manifest.json"])
             # Check inside the context - the file is written to current directory
@@ -73,7 +78,7 @@ class TestValidateCommand:
 
     def test_validate_no_assets(self, tmp_path: Path) -> None:
         """Validate with no assets passes."""
-        from servo.cli.main import app
+        from arco_flow.cli.main import app
 
         with runner.isolated_filesystem(temp_dir=tmp_path):
             result = runner.invoke(app, ["validate"])
@@ -82,19 +87,21 @@ class TestValidateCommand:
 
     def test_validate_valid_assets(self, tmp_path: Path) -> None:
         """Validate with valid assets passes."""
-        from servo.cli.main import app
+        from arco_flow.cli.main import app
 
         with runner.isolated_filesystem(temp_dir=tmp_path):
             Path("assets").mkdir()
             Path("assets/__init__.py").write_text("")
-            Path("assets/raw.py").write_text(dedent("""
-                from servo import asset
-                from servo.context import AssetContext
+            Path("assets/raw.py").write_text(
+                dedent("""
+                from arco_flow import asset
+                from arco_flow.context import AssetContext
 
                 @asset(namespace="raw")
                 def events(ctx: AssetContext) -> None:
                     pass
-            """))
+            """)
+            )
 
             result = runner.invoke(app, ["validate"])
 
@@ -106,7 +113,7 @@ class TestInitCommand:
 
     def test_init_creates_project(self, tmp_path: Path) -> None:
         """Init creates project structure."""
-        from servo.cli.main import app
+        from arco_flow.cli.main import app
 
         with runner.isolated_filesystem(temp_dir=tmp_path):
             result = runner.invoke(app, ["init", "my-project"])

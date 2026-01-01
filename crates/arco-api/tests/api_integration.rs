@@ -833,7 +833,7 @@ mod orchestration {
     }
 
     #[tokio::test]
-    async fn test_servo_deploy_run_callbacks_and_logs() -> Result<()> {
+    async fn test_arco_flow_deploy_run_callbacks_and_logs() -> Result<()> {
         let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let router = ServerBuilder::new()
             .debug(true)
@@ -861,7 +861,7 @@ mod orchestration {
             router.clone(),
             "/api/v1/workspaces/test-workspace/manifests",
             manifest,
-            &[("Idempotency-Key", "idem-servo-001")],
+            &[("Idempotency-Key", "idem-arco-flow-001")],
         )
         .await?;
         assert_eq!(status, StatusCode::CREATED);
@@ -1460,6 +1460,127 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
                 .headers()
                 .contains_key("access-control-allow-origin")
         );
+
+        Ok(())
+    }
+}
+
+mod query {
+    use super::*;
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    async fn seed_catalog(router: axum::Router) -> Result<axum::Router> {
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/namespaces",
+            serde_json::json!({
+                "name": "analytics",
+                "description": "Analytics namespace"
+            }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/namespaces/analytics/tables",
+            serde_json::json!({
+                "name": "events",
+                "description": "Event stream",
+                "columns": [
+                    {"name": "event_id", "data_type": "STRING", "nullable": false},
+                    {"name": "event_type", "data_type": "STRING", "nullable": false}
+                ]
+            }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        Ok(router)
+    }
+
+    #[tokio::test]
+    async fn test_query_returns_arrow_stream() -> Result<()> {
+        let router = seed_catalog(test_router()).await?;
+
+        let request = helpers::make_request_with_headers(
+            Method::POST,
+            "/api/v1/query",
+            Some(serde_json::json!({
+                "sql": "SELECT name FROM catalog.namespaces"
+            })),
+            &[("Accept", "application/vnd.apache.arrow.stream")],
+        )?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(content_type, Some("application/vnd.apache.arrow.stream"));
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .context("read response body")?;
+        let cursor = Cursor::new(body.to_vec());
+        let mut reader = StreamReader::try_new(cursor, None)
+            .context("open arrow stream reader")?;
+        let mut rows = 0;
+        while let Some(batch) = reader.next() {
+            let batch = batch.context("read arrow batch")?;
+            rows += batch.num_rows();
+        }
+        assert!(rows >= 1, "expected at least one namespace row");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_query_returns_json_format() -> Result<()> {
+        let router = seed_catalog(test_router()).await?;
+
+        let request = helpers::make_request(
+            Method::POST,
+            "/api/v1/query?format=json",
+            Some(serde_json::json!({
+                "sql": "SELECT name FROM catalog.namespaces"
+            })),
+        )?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(content_type, Some("application/json"));
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .context("read response body")?;
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&body).context("parse JSON response")?;
+        assert!(rows.iter().any(|row| row.get("name") == Some(&"analytics".into())));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_query_rejects_non_select() -> Result<()> {
+        let router = test_router();
+
+        let request = helpers::make_request(
+            Method::POST,
+            "/api/v1/query",
+            Some(serde_json::json!({
+                "sql": "DELETE FROM catalog.namespaces"
+            })),
+        )?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         Ok(())
     }

@@ -1,0 +1,35 @@
+   Compiling arco-api v0.1.0 (/Users/ethanurbanski/arco/crates/arco-api)
+error[E0382]: borrow of moved value: `df`
+    --> crates/arco-api/src/routes/query.rs:116:36
+     |
+104  |     let df = session.sql(sql).await.map_err(map_datafusion_error)?;
+     |         -- move occurs because `df` has type `DataFrame`, which does not implement the `Copy` trait
+105  |     let batches = df.collect().await.map_err(map_datafusion_error)?;
+     |                      --------- `df` moved due to this method call
+...
+116  |     let payload = batches_to_arrow(df.schema(), &batches)?;
+     |                                    ^^ value borrowed here after move
+     |
+note: `DataFrame::collect` takes ownership of the receiver `self`, which moves `df`
+    --> /Users/ethanurbanski/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/datafusion-46.0.1/src/dataframe/mod.rs:1253:26
+     |
+1253 |     pub async fn collect(self) -> Result<Vec<RecordBatch>> {
+     |                          ^^^^
+help: you can `clone` the value and consume it, but this might not be your desired behavior
+     |
+105  |     let batches = df.clone().collect().await.map_err(map_datafusion_error)?;
+     |                     ++++++++
+
+warning: variable does not need to be mutable
+   --> crates/arco-api/src/routes/query.rs:234:9
+    |
+234 |     let mut reader = builder
+    |         ----^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` on by default
+
+For more information about this error, try `rustc --explain E0382`.
+warning: `arco-api` (lib) generated 1 warning
+error: could not compile `arco-api` (lib) due to 1 previous error; 1 warning emitted

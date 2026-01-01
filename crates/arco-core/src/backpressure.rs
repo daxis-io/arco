@@ -36,7 +36,7 @@
 //! # No Listing Required
 //!
 //! Positions come from:
-//! - `last_written_position`: Incremented on each ledger append (in-memory or Servo metadata)
+//! - `last_written_position`: Incremented on each ledger append (in-memory or Arco Flow metadata)
 //! - `last_compacted_position`: Read from manifest `position_watermark` field
 //!
 //! This avoids expensive listing operations on the critical path.
@@ -74,10 +74,10 @@ pub struct BackpressureState {
     /// Domain identifier (e.g., "catalog", "lineage").
     pub domain: String,
 
-    /// Last written position (from Servo/ingestion).
+    /// Last written position (from Arco Flow/ingestion).
     ///
     /// This is incremented on each ledger append and tracked
-    /// in-memory or persisted in Servo metadata.
+    /// in-memory or persisted in Arco Flow metadata.
     pub last_written_position: u64,
 
     /// Last compacted position (from manifest watermark).

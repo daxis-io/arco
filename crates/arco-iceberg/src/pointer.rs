@@ -14,6 +14,7 @@ use uuid::Uuid;
 use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
 
 use crate::error::{IcebergError, IcebergResult};
+use crate::paths::{ICEBERG_POINTER_PREFIX, iceberg_pointer_path};
 use crate::types::ObjectVersion;
 
 /// Tracks the current state of an Iceberg table.
@@ -112,7 +113,7 @@ impl IcebergTablePointer {
     /// Returns the path where this pointer should be stored.
     #[must_use]
     pub fn storage_path(table_uuid: &Uuid) -> String {
-        format!("_catalog/iceberg_pointers/{table_uuid}.json")
+        iceberg_pointer_path(table_uuid)
     }
 }
 
@@ -150,11 +151,12 @@ pub enum SnapshotRefType {
 }
 
 /// Source of the last update to the pointer.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UpdateSource {
-    /// Update from Servo orchestration.
-    Servo {
+    /// Update from Arco Flow orchestration.
+    #[serde(rename = "arco-flow")]
+    ArcoFlow {
         /// The run ID.
         run_id: ulid::Ulid,
         /// The task ID.
@@ -176,13 +178,8 @@ pub enum UpdateSource {
     },
     /// Unknown source (for deserialization compatibility).
     #[serde(other)]
+    #[default]
     Unknown,
-}
-
-impl Default for UpdateSource {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 /// Error when validating pointer version.
@@ -399,11 +396,11 @@ impl<S: StorageBackend> PointerStore for PointerStoreImpl<S> {
     }
 
     async fn list_all(&self) -> IcebergResult<Vec<Uuid>> {
-        let prefix = "_catalog/iceberg_pointers/";
+        let prefix = format!("{ICEBERG_POINTER_PREFIX}/");
 
         let entries = self
             .storage
-            .list(prefix)
+            .list(&prefix)
             .await
             .map_err(|e| IcebergError::Internal {
                 message: format!("Failed to list pointers: {e}"),
@@ -412,7 +409,7 @@ impl<S: StorageBackend> PointerStore for PointerStoreImpl<S> {
         let mut uuids = Vec::new();
         for entry in entries {
             // Extract UUID from path like "_catalog/iceberg_pointers/{uuid}.json"
-            if let Some(filename) = entry.path.strip_prefix(prefix) {
+            if let Some(filename) = entry.path.strip_prefix(&prefix) {
                 if let Some(uuid_str) = filename.strip_suffix(".json") {
                     if let Ok(uuid) = Uuid::parse_str(uuid_str) {
                         uuids.push(uuid);
@@ -480,21 +477,19 @@ mod tests {
     fn test_storage_path() {
         let uuid = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid uuid");
         let path = IcebergTablePointer::storage_path(&uuid);
-        assert_eq!(
-            path,
-            "_catalog/iceberg_pointers/550e8400-e29b-41d4-a716-446655440000.json"
-        );
+        let expected = format!("{ICEBERG_POINTER_PREFIX}/{uuid}.json");
+        assert_eq!(path, expected);
     }
 
     #[test]
     fn test_update_source_variants() {
         // Test each variant serializes correctly
-        let servo = UpdateSource::Servo {
+        let flow = UpdateSource::ArcoFlow {
             run_id: ulid::Ulid::new(),
             task_id: ulid::Ulid::new(),
         };
-        let json = serde_json::to_string(&servo).expect("serialization");
-        assert!(json.contains("\"type\":\"servo\""));
+        let json = serde_json::to_string(&flow).expect("serialization");
+        assert!(json.contains("\"type\":\"arco-flow\""));
 
         let rest = UpdateSource::IcebergRest {
             client_info: Some("test".to_string()),

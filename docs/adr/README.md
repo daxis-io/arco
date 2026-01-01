@@ -37,3 +37,4 @@ Each ADR follows this structure:
 | [024](adr-024-schedule-sensor-automation.md) | Schedule and sensor automation | Accepted |
 | [025](adr-025-backfill-controller.md) | Backfill controller | Accepted |
 | [026](adr-026-partition-status-tracking.md) | Partition status tracking | Accepted |
+| [027](adr-027-datafusion-query-endpoint.md) | DataFusion query endpoint | Accepted |

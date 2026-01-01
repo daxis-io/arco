@@ -1,0 +1,219 @@
+Diff in /Users/ethanurbanski/arco/crates/arco-catalog/src/parquet_util.rs:12:
+ use std::io::Cursor;
+ use std::sync::Arc;
+ 
+[31m-use arrow::array::{
+(B[m[31m-    Array as _, BooleanArray, Float32Array, Int32Array, Int64Array, StringArray,
+(B[m[31m-};
+(B[m[32m+use arrow::array::{Array as _, BooleanArray, Float32Array, Int32Array, Int64Array, StringArray};
+(B[m use arrow::datatypes::{DataType, Field, Schema};
+ use arrow::record_batch::RecordBatch;
+ use bytes::Bytes;
+Diff in /Users/ethanurbanski/arco/crates/arco-catalog/src/parquet_util.rs:430:
+ pub fn write_search_postings(rows: &[SearchPostingRecord]) -> Result<Bytes> {
+     let schema = search_postings_schema();
+ 
+[31m-    let tokens = StringArray::from(rows.iter().map(|r| Some(r.token.as_str())).collect::<Vec<_>>());
+(B[m[31m-    let token_norms =
+(B[m[31m-        StringArray::from(rows.iter().map(|r| Some(r.token_norm.as_str())).collect::<Vec<_>>());
+(B[m[31m-    let doc_types =
+(B[m[31m-        StringArray::from(rows.iter().map(|r| Some(r.doc_type.as_str())).collect::<Vec<_>>());
+(B[m[31m-    let doc_ids =
+(B[m[31m-        StringArray::from(rows.iter().map(|r| Some(r.doc_id.as_str())).collect::<Vec<_>>());
+(B[m[31m-    let fields = StringArray::from(rows.iter().map(|r| Some(r.field.as_str())).collect::<Vec<_>>());
+(B[m[32m+    let tokens = StringArray::from(
+(B[m[32m+        rows.iter()
+(B[m[32m+            .map(|r| Some(r.token.as_str()))
+(B[m[32m+            .collect::<Vec<_>>(),
+(B[m[32m+    );
+(B[m[32m+    let token_norms = StringArray::from(
+(B[m[32m+        rows.iter()
+(B[m[32m+            .map(|r| Some(r.token_norm.as_str()))
+(B[m[32m+            .collect::<Vec<_>>(),
+(B[m[32m+    );
+(B[m[32m+    let doc_types = StringArray::from(
+(B[m[32m+        rows.iter()
+(B[m[32m+            .map(|r| Some(r.doc_type.as_str()))
+(B[m[32m+            .collect::<Vec<_>>(),
+(B[m[32m+    );
+(B[m[32m+    let doc_ids = StringArray::from(
+(B[m[32m+        rows.iter()
+(B[m[32m+            .map(|r| Some(r.doc_id.as_str()))
+(B[m[32m+            .collect::<Vec<_>>(),
+(B[m[32m+    );
+(B[m[32m+    let fields = StringArray::from(
+(B[m[32m+        rows.iter()
+(B[m[32m+            .map(|r| Some(r.field.as_str()))
+(B[m[32m+            .collect::<Vec<_>>(),
+(B[m[32m+    );
+(B[m     let scores = Float32Array::from(rows.iter().map(|r| r.score).collect::<Vec<_>>());
+ 
+     let batch = RecordBatch::try_new(
+Diff in /Users/ethanurbanski/arco/crates/arco-catalog/src/tier1_compactor.rs:496:
+             let search_state = build_search_state(&catalog_state);
+ 
+             let next_version = manifest.snapshot_version + 1;
+[31m-            let snapshot = tier1_snapshot::write_search_snapshot(
+(B[m[31m-                &self.storage,
+(B[m[31m-                next_version,
+(B[m[31m-                &search_state,
+(B[m[31m-            )
+(B[m[31m-            .await
+(B[m[31m-            .map_err(map_processing_error)?;
+(B[m[32m+            let snapshot =
+(B[m[32m+                tier1_snapshot::write_search_snapshot(&self.storage, next_version, &search_state)
+(B[m[32m+                    .await
+(B[m[32m+                    .map_err(map_processing_error)?;
+(B[m 
+             let commit_ulid = next_commit_ulid(prev_manifest.commit_ulid.as_deref())?;
+ 
+Diff in /Users/ethanurbanski/arco/crates/arco-catalog/src/tier1_compactor.rs:519:
+                 .validate_succession(&prev_manifest, &prev_raw_hash)
+                 .map_err(|message| Tier1CompactionError::ProcessingError { message })?;
+ 
+[31m-            let commit = build_search_commit_record(
+(B[m[31m-                &self.storage,
+(B[m[31m-                &prev_manifest,
+(B[m[31m-                &manifest,
+(B[m[31m-                &commit_ulid,
+(B[m[31m-            )
+(B[m[31m-            .await?;
+(B[m[32m+            let commit =
+(B[m[32m+                build_search_commit_record(&self.storage, &prev_manifest, &manifest, &commit_ulid)
+(B[m[32m+                    .await?;
+(B[m             manifest.last_commit_id = Some(commit.commit_id.clone());
+ 
+             let bytes = serde_json::to_vec(&manifest).map_err(map_processing_error)?;
+Diff in /Users/ethanurbanski/arco/crates/arco-catalog/src/tier1_compactor.rs:852:
+     let mut postings = Vec::new();
+ 
+     for ns in &catalog.namespaces {
+[31m-        append_tokens(
+(B[m[31m-            &mut postings,
+(B[m[31m-            "namespace",
+(B[m[31m-            &ns.id,
+(B[m[31m-            "name",
+(B[m[31m-            1.0,
+(B[m[31m-            &ns.name,
+(B[m[31m-        );
+(B[m[32m+        append_tokens(&mut postings, "namespace", &ns.id, "name", 1.0, &ns.name);
+(B[m         if let Some(description) = &ns.description {
+             append_tokens(
+                 &mut postings,
+Diff in /Users/ethanurbanski/arco/crates/arco-catalog/src/tier1_compactor.rs:1257:
+             "token_postings.parquet",
+         );
+         let postings_bytes = storage.get_raw(&postings_path).await.expect("postings");
+[31m-        let postings = crate::parquet_util::read_search_postings(&postings_bytes)
+(B[m[31m-            .expect("read postings");
+(B[m[32m+        let postings =
+(B[m[32m+            crate::parquet_util::read_search_postings(&postings_bytes).expect("read postings");
+(B[m         assert!(!postings.is_empty());
+ 
+         guard.release().await.expect("release");
+Diff in /Users/ethanurbanski/arco/crates/arco-catalog/src/tier1_snapshot.rs:99:
+ ) -> Result<SnapshotInfo> {
+     let snapshot_dir = StateKey::snapshot_dir(CatalogDomain::Search, version);
+     let bytes = parquet_util::write_search_postings(&state.postings)?;
+[31m-    let key =
+(B[m[31m-        StateKey::snapshot_file(CatalogDomain::Search, version, "token_postings.parquet");
+(B[m[32m+    let key = StateKey::snapshot_file(CatalogDomain::Search, version, "token_postings.parquet");
+(B[m 
+     put_state_if_absent(storage, &key, bytes.clone()).await?;
+ 
+Diff in /Users/ethanurbanski/arco/crates/arco-compactor/src/anti_entropy.rs:452:
+                     .map_err(|e| AntiEntropyError::WatermarkError {
+                         message: format!("failed to read executions manifest: {e}"),
+                     })?;
+[31m-                let manifest: ExecutionsManifest =
+(B[m[31m-                    serde_json::from_slice(&data).map_err(|e| AntiEntropyError::WatermarkError {
+(B[m[32m+                let manifest: ExecutionsManifest = serde_json::from_slice(&data).map_err(|e| {
+(B[m[32m+                    AntiEntropyError::WatermarkError {
+(B[m                         message: format!("failed to parse executions manifest: {e}"),
+[31m-                    })?;
+(B[m[32m+                    }
+(B[m[32m+                })?;
+(B[m                 Ok(DomainWatermark {
+                     watermark_event_id: manifest.watermark_event_id.clone(),
+                     last_compaction_at: manifest.last_compaction_at,
+Diff in /Users/ethanurbanski/arco/crates/arco-compactor/src/anti_entropy.rs:470:
+                         message: format!("failed to read catalog manifest: {e}"),
+                     })?;
+                 let manifest: CatalogDomainManifest =
+[31m-                    serde_json::from_slice(&data).map_err(|e| AntiEntropyError::WatermarkError {
+(B[m[31m-                        message: format!("failed to parse catalog manifest: {e}"),
+(B[m[32m+                    serde_json::from_slice(&data).map_err(|e| {
+(B[m[32m+                        AntiEntropyError::WatermarkError {
+(B[m[32m+                            message: format!("failed to parse catalog manifest: {e}"),
+(B[m[32m+                        }
+(B[m                     })?;
+                 Ok(DomainWatermark {
+                     watermark_event_id: manifest.watermark_event_id.clone(),
+Diff in /Users/ethanurbanski/arco/crates/arco-compactor/src/anti_entropy.rs:486:
+                     .map_err(|e| AntiEntropyError::WatermarkError {
+                         message: format!("failed to read lineage manifest: {e}"),
+                     })?;
+[31m-                let manifest: LineageManifest =
+(B[m[31m-                    serde_json::from_slice(&data).map_err(|e| AntiEntropyError::WatermarkError {
+(B[m[32m+                let manifest: LineageManifest = serde_json::from_slice(&data).map_err(|e| {
+(B[m[32m+                    AntiEntropyError::WatermarkError {
+(B[m                         message: format!("failed to parse lineage manifest: {e}"),
+[31m-                    })?;
+(B[m[32m+                    }
+(B[m[32m+                })?;
+(B[m                 Ok(DomainWatermark {
+                     watermark_event_id: manifest.watermark_event_id.clone(),
+                     last_compaction_at: Some(manifest.updated_at),
+Diff in /Users/ethanurbanski/arco/crates/arco-compactor/src/anti_entropy.rs:514:
+             .map_err(|e| AntiEntropyError::WatermarkError {
+                 message: format!("failed to read catalog manifest: {e}"),
+             })?;
+[31m-        let catalog_manifest: CatalogDomainManifest =
+(B[m[31m-            serde_json::from_slice(&catalog_bytes).map_err(|e| AntiEntropyError::WatermarkError {
+(B[m[32m+        let catalog_manifest: CatalogDomainManifest = serde_json::from_slice(&catalog_bytes)
+(B[m[32m+            .map_err(|e| AntiEntropyError::WatermarkError {
+(B[m                 message: format!("failed to parse catalog manifest: {e}"),
+             })?;
+ 
+Diff in /Users/ethanurbanski/arco/crates/arco-compactor/src/anti_entropy.rs:527:
+                 message: format!("failed to read search manifest: {e}"),
+             })?;
+         let search_manifest: SearchManifest =
+[31m-            serde_json::from_slice(&search_bytes).map_err(|e| AntiEntropyError::WatermarkError {
+(B[m[31m-                message: format!("failed to parse search manifest: {e}"),
+(B[m[32m+            serde_json::from_slice(&search_bytes).map_err(|e| {
+(B[m[32m+                AntiEntropyError::WatermarkError {
+(B[m[32m+                    message: format!("failed to parse search manifest: {e}"),
+(B[m[32m+                }
+(B[m             })?;
+ 
+         let mut missed_paths = Vec::new();
+Diff in /Users/ethanurbanski/arco/crates/arco-compactor/src/notification_consumer.rs:457:
+                     error: None,
+                 }
+             }
+[31m-            CatalogDomain::Search => self
+(B[m[31m-                .process_tier1_domain_events(catalog_domain, event_paths)
+(B[m[31m-                .await?,
+(B[m[32m+            CatalogDomain::Search => {
+(B[m[32m+                self.process_tier1_domain_events(catalog_domain, event_paths)
+(B[m[32m+                    .await?
+(B[m[32m+            }
+(B[m             CatalogDomain::Catalog | CatalogDomain::Lineage => {
+                 return Err(NotificationConsumerError::NotImplemented {
+                     domain: domain.to_string(),
+Diff in /Users/ethanurbanski/arco/crates/arco-core/src/backpressure.rs:74:
+     /// Domain identifier (e.g., "catalog", "lineage").
+     pub domain: String,
+ 
+[31m-/// Last written position (from Arco Flow/ingestion).
+(B[m[31m-///
+(B[m[31m-/// This is incremented on each ledger append and tracked
+(B[m[31m-/// in-memory or persisted in Arco Flow metadata.
+(B[m[32m+    /// Last written position (from Arco Flow/ingestion).
+(B[m[32m+    ///
+(B[m[32m+    /// This is incremented on each ledger append and tracked
+(B[m[32m+    /// in-memory or persisted in Arco Flow metadata.
+(B[m     pub last_written_position: u64,
+ 
+     /// Last compacted position (from manifest watermark).

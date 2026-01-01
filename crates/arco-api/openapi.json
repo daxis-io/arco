@@ -1552,7 +1552,7 @@
         "tags": [
           "Orchestration"
         ],
-        "summary": "Backfill missing run_key fingerprints.",
+        "summary": "Backfill missing `run_key` fingerprints.",
         "description": "Allows updating legacy reservations that were created before fingerprints\nwere introduced, enabling strict payload validation moving forward.",
         "operationId": "backfill_run_key",
         "parameters": [

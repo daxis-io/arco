@@ -66,6 +66,11 @@ use crate::notification_consumer::{
 // ============================================================================
 
 const COMPACTION_DOMAINS: [&str; 4] = ["catalog", "lineage", "executions", "search"];
+const AUTO_ANTI_ENTROPY_DOMAINS: [CatalogDomain; 3] = [
+    CatalogDomain::Catalog,
+    CatalogDomain::Lineage,
+    CatalogDomain::Executions,
+];
 const COMPACTION_LAG_UPDATE_SECS: u64 = 30;
 
 /// Arco catalog compactor.
@@ -109,6 +114,51 @@ enum Commands {
             default_value = "300"
         )]
         unhealthy_threshold_secs: u64,
+
+        #[arg(
+            long,
+            env = "ARCO_COMPACTOR_URL",
+            help = "Base URL for this compactor (used for /internal/notify)."
+        )]
+        compactor_url: Option<String>,
+
+        #[arg(
+            long,
+            env = "ARCO_COMPACTOR_AUDIENCE",
+            help = "Override audience for compactor identity tokens."
+        )]
+        compactor_audience: Option<String>,
+
+        #[arg(
+            long,
+            env = "ARCO_COMPACTOR_ID_TOKEN",
+            help = "Precomputed identity token for compactor invocation."
+        )]
+        compactor_id_token: Option<String>,
+
+        #[arg(
+            long,
+            env = "ARCO_ANTI_ENTROPY_MAX_OBJECTS_PER_RUN",
+            default_value = "1000",
+            help = "Maximum objects to list per auto anti-entropy run."
+        )]
+        anti_entropy_max_objects_per_run: usize,
+
+        #[arg(
+            long,
+            env = "ARCO_ANTI_ENTROPY_REPROCESS_BATCH_SIZE",
+            default_value = "100",
+            help = "Maximum paths per auto anti-entropy reprocessing request."
+        )]
+        anti_entropy_reprocess_batch_size: usize,
+
+        #[arg(
+            long,
+            env = "ARCO_ANTI_ENTROPY_REPROCESS_TIMEOUT_SECS",
+            default_value = "30",
+            help = "HTTP timeout for auto anti-entropy reprocessing requests (seconds)."
+        )]
+        anti_entropy_reprocess_timeout_secs: u64,
     },
 
     /// Run a single compaction pass.
@@ -310,6 +360,17 @@ struct ServiceState {
     tenant_id: String,
     workspace_id: String,
     notification_consumer: Arc<Mutex<NotificationConsumer>>,
+    auto_anti_entropy: AutoAntiEntropyConfig,
+}
+
+#[derive(Clone)]
+struct AutoAntiEntropyConfig {
+    compactor_url: String,
+    compactor_audience: Option<String>,
+    compactor_id_token: Option<String>,
+    max_objects_per_run: usize,
+    reprocess_batch_size: usize,
+    reprocess_timeout_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -729,6 +790,8 @@ async fn run_compaction_cycle_guarded(state: &Arc<ServiceState>) {
 async fn run_compaction_cycle(state: &Arc<ServiceState>) -> Result<()> {
     let mut consumer = state.notification_consumer.lock().await;
     if consumer.pending_count() == 0 {
+        drop(consumer);
+        run_auto_anti_entropy(state).await?;
         return Ok(());
     }
     if !consumer.should_flush() {
@@ -753,6 +816,44 @@ async fn run_compaction_cycle(state: &Arc<ServiceState>) -> Result<()> {
     Ok(())
 }
 
+async fn run_auto_anti_entropy(state: &Arc<ServiceState>) -> Result<()> {
+    if state.auto_anti_entropy.max_objects_per_run == 0 {
+        return Ok(());
+    }
+
+    for domain in AUTO_ANTI_ENTROPY_DOMAINS {
+        let default_config = anti_entropy::AntiEntropyConfig::default();
+        let config = anti_entropy::AntiEntropyConfig {
+            domain: domain.as_str().to_string(),
+            tenant_id: state.tenant_id.clone(),
+            workspace_id: state.workspace_id.clone(),
+            max_objects_per_run: state.auto_anti_entropy.max_objects_per_run,
+            compactor_url: Some(state.auto_anti_entropy.compactor_url.clone()),
+            compactor_audience: state.auto_anti_entropy.compactor_audience.clone(),
+            compactor_id_token: state.auto_anti_entropy.compactor_id_token.clone(),
+            reprocess_batch_size: state.auto_anti_entropy.reprocess_batch_size,
+            reprocess_timeout_secs: state.auto_anti_entropy.reprocess_timeout_secs,
+            ..default_config
+        };
+
+        let mut job = anti_entropy::AntiEntropyJob::new(state.storage.clone(), config);
+        let result = job
+            .run_pass()
+            .await
+            .map_err(|err| anyhow!("auto anti-entropy failed for {}: {err}", domain.as_str()))?;
+
+        tracing::info!(
+            domain = domain.as_str(),
+            objects_scanned = result.objects_scanned,
+            missed_events = result.missed_events,
+            scan_complete = result.scan_complete,
+            "auto anti-entropy pass completed"
+        );
+    }
+
+    Ok(())
+}
+
 // ============================================================================
 // Main Entry Point
 // ============================================================================
@@ -770,14 +871,20 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let scoped = ScopedConfig::from_args(&args)?;
 
     match args.command {
         Commands::Serve {
             port,
             interval_secs,
             unhealthy_threshold_secs,
+            compactor_url,
+            compactor_audience,
+            compactor_id_token,
+            anti_entropy_max_objects_per_run,
+            anti_entropy_reprocess_batch_size,
+            anti_entropy_reprocess_timeout_secs,
         } => {
-            let scoped = ScopedConfig::from_args(&args)?;
             let scoped_storage = scoped.scoped_storage()?;
 
             // Initialize metrics before starting
@@ -794,16 +901,33 @@ async fn main() -> Result<()> {
             );
 
             let compactor_state = Arc::new(CompactorState::new(unhealthy_threshold_secs));
-            let notification_consumer = NotificationConsumer::new(
-                scoped_storage.clone(),
-                NotificationConsumerConfig::default(),
-            );
+            let mut notification_config = NotificationConsumerConfig::default();
+            for domain in ["catalog", "lineage", "executions"] {
+                if !notification_config
+                    .domains
+                    .iter()
+                    .any(|value| value == domain)
+                {
+                    notification_config.domains.push(domain.to_string());
+                }
+            }
+            let notification_consumer =
+                NotificationConsumer::new(scoped_storage.clone(), notification_config);
+            let auto_anti_entropy = AutoAntiEntropyConfig {
+                compactor_url: compactor_url.unwrap_or_else(|| format!("http://127.0.0.1:{port}")),
+                compactor_audience,
+                compactor_id_token,
+                max_objects_per_run: anti_entropy_max_objects_per_run,
+                reprocess_batch_size: anti_entropy_reprocess_batch_size,
+                reprocess_timeout_secs: anti_entropy_reprocess_timeout_secs,
+            };
             let state = Arc::new(ServiceState {
                 compactor: Arc::clone(&compactor_state),
                 storage: scoped_storage,
                 tenant_id: scoped.tenant_id.clone(),
                 workspace_id: scoped.workspace_id.clone(),
                 notification_consumer: Arc::new(Mutex::new(notification_consumer)),
+                auto_anti_entropy,
             });
 
             // Update compaction lag gauge periodically using last successful compaction as proxy.
@@ -872,7 +996,6 @@ async fn main() -> Result<()> {
                 "Starting manual compaction"
             );
 
-            let scoped = ScopedConfig::from_args(&args)?;
             let scoped_storage = scoped.scoped_storage()?;
 
             if dry_run {
@@ -900,14 +1023,13 @@ async fn main() -> Result<()> {
             reprocess_batch_size,
             reprocess_timeout_secs,
         } => {
-            let scoped = ScopedConfig::from_args(&args)?;
             let scoped_storage = scoped.scoped_storage()?;
 
             let default_config = anti_entropy::AntiEntropyConfig::default();
             let config = anti_entropy::AntiEntropyConfig {
                 domain: domain.clone(),
-                tenant_id: scoped.tenant_id,
-                workspace_id: scoped.workspace_id,
+                tenant_id: scoped.tenant_id.clone(),
+                workspace_id: scoped.workspace_id.clone(),
                 max_objects_per_run,
                 compactor_url: compactor_url.clone(),
                 compactor_audience: compactor_audience.clone(),

@@ -14,15 +14,15 @@
 
 use std::sync::Arc;
 
+use arco_catalog::CatalogReader;
 use arco_catalog::manifest::{
     CatalogDomainManifest, ExecutionsManifest, LineageManifest, RootManifest, SearchManifest,
 };
 use arco_catalog::parquet_util;
-use arco_catalog::CatalogReader;
 use arco_core::storage::{MemoryBackend, StorageBackend, WritePrecondition};
 use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
 use chrono::Utc;
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use tokio::runtime::Runtime;
 
 async fn setup_catalog(
@@ -80,21 +80,27 @@ async fn setup_catalog(
     let snapshot_version = 1u64;
 
     let ns_bytes = parquet_util::write_namespaces(&namespaces).expect("write namespaces");
-    let ns_path = CatalogPaths::snapshot_file(CatalogDomain::Catalog, snapshot_version, "namespaces.parquet");
+    let ns_path = CatalogPaths::snapshot_file(
+        CatalogDomain::Catalog,
+        snapshot_version,
+        "namespaces.parquet",
+    );
     storage
         .put_raw(&ns_path, ns_bytes.into(), WritePrecondition::None)
         .await
         .expect("put namespaces");
 
     let tables_bytes = parquet_util::write_tables(&tables).expect("write tables");
-    let tables_path = CatalogPaths::snapshot_file(CatalogDomain::Catalog, snapshot_version, "tables.parquet");
+    let tables_path =
+        CatalogPaths::snapshot_file(CatalogDomain::Catalog, snapshot_version, "tables.parquet");
     storage
         .put_raw(&tables_path, tables_bytes.into(), WritePrecondition::None)
         .await
         .expect("put tables");
 
     let columns_bytes = parquet_util::write_columns(&columns).expect("write columns");
-    let columns_path = CatalogPaths::snapshot_file(CatalogDomain::Catalog, snapshot_version, "columns.parquet");
+    let columns_path =
+        CatalogPaths::snapshot_file(CatalogDomain::Catalog, snapshot_version, "columns.parquet");
     storage
         .put_raw(&columns_path, columns_bytes.into(), WritePrecondition::None)
         .await
@@ -102,7 +108,8 @@ async fn setup_catalog(
 
     // Write empty lineage edges
     let edges_bytes = parquet_util::write_lineage_edges(&[]).expect("write edges");
-    let edges_path = CatalogPaths::snapshot_file(CatalogDomain::Lineage, snapshot_version, "edges.parquet");
+    let edges_path =
+        CatalogPaths::snapshot_file(CatalogDomain::Lineage, snapshot_version, "edges.parquet");
     storage
         .put_raw(&edges_path, edges_bytes.into(), WritePrecondition::None)
         .await
@@ -110,11 +117,13 @@ async fn setup_catalog(
 
     let mut catalog_manifest = CatalogDomainManifest::new();
     catalog_manifest.snapshot_version = snapshot_version;
-    catalog_manifest.snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, snapshot_version);
+    catalog_manifest.snapshot_path =
+        CatalogPaths::snapshot_dir(CatalogDomain::Catalog, snapshot_version);
 
     let mut lineage_manifest = LineageManifest::new();
     lineage_manifest.snapshot_version = snapshot_version;
-    lineage_manifest.edges_path = CatalogPaths::snapshot_dir(CatalogDomain::Lineage, snapshot_version);
+    lineage_manifest.edges_path =
+        CatalogPaths::snapshot_dir(CatalogDomain::Lineage, snapshot_version);
 
     let executions_manifest = ExecutionsManifest::new();
     let search_manifest = SearchManifest::new();

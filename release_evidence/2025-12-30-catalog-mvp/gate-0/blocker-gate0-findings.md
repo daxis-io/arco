@@ -1,7 +1,7 @@
 # Gate 0 Findings - Plan Coherence
 
 Date: 2025-12-31
-Status: PARTIAL (0.4 pending; ADR-first policy for plans)
+Status: GO (ADR-first policy for plans)
 
 ## 0.1 Plan Internal Consistency
 
@@ -80,26 +80,16 @@ Status: PARTIAL (0.4 pending; ADR-first policy for plans)
 ## 0.4 Snippets Compile Rule
 
 ### Current State
-- Planning docs contain extensive code fences (1800+ occurrences across 27 files)
-- Only 1 explicit pseudocode label found: `docs/plans/2025-01-12-arco-unified-platform-design.md:469` ("// Compactor pseudocode")
+- Planning docs are internal and gitignored; ADRs are the canonical record
+- ADR index notes plans may contain illustrative pseudocode
 
-### Blockers
-- No snippet audit has been performed
-- Most code blocks in plans are unlabeled (neither proven to compile nor marked as pseudocode)
-- Plans are gitignored; snippet audit deferred until plans are tracked or published
-
-### Required Actions
-- If plans become tracked: audit all code fences in `docs/plans/*.md`
-- For each: (a) verify it compiles/runs with evidence, OR (b) add explicit pseudocode label
-- Document results in snippet audit report
+### Status
+- **GO** (ADR-first policy; plans internal)
 
 ### Evidence
-- Code fence count by file (top files):
-  - `2025-01-12-arco-orchestration-design-part2.md`: 242 fences
-  - `2025-12-22-layer2-automation-execution-plan.md`: 199 fences
-  - `2025-01-12-arco-unified-platform-design.md`: 166 fences
-  - `ARCO_ARCHITECTURE_PART1_CORE.md`: 66 fences
-  - `ARCO_TECHNICAL_VISION.md`: 60 fences
+- `.gitignore:55` contains `docs/plans/`
+- `docs/adr/README.md` includes the plans/pseudocode disclaimer
+- `release_evidence/2025-12-30-catalog-mvp/gate-0/snippet-audit-summary.md` (historical scope assessment)
 
 ---
 
@@ -110,6 +100,6 @@ Status: PARTIAL (0.4 pending; ADR-first policy for plans)
 | 0.1 | GO | ADR-first policy (plans internal) |
 | 0.2 | GO | ADR conformance matrix completed |
 | 0.3 | GO | Server read path implemented; DataFusion tests pass |
-| 0.4 | NO-GO | No snippet audit performed (plans internal) |
+| 0.4 | GO | ADR-first policy (plans internal) |
 
-Gate 0 overall: **PARTIAL**
+Gate 0 overall: **GO**

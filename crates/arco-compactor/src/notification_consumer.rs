@@ -457,15 +457,9 @@ impl NotificationConsumer {
                     error: None,
                 }
             }
-            CatalogDomain::Search => {
+            CatalogDomain::Search | CatalogDomain::Catalog | CatalogDomain::Lineage => {
                 self.process_tier1_domain_events(catalog_domain, event_paths)
                     .await?
-            }
-            CatalogDomain::Catalog | CatalogDomain::Lineage => {
-                return Err(NotificationConsumerError::NotImplemented {
-                    domain: domain.to_string(),
-                    message: "tier1 DDL domains require /internal/sync-compact".to_string(),
-                });
             }
         };
 

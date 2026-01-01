@@ -191,9 +191,9 @@ Evidence index: `docs/audits/2025-12-30-prod-readiness/evidence/gate-2/00-eviden
 
 ### Operational wiring gaps (affects readiness)
 
-- Compaction loop is implemented but only flushes queued notifications (no listing); relies on `/internal/notify` or anti-entropy to feed events: `crates/arco-compactor/src/main.rs:675`, `crates/arco-compactor/src/main.rs:728`
-- Notification consumer fast-path supports Executions + Search; Catalog/Lineage return NotImplemented and require `/internal/sync-compact`: `crates/arco-compactor/src/notification_consumer.rs:411`, `crates/arco-compactor/src/notification_consumer.rs:465`
-- Anti-entropy job is implemented with cursor + listing scan; Search uses derived rebuild (no listing) via catalog/search watermark comparison: `crates/arco-compactor/src/anti_entropy.rs:337`, `crates/arco-compactor/src/anti_entropy.rs:358`, `crates/arco-compactor/src/anti_entropy.rs:508`
+- Compaction loop triggers auto anti-entropy when the notification queue is empty (bounded listing per run): `crates/arco-compactor/src/main.rs`
+- Notification consumer now processes Catalog/Lineage/Executions/Search via explicit paths with Tier-1 lock acquisition for DDL domains: `crates/arco-compactor/src/notification_consumer.rs`
+- Anti-entropy job is implemented with cursor + listing scan; Search uses derived rebuild (no listing) via catalog/search watermark comparison: `crates/arco-compactor/src/anti_entropy.rs:337`, `crates/arco-compactor/src/anti_entropy.rs:508`
 
 ### Evidence
 

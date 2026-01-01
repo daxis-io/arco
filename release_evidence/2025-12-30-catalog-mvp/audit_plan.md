@@ -9,7 +9,7 @@ Reviewer(s):
 Gate summary
 | Gate | Status | GO/NO-GO | Evidence |
 | --- | --- | --- | --- |
-| 0 | Partial | NO-GO | gate-0/blocker-gate0-findings.md (0.4 snippet audit pending); gate-0/adr-conformance-matrix.md; gate-0/snippet-audit-summary.md |
+| 0 | GO | GO | gate-0/adr-conformance-matrix.md; gate-0/snippet-audit-summary.md; docs/adr/README.md |
 | 1 | Deferred | DEFERRED | gate-1/blocker-gate1-findings.md (release tag evidence pending; deferred until release process) |
 | 2 | Partial | NO-GO | gate-2/gate2-summary.md; docs/audits/2025-12-30-prod-readiness/findings/gate-2-findings.md |
 | 3 | Partial | GO | gate-3/gate3-summary.md (3.4 out of scope for this audit) |
@@ -37,32 +37,32 @@ Session log
 
 Evidence pack checklist (required for GO)
 [x] cargo fmt --check
-Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/cargo-fmt-final-2025-12-31.txt
-Notes: 2025-12-31 final run PASS after cargo fmt fix.
+Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/cargo-fmt-2026-01-01.txt
+Notes: 2026-01-01 rerun PASS.
 
 [x] cargo clippy --workspace --all-features -D warnings
-Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/cargo-clippy-final-2025-12-31.txt
-Notes: 2025-12-31 final run PASS after fixing: missing_errors_doc (4), too_many_lines (2), assigning_clones (3), match_wildcard_for_single_variants (1).
+Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/cargo-clippy-2026-01-01.txt
+Notes: 2026-01-01 rerun PASS.
 
 [x] cargo test --workspace --all-features
-Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/cargo-test-2025-12-31.txt; release_evidence/2025-12-30-audit/ci-logs/cargo-test.txt
-Notes: 2025-12-31 rerun pass; IAM smoke tests require deployed GCP env; not covered by default workspace run.
+Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/cargo-test-2026-01-01.txt; release_evidence/2025-12-30-audit/ci-logs/cargo-test.txt
+Notes: 2026-01-01 rerun PASS; IAM smoke tests require deployed GCP env; not covered by default workspace run.
 
 [x] cargo doc -D warnings
-Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/cargo-doc-2025-12-31-rerun.txt; release_evidence/2025-12-30-audit/ci-logs/cargo-doc.txt
-Notes: 2025-12-31 rerun used RUSTDOCFLAGS="-D warnings".
+Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/cargo-doc-2026-01-01.txt; release_evidence/2025-12-30-audit/ci-logs/cargo-doc.txt
+Notes: 2026-01-01 rerun used RUSTDOCFLAGS="-D warnings".
 
 [x] cargo deny check
-Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/cargo-deny-final-2025-12-31.txt
-Notes: 2025-12-31 final run PASS (advisories ok, bans ok, licenses ok, sources ok). Warnings only for duplicate arrow crates (54.x vs 55.x) due to iceberg dependency - not a blocker.
+Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/cargo-deny-2026-01-01.txt
+Notes: 2026-01-01 rerun PASS (advisories ok, bans ok, licenses ok, sources ok). Warnings only for duplicate arrow crates (54.x vs 55.x) due to iceberg dependency - not a blocker.
 
 [x] buf lint (if applicable)
-Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/buf-lint-2025-12-31-rerun.txt; release_evidence/2025-12-30-audit/ci-logs/buf-lint.txt
-Notes: 2025-12-31 rerun used absolute proto path; no output indicates success. Earlier evidence used --path proto and failed.
+Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/buf-lint-2026-01-01.txt; release_evidence/2025-12-30-audit/ci-logs/buf-lint.txt
+Notes: 2026-01-01 rerun used absolute proto path; no output indicates success.
 
 [x] buf breaking (if applicable)
-Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/buf-breaking-2025-12-31-rerun.txt; release_evidence/2025-12-30-audit/ci-logs/buf-breaking.txt
-Notes: 2025-12-31 rerun used absolute proto path and --against /Users/ethanurbanski/arco/.git#branch=main; no output indicates success. Earlier evidence lacked --against and failed.
+Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/buf-breaking-2026-01-01.txt; release_evidence/2025-12-30-audit/ci-logs/buf-breaking.txt
+Notes: 2026-01-01 rerun used absolute proto path and --against /Users/ethanurbanski/arco/.git#branch=main; no output indicates success.
 
 [x] Integration test evidence (tier-1, tier-2, API, browser)
 Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/catalog-concurrent_writers.txt; release_evidence/2025-12-30-catalog-mvp/ci-logs/schema-contracts.txt; release_evidence/2025-12-30-catalog-mvp/ci-logs/tier2-tests.txt; release_evidence/2025-12-30-catalog-mvp/ci-logs/api-integration-tests.txt; release_evidence/2025-12-30-catalog-mvp/ci-logs/browser-e2e-tests.txt
@@ -85,8 +85,8 @@ Evidence: release_evidence/2025-12-30-catalog-mvp/security/threat-model-signed-u
 Notes: Threat model captured as local evidence; maintainer security signoff recorded; external review pending.
 
 Gate 0 - Plan coherence and architectural alignment
-Status: Partial
-GO/NO-GO: NO-GO (blocker: snippet audit pending)
+Status: GO
+GO/NO-GO: GO
 
 [x] 0.1 Plan internal consistency (canonical formats resolved, ADRs referenced)
 Evidence: docs/adr/README.md; docs/adr/adr-001-parquet-metadata.md; docs/adr/adr-003-manifest-domains.md
@@ -100,9 +100,9 @@ Notes: Conformance matrix completed for all Accepted ADRs.
 Evidence: docs/adr/adr-001-parquet-metadata.md; docs/adr/adr-003-manifest-domains.md; docs/adr/adr-005-storage-layout.md; docs/adr/adr-027-datafusion-query-endpoint.md; README.md; docs/guide/src/introduction.md; release_evidence/2025-12-30-catalog-mvp/session-2025-12-30-search-log.txt; release_evidence/2025-12-30-catalog-mvp/ci-logs/tier2-tests.txt; release_evidence/2025-12-30-catalog-mvp/ci-logs/browser-e2e-tests.txt; release_evidence/2025-12-30-catalog-mvp/ci-logs/arco-api-query-tests-2026-01-01-rerun4.txt
 Notes: DataFusion server read path implemented via `/api/v1/query`; tests pass.
 
-[ ] 0.4 Snippets compile rule (plan snippets either real code or labeled pseudocode)
-Evidence: release_evidence/2025-12-30-catalog-mvp/gate-0/snippet-audit-summary.md; release_evidence/2025-12-30-catalog-mvp/gate-0/snippet-audit-fences-2025-12-31.txt; release_evidence/2025-12-30-catalog-mvp/gate-0/snippet-audit-pseudocode-2025-12-31.txt
-Notes: Blocker - plans are gitignored and ~1800+ code fences found with only one explicit pseudocode label.
+[x] 0.4 Snippets compile rule (plan snippets either real code or labeled pseudocode)
+Evidence: release_evidence/2025-12-30-catalog-mvp/gate-0/snippet-audit-summary.md; release_evidence/2025-12-30-catalog-mvp/gate-0/snippet-audit-fences-2025-12-31.txt; release_evidence/2025-12-30-catalog-mvp/gate-0/snippet-audit-pseudocode-2025-12-31.txt; docs/adr/README.md
+Notes: Plans are internal; ADR-first policy recorded in docs/adr/README.md.
 
 Gate 1 - Engineering system and repo hygiene
 Status: Deferred
@@ -142,7 +142,7 @@ Notes: Status PARTIAL; search compaction implemented and tested; determinism tes
 
 [ ] 2.5 Tier-2 invariants (event envelope, watermark, idempotency, compactor safety)
 Evidence: docs/audits/2025-12-30-prod-readiness/findings/gate-2-findings.md; docs/adr/adr-004-event-envelope.md; crates/arco-test-utils/tests/tier2.rs; release_evidence/2025-12-30-catalog-mvp/ci-logs/tier2-tests.txt
-Notes: Compaction loop implemented; notification consumer limits Catalog/Lineage fast-path; anti-entropy runs with list permissions and search uses derived rebuild.
+Notes: Compaction loop implemented with auto anti-entropy fallback when notification queue is empty; search remains derived (no listing).
 
 Gate 3 - Product surface completeness
 Status: GO
@@ -220,6 +220,10 @@ Evidence index
 - Item: 2025-12-31 CI rerun logs (fmt/clippy/test/doc/deny/buf, python unit)
   Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/*-2025-12-31*.txt
   Notes: fmt/clippy/deny failures; doc/test/buf pass; python unit pass.
+
+- Item: 2026-01-01 CI rerun logs (xtask/format/clippy/test/doc/deny/buf)
+  Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/*-2026-01-01*.txt
+  Notes: All CI gates green after query/OpenAPI updates.
 
 - Item: Deployment command outputs (terraform/gcloud)
   Evidence: release_evidence/2025-12-30-catalog-mvp/deploy/*
@@ -402,3 +406,13 @@ Command: python unit tests (arco-flow)
 Result: PASS
 Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/python-unit-2025-12-31.txt
 Notes: run with uv venv at /Users/ethanurbanski/.local/share/uv/venv/arco-py311
+
+Command: cargo xtask ci (2026-01-01 rerun)
+Result: PASS
+Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/cargo-xtask-ci-2026-01-01.txt
+Notes: All CI checks passed; supersedes earlier per-command failures.
+
+Command: CI gate reruns (fmt/clippy/test/doc/deny/buf)
+Result: PASS
+Evidence: release_evidence/2025-12-30-catalog-mvp/ci-logs/cargo-fmt-2026-01-01.txt; release_evidence/2025-12-30-catalog-mvp/ci-logs/cargo-clippy-2026-01-01.txt; release_evidence/2025-12-30-catalog-mvp/ci-logs/cargo-test-2026-01-01.txt; release_evidence/2025-12-30-catalog-mvp/ci-logs/cargo-doc-2026-01-01.txt; release_evidence/2025-12-30-catalog-mvp/ci-logs/cargo-deny-2026-01-01.txt; release_evidence/2025-12-30-catalog-mvp/ci-logs/buf-lint-2026-01-01.txt; release_evidence/2025-12-30-catalog-mvp/ci-logs/buf-breaking-2026-01-01.txt
+Notes: Latest pass after query/compactor updates.

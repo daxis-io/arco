@@ -1525,8 +1525,7 @@ mod query {
             .await
             .context("read response body")?;
         let cursor = Cursor::new(body.to_vec());
-        let mut reader = StreamReader::try_new(cursor, None)
-            .context("open arrow stream reader")?;
+        let mut reader = StreamReader::try_new(cursor, None).context("open arrow stream reader")?;
         let mut rows = 0;
         while let Some(batch) = reader.next() {
             let batch = batch.context("read arrow batch")?;
@@ -1562,7 +1561,10 @@ mod query {
             .context("read response body")?;
         let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&body).context("parse JSON response")?;
-        assert!(rows.iter().any(|row| row.get("name") == Some(&"analytics".into())));
+        assert!(
+            rows.iter()
+                .any(|row| row.get("name") == Some(&"analytics".into()))
+        );
 
         Ok(())
     }

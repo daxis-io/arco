@@ -889,6 +889,76 @@
         ]
       }
     },
+    "/api/v1/query": {
+      "post": {
+        "tags": [
+          "query"
+        ],
+        "summary": "Execute a SQL query against catalog snapshots.",
+        "description": "POST /api/v1/query",
+        "operationId": "query",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Query results (Arrow IPC stream or JSON)"
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/api/v1/tasks/{task_id}/completed": {
       "post": {
         "tags": [
@@ -2971,6 +3041,19 @@
           }
         }
       },
+      "QueryRequest": {
+        "type": "object",
+        "description": "Query request payload.",
+        "required": [
+          "sql"
+        ],
+        "properties": {
+          "sql": {
+            "type": "string",
+            "description": "SQL query to execute (read-only)."
+          }
+        }
+      },
       "RegisterTableRequest": {
         "type": "object",
         "description": "Request to register a table.",
@@ -4084,6 +4167,10 @@
     {
       "name": "browser",
       "description": "Browser signed URL minting"
+    },
+    {
+      "name": "query",
+      "description": "SQL query execution"
     },
     {
       "name": "Orchestration",

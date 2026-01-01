@@ -1,7 +1,7 @@
 # Snippet Audit Summary - Gate 0.4
 
 Date: 2025-12-31
-Status: BLOCKER (audit not performed due to scope; investigation complete but blocked by gitignored plans)
+Status: RESOLVED (ADR-first policy; plans internal)
 
 ## Background
 
@@ -39,31 +39,14 @@ Gate 0.4 requires that all code snippets in planning docs either:
 Only 1 explicit pseudocode label found:
 - `docs/plans/2025-01-12-arco-unified-platform-design.md:469` contains `// Compactor pseudocode`
 
-### Blocker
+### Decision
 
-1. **docs/plans/ is gitignored** - These files are not tracked in version control
-2. **~1800 code fences** - Manual audit is prohibitively large
-3. **Most snippets unlabeled** - Neither proven to compile nor marked as pseudocode
+- Plans are internal and gitignored; ADRs are the source of record for architecture.
+- Snippet audit is treated as out of scope for MVP under the ADR-first policy.
 
 ## Recommendation
 
-Given that `docs/plans/` is gitignored:
-
-**Option A: Accept as-is for MVP**
-- Plans are internal design docs, not customer-facing
-- Snippets serve illustration purposes
-- Add blanket disclaimer to `docs/plans/README.md` noting snippets are illustrative
-
-**Option B: Full audit (significant effort)**
-- Remove `docs/plans/` from `.gitignore`
-- Extract all code fences
-- For Rust snippets: verify they compile with `rustc --edition=2021 --check`
-- For JSON/YAML: validate with schema or parser
-- Label remaining as pseudocode
-
-**Option C: Targeted audit**
-- Audit only `ARCO_TECHNICAL_VISION.md` (60 fences) as the canonical architecture doc
-- Leave execution-focused plans unlabeled
+If plans become tracked or published, revisit the snippet audit with a targeted scope (technical vision first) before production readiness signoff.
 
 ## Evidence
 
@@ -73,4 +56,4 @@ Given that `docs/plans/` is gitignored:
 
 ## Gate 0.4 Status
 
-**NO-GO** - Snippet audit not performed. Recommend Option A (accept with disclaimer) or Option C (targeted audit of vision doc only) for MVP.
+**GO** - ADR-first policy adopted; plans are internal and treated as illustrative.

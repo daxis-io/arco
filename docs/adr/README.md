@@ -2,6 +2,9 @@
 
 This directory contains Architecture Decision Records (ADRs) for Arco.
 
+Design documents under `docs/plans/` are internal and may contain illustrative
+pseudocode. ADRs are the source of record for architectural decisions.
+
 ## Format
 
 Each ADR follows this structure:

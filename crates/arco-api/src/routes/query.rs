@@ -1,8 +1,9 @@
 //! Query API routes.
 //!
-//! Provides a minimal SQL query endpoint backed by DataFusion.
+//! Provides a minimal SQL query endpoint backed by `DataFusion`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Query, State};
@@ -12,6 +13,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use bytes::Bytes;
 use serde::Deserialize;
+use tokio::time::timeout;
 use utoipa::ToSchema;
 
 use arrow::datatypes::Schema;
@@ -23,6 +25,8 @@ use datafusion::datasource::MemTable;
 use datafusion::error::DataFusionError;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
+use datafusion::sql::parser::{DFParser, Statement as DFStatement};
+use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use arco_catalog::CatalogReader;
@@ -34,6 +38,10 @@ use crate::server::AppState;
 
 const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 const JSON_CONTENT_TYPE: &str = "application/json";
+const MAX_QUERY_LENGTH: usize = 10_000;
+const MAX_QUERY_ROWS: usize = 10_000;
+const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Query request payload.
 #[derive(Debug, Deserialize, ToSchema)]
@@ -83,6 +91,11 @@ pub(crate) async fn query(
     if sql.is_empty() {
         return Err(ApiError::bad_request("sql cannot be empty"));
     }
+    if sql.len() > MAX_QUERY_LENGTH {
+        return Err(ApiError::bad_request(format!(
+            "sql exceeds max length ({MAX_QUERY_LENGTH} bytes)",
+        )));
+    }
     validate_query(sql)?;
 
     tracing::info!(
@@ -99,23 +112,36 @@ pub(crate) async fn query(
     let session = SessionContext::new();
     let registered = register_snapshot_tables(&session, &reader, &storage).await?;
     if registered == 0 {
-        return Err(ApiError::not_found("No snapshot tables available for query"));
+        return Err(ApiError::not_found(
+            "No snapshot tables available for query",
+        ));
     }
 
-    let df = session.sql(sql).await.map_err(map_datafusion_error)?;
+    let df = session
+        .sql(sql)
+        .await
+        .map_err(|err| map_datafusion_error(&err))?
+        .limit(0, Some(MAX_QUERY_ROWS))
+        .map_err(|err| map_datafusion_error(&err))?;
     let schema = df.schema().clone();
-    let batches = df.collect().await.map_err(map_datafusion_error)?;
+    let batches = timeout(QUERY_TIMEOUT, df.collect())
+        .await
+        .map_err(|_| ApiError::bad_request("query timed out"))?
+        .map_err(|err| map_datafusion_error(&err))?;
 
     if wants_json(&params, &headers)? {
         let payload = batches_to_json(&batches)?;
+        ensure_response_size(payload.len())?;
         let mut response = Response::new(Body::from(payload));
-        response
-            .headers_mut()
-            .insert(header::CONTENT_TYPE, HeaderValue::from_static(JSON_CONTENT_TYPE));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(JSON_CONTENT_TYPE),
+        );
         return Ok(response);
     }
 
     let payload = batches_to_arrow(&schema, &batches)?;
+    ensure_response_size(payload.len())?;
     let mut response = Response::new(Body::from(payload));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -125,13 +151,28 @@ pub(crate) async fn query(
 }
 
 fn validate_query(sql: &str) -> Result<(), ApiError> {
-    let normalized = sql.trim_start().to_ascii_lowercase();
-    if normalized.starts_with("select") || normalized.starts_with("with") {
-        return Ok(());
+    let statements = DFParser::parse_sql(sql)
+        .map_err(|err| ApiError::bad_request(format!("failed to parse SQL: {err}")))?;
+    let mut iter = statements.iter();
+    let Some(statement) = iter.next() else {
+        return Err(ApiError::bad_request("sql must contain a statement"));
+    };
+    if iter.next().is_some() {
+        return Err(ApiError::bad_request(
+            "only single-statement queries are supported",
+        ));
     }
-    Err(ApiError::bad_request(
-        "Only SELECT/CTE queries are supported",
-    ))
+    match statement {
+        DFStatement::Statement(statement) => match statement.as_ref() {
+            SqlStatement::Query(_) => Ok(()),
+            _ => Err(ApiError::bad_request(
+                "Only SELECT/CTE queries are supported",
+            )),
+        },
+        _ => Err(ApiError::bad_request(
+            "Only SELECT/CTE queries are supported",
+        )),
+    }
 }
 
 fn wants_json(params: &QueryParams, headers: &HeaderMap) -> Result<bool, ApiError> {
@@ -140,9 +181,7 @@ fn wants_json(params: &QueryParams, headers: &HeaderMap) -> Result<bool, ApiErro
         return match normalized.as_str() {
             "json" => Ok(true),
             "arrow" => Ok(false),
-            _ => Err(ApiError::bad_request(
-                "format must be one of: json, arrow",
-            )),
+            _ => Err(ApiError::bad_request("format must be one of: json, arrow")),
         };
     }
 
@@ -221,11 +260,8 @@ async fn register_domain_tables(
         let bytes = storage.get_raw(&path).await.map_err(ApiError::from)?;
         let table = parquet_bytes_to_mem_table(bytes)?;
         session
-            .register_table(
-                TableReference::partial(domain.as_str(), *table_name),
-                table,
-            )
-            .map_err(map_datafusion_error)?;
+            .register_table(TableReference::partial(domain.as_str(), *table_name), table)
+            .map_err(|err| map_datafusion_error(&err))?;
         registered += 1;
     }
 
@@ -234,8 +270,13 @@ async fn register_domain_tables(
 
 async fn ensure_schema(session: &SessionContext, schema: &str) -> Result<(), ApiError> {
     let statement = format!("CREATE SCHEMA IF NOT EXISTS {schema}");
-    let df = session.sql(&statement).await.map_err(map_datafusion_error)?;
-    df.collect().await.map_err(map_datafusion_error)?;
+    let df = session
+        .sql(&statement)
+        .await
+        .map_err(|err| map_datafusion_error(&err))?;
+    df.collect()
+        .await
+        .map_err(|err| map_datafusion_error(&err))?;
     Ok(())
 }
 
@@ -292,7 +333,16 @@ fn batches_to_arrow(
     Ok(buffer)
 }
 
-fn map_datafusion_error(err: DataFusionError) -> ApiError {
+fn ensure_response_size(len: usize) -> Result<(), ApiError> {
+    if len > MAX_RESPONSE_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "query result exceeds max size ({MAX_RESPONSE_BYTES} bytes)",
+        )));
+    }
+    Ok(())
+}
+
+fn map_datafusion_error(err: &DataFusionError) -> ApiError {
     match err {
         DataFusionError::SQL(_, _)
         | DataFusionError::Plan(_)

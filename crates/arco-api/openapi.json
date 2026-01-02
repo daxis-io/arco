@@ -1263,6 +1263,269 @@
         ]
       }
     },
+    "/api/v1/workspaces/{workspace_id}/assets/{asset_key}/partitions/summary": {
+      "get": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "Get partition summary for an asset.",
+        "operationId": "get_asset_partition_summary",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "asset_key",
+            "in": "path",
+            "description": "Asset key (URL-encoded)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Partition summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssetPartitionSummaryResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Asset not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/backfills": {
+      "get": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "List backfills.",
+        "operationId": "list_backfills",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum backfills to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Pagination cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "Filter by state",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/BackfillStateResponse"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of backfills",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListBackfillsResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/backfills/{backfill_id}": {
+      "get": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "Get backfill by ID.",
+        "operationId": "get_backfill",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "backfill_id",
+            "in": "path",
+            "description": "Backfill ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Backfill details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackfillResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Backfill not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/backfills/{backfill_id}/chunks": {
+      "get": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "List backfill chunks.",
+        "operationId": "list_backfill_chunks",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "backfill_id",
+            "in": "path",
+            "description": "Backfill ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum chunks to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Pagination cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "Filter by state",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ChunkStateResponse"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of chunks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListBackfillChunksResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Backfill not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/manifests": {
       "get": {
         "tags": [
@@ -1422,6 +1685,81 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/partitions": {
+      "get": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "List partitions.",
+        "operationId": "list_partitions",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum partitions to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Pagination cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "assetKey",
+            "in": "query",
+            "description": "Filter by asset key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "staleOnly",
+            "in": "query",
+            "description": "Filter to stale partitions only",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of partitions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListPartitionsResponse"
                 }
               }
             }
@@ -1998,6 +2336,373 @@
         ]
       }
     },
+    "/api/v1/workspaces/{workspace_id}/schedules": {
+      "get": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "List schedules.",
+        "operationId": "list_schedules",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum schedules to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Pagination cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of schedules",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSchedulesResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/schedules/{schedule_id}": {
+      "get": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "Get schedule by ID.",
+        "operationId": "get_schedule",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "schedule_id",
+            "in": "path",
+            "description": "Schedule ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Schedule details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Schedule not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/schedules/{schedule_id}/ticks": {
+      "get": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "List schedule ticks.",
+        "operationId": "list_schedule_ticks",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "schedule_id",
+            "in": "path",
+            "description": "Schedule ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum ticks to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Pagination cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Filter by status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/TickStatusResponse"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of ticks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListScheduleTicksResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/sensors": {
+      "get": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "List sensors.",
+        "operationId": "list_sensors",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum sensors to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Pagination cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of sensors",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSensorsResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/sensors/{sensor_id}": {
+      "get": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "Get sensor by ID.",
+        "operationId": "get_sensor",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sensor_id",
+            "in": "path",
+            "description": "Sensor ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sensor details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SensorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Sensor not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/sensors/{sensor_id}/evals": {
+      "get": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "List sensor evaluations.",
+        "operationId": "list_sensor_evals",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sensor_id",
+            "in": "path",
+            "description": "Sensor ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum evaluations to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Pagination cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of evaluations",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSensorEvalsResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/api/v1/workspaces/{workspace_id}/sensors/{sensor_id}/evaluate": {
       "post": {
         "tags": [
@@ -2234,6 +2939,172 @@
           }
         }
       },
+      "AssetPartitionSummaryResponse": {
+        "type": "object",
+        "description": "Asset partition summary response.",
+        "required": [
+          "assetKey",
+          "totalPartitions",
+          "materializedPartitions",
+          "stalePartitions",
+          "missingPartitions"
+        ],
+        "properties": {
+          "assetKey": {
+            "type": "string",
+            "description": "Asset key."
+          },
+          "materializedPartitions": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Materialized partition count.",
+            "minimum": 0
+          },
+          "missingPartitions": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Missing partition count.",
+            "minimum": 0
+          },
+          "stalePartitions": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Stale partition count.",
+            "minimum": 0
+          },
+          "totalPartitions": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Total partition count.",
+            "minimum": 0
+          }
+        }
+      },
+      "BackfillChunkResponse": {
+        "type": "object",
+        "description": "Backfill chunk response.",
+        "required": [
+          "chunkId",
+          "backfillId",
+          "chunkIndex",
+          "partitionKeys",
+          "runKey",
+          "state"
+        ],
+        "properties": {
+          "backfillId": {
+            "type": "string",
+            "description": "Backfill identifier."
+          },
+          "chunkId": {
+            "type": "string",
+            "description": "Chunk identifier."
+          },
+          "chunkIndex": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Zero-indexed chunk number.",
+            "minimum": 0
+          },
+          "partitionKeys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Partition keys in this chunk."
+          },
+          "runId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Run ID if resolved."
+          },
+          "runKey": {
+            "type": "string",
+            "description": "Run key for this chunk."
+          },
+          "state": {
+            "$ref": "#/components/schemas/ChunkStateResponse",
+            "description": "Chunk state."
+          }
+        }
+      },
+      "BackfillResponse": {
+        "type": "object",
+        "description": "Backfill response.",
+        "required": [
+          "backfillId",
+          "assetSelection",
+          "partitionSelector",
+          "chunkSize",
+          "maxConcurrentRuns",
+          "state",
+          "stateVersion",
+          "createdAt",
+          "chunkCounts"
+        ],
+        "properties": {
+          "assetSelection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Assets to backfill."
+          },
+          "backfillId": {
+            "type": "string",
+            "description": "Backfill identifier."
+          },
+          "chunkCounts": {
+            "$ref": "#/components/schemas/ChunkCounts",
+            "description": "Chunk counts by state."
+          },
+          "chunkSize": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of partitions per chunk.",
+            "minimum": 0
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the backfill was created."
+          },
+          "maxConcurrentRuns": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Maximum concurrent chunk runs.",
+            "minimum": 0
+          },
+          "partitionSelector": {
+            "$ref": "#/components/schemas/PartitionSelectorResponse",
+            "description": "Partition selector."
+          },
+          "state": {
+            "$ref": "#/components/schemas/BackfillStateResponse",
+            "description": "Current state."
+          },
+          "stateVersion": {
+            "type": "integer",
+            "format": "int32",
+            "description": "State version (for CAS).",
+            "minimum": 0
+          }
+        }
+      },
+      "BackfillStateResponse": {
+        "type": "string",
+        "description": "Backfill state values.",
+        "enum": [
+          "PENDING",
+          "RUNNING",
+          "PAUSED",
+          "SUCCEEDED",
+          "FAILED",
+          "CANCELLED"
+        ]
+      },
       "CallbackErrorResponse": {
         "type": "object",
         "description": "Callback error response per ADR-023.",
@@ -2327,6 +3198,60 @@
             "description": "New state (should be CANCELLED or CANCELLING)."
           }
         }
+      },
+      "ChunkCounts": {
+        "type": "object",
+        "description": "Chunk counts by state.",
+        "required": [
+          "total",
+          "pending",
+          "running",
+          "succeeded",
+          "failed"
+        ],
+        "properties": {
+          "failed": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Failed chunks.",
+            "minimum": 0
+          },
+          "pending": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Pending chunks.",
+            "minimum": 0
+          },
+          "running": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Running chunks.",
+            "minimum": 0
+          },
+          "succeeded": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Succeeded chunks.",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Total chunks.",
+            "minimum": 0
+          }
+        }
+      },
+      "ChunkStateResponse": {
+        "type": "string",
+        "description": "Chunk state values.",
+        "enum": [
+          "PENDING",
+          "PLANNED",
+          "RUNNING",
+          "SUCCEEDED",
+          "FAILED"
+        ]
       },
       "ColumnDefinition": {
         "type": "object",
@@ -2733,6 +3658,118 @@
           }
         }
       },
+      "ListBackfillChunksResponse": {
+        "type": "object",
+        "description": "Response for listing backfill chunks.",
+        "required": [
+          "chunks"
+        ],
+        "properties": {
+          "chunks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BackfillChunkResponse"
+            },
+            "description": "List of chunks."
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Next page cursor."
+          }
+        }
+      },
+      "ListBackfillsQuery": {
+        "type": "object",
+        "description": "Query parameters for listing backfills.",
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cursor for pagination."
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Maximum backfills to return.",
+            "minimum": 0
+          },
+          "state": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BackfillStateResponse",
+                "description": "Filter by state."
+              }
+            ]
+          }
+        }
+      },
+      "ListBackfillsResponse": {
+        "type": "object",
+        "description": "Response for listing backfills.",
+        "required": [
+          "backfills"
+        ],
+        "properties": {
+          "backfills": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BackfillResponse"
+            },
+            "description": "List of backfills."
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Next page cursor."
+          }
+        }
+      },
+      "ListChunksQuery": {
+        "type": "object",
+        "description": "Query parameters for listing backfill chunks.",
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cursor for pagination."
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Maximum chunks to return.",
+            "minimum": 0
+          },
+          "state": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ChunkStateResponse",
+                "description": "Filter by state."
+              }
+            ]
+          }
+        }
+      },
       "ListManifestsResponse": {
         "type": "object",
         "description": "Response for listing manifests.",
@@ -2765,6 +3802,87 @@
           }
         }
       },
+      "ListPartitionsQuery": {
+        "type": "object",
+        "description": "Query parameters for listing partitions.",
+        "properties": {
+          "assetKey": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Filter by asset key."
+          },
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cursor for pagination."
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Maximum partitions to return.",
+            "minimum": 0
+          },
+          "staleOnly": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Filter to stale partitions only."
+          }
+        }
+      },
+      "ListPartitionsResponse": {
+        "type": "object",
+        "description": "Response for listing partitions.",
+        "required": [
+          "partitions"
+        ],
+        "properties": {
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Next page cursor."
+          },
+          "partitions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PartitionStatusApiResponse"
+            },
+            "description": "List of partitions."
+          }
+        }
+      },
+      "ListQuery": {
+        "type": "object",
+        "description": "Common list query parameters.",
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cursor for pagination."
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Maximum items to return.",
+            "minimum": 0
+          }
+        }
+      },
       "ListRunsResponse": {
         "type": "object",
         "description": "Response for listing runs.",
@@ -2788,6 +3906,98 @@
           }
         }
       },
+      "ListScheduleTicksResponse": {
+        "type": "object",
+        "description": "Response for listing schedule ticks.",
+        "required": [
+          "ticks"
+        ],
+        "properties": {
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Next page cursor."
+          },
+          "ticks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScheduleTickResponse"
+            },
+            "description": "List of ticks."
+          }
+        }
+      },
+      "ListSchedulesResponse": {
+        "type": "object",
+        "description": "Response for listing schedules.",
+        "required": [
+          "schedules"
+        ],
+        "properties": {
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Next page cursor."
+          },
+          "schedules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScheduleResponse"
+            },
+            "description": "List of schedules."
+          }
+        }
+      },
+      "ListSensorEvalsResponse": {
+        "type": "object",
+        "description": "Response for listing sensor evaluations.",
+        "required": [
+          "evals"
+        ],
+        "properties": {
+          "evals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SensorEvalResponse"
+            },
+            "description": "List of evaluations."
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Next page cursor."
+          }
+        }
+      },
+      "ListSensorsResponse": {
+        "type": "object",
+        "description": "Response for listing sensors.",
+        "required": [
+          "sensors"
+        ],
+        "properties": {
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Next page cursor."
+          },
+          "sensors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SensorResponse"
+            },
+            "description": "List of sensors."
+          }
+        }
+      },
       "ListTablesResponse": {
         "type": "object",
         "description": "List tables response.",
@@ -2801,6 +4011,39 @@
               "$ref": "#/components/schemas/TableResponse"
             },
             "description": "List of tables."
+          }
+        }
+      },
+      "ListTicksQuery": {
+        "type": "object",
+        "description": "Query parameters for listing schedule ticks.",
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cursor for pagination."
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Maximum ticks to return.",
+            "minimum": 0
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TickStatusResponse",
+                "description": "Filter by tick status."
+              }
+            ]
           }
         }
       },
@@ -3020,6 +4263,140 @@
           "updated_at": {
             "type": "string",
             "description": "Last update timestamp (ISO 8601)."
+          }
+        }
+      },
+      "PartitionSelectorResponse": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Range of partitions.",
+            "required": [
+              "start",
+              "end",
+              "type"
+            ],
+            "properties": {
+              "end": {
+                "type": "string",
+                "description": "End partition (inclusive)."
+              },
+              "start": {
+                "type": "string",
+                "description": "Start partition (inclusive)."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "range"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Explicit list of partitions.",
+            "required": [
+              "partitions",
+              "type"
+            ],
+            "properties": {
+              "partitions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Partition keys."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "explicit"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Filter-based selection.",
+            "required": [
+              "filters",
+              "type"
+            ],
+            "properties": {
+              "filters": {
+                "type": "object",
+                "description": "Filter expressions.",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "filter"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Partition selector response."
+      },
+      "PartitionStatusApiResponse": {
+        "type": "object",
+        "description": "Partition status response.",
+        "required": [
+          "assetKey",
+          "partitionKey",
+          "isStale"
+        ],
+        "properties": {
+          "assetKey": {
+            "type": "string",
+            "description": "Asset key."
+          },
+          "isStale": {
+            "type": "boolean",
+            "description": "Whether this partition is stale."
+          },
+          "lastMaterializationAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Timestamp of last successful materialization."
+          },
+          "lastMaterializationRunId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Run that last materialized (success only)."
+          },
+          "partitionKey": {
+            "type": "string",
+            "description": "Partition key."
+          },
+          "partitionValues": {
+            "type": "object",
+            "description": "Dimension key-values for the partition.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "staleReason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the partition is stale."
           }
         }
       },
@@ -3419,6 +4796,142 @@
           }
         }
       },
+      "ScheduleResponse": {
+        "type": "object",
+        "description": "Schedule state response.",
+        "required": [
+          "scheduleId"
+        ],
+        "properties": {
+          "lastRunKey": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Last run key generated."
+          },
+          "lastScheduledFor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Last scheduled_for timestamp that was processed."
+          },
+          "lastTickId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Last tick ID that was processed."
+          },
+          "scheduleId": {
+            "type": "string",
+            "description": "Schedule identifier."
+          }
+        }
+      },
+      "ScheduleTickResponse": {
+        "type": "object",
+        "description": "Schedule tick response.",
+        "required": [
+          "tickId",
+          "scheduleId",
+          "scheduledFor",
+          "assetSelection",
+          "status"
+        ],
+        "properties": {
+          "assetSelection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Asset selection at tick time."
+          },
+          "runId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Run ID if resolved."
+          },
+          "runKey": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Run key if a run was requested."
+          },
+          "scheduleId": {
+            "type": "string",
+            "description": "Schedule identifier."
+          },
+          "scheduledFor": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When this tick was scheduled for."
+          },
+          "status": {
+            "$ref": "#/components/schemas/TickStatusResponse",
+            "description": "Tick status."
+          },
+          "tickId": {
+            "type": "string",
+            "description": "Unique tick ID."
+          }
+        }
+      },
+      "SensorEvalResponse": {
+        "type": "object",
+        "description": "Sensor evaluation history response.",
+        "required": [
+          "evalId",
+          "sensorId",
+          "evaluatedAt",
+          "status",
+          "runRequestsCount"
+        ],
+        "properties": {
+          "cursorAfter": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cursor after evaluation."
+          },
+          "cursorBefore": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cursor before evaluation."
+          },
+          "evalId": {
+            "type": "string",
+            "description": "Evaluation identifier."
+          },
+          "evaluatedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Evaluation timestamp."
+          },
+          "runRequestsCount": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of run requests generated.",
+            "minimum": 0
+          },
+          "sensorId": {
+            "type": "string",
+            "description": "Sensor identifier."
+          },
+          "status": {
+            "$ref": "#/components/schemas/SensorEvalStatusResponse",
+            "description": "Evaluation status."
+          }
+        }
+      },
       "SensorEvalStatusResponse": {
         "oneOf": [
           {
@@ -3488,6 +5001,55 @@
           }
         ],
         "description": "Sensor evaluation status (API response)."
+      },
+      "SensorResponse": {
+        "type": "object",
+        "description": "Sensor state response.",
+        "required": [
+          "sensorId",
+          "status",
+          "stateVersion"
+        ],
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Current cursor value (poll sensors)."
+          },
+          "lastEvaluationAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Last successful evaluation time."
+          },
+          "sensorId": {
+            "type": "string",
+            "description": "Sensor identifier."
+          },
+          "stateVersion": {
+            "type": "integer",
+            "format": "int32",
+            "description": "State version (for CAS).",
+            "minimum": 0
+          },
+          "status": {
+            "$ref": "#/components/schemas/SensorStatusResponse",
+            "description": "Sensor status."
+          }
+        }
+      },
+      "SensorStatusResponse": {
+        "type": "string",
+        "description": "Sensor status values.",
+        "enum": [
+          "ACTIVE",
+          "PAUSED",
+          "ERROR"
+        ]
       },
       "SignedUrl": {
         "type": "object",
@@ -4043,6 +5605,15 @@
             "description": "Task key."
           }
         }
+      },
+      "TickStatusResponse": {
+        "type": "string",
+        "description": "Tick status values.",
+        "enum": [
+          "TRIGGERED",
+          "SKIPPED",
+          "FAILED"
+        ]
       },
       "TriggerRunRequest": {
         "type": "object",

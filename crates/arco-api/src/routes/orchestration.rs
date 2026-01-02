@@ -40,13 +40,14 @@ use crate::server::AppState;
 use arco_core::{WritePrecondition, WriteResult};
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::{
-    FoldState, MicroCompactor, RunRow, RunState as FoldRunState, TaskRow,
-    TaskState as FoldTaskState,
+    BackfillChunkRow, BackfillRow, FoldState, MicroCompactor, PartitionStatusRow, RunRow,
+    RunState as FoldRunState, ScheduleStateRow, ScheduleTickRow, SensorEvalRow, SensorStateRow,
+    TaskRow, TaskState as FoldTaskState,
 };
 use arco_flow::orchestration::controllers::{PubSubMessage, PushSensorHandler};
 use arco_flow::orchestration::events::{
-    OrchestrationEvent, OrchestrationEventData, RunRequest, SensorEvalStatus, SensorStatus,
-    TaskDef, TriggerInfo,
+    BackfillState, ChunkState, OrchestrationEvent, OrchestrationEventData, PartitionSelector,
+    RunRequest, SensorEvalStatus, SensorStatus, TaskDef, TickStatus, TriggerInfo,
 };
 use arco_flow::orchestration::run_key::{
     FingerprintPolicy, ReservationResult, RunKeyReservation, get_reservation, reservation_path,
@@ -268,6 +269,7 @@ fn default_limit() -> u32 {
 }
 
 const MAX_LIST_LIMIT: u32 = 200;
+const DEFAULT_LIMIT: u32 = 50;
 const MAX_LOG_BYTES: usize = 2 * 1024 * 1024;
 
 /// Response for listing runs.
@@ -393,7 +395,7 @@ pub struct ManualSensorEvaluateResponse {
 }
 
 /// Sensor evaluation status (API response).
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SensorEvalStatusResponse {
     /// Sensor triggered one or more runs.
@@ -425,6 +427,424 @@ pub struct RunRequestResponse {
 }
 
 // ============================================================================
+// Schedule API Types
+// ============================================================================
+
+/// Schedule state response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleResponse {
+    /// Schedule identifier.
+    pub schedule_id: String,
+    /// Last scheduled_for timestamp that was processed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_scheduled_for: Option<DateTime<Utc>>,
+    /// Last tick ID that was processed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tick_id: Option<String>,
+    /// Last run key generated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_key: Option<String>,
+}
+
+/// Response for listing schedules.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSchedulesResponse {
+    /// List of schedules.
+    pub schedules: Vec<ScheduleResponse>,
+    /// Next page cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Schedule tick response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleTickResponse {
+    /// Unique tick ID.
+    pub tick_id: String,
+    /// Schedule identifier.
+    pub schedule_id: String,
+    /// When this tick was scheduled for.
+    pub scheduled_for: DateTime<Utc>,
+    /// Asset selection at tick time.
+    pub asset_selection: Vec<String>,
+    /// Tick status.
+    pub status: TickStatusResponse,
+    /// Run key if a run was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Run ID if resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+/// Tick status values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TickStatusResponse {
+    /// Tick triggered a run.
+    Triggered,
+    /// Tick was skipped.
+    Skipped,
+    /// Tick failed to evaluate.
+    Failed,
+}
+
+/// Response for listing schedule ticks.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListScheduleTicksResponse {
+    /// List of ticks.
+    pub ticks: Vec<ScheduleTickResponse>,
+    /// Next page cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Query parameters for listing schedule ticks.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct ListTicksQuery {
+    /// Maximum ticks to return.
+    pub limit: Option<u32>,
+    /// Cursor for pagination.
+    pub cursor: Option<String>,
+    /// Filter by tick status.
+    pub status: Option<TickStatusResponse>,
+}
+
+// ============================================================================
+// Sensor API Types
+// ============================================================================
+
+/// Sensor state response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SensorResponse {
+    /// Sensor identifier.
+    pub sensor_id: String,
+    /// Current cursor value (poll sensors).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Last successful evaluation time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_evaluation_at: Option<DateTime<Utc>>,
+    /// Sensor status.
+    pub status: SensorStatusResponse,
+    /// State version (for CAS).
+    pub state_version: u32,
+}
+
+/// Sensor status values.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SensorStatusResponse {
+    /// Sensor is active.
+    Active,
+    /// Sensor is paused.
+    Paused,
+    /// Sensor is in error state.
+    Error,
+}
+
+/// Response for listing sensors.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSensorsResponse {
+    /// List of sensors.
+    pub sensors: Vec<SensorResponse>,
+    /// Next page cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Sensor evaluation history response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SensorEvalResponse {
+    /// Evaluation identifier.
+    pub eval_id: String,
+    /// Sensor identifier.
+    pub sensor_id: String,
+    /// Cursor before evaluation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_before: Option<String>,
+    /// Cursor after evaluation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_after: Option<String>,
+    /// Evaluation timestamp.
+    pub evaluated_at: DateTime<Utc>,
+    /// Evaluation status.
+    pub status: SensorEvalStatusResponse,
+    /// Number of run requests generated.
+    pub run_requests_count: u32,
+}
+
+/// Response for listing sensor evaluations.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSensorEvalsResponse {
+    /// List of evaluations.
+    pub evals: Vec<SensorEvalResponse>,
+    /// Next page cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+// ============================================================================
+// Backfill API Types
+// ============================================================================
+
+/// Backfill response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackfillResponse {
+    /// Backfill identifier.
+    pub backfill_id: String,
+    /// Assets to backfill.
+    pub asset_selection: Vec<String>,
+    /// Partition selector.
+    pub partition_selector: PartitionSelectorResponse,
+    /// Number of partitions per chunk.
+    pub chunk_size: u32,
+    /// Maximum concurrent chunk runs.
+    pub max_concurrent_runs: u32,
+    /// Current state.
+    pub state: BackfillStateResponse,
+    /// State version (for CAS).
+    pub state_version: u32,
+    /// When the backfill was created.
+    pub created_at: DateTime<Utc>,
+    /// Chunk counts by state.
+    pub chunk_counts: ChunkCounts,
+}
+
+/// Partition selector response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PartitionSelectorResponse {
+    /// Range of partitions.
+    Range {
+        /// Start partition (inclusive).
+        start: String,
+        /// End partition (inclusive).
+        end: String,
+    },
+    /// Explicit list of partitions.
+    Explicit {
+        /// Partition keys.
+        partitions: Vec<String>,
+    },
+    /// Filter-based selection.
+    Filter {
+        /// Filter expressions.
+        filters: HashMap<String, String>,
+    },
+}
+
+/// Backfill state values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BackfillStateResponse {
+    /// Backfill created but not yet started.
+    Pending,
+    /// Backfill is actively processing chunks.
+    Running,
+    /// Backfill is paused.
+    Paused,
+    /// All chunks completed successfully.
+    Succeeded,
+    /// At least one chunk failed after retries.
+    Failed,
+    /// Backfill was cancelled.
+    Cancelled,
+}
+
+/// Chunk counts by state.
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkCounts {
+    /// Total chunks.
+    pub total: u32,
+    /// Pending chunks.
+    pub pending: u32,
+    /// Running chunks.
+    pub running: u32,
+    /// Succeeded chunks.
+    pub succeeded: u32,
+    /// Failed chunks.
+    pub failed: u32,
+}
+
+/// Response for listing backfills.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListBackfillsResponse {
+    /// List of backfills.
+    pub backfills: Vec<BackfillResponse>,
+    /// Next page cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Backfill chunk response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackfillChunkResponse {
+    /// Chunk identifier.
+    pub chunk_id: String,
+    /// Backfill identifier.
+    pub backfill_id: String,
+    /// Zero-indexed chunk number.
+    pub chunk_index: u32,
+    /// Partition keys in this chunk.
+    pub partition_keys: Vec<String>,
+    /// Run key for this chunk.
+    pub run_key: String,
+    /// Run ID if resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Chunk state.
+    pub state: ChunkStateResponse,
+}
+
+/// Chunk state values.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ChunkStateResponse {
+    /// Chunk is pending.
+    Pending,
+    /// Chunk has been planned.
+    Planned,
+    /// Chunk run is in progress.
+    Running,
+    /// Chunk completed successfully.
+    Succeeded,
+    /// Chunk failed.
+    Failed,
+}
+
+/// Response for listing backfill chunks.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListBackfillChunksResponse {
+    /// List of chunks.
+    pub chunks: Vec<BackfillChunkResponse>,
+    /// Next page cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+// ============================================================================
+// Partition Status API Types
+// ============================================================================
+
+/// Partition status response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PartitionStatusApiResponse {
+    /// Asset key.
+    pub asset_key: String,
+    /// Partition key.
+    pub partition_key: String,
+    /// Run that last materialized (success only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_materialization_run_id: Option<String>,
+    /// Timestamp of last successful materialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_materialization_at: Option<DateTime<Utc>>,
+    /// Whether this partition is stale.
+    pub is_stale: bool,
+    /// Why the partition is stale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+    /// Dimension key-values for the partition.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub partition_values: HashMap<String, String>,
+}
+
+/// Response for listing partitions.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPartitionsResponse {
+    /// List of partitions.
+    pub partitions: Vec<PartitionStatusApiResponse>,
+    /// Next page cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Asset partition summary response.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetPartitionSummaryResponse {
+    /// Asset key.
+    pub asset_key: String,
+    /// Total partition count.
+    pub total_partitions: u32,
+    /// Materialized partition count.
+    pub materialized_partitions: u32,
+    /// Stale partition count.
+    pub stale_partitions: u32,
+    /// Missing partition count.
+    pub missing_partitions: u32,
+}
+
+// ============================================================================
+// Query Parameter Types
+// ============================================================================
+
+/// Common list query parameters.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct ListQuery {
+    /// Maximum items to return.
+    pub limit: Option<u32>,
+    /// Cursor for pagination.
+    pub cursor: Option<String>,
+}
+
+/// Query parameters for listing backfills.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct ListBackfillsQuery {
+    /// Maximum backfills to return.
+    pub limit: Option<u32>,
+    /// Cursor for pagination.
+    pub cursor: Option<String>,
+    /// Filter by state.
+    pub state: Option<BackfillStateResponse>,
+}
+
+/// Query parameters for listing backfill chunks.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct ListChunksQuery {
+    /// Maximum chunks to return.
+    pub limit: Option<u32>,
+    /// Cursor for pagination.
+    pub cursor: Option<String>,
+    /// Filter by state.
+    pub state: Option<ChunkStateResponse>,
+}
+
+/// Query parameters for listing partitions.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPartitionsQuery {
+    /// Maximum partitions to return.
+    pub limit: Option<u32>,
+    /// Cursor for pagination.
+    pub cursor: Option<String>,
+    /// Filter by asset key.
+    pub asset_key: Option<String>,
+    /// Filter to stale partitions only.
+    pub stale_only: Option<bool>,
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -433,6 +853,21 @@ fn ensure_workspace(ctx: &RequestContext, workspace_id: &str) -> Result<(), ApiE
         return Err(ApiError::not_found("workspace not found"));
     }
     Ok(())
+}
+
+fn parse_pagination(limit: u32, cursor: Option<&str>) -> Result<(usize, usize), ApiError> {
+    if limit == 0 || limit > MAX_LIST_LIMIT {
+        return Err(ApiError::bad_request(format!(
+            "limit must be between 1 and {MAX_LIST_LIMIT}"
+        )));
+    }
+
+    let offset = cursor
+        .map(|value| value.parse::<usize>().map_err(|_| ApiError::bad_request("invalid cursor")))
+        .transpose()?
+        .unwrap_or(0);
+
+    Ok((limit as usize, offset))
 }
 
 fn user_id_for_events(ctx: &RequestContext) -> String {
@@ -718,6 +1153,217 @@ fn map_run_requests(run_requests: &[RunRequest]) -> Vec<RunRequestResponse> {
             partition_selection: req.partition_selection.clone(),
         })
         .collect()
+}
+
+// ============================================================================
+// Schedule/Sensor/Backfill/Partition Mapping Helpers
+// ============================================================================
+
+fn map_schedule_state(row: &ScheduleStateRow) -> ScheduleResponse {
+    ScheduleResponse {
+        schedule_id: row.schedule_id.clone(),
+        last_scheduled_for: row.last_scheduled_for,
+        last_tick_id: row.last_tick_id.clone(),
+        last_run_key: row.last_run_key.clone(),
+    }
+}
+
+fn map_tick_status(status: &TickStatus) -> TickStatusResponse {
+    match status {
+        TickStatus::Triggered => TickStatusResponse::Triggered,
+        TickStatus::Skipped { .. } => TickStatusResponse::Skipped,
+        TickStatus::Failed { .. } => TickStatusResponse::Failed,
+    }
+}
+
+fn map_schedule_tick(row: &ScheduleTickRow) -> ScheduleTickResponse {
+    ScheduleTickResponse {
+        tick_id: row.tick_id.clone(),
+        schedule_id: row.schedule_id.clone(),
+        scheduled_for: row.scheduled_for,
+        asset_selection: row.asset_selection.clone(),
+        status: map_tick_status(&row.status),
+        run_key: row.run_key.clone(),
+        run_id: row.run_id.clone(),
+    }
+}
+
+fn map_sensor_status(status: SensorStatus) -> SensorStatusResponse {
+    match status {
+        SensorStatus::Active => SensorStatusResponse::Active,
+        SensorStatus::Paused => SensorStatusResponse::Paused,
+        SensorStatus::Error => SensorStatusResponse::Error,
+    }
+}
+
+fn map_sensor_state(row: &SensorStateRow) -> SensorResponse {
+    SensorResponse {
+        sensor_id: row.sensor_id.clone(),
+        cursor: row.cursor.clone(),
+        last_evaluation_at: row.last_evaluation_at,
+        status: map_sensor_status(row.status),
+        state_version: row.state_version,
+    }
+}
+
+fn map_sensor_eval(row: &SensorEvalRow) -> SensorEvalResponse {
+    SensorEvalResponse {
+        eval_id: row.eval_id.clone(),
+        sensor_id: row.sensor_id.clone(),
+        cursor_before: row.cursor_before.clone(),
+        cursor_after: row.cursor_after.clone(),
+        evaluated_at: row.evaluated_at,
+        status: map_sensor_eval_status(&row.status),
+        run_requests_count: row.run_requests.len() as u32,
+    }
+}
+
+fn map_backfill_state(state: BackfillState) -> BackfillStateResponse {
+    match state {
+        BackfillState::Pending => BackfillStateResponse::Pending,
+        BackfillState::Running => BackfillStateResponse::Running,
+        BackfillState::Paused => BackfillStateResponse::Paused,
+        BackfillState::Succeeded => BackfillStateResponse::Succeeded,
+        BackfillState::Failed => BackfillStateResponse::Failed,
+        BackfillState::Cancelled => BackfillStateResponse::Cancelled,
+    }
+}
+
+fn map_partition_selector(selector: &PartitionSelector) -> PartitionSelectorResponse {
+    match selector {
+        PartitionSelector::Range { start, end } => PartitionSelectorResponse::Range {
+            start: start.clone(),
+            end: end.clone(),
+        },
+        PartitionSelector::Explicit { partition_keys } => PartitionSelectorResponse::Explicit {
+            partitions: partition_keys.clone(),
+        },
+        PartitionSelector::Filter { filters } => PartitionSelectorResponse::Filter {
+            filters: filters.clone(),
+        },
+    }
+}
+
+fn build_chunk_counts(chunks: &[&BackfillChunkRow]) -> ChunkCounts {
+    let mut counts = ChunkCounts {
+        total: chunks.len() as u32,
+        ..Default::default()
+    };
+
+    for chunk in chunks {
+        match chunk.state {
+            ChunkState::Pending | ChunkState::Planned => counts.pending += 1,
+            ChunkState::Running => counts.running += 1,
+            ChunkState::Succeeded => counts.succeeded += 1,
+            ChunkState::Failed => counts.failed += 1,
+        }
+    }
+
+    counts
+}
+
+fn build_chunk_counts_index<'a, I>(chunks: I) -> HashMap<String, ChunkCounts>
+where
+    I: IntoIterator<Item = &'a BackfillChunkRow>,
+{
+    let mut counts = HashMap::new();
+
+    for chunk in chunks {
+        let entry = counts
+            .entry(chunk.backfill_id.clone())
+            .or_insert_with(ChunkCounts::default);
+
+        entry.total = entry.total.saturating_add(1);
+
+        match chunk.state {
+            ChunkState::Pending | ChunkState::Planned => {
+                entry.pending = entry.pending.saturating_add(1);
+            }
+            ChunkState::Running => {
+                entry.running = entry.running.saturating_add(1);
+            }
+            ChunkState::Succeeded => {
+                entry.succeeded = entry.succeeded.saturating_add(1);
+            }
+            ChunkState::Failed => {
+                entry.failed = entry.failed.saturating_add(1);
+            }
+        }
+    }
+
+    counts
+}
+
+fn map_backfill_with_counts(row: &BackfillRow, counts: ChunkCounts) -> BackfillResponse {
+    BackfillResponse {
+        backfill_id: row.backfill_id.clone(),
+        asset_selection: row.asset_selection.clone(),
+        partition_selector: map_partition_selector(&row.partition_selector),
+        chunk_size: row.chunk_size,
+        max_concurrent_runs: row.max_concurrent_runs,
+        state: map_backfill_state(row.state),
+        state_version: row.state_version,
+        created_at: row.created_at,
+        chunk_counts: counts,
+    }
+}
+
+fn map_backfill(row: &BackfillRow, chunks: &[&BackfillChunkRow]) -> BackfillResponse {
+    map_backfill_with_counts(row, build_chunk_counts(chunks))
+}
+
+fn map_chunk_state(state: ChunkState) -> ChunkStateResponse {
+    match state {
+        ChunkState::Pending => ChunkStateResponse::Pending,
+        ChunkState::Planned => ChunkStateResponse::Planned,
+        ChunkState::Running => ChunkStateResponse::Running,
+        ChunkState::Succeeded => ChunkStateResponse::Succeeded,
+        ChunkState::Failed => ChunkStateResponse::Failed,
+    }
+}
+
+fn map_backfill_chunk(row: &BackfillChunkRow) -> BackfillChunkResponse {
+    BackfillChunkResponse {
+        chunk_id: row.chunk_id.clone(),
+        backfill_id: row.backfill_id.clone(),
+        chunk_index: row.chunk_index,
+        partition_keys: row.partition_keys.clone(),
+        run_key: row.run_key.clone(),
+        run_id: row.run_id.clone(),
+        state: map_chunk_state(row.state),
+    }
+}
+
+fn map_partition_status(row: &PartitionStatusRow) -> PartitionStatusApiResponse {
+    PartitionStatusApiResponse {
+        asset_key: row.asset_key.clone(),
+        partition_key: row.partition_key.clone(),
+        last_materialization_run_id: row.last_materialization_run_id.clone(),
+        last_materialization_at: row.last_materialization_at,
+        is_stale: row.stale_since.is_some(),
+        stale_reason: row.stale_reason_code.clone(),
+        partition_values: row.partition_values.clone(),
+    }
+}
+
+fn paginate<T: Clone>(items: Vec<T>, limit: usize, offset: usize) -> (Vec<T>, Option<String>) {
+    let end = (offset + limit).min(items.len());
+    let page = items.get(offset..end).unwrap_or_default().to_vec();
+    let next_cursor = if end < items.len() {
+        Some(end.to_string())
+    } else {
+        None
+    };
+    (page, next_cursor)
+}
+
+fn filter_ticks_by_status(
+    ticks: &mut Vec<ScheduleTickResponse>,
+    status: Option<TickStatusResponse>,
+) {
+    if let Some(filter) = status {
+        ticks.retain(|tick| tick.status == filter);
+    }
 }
 
 // ============================================================================
@@ -1603,19 +2249,519 @@ pub(crate) async fn get_run_logs(
 }
 
 // ============================================================================
+// Schedule Routes
+// ============================================================================
+
+/// List schedules.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/schedules",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("limit" = Option<u32>, Query, description = "Maximum schedules to return"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+    ),
+    responses(
+        (status = 200, description = "List of schedules", body = ListSchedulesResponse),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn list_schedules(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path(workspace_id): Path<String>,
+    AxumQuery(query): AxumQuery<ListQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let (limit, offset) = parse_pagination(query.limit.unwrap_or(DEFAULT_LIMIT), query.cursor.as_deref())?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let mut schedules: Vec<ScheduleResponse> = fold_state
+        .schedule_state
+        .values()
+        .map(map_schedule_state)
+        .collect();
+    schedules.sort_by(|a, b| a.schedule_id.cmp(&b.schedule_id));
+
+    let (page, next_cursor) = paginate(schedules, limit, offset);
+
+    Ok(Json(ListSchedulesResponse {
+        schedules: page,
+        next_cursor,
+    }))
+}
+
+/// Get schedule by ID.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/schedules/{schedule_id}",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("schedule_id" = String, Path, description = "Schedule ID")
+    ),
+    responses(
+        (status = 200, description = "Schedule details", body = ScheduleResponse),
+        (status = 404, description = "Schedule not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn get_schedule(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, schedule_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let schedule = fold_state
+        .schedule_state
+        .get(&schedule_id)
+        .ok_or_else(|| ApiError::not_found(format!("schedule not found: {schedule_id}")))?;
+
+    Ok(Json(map_schedule_state(schedule)))
+}
+
+/// List schedule ticks.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/schedules/{schedule_id}/ticks",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("schedule_id" = String, Path, description = "Schedule ID"),
+        ("limit" = Option<u32>, Query, description = "Maximum ticks to return"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("status" = Option<TickStatusResponse>, Query, description = "Filter by status"),
+    ),
+    responses(
+        (status = 200, description = "List of ticks", body = ListScheduleTicksResponse),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn list_schedule_ticks(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, schedule_id)): Path<(String, String)>,
+    AxumQuery(query): AxumQuery<ListTicksQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let (limit, offset) = parse_pagination(query.limit.unwrap_or(DEFAULT_LIMIT), query.cursor.as_deref())?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let mut ticks: Vec<ScheduleTickResponse> = fold_state
+        .schedule_ticks
+        .values()
+        .filter(|t| t.schedule_id == schedule_id)
+        .map(map_schedule_tick)
+        .collect();
+    filter_ticks_by_status(&mut ticks, query.status);
+    ticks.sort_by(|a, b| b.scheduled_for.cmp(&a.scheduled_for));
+
+    let (page, next_cursor) = paginate(ticks, limit, offset);
+
+    Ok(Json(ListScheduleTicksResponse {
+        ticks: page,
+        next_cursor,
+    }))
+}
+
+// ============================================================================
+// Sensor Routes
+// ============================================================================
+
+/// List sensors.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/sensors",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("limit" = Option<u32>, Query, description = "Maximum sensors to return"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+    ),
+    responses(
+        (status = 200, description = "List of sensors", body = ListSensorsResponse),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn list_sensors(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path(workspace_id): Path<String>,
+    AxumQuery(query): AxumQuery<ListQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let (limit, offset) = parse_pagination(query.limit.unwrap_or(DEFAULT_LIMIT), query.cursor.as_deref())?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let mut sensors: Vec<SensorResponse> = fold_state
+        .sensor_state
+        .values()
+        .map(map_sensor_state)
+        .collect();
+    sensors.sort_by(|a, b| a.sensor_id.cmp(&b.sensor_id));
+
+    let (page, next_cursor) = paginate(sensors, limit, offset);
+
+    Ok(Json(ListSensorsResponse {
+        sensors: page,
+        next_cursor,
+    }))
+}
+
+/// Get sensor by ID.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/sensors/{sensor_id}",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("sensor_id" = String, Path, description = "Sensor ID")
+    ),
+    responses(
+        (status = 200, description = "Sensor details", body = SensorResponse),
+        (status = 404, description = "Sensor not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn get_sensor(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, sensor_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let sensor = fold_state
+        .sensor_state
+        .get(&sensor_id)
+        .ok_or_else(|| ApiError::not_found(format!("sensor not found: {sensor_id}")))?;
+
+    Ok(Json(map_sensor_state(sensor)))
+}
+
+/// List sensor evaluations.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/sensors/{sensor_id}/evals",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("sensor_id" = String, Path, description = "Sensor ID"),
+        ("limit" = Option<u32>, Query, description = "Maximum evaluations to return"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+    ),
+    responses(
+        (status = 200, description = "List of evaluations", body = ListSensorEvalsResponse),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn list_sensor_evals(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, sensor_id)): Path<(String, String)>,
+    AxumQuery(query): AxumQuery<ListQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let (limit, offset) = parse_pagination(query.limit.unwrap_or(DEFAULT_LIMIT), query.cursor.as_deref())?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let mut evals: Vec<SensorEvalResponse> = fold_state
+        .sensor_evals
+        .values()
+        .filter(|e| e.sensor_id == sensor_id)
+        .map(map_sensor_eval)
+        .collect();
+    evals.sort_by(|a, b| b.evaluated_at.cmp(&a.evaluated_at));
+
+    let (page, next_cursor) = paginate(evals, limit, offset);
+
+    Ok(Json(ListSensorEvalsResponse {
+        evals: page,
+        next_cursor,
+    }))
+}
+
+// ============================================================================
+// Backfill Routes
+// ============================================================================
+
+/// List backfills.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/backfills",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("limit" = Option<u32>, Query, description = "Maximum backfills to return"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("state" = Option<BackfillStateResponse>, Query, description = "Filter by state"),
+    ),
+    responses(
+        (status = 200, description = "List of backfills", body = ListBackfillsResponse),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn list_backfills(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path(workspace_id): Path<String>,
+    AxumQuery(query): AxumQuery<ListBackfillsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let (limit, offset) = parse_pagination(query.limit.unwrap_or(DEFAULT_LIMIT), query.cursor.as_deref())?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let counts_by_backfill = build_chunk_counts_index(fold_state.backfill_chunks.values());
+    let mut backfills: Vec<BackfillResponse> = fold_state
+        .backfills
+        .values()
+        .map(|b| {
+            let counts = counts_by_backfill
+                .get(&b.backfill_id)
+                .cloned()
+                .unwrap_or_default();
+            map_backfill_with_counts(b, counts)
+        })
+        .collect();
+
+    if let Some(state_filter) = query.state {
+        backfills.retain(|b| b.state == state_filter);
+    }
+
+    backfills.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    let (page, next_cursor) = paginate(backfills, limit, offset);
+
+    Ok(Json(ListBackfillsResponse {
+        backfills: page,
+        next_cursor,
+    }))
+}
+
+/// Get backfill by ID.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/backfills/{backfill_id}",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("backfill_id" = String, Path, description = "Backfill ID")
+    ),
+    responses(
+        (status = 200, description = "Backfill details", body = BackfillResponse),
+        (status = 404, description = "Backfill not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn get_backfill(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, backfill_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let backfill = fold_state
+        .backfills
+        .get(&backfill_id)
+        .ok_or_else(|| ApiError::not_found(format!("backfill not found: {backfill_id}")))?;
+
+    let chunks: Vec<&BackfillChunkRow> = fold_state
+        .backfill_chunks
+        .values()
+        .filter(|c| c.backfill_id == backfill_id)
+        .collect();
+
+    Ok(Json(map_backfill(backfill, &chunks)))
+}
+
+/// List backfill chunks.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/backfills/{backfill_id}/chunks",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("backfill_id" = String, Path, description = "Backfill ID"),
+        ("limit" = Option<u32>, Query, description = "Maximum chunks to return"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("state" = Option<ChunkStateResponse>, Query, description = "Filter by state"),
+    ),
+    responses(
+        (status = 200, description = "List of chunks", body = ListBackfillChunksResponse),
+        (status = 404, description = "Backfill not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn list_backfill_chunks(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, backfill_id)): Path<(String, String)>,
+    AxumQuery(query): AxumQuery<ListChunksQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let (limit, offset) = parse_pagination(query.limit.unwrap_or(DEFAULT_LIMIT), query.cursor.as_deref())?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    // Verify backfill exists
+    if !fold_state.backfills.contains_key(&backfill_id) {
+        return Err(ApiError::not_found(format!(
+            "backfill not found: {backfill_id}"
+        )));
+    }
+
+    let mut chunks: Vec<BackfillChunkResponse> = fold_state
+        .backfill_chunks
+        .values()
+        .filter(|c| c.backfill_id == backfill_id)
+        .map(map_backfill_chunk)
+        .collect();
+
+    if let Some(state_filter) = query.state {
+        chunks.retain(|c| c.state as u8 == state_filter as u8);
+    }
+
+    chunks.sort_by(|a, b| a.chunk_index.cmp(&b.chunk_index));
+
+    let (page, next_cursor) = paginate(chunks, limit, offset);
+
+    Ok(Json(ListBackfillChunksResponse {
+        chunks: page,
+        next_cursor,
+    }))
+}
+
+// ============================================================================
+// Partition Routes
+// ============================================================================
+
+/// List partitions.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/partitions",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("limit" = Option<u32>, Query, description = "Maximum partitions to return"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("assetKey" = Option<String>, Query, description = "Filter by asset key"),
+        ("staleOnly" = Option<bool>, Query, description = "Filter to stale partitions only"),
+    ),
+    responses(
+        (status = 200, description = "List of partitions", body = ListPartitionsResponse),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn list_partitions(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path(workspace_id): Path<String>,
+    AxumQuery(query): AxumQuery<ListPartitionsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let (limit, offset) = parse_pagination(query.limit.unwrap_or(DEFAULT_LIMIT), query.cursor.as_deref())?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let mut partitions: Vec<PartitionStatusApiResponse> = fold_state
+        .partition_status
+        .values()
+        .filter(|p| {
+            if let Some(ref asset_key) = query.asset_key {
+                if &p.asset_key != asset_key {
+                    return false;
+                }
+            }
+            if query.stale_only.unwrap_or(false) && p.stale_since.is_none() {
+                return false;
+            }
+            true
+        })
+        .map(map_partition_status)
+        .collect();
+
+    partitions.sort_by(|a, b| {
+        a.asset_key
+            .cmp(&b.asset_key)
+            .then_with(|| a.partition_key.cmp(&b.partition_key))
+    });
+
+    let (page, next_cursor) = paginate(partitions, limit, offset);
+
+    Ok(Json(ListPartitionsResponse {
+        partitions: page,
+        next_cursor,
+    }))
+}
+
+/// Get partition summary for an asset.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/assets/{asset_key}/partitions/summary",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("asset_key" = String, Path, description = "Asset key (URL-encoded)")
+    ),
+    responses(
+        (status = 200, description = "Partition summary", body = AssetPartitionSummaryResponse),
+        (status = 404, description = "Asset not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn get_asset_partition_summary(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, asset_key)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let partitions: Vec<&PartitionStatusRow> = fold_state
+        .partition_status
+        .values()
+        .filter(|p| p.asset_key == asset_key)
+        .collect();
+
+    if partitions.is_empty() {
+        return Err(ApiError::not_found(format!(
+            "no partitions found for asset: {asset_key}"
+        )));
+    }
+
+    let total = partitions.len() as u32;
+    let materialized = partitions
+        .iter()
+        .filter(|p| p.last_materialization_run_id.is_some())
+        .count() as u32;
+    let stale = partitions
+        .iter()
+        .filter(|p| p.stale_since.is_some())
+        .count() as u32;
+    let missing = total - materialized;
+
+    Ok(Json(AssetPartitionSummaryResponse {
+        asset_key,
+        total_partitions: total,
+        materialized_partitions: materialized,
+        stale_partitions: stale,
+        missing_partitions: missing,
+    }))
+}
+
+// ============================================================================
 // Router
 // ============================================================================
 
 /// Creates the orchestration routes.
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        // Runs
         .route("/workspaces/:workspace_id/runs", post(trigger_run))
         .route("/workspaces/:workspace_id/runs", get(list_runs))
         .route("/workspaces/:workspace_id/runs/:run_id", get(get_run))
-        .route(
-            "/workspaces/:workspace_id/sensors/:sensor_id/evaluate",
-            post(manual_evaluate_sensor),
-        )
         .route(
             "/workspaces/:workspace_id/runs/run-key/backfill",
             post(backfill_run_key),
@@ -1631,6 +2777,46 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/workspaces/:workspace_id/runs/:run_id/logs",
             get(get_run_logs),
+        )
+        // Schedules
+        .route("/workspaces/:workspace_id/schedules", get(list_schedules))
+        .route(
+            "/workspaces/:workspace_id/schedules/:schedule_id",
+            get(get_schedule),
+        )
+        .route(
+            "/workspaces/:workspace_id/schedules/:schedule_id/ticks",
+            get(list_schedule_ticks),
+        )
+        // Sensors
+        .route("/workspaces/:workspace_id/sensors", get(list_sensors))
+        .route(
+            "/workspaces/:workspace_id/sensors/:sensor_id",
+            get(get_sensor),
+        )
+        .route(
+            "/workspaces/:workspace_id/sensors/:sensor_id/evaluate",
+            post(manual_evaluate_sensor),
+        )
+        .route(
+            "/workspaces/:workspace_id/sensors/:sensor_id/evals",
+            get(list_sensor_evals),
+        )
+        // Backfills
+        .route("/workspaces/:workspace_id/backfills", get(list_backfills))
+        .route(
+            "/workspaces/:workspace_id/backfills/:backfill_id",
+            get(get_backfill),
+        )
+        .route(
+            "/workspaces/:workspace_id/backfills/:backfill_id/chunks",
+            get(list_backfill_chunks),
+        )
+        // Partitions
+        .route("/workspaces/:workspace_id/partitions", get(list_partitions))
+        .route(
+            "/workspaces/:workspace_id/assets/:asset_key/partitions/summary",
+            get(get_asset_partition_summary),
         )
 }
 
@@ -1674,6 +2860,156 @@ mod tests {
         let json = serde_json::to_string(&response).expect("serialize");
         assert!(json.contains("\"runId\":\"run_123\""));
         assert!(json.contains("\"state\":\"RUNNING\""));
+    }
+
+    #[test]
+    fn test_parse_pagination_rejects_zero_limit() {
+        let err = parse_pagination(0, None).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.message(),
+            format!("limit must be between 1 and {MAX_LIST_LIMIT}")
+        );
+    }
+
+    #[test]
+    fn test_parse_pagination_rejects_invalid_cursor() {
+        let err = parse_pagination(1, Some("abc")).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.message(), "invalid cursor");
+    }
+
+    #[test]
+    fn test_parse_pagination_parses_cursor() {
+        let (limit, offset) = parse_pagination(5, Some("10")).expect("parse");
+        assert_eq!(limit, 5);
+        assert_eq!(offset, 10);
+    }
+
+    #[test]
+    fn test_partition_selector_filter_maps_to_response() {
+        let mut filters = HashMap::new();
+        filters.insert("region".to_string(), "us-*".to_string());
+
+        let selector = PartitionSelector::Filter {
+            filters: filters.clone(),
+        };
+        let response = map_partition_selector(&selector);
+        let json = serde_json::to_value(&response).expect("serialize");
+
+        assert_eq!(json["type"], "filter");
+        assert_eq!(json["filters"]["region"], "us-*");
+    }
+
+    #[test]
+    fn test_build_chunk_counts_index_groups_by_backfill() {
+        let rows = vec![
+            BackfillChunkRow {
+                tenant_id: "tenant".to_string(),
+                workspace_id: "workspace".to_string(),
+                chunk_id: "bf_a:0".to_string(),
+                backfill_id: "bf_a".to_string(),
+                chunk_index: 0,
+                partition_keys: vec!["2025-01-01".to_string()],
+                run_key: "rk_a0".to_string(),
+                run_id: None,
+                state: ChunkState::Pending,
+                row_version: "01HQ1".to_string(),
+            },
+            BackfillChunkRow {
+                tenant_id: "tenant".to_string(),
+                workspace_id: "workspace".to_string(),
+                chunk_id: "bf_a:1".to_string(),
+                backfill_id: "bf_a".to_string(),
+                chunk_index: 1,
+                partition_keys: vec!["2025-01-02".to_string()],
+                run_key: "rk_a1".to_string(),
+                run_id: None,
+                state: ChunkState::Planned,
+                row_version: "01HQ2".to_string(),
+            },
+            BackfillChunkRow {
+                tenant_id: "tenant".to_string(),
+                workspace_id: "workspace".to_string(),
+                chunk_id: "bf_a:2".to_string(),
+                backfill_id: "bf_a".to_string(),
+                chunk_index: 2,
+                partition_keys: vec!["2025-01-03".to_string()],
+                run_key: "rk_a2".to_string(),
+                run_id: None,
+                state: ChunkState::Running,
+                row_version: "01HQ3".to_string(),
+            },
+            BackfillChunkRow {
+                tenant_id: "tenant".to_string(),
+                workspace_id: "workspace".to_string(),
+                chunk_id: "bf_b:0".to_string(),
+                backfill_id: "bf_b".to_string(),
+                chunk_index: 0,
+                partition_keys: vec!["2025-01-01".to_string()],
+                run_key: "rk_b0".to_string(),
+                run_id: None,
+                state: ChunkState::Succeeded,
+                row_version: "01HQ4".to_string(),
+            },
+            BackfillChunkRow {
+                tenant_id: "tenant".to_string(),
+                workspace_id: "workspace".to_string(),
+                chunk_id: "bf_b:1".to_string(),
+                backfill_id: "bf_b".to_string(),
+                chunk_index: 1,
+                partition_keys: vec!["2025-01-02".to_string()],
+                run_key: "rk_b1".to_string(),
+                run_id: None,
+                state: ChunkState::Failed,
+                row_version: "01HQ5".to_string(),
+            },
+        ];
+
+        let counts = build_chunk_counts_index(rows.iter());
+
+        let a = counts.get("bf_a").expect("bf_a");
+        assert_eq!(a.total, 3);
+        assert_eq!(a.pending, 2);
+        assert_eq!(a.running, 1);
+        assert_eq!(a.succeeded, 0);
+        assert_eq!(a.failed, 0);
+
+        let b = counts.get("bf_b").expect("bf_b");
+        assert_eq!(b.total, 2);
+        assert_eq!(b.pending, 0);
+        assert_eq!(b.running, 0);
+        assert_eq!(b.succeeded, 1);
+        assert_eq!(b.failed, 1);
+    }
+
+    #[test]
+    fn test_filter_ticks_by_status() {
+        let mut ticks = vec![
+            ScheduleTickResponse {
+                tick_id: "tick_1".to_string(),
+                schedule_id: "sched".to_string(),
+                scheduled_for: Utc::now(),
+                asset_selection: vec![],
+                status: TickStatusResponse::Triggered,
+                run_key: None,
+                run_id: None,
+            },
+            ScheduleTickResponse {
+                tick_id: "tick_2".to_string(),
+                schedule_id: "sched".to_string(),
+                scheduled_for: Utc::now(),
+                asset_selection: vec![],
+                status: TickStatusResponse::Failed,
+                run_key: None,
+                run_id: None,
+            },
+        ];
+
+        filter_ticks_by_status(&mut ticks, Some(TickStatusResponse::Failed));
+
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].status, TickStatusResponse::Failed);
     }
 
     #[test]

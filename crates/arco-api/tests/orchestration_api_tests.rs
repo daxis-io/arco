@@ -18,7 +18,10 @@ fn test_router() -> axum::Router {
 struct CreateBackfillResponse {
     backfill_id: String,
     accepted_event_id: String,
+    #[allow(dead_code)]
     accepted_at: String,
+    #[allow(dead_code)]
+    correlation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,6 +204,159 @@ async fn test_create_backfill_conflicts_on_payload_mismatch() -> Result<()> {
     .await?;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(error.code, "CONFLICT");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_create_backfill_rejects_empty_asset_selection() -> Result<()> {
+    let router = test_router();
+
+    let body = serde_json::json!({
+        "assetSelection": [],
+        "partitionSelector": {
+            "type": "explicit",
+            "partitions": ["2025-01-01"]
+        }
+    });
+
+    let (status, error): (_, ApiErrorResponse) = helpers::post_json_with_headers(
+        router,
+        "/api/v1/workspaces/test-workspace/backfills",
+        body,
+        &[("Idempotency-Key", "idem_empty_assets")],
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "BAD_REQUEST");
+    assert!(error.message.contains("assetSelection"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_create_backfill_rejects_empty_partitions() -> Result<()> {
+    let router = test_router();
+
+    let body = serde_json::json!({
+        "assetSelection": ["analytics.daily_sales"],
+        "partitionSelector": {
+            "type": "explicit",
+            "partitions": []
+        }
+    });
+
+    let (status, error): (_, ApiErrorResponse) = helpers::post_json_with_headers(
+        router,
+        "/api/v1/workspaces/test-workspace/backfills",
+        body,
+        &[("Idempotency-Key", "idem_empty_parts")],
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "BAD_REQUEST");
+    assert!(error.message.contains("partitions"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_create_backfill_rejects_filter_selector() -> Result<()> {
+    let router = test_router();
+
+    let body = serde_json::json!({
+        "assetSelection": ["analytics.daily_sales"],
+        "partitionSelector": {
+            "type": "filter",
+            "filters": {
+                "region": "us-west"
+            }
+        }
+    });
+
+    let (status, error): (_, ApiErrorResponse) = helpers::post_json_with_headers(
+        router,
+        "/api/v1/workspaces/test-workspace/backfills",
+        body,
+        &[("Idempotency-Key", "idem_filter")],
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error.code, "PARTITION_SELECTOR_NOT_SUPPORTED");
+    assert_eq!(error.error.as_deref(), Some("unprocessable_entity"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_create_backfill_uses_client_request_id_for_idempotency() -> Result<()> {
+    let router = test_router();
+
+    // First request with clientRequestId in body (no Idempotency-Key header)
+    let body = serde_json::json!({
+        "assetSelection": ["analytics.daily_sales"],
+        "partitionSelector": {
+            "type": "explicit",
+            "partitions": ["2025-01-01", "2025-01-02"]
+        },
+        "clientRequestId": "client_req_04"
+    });
+
+    let (status, first): (_, CreateBackfillResponse) = helpers::post_json_with_headers(
+        router.clone(),
+        "/api/v1/workspaces/test-workspace/backfills",
+        body.clone(),
+        &[], // No Idempotency-Key header
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    // Second request with same clientRequestId should be idempotent
+    let (status, second): (_, CreateBackfillResponse) = helpers::post_json_with_headers(
+        router,
+        "/api/v1/workspaces/test-workspace/backfills",
+        body,
+        &[], // No Idempotency-Key header
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first.backfill_id, second.backfill_id);
+    assert_eq!(first.accepted_event_id, second.accepted_event_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_create_backfill_returns_correlation_id() -> Result<()> {
+    let router = test_router();
+
+    let body = serde_json::json!({
+        "assetSelection": ["analytics.daily_sales"],
+        "partitionSelector": {
+            "type": "explicit",
+            "partitions": ["2025-01-01"]
+        }
+    });
+
+    let (status, response): (_, CreateBackfillResponse) = helpers::post_json_with_headers(
+        router,
+        "/api/v1/workspaces/test-workspace/backfills",
+        body,
+        &[
+            ("Idempotency-Key", "idem_correlation"),
+            ("X-Request-Id", "test-correlation-id-123"),
+        ],
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(!response.backfill_id.is_empty());
+    assert!(!response.accepted_event_id.is_empty());
+    // correlation_id should be present (from X-Request-Id header)
+    assert!(response.correlation_id.is_some());
 
     Ok(())
 }

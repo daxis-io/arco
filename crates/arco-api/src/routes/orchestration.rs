@@ -844,6 +844,9 @@ pub struct CreateBackfillResponse {
     pub accepted_event_id: String,
     /// When the event was accepted.
     pub accepted_at: DateTime<Utc>,
+    /// Optional correlation ID for request tracing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
 }
 
 /// Partition selector request.
@@ -2101,18 +2104,86 @@ fn compute_backfill_fingerprint(
     Ok(hex::encode(hash))
 }
 
-async fn check_backfill_idempotency(
+/// Result of attempting to reserve an idempotency slot.
+enum IdempotencyReservation {
+    /// Slot reserved successfully; proceed with backfill creation.
+    Reserved,
+    /// Idempotent replay; return cached response.
+    Replay(CreateBackfillResponse),
+}
+
+/// Atomically reserve an idempotency slot before creating the backfill.
+///
+/// This prevents race conditions by storing the idempotency record BEFORE
+/// writing the event. If two concurrent requests have the same idempotency key,
+/// exactly one will succeed in reserving the slot.
+async fn reserve_backfill_idempotency(
     storage: &ScopedStorage,
     idempotency_key: Option<&str>,
     request_fingerprint: &str,
     requested_backfill_id: Option<&str>,
-) -> Result<Option<CreateBackfillResponse>, ApiError> {
+    backfill_id: &str,
+    accepted_event_id: &str,
+    accepted_at: DateTime<Utc>,
+) -> Result<IdempotencyReservation, ApiError> {
     let Some(key) = idempotency_key else {
-        return Ok(None);
+        return Ok(IdempotencyReservation::Reserved);
     };
 
-    let Some(existing) = load_backfill_idempotency_record(storage, key).await? else {
-        return Ok(None);
+    let record = BackfillIdempotencyRecord {
+        idempotency_key: key.to_string(),
+        request_fingerprint: request_fingerprint.to_string(),
+        backfill_id: backfill_id.to_string(),
+        accepted_event_id: accepted_event_id.to_string(),
+        accepted_at,
+    };
+
+    let record_json = serde_json::to_string(&record).map_err(|e| {
+        ApiError::internal(format!("failed to serialize idempotency record: {e}"))
+    })?;
+    let record_path = backfill_idempotency_path(key);
+
+    // Attempt atomic reservation with CAS
+    let result = storage
+        .put_raw(
+            &record_path,
+            Bytes::from(record_json),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to store idempotency record: {e}")))?;
+
+    match result {
+        WriteResult::Success { .. } => {
+            // Successfully reserved the slot
+            Ok(IdempotencyReservation::Reserved)
+        }
+        WriteResult::PreconditionFailed { .. } => {
+            // Slot already taken - check if it's a valid replay or conflict
+            check_existing_idempotency_record(
+                storage,
+                key,
+                request_fingerprint,
+                requested_backfill_id,
+            )
+            .await
+        }
+    }
+}
+
+/// Check an existing idempotency record for replay or conflict.
+async fn check_existing_idempotency_record(
+    storage: &ScopedStorage,
+    idempotency_key: &str,
+    request_fingerprint: &str,
+    requested_backfill_id: Option<&str>,
+) -> Result<IdempotencyReservation, ApiError> {
+    let Some(existing) = load_backfill_idempotency_record(storage, idempotency_key).await? else {
+        // Record was deleted between CAS failure and read - rare but possible
+        // Return conflict to be safe; client can retry
+        return Err(ApiError::conflict(
+            "idempotency key reservation conflict; please retry",
+        ));
     };
 
     if let Some(requested_backfill_id) = requested_backfill_id {
@@ -2124,10 +2195,11 @@ async fn check_backfill_idempotency(
     }
 
     if existing.request_fingerprint == request_fingerprint {
-        return Ok(Some(CreateBackfillResponse {
+        return Ok(IdempotencyReservation::Replay(CreateBackfillResponse {
             backfill_id: existing.backfill_id,
             accepted_event_id: existing.accepted_event_id,
             accepted_at: existing.accepted_at,
+            correlation_id: None,
         }));
     }
 
@@ -2154,50 +2226,6 @@ async fn load_backfill_idempotency_record(
             "failed to read idempotency record: {err}"
         ))),
     }
-}
-
-async fn store_backfill_idempotency_record(
-    storage: &ScopedStorage,
-    idempotency_key: Option<String>,
-    request_fingerprint: String,
-    backfill_id: &str,
-    accepted_event_id: &str,
-    accepted_at: DateTime<Utc>,
-) -> Result<(), ApiError> {
-    let Some(key) = idempotency_key else {
-        return Ok(());
-    };
-
-    let record = BackfillIdempotencyRecord {
-        idempotency_key: key.clone(),
-        request_fingerprint,
-        backfill_id: backfill_id.to_string(),
-        accepted_event_id: accepted_event_id.to_string(),
-        accepted_at,
-    };
-
-    let record_json = serde_json::to_string(&record).map_err(|e| {
-        ApiError::internal(format!("failed to serialize idempotency record: {e}"))
-    })?;
-    let record_path = backfill_idempotency_path(&key);
-    let record_result = storage
-        .put_raw(
-            &record_path,
-            Bytes::from(record_json),
-            WritePrecondition::DoesNotExist,
-        )
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to store idempotency record: {e}")))?;
-
-    if matches!(record_result, WriteResult::PreconditionFailed { .. }) {
-        tracing::warn!(
-            idempotency_key = %key,
-            backfill_id = %backfill_id,
-            "idempotency record already exists after backfill creation"
-        );
-    }
-
-    Ok(())
 }
 
 async fn load_orchestration_state(
@@ -5453,12 +5481,19 @@ pub(crate) async fn create_backfill(
     Path(workspace_id): Path<String>,
     Json(request): Json<CreateBackfillRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    tracing::info!(
+    let span = tracing::info_span!(
+        "create_backfill",
         workspace_id = %workspace_id,
+        backfill_id = tracing::field::Empty,
+    );
+    let _guard = span.enter();
+
+    tracing::info!(
         asset_selection = ?request.asset_selection,
         "Creating backfill"
     );
 
+    // Validate request
     ensure_workspace(&ctx, &workspace_id)?;
     validate_backfill_asset_selection(&request.asset_selection)?;
     let partition_keys = extract_explicit_partition_keys(&request.partition_selector)?;
@@ -5475,26 +5510,48 @@ pub(crate) async fn create_backfill(
     let storage = ctx.scoped_storage(backend)?;
     let idempotency_key = resolve_backfill_idempotency_key(&ctx, &request);
 
-    if let Some(response) = check_backfill_idempotency(
-        &storage,
-        idempotency_key.as_deref(),
-        &request_fingerprint,
-        request.backfill_id.as_deref(),
-    )
-    .await?
-    {
-        return Ok((StatusCode::OK, Json(response)));
-    }
-
+    // Generate identifiers upfront so we can reserve idempotency slot atomically
     let backfill_id = request
         .backfill_id
         .clone()
         .unwrap_or_else(|| Ulid::new().to_string());
+    let accepted_event_id = Ulid::new().to_string();
+    let accepted_at = Utc::now();
+    let correlation_id = ctx.request_id.clone();
+
+    tracing::Span::current().record("backfill_id", &backfill_id);
+
+    // Atomically reserve idempotency slot BEFORE writing event
+    // This prevents race conditions where two concurrent requests both create backfills
+    match reserve_backfill_idempotency(
+        &storage,
+        idempotency_key.as_deref(),
+        &request_fingerprint,
+        request.backfill_id.as_deref(),
+        &backfill_id,
+        &accepted_event_id,
+        accepted_at,
+    )
+    .await?
+    {
+        IdempotencyReservation::Replay(response) => {
+            tracing::info!(
+                backfill_id = %response.backfill_id,
+                "Idempotent replay - returning cached response"
+            );
+            return Ok((StatusCode::OK, Json(response)));
+        }
+        IdempotencyReservation::Reserved => {
+            // Proceed with backfill creation
+        }
+    }
+
+    // Build and write the event
     let client_request_id =
         resolve_backfill_client_request_id(idempotency_key.as_deref(), &request);
     let total_partitions = usize_to_u32_saturating(partition_keys.len());
 
-    let event = OrchestrationEvent::new(
+    let mut event = OrchestrationEvent::new(
         &ctx.tenant,
         &workspace_id,
         OrchestrationEventData::BackfillCreated {
@@ -5510,10 +5567,11 @@ pub(crate) async fn create_backfill(
             parent_backfill_id: None,
         },
     );
+    // Use the pre-generated event_id and timestamp for consistency with idempotency record
+    event.event_id.clone_from(&accepted_event_id);
+    event.timestamp = accepted_at;
 
     let event_path = LedgerWriter::event_path(&event);
-    let accepted_event_id = event.event_id.clone();
-    let accepted_at = event.timestamp;
 
     let ledger = LedgerWriter::new(storage.clone());
     ledger
@@ -5523,15 +5581,10 @@ pub(crate) async fn create_backfill(
 
     compact_orchestration_events(&state.config, storage.clone(), vec![event_path]).await?;
 
-    store_backfill_idempotency_record(
-        &storage,
-        idempotency_key,
-        request_fingerprint,
-        &backfill_id,
-        &accepted_event_id,
-        accepted_at,
-    )
-    .await?;
+    tracing::info!(
+        accepted_event_id = %accepted_event_id,
+        "Backfill created successfully"
+    );
 
     Ok((
         StatusCode::ACCEPTED,
@@ -5539,6 +5592,7 @@ pub(crate) async fn create_backfill(
             backfill_id,
             accepted_event_id,
             accepted_at,
+            correlation_id: Some(correlation_id),
         }),
     ))
 }

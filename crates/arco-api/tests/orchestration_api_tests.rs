@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::http::{Method, StatusCode, header};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use tower::ServiceExt;
 
 use arco_api::server::ServerBuilder;
@@ -159,8 +159,6 @@ async fn test_create_backfill_idempotent_on_key() -> Result<()> {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(first.backfill_id, second.backfill_id);
     assert_eq!(first.accepted_event_id, second.accepted_event_id);
-    assert!(!first.accepted_at.is_empty());
-    assert_eq!(first.accepted_at, second.accepted_at);
 
     Ok(())
 }

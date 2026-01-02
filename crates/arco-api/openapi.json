@@ -2285,7 +2285,7 @@
         "tags": [
           "Orchestration"
         ],
-        "summary": "Create a new backfill.",
+        "summary": "Create a backfill.",
         "operationId": "create_backfill",
         "parameters": [
           {
@@ -2310,7 +2310,7 @@
         },
         "responses": {
           "200": {
-            "description": "Existing backfill returned",
+            "description": "Idempotent backfill replay",
             "content": {
               "application/json": {
                 "schema": {
@@ -2320,7 +2320,7 @@
             }
           },
           "202": {
-            "description": "Backfill accepted",
+            "description": "Backfill created",
             "content": {
               "application/json": {
                 "schema": {
@@ -2350,7 +2350,7 @@
             }
           },
           "409": {
-            "description": "Idempotency conflict",
+            "description": "Idempotency key conflict",
             "content": {
               "application/json": {
                 "schema": {
@@ -2360,11 +2360,11 @@
             }
           },
           "422": {
-            "description": "Partition selector not supported",
+            "description": "Unsupported partition selector",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UnprocessableEntityResponse"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -3911,6 +3911,13 @@
             "type": "string",
             "description": "Stable machine-readable error code."
           },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional error category (e.g., `unprocessable_entity`)."
+          },
           "message": {
             "type": "string",
             "description": "Human-readable message (safe for clients)."
@@ -4445,49 +4452,11 @@
           }
         }
       },
-      "CommitRequest": {
-        "type": "object",
-        "required": [
-          "read_version",
-          "staged_path",
-          "staged_version"
-        ],
-        "properties": {
-          "read_version": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Optimistic concurrency token: the version the client read."
-          },
-          "staged_path": {
-            "type": "string",
-            "description": "Path returned by the stage endpoint."
-          },
-          "staged_version": {
-            "type": "string",
-            "description": "Version returned by the stage endpoint."
-          }
-        }
-      },
-      "CommitResponse": {
-        "type": "object",
-        "required": [
-          "version",
-          "delta_log_path"
-        ],
-        "properties": {
-          "delta_log_path": {
-            "type": "string"
-          },
-          "version": {
-            "type": "integer",
-            "format": "int64"
-          }
-        }
-      },
       "CreateBackfillRequest": {
         "type": "object",
         "description": "Request to create a backfill.",
         "required": [
+          "assetSelection",
           "partitionSelector"
         ],
         "properties": {
@@ -4498,13 +4467,20 @@
             },
             "description": "Assets to backfill."
           },
+          "backfillId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional backfill identifier (ULID)."
+          },
           "chunkSize": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int32",
-            "description": "Number of partitions per chunk (0 uses default).",
+            "description": "Number of partitions per chunk (defaults to 10).",
             "minimum": 0
           },
           "clientRequestId": {
@@ -4512,7 +4488,7 @@
               "string",
               "null"
             ],
-            "description": "Client request ID for idempotency."
+            "description": "Optional client request ID (for idempotency)."
           },
           "maxConcurrentRuns": {
             "type": [
@@ -4520,12 +4496,12 @@
               "null"
             ],
             "format": "int32",
-            "description": "Maximum concurrent chunk runs (0 uses default).",
+            "description": "Maximum concurrent chunk runs (defaults to 2).",
             "minimum": 0
           },
           "partitionSelector": {
             "$ref": "#/components/schemas/PartitionSelectorRequest",
-            "description": "Partition selector."
+            "description": "Partition selector (explicit only; range/filter planned once `PartitionResolver` is implemented)."
           }
         }
       },
@@ -4541,35 +4517,15 @@
           "acceptedAt": {
             "type": "string",
             "format": "date-time",
-            "description": "Time the event was accepted."
+            "description": "When the event was accepted."
           },
           "acceptedEventId": {
             "type": "string",
-            "description": "Event ID that was accepted."
+            "description": "Event identifier accepted by the ledger."
           },
           "backfillId": {
             "type": "string",
             "description": "Backfill identifier."
-          }
-        }
-      },
-      "CreateCatalogRequest": {
-        "type": "object",
-        "description": "Request to create a catalog.",
-        "required": [
-          "name"
-        ],
-        "properties": {
-          "description": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Optional description."
-          },
-          "name": {
-            "type": "string",
-            "description": "Catalog name (unique within workspace)."
           }
         }
       },

@@ -22,6 +22,9 @@ pub struct ApiErrorBody {
     pub code: String,
     /// Human-readable message (safe for clients).
     pub message: String,
+    /// Optional error category (e.g., `unprocessable_entity`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Optional request ID for correlation.
     pub request_id: Option<String>,
@@ -33,6 +36,7 @@ pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    error: Option<&'static str>,
     request_id: Option<String>,
     retry_after_secs: Option<u64>,
 }
@@ -107,20 +111,14 @@ impl ApiError {
         Self::new(StatusCode::NOT_IMPLEMENTED, "NOT_IMPLEMENTED", message)
     }
 
-    /// Creates an error from status code and message for idempotency replays.
-    #[must_use]
-    pub fn from_status_and_message(status: u16, message: impl Into<String>) -> Self {
-        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let code = match status {
-            StatusCode::BAD_REQUEST => "BAD_REQUEST",
-            StatusCode::UNAUTHORIZED => "UNAUTHORIZED",
-            StatusCode::FORBIDDEN => "FORBIDDEN",
-            StatusCode::NOT_FOUND => "NOT_FOUND",
-            StatusCode::CONFLICT => "CONFLICT",
-            StatusCode::PRECONDITION_FAILED => "PRECONDITION_FAILED",
-            _ => "INTERNAL",
-        };
-        Self::new(status, code, message)
+    /// Returns an unprocessable entity error response.
+    pub fn unprocessable_entity(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new_with_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            code,
+            message,
+            Some("unprocessable_entity"),
+        )
     }
 
     /// Attaches a request ID for correlation.
@@ -155,10 +153,20 @@ impl ApiError {
     }
 
     fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self::new_with_error(status, code, message, None)
+    }
+
+    fn new_with_error(
+        status: StatusCode,
+        code: &'static str,
+        message: impl Into<String>,
+        error: Option<&'static str>,
+    ) -> Self {
         Self {
             status,
             code,
             message: message.into(),
+            error,
             request_id: None,
             retry_after_secs: None,
         }
@@ -187,6 +195,7 @@ impl IntoResponse for ApiError {
             Json(ApiErrorBody {
                 code: self.code.to_string(),
                 message: self.message,
+                error: self.error.map(str::to_string),
                 request_id: request_id.clone(),
             }),
         )

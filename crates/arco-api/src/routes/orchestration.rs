@@ -37,8 +37,7 @@ use utoipa::{IntoParams, ToSchema};
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
 use crate::orchestration_compaction::compact_orchestration_events;
-use crate::paths::{MANIFEST_IDEMPOTENCY_PREFIX, MANIFEST_PREFIX, backfill_idempotency_path};
-use crate::routes::manifests::StoredManifest;
+use crate::paths::backfill_idempotency_path;
 use crate::server::AppState;
 use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
 use arco_flow::orchestration::LedgerWriter;
@@ -627,20 +626,6 @@ pub struct RunRequestResponse {
 pub struct ScheduleResponse {
     /// Schedule identifier.
     pub schedule_id: String,
-    /// Cron expression for the schedule.
-    pub cron_expression: String,
-    /// IANA timezone used for evaluation.
-    pub timezone: String,
-    /// Maximum time window for catchup.
-    pub catchup_window_minutes: u32,
-    /// Maximum number of ticks to catch up per evaluation.
-    pub max_catchup_ticks: u32,
-    /// Asset selection snapshot stored with the definition.
-    pub asset_selection: Vec<String>,
-    /// Whether the schedule is enabled.
-    pub enabled: bool,
-    /// Current definition version.
-    pub definition_version: String,
     /// Last `scheduled_for` timestamp that was processed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_scheduled_for: Option<DateTime<Utc>>,
@@ -827,38 +812,37 @@ pub struct ListSensorEvalsResponse {
 // Backfill API Types
 // ============================================================================
 
-const DEFAULT_BACKFILL_CHUNK_SIZE: u32 = 10;
-const DEFAULT_BACKFILL_MAX_CONCURRENT_RUNS: u32 = 2;
-
 /// Request to create a backfill.
 #[derive(Debug, Deserialize, ToSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateBackfillRequest {
-    /// Assets to backfill.
-    #[serde(default)]
-    pub asset_selection: Vec<String>,
-    /// Partition selector.
-    pub partition_selector: PartitionSelectorRequest,
-    /// Client request ID for idempotency.
+    /// Optional backfill identifier (ULID).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backfill_id: Option<String>,
+    /// Optional client request ID (for idempotency).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_request_id: Option<String>,
-    /// Number of partitions per chunk (0 uses default).
+    /// Assets to backfill.
+    pub asset_selection: Vec<String>,
+    /// Partition selector (explicit only; range/filter planned once `PartitionResolver` is implemented).
+    pub partition_selector: PartitionSelectorRequest,
+    /// Number of partitions per chunk (defaults to 10).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_size: Option<u32>,
-    /// Maximum concurrent chunk runs (0 uses default).
+    /// Maximum concurrent chunk runs (defaults to 2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_runs: Option<u32>,
 }
 
 /// Response after creating a backfill.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateBackfillResponse {
     /// Backfill identifier.
     pub backfill_id: String,
-    /// Event ID that was accepted.
+    /// Event identifier accepted by the ledger.
     pub accepted_event_id: String,
-    /// Time the event was accepted.
+    /// When the event was accepted.
     pub accepted_at: DateTime<Utc>,
 }
 
@@ -883,18 +867,6 @@ pub enum PartitionSelectorRequest {
         /// Filter expressions.
         filters: HashMap<String, String>,
     },
-}
-
-/// Error response for unsupported partition selectors.
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct UnprocessableEntityResponse {
-    /// Error category.
-    pub error: String,
-    /// Human-readable error message.
-    pub message: String,
-    /// Stable error code.
-    pub code: String,
 }
 
 /// Backfill response.
@@ -1147,6 +1119,20 @@ pub struct ListPartitionsQuery {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+// Keep in sync with BackfillController defaults.
+const DEFAULT_BACKFILL_CHUNK_SIZE: u32 = 10;
+const DEFAULT_BACKFILL_MAX_CONCURRENT_RUNS: u32 = 2;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackfillIdempotencyRecord {
+    idempotency_key: String,
+    request_fingerprint: String,
+    backfill_id: String,
+    accepted_event_id: String,
+    accepted_at: DateTime<Utc>,
+}
 
 fn ensure_workspace(ctx: &RequestContext, workspace_id: &str) -> Result<(), ApiError> {
     if workspace_id != ctx.workspace {
@@ -2000,6 +1986,218 @@ async fn append_backfill_created_event(
 
 fn user_id_for_events(ctx: &RequestContext) -> String {
     ctx.user_id.clone().unwrap_or_else(|| "api".to_string())
+}
+
+fn resolve_backfill_chunk_size(chunk_size: Option<u32>) -> Result<u32, ApiError> {
+    let resolved = chunk_size.unwrap_or(DEFAULT_BACKFILL_CHUNK_SIZE);
+    if resolved == 0 {
+        return Err(ApiError::bad_request(
+            "chunkSize must be greater than zero",
+        ));
+    }
+    Ok(resolved)
+}
+
+fn resolve_backfill_max_concurrent(max_concurrent_runs: Option<u32>) -> Result<u32, ApiError> {
+    let resolved = max_concurrent_runs.unwrap_or(DEFAULT_BACKFILL_MAX_CONCURRENT_RUNS);
+    if resolved == 0 {
+        return Err(ApiError::bad_request(
+            "maxConcurrentRuns must be greater than zero",
+        ));
+    }
+    Ok(resolved)
+}
+
+fn resolve_backfill_idempotency_key(
+    ctx: &RequestContext,
+    request: &CreateBackfillRequest,
+) -> Option<String> {
+    ctx.idempotency_key
+        .clone()
+        .or_else(|| request.client_request_id.clone())
+}
+
+fn resolve_backfill_client_request_id(
+    idempotency_key: Option<&str>,
+    request: &CreateBackfillRequest,
+) -> String {
+    idempotency_key
+        .map(ToString::to_string)
+        .or_else(|| request.client_request_id.clone())
+        .unwrap_or_else(|| Ulid::new().to_string())
+}
+
+fn validate_backfill_asset_selection(asset_selection: &[String]) -> Result<(), ApiError> {
+    if asset_selection.is_empty() {
+        return Err(ApiError::bad_request("assetSelection cannot be empty"));
+    }
+    if asset_selection.len() != 1 {
+        return Err(ApiError::bad_request(
+            "multi-asset backfills are not supported yet",
+        ));
+    }
+    if asset_selection
+        .first()
+        .is_some_and(|asset| asset.trim().is_empty())
+    {
+        return Err(ApiError::bad_request("assetSelection cannot be empty"));
+    }
+    Ok(())
+}
+
+fn extract_explicit_partition_keys(
+    selector: &PartitionSelectorRequest,
+) -> Result<&[String], ApiError> {
+    let partitions = match selector {
+        PartitionSelectorRequest::Explicit { partitions } => partitions,
+        PartitionSelectorRequest::Range { .. } | PartitionSelectorRequest::Filter { .. } => {
+            return Err(ApiError::unprocessable_entity(
+                "PARTITION_SELECTOR_NOT_SUPPORTED",
+                "Only explicit partition lists are supported. Range and filter selectors require a PartitionResolver (not yet implemented).",
+            ));
+        }
+    };
+
+    if partitions.is_empty() {
+        return Err(ApiError::bad_request(
+            "partitionSelector.partitions cannot be empty",
+        ));
+    }
+    if partitions.iter().any(|key| key.trim().is_empty()) {
+        return Err(ApiError::bad_request(
+            "partitionSelector.partitions cannot contain empty values",
+        ));
+    }
+    Ok(partitions)
+}
+
+fn compute_backfill_fingerprint(
+    asset_selection: &[String],
+    partition_keys: &[String],
+    chunk_size: u32,
+    max_concurrent_runs: u32,
+) -> Result<String, ApiError> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FingerprintPayload<'a> {
+        asset_selection: &'a [String],
+        partition_keys: &'a [String],
+        chunk_size: u32,
+        max_concurrent_runs: u32,
+    }
+
+    let payload = FingerprintPayload {
+        asset_selection,
+        partition_keys,
+        chunk_size,
+        max_concurrent_runs,
+    };
+    let json = serde_json::to_vec(&payload).map_err(|e| {
+        ApiError::internal(format!(
+            "failed to serialize backfill request fingerprint: {e}"
+        ))
+    })?;
+    let hash = Sha256::digest(&json);
+    Ok(hex::encode(hash))
+}
+
+async fn check_backfill_idempotency(
+    storage: &ScopedStorage,
+    idempotency_key: Option<&str>,
+    request_fingerprint: &str,
+    requested_backfill_id: Option<&str>,
+) -> Result<Option<CreateBackfillResponse>, ApiError> {
+    let Some(key) = idempotency_key else {
+        return Ok(None);
+    };
+
+    let Some(existing) = load_backfill_idempotency_record(storage, key).await? else {
+        return Ok(None);
+    };
+
+    if let Some(requested_backfill_id) = requested_backfill_id {
+        if requested_backfill_id != existing.backfill_id {
+            return Err(ApiError::conflict(
+                "idempotency key already used for a different backfill",
+            ));
+        }
+    }
+
+    if existing.request_fingerprint == request_fingerprint {
+        return Ok(Some(CreateBackfillResponse {
+            backfill_id: existing.backfill_id,
+            accepted_event_id: existing.accepted_event_id,
+            accepted_at: existing.accepted_at,
+        }));
+    }
+
+    Err(ApiError::conflict(
+        "idempotency key already used for a different backfill request",
+    ))
+}
+
+async fn load_backfill_idempotency_record(
+    storage: &ScopedStorage,
+    idempotency_key: &str,
+) -> Result<Option<BackfillIdempotencyRecord>, ApiError> {
+    let path = backfill_idempotency_path(idempotency_key);
+    match storage.get_raw(&path).await {
+        Ok(bytes) => {
+            let record: BackfillIdempotencyRecord =
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    ApiError::internal(format!("failed to parse idempotency record: {e}"))
+                })?;
+            Ok(Some(record))
+        }
+        Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => Ok(None),
+        Err(err) => Err(ApiError::internal(format!(
+            "failed to read idempotency record: {err}"
+        ))),
+    }
+}
+
+async fn store_backfill_idempotency_record(
+    storage: &ScopedStorage,
+    idempotency_key: Option<String>,
+    request_fingerprint: String,
+    backfill_id: &str,
+    accepted_event_id: &str,
+    accepted_at: DateTime<Utc>,
+) -> Result<(), ApiError> {
+    let Some(key) = idempotency_key else {
+        return Ok(());
+    };
+
+    let record = BackfillIdempotencyRecord {
+        idempotency_key: key.clone(),
+        request_fingerprint,
+        backfill_id: backfill_id.to_string(),
+        accepted_event_id: accepted_event_id.to_string(),
+        accepted_at,
+    };
+
+    let record_json = serde_json::to_string(&record).map_err(|e| {
+        ApiError::internal(format!("failed to serialize idempotency record: {e}"))
+    })?;
+    let record_path = backfill_idempotency_path(&key);
+    let record_result = storage
+        .put_raw(
+            &record_path,
+            Bytes::from(record_json),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to store idempotency record: {e}")))?;
+
+    if matches!(record_result, WriteResult::PreconditionFailed { .. }) {
+        tracing::warn!(
+            idempotency_key = %key,
+            backfill_id = %backfill_id,
+            "idempotency record already exists after backfill creation"
+        );
+    }
+
+    Ok(())
 }
 
 async fn load_orchestration_state(
@@ -3160,7 +3358,7 @@ fn map_sensor_eval(row: &SensorEvalRow) -> SensorEvalResponse {
         cursor_after: row.cursor_after.clone(),
         evaluated_at: row.evaluated_at,
         status: map_sensor_eval_status(&row.status),
-        run_requests_count: u32::try_from(row.run_requests.len()).unwrap_or(u32::MAX),
+        run_requests_count: usize_to_u32_saturating(row.run_requests.len()),
     }
 }
 
@@ -3192,7 +3390,7 @@ fn map_partition_selector(selector: &PartitionSelector) -> PartitionSelectorResp
 
 fn build_chunk_counts(chunks: &[&BackfillChunkRow]) -> ChunkCounts {
     let mut counts = ChunkCounts {
-        total: u32::try_from(chunks.len()).unwrap_or(u32::MAX),
+        total: usize_to_u32_saturating(chunks.len()),
         ..Default::default()
     };
 
@@ -3290,6 +3488,10 @@ fn map_partition_status(row: &PartitionStatusRow) -> PartitionStatusApiResponse 
         stale_reason: row.stale_reason_code.clone(),
         partition_values: row.partition_values.clone(),
     }
+}
+
+fn usize_to_u32_saturating(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 fn paginate<T: Clone>(items: &[T], limit: usize, offset: usize) -> (Vec<T>, Option<String>) {
@@ -5226,7 +5428,7 @@ pub(crate) async fn list_sensor_evals(
 // Backfill Routes
 // ============================================================================
 
-/// Create a new backfill.
+/// Create a backfill.
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{workspace_id}/backfills",
@@ -5235,12 +5437,12 @@ pub(crate) async fn list_sensor_evals(
     ),
     request_body = CreateBackfillRequest,
     responses(
-        (status = 202, description = "Backfill accepted", body = CreateBackfillResponse),
-        (status = 200, description = "Existing backfill returned", body = CreateBackfillResponse),
+        (status = 202, description = "Backfill created", body = CreateBackfillResponse),
+        (status = 200, description = "Idempotent backfill replay", body = CreateBackfillResponse),
         (status = 400, description = "Invalid request", body = ApiErrorBody),
-        (status = 409, description = "Idempotency conflict", body = ApiErrorBody),
-        (status = 422, description = "Partition selector not supported", body = UnprocessableEntityResponse),
         (status = 404, description = "Workspace not found", body = ApiErrorBody),
+        (status = 409, description = "Idempotency key conflict", body = ApiErrorBody),
+        (status = 422, description = "Unsupported partition selector", body = ApiErrorBody),
     ),
     tag = "Orchestration",
     security(("bearerAuth" = []))
@@ -5250,85 +5452,95 @@ pub(crate) async fn create_backfill(
     ctx: RequestContext,
     Path(workspace_id): Path<String>,
     Json(request): Json<CreateBackfillRequest>,
-) -> Result<Response, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
+    tracing::info!(
+        workspace_id = %workspace_id,
+        asset_selection = ?request.asset_selection,
+        "Creating backfill"
+    );
+
     ensure_workspace(&ctx, &workspace_id)?;
-
-    let CreateBackfillRequest {
-        asset_selection,
-        partition_selector,
-        client_request_id,
-        chunk_size,
-        max_concurrent_runs,
-    } = request;
-
-    if asset_selection.is_empty() {
-        return Err(ApiError::bad_request("assetSelection cannot be empty"));
-    }
-
-    if asset_selection.len() > 1 {
-        return Err(ApiError::bad_request(
-            "multi-asset backfills are not supported yet",
-        ));
-    }
-
-    let idempotency_key = client_request_id
-        .or_else(|| ctx.idempotency_key.clone())
-        .ok_or_else(|| ApiError::bad_request("clientRequestId or Idempotency-Key is required"))?;
-
-    let (partition_selector, partition_keys) = match partition_selector {
-        PartitionSelectorRequest::Explicit { partitions } => {
-            explicit_partition_selector(partitions)?
-        }
-        PartitionSelectorRequest::Range { .. } | PartitionSelectorRequest::Filter { .. } => {
-            let response = unsupported_partition_selector_response();
-            return Ok((StatusCode::UNPROCESSABLE_ENTITY, Json(response)).into_response());
-        }
-    };
-
-    let chunk_size = match chunk_size {
-        Some(0) | None => DEFAULT_BACKFILL_CHUNK_SIZE,
-        Some(value) => value,
-    };
-    let max_concurrent_runs = match max_concurrent_runs {
-        Some(0) | None => DEFAULT_BACKFILL_MAX_CONCURRENT_RUNS,
-        Some(value) => value,
-    };
-    let input = BackfillCreateInput {
-        asset_selection,
-        partition_selector,
+    validate_backfill_asset_selection(&request.asset_selection)?;
+    let partition_keys = extract_explicit_partition_keys(&request.partition_selector)?;
+    let chunk_size = resolve_backfill_chunk_size(request.chunk_size)?;
+    let max_concurrent_runs = resolve_backfill_max_concurrent(request.max_concurrent_runs)?;
+    let request_fingerprint = compute_backfill_fingerprint(
+        &request.asset_selection,
         partition_keys,
         chunk_size,
         max_concurrent_runs,
-    };
-
-    let fingerprint = compute_backfill_fingerprint(
-        &input.asset_selection,
-        &input.partition_keys,
-        input.chunk_size,
-        input.max_concurrent_runs,
     )?;
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
+    let idempotency_key = resolve_backfill_idempotency_key(&ctx, &request);
 
-    if let Some(existing) =
-        resolve_backfill_idempotency(&storage, &idempotency_key, &fingerprint).await?
+    if let Some(response) = check_backfill_idempotency(
+        &storage,
+        idempotency_key.as_deref(),
+        &request_fingerprint,
+        request.backfill_id.as_deref(),
+    )
+    .await?
     {
-        return Ok((StatusCode::OK, Json(existing)).into_response());
+        return Ok((StatusCode::OK, Json(response)));
     }
 
-    let response = append_backfill_created_event(
-        state.as_ref(),
-        &ctx,
+    let backfill_id = request
+        .backfill_id
+        .clone()
+        .unwrap_or_else(|| Ulid::new().to_string());
+    let client_request_id =
+        resolve_backfill_client_request_id(idempotency_key.as_deref(), &request);
+    let total_partitions = usize_to_u32_saturating(partition_keys.len());
+
+    let event = OrchestrationEvent::new(
+        &ctx.tenant,
         &workspace_id,
-        input,
-        &idempotency_key,
+        OrchestrationEventData::BackfillCreated {
+            backfill_id: backfill_id.clone(),
+            client_request_id,
+            asset_selection: request.asset_selection.clone(),
+            partition_selector: PartitionSelector::Explicit {
+                partition_keys: partition_keys.to_vec(),
+            },
+            total_partitions,
+            chunk_size,
+            max_concurrent_runs,
+            parent_backfill_id: None,
+        },
+    );
+
+    let event_path = LedgerWriter::event_path(&event);
+    let accepted_event_id = event.event_id.clone();
+    let accepted_at = event.timestamp;
+
+    let ledger = LedgerWriter::new(storage.clone());
+    ledger
+        .append(event)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to write BackfillCreated event: {e}")))?;
+
+    compact_orchestration_events(&state.config, storage.clone(), vec![event_path]).await?;
+
+    store_backfill_idempotency_record(
         &storage,
-        fingerprint,
+        idempotency_key,
+        request_fingerprint,
+        &backfill_id,
+        &accepted_event_id,
+        accepted_at,
     )
     .await?;
 
-    Ok((StatusCode::ACCEPTED, Json(response)).into_response())
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(CreateBackfillResponse {
+            backfill_id,
+            accepted_event_id,
+            accepted_at,
+        }),
+    ))
 }
 
 /// List backfills.
@@ -5583,21 +5795,19 @@ pub(crate) async fn get_asset_partition_summary(
         )));
     }
 
-    let total = u32::try_from(partitions.len()).unwrap_or(u32::MAX);
-    let materialized = u32::try_from(
+    let total = usize_to_u32_saturating(partitions.len());
+    let materialized = usize_to_u32_saturating(
         partitions
             .iter()
             .filter(|p| p.last_materialization_run_id.is_some())
             .count(),
-    )
-    .unwrap_or(u32::MAX);
-    let stale_count = u32::try_from(
+    );
+    let stale_count = usize_to_u32_saturating(
         partitions
             .iter()
             .filter(|p| p.stale_since.is_some())
             .count(),
-    )
-    .unwrap_or(u32::MAX);
+    );
     let missing = total.saturating_sub(materialized);
 
     Ok(Json(AssetPartitionSummaryResponse {

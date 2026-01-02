@@ -601,6 +601,20 @@ pub enum SensorEvalStatusResponse {
     SkippedStaleCursor,
 }
 
+/// Sensor evaluation status filter (query parameter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SensorEvalStatusFilter {
+    /// Sensor triggered one or more runs.
+    Triggered,
+    /// Sensor evaluated but no new data found.
+    NoNewData,
+    /// Sensor evaluation failed.
+    Error,
+    /// Sensor evaluation was skipped due to stale cursor (CAS failed).
+    SkippedStaleCursor,
+}
+
 /// Run request returned from sensor evaluation.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -726,8 +740,28 @@ pub struct ListTicksQuery {
     pub limit: Option<u32>,
     /// Cursor for pagination.
     pub cursor: Option<String>,
+    /// Filter ticks after this timestamp (inclusive).
+    pub since: Option<DateTime<Utc>>,
+    /// Filter ticks before this timestamp (inclusive).
+    pub until: Option<DateTime<Utc>>,
     /// Filter by tick status.
     pub status: Option<TickStatusResponse>,
+}
+
+/// Query parameters for listing sensor evaluations.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSensorEvalsQuery {
+    /// Maximum evaluations to return.
+    pub limit: Option<u32>,
+    /// Cursor for pagination.
+    pub cursor: Option<String>,
+    /// Filter evaluations after this timestamp (inclusive).
+    pub since: Option<DateTime<Utc>>,
+    /// Filter evaluations before this timestamp (inclusive).
+    pub until: Option<DateTime<Utc>>,
+    /// Filter by evaluation status.
+    pub status: Option<SensorEvalStatusFilter>,
 }
 
 // ============================================================================
@@ -3542,6 +3576,60 @@ fn filter_ticks_by_status(
     }
 }
 
+fn filter_ticks_by_time_range(
+    ticks: &mut Vec<ScheduleTickResponse>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) {
+    if since.is_none() && until.is_none() {
+        return;
+    }
+
+    ticks.retain(|tick| {
+        let after_since = since.is_none_or(|since| tick.scheduled_for >= since);
+        let before_until = until.is_none_or(|until| tick.scheduled_for <= until);
+        after_since && before_until
+    });
+}
+
+fn filter_sensor_evals_by_status(
+    evals: &mut Vec<SensorEvalResponse>,
+    status: Option<SensorEvalStatusFilter>,
+) {
+    let Some(filter) = status else {
+        return;
+    };
+
+    evals.retain(|eval| {
+        matches!(
+            (&eval.status, filter),
+            (SensorEvalStatusResponse::Triggered, SensorEvalStatusFilter::Triggered)
+                | (SensorEvalStatusResponse::NoNewData, SensorEvalStatusFilter::NoNewData)
+                | (SensorEvalStatusResponse::Error { .. }, SensorEvalStatusFilter::Error)
+                | (
+                    SensorEvalStatusResponse::SkippedStaleCursor,
+                    SensorEvalStatusFilter::SkippedStaleCursor
+                )
+        )
+    });
+}
+
+fn filter_sensor_evals_by_time_range(
+    evals: &mut Vec<SensorEvalResponse>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) {
+    if since.is_none() && until.is_none() {
+        return;
+    }
+
+    evals.retain(|eval| {
+        let after_since = since.is_none_or(|since| eval.evaluated_at >= since);
+        let before_until = until.is_none_or(|until| eval.evaluated_at <= until);
+        after_since && before_until
+    });
+}
+
 // ============================================================================
 // Route Handlers
 // ============================================================================
@@ -5287,6 +5375,8 @@ pub(crate) async fn get_schedule_tick(
         ("schedule_id" = String, Path, description = "Schedule ID"),
         ("limit" = Option<u32>, Query, description = "Maximum ticks to return"),
         ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("since" = Option<DateTime<Utc>>, Query, description = "Filter ticks after this timestamp (inclusive)"),
+        ("until" = Option<DateTime<Utc>>, Query, description = "Filter ticks before this timestamp (inclusive)"),
         ("status" = Option<TickStatusResponse>, Query, description = "Filter by status"),
     ),
     responses(
@@ -5315,11 +5405,8 @@ pub(crate) async fn list_schedule_ticks(
         .map(map_schedule_tick)
         .collect();
     filter_ticks_by_status(&mut ticks, query.status);
-    ticks.sort_by(|a, b| {
-        b.scheduled_for
-            .cmp(&a.scheduled_for)
-            .then_with(|| b.tick_id.cmp(&a.tick_id))
-    });
+    filter_ticks_by_time_range(&mut ticks, query.since, query.until);
+    ticks.sort_by(|a, b| b.scheduled_for.cmp(&a.scheduled_for));
 
     let (page, next_cursor) = paginate(&ticks, limit, offset);
 
@@ -5416,6 +5503,9 @@ pub(crate) async fn get_sensor(
         ("sensor_id" = String, Path, description = "Sensor ID"),
         ("limit" = Option<u32>, Query, description = "Maximum evaluations to return"),
         ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("since" = Option<DateTime<Utc>>, Query, description = "Filter evaluations after this timestamp (inclusive)"),
+        ("until" = Option<DateTime<Utc>>, Query, description = "Filter evaluations before this timestamp (inclusive)"),
+        ("status" = Option<SensorEvalStatusFilter>, Query, description = "Filter by status"),
     ),
     responses(
         (status = 200, description = "List of evaluations", body = ListSensorEvalsResponse),
@@ -5427,7 +5517,7 @@ pub(crate) async fn list_sensor_evals(
     State(state): State<Arc<AppState>>,
     ctx: RequestContext,
     Path((workspace_id, sensor_id)): Path<(String, String)>,
-    AxumQuery(query): AxumQuery<ListQuery>,
+    AxumQuery(query): AxumQuery<ListSensorEvalsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
     let (limit, offset) = parse_pagination(
@@ -5442,6 +5532,8 @@ pub(crate) async fn list_sensor_evals(
         .filter(|e| e.sensor_id == sensor_id)
         .map(map_sensor_eval)
         .collect();
+    filter_sensor_evals_by_status(&mut evals, query.status);
+    filter_sensor_evals_by_time_range(&mut evals, query.since, query.until);
     evals.sort_by(|a, b| b.evaluated_at.cmp(&a.evaluated_at));
 
     let (page, next_cursor) = paginate(&evals, limit, offset);
@@ -5968,94 +6060,7 @@ mod tests {
     use anyhow::{Result, anyhow};
     use arco_core::partition::{PartitionKey, ScalarValue};
     use axum::http::StatusCode;
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    use chrono::Duration;
-    use serde_json::json;
-
-    fn hash_trigger_fingerprint_payload(
-        request: &TriggerRunRequest,
-        partition_key: Option<String>,
-    ) -> Result<String> {
-        #[derive(Serialize)]
-        struct FingerprintPayload {
-            selection: Vec<String>,
-            include_upstream: bool,
-            include_downstream: bool,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            partition_key: Option<String>,
-            labels: BTreeMap<String, String>,
-        }
-
-        let mut selection: Vec<String> = request
-            .selection
-            .iter()
-            .map(|value| {
-                arco_flow::orchestration::canonicalize_asset_key(value).map_err(anyhow::Error::msg)
-            })
-            .collect::<Result<_, _>>()?;
-        selection.sort();
-        selection.dedup();
-
-        let labels = request
-            .labels
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<BTreeMap<_, _>>();
-
-        let payload = FingerprintPayload {
-            selection,
-            include_upstream: request.include_upstream,
-            include_downstream: request.include_downstream,
-            partition_key,
-            labels,
-        };
-
-        let json = serde_json::to_vec(&payload)?;
-        Ok(hex::encode(Sha256::digest(&json)))
-    }
-
-    fn partitioning_spec(dimensions: Vec<DimensionSpec>) -> PartitioningSpec {
-        PartitioningSpec {
-            is_partitioned: !dimensions.is_empty(),
-            dimensions,
-        }
-    }
-
-    fn time_dimension(name: &str, granularity: Option<&str>) -> DimensionSpec {
-        DimensionSpec {
-            name: name.to_string(),
-            kind: "time".to_string(),
-            granularity: granularity.map(str::to_string),
-            values: None,
-        }
-    }
-
-    fn static_dimension(name: &str) -> DimensionSpec {
-        DimensionSpec {
-            name: name.to_string(),
-            kind: "static".to_string(),
-            granularity: None,
-            values: None,
-        }
-    }
-
-    fn static_dimension_with_values(name: &str, values: Vec<&str>) -> DimensionSpec {
-        DimensionSpec {
-            name: name.to_string(),
-            kind: "static".to_string(),
-            granularity: None,
-            values: Some(values.into_iter().map(str::to_string).collect()),
-        }
-    }
-
-    fn tenant_dimension(name: &str) -> DimensionSpec {
-        DimensionSpec {
-            name: name.to_string(),
-            kind: "tenant".to_string(),
-            granularity: None,
-            values: None,
-        }
-    }
+    use chrono::{Duration, TimeZone};
 
     #[test]
     fn test_trigger_request_deserialization() {
@@ -6684,6 +6689,91 @@ mod tests {
 
         assert_eq!(ticks.len(), 1);
         assert_eq!(ticks[0].status, TickStatusResponse::Failed);
+    }
+
+    #[test]
+    fn test_filter_ticks_by_time_range_inclusive() {
+        let base = Utc.with_ymd_and_hms(2025, 1, 3, 0, 0, 0).unwrap();
+        let mut ticks = vec![
+            ScheduleTickResponse {
+                tick_id: "tick_1".to_string(),
+                schedule_id: "sched".to_string(),
+                scheduled_for: base - Duration::days(2),
+                asset_selection: vec![],
+                status: TickStatusResponse::Triggered,
+                run_key: None,
+                run_id: None,
+            },
+            ScheduleTickResponse {
+                tick_id: "tick_2".to_string(),
+                schedule_id: "sched".to_string(),
+                scheduled_for: base - Duration::days(1),
+                asset_selection: vec![],
+                status: TickStatusResponse::Triggered,
+                run_key: None,
+                run_id: None,
+            },
+            ScheduleTickResponse {
+                tick_id: "tick_3".to_string(),
+                schedule_id: "sched".to_string(),
+                scheduled_for: base,
+                asset_selection: vec![],
+                status: TickStatusResponse::Triggered,
+                run_key: None,
+                run_id: None,
+            },
+        ];
+
+        let since = base - Duration::days(1);
+        let until = base;
+        filter_ticks_by_time_range(&mut ticks, Some(since), Some(until));
+
+        assert_eq!(ticks.len(), 2);
+        assert!(ticks
+            .iter()
+            .all(|tick| tick.scheduled_for >= since && tick.scheduled_for <= until));
+    }
+
+    #[test]
+    fn test_filter_sensor_evals_by_time_range_and_status() {
+        let base = Utc.with_ymd_and_hms(2025, 2, 1, 12, 0, 0).unwrap();
+        let mut evals = vec![
+            SensorEvalResponse {
+                eval_id: "eval_1".to_string(),
+                sensor_id: "sensor".to_string(),
+                cursor_before: None,
+                cursor_after: None,
+                evaluated_at: base - Duration::days(2),
+                status: SensorEvalStatusResponse::Triggered,
+                run_requests_count: 1,
+            },
+            SensorEvalResponse {
+                eval_id: "eval_2".to_string(),
+                sensor_id: "sensor".to_string(),
+                cursor_before: None,
+                cursor_after: None,
+                evaluated_at: base - Duration::days(1),
+                status: SensorEvalStatusResponse::NoNewData,
+                run_requests_count: 0,
+            },
+            SensorEvalResponse {
+                eval_id: "eval_3".to_string(),
+                sensor_id: "sensor".to_string(),
+                cursor_before: None,
+                cursor_after: None,
+                evaluated_at: base,
+                status: SensorEvalStatusResponse::Triggered,
+                run_requests_count: 2,
+            },
+        ];
+
+        let since = base - Duration::days(1);
+        let until = base;
+        filter_sensor_evals_by_status(&mut evals, Some(SensorEvalStatusFilter::Triggered));
+        filter_sensor_evals_by_time_range(&mut evals, Some(since), Some(until));
+
+        assert_eq!(evals.len(), 1);
+        assert_eq!(evals[0].eval_id, "eval_3");
     }
 
     #[test]

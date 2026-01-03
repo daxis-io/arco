@@ -6,6 +6,7 @@ use axum::http::{Method, StatusCode, header};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use tower::ServiceExt;
+use ulid::Ulid;
 
 use arco_api::server::ServerBuilder;
 
@@ -84,6 +85,23 @@ mod helpers {
         headers: &[(&str, &str)],
     ) -> Result<(StatusCode, T)> {
         let request = make_request_with_headers(Method::POST, uri, Some(body), headers)?;
+        let response = send(router, request).await?;
+        let (status, body) = response_body(response).await?;
+        let json = serde_json::from_slice(&body).with_context(|| {
+            format!(
+                "parse JSON response (status={status}): {}",
+                String::from_utf8_lossy(&body)
+            )
+        })?;
+        Ok((status, json))
+    }
+
+    pub async fn get_json_with_headers<T: DeserializeOwned>(
+        router: axum::Router,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<(StatusCode, T)> {
+        let request = make_request_with_headers(Method::GET, uri, None, headers)?;
         let response = send(router, request).await?;
         let (status, body) = response_body(response).await?;
         let json = serde_json::from_slice(&body).with_context(|| {
@@ -357,6 +375,69 @@ async fn test_create_backfill_returns_correlation_id() -> Result<()> {
     assert!(!response.accepted_event_id.is_empty());
     // correlation_id should be present (from X-Request-Id header)
     assert!(response.correlation_id.is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_trigger_run_returns_acceptance_metadata() -> Result<()> {
+    let router = test_router();
+
+    let body = serde_json::json!({
+        "selection": ["analytics.daily_sales"]
+    });
+
+    let (status, payload): (_, serde_json::Value) = helpers::post_json_with_headers(
+        router,
+        "/api/v1/workspaces/test-workspace/runs",
+        body,
+        &[("X-Request-Id", "req_accept_01")],
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(payload["acceptedEventId"].as_str().unwrap_or_default().len() > 0);
+    assert!(payload["acceptedAt"].as_str().unwrap_or_default().len() > 0);
+    assert_eq!(
+        payload["correlationId"].as_str(),
+        Some("req_accept_01")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_get_backfill_wait_for_event_times_out() -> Result<()> {
+    let router = test_router();
+
+    let body = serde_json::json!({
+        "assetSelection": ["analytics.daily_sales"],
+        "partitionSelector": {
+            "type": "explicit",
+            "partitions": ["2025-01-01"]
+        }
+    });
+
+    let (status, response): (_, CreateBackfillResponse) = helpers::post_json_with_headers(
+        router.clone(),
+        "/api/v1/workspaces/test-workspace/backfills",
+        body,
+        &[("Idempotency-Key", "idem_wait_timeout")],
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let future_event_id = Ulid::new().to_string();
+    let uri = format!(
+        "/api/v1/workspaces/test-workspace/backfills/{}?waitForEventId={}&timeoutMs=1",
+        response.backfill_id, future_event_id
+    );
+
+    let (status, error): (_, ApiErrorResponse) =
+        helpers::get_json_with_headers(router, &uri, &[]).await?;
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(error.code, "REQUEST_TIMEOUT");
+    assert!(error.message.contains("timed out"));
 
     Ok(())
 }

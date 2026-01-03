@@ -21,6 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::Query as AxumQuery;
 use axum::extract::{Path, State};
@@ -32,6 +33,7 @@ use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::time::{Instant, sleep};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::context::RequestContext;
@@ -42,8 +44,8 @@ use crate::server::AppState;
 use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::{
-    BackfillChunkRow, BackfillRow, FoldState, MicroCompactor, PartitionStatusRow, RunRow,
-    RunState as FoldRunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
+    BackfillChunkRow, BackfillRow, FoldState, MicroCompactor, OrchestrationManifest,
+    PartitionStatusRow, RunRow, RunState as FoldRunState, ScheduleStateRow, ScheduleTickRow,
     SensorEvalRow, SensorStateRow, TaskRow, TaskState as FoldTaskState,
 };
 use arco_flow::orchestration::controllers::{PubSubMessage, PushSensorHandler};
@@ -284,6 +286,13 @@ pub struct TriggerRunResponse {
     pub created: bool,
     /// Run creation timestamp.
     pub created_at: DateTime<Utc>,
+    /// Event identifier accepted by the ledger.
+    pub accepted_event_id: String,
+    /// When the event was accepted.
+    pub accepted_at: DateTime<Utc>,
+    /// Optional correlation ID for request tracing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
 }
 
 /// Response after backfilling a `run_key` reservation.
@@ -1127,6 +1136,16 @@ pub struct ListBackfillsQuery {
     pub state: Option<BackfillStateResponse>,
 }
 
+/// Query parameters for waiting on compaction watermarks.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitForEventQuery {
+    /// Event ID to wait for before returning.
+    pub wait_for_event_id: Option<String>,
+    /// Timeout in milliseconds (defaults to 5000).
+    pub timeout_ms: Option<u64>,
+}
+
 /// Query parameters for listing backfill chunks.
 #[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
 #[serde(rename_all = "camelCase")]
@@ -1822,207 +1841,80 @@ fn parse_pagination(limit: u32, cursor: Option<&str>) -> Result<(usize, usize), 
     Ok((limit as usize, offset))
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct BackfillIdempotencyRecord {
-    idempotency_key: String,
-    backfill_id: String,
-    accepted_event_id: String,
-    accepted_at: DateTime<Utc>,
-    fingerprint: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BackfillFingerprintPayload {
-    asset_selection: Vec<String>,
-    partitions: Vec<String>,
-    chunk_size: u32,
-    max_concurrent_runs: u32,
-}
-
-struct BackfillCreateInput {
-    asset_selection: Vec<String>,
-    partition_selector: PartitionSelector,
-    partition_keys: Vec<String>,
-    chunk_size: u32,
-    max_concurrent_runs: u32,
-}
-
-fn compute_backfill_fingerprint(
-    asset_selection: &[String],
-    partitions: &[String],
-    chunk_size: u32,
-    max_concurrent_runs: u32,
-) -> Result<String, ApiError> {
-    let payload = BackfillFingerprintPayload {
-        asset_selection: asset_selection.to_vec(),
-        partitions: partitions.to_vec(),
-        chunk_size,
-        max_concurrent_runs,
-    };
-    let json = serde_json::to_vec(&payload).map_err(|e| {
-        ApiError::internal(format!("failed to serialize backfill fingerprint: {e}"))
-    })?;
-    let hash = Sha256::digest(&json);
-    Ok(hex::encode(hash))
-}
-
-async fn load_backfill_idempotency_record(
-    storage: &ScopedStorage,
-    idempotency_key: &str,
-) -> Result<Option<BackfillIdempotencyRecord>, ApiError> {
-    let path = backfill_idempotency_path(idempotency_key);
-    match storage.get_raw(&path).await {
-        Ok(bytes) => {
-            let record: BackfillIdempotencyRecord =
-                serde_json::from_slice(&bytes).map_err(|e| {
-                    ApiError::internal(format!("failed to parse backfill idempotency record: {e}"))
-                })?;
-            Ok(Some(record))
-        }
-        Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => Ok(None),
-        Err(err) => Err(ApiError::internal(format!(
-            "failed to read backfill idempotency record: {err}"
-        ))),
-    }
-}
-
-async fn store_backfill_idempotency_record(
-    storage: &ScopedStorage,
-    record: &BackfillIdempotencyRecord,
-) -> Result<(), ApiError> {
-    let record_json = serde_json::to_string(record).map_err(|e| {
-        ApiError::internal(format!(
-            "failed to serialize backfill idempotency record: {e}"
-        ))
-    })?;
-    let record_path = backfill_idempotency_path(&record.idempotency_key);
-    let result = storage
-        .put_raw(
-            &record_path,
-            Bytes::from(record_json),
-            WritePrecondition::DoesNotExist,
-        )
-        .await
-        .map_err(|e| {
-            ApiError::internal(format!("failed to store backfill idempotency record: {e}"))
-        })?;
-
-    if matches!(result, WriteResult::PreconditionFailed { .. }) {
-        tracing::warn!(
-            idempotency_key = %record.idempotency_key,
-            backfill_id = %record.backfill_id,
-            "backfill idempotency record already exists after write"
-        );
-    }
-
-    Ok(())
-}
-
-fn explicit_partition_selector(
-    partitions: Vec<String>,
-) -> Result<(PartitionSelector, Vec<String>), ApiError> {
-    if partitions.is_empty() {
-        return Err(ApiError::bad_request("partition selector cannot be empty"));
-    }
-    if partitions.iter().any(String::is_empty) {
-        return Err(ApiError::bad_request("partition key cannot be empty"));
-    }
-
-    Ok((
-        PartitionSelector::Explicit {
-            partition_keys: partitions.clone(),
-        },
-        partitions,
-    ))
-}
-
-fn unsupported_partition_selector_response() -> UnprocessableEntityResponse {
-    UnprocessableEntityResponse {
-        error: "unprocessable_entity".to_string(),
-        code: "PARTITION_SELECTOR_NOT_SUPPORTED".to_string(),
-        message: "Only explicit partition lists are supported. Range and filter selectors require a PartitionResolver (not yet implemented).".to_string(),
-    }
-}
-
-async fn resolve_backfill_idempotency(
-    storage: &ScopedStorage,
-    idempotency_key: &str,
-    fingerprint: &str,
-) -> Result<Option<CreateBackfillResponse>, ApiError> {
-    if let Some(existing) = load_backfill_idempotency_record(storage, idempotency_key).await? {
-        if existing.fingerprint == fingerprint {
-            return Ok(Some(CreateBackfillResponse {
-                backfill_id: existing.backfill_id,
-                accepted_event_id: existing.accepted_event_id,
-                accepted_at: existing.accepted_at,
-            }));
-        }
-
-        return Err(ApiError::conflict(
-            "idempotency key already used for a different backfill",
-        ));
-    }
-
-    Ok(None)
-}
-
-async fn append_backfill_created_event(
-    state: &AppState,
-    ctx: &RequestContext,
-    workspace_id: &str,
-    input: BackfillCreateInput,
-    idempotency_key: &str,
-    storage: &ScopedStorage,
-    fingerprint: String,
-) -> Result<CreateBackfillResponse, ApiError> {
-    let backfill_id = Ulid::new().to_string();
-    let total_partitions = u32::try_from(input.partition_keys.len()).unwrap_or(u32::MAX);
-    let event = OrchestrationEvent::new(
-        &ctx.tenant,
-        workspace_id,
-        OrchestrationEventData::BackfillCreated {
-            backfill_id: backfill_id.clone(),
-            client_request_id: idempotency_key.to_string(),
-            asset_selection: input.asset_selection,
-            partition_selector: input.partition_selector,
-            total_partitions,
-            chunk_size: input.chunk_size,
-            max_concurrent_runs: input.max_concurrent_runs,
-            parent_backfill_id: None,
-        },
-    );
-
-    let accepted_event_id = event.event_id.clone();
-    let accepted_at = event.timestamp;
-
-    let ledger = LedgerWriter::new(storage.clone());
-    let event_path = LedgerWriter::event_path(&event);
-    ledger
-        .append(event)
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to write BackfillCreated event: {e}")))?;
-
-    compact_orchestration_events(&state.config, storage.clone(), vec![event_path]).await?;
-
-    let record = BackfillIdempotencyRecord {
-        idempotency_key: idempotency_key.to_string(),
-        backfill_id: backfill_id.clone(),
-        accepted_event_id: accepted_event_id.clone(),
-        accepted_at,
-        fingerprint,
-    };
-    store_backfill_idempotency_record(storage, &record).await?;
-
-    Ok(CreateBackfillResponse {
-        backfill_id,
-        accepted_event_id,
-        accepted_at,
-    })
-}
+const DEFAULT_WAIT_TIMEOUT_MS: u64 = 5_000;
+const WAIT_BACKOFF_INITIAL_MS: u64 = 20;
+const WAIT_BACKOFF_MAX_MS: u64 = 250;
 
 fn user_id_for_events(ctx: &RequestContext) -> String {
     ctx.user_id.clone().unwrap_or_else(|| "api".to_string())
+}
+
+async fn load_orchestration_manifest(
+    ctx: &RequestContext,
+    state: &AppState,
+) -> Result<OrchestrationManifest, ApiError> {
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+    let compactor = MicroCompactor::new(storage);
+    let (manifest, _) = compactor
+        .load_state()
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to load orchestration manifest: {e}")))?;
+    Ok(manifest)
+}
+
+fn watermark_reached(manifest: &OrchestrationManifest, target: &Ulid) -> bool {
+    let Some(ref watermark) = manifest.watermarks.events_processed_through else {
+        return false;
+    };
+
+    Ulid::from_string(watermark).map_or_else(
+        |_| {
+            tracing::warn!(
+                watermark = %watermark,
+                "invalid events_processed_through watermark"
+            );
+            false
+        },
+        |value| value >= *target,
+    )
+}
+
+async fn wait_for_event_processed(
+    ctx: &RequestContext,
+    state: &AppState,
+    event_id: &str,
+    timeout: Duration,
+) -> Result<(), ApiError> {
+    let target = Ulid::from_string(event_id)
+        .map_err(|_| ApiError::bad_request("waitForEventId must be a ULID"))?;
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut backoff = Duration::from_millis(WAIT_BACKOFF_INITIAL_MS);
+
+    loop {
+        let manifest = load_orchestration_manifest(ctx, state).await?;
+        if watermark_reached(&manifest, &target) {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(ApiError::request_timeout(format!(
+                "timed out waiting for event {event_id}"
+            )));
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let sleep_for = backoff.min(remaining);
+        if sleep_for.is_zero() {
+            return Err(ApiError::request_timeout(format!(
+                "timed out waiting for event {event_id}"
+            )));
+        }
+
+        sleep(sleep_for).await;
+        backoff = (backoff * 2).min(Duration::from_millis(WAIT_BACKOFF_MAX_MS));
+    }
 }
 
 fn resolve_backfill_chunk_size(chunk_size: Option<u32>) -> Result<u32, ApiError> {
@@ -3686,12 +3578,15 @@ pub(crate) async fn trigger_run(
     let run_id = Ulid::new().to_string();
     let plan_id = Ulid::new().to_string();
     let now = Utc::now();
+    let correlation_id = ctx.request_id.clone();
 
     // Create storage for reservation and ledger
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
     let ledger = LedgerWriter::new(storage.clone());
     let mut run_event_overrides: Option<RunEventOverrides> = None;
+    let mut accepted_event_id: Option<String> = None;
+    let mut accepted_at: Option<DateTime<Utc>> = None;
 
     let has_partition_request = request.partition_key.is_some() || !request.partitions.is_empty();
     let mut plan_context: Option<RunPlanContext> = None;
@@ -3880,6 +3775,8 @@ pub(crate) async fn trigger_run(
             ReservationResult::Reserved => {
                 // We won the race - proceed to emit events
                 tracing::debug!(run_key = %run_key, "run_key reserved, proceeding with run creation");
+                accepted_event_id = Some(run_event_id.clone());
+                accepted_at = Some(now);
                 run_event_overrides = Some(RunEventOverrides {
                     run_event_id,
                     plan_event_id,
@@ -3996,6 +3893,9 @@ pub(crate) async fn trigger_run(
                         state: run_state,
                         created: false,
                         created_at: existing.created_at,
+                        accepted_event_id: existing.event_id,
+                        accepted_at: existing.created_at,
+                        correlation_id: Some(correlation_id),
                     }),
                 ));
             }
@@ -4020,27 +3920,17 @@ pub(crate) async fn trigger_run(
         }
     }
 
-    if plan_context.is_none() {
-        plan_context = Some(load_run_plan_context(&storage, &request).await?);
+    if request.run_key.is_none() {
+        let run_event_id = Ulid::new().to_string();
+        let plan_event_id = Ulid::new().to_string();
+        accepted_event_id = Some(run_event_id.clone());
+        accepted_at = Some(now);
+        run_event_overrides = Some(RunEventOverrides {
+            run_event_id,
+            plan_event_id,
+            created_at: now,
+        });
     }
-    let Some(plan_context_ref) = plan_context.as_ref() else {
-        return Err(ApiError::internal("internal error: missing plan context"));
-    };
-    let tasks = build_task_defs_for_request(
-        plan_context_ref,
-        &request,
-        resolved_partition_key.canonical(),
-    )?;
-
-    tracing::info!(
-        manifest_id = %plan_context_ref.manifest_id,
-        manifest_deployed_at = %plan_context_ref.deployed_at,
-        root_assets = ?plan_context_ref.root_assets,
-        include_upstream = request.include_upstream,
-        include_downstream = request.include_downstream,
-        planned_tasks = tasks.len(),
-        "planning run from latest manifest"
-    );
 
     let event_paths = append_run_events(
         &ledger,
@@ -4060,6 +3950,11 @@ pub(crate) async fn trigger_run(
 
     compact_orchestration_events(&state.config, storage.clone(), event_paths).await?;
 
+    let accepted_event_id = accepted_event_id
+        .ok_or_else(|| ApiError::internal("missing accepted_event_id for run"))?;
+    let accepted_at =
+        accepted_at.ok_or_else(|| ApiError::internal("missing accepted_at for run"))?;
+
     Ok((
         StatusCode::CREATED,
         Json(TriggerRunResponse {
@@ -4068,6 +3963,9 @@ pub(crate) async fn trigger_run(
             state: RunStateResponse::Pending,
             created: true,
             created_at: now,
+            accepted_event_id,
+            accepted_at,
+            correlation_id: Some(correlation_id),
         }),
     ))
 }
@@ -5751,11 +5649,14 @@ pub(crate) async fn list_backfills(
     path = "/api/v1/workspaces/{workspace_id}/backfills/{backfill_id}",
     params(
         ("workspace_id" = String, Path, description = "Workspace ID"),
-        ("backfill_id" = String, Path, description = "Backfill ID")
+        ("backfill_id" = String, Path, description = "Backfill ID"),
+        ("waitForEventId" = Option<String>, Query, description = "Wait until this event ID is processed"),
+        ("timeoutMs" = Option<u64>, Query, description = "Timeout in milliseconds (defaults to 5000)")
     ),
     responses(
         (status = 200, description = "Backfill details", body = BackfillResponse),
         (status = 404, description = "Backfill not found", body = ApiErrorBody),
+        (status = 408, description = "Timed out waiting for event", body = ApiErrorBody),
     ),
     tag = "Orchestration",
     security(("bearerAuth" = []))
@@ -5764,8 +5665,15 @@ pub(crate) async fn get_backfill(
     State(state): State<Arc<AppState>>,
     ctx: RequestContext,
     Path((workspace_id, backfill_id)): Path<(String, String)>,
+    AxumQuery(query): AxumQuery<WaitForEventQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
+
+    if let Some(ref event_id) = query.wait_for_event_id {
+        let timeout = Duration::from_millis(query.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS));
+        wait_for_event_processed(&ctx, &state, event_id, timeout).await?;
+    }
+
     let fold_state = load_orchestration_state(&ctx, &state).await?;
 
     let backfill = fold_state

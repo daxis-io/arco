@@ -96,6 +96,15 @@ impl ApiError {
         )
     }
 
+    /// Returns an error response when a request times out.
+    pub fn request_timeout(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "REQUEST_TIMEOUT",
+            message,
+        )
+    }
+
     /// Returns an internal error response.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", message)

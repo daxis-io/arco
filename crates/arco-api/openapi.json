@@ -2402,6 +2402,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "waitForEventId",
+            "in": "query",
+            "description": "Wait until this event ID is processed",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "timeoutMs",
+            "in": "query",
+            "description": "Timeout in milliseconds (defaults to 5000)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
           }
         ],
         "responses": {
@@ -2417,6 +2437,16 @@
           },
           "404": {
             "description": "Backfill not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Timed out waiting for event",
             "content": {
               "application/json": {
                 "schema": {
@@ -7601,9 +7631,27 @@
           "planId",
           "state",
           "created",
-          "createdAt"
+          "createdAt",
+          "acceptedEventId",
+          "acceptedAt"
         ],
         "properties": {
+          "acceptedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the event was accepted."
+          },
+          "acceptedEventId": {
+            "type": "string",
+            "description": "Event identifier accepted by the ledger."
+          },
+          "correlationId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional correlation ID for request tracing."
+          },
           "created": {
             "type": "boolean",
             "description": "Whether this is a new run or an existing one (`run_key` deduplication)."

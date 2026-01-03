@@ -49,8 +49,8 @@ resource "google_cloud_run_v2_service" "api" {
           cpu    = var.api_cpu
           memory = var.api_memory
         }
-        cpu_idle          = true  # Scale to zero when idle
-        startup_cpu_boost = true  # Faster cold starts
+        cpu_idle          = true # Scale to zero when idle
+        startup_cpu_boost = true # Faster cold starts
       }
 
       # Health checks
@@ -93,7 +93,7 @@ resource "google_cloud_run_v2_service" "api" {
 
       env {
         name  = "ARCO_DEBUG"
-        value = var.environment == "dev" ? "true" : "false"
+        value = var.environment == "dev" && !var.api_public ? "true" : "false"
       }
 
       env {
@@ -119,6 +119,11 @@ resource "google_cloud_run_v2_service" "api" {
       env {
         name  = "ARCO_ENVIRONMENT"
         value = var.environment
+      }
+
+      env {
+        name  = "ARCO_API_PUBLIC"
+        value = var.api_public ? "true" : "false"
       }
 
       env {

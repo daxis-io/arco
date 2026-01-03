@@ -3,7 +3,7 @@
 **Date:** 2026-01-02  
 **Commit:** 966b8eecce6348821c258e38553ed945e314cfde  
 **Scope:** Catalog/metastore security posture (API authN/authZ, storage isolation & IAM, read-path URL minting, observability/monitoring, Iceberg REST + credential vending)  
-**Overall status:** ⚠️ **Not audit-ready** (P0 gaps remain: debug-mode isolation bypass risk, missing security audit trail, `/metrics` exposure in public mode, JWT issuer/audience policy not enforced by default, and Iceberg REST baseline/credential vending not GA-ready; see `crates/arco-api/src/context.rs:80`, `crates/arco-api/src/server.rs:379`, `infra/terraform/variables.tf:145`, `crates/arco-api/src/config.rs:302`, `crates/arco-api/src/server.rs:397`).
+**Overall status:** ⚠️ **Not audit-ready** (P0 gaps remain: missing security audit trail, `/metrics` exposure in public mode, JWT issuer/audience policy not enforced by default, and Iceberg REST baseline/credential vending not GA-ready; see `crates/arco-api/src/server.rs:379`, `infra/terraform/variables.tf:145`, `crates/arco-api/src/config.rs:302`, `crates/arco-api/src/server.rs:397`).
 
 ## Status Legend
 
@@ -21,8 +21,9 @@
 |------|--------|----------|------------|--------------|--------------------------|---------------|--------------|
 | GCS IAM prefix scoping | ⚠️ | P0 | Medium | Terraform + env test needed | `infra/terraform/iam_conditions.tf:1`, `infra/terraform/iam_conditions.tf:28`, `infra/terraform/iam_conditions.tf:54` | Conditional IAM semantics for `list` unverified; bucket public access prevention not enforced | Add IAM semantics verification (sandbox env); enforce `public_access_prevention` |
 | Service accounts & Cloud Run isolation | ✅ | P0 | High | Terraform | `infra/terraform/iam.tf:23`, `infra/terraform/iam.tf:67`, `infra/terraform/iam.tf:75`, `infra/terraform/cloud_run.tf:28`, `infra/terraform/cloud_run.tf:173`, `infra/terraform/cloud_run_job.tf:16` | Misconfig of `api_public` + unauthenticated `/metrics` | Keep API internal by default; protect `/metrics` when public |
-| API auth (JWT + debug headers) | ⚠️ | P0 | High | Code review | `crates/arco-api/src/context.rs:80`, `crates/arco-api/src/context.rs:111`, `infra/terraform/cloud_run.tf:94` | Debug mode grants caller-chosen tenant/workspace; issuer/audience optional by default; no JWKS/rotation | Add prod guardrail for debug; make `iss`/`aud` policy P0; track JWKS backlog |
-| Tenant/workspace storage isolation | ✅ | P0 | High | Code + tests | `crates/arco-core/src/scoped_storage.rs:1`, `crates/arco-core/src/scoped_storage.rs:115`, `crates/arco-core/src/scoped_storage.rs:821` | If auth bypassed (debug), scope selection becomes attacker-controlled | Harden debug-mode gating; add e2e coverage |
+| API auth (JWT + debug headers) | ⚠️ | P0 | High | Code review | `crates/arco-api/src/context.rs:80`, `crates/arco-api/src/context.rs:111`, `infra/terraform/cloud_run.tf:94` | Issuer/audience optional by default; no JWKS/rotation | Make `iss`/`aud` policy P0; track JWKS backlog |
+| Runtime posture contract (dev/private/public) | ✅ | P0 | Medium | Code + tests | `crates/arco-api/src/config.rs:10`, `crates/arco-api/src/config.rs:343`, `crates/arco-api/src/server.rs:572`, `infra/terraform/cloud_run.tf:119`, `infra/terraform/cloud_run.tf:125` | Posture depends on correct env/ingress wiring | Add deployment validation for `ARCO_ENVIRONMENT`/`ARCO_API_PUBLIC` and keep guardrail tests |
+| Tenant/workspace storage isolation | ✅ | P0 | High | Code + tests | `crates/arco-core/src/scoped_storage.rs:1`, `crates/arco-core/src/scoped_storage.rs:115`, `crates/arco-core/src/scoped_storage.rs:821` | If debug is enabled (dev posture), scope selection becomes attacker-controlled | Keep guardrail + add e2e coverage |
 | Browser-direct read path (signed URLs) | ✅ | P0 | High | Code review | `crates/arco-api/src/routes/browser.rs:5`, `crates/arco-api/src/routes/browser.rs:119`, `crates/arco-catalog/src/reader.rs:494` | URL secrets could leak via logs if misused; audit event at URL mint time missing | Add structured audit event for URL mint allow/deny; enforce redaction wrappers |
 | Observability & monitoring | ⚠️ | P1 | Medium | Code + infra | `crates/arco-core/src/observability.rs:43`, `crates/arco-api/src/metrics.rs:41`, `infra/monitoring/otel-collector.yaml:1` | No structured audit events; `/metrics` unauthenticated; high-cardinality tenant labels | Add audit schema + storage plan; limit metrics labels; protect `/metrics` |
 | Iceberg REST surface | 🔨 | P0 | Medium | Code review | `crates/arco-api/src/server.rs:219`, `crates/arco-iceberg/src/router.rs:37`, `crates/arco-iceberg/src/types/config.rs:8` | Many PRD endpoints missing; query params declared but ignored | Slice PRs for endpoint completeness + parameter parsing |
@@ -66,13 +67,14 @@ If these assumptions change, evidence must be re-collected.
 
 ### 1.1 Can debug auth bypass be accidentally enabled in production?
 
-**Answer:** Yes (misconfiguration risk), but Terraform defaults reduce likelihood.
+**Answer:** No (fails fast), provided posture is set via required env vars.
 
-- **Control:** `ARCO_DEBUG` controls debug mode (`crates/arco-api/src/config.rs:19`).
-- **Behavior:** When `debug=true`, tenant/workspace come from caller-supplied headers (`crates/arco-api/src/context.rs:80`). When `debug=false`, a bearer JWT is required (`crates/arco-api/src/context.rs:91`).
-- **Terraform default:** Cloud Run sets `ARCO_DEBUG` to `false` unless `environment == "dev"` (`infra/terraform/cloud_run.tf:94`).
+- **Guardrail:** Server refuses to start when `debug=true` outside `Posture::Dev` (`crates/arco-api/src/server.rs:572`).
+- **Posture source:** `ARCO_ENVIRONMENT` + `ARCO_API_PUBLIC` are required to derive posture (`crates/arco-api/src/config.rs:343`).
+- **Terraform wiring:** Cloud Run sets both `ARCO_ENVIRONMENT` and `ARCO_API_PUBLIC` (`infra/terraform/cloud_run.tf:119`, `infra/terraform/cloud_run.tf:125`).
+- **Behavior:** Header-based tenant/workspace scoping is allowed only when `debug=true` and posture is dev (`crates/arco-api/src/context.rs:80`).
 
-**Risk:** If `ARCO_DEBUG=true` in a public deployment, a caller can choose arbitrary `X-Tenant-Id`/`X-Workspace-Id` (`crates/arco-api/src/context.rs:80`), defeating tenant isolation.
+**Residual risk:** If runtime env values do not reflect actual ingress (e.g., `ARCO_API_PUBLIC=false` while the service is externally reachable), debug could be enabled in an exposed deployment. Validate env wiring in deployment pipelines.
 
 ### 1.2 Is tenant isolation enforced at the storage layer, not just API layer?
 
@@ -177,8 +179,8 @@ If these assumptions change, evidence must be re-collected.
 
 - Main API routes are authenticated via `auth_middleware` (`crates/arco-api/src/server.rs:359`).
 - `RequestContext` extraction:
-  - Debug mode uses `X-Tenant-Id` / `X-Workspace-Id` headers (`crates/arco-api/src/context.rs:80`).
-  - Production mode requires `Authorization: Bearer <jwt>` (`crates/arco-api/src/context.rs:91`).
+  - Debug mode uses `X-Tenant-Id` / `X-Workspace-Id` headers only when posture is dev (`crates/arco-api/src/context.rs:80`).
+  - Non-dev posture requires `Authorization: Bearer <jwt>` (`crates/arco-api/src/context.rs:94`).
 - JWT signature validation supports HS256 (secret) and RS256 (public key PEM), mutually exclusive (`crates/arco-api/src/context.rs:188`).
 - Tenant/workspace normalization prevents separators and invalid chars (`crates/arco-api/src/context.rs:144`).
 - Request IDs are generated/propagated and echoed back (`crates/arco-api/src/context.rs:76`, `crates/arco-api/src/context.rs:272`).
@@ -201,21 +203,23 @@ If these assumptions change, evidence must be re-collected.
 
 ### B.2 Debug/Bypass Modes
 
-**Status:** ⚠️ Implemented, risky if misconfigured
+**Status:** ✅ Implemented guardrail (debug only in dev posture)
 
 **What we verified:**
 
-- Debug mode is controlled by `ARCO_DEBUG` (`crates/arco-api/src/config.rs:19`, `crates/arco-api/src/config.rs:218`).
-- Terraform sets debug true only for dev by default (`infra/terraform/cloud_run.tf:94`).
+- Posture is derived from required `ARCO_ENVIRONMENT` + `ARCO_API_PUBLIC` (`crates/arco-api/src/config.rs:343`, `crates/arco-api/src/config.rs:354`).
+- Server rejects `debug=true` outside `Posture::Dev` (`crates/arco-api/src/server.rs:572`).
+- Terraform provides `ARCO_ENVIRONMENT` and `ARCO_API_PUBLIC` to Cloud Run (`infra/terraform/cloud_run.tf:119`, `infra/terraform/cloud_run.tf:125`).
+- Debug-mode header scoping uses `debug && posture.is_dev()` for API requests and task callbacks (`crates/arco-api/src/context.rs:80`, `crates/arco-api/src/routes/tasks.rs:602`).
+- Regression tests cover dev acceptance and non-dev rejection for RequestContext and task callbacks (`crates/arco-api/src/context.rs:292`, `crates/arco-api/src/context.rs:315`, `crates/arco-api/src/routes/tasks.rs:1234`, `crates/arco-api/src/routes/tasks.rs:1273`).
 
-**Risk assessment:**
+**Residual risk:**
 
-- If `ARCO_DEBUG=true` in any environment with external access, a caller can choose tenant/workspace via headers (`crates/arco-api/src/context.rs:80`).
-- In debug mode, task callback middleware does not validate the bearer token and instead accepts any token plus header-based tenant/workspace scoping (`crates/arco-api/src/routes/tasks.rs:602`).
+- If ingress configuration diverges from `ARCO_API_PUBLIC`, posture can be misclassified.
 
 **Recommended actions:**
 
-- Add a hard prod guardrail (refuse debug header-based scoping in any externally reachable/non-dev posture), covering both request auth and task callbacks, and cover with tests.
+- Add deployment validation to ensure `ARCO_ENVIRONMENT`/`ARCO_API_PUBLIC` match actual ingress; keep guardrail tests as regressions.
 
 ---
 
@@ -443,7 +447,7 @@ If `/metrics` is externally reachable, these labels can disclose identifiers; ev
 
 | Gap | Risk | Mitigation |
 |-----|------|------------|
-| Debug mode enabled in a public deployment | Caller chooses tenant/workspace via headers; task callbacks accept any bearer token; cross-tenant read/write | Add runtime guardrail; refuse debug in public/non-dev; cover task callbacks; test it (`crates/arco-api/src/context.rs:80`, `crates/arco-api/src/routes/tasks.rs:602`) |
+| Debug mode outside dev posture (regression risk) | Caller chooses tenant/workspace via headers; task callbacks accept any bearer token; cross-tenant read/write | Guardrail enforced at startup; keep regression tests (`crates/arco-api/src/server.rs:572`, `crates/arco-api/src/server.rs:736`) |
 | `/metrics` reachable when API is public | Identifier leakage + endpoint surface disclosure; potential DoS of monitoring pipeline | Protect `/metrics` when `api_public=true` (`crates/arco-api/src/server.rs:379`, `infra/terraform/cloud_run.tf:25`) |
 | No structured security/mutation audit trail | Violates non-negotiable “audit trail covers all mutations” | Implement audit schema + append-only storage + hash-chain integrity (`docs/plans/2025-01-12-arco-unified-platform-design.md:4132`) |
 | JWT issuer/audience policy not enforced by default | Misconfigured IdP can lead to cross-tenant access | Require `iss`/`aud` in prod; validate non-empty env vars (`crates/arco-api/src/context.rs:123`, `infra/terraform/variables.tf:145`) |

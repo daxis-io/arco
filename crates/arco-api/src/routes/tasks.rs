@@ -599,7 +599,9 @@ pub async fn task_auth_middleware(
         return unauthorized_response(&request_id, "missing bearer token");
     };
 
-    let (tenant, workspace) = if state.config.debug {
+    let debug_allowed = state.config.debug && state.config.posture.is_dev();
+
+    let (tenant, workspace) = if debug_allowed {
         let tenant = header_string(headers, "X-Tenant-Id").unwrap_or_default();
         let workspace = header_string(headers, "X-Workspace-Id").unwrap_or_default();
         if tenant.is_empty() || workspace.is_empty() {
@@ -657,11 +659,12 @@ async fn build_callback_dependencies(
     let storage = ctx.scoped_storage(backend)?;
     let lookup = ParquetTaskStateLookup::load(storage.clone()).await?;
     let ledger = Arc::new(CompactingLedgerWriter::new(storage, state.config.clone()));
+    let debug_allowed = state.config.debug && state.config.posture.is_dev();
     let validator = Arc::new(JwtTaskTokenValidator::new(
         &state.config.jwt,
         &ctx.tenant,
         &ctx.workspace,
-        state.config.debug,
+        debug_allowed,
     )?);
     let callback_ctx =
         CallbackContext::new(ledger, validator, ctx.tenant.clone(), ctx.workspace.clone());
@@ -981,6 +984,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 mod tests {
     use super::*;
     use anyhow::Result;
+    use crate::config::Posture;
     use axum::body::Body as AxumBody;
     use axum::http::Request as AxumRequest;
     use axum::routing::get;
@@ -1223,6 +1227,76 @@ mod tests {
         let payload: Value = serde_json::from_slice(&body)?;
         assert_eq!(payload["tenant"], "tenant-1");
         assert_eq!(payload["workspace"], "workspace-1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_task_auth_middleware_accepts_debug_headers_in_dev() -> Result<()> {
+        let mut config = crate::config::Config::default();
+        config.debug = true;
+        config.posture = Posture::Dev;
+        let state = Arc::new(AppState::with_memory_storage(config));
+
+        let app = Router::new()
+            .route(
+                "/api/v1/tasks/task-123/started",
+                get(|ctx: RequestContext| async move {
+                    Json(serde_json::json!({
+                        "tenant": ctx.tenant,
+                        "workspace": ctx.workspace,
+                    }))
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                task_auth_middleware,
+            ))
+            .with_state(state);
+
+        let request = AxumRequest::builder()
+            .uri("/api/v1/tasks/task-123/started")
+            .header("authorization", "Bearer debug-token")
+            .header("X-Tenant-Id", "tenant-1")
+            .header("X-Workspace-Id", "workspace-1")
+            .body(AxumBody::empty())?;
+        let response = app.oneshot(request).await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024).await?;
+        let payload: Value = serde_json::from_slice(&body)?;
+        assert_eq!(payload["tenant"], "tenant-1");
+        assert_eq!(payload["workspace"], "workspace-1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_task_auth_middleware_rejects_debug_headers_outside_dev() -> Result<()> {
+        let mut config = crate::config::Config::default();
+        config.debug = true;
+        config.posture = Posture::Private;
+        config.jwt.hs256_secret = Some("test-secret".to_string());
+        let state = Arc::new(AppState::with_memory_storage(config));
+
+        let app = Router::new()
+            .route(
+                "/api/v1/tasks/task-123/started",
+                get(|_ctx: RequestContext| async { StatusCode::OK }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                task_auth_middleware,
+            ))
+            .with_state(state);
+
+        let request = AxumRequest::builder()
+            .uri("/api/v1/tasks/task-123/started")
+            .header("authorization", "Bearer not-a-jwt")
+            .header("X-Tenant-Id", "tenant-1")
+            .header("X-Workspace-Id", "workspace-1")
+            .body(AxumBody::empty())?;
+        let response = app.oneshot(request).await?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         Ok(())
     }
 }

@@ -24,8 +24,8 @@ api_memory     = "512Mi"
 compactor_cpu  = "1"
 compactor_memory = "512Mi"
 
-# Security (dev: relaxed)
-api_public           = true
+# Security (dev: relaxed). api_public=true disables debug guardrails.
+api_public           = false
 allowed_cors_origins = "*"
 
 # JWT (dev: simple HS256 secret, or leave empty for header-based auth)

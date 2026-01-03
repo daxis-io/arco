@@ -19,7 +19,8 @@ This document captures the delta between “current state” and parity/security
 Key findings that directly affect the delivery plan:
 
 - The architecture treats **multi-tenancy**, **secrets never in events/logs**, and **audit trail covers all mutations** as completeness criteria (`docs/plans/2025-01-12-arco-unified-platform-design.md:4130`, `docs/plans/2025-01-12-arco-unified-platform-design.md:4131`, `docs/plans/2025-01-12-arco-unified-platform-design.md:4132`).
-- Debug-mode (`ARCO_DEBUG=true`) is a **tenant isolation bypass** for API requests (`crates/arco-api/src/context.rs:80`) *and* disables task-token validation in callback middleware (accepts any bearer token + tenant/workspace headers) (`crates/arco-api/src/routes/tasks.rs:602`).
+- Runtime posture contract implemented: `Posture` is derived from required `ARCO_ENVIRONMENT` + `ARCO_API_PUBLIC`, and Terraform wires `ARCO_API_PUBLIC` (`crates/arco-api/src/config.rs:10`, `crates/arco-api/src/config.rs:343`, `infra/terraform/cloud_run.tf:119`, `infra/terraform/cloud_run.tf:125`).
+- Debug-mode (`ARCO_DEBUG=true`) is a tenant isolation bypass for API requests and task callbacks, but header-based scoping now requires `debug && posture.is_dev()` and startup rejects debug outside dev (`crates/arco-api/src/context.rs:80`, `crates/arco-api/src/routes/tasks.rs:602`, `crates/arco-api/src/server.rs:572`).
 - JWT verification supports HS256/RS256, and issuer/audience enforcement exists but is optional (`crates/arco-api/src/context.rs:188`, `crates/arco-api/src/context.rs:123`). Terraform defaults `ARCO_JWT_ISSUER`/`ARCO_JWT_AUDIENCE` to empty strings (`infra/terraform/variables.tf:145`), and empty env vars are treated as “unset” (`crates/arco-api/src/config.rs:302`).
 - `/metrics` is mounted without auth (`crates/arco-api/src/server.rs:379`). If `api_public=true` allows unauthenticated invocation (`infra/terraform/iam.tf:135`), `/metrics` becomes both an info disclosure surface and an attacker-amplifiable DoS vector.
 - Metrics cardinality is attacker-amplifiable:
@@ -52,7 +53,7 @@ This is a minimal traceability slice for the metastore/security-critical items.
 | Iceberg REST: spec-declared params are actually parsed | P0 | ⚠️ | `snapshots` is declared but not currently parsed in handler signature (`crates/arco-iceberg/src/routes/tables.rs:128`, `crates/arco-iceberg/src/routes/tables.rs:146`) |
 | Iceberg REST: credential vending endpoint is wired and audited | P0 | 🔨 | Endpoint exists; provider is optional and currently not wired (`crates/arco-iceberg/src/state.rs:58`, `crates/arco-api/src/server.rs:397`, `crates/arco-iceberg/src/routes/tables.rs:578`) |
 | Browser read path: signed URL minting allowlisted + tenant-scoped + TTL bounded | P0 | ✅ | `crates/arco-api/src/routes/browser.rs:119`, `crates/arco-api/src/routes/browser.rs:165`, `crates/arco-catalog/src/reader.rs:494`, `crates/arco-catalog/src/reader.rs:601` |
-| API auth: debug headers for dev vs Bearer JWT for prod | P0 | ⚠️ | `crates/arco-api/src/context.rs:80`, `crates/arco-api/src/context.rs:91` |
+| API auth: debug headers for dev posture vs Bearer JWT for non-dev | P0 | ⚠️ | `crates/arco-api/src/context.rs:80`, `crates/arco-api/src/context.rs:94`, `crates/arco-api/src/context.rs:292` |
 | Security audit trail for decisions + mutations | P0 | ❌ | No structured security decision audit events (allow/deny) evidenced; note Tier-1 commit records provide tamper-evident mutation history but lack principal attribution/decision logging (`crates/arco-catalog/src/manifest.rs:738`, `crates/arco-core/src/storage_traits.rs:186`). URL minting currently logs safe metadata + metrics only (`crates/arco-api/src/routes/browser.rs:143`, `crates/arco-api/src/routes/browser.rs:181`) |
 | Engine interop: Spark/Flink/Trino “MUST PASS” matrix + known-good configs | P0 | ❌ | Not present in repo; the existing Iceberg test uses custom headers (`crates/arco-integration-tests/tests/iceberg_rest_catalog.rs:132`) |
 
@@ -62,8 +63,8 @@ This is a minimal traceability slice for the metastore/security-critical items.
 
 ### 3.1 Security/Ops (P0)
 
-1. Add an explicit, enforceable deployment posture contract (dev/private/public) at runtime (do not rely on infra-only `api_public`).
-2. Prevent `ARCO_DEBUG=true` in any externally reachable posture; include task-callback middleware behavior.
+1. ✅ Implemented explicit runtime posture contract via required `ARCO_ENVIRONMENT` + `ARCO_API_PUBLIC` (`crates/arco-api/src/config.rs:343`, `infra/terraform/cloud_run.tf:119`, `infra/terraform/cloud_run.tf:125`).
+2. ✅ Prevent `ARCO_DEBUG=true` outside dev posture at startup, and require `debug && posture.is_dev()` for header-based scoping in API + task callbacks (`crates/arco-api/src/server.rs:572`, `crates/arco-api/src/context.rs:80`, `crates/arco-api/src/routes/tasks.rs:602`). Tests cover dev accept + non-dev reject (`crates/arco-api/src/context.rs:292`, `crates/arco-api/src/context.rs:315`, `crates/arco-api/src/routes/tasks.rs:1234`, `crates/arco-api/src/routes/tasks.rs:1273`).
 3. Require JWT `iss` + `aud` policy in production posture; fail closed when unset/empty.
 4. Protect `/metrics` for public deployments and define a metrics policy that prevents identifier leakage and cardinality amplification (remove attacker-controlled label values; reduce tenant/workspace label dimensions).
 5. Implement a minimal security/mutation audit event stream (auth allow/deny, URL mint allow/deny, credential vend allow/deny, Iceberg commit) consistent with the audit trail invariant.
@@ -87,7 +88,7 @@ Each PR slice is intended to be reviewable and test-backed.
 
 | PR | Goal | Scope | Tests/Verification |
 |----|------|-------|-------------------|
-| PR-0 | Runtime posture contract | Add explicit `Posture` enum to `Config` and enforce invariants. See **PR-0 Design** below. | Unit tests for parsing + invariants; docs for posture matrix |
+| PR-0 | Runtime posture contract | ✅ Implemented: `Posture` enum + env mapping (`ARCO_ENVIRONMENT` + `ARCO_API_PUBLIC`) + startup guardrail. See **PR-0 Design** below. | Unit tests for posture mapping + guardrail (`crates/arco-api/src/config.rs:532`, `crates/arco-api/src/server.rs:736`) |
 
 #### PR-0 Design: Posture Enum
 
@@ -105,7 +106,8 @@ pub enum Posture {
 
 | `ARCO_ENVIRONMENT` | `api_public` (infra) | Resulting Posture | Debug | `/metrics` | JWT iss/aud |
 |--------------------|----------------------|-------------------|-------|------------|-------------|
-| `dev`              | (any)                | `Dev`             | ✅ allowed | open | optional |
+| `dev`              | `false`              | `Dev`             | ✅ allowed | open | optional |
+| `dev`              | `true`               | `Public`          | ❌ forbidden | protected | required |
 | `staging`          | `false`              | `Private`         | ❌ forbidden | open | required |
 | `staging`          | `true`               | `Public`          | ❌ forbidden | protected | required |
 | `prod`             | `false`              | `Private`         | ❌ forbidden | open | required |
@@ -113,12 +115,14 @@ pub enum Posture {
 
 **Invariants enforced at startup (`server.rs::validate_config`):**
 
-- `Posture::Dev`: no additional constraints
-- `Posture::Private`: `debug=false` required; JWT secret/key required
-- `Posture::Public`: `debug=false` required; JWT secret/key required; `iss`/`aud` required; `/metrics` protection required
+- `Posture::Dev`: allows `debug=true` (no posture-specific restrictions beyond existing config checks)
+- `Posture::Private` / `Posture::Public`: `debug=false` required (`crates/arco-api/src/server.rs:573`) and JWT secret/public key required when `debug=false` (`crates/arco-api/src/server.rs:599`)
 
-**Note:** `api_public` is infra-only today. PR-0 should either (a) add `ARCO_API_PUBLIC` env var, or (b) infer posture from `ARCO_ENVIRONMENT` alone and document that `staging`/`prod` always require JWT policy regardless of ingress.
-| PR-1 | Debug guardrail | Refuse debug header-based scope selection in non-dev posture (including task callback middleware). | Integration tests covering debug footgun (`crates/arco-api/src/context.rs:80`, `crates/arco-api/src/routes/tasks.rs:602`) |
+**Not yet enforced by PR-0 (tracked by PR-2 / PR-3a):**
+- `Posture::Public`: require `iss`/`aud` and protect `/metrics`.
+
+**Note:** Implemented option (a): `ARCO_API_PUBLIC` is now required and wired via Terraform (`crates/arco-api/src/config.rs:343`, `infra/terraform/cloud_run.tf:125`).
+| PR-1 | Debug guardrail | ✅ Implemented: header-based scoping requires `debug && posture.is_dev()` for API + task callbacks. | Unit tests for RequestContext + task callbacks (`crates/arco-api/src/context.rs:292`, `crates/arco-api/src/context.rs:315`, `crates/arco-api/src/routes/tasks.rs:1234`, `crates/arco-api/src/routes/tasks.rs:1273`) |
 | PR-2 | JWT claim policy hardening | Require `iss`/`aud` when `debug=false` in production posture; document allowed algs (HS256/RS256). | Unit tests for empty env vars treated as unset (`crates/arco-api/src/config.rs:302`); integration test for reject |
 | PR-3a | `/metrics` access control | Define and implement a `/metrics` access strategy. See **PR-3a Design** below. | See PR-3a DoD below |
 

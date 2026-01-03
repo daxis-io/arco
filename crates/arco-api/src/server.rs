@@ -570,6 +570,12 @@ impl Server {
     }
 
     fn validate_config(&self) -> Result<()> {
+        if !self.config.posture.is_dev() && self.config.debug {
+            return Err(arco_core::Error::InvalidInput(
+                "debug mode requires posture=dev".to_string(),
+            ));
+        }
+
         // Enforce "no wildcard in production" for CORS.
         if !self.config.debug
             && self
@@ -724,6 +730,32 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    use crate::config::Posture;
+
+    #[test]
+    fn test_posture_allows_debug_in_dev() -> Result<()> {
+        let mut builder = ServerBuilder::new();
+        builder.config.posture = Posture::Dev;
+        builder.config.debug = true;
+
+        let server = builder.build();
+        server.validate_config()?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_posture_blocks_debug_outside_dev() {
+        for posture in [Posture::Private, Posture::Public] {
+            let mut builder = ServerBuilder::new();
+            builder.config.posture = posture;
+            builder.config.debug = true;
+
+            let server = builder.build();
+            let err = server.validate_config().unwrap_err();
+            assert!(matches!(err, arco_core::Error::InvalidInput(_)));
+        }
+    }
 
     #[tokio::test]
     async fn test_health_endpoint() -> Result<()> {

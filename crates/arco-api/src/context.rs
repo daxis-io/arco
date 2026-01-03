@@ -77,7 +77,9 @@ impl FromRequestParts<Arc<AppState>> for RequestContext {
             request_id_from_headers(headers).unwrap_or_else(|| Ulid::new().to_string());
         let idempotency_key = header_string(headers, "Idempotency-Key");
 
-        let (tenant, workspace, user_id) = if state.config.debug {
+        let debug_allowed = state.config.debug && state.config.posture.is_dev();
+
+        let (tenant, workspace, user_id) = if debug_allowed {
             let tenant = header_string(headers, "X-Tenant-Id").ok_or_else(|| {
                 ApiError::unauthorized("missing X-Tenant-Id header (debug mode)")
                     .with_request_id(request_id.clone())
@@ -276,4 +278,58 @@ pub async fn auth_middleware(
             .insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use axum::http::{Request as AxumRequest, StatusCode};
+
+    use crate::config::{Config, Posture};
+    use crate::server::AppState;
+
+    #[tokio::test]
+    async fn test_request_context_accepts_debug_headers_in_dev() -> Result<()> {
+        let mut config = Config::default();
+        config.debug = true;
+        config.posture = Posture::Dev;
+        let state = Arc::new(AppState::with_memory_storage(config));
+
+        let request = AxumRequest::builder()
+            .uri("/")
+            .header("X-Tenant-Id", "tenant-1")
+            .header("X-Workspace-Id", "workspace-1")
+            .header("X-User-Id", "user-1")
+            .body(Body::empty())?;
+        let (mut parts, _body) = request.into_parts();
+
+        let ctx = RequestContext::from_request_parts(&mut parts, &state).await?;
+        assert_eq!(ctx.tenant, "tenant-1");
+        assert_eq!(ctx.workspace, "workspace-1");
+        assert_eq!(ctx.user_id.as_deref(), Some("user-1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_request_context_requires_jwt_outside_dev() -> Result<()> {
+        let mut config = Config::default();
+        config.debug = true;
+        config.posture = Posture::Private;
+        let state = Arc::new(AppState::with_memory_storage(config));
+
+        let request = AxumRequest::builder()
+            .uri("/")
+            .header("X-Tenant-Id", "tenant-1")
+            .header("X-Workspace-Id", "workspace-1")
+            .body(Body::empty())?;
+        let (mut parts, _body) = request.into_parts();
+
+        let err = RequestContext::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(err.message(), "Authorization header required");
+        Ok(())
+    }
 }

@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use tower::ServiceExt;
 
-use arco_api::config::{Config, CorsConfig};
+use arco_api::config::{Config, CorsConfig, Posture};
 use arco_api::server::{Server, ServerBuilder};
 
 const TEST_JWT_SECRET: &str = "test-jwt-secret";
@@ -19,6 +19,7 @@ fn test_router() -> axum::Router {
 fn test_router_prod() -> axum::Router {
     let config = Config {
         debug: false,
+        posture: Posture::Private,
         jwt: arco_api::config::JwtConfig {
             hs256_secret: Some(TEST_JWT_SECRET.to_string()),
             ..arco_api::config::JwtConfig::default()
@@ -1296,6 +1297,7 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
     async fn test_production_mode_accepts_rs256_jwt() -> Result<()> {
         let config = Config {
             debug: false,
+            posture: Posture::Private,
             jwt: arco_api::config::JwtConfig {
                 rs256_public_key_pem: Some(TEST_RSA_PUBLIC_KEY_PEM.to_string()),
                 ..arco_api::config::JwtConfig::default()

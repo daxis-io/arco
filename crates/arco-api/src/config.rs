@@ -7,6 +7,38 @@ use arco_core::{Error, Result};
 
 use crate::rate_limit::RateLimitConfig;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+/// Deployment posture for runtime guardrails.
+pub enum Posture {
+    /// Local development posture (debug allowed).
+    Dev,
+    /// Internal deployment posture (debug forbidden).
+    Private,
+    /// Public deployment posture (debug forbidden).
+    Public,
+}
+
+impl Posture {
+    /// Returns true when posture is dev.
+    #[must_use]
+    pub fn is_dev(self) -> bool {
+        matches!(self, Self::Dev)
+    }
+
+    /// Returns true when posture is public.
+    #[must_use]
+    pub fn is_public(self) -> bool {
+        matches!(self, Self::Public)
+    }
+}
+
+impl Default for Posture {
+    fn default() -> Self {
+        Self::Dev
+    }
+}
+
 /// Configuration for the Arco API server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -24,6 +56,10 @@ pub struct Config {
     /// When disabled:
     /// - `Authorization` is required (JWT claim extraction + signature verification)
     pub debug: bool,
+
+    /// Deployment posture (dev/private/public) for runtime guardrails.
+    #[serde(default)]
+    pub posture: Posture,
 
     /// CORS configuration.
     #[serde(default)]
@@ -92,6 +128,7 @@ impl Default for Config {
             http_port: 8080,
             grpc_port: 9090,
             debug: false,
+            posture: Posture::Dev,
             cors: CorsConfig::default(),
             jwt: JwtConfig::default(),
             rate_limit: RateLimitConfig::default(),
@@ -179,6 +216,8 @@ impl Config {
     /// - `ARCO_HTTP_PORT`
     /// - `ARCO_GRPC_PORT`
     /// - `ARCO_DEBUG`
+    /// - `ARCO_ENVIRONMENT`
+    /// - `ARCO_API_PUBLIC`
     /// - `ARCO_CORS_ALLOWED_ORIGINS` (comma-separated, or `*`)
     /// - `ARCO_CORS_MAX_AGE_SECONDS`
     /// - `ARCO_JWT_SECRET`
@@ -218,6 +257,8 @@ impl Config {
         if let Some(debug) = env_bool("ARCO_DEBUG")? {
             config.debug = debug;
         }
+
+        config.posture = posture_from_env()?;
 
         if let Some(origins) = env_string("ARCO_CORS_ALLOWED_ORIGINS") {
             config.cors.allowed_origins = parse_cors_allowed_origins(&origins);
@@ -297,6 +338,33 @@ impl Config {
 
         Ok(config)
     }
+}
+
+fn posture_from_env() -> Result<Posture> {
+    let environment = env_string("ARCO_ENVIRONMENT").ok_or_else(|| {
+        Error::InvalidInput("ARCO_ENVIRONMENT is required (dev|staging|prod)".to_string())
+    })?;
+    let api_public = env_bool("ARCO_API_PUBLIC")?.ok_or_else(|| {
+        Error::InvalidInput("ARCO_API_PUBLIC is required (true/false)".to_string())
+    })?;
+
+    posture_from_values(&environment, api_public)
+}
+
+fn posture_from_values(environment: &str, api_public: bool) -> Result<Posture> {
+    let environment = environment.to_ascii_lowercase();
+    let posture = match (environment.as_str(), api_public) {
+        ("dev", false) => Posture::Dev,
+        ("staging" | "prod", false) => Posture::Private,
+        ("dev" | "staging" | "prod", true) => Posture::Public,
+        _ => {
+            return Err(Error::InvalidInput(format!(
+                "ARCO_ENVIRONMENT must be one of dev, staging, prod (got {environment})"
+            )));
+        }
+    };
+
+    Ok(posture)
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -448,5 +516,28 @@ fn normalize_pem(pem: &str) -> String {
         trimmed.replace("\\n", "\n")
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn posture_rejects_invalid_environment() {
+        let err = posture_from_values("qa", false).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)));
+    }
+
+    #[test]
+    fn posture_maps_environment_and_public_flag() -> Result<()> {
+        assert_eq!(posture_from_values("dev", false)?, Posture::Dev);
+        assert_eq!(posture_from_values("DEV", false)?, Posture::Dev);
+        assert_eq!(posture_from_values("dev", true)?, Posture::Public);
+        assert_eq!(posture_from_values("staging", false)?, Posture::Private);
+        assert_eq!(posture_from_values("staging", true)?, Posture::Public);
+        assert_eq!(posture_from_values("prod", false)?, Posture::Private);
+        assert_eq!(posture_from_values("prod", true)?, Posture::Public);
+        Ok(())
     }
 }

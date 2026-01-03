@@ -283,14 +283,13 @@ pub async fn auth_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Result;
     use axum::http::{Request as AxumRequest, StatusCode};
 
     use crate::config::{Config, Posture};
     use crate::server::AppState;
 
     #[tokio::test]
-    async fn test_request_context_accepts_debug_headers_in_dev() -> Result<()> {
+    async fn test_request_context_accepts_debug_headers_in_dev() {
         let mut config = Config::default();
         config.debug = true;
         config.posture = Posture::Dev;
@@ -301,18 +300,20 @@ mod tests {
             .header("X-Tenant-Id", "tenant-1")
             .header("X-Workspace-Id", "workspace-1")
             .header("X-User-Id", "user-1")
-            .body(Body::empty())?;
+            .body(Body::empty())
+            .expect("request");
         let (mut parts, _body) = request.into_parts();
 
-        let ctx = RequestContext::from_request_parts(&mut parts, &state).await?;
+        let ctx = RequestContext::from_request_parts(&mut parts, &state)
+            .await
+            .expect("request context");
         assert_eq!(ctx.tenant, "tenant-1");
         assert_eq!(ctx.workspace, "workspace-1");
         assert_eq!(ctx.user_id.as_deref(), Some("user-1"));
-        Ok(())
     }
 
     #[tokio::test]
-    async fn test_request_context_requires_jwt_outside_dev() -> Result<()> {
+    async fn test_request_context_requires_jwt_outside_dev() {
         let mut config = Config::default();
         config.debug = true;
         config.posture = Posture::Private;
@@ -322,7 +323,8 @@ mod tests {
             .uri("/")
             .header("X-Tenant-Id", "tenant-1")
             .header("X-Workspace-Id", "workspace-1")
-            .body(Body::empty())?;
+            .body(Body::empty())
+            .expect("request");
         let (mut parts, _body) = request.into_parts();
 
         let err = RequestContext::from_request_parts(&mut parts, &state)
@@ -330,6 +332,5 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(err.message(), "Authorization header required");
-        Ok(())
     }
 }

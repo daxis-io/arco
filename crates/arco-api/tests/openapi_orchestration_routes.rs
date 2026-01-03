@@ -36,13 +36,19 @@ fn list_history_endpoints_do_not_document_404() -> Result<()> {
     let json = arco_api::openapi::openapi_json()?;
     let spec: serde_json::Value = serde_json::from_str(&json)?;
 
-    let ticks = &spec["paths"]["/api/v1/workspaces/{workspace_id}/schedules/{schedule_id}/ticks"]
-        ["get"]["responses"];
-    ensure!(ticks.get("404").is_none(), "unexpected 404 in ticks responses");
+    let ticks = &spec["paths"]["/api/v1/workspaces/{workspace_id}/schedules/{schedule_id}/ticks"]["get"]
+        ["responses"];
+    ensure!(
+        ticks.get("404").is_none(),
+        "unexpected 404 in ticks responses"
+    );
 
-    let evals = &spec["paths"]["/api/v1/workspaces/{workspace_id}/sensors/{sensor_id}/evals"]
-        ["get"]["responses"];
-    ensure!(evals.get("404").is_none(), "unexpected 404 in evals responses");
+    let evals = &spec["paths"]["/api/v1/workspaces/{workspace_id}/sensors/{sensor_id}/evals"]["get"]
+        ["responses"];
+    ensure!(
+        evals.get("404").is_none(),
+        "unexpected 404 in evals responses"
+    );
 
     Ok(())
 }

@@ -1383,6 +1383,101 @@
             "bearerAuth": []
           }
         ]
+      },
+      "post": {
+        "tags": [
+          "Orchestration"
+        ],
+        "summary": "Create a new backfill.",
+        "operationId": "create_backfill",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBackfillRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Existing backfill returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateBackfillResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Backfill accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateBackfillResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Workspace not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Idempotency conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Partition selector not supported",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnprocessableEntityResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     },
     "/api/v1/workspaces/{workspace_id}/backfills/{backfill_id}": {
@@ -3323,6 +3418,75 @@
           }
         }
       },
+      "CreateBackfillRequest": {
+        "type": "object",
+        "description": "Request to create a backfill.",
+        "required": [
+          "partitionSelector"
+        ],
+        "properties": {
+          "assetSelection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Assets to backfill."
+          },
+          "chunkSize": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Number of partitions per chunk (0 uses default).",
+            "minimum": 0
+          },
+          "clientRequestId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Client request ID for idempotency."
+          },
+          "maxConcurrentRuns": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Maximum concurrent chunk runs (0 uses default).",
+            "minimum": 0
+          },
+          "partitionSelector": {
+            "$ref": "#/components/schemas/PartitionSelectorRequest",
+            "description": "Partition selector."
+          }
+        }
+      },
+      "CreateBackfillResponse": {
+        "type": "object",
+        "description": "Response after creating a backfill.",
+        "required": [
+          "backfillId",
+          "acceptedEventId",
+          "acceptedAt"
+        ],
+        "properties": {
+          "acceptedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Time the event was accepted."
+          },
+          "acceptedEventId": {
+            "type": "string",
+            "description": "Event ID that was accepted."
+          },
+          "backfillId": {
+            "type": "string",
+            "description": "Backfill identifier."
+          }
+        }
+      },
       "CreateNamespaceRequest": {
         "type": "object",
         "description": "Request to create a namespace.",
@@ -4266,6 +4430,85 @@
           }
         }
       },
+      "PartitionSelectorRequest": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Range of partitions.",
+            "required": [
+              "start",
+              "end",
+              "type"
+            ],
+            "properties": {
+              "end": {
+                "type": "string",
+                "description": "End partition (inclusive)."
+              },
+              "start": {
+                "type": "string",
+                "description": "Start partition (inclusive)."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "range"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Explicit list of partitions.",
+            "required": [
+              "partitions",
+              "type"
+            ],
+            "properties": {
+              "partitions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Partition keys."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "explicit"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Filter-based selection.",
+            "required": [
+              "filters",
+              "type"
+            ],
+            "properties": {
+              "filters": {
+                "type": "object",
+                "description": "Filter expressions.",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "filter"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Partition selector request."
+      },
       "PartitionSelectorResponse": {
         "oneOf": [
           {
@@ -4816,7 +5059,7 @@
               "null"
             ],
             "format": "date-time",
-            "description": "Last scheduled_for timestamp that was processed."
+            "description": "Last `scheduled_for` timestamp that was processed."
           },
           "lastTickId": {
             "type": [
@@ -5683,6 +5926,29 @@
           "state": {
             "$ref": "#/components/schemas/RunStateResponse",
             "description": "Current run state."
+          }
+        }
+      },
+      "UnprocessableEntityResponse": {
+        "type": "object",
+        "description": "Error response for unsupported partition selectors.",
+        "required": [
+          "error",
+          "message",
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable error code."
+          },
+          "error": {
+            "type": "string",
+            "description": "Error category."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable error message."
           }
         }
       },

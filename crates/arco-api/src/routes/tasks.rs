@@ -983,8 +983,8 @@ pub fn routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Result;
     use crate::config::Posture;
+    use anyhow::Result;
     use axum::body::Body as AxumBody;
     use axum::http::Request as AxumRequest;
     use axum::routing::get;

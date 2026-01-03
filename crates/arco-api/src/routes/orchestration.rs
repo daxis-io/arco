@@ -24,7 +24,7 @@ use std::sync::Arc;
 use axum::extract::Query as AxumQuery;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
@@ -36,8 +36,9 @@ use utoipa::{IntoParams, ToSchema};
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
 use crate::orchestration_compaction::compact_orchestration_events;
+use crate::paths::backfill_idempotency_path;
 use crate::server::AppState;
-use arco_core::{WritePrecondition, WriteResult};
+use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::{
     BackfillChunkRow, BackfillRow, FoldState, MicroCompactor, PartitionStatusRow, RunRow,
@@ -436,7 +437,7 @@ pub struct RunRequestResponse {
 pub struct ScheduleResponse {
     /// Schedule identifier.
     pub schedule_id: String,
-    /// Last scheduled_for timestamp that was processed.
+    /// Last `scheduled_for` timestamp that was processed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_scheduled_for: Option<DateTime<Utc>>,
     /// Last tick ID that was processed.
@@ -596,6 +597,76 @@ pub struct ListSensorEvalsResponse {
 // ============================================================================
 // Backfill API Types
 // ============================================================================
+
+const DEFAULT_BACKFILL_CHUNK_SIZE: u32 = 10;
+const DEFAULT_BACKFILL_MAX_CONCURRENT_RUNS: u32 = 2;
+
+/// Request to create a backfill.
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateBackfillRequest {
+    /// Assets to backfill.
+    #[serde(default)]
+    pub asset_selection: Vec<String>,
+    /// Partition selector.
+    pub partition_selector: PartitionSelectorRequest,
+    /// Client request ID for idempotency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_request_id: Option<String>,
+    /// Number of partitions per chunk (0 uses default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_size: Option<u32>,
+    /// Maximum concurrent chunk runs (0 uses default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_runs: Option<u32>,
+}
+
+/// Response after creating a backfill.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateBackfillResponse {
+    /// Backfill identifier.
+    pub backfill_id: String,
+    /// Event ID that was accepted.
+    pub accepted_event_id: String,
+    /// Time the event was accepted.
+    pub accepted_at: DateTime<Utc>,
+}
+
+/// Partition selector request.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PartitionSelectorRequest {
+    /// Range of partitions.
+    Range {
+        /// Start partition (inclusive).
+        start: String,
+        /// End partition (inclusive).
+        end: String,
+    },
+    /// Explicit list of partitions.
+    Explicit {
+        /// Partition keys.
+        partitions: Vec<String>,
+    },
+    /// Filter-based selection.
+    Filter {
+        /// Filter expressions.
+        filters: HashMap<String, String>,
+    },
+}
+
+/// Error response for unsupported partition selectors.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UnprocessableEntityResponse {
+    /// Error category.
+    pub error: String,
+    /// Human-readable error message.
+    pub message: String,
+    /// Stable error code.
+    pub code: String,
+}
 
 /// Backfill response.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -863,11 +934,214 @@ fn parse_pagination(limit: u32, cursor: Option<&str>) -> Result<(usize, usize), 
     }
 
     let offset = cursor
-        .map(|value| value.parse::<usize>().map_err(|_| ApiError::bad_request("invalid cursor")))
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| ApiError::bad_request("invalid cursor"))
+        })
         .transpose()?
         .unwrap_or(0);
 
     Ok((limit as usize, offset))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BackfillIdempotencyRecord {
+    idempotency_key: String,
+    backfill_id: String,
+    accepted_event_id: String,
+    accepted_at: DateTime<Utc>,
+    fingerprint: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackfillFingerprintPayload {
+    asset_selection: Vec<String>,
+    partitions: Vec<String>,
+    chunk_size: u32,
+    max_concurrent_runs: u32,
+}
+
+struct BackfillCreateInput {
+    asset_selection: Vec<String>,
+    partition_selector: PartitionSelector,
+    partition_keys: Vec<String>,
+    chunk_size: u32,
+    max_concurrent_runs: u32,
+}
+
+fn compute_backfill_fingerprint(
+    asset_selection: &[String],
+    partitions: &[String],
+    chunk_size: u32,
+    max_concurrent_runs: u32,
+) -> Result<String, ApiError> {
+    let payload = BackfillFingerprintPayload {
+        asset_selection: asset_selection.to_vec(),
+        partitions: partitions.to_vec(),
+        chunk_size,
+        max_concurrent_runs,
+    };
+    let json = serde_json::to_vec(&payload).map_err(|e| {
+        ApiError::internal(format!("failed to serialize backfill fingerprint: {e}"))
+    })?;
+    let hash = Sha256::digest(&json);
+    Ok(hex::encode(hash))
+}
+
+async fn load_backfill_idempotency_record(
+    storage: &ScopedStorage,
+    idempotency_key: &str,
+) -> Result<Option<BackfillIdempotencyRecord>, ApiError> {
+    let path = backfill_idempotency_path(idempotency_key);
+    match storage.get_raw(&path).await {
+        Ok(bytes) => {
+            let record: BackfillIdempotencyRecord =
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    ApiError::internal(format!("failed to parse backfill idempotency record: {e}"))
+                })?;
+            Ok(Some(record))
+        }
+        Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => Ok(None),
+        Err(err) => Err(ApiError::internal(format!(
+            "failed to read backfill idempotency record: {err}"
+        ))),
+    }
+}
+
+async fn store_backfill_idempotency_record(
+    storage: &ScopedStorage,
+    record: &BackfillIdempotencyRecord,
+) -> Result<(), ApiError> {
+    let record_json = serde_json::to_string(record).map_err(|e| {
+        ApiError::internal(format!(
+            "failed to serialize backfill idempotency record: {e}"
+        ))
+    })?;
+    let record_path = backfill_idempotency_path(&record.idempotency_key);
+    let result = storage
+        .put_raw(
+            &record_path,
+            Bytes::from(record_json),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!("failed to store backfill idempotency record: {e}"))
+        })?;
+
+    if matches!(result, WriteResult::PreconditionFailed { .. }) {
+        tracing::warn!(
+            idempotency_key = %record.idempotency_key,
+            backfill_id = %record.backfill_id,
+            "backfill idempotency record already exists after write"
+        );
+    }
+
+    Ok(())
+}
+
+fn explicit_partition_selector(
+    partitions: Vec<String>,
+) -> Result<(PartitionSelector, Vec<String>), ApiError> {
+    if partitions.is_empty() {
+        return Err(ApiError::bad_request("partition selector cannot be empty"));
+    }
+    if partitions.iter().any(String::is_empty) {
+        return Err(ApiError::bad_request("partition key cannot be empty"));
+    }
+
+    Ok((
+        PartitionSelector::Explicit {
+            partition_keys: partitions.clone(),
+        },
+        partitions,
+    ))
+}
+
+fn unsupported_partition_selector_response() -> UnprocessableEntityResponse {
+    UnprocessableEntityResponse {
+        error: "unprocessable_entity".to_string(),
+        code: "PARTITION_SELECTOR_NOT_SUPPORTED".to_string(),
+        message: "Only explicit partition lists are supported. Range and filter selectors require a PartitionResolver (not yet implemented).".to_string(),
+    }
+}
+
+async fn resolve_backfill_idempotency(
+    storage: &ScopedStorage,
+    idempotency_key: &str,
+    fingerprint: &str,
+) -> Result<Option<CreateBackfillResponse>, ApiError> {
+    if let Some(existing) = load_backfill_idempotency_record(storage, idempotency_key).await? {
+        if existing.fingerprint == fingerprint {
+            return Ok(Some(CreateBackfillResponse {
+                backfill_id: existing.backfill_id,
+                accepted_event_id: existing.accepted_event_id,
+                accepted_at: existing.accepted_at,
+            }));
+        }
+
+        return Err(ApiError::conflict(
+            "idempotency key already used for a different backfill",
+        ));
+    }
+
+    Ok(None)
+}
+
+async fn append_backfill_created_event(
+    state: &AppState,
+    ctx: &RequestContext,
+    workspace_id: &str,
+    input: BackfillCreateInput,
+    idempotency_key: &str,
+    storage: &ScopedStorage,
+    fingerprint: String,
+) -> Result<CreateBackfillResponse, ApiError> {
+    let backfill_id = Ulid::new().to_string();
+    let total_partitions = u32::try_from(input.partition_keys.len()).unwrap_or(u32::MAX);
+    let event = OrchestrationEvent::new(
+        &ctx.tenant,
+        workspace_id,
+        OrchestrationEventData::BackfillCreated {
+            backfill_id: backfill_id.clone(),
+            client_request_id: idempotency_key.to_string(),
+            asset_selection: input.asset_selection,
+            partition_selector: input.partition_selector,
+            total_partitions,
+            chunk_size: input.chunk_size,
+            max_concurrent_runs: input.max_concurrent_runs,
+            parent_backfill_id: None,
+        },
+    );
+
+    let accepted_event_id = event.event_id.clone();
+    let accepted_at = event.timestamp;
+
+    let ledger = LedgerWriter::new(storage.clone());
+    let event_path = LedgerWriter::event_path(&event);
+    ledger
+        .append(event)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to write BackfillCreated event: {e}")))?;
+
+    compact_orchestration_events(&state.config, storage.clone(), vec![event_path]).await?;
+
+    let record = BackfillIdempotencyRecord {
+        idempotency_key: idempotency_key.to_string(),
+        backfill_id: backfill_id.clone(),
+        accepted_event_id: accepted_event_id.clone(),
+        accepted_at,
+        fingerprint,
+    };
+    store_backfill_idempotency_record(storage, &record).await?;
+
+    Ok(CreateBackfillResponse {
+        backfill_id,
+        accepted_event_id,
+        accepted_at,
+    })
 }
 
 fn user_id_for_events(ctx: &RequestContext) -> String {
@@ -1214,7 +1488,7 @@ fn map_sensor_eval(row: &SensorEvalRow) -> SensorEvalResponse {
         cursor_after: row.cursor_after.clone(),
         evaluated_at: row.evaluated_at,
         status: map_sensor_eval_status(&row.status),
-        run_requests_count: row.run_requests.len() as u32,
+        run_requests_count: u32::try_from(row.run_requests.len()).unwrap_or(u32::MAX),
     }
 }
 
@@ -1246,7 +1520,7 @@ fn map_partition_selector(selector: &PartitionSelector) -> PartitionSelectorResp
 
 fn build_chunk_counts(chunks: &[&BackfillChunkRow]) -> ChunkCounts {
     let mut counts = ChunkCounts {
-        total: chunks.len() as u32,
+        total: u32::try_from(chunks.len()).unwrap_or(u32::MAX),
         ..Default::default()
     };
 
@@ -1346,7 +1620,7 @@ fn map_partition_status(row: &PartitionStatusRow) -> PartitionStatusApiResponse 
     }
 }
 
-fn paginate<T: Clone>(items: Vec<T>, limit: usize, offset: usize) -> (Vec<T>, Option<String>) {
+fn paginate<T: Clone>(items: &[T], limit: usize, offset: usize) -> (Vec<T>, Option<String>) {
     let end = (offset + limit).min(items.len());
     let page = items.get(offset..end).unwrap_or_default().to_vec();
     let next_cursor = if end < items.len() {
@@ -2274,7 +2548,10 @@ pub(crate) async fn list_schedules(
     AxumQuery(query): AxumQuery<ListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
-    let (limit, offset) = parse_pagination(query.limit.unwrap_or(DEFAULT_LIMIT), query.cursor.as_deref())?;
+    let (limit, offset) = parse_pagination(
+        query.limit.unwrap_or(DEFAULT_LIMIT),
+        query.cursor.as_deref(),
+    )?;
     let fold_state = load_orchestration_state(&ctx, &state).await?;
 
     let mut schedules: Vec<ScheduleResponse> = fold_state
@@ -2284,7 +2561,7 @@ pub(crate) async fn list_schedules(
         .collect();
     schedules.sort_by(|a, b| a.schedule_id.cmp(&b.schedule_id));
 
-    let (page, next_cursor) = paginate(schedules, limit, offset);
+    let (page, next_cursor) = paginate(&schedules, limit, offset);
 
     Ok(Json(ListSchedulesResponse {
         schedules: page,
@@ -2347,7 +2624,10 @@ pub(crate) async fn list_schedule_ticks(
     AxumQuery(query): AxumQuery<ListTicksQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
-    let (limit, offset) = parse_pagination(query.limit.unwrap_or(DEFAULT_LIMIT), query.cursor.as_deref())?;
+    let (limit, offset) = parse_pagination(
+        query.limit.unwrap_or(DEFAULT_LIMIT),
+        query.cursor.as_deref(),
+    )?;
     let fold_state = load_orchestration_state(&ctx, &state).await?;
 
     let mut ticks: Vec<ScheduleTickResponse> = fold_state
@@ -2359,7 +2639,7 @@ pub(crate) async fn list_schedule_ticks(
     filter_ticks_by_status(&mut ticks, query.status);
     ticks.sort_by(|a, b| b.scheduled_for.cmp(&a.scheduled_for));
 
-    let (page, next_cursor) = paginate(ticks, limit, offset);
+    let (page, next_cursor) = paginate(&ticks, limit, offset);
 
     Ok(Json(ListScheduleTicksResponse {
         ticks: page,
@@ -2393,7 +2673,10 @@ pub(crate) async fn list_sensors(
     AxumQuery(query): AxumQuery<ListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
-    let (limit, offset) = parse_pagination(query.limit.unwrap_or(DEFAULT_LIMIT), query.cursor.as_deref())?;
+    let (limit, offset) = parse_pagination(
+        query.limit.unwrap_or(DEFAULT_LIMIT),
+        query.cursor.as_deref(),
+    )?;
     let fold_state = load_orchestration_state(&ctx, &state).await?;
 
     let mut sensors: Vec<SensorResponse> = fold_state
@@ -2403,7 +2686,7 @@ pub(crate) async fn list_sensors(
         .collect();
     sensors.sort_by(|a, b| a.sensor_id.cmp(&b.sensor_id));
 
-    let (page, next_cursor) = paginate(sensors, limit, offset);
+    let (page, next_cursor) = paginate(&sensors, limit, offset);
 
     Ok(Json(ListSensorsResponse {
         sensors: page,
@@ -2465,7 +2748,10 @@ pub(crate) async fn list_sensor_evals(
     AxumQuery(query): AxumQuery<ListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
-    let (limit, offset) = parse_pagination(query.limit.unwrap_or(DEFAULT_LIMIT), query.cursor.as_deref())?;
+    let (limit, offset) = parse_pagination(
+        query.limit.unwrap_or(DEFAULT_LIMIT),
+        query.cursor.as_deref(),
+    )?;
     let fold_state = load_orchestration_state(&ctx, &state).await?;
 
     let mut evals: Vec<SensorEvalResponse> = fold_state
@@ -2476,7 +2762,7 @@ pub(crate) async fn list_sensor_evals(
         .collect();
     evals.sort_by(|a, b| b.evaluated_at.cmp(&a.evaluated_at));
 
-    let (page, next_cursor) = paginate(evals, limit, offset);
+    let (page, next_cursor) = paginate(&evals, limit, offset);
 
     Ok(Json(ListSensorEvalsResponse {
         evals: page,
@@ -2487,6 +2773,111 @@ pub(crate) async fn list_sensor_evals(
 // ============================================================================
 // Backfill Routes
 // ============================================================================
+
+/// Create a new backfill.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/backfills",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID")
+    ),
+    request_body = CreateBackfillRequest,
+    responses(
+        (status = 202, description = "Backfill accepted", body = CreateBackfillResponse),
+        (status = 200, description = "Existing backfill returned", body = CreateBackfillResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorBody),
+        (status = 409, description = "Idempotency conflict", body = ApiErrorBody),
+        (status = 422, description = "Partition selector not supported", body = UnprocessableEntityResponse),
+        (status = 404, description = "Workspace not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn create_backfill(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path(workspace_id): Path<String>,
+    Json(request): Json<CreateBackfillRequest>,
+) -> Result<Response, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+
+    let CreateBackfillRequest {
+        asset_selection,
+        partition_selector,
+        client_request_id,
+        chunk_size,
+        max_concurrent_runs,
+    } = request;
+
+    if asset_selection.is_empty() {
+        return Err(ApiError::bad_request("assetSelection cannot be empty"));
+    }
+
+    if asset_selection.len() > 1 {
+        return Err(ApiError::bad_request(
+            "multi-asset backfills are not supported yet",
+        ));
+    }
+
+    let idempotency_key = client_request_id
+        .or_else(|| ctx.idempotency_key.clone())
+        .ok_or_else(|| ApiError::bad_request("clientRequestId or Idempotency-Key is required"))?;
+
+    let (partition_selector, partition_keys) = match partition_selector {
+        PartitionSelectorRequest::Explicit { partitions } => {
+            explicit_partition_selector(partitions)?
+        }
+        PartitionSelectorRequest::Range { .. } | PartitionSelectorRequest::Filter { .. } => {
+            let response = unsupported_partition_selector_response();
+            return Ok((StatusCode::UNPROCESSABLE_ENTITY, Json(response)).into_response());
+        }
+    };
+
+    let chunk_size = match chunk_size {
+        Some(0) | None => DEFAULT_BACKFILL_CHUNK_SIZE,
+        Some(value) => value,
+    };
+    let max_concurrent_runs = match max_concurrent_runs {
+        Some(0) | None => DEFAULT_BACKFILL_MAX_CONCURRENT_RUNS,
+        Some(value) => value,
+    };
+    let input = BackfillCreateInput {
+        asset_selection,
+        partition_selector,
+        partition_keys,
+        chunk_size,
+        max_concurrent_runs,
+    };
+
+    let fingerprint = compute_backfill_fingerprint(
+        &input.asset_selection,
+        &input.partition_keys,
+        input.chunk_size,
+        input.max_concurrent_runs,
+    )?;
+
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+
+    if let Some(existing) =
+        resolve_backfill_idempotency(&storage, &idempotency_key, &fingerprint).await?
+    {
+        return Ok((StatusCode::OK, Json(existing)).into_response());
+    }
+
+    let response = append_backfill_created_event(
+        state.as_ref(),
+        &ctx,
+        &workspace_id,
+        input,
+        &idempotency_key,
+        &storage,
+        fingerprint,
+    )
+    .await?;
+
+    Ok((StatusCode::ACCEPTED, Json(response)).into_response())
+}
 
 /// List backfills.
 #[utoipa::path(
@@ -2511,7 +2902,10 @@ pub(crate) async fn list_backfills(
     AxumQuery(query): AxumQuery<ListBackfillsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
-    let (limit, offset) = parse_pagination(query.limit.unwrap_or(DEFAULT_LIMIT), query.cursor.as_deref())?;
+    let (limit, offset) = parse_pagination(
+        query.limit.unwrap_or(DEFAULT_LIMIT),
+        query.cursor.as_deref(),
+    )?;
     let fold_state = load_orchestration_state(&ctx, &state).await?;
 
     let counts_by_backfill = build_chunk_counts_index(fold_state.backfill_chunks.values());
@@ -2533,7 +2927,7 @@ pub(crate) async fn list_backfills(
 
     backfills.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-    let (page, next_cursor) = paginate(backfills, limit, offset);
+    let (page, next_cursor) = paginate(&backfills, limit, offset);
 
     Ok(Json(ListBackfillsResponse {
         backfills: page,
@@ -2603,7 +2997,10 @@ pub(crate) async fn list_backfill_chunks(
     AxumQuery(query): AxumQuery<ListChunksQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
-    let (limit, offset) = parse_pagination(query.limit.unwrap_or(DEFAULT_LIMIT), query.cursor.as_deref())?;
+    let (limit, offset) = parse_pagination(
+        query.limit.unwrap_or(DEFAULT_LIMIT),
+        query.cursor.as_deref(),
+    )?;
     let fold_state = load_orchestration_state(&ctx, &state).await?;
 
     // Verify backfill exists
@@ -2626,7 +3023,7 @@ pub(crate) async fn list_backfill_chunks(
 
     chunks.sort_by(|a, b| a.chunk_index.cmp(&b.chunk_index));
 
-    let (page, next_cursor) = paginate(chunks, limit, offset);
+    let (page, next_cursor) = paginate(&chunks, limit, offset);
 
     Ok(Json(ListBackfillChunksResponse {
         chunks: page,
@@ -2662,7 +3059,10 @@ pub(crate) async fn list_partitions(
     AxumQuery(query): AxumQuery<ListPartitionsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
-    let (limit, offset) = parse_pagination(query.limit.unwrap_or(DEFAULT_LIMIT), query.cursor.as_deref())?;
+    let (limit, offset) = parse_pagination(
+        query.limit.unwrap_or(DEFAULT_LIMIT),
+        query.cursor.as_deref(),
+    )?;
     let fold_state = load_orchestration_state(&ctx, &state).await?;
 
     let mut partitions: Vec<PartitionStatusApiResponse> = fold_state
@@ -2688,7 +3088,7 @@ pub(crate) async fn list_partitions(
             .then_with(|| a.partition_key.cmp(&b.partition_key))
     });
 
-    let (page, next_cursor) = paginate(partitions, limit, offset);
+    let (page, next_cursor) = paginate(&partitions, limit, offset);
 
     Ok(Json(ListPartitionsResponse {
         partitions: page,
@@ -2731,22 +3131,28 @@ pub(crate) async fn get_asset_partition_summary(
         )));
     }
 
-    let total = partitions.len() as u32;
-    let materialized = partitions
-        .iter()
-        .filter(|p| p.last_materialization_run_id.is_some())
-        .count() as u32;
-    let stale = partitions
-        .iter()
-        .filter(|p| p.stale_since.is_some())
-        .count() as u32;
-    let missing = total - materialized;
+    let total = u32::try_from(partitions.len()).unwrap_or(u32::MAX);
+    let materialized = u32::try_from(
+        partitions
+            .iter()
+            .filter(|p| p.last_materialization_run_id.is_some())
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    let stale_count = u32::try_from(
+        partitions
+            .iter()
+            .filter(|p| p.stale_since.is_some())
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    let missing = total.saturating_sub(materialized);
 
     Ok(Json(AssetPartitionSummaryResponse {
         asset_key,
         total_partitions: total,
         materialized_partitions: materialized,
-        stale_partitions: stale,
+        stale_partitions: stale_count,
         missing_partitions: missing,
     }))
 }
@@ -2803,7 +3209,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             get(list_sensor_evals),
         )
         // Backfills
-        .route("/workspaces/:workspace_id/backfills", get(list_backfills))
+        .route(
+            "/workspaces/:workspace_id/backfills",
+            post(create_backfill).get(list_backfills),
+        )
         .route(
             "/workspaces/:workspace_id/backfills/:backfill_id",
             get(get_backfill),

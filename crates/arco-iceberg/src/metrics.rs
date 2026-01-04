@@ -57,6 +57,7 @@ pub const GC_RECEIPTS_DELETED: &str = "iceberg_gc_receipts_deleted_total";
 
 /// GC duration histogram.
 pub const GC_DURATION: &str = "iceberg_gc_duration_seconds";
+const UNMATCHED_ENDPOINT: &str = "unmatched";
 
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 static METRICS_REGISTERED: OnceLock<()> = OnceLock::new();
@@ -155,14 +156,18 @@ pub fn prometheus_handle() -> Option<PrometheusHandle> {
     PROMETHEUS_HANDLE.get().cloned()
 }
 
+fn endpoint_label<B>(request: &Request<B>) -> String {
+    request.extensions().get::<MatchedPath>().map_or_else(
+        || UNMATCHED_ENDPOINT.to_string(),
+        |path| path.as_str().to_string(),
+    )
+}
+
 /// Middleware that records request metrics.
 pub async fn metrics_middleware(request: Request, next: Next) -> Response {
     let start = Instant::now();
 
-    let path = request.extensions().get::<MatchedPath>().map_or_else(
-        || request.uri().path().to_string(),
-        |mp| mp.as_str().to_string(),
-    );
+    let path = endpoint_label(&request);
     let method = request.method().to_string();
 
     let response = next.run(request).await;
@@ -174,7 +179,6 @@ pub async fn metrics_middleware(request: Request, next: Next) -> Response {
     let labels = [
         ("endpoint", path.clone()),
         ("method", method.clone()),
-        ("status", status.clone()),
         ("status_class", status_class.to_string()),
     ];
 
@@ -213,33 +217,21 @@ pub fn record_cas_conflict(endpoint: &str, method: &str, operation: &str) {
 // ============================================================================
 
 /// Records a completed table reconciliation.
-pub fn record_reconciler_table(tenant: &str, workspace: &str) {
+pub fn record_reconciler_table() {
     register_metrics();
-    let labels = [
-        ("tenant", tenant.to_string()),
-        ("workspace", workspace.to_string()),
-    ];
-    counter!(RECONCILER_TABLES_PROCESSED, &labels).increment(1);
+    counter!(RECONCILER_TABLES_PROCESSED).increment(1);
 }
 
 /// Records backfilled receipts during reconciliation.
-pub fn record_reconciler_receipts(tenant: &str, workspace: &str, count: u64) {
+pub fn record_reconciler_receipts(count: u64) {
     register_metrics();
-    let labels = [
-        ("tenant", tenant.to_string()),
-        ("workspace", workspace.to_string()),
-    ];
-    counter!(RECONCILER_RECEIPTS_BACKFILLED, &labels).increment(count);
+    counter!(RECONCILER_RECEIPTS_BACKFILLED).increment(count);
 }
 
 /// Records reconciliation run duration.
-pub fn record_reconciler_duration(tenant: &str, workspace: &str, duration_secs: f64) {
+pub fn record_reconciler_duration(duration_secs: f64) {
     register_metrics();
-    let labels = [
-        ("tenant", tenant.to_string()),
-        ("workspace", workspace.to_string()),
-    ];
-    histogram!(RECONCILER_DURATION, &labels).record(duration_secs);
+    histogram!(RECONCILER_DURATION).record(duration_secs);
 }
 
 // ============================================================================
@@ -325,6 +317,29 @@ pub fn serve_metrics() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::routing::get;
+    use tower::Service;
+
+    fn metric_lines<'a>(metrics: &'a str, name: &str) -> Vec<&'a str> {
+        metrics
+            .lines()
+            .filter(|line| line.starts_with(name))
+            .collect()
+    }
+
+    fn assert_metric_lines_contain(metrics: &str, name: &str, needle: &str) {
+        let lines = metric_lines(metrics, name);
+        assert!(!lines.is_empty());
+        assert!(lines.iter().any(|line| line.contains(needle)));
+    }
+
+    fn assert_metric_lines_do_not_contain(metrics: &str, name: &str, needle: &str) {
+        let lines = metric_lines(metrics, name);
+        assert!(!lines.is_empty());
+        assert!(lines.iter().all(|line| !line.contains(needle)));
+    }
 
     #[test]
     fn test_status_class() {
@@ -339,5 +354,34 @@ mod tests {
         assert!(!should_record_error(StatusCode::NO_CONTENT));
         assert!(should_record_error(StatusCode::BAD_REQUEST));
         assert!(should_record_error(StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[test]
+    fn test_endpoint_label_unmatched() {
+        let request = Request::builder()
+            .uri("/missing")
+            .body(Body::empty())
+            .unwrap();
+        let label = endpoint_label(&request);
+        assert_eq!(label, UNMATCHED_ENDPOINT);
+    }
+
+    #[tokio::test]
+    async fn test_request_metrics_labels() {
+        let handle = init_metrics();
+        let app = Router::new()
+            .route("/tables/:id", get(|| async { StatusCode::OK }))
+            .route_layer(axum::middleware::from_fn(metrics_middleware));
+        let request = Request::builder()
+            .uri("/tables/123")
+            .body(Body::empty())
+            .unwrap();
+        let mut service = app.into_service::<Body>();
+        let _response = service.call(request).await.unwrap();
+        let metrics = handle.render();
+        assert_metric_lines_contain(&metrics, ICEBERG_REQUEST_TOTAL, "endpoint=\"/tables/:id\"");
+        assert!(!metrics.contains("endpoint=\"/tables/123\""));
+        assert_metric_lines_do_not_contain(&metrics, ICEBERG_REQUEST_TOTAL, "status=\"");
+        assert_metric_lines_do_not_contain(&metrics, ICEBERG_REQUEST_DURATION, "status=\"");
     }
 }

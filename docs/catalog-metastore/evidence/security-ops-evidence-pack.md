@@ -3,7 +3,7 @@
 **Date:** 2026-01-02  
 **Commit:** 966b8eecce6348821c258e38553ed945e314cfde  
 **Scope:** Catalog/metastore security posture (API authN/authZ, storage isolation & IAM, read-path URL minting, observability/monitoring, Iceberg REST + credential vending)  
-**Overall status:** ⚠️ **Not audit-ready** (P0 gaps remain: missing security audit trail, `/metrics` exposure in public mode, JWT issuer/audience policy not enforced by default, and Iceberg REST baseline/credential vending not GA-ready; see `crates/arco-api/src/server.rs:379`, `infra/terraform/variables.tf:145`, `crates/arco-api/src/config.rs:302`, `crates/arco-api/src/server.rs:397`).
+**Overall status:** ⚠️ **Not audit-ready** (P0 gaps remain: missing security audit trail and Iceberg REST baseline/credential vending not GA-ready; API `/metrics` is blocked in public posture but compactor `/metrics` remains unauthenticated; see `crates/arco-api/src/server.rs:374`, `crates/arco-api/src/server.rs:384`, `crates/arco-compactor/src/main.rs:963`, `crates/arco-api/src/server.rs:402`).
 
 ## Status Legend
 
@@ -19,15 +19,15 @@
 
 | Area | Status | Severity | Confidence | Verification | Key Evidence (file:line) | Primary Risks | Next Actions |
 |------|--------|----------|------------|--------------|--------------------------|---------------|--------------|
-| GCS IAM prefix scoping | ⚠️ | P0 | Medium | Terraform + env test needed | `infra/terraform/iam_conditions.tf:1`, `infra/terraform/iam_conditions.tf:28`, `infra/terraform/iam_conditions.tf:54` | Conditional IAM semantics for `list` unverified; bucket public access prevention not enforced | Add IAM semantics verification (sandbox env); enforce `public_access_prevention` |
+| GCS IAM prefix scoping | ⚠️ | P0 | Medium | Terraform + env test needed | `infra/terraform/iam_conditions.tf:1`, `infra/terraform/iam_conditions.tf:28`, `infra/terraform/iam_conditions.tf:54`, `infra/terraform/main.tf:63` | Conditional IAM semantics for `list` unverified | Add IAM semantics verification (sandbox env) |
 | Service accounts & Cloud Run isolation | ✅ | P0 | High | Terraform | `infra/terraform/iam.tf:23`, `infra/terraform/iam.tf:67`, `infra/terraform/iam.tf:75`, `infra/terraform/cloud_run.tf:28`, `infra/terraform/cloud_run.tf:173`, `infra/terraform/cloud_run_job.tf:16` | Misconfig of `api_public` + unauthenticated `/metrics` | Keep API internal by default; protect `/metrics` when public |
-| API auth (JWT + debug headers) | ⚠️ | P0 | High | Code review | `crates/arco-api/src/context.rs:80`, `crates/arco-api/src/context.rs:111`, `infra/terraform/cloud_run.tf:94` | Issuer/audience optional by default; no JWKS/rotation | Make `iss`/`aud` policy P0; track JWKS backlog |
-| Runtime posture contract (dev/private/public) | ✅ | P0 | Medium | Code + tests | `crates/arco-api/src/config.rs:10`, `crates/arco-api/src/config.rs:343`, `crates/arco-api/src/server.rs:572`, `infra/terraform/cloud_run.tf:119`, `infra/terraform/cloud_run.tf:125` | Posture depends on correct env/ingress wiring | Add deployment validation for `ARCO_ENVIRONMENT`/`ARCO_API_PUBLIC` and keep guardrail tests |
+| API auth (JWT + debug headers) | ⚠️ | P0 | High | Code review | `crates/arco-api/src/context.rs:80`, `crates/arco-api/src/context.rs:125`, `crates/arco-api/src/context.rs:246`, `crates/arco-api/src/server.rs:615`, `crates/arco-api/tests/api_integration.rs:1394`, `infra/terraform/cloud_run.tf:94` | JWKS/rotation not implemented | Track JWKS backlog |
+| Runtime posture contract (dev/private/public) | ✅ | P0 | Medium | Code + tests | `crates/arco-api/src/config.rs:13`, `crates/arco-api/src/config.rs:343`, `crates/arco-api/src/config.rs:545`, `crates/arco-api/src/server.rs:578`, `crates/arco-api/src/server.rs:784`, `infra/terraform/cloud_run.tf:119`, `infra/terraform/cloud_run.tf:125` | Posture depends on correct env/ingress wiring | Add deployment validation for `ARCO_ENVIRONMENT`/`ARCO_API_PUBLIC` and keep guardrail tests |
 | Tenant/workspace storage isolation | ✅ | P0 | High | Code + tests | `crates/arco-core/src/scoped_storage.rs:1`, `crates/arco-core/src/scoped_storage.rs:115`, `crates/arco-core/src/scoped_storage.rs:821` | If debug is enabled (dev posture), scope selection becomes attacker-controlled | Keep guardrail + add e2e coverage |
 | Browser-direct read path (signed URLs) | ✅ | P0 | High | Code review | `crates/arco-api/src/routes/browser.rs:5`, `crates/arco-api/src/routes/browser.rs:119`, `crates/arco-catalog/src/reader.rs:494` | URL secrets could leak via logs if misused; audit event at URL mint time missing | Add structured audit event for URL mint allow/deny; enforce redaction wrappers |
-| Observability & monitoring | ⚠️ | P1 | Medium | Code + infra | `crates/arco-core/src/observability.rs:43`, `crates/arco-api/src/metrics.rs:41`, `infra/monitoring/otel-collector.yaml:1` | No structured audit events; `/metrics` unauthenticated; high-cardinality tenant labels | Add audit schema + storage plan; limit metrics labels; protect `/metrics` |
+| Observability & monitoring | ⚠️ | P1 | Medium | Code + infra | `crates/arco-core/src/observability.rs:43`, `crates/arco-api/src/metrics.rs:41`, `crates/arco-api/src/server.rs:384`, `crates/arco-compactor/src/main.rs:963`, `infra/monitoring/otel-collector.yaml:1` | Auth + URL mint audit events implemented; remaining instrumentation is P1; API `/metrics` blocked in public posture but compactor remains unauthenticated; metrics labels are bounded but must stay regression-tested | Keep compactor internal or add metrics auth; keep label tests; add credential vending + Iceberg commit audit in P1 |
 | Iceberg REST surface | 🔨 | P0 | Medium | Code review | `crates/arco-api/src/server.rs:219`, `crates/arco-iceberg/src/router.rs:37`, `crates/arco-iceberg/src/types/config.rs:8` | Many PRD endpoints missing; query params declared but ignored | Slice PRs for endpoint completeness + parameter parsing |
-| Iceberg credential vending | ❌ | P0 | High | Code review | `crates/arco-iceberg/src/state.rs:117`, `crates/arco-api/src/server.rs:397`, `crates/arco-iceberg/src/routes/tables.rs:497` | No provider wired; no vend/deny audit trail | Implement provider + wire into API; add vend/deny audit logging |
+| Iceberg credential vending | ❌ | P0 | High | Code review | `crates/arco-iceberg/src/state.rs:117`, `crates/arco-api/src/server.rs:402`, `crates/arco-iceberg/src/routes/tables.rs:497` | No provider wired; no vend/deny audit trail | Implement provider + wire into API; add vend/deny audit logging |
 
 ---
 
@@ -69,7 +69,7 @@ If these assumptions change, evidence must be re-collected.
 
 **Answer:** No (fails fast), provided posture is set via required env vars.
 
-- **Guardrail:** Server refuses to start when `debug=true` outside `Posture::Dev` (`crates/arco-api/src/server.rs:572`).
+- **Guardrail:** Server refuses to start when `debug=true` outside `Posture::Dev` (`crates/arco-api/src/server.rs:578`).
 - **Posture source:** `ARCO_ENVIRONMENT` + `ARCO_API_PUBLIC` are required to derive posture (`crates/arco-api/src/config.rs:343`).
 - **Terraform wiring:** Cloud Run sets both `ARCO_ENVIRONMENT` and `ARCO_API_PUBLIC` (`infra/terraform/cloud_run.tf:119`, `infra/terraform/cloud_run.tf:125`).
 - **Behavior:** Header-based tenant/workspace scoping is allowed only when `debug=true` and posture is dev (`crates/arco-api/src/context.rs:80`).
@@ -137,17 +137,25 @@ If these assumptions change, evidence must be re-collected.
 **What remains unknown / unverified:**
 
 - Whether conditional IAM expressions using `resource.name.matches(".../objects/..."` reliably constrain `storage.objects.list` to a prefix in GCS (anti-entropy intent) (`infra/terraform/iam_conditions.tf:195`).
-- No explicit bucket `public_access_prevention` is configured in the bucket resource (`infra/terraform/main.tf:52`).
 
 **Risks:**
 
 - If conditional IAM does not constrain list operations as intended, anti-entropy might fail at runtime or force broader permissions.
-- Without explicit bucket public access prevention, misconfiguration could allow accidental public access.
+
+**Bucket public access prevention (P0-5 - COMPLETE):**
+
+- `public_access_prevention = "enforced"` is configured on the catalog bucket (`infra/terraform/main.tf:63`).
+- This defense-in-depth control ensures bucket data cannot be accidentally exposed even if ACLs are misconfigured.
+
+**IAM list semantics verification (P0-6):**
+
+- Runbook created: `docs/runbooks/iam-list-semantics-verification.md`
+- Script tests whether conditional IAM constrains `storage.objects.list` results
+- Pending execution in sandbox environment to capture evidence
 
 **Recommended actions (PRD-aligned):**
 
-- Add a sandbox verification that anti-entropy SA can list only ledger prefix (and cannot list commits/state).
-- Add `public_access_prevention = "enforced"` to `google_storage_bucket.catalog` and document why.
+- Execute IAM list semantics verification script in sandbox environment and document results.
 
 ### A.2 Service Account Design (API vs Compactor)
 
@@ -185,11 +193,11 @@ If these assumptions change, evidence must be re-collected.
 - Tenant/workspace normalization prevents separators and invalid chars (`crates/arco-api/src/context.rs:144`).
 - Request IDs are generated/propagated and echoed back (`crates/arco-api/src/context.rs:76`, `crates/arco-api/src/context.rs:272`).
 
-**JWT claim policy gap (issuer/audience):**
+**JWT claim policy enforcement (issuer/audience):**
 
-- `iss` and `aud` are only enforced when configured (`crates/arco-api/src/context.rs:123`, `crates/arco-api/src/context.rs:126`).
-- Cloud Run wires `ARCO_JWT_ISSUER` / `ARCO_JWT_AUDIENCE` from Terraform variables (`infra/terraform/cloud_run.tf:104`, `infra/terraform/cloud_run.tf:109`), but Terraform defaults those vars to empty strings (`infra/terraform/variables.tf:145`, `infra/terraform/variables.tf:151`).
-- Empty env vars are treated as “unset” (`crates/arco-api/src/config.rs:302`), so issuer/audience may be unintentionally unenforced unless explicitly set.
+- Startup validation requires non-empty `jwt.issuer` and `jwt.audience` when `debug=false` and posture != dev (`crates/arco-api/src/server.rs:628`, `crates/arco-api/src/server.rs:640`).
+- RequestContext rejects JWTs missing `iss`/`aud` when configured (`crates/arco-api/src/context.rs:125`, `crates/arco-api/src/context.rs:143`, `crates/arco-api/src/context.rs:246`, `crates/arco-api/src/context.rs:275`).
+- Integration tests cover missing issuer/audience claims (`crates/arco-api/tests/api_integration.rs:1394`, `crates/arco-api/tests/api_integration.rs:1423`).
 
 **Implemented auth middleware variants:**
 
@@ -208,10 +216,10 @@ If these assumptions change, evidence must be re-collected.
 **What we verified:**
 
 - Posture is derived from required `ARCO_ENVIRONMENT` + `ARCO_API_PUBLIC` (`crates/arco-api/src/config.rs:343`, `crates/arco-api/src/config.rs:354`).
-- Server rejects `debug=true` outside `Posture::Dev` (`crates/arco-api/src/server.rs:572`).
+- Server rejects `debug=true` outside `Posture::Dev` (`crates/arco-api/src/server.rs:578`).
 - Terraform provides `ARCO_ENVIRONMENT` and `ARCO_API_PUBLIC` to Cloud Run (`infra/terraform/cloud_run.tf:119`, `infra/terraform/cloud_run.tf:125`).
 - Debug-mode header scoping uses `debug && posture.is_dev()` for API requests and task callbacks (`crates/arco-api/src/context.rs:80`, `crates/arco-api/src/routes/tasks.rs:602`).
-- Regression tests cover dev acceptance and non-dev rejection for RequestContext and task callbacks (`crates/arco-api/src/context.rs:292`, `crates/arco-api/src/context.rs:315`, `crates/arco-api/src/routes/tasks.rs:1234`, `crates/arco-api/src/routes/tasks.rs:1273`).
+- Regression tests cover dev acceptance and non-dev rejection for RequestContext and task callbacks (`crates/arco-api/src/context.rs:331`, `crates/arco-api/src/context.rs:355`, `crates/arco-api/src/routes/tasks.rs:1234`, `crates/arco-api/src/routes/tasks.rs:1273`).
 
 **Residual risk:**
 
@@ -242,54 +250,76 @@ If these assumptions change, evidence must be re-collected.
 
 ### C.2 Metrics & Monitoring Pipeline
 
-**Status:** ⚠️ Implemented, but needs label policy + access control
+**Status:** ⚠️ Implemented, but needs access control + audit coverage
 
 **What we verified:**
 
 - Prometheus exporter + middleware exist (`crates/arco-api/src/metrics.rs:41`, `crates/arco-api/src/metrics.rs:94`).
-- `/metrics` is mounted without auth (`crates/arco-api/src/server.rs:379`).
+- API `/metrics` returns 404 in public posture and is otherwise open (`crates/arco-api/src/server.rs:374`, `crates/arco-api/src/server.rs:384`).
+- Compactor `/metrics` is mounted without auth in serve mode (`crates/arco-compactor/src/main.rs:963`).
 - OTel Collector scrapes Prometheus endpoints and exports to Cloud Monitoring (`infra/monitoring/otel-collector.yaml:1`, `infra/monitoring/README.md:17`).
 
-**High-cardinality / identifier leakage risk:**
+**Label policy evidence:**
 
-- Request metrics `endpoint` label falls back to raw `request.uri().path()` when `MatchedPath` is absent (`crates/arco-api/src/metrics.rs:97`).
-- API metrics record `tenant` as a label for signed URL minting (`crates/arco-api/src/metrics.rs:180`).
-- Rate-limit metrics record `tenant` and raw `endpoint` labels (`crates/arco-api/src/metrics.rs:186`).
-- Iceberg reconciler metrics record `tenant` and `workspace` as labels (`crates/arco-iceberg/src/metrics.rs:216`).
-
-If `/metrics` is externally reachable, these labels can disclose identifiers; even if internal, they can create high cardinality. Hashing tenant/workspace does not reduce series count; the label policy must reduce dimensions and avoid attacker-controlled values.
+- `endpoint` uses `MatchedPath` with `UNMATCHED_ENDPOINT` fallback (no raw path) (`crates/arco-api/src/metrics.rs:90`, `crates/arco-iceberg/src/metrics.rs:159`).
+- Tests assert no raw-path labels and no tenant/workspace labels (`crates/arco-api/src/metrics.rs:245`, `crates/arco-api/src/metrics.rs:255`, `crates/arco-iceberg/src/metrics.rs:369`).
 
 **Recommended actions:**
 
 - Protect `/metrics` in public deployments (and document scraper migration).
-- Remove attacker-controlled label values (no raw path fallback) and reduce/remove tenant/workspace labels where possible.
+- Keep label-policy regression tests; add compactor `/metrics` auth if internal-only ingress is not guaranteed.
 
 ### C.3 Audit Trail (Security Decisions + Mutations)
 
-**Status:** ❌ Missing (design requirement not met)
+**Status:** ⚠️ Implemented baseline (auth + URL mint instrumented; remaining gaps are P1)
 
-**Design intent (what “complete” means):**
+**Design intent (what "complete" means):**
 
-- “Audit trail covers all mutations” is a completeness criterion (`docs/plans/2025-01-12-arco-unified-platform-design.md:4132`).
+- "Audit trail covers all mutations" is a completeness criterion (`docs/plans/2025-01-12-arco-unified-platform-design.md:4132`).
 - Design sketches an `AuditEvent` schema with actor/action/resource and before/after values (`docs/plans/2025-01-12-arco-unified-platform-design.md:3100`).
 - Audit log should be append-only and tamper-evident via hash chain (`docs/plans/2025-01-12-arco-unified-platform-design.md:3167`).
 - Storage layout expects monthly Parquet logs under `audit/YYYY-MM/audit_log.parquet` (`docs/plans/ARCO_TECHNICAL_VISION.md:437`).
 - For signed URLs specifically, the audit record should be created at *generation time* (`docs/adr/adr-019-existence-privacy.md:101`).
 
-**Implementation evidence (current gaps):**
+**Implementation evidence (P0-4a - Audit Foundation):**
 
-- Tier-1 commit records already form an append-only, tamper-evident mutation history, but they don’t cover security decision events (auth/url-mint/vend allow/deny) or principal attribution (`crates/arco-catalog/src/manifest.rs:738`, `crates/arco-core/src/storage_traits.rs:186`).
-- Signed URL minting currently logs only safe metadata and increments metrics; it does not emit a structured audit event (`crates/arco-api/src/routes/browser.rs:143`, `crates/arco-api/src/routes/browser.rs:181`).
-- Catalog mutation attribution currently uses `api:{tenant}` rather than the authenticated principal identity, reducing forensic value even if durable audit logs are added (`crates/arco-api/src/routes/namespaces.rs:115`, `crates/arco-api/src/routes/tables.rs:170`).
+- `AuditEvent` schema implemented with all required fields (`crates/arco-core/src/audit.rs:119`):
+  - `event_version`, `event_id` (ULID), `timestamp`, `request_id`, `trace_id` (optional)
+  - `actor`, `tenant_id` (optional), `workspace_id` (optional)
+  - `action` (enum: AUTH_ALLOW/DENY, URL_MINT_ALLOW/DENY, CRED_VEND_ALLOW/DENY, ICEBERG_COMMIT/DENY)
+  - `resource`, `decision_reason`, `policy_version`
+- `AuditAction` enum defines security decision actions (`crates/arco-core/src/audit.rs:46`).
+- Secret redaction implemented: builder automatically redacts fields containing secret patterns (`crates/arco-core/src/audit.rs:207`, `crates/arco-core/src/audit.rs:264`).
+- Redact-and-continue strategy prevents audit suppression attacks (`crates/arco-core/src/audit.rs:431`).
+- `AuditSinkConfig` defines failure semantics (best-effort default) and DoS controls (`crates/arco-core/src/audit.rs:438`).
+- Schema stability tests ensure serialization format is stable (`crates/arco-core/src/audit.rs:696`).
+- Secret detection tests verify redaction patterns work (`crates/arco-core/src/audit.rs:573`, `crates/arco-core/src/audit.rs:585`, `crates/arco-core/src/audit.rs:602`).
 
-**Recommended minimum audit event schema (P0):**
+**Sink infrastructure (P0-4b - COMPLETE):**
 
-- `timestamp`, `request_id`, `trace_id` (if available)
-- `actor` (subject identity), `tenant_id`, `workspace_id`
-- `action` (AUTH_ALLOW/DENY, URL_MINT_ALLOW/DENY, ICEBERG_COMMIT, CRED_VEND_ALLOW/DENY)
-- `resource` (table/namespace/path prefix)
-- `decision_reason`, `policy_version`
-- **Never include:** raw JWTs, signed URLs, secret values
+- `AuditSink` trait for pluggable sinks (`crates/arco-core/src/audit.rs:483`).
+- `AuditEmitter` with routing and rate limiting support (`crates/arco-core/src/audit.rs:499`).
+- `TracingAuditSink` for production (structured JSON logs) (`crates/arco-core/src/audit.rs:593`).
+- `TestAuditSink` for unit testing (`crates/arco-core/src/audit.rs:635`).
+- Unit tests for sink capture and event filtering (`crates/arco-core/src/audit.rs:972-1038`).
+- `AppState` has `audit: Arc<AuditEmitter>` field with accessor (`crates/arco-api/src/server.rs:74`).
+
+**Auth and URL minting instrumentation (P0-4b - COMPLETE):**
+
+- API-layer audit helpers: stable reason codes and emission functions (`crates/arco-api/src/audit.rs:1-109`).
+- `auth_middleware` emits `AUTH_ALLOW` on successful JWT validation (`crates/arco-api/src/context.rs:319`).
+- `auth_middleware` emits `AUTH_DENY` with `missing_token` or `invalid_token` reason on failure (`crates/arco-api/src/context.rs:314`).
+- `mint_urls` emits `URL_MINT_DENY` with `path_traversal` reason on traversal attempt (`crates/arco-api/src/routes/browser.rs:140`).
+- `mint_urls` emits `URL_MINT_DENY` with `not_in_allowlist` reason on allowlist failure (`crates/arco-api/src/routes/browser.rs:177`).
+- `mint_urls` emits `URL_MINT_ALLOW` on successful minting (`crates/arco-api/src/routes/browser.rs:198`).
+
+**Remaining gaps (P1 - Future instrumentation):**
+
+- Credential vending does not yet emit audit events (`crates/arco-iceberg/src/routes/tables.rs:497`).
+- Iceberg commit does not yet emit audit events (`crates/arco-iceberg/src/routes/tables.rs:369`).
+- Task auth middleware (`crates/arco-api/src/routes/tasks.rs:587`) - defer to task subsystem work.
+- Iceberg auth middleware (`crates/arco-api/src/server.rs:219`) - defer to Iceberg completeness work.
+- Catalog mutation attribution still uses `api:{tenant}` (`crates/arco-api/src/routes/namespaces.rs:115`).
 
 **Storage + integrity plan (P0/P1):**
 
@@ -331,7 +361,7 @@ If `/metrics` is externally reachable, these labels can disclose identifiers; ev
 - Iceberg spec endpoints not implemented: metrics (`POST .../metrics`) and multi-table transactions (`POST /transactions/commit`) (not routed; not advertised) (`crates/arco-iceberg/src/router.rs:37`, `crates/arco-iceberg/src/types/config.rs:10`).
 - Drop-table `purgeRequested` semantics are not implemented (drop-table endpoint itself is missing) (`crates/arco-iceberg/src/types/config.rs:67`).
 - Parity docs call out engine/client auth schemes (SigV4, Google Auth, token rotation/revocation); current API supports debug headers or `Authorization: Bearer <jwt>` only (`crates/arco-api/src/context.rs:80`, `crates/arco-api/src/context.rs:237`).
-- Some documented query parameters are declared but not parsed (e.g., `snapshots`, `planId`) (`crates/arco-iceberg/src/routes/tables.rs:84`, `crates/arco-iceberg/src/routes/tables.rs:128`, `crates/arco-iceberg/src/routes/tables.rs:146`).
+- ✅ Query parameters now properly parsed: `snapshots` param parsed via `LoadTableQuery` (`crates/arco-iceberg/src/types/table.rs:63-87`), filtering implemented (`crates/arco-iceberg/src/routes/tables.rs:241-244`). `planId` removed from OpenAPI (scan planning not implemented).
 - Test signal is weaker than it appears: the OpenAPI compliance test checks parameter-name and numeric status-code subsets (not full schema/behavior), and the integration test exercises the Iceberg router directly using custom tenancy headers (not API-layer JWT auth) (`crates/arco-iceberg/tests/openapi_compliance.rs:107`, `crates/arco-integration-tests/tests/iceberg_rest_catalog.rs:132`).
 
 ### D.3 ETag / If-None-Match & Idempotency
@@ -353,7 +383,7 @@ If `/metrics` is externally reachable, these labels can disclose identifiers; ev
 
 - A `CredentialProvider` interface exists (`crates/arco-iceberg/src/state.rs:117`).
 - The credentials endpoint exists and requires vending to be enabled (`crates/arco-iceberg/src/routes/tables.rs:497`).
-- API constructs `IcebergState` without attaching a provider (`crates/arco-api/src/server.rs:397`, `crates/arco-iceberg/src/state.rs:75`).
+- API constructs `IcebergState` without attaching a provider (`crates/arco-api/src/server.rs:402`, `crates/arco-iceberg/src/state.rs:75`).
 
 **Risks:**
 
@@ -447,11 +477,9 @@ If `/metrics` is externally reachable, these labels can disclose identifiers; ev
 
 | Gap | Risk | Mitigation |
 |-----|------|------------|
-| Debug mode outside dev posture (regression risk) | Caller chooses tenant/workspace via headers; task callbacks accept any bearer token; cross-tenant read/write | Guardrail enforced at startup; keep regression tests (`crates/arco-api/src/server.rs:572`, `crates/arco-api/src/server.rs:736`) |
-| `/metrics` reachable when API is public | Identifier leakage + endpoint surface disclosure; potential DoS of monitoring pipeline | Protect `/metrics` when `api_public=true` (`crates/arco-api/src/server.rs:379`, `infra/terraform/cloud_run.tf:25`) |
-| No structured security/mutation audit trail | Violates non-negotiable “audit trail covers all mutations” | Implement audit schema + append-only storage + hash-chain integrity (`docs/plans/2025-01-12-arco-unified-platform-design.md:4132`) |
-| JWT issuer/audience policy not enforced by default | Misconfigured IdP can lead to cross-tenant access | Require `iss`/`aud` in prod; validate non-empty env vars (`crates/arco-api/src/context.rs:123`, `infra/terraform/variables.tf:145`) |
-| Iceberg credential vending not wired | Engines cannot rely on scoped access delegation; blocks secure multi-engine use | Wire a `CredentialProvider` and emit vend/deny audit events (`crates/arco-iceberg/src/state.rs:58`, `crates/arco-api/src/server.rs:397`) |
+| Debug mode outside dev posture (regression risk) | Caller chooses tenant/workspace via headers; task callbacks accept any bearer token; cross-tenant read/write | Guardrail enforced at startup; keep regression tests (`crates/arco-api/src/server.rs:578`, `crates/arco-api/src/server.rs:784`) |
+| Compactor `/metrics` unauthenticated (ensure internal-only ingress) | Identifier leakage + endpoint surface disclosure; potential DoS of monitoring pipeline if exposed | API blocks `/metrics` in public posture; keep compactor internal or add metrics auth (`crates/arco-api/src/server.rs:374`, `crates/arco-api/src/server.rs:384`, `crates/arco-compactor/src/main.rs:963`, `infra/terraform/cloud_run.tf:25`) |
+| Iceberg credential vending not wired | Engines cannot rely on scoped access delegation; blocks secure multi-engine use | Wire a `CredentialProvider` and emit vend/deny audit events (`crates/arco-iceberg/src/state.rs:58`, `crates/arco-api/src/server.rs:402`) |
 | Iceberg REST baseline endpoints missing | Engines/clients cannot fully use Arco as Iceberg REST catalog; parity gate fails | Implement namespaces/tables CRUD, rename, metrics, transactions; keep `/v1/config` capability hiding accurate (`crates/arco-iceberg/src/router.rs:37`, `crates/arco-iceberg/src/types/config.rs:10`) |
 
 ### P1 (High)
@@ -460,14 +488,13 @@ If `/metrics` is externally reachable, these labels can disclose identifiers; ev
 |-----|------|------------|
 | No JWKS/rotation for JWT verification | Key rotation operational risk; manual key distribution | Track JWKS implementation; add `jwks_url` + caching + alg allowlist |
 | Conditional IAM list semantics unverified | Anti-entropy may fail or require broader perms | Add sandbox verification + capture evidence |
-| No explicit bucket public access prevention | Accidental public bucket access possible | Set `public_access_prevention` enforced |
 
 ### P2 (Medium)
 
 | Gap | Risk | Mitigation |
 |-----|------|------------|
 | URL redaction helpers exist but unused | Accidental signed URL logging later | Adopt redaction wrapper in log sites; add test (`crates/arco-api/src/redaction.rs:8`) |
-| High-cardinality metrics labels (tenant/workspace) | Monitoring cost/DoS; identifier leakage; attacker-amplifiable via raw-path endpoint labels | Adopt label policy: remove raw-path fallback and reduce/remove tenant/workspace labels (`crates/arco-api/src/metrics.rs:97`, `crates/arco-iceberg/src/metrics.rs:216`) |
+| Metrics label regression risk | Future changes could reintroduce raw-path or tenant/workspace labels; monitoring cost/DoS if that happens | Keep label-policy tests (`crates/arco-api/src/metrics.rs:245`, `crates/arco-iceberg/src/metrics.rs:369`) |
 | Rate limiting is per-instance in-memory | Bursts across instances; DoW still possible | Consider shared limiter or edge WAF |
 
 ---

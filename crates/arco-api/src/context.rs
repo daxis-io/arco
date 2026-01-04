@@ -136,6 +136,13 @@ fn extract_from_jwt(
         return Err(ApiError::invalid_token().with_request_id(request_id.to_string()));
     };
 
+    if state.config.jwt.issuer.is_some() {
+        require_issuer_claim(obj, request_id)?;
+    }
+    if state.config.jwt.audience.is_some() {
+        require_audience_claim(obj, request_id)?;
+    }
+
     let tenant = extract_required_claim(obj, &state.config.jwt.tenant_claim, request_id)?;
     let workspace = extract_required_claim(obj, &state.config.jwt.workspace_claim, request_id)?;
     let user_id = extract_required_claim(obj, &state.config.jwt.user_claim, request_id)?;
@@ -216,7 +223,7 @@ fn jwt_decoding_key(
     }
 }
 
-fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
     header_string(headers, "X-Request-Id").or_else(|| header_string(headers, "X-Request-ID"))
 }
 
@@ -234,6 +241,38 @@ fn extract_required_claim(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .ok_or_else(|| ApiError::invalid_token().with_request_id(request_id.to_string()))
+}
+
+fn require_issuer_claim(
+    obj: &serde_json::Map<String, Value>,
+    request_id: &str,
+) -> Result<(), ApiError> {
+    let issuer = obj
+        .get("iss")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    if issuer.is_none() {
+        return Err(ApiError::invalid_token().with_request_id(request_id.to_string()));
+    }
+    Ok(())
+}
+
+fn require_audience_claim(
+    obj: &serde_json::Map<String, Value>,
+    request_id: &str,
+) -> Result<(), ApiError> {
+    let has_audience = match obj.get("aud") {
+        Some(Value::String(value)) => !value.is_empty(),
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|value| !value.is_empty()),
+        _ => false,
+    };
+    if !has_audience {
+        return Err(ApiError::invalid_token().with_request_id(request_id.to_string()));
+    }
+    Ok(())
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -261,11 +300,25 @@ pub async fn auth_middleware(
     next: Next,
 ) -> Response {
     let (mut parts, body) = req.into_parts();
+    let resource = parts.uri.path().to_string();
+    let request_id =
+        request_id_from_headers(&parts.headers).unwrap_or_else(|| Ulid::new().to_string());
 
     let ctx = match RequestContext::from_request_parts(&mut parts, &state).await {
         Ok(ctx) => ctx,
-        Err(err) => return err.into_response(),
+        Err(err) => {
+            let reason = if err.code() == "MISSING_AUTH" {
+                crate::audit::REASON_MISSING_TOKEN
+            } else {
+                crate::audit::REASON_INVALID_TOKEN
+            };
+            let audit_request_id = err.request_id().unwrap_or(&request_id);
+            crate::audit::emit_auth_deny(&state, audit_request_id, &resource, reason);
+            return err.into_response();
+        }
     };
+
+    crate::audit::emit_auth_allow(&state, &ctx, &resource);
 
     let mut req = Request::from_parts(parts, body);
     let request_id = ctx.request_id.clone();

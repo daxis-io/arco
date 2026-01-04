@@ -31,6 +31,7 @@ pub const SIGNED_URL_MINTED: &str = "signed_url_minted_total";
 
 /// Rate limit hit counter.
 pub const RATE_LIMIT_HITS: &str = "rate_limit_hits_total";
+const UNMATCHED_ENDPOINT: &str = "unmatched";
 
 // ============================================================================
 // Prometheus Recorder
@@ -86,19 +87,22 @@ pub fn prometheus_handle() -> Option<PrometheusHandle> {
 // Metrics Middleware
 // ============================================================================
 
+pub(crate) fn endpoint_label<B>(request: &Request<B>) -> String {
+    request.extensions().get::<MatchedPath>().map_or_else(
+        || UNMATCHED_ENDPOINT.to_string(),
+        |path| path.as_str().to_string(),
+    )
+}
+
 /// Middleware that records request metrics.
 ///
 /// Captures:
-/// - `api_request_duration_seconds{endpoint, status}` - histogram of request durations
-/// - `api_request_total{endpoint, status}` - counter of total requests
+/// - `api_request_duration_seconds{endpoint, method, status_class}` - histogram of request durations
+/// - `api_request_total{endpoint, method, status_class}` - counter of total requests
 pub async fn metrics_middleware(request: Request, next: Next) -> Response {
     let start = Instant::now();
 
-    // Extract the matched path (e.g., "/api/v1/namespaces/:namespace_id")
-    let path = request.extensions().get::<MatchedPath>().map_or_else(
-        || request.uri().path().to_string(),
-        |mp| mp.as_str().to_string(),
-    );
+    let path = endpoint_label(&request);
 
     let method = request.method().to_string();
 
@@ -113,7 +117,6 @@ pub async fn metrics_middleware(request: Request, next: Next) -> Response {
     let labels = [
         ("endpoint", path.clone()),
         ("method", method.clone()),
-        ("status", status.clone()),
         ("status_class", status_class.to_string()),
     ];
 
@@ -178,18 +181,13 @@ pub async fn serve_metrics() -> impl IntoResponse {
 // ============================================================================
 
 /// Records a signed URL minting event.
-pub fn record_signed_url_minted(tenant: &str) {
-    counter!(SIGNED_URL_MINTED, "tenant" => tenant.to_string()).increment(1);
+pub fn record_signed_url_minted() {
+    counter!(SIGNED_URL_MINTED).increment(1);
 }
 
 /// Records a rate limit hit.
-pub fn record_rate_limit_hit(tenant: &str, endpoint: &str) {
-    counter!(
-        RATE_LIMIT_HITS,
-        "tenant" => tenant.to_string(),
-        "endpoint" => endpoint.to_string()
-    )
-    .increment(1);
+pub fn record_rate_limit_hit(endpoint: &str) {
+    counter!(RATE_LIMIT_HITS, "endpoint" => endpoint.to_string()).increment(1);
 }
 
 // ============================================================================
@@ -199,6 +197,29 @@ pub fn record_rate_limit_hit(tenant: &str, endpoint: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::routing::get;
+    use tower::Service;
+
+    fn metric_lines<'a>(metrics: &'a str, name: &str) -> Vec<&'a str> {
+        metrics
+            .lines()
+            .filter(|line| line.starts_with(name))
+            .collect()
+    }
+
+    fn assert_metric_lines_contain(metrics: &str, name: &str, needle: &str) {
+        let lines = metric_lines(metrics, name);
+        assert!(!lines.is_empty());
+        assert!(lines.iter().any(|line| line.contains(needle)));
+    }
+
+    fn assert_metric_lines_do_not_contain(metrics: &str, name: &str, needle: &str) {
+        let lines = metric_lines(metrics, name);
+        assert!(!lines.is_empty());
+        assert!(lines.iter().all(|line| !line.contains(needle)));
+    }
 
     #[test]
     fn test_status_class() {
@@ -208,5 +229,44 @@ mod tests {
         assert_eq!(status_class(StatusCode::BAD_REQUEST), "4xx");
         assert_eq!(status_class(StatusCode::NOT_FOUND), "4xx");
         assert_eq!(status_class(StatusCode::INTERNAL_SERVER_ERROR), "5xx");
+    }
+
+    #[test]
+    fn test_endpoint_label_unmatched() {
+        let request = Request::builder()
+            .uri("/missing")
+            .body(Body::empty())
+            .unwrap();
+        let label = endpoint_label(&request);
+        assert_eq!(label, UNMATCHED_ENDPOINT);
+    }
+
+    #[test]
+    fn test_counters_without_tenant_labels() {
+        let handle = init_metrics();
+        record_signed_url_minted();
+        record_rate_limit_hit("/api/v1/test");
+        let metrics = handle.render();
+        assert_metric_lines_do_not_contain(&metrics, SIGNED_URL_MINTED, "tenant=");
+        assert_metric_lines_do_not_contain(&metrics, RATE_LIMIT_HITS, "tenant=");
+    }
+
+    #[tokio::test]
+    async fn test_request_metrics_labels() {
+        let handle = init_metrics();
+        let app = Router::new()
+            .route("/items/:id", get(|| async { StatusCode::OK }))
+            .route_layer(axum::middleware::from_fn(metrics_middleware));
+        let request = Request::builder()
+            .uri("/items/123")
+            .body(Body::empty())
+            .unwrap();
+        let mut service = app.into_service::<Body>();
+        let _response = service.call(request).await.unwrap();
+        let metrics = handle.render();
+        assert_metric_lines_contain(&metrics, API_REQUEST_TOTAL, "endpoint=\"/items/:id\"");
+        assert!(!metrics.contains("endpoint=\"/items/123\""));
+        assert_metric_lines_do_not_contain(&metrics, API_REQUEST_TOTAL, "status=\"");
+        assert_metric_lines_do_not_contain(&metrics, API_REQUEST_DURATION, "status=\"");
     }
 }

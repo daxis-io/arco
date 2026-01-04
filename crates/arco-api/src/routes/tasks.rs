@@ -591,11 +591,18 @@ pub async fn task_auth_middleware(
 ) -> axum::response::Response {
     let (mut parts, body) = req.into_parts();
     let headers = &parts.headers;
+    let resource = parts.uri.path().to_string();
 
     let request_id = request_id_from_headers(headers).unwrap_or_else(|| Ulid::new().to_string());
     let idempotency_key = header_string(headers, "Idempotency-Key");
 
     let Some(token) = extract_bearer_token(headers) else {
+        crate::audit::emit_auth_deny(
+            &state,
+            &request_id,
+            &resource,
+            crate::audit::REASON_MISSING_TOKEN,
+        );
         return unauthorized_response(&request_id, "missing bearer token");
     };
 
@@ -605,19 +612,45 @@ pub async fn task_auth_middleware(
         let tenant = header_string(headers, "X-Tenant-Id").unwrap_or_default();
         let workspace = header_string(headers, "X-Workspace-Id").unwrap_or_default();
         if tenant.is_empty() || workspace.is_empty() {
+            crate::audit::emit_auth_deny(
+                &state,
+                &request_id,
+                &resource,
+                crate::audit::REASON_MISSING_TOKEN,
+            );
             return unauthorized_response(&request_id, "missing tenant/workspace headers");
         }
         (tenant, workspace)
     } else {
         let claims = match decode_task_claims(&state.config.jwt, &token) {
             Ok(claims) => claims,
-            Err(err) => return unauthorized_response(&request_id, &err),
+            Err(err) => {
+                crate::audit::emit_auth_deny(
+                    &state,
+                    &request_id,
+                    &resource,
+                    crate::audit::REASON_INVALID_TOKEN,
+                );
+                return unauthorized_response(&request_id, &err);
+            }
         };
 
         let Some(tenant) = claims.tenant else {
+            crate::audit::emit_auth_deny(
+                &state,
+                &request_id,
+                &resource,
+                crate::audit::REASON_INVALID_TOKEN,
+            );
             return unauthorized_response(&request_id, "missing tenant claim");
         };
         let Some(workspace) = claims.workspace else {
+            crate::audit::emit_auth_deny(
+                &state,
+                &request_id,
+                &resource,
+                crate::audit::REASON_INVALID_TOKEN,
+            );
             return unauthorized_response(&request_id, "missing workspace claim");
         };
         (tenant, workspace)
@@ -630,6 +663,8 @@ pub async fn task_auth_middleware(
         request_id: request_id.clone(),
         idempotency_key,
     };
+
+    crate::audit::emit_auth_allow(&state, &ctx, &resource);
 
     parts.extensions.insert(ctx.clone());
     let mut req = Request::from_parts(parts, body);

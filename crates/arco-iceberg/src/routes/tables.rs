@@ -32,7 +32,8 @@ use crate::routes::utils::{ensure_prefix, join_namespace, paginate, parse_namesp
 use crate::state::{CredentialRequest, IcebergState, TableInfo};
 use crate::types::{
     AccessDelegation, CommitTableRequest, CommitTableResponse, ListTablesQuery, ListTablesResponse,
-    LoadTableResponse, TableCredentialsResponse, TableIdent, TableMetadata,
+    LoadTableQuery, LoadTableResponse, SnapshotsFilter, TableCredentialsResponse, TableIdent,
+    TableMetadata,
 };
 
 /// Creates table routes.
@@ -125,7 +126,7 @@ async fn list_tables(
         ("namespace" = String, Path, description = "Namespace name"),
         ("table" = String, Path, description = "Table name"),
         ("If-None-Match" = Option<String>, Header, description = "ETag for conditional table load"),
-        ("snapshots" = Option<String>, Query, description = "Snapshots to return (all or refs)"),
+        LoadTableQuery,
         ("X-Iceberg-Access-Delegation" = Option<String>, Header, description = "Credential vending hint")
     ),
     responses(
@@ -147,6 +148,7 @@ async fn load_table(
     Extension(ctx): Extension<IcebergRequestContext>,
     State(state): State<IcebergState>,
     Path(path): Path<TablePath>,
+    Query(query): Query<LoadTableQuery>,
     headers: HeaderMap,
 ) -> IcebergResult<Response> {
     ensure_prefix(&path.prefix, &state.config)?;
@@ -231,10 +233,18 @@ async fn load_table(
                 message: err.to_string(),
             })?;
 
-    let metadata: TableMetadata =
+    let mut metadata: TableMetadata =
         serde_json::from_slice(&metadata_bytes).map_err(|err| IcebergError::Internal {
             message: format!("Failed to parse table metadata: {err}"),
         })?;
+
+    if query.snapshots == Some(SnapshotsFilter::Refs) {
+        let referenced_ids: std::collections::HashSet<i64> =
+            metadata.refs.values().map(|r| r.snapshot_id).collect();
+        metadata
+            .snapshots
+            .retain(|s| referenced_ids.contains(&s.snapshot_id));
+    }
 
     let storage_credentials = maybe_vended_credentials(
         &state,
@@ -281,7 +291,6 @@ async fn load_table(
         ("prefix" = String, Path, description = "Catalog prefix"),
         ("namespace" = String, Path, description = "Namespace name"),
         ("table" = String, Path, description = "Table name"),
-        ("planId" = Option<String>, Query, description = "Plan ID used for server-side scan planning")
     ),
     responses(
         (status = 204, description = "Table exists"),
@@ -479,7 +488,7 @@ async fn commit_table(
         ("prefix" = String, Path, description = "Catalog prefix"),
         ("namespace" = String, Path, description = "Namespace name"),
         ("table" = String, Path, description = "Table name"),
-        ("planId" = Option<String>, Query, description = "Plan ID used for server-side scan planning")
+        ("planId" = Option<String>, Query, description = "Plan ID for server-side scan planning (not yet implemented; parameter accepted but ignored)")
     ),
     responses(
         (status = 200, description = "Credentials returned", body = TableCredentialsResponse),

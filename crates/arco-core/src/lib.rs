@@ -33,6 +33,7 @@
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 
+pub mod audit;
 pub mod backpressure;
 pub mod canonical_json;
 pub mod catalog_event;

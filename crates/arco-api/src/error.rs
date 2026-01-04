@@ -126,6 +126,12 @@ impl ApiError {
         self.request_id.as_deref()
     }
 
+    /// Returns the stable machine-readable error code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        self.code
+    }
+
     fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status,

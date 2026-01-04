@@ -64,11 +64,11 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "targets": [
         {
-          "expr": "sum(increase(rate_limit_hits_total[5m])) by (tenant)",
-          "legendFormat": "{{tenant}}"
+          "expr": "sum(increase(rate_limit_hits_total[5m])) by (endpoint)",
+          "legendFormat": "{{endpoint}}"
         }
       ],
-      "description": "Rate limit rejections per tenant"
+      "description": "Rate limit rejections per endpoint"
     },
     {
       "title": "Compaction Duration",
@@ -153,11 +153,11 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
       "targets": [
         {
-          "expr": "sum(rate(signed_url_minted_total[5m])) by (tenant)",
-          "legendFormat": "{{tenant}}"
+          "expr": "sum(rate(signed_url_minted_total[5m]))",
+          "legendFormat": "total"
         }
       ],
-      "description": "Signed URL minting rate per tenant"
+      "description": "Signed URL minting rate"
     },
     {
       "title": "CAS Retries",

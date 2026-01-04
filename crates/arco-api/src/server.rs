@@ -29,6 +29,7 @@ use crate::error::ApiError;
 use crate::rate_limit::RateLimitState;
 use arco_catalog::SyncCompactor;
 use arco_core::Result;
+use arco_core::audit::AuditEmitter;
 
 // ============================================================================
 // Health and Ready Responses
@@ -70,6 +71,8 @@ pub struct AppState {
     sync_compactor: Option<Arc<dyn SyncCompactor>>,
     /// Sensor evaluator used by manual sensor evaluate.
     sensor_evaluator: Arc<dyn SensorEvaluator>,
+    /// Audit event emitter for security decision logging.
+    audit: Arc<AuditEmitter>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -80,6 +83,7 @@ impl std::fmt::Debug for AppState {
             .field("rate_limit", &"<RateLimitState>")
             .field("sync_compactor", &self.sync_compactor.is_some())
             .field("sensor_evaluator", &"<SensorEvaluator>")
+            .field("audit", &self.audit)
             .finish()
     }
 }
@@ -98,17 +102,40 @@ impl AppState {
         storage: Arc<dyn arco_core::storage::StorageBackend>,
         sensor_evaluator: Arc<dyn SensorEvaluator>,
     ) -> Self {
+        Self::new_with_audit(config, storage, sensor_evaluator, None)
+    }
+
+    /// Creates new application state with an explicit sensor evaluator and optional audit emitter.
+    ///
+    /// If `audit_emitter` is `None`, a default tracing-based emitter is used.
+    #[must_use]
+    pub fn new_with_audit(
+        config: Config,
+        storage: Arc<dyn arco_core::storage::StorageBackend>,
+        sensor_evaluator: Arc<dyn SensorEvaluator>,
+        audit_emitter: Option<Arc<AuditEmitter>>,
+    ) -> Self {
+        let mut config = config;
+        config.audit.prepare();
+        if config.audit.actor_hmac_key_invalid() {
+            tracing::warn!(
+                "ARCO_AUDIT_ACTOR_HMAC_KEY is set but is not valid base64; falling back to SHA-256 pseudonymization"
+            );
+        }
+
         let rate_limit = Arc::new(RateLimitState::new(config.rate_limit.clone()));
         let sync_compactor = config.compactor_url.as_ref().map(|url| {
             let client: Arc<dyn SyncCompactor> = Arc::new(CompactorClient::new(url.clone()));
             client
         });
+        let audit = audit_emitter.unwrap_or_else(|| Arc::new(AuditEmitter::with_tracing()));
         Self {
             config,
             storage,
             rate_limit,
             sync_compactor,
             sensor_evaluator,
+            audit,
         }
     }
 
@@ -124,6 +151,14 @@ impl AppState {
         config: Config,
         sensor_evaluator: Arc<dyn SensorEvaluator>,
     ) -> Self {
+        let mut config = config;
+        config.audit.prepare();
+        if config.audit.actor_hmac_key_invalid() {
+            tracing::warn!(
+                "ARCO_AUDIT_ACTOR_HMAC_KEY is set but is not valid base64; falling back to SHA-256 pseudonymization"
+            );
+        }
+
         let sync_compactor = config.compactor_url.as_ref().map(|url| {
             let client: Arc<dyn SyncCompactor> = Arc::new(CompactorClient::new(url.clone()));
             client
@@ -134,6 +169,7 @@ impl AppState {
             storage: Arc::new(arco_core::storage::MemoryBackend::new()),
             sync_compactor,
             sensor_evaluator,
+            audit: Arc::new(AuditEmitter::with_tracing()),
         }
     }
 
@@ -156,6 +192,12 @@ impl AppState {
     #[must_use]
     pub fn sensor_evaluator(&self) -> Arc<dyn SensorEvaluator> {
         Arc::clone(&self.sensor_evaluator)
+    }
+
+    /// Returns the audit event emitter.
+    #[must_use]
+    pub fn audit(&self) -> &AuditEmitter {
+        &self.audit
     }
 }
 
@@ -226,10 +268,25 @@ async fn iceberg_auth_middleware(
     }
 
     let (mut parts, body) = req.into_parts();
+    let resource = parts.uri.path().to_string();
+    let request_id = crate::context::request_id_from_headers(&parts.headers)
+        .unwrap_or_else(|| ulid::Ulid::new().to_string());
+
     let ctx = match RequestContext::from_request_parts(&mut parts, &state).await {
         Ok(ctx) => ctx,
-        Err(err) => return api_error_to_iceberg_response(&err),
+        Err(err) => {
+            let reason = if err.code() == "MISSING_AUTH" {
+                crate::audit::REASON_MISSING_TOKEN
+            } else {
+                crate::audit::REASON_INVALID_TOKEN
+            };
+            let audit_request_id = err.request_id().unwrap_or(&request_id);
+            crate::audit::emit_auth_deny(&state, audit_request_id, &resource, reason);
+            return api_error_to_iceberg_response(&err);
+        }
     };
+
+    crate::audit::emit_auth_allow(&state, &ctx, &resource);
 
     let iceberg_ctx = IcebergRequestContext {
         tenant: ctx.tenant.clone(),
@@ -295,6 +352,7 @@ pub struct Server {
     config: Config,
     storage: Arc<dyn arco_core::storage::StorageBackend>,
     sensor_evaluator: Arc<dyn SensorEvaluator>,
+    audit_emitter: Option<Arc<AuditEmitter>>,
 }
 
 impl std::fmt::Debug for Server {
@@ -303,6 +361,7 @@ impl std::fmt::Debug for Server {
             .field("config", &self.config)
             .field("storage", &"<StorageBackend>")
             .field("sensor_evaluator", &"<SensorEvaluator>")
+            .field("audit_emitter", &self.audit_emitter.is_some())
             .finish()
     }
 }
@@ -317,6 +376,7 @@ impl Server {
             config,
             storage: Arc::new(arco_core::storage::MemoryBackend::new()),
             sensor_evaluator: Arc::new(NoopSensorEvaluator),
+            audit_emitter: None,
         }
     }
 
@@ -330,6 +390,7 @@ impl Server {
             config,
             storage,
             sensor_evaluator: Arc::new(NoopSensorEvaluator),
+            audit_emitter: None,
         }
     }
 
@@ -347,10 +408,11 @@ impl Server {
 
     /// Creates the router with all routes and middleware.
     fn create_router(&self) -> Router {
-        let state = Arc::new(AppState::new_with_evaluator(
+        let state = Arc::new(AppState::new_with_audit(
             self.config.clone(),
             Arc::clone(&self.storage),
             Arc::clone(&self.sensor_evaluator),
+            self.audit_emitter.clone(),
         ));
 
         // Build CORS layer from config
@@ -371,12 +433,17 @@ impl Server {
             crate::rate_limit::rate_limit_middleware,
         );
         let metrics_layer = middleware::from_fn(crate::metrics::metrics_middleware);
+        let metrics_handler = if state.config.posture.is_public() {
+            get(|| async { StatusCode::NOT_FOUND })
+        } else {
+            get(crate::metrics::serve_metrics)
+        };
 
         let mut router = Router::new()
             // Health, ready, and metrics endpoints (no auth required)
             .route("/health", get(health))
             .route("/ready", get(ready))
-            .route("/metrics", get(crate::metrics::serve_metrics))
+            .route("/metrics", metrics_handler)
             // API routes (auth via RequestContext extractor)
             .nest(
                 "/api/v1",
@@ -596,6 +663,12 @@ impl Server {
             ));
         }
 
+        if !self.config.debug && self.config.compactor_url.is_none() {
+            return Err(arco_core::Error::InvalidInput(
+                "ARCO_COMPACTOR_URL is required when ARCO_DEBUG=false".to_string(),
+            ));
+        }
+
         // Require JWT configuration in production mode.
         if !self.config.debug {
             let has_hs256_secret = self.config.jwt.hs256_secret.is_some();
@@ -613,6 +686,31 @@ impl Server {
                         .to_string(),
                 ));
             }
+
+            if !self.config.posture.is_dev() {
+                if self
+                    .config
+                    .jwt
+                    .issuer
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    return Err(arco_core::Error::InvalidInput(
+                        "jwt.issuer is required when debug=false and posture!=dev".to_string(),
+                    ));
+                }
+                if self
+                    .config
+                    .jwt
+                    .audience
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    return Err(arco_core::Error::InvalidInput(
+                        "jwt.audience is required when debug=false and posture!=dev".to_string(),
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -624,6 +722,7 @@ pub struct ServerBuilder {
     config: Config,
     storage: Arc<dyn arco_core::storage::StorageBackend>,
     sensor_evaluator: Arc<dyn SensorEvaluator>,
+    audit_emitter: Option<Arc<AuditEmitter>>,
 }
 
 impl std::fmt::Debug for ServerBuilder {
@@ -632,6 +731,7 @@ impl std::fmt::Debug for ServerBuilder {
             .field("config", &self.config)
             .field("storage", &"<StorageBackend>")
             .field("sensor_evaluator", &"<SensorEvaluator>")
+            .field("audit_emitter", &self.audit_emitter.is_some())
             .finish()
     }
 }
@@ -642,6 +742,7 @@ impl Default for ServerBuilder {
             config: Config::default(),
             storage: Arc::new(arco_core::storage::MemoryBackend::new()),
             sensor_evaluator: Arc::new(NoopSensorEvaluator),
+            audit_emitter: None,
         }
     }
 }
@@ -685,6 +786,13 @@ impl ServerBuilder {
         self
     }
 
+    /// Sets the full configuration (for advanced use cases or testing).
+    #[must_use]
+    pub fn config(mut self, config: Config) -> Self {
+        self.config = config;
+        self
+    }
+
     /// Sets the storage backend used by request handlers.
     ///
     /// By default, the server uses an in-memory backend intended only for tests/dev.
@@ -708,6 +816,13 @@ impl ServerBuilder {
         self
     }
 
+    /// Sets a custom audit emitter (primarily for testing).
+    #[must_use]
+    pub fn audit_emitter(mut self, emitter: Arc<AuditEmitter>) -> Self {
+        self.audit_emitter = Some(emitter);
+        self
+    }
+
     /// Builds the server.
     #[must_use]
     pub fn build(self) -> Server {
@@ -715,6 +830,7 @@ impl ServerBuilder {
             config: self.config,
             storage: self.storage,
             sensor_evaluator: self.sensor_evaluator,
+            audit_emitter: self.audit_emitter,
         }
     }
 }
@@ -755,6 +871,89 @@ mod tests {
             let err = server.validate_config().unwrap_err();
             assert!(matches!(err, arco_core::Error::InvalidInput(_)));
         }
+    }
+
+    fn configure_non_dev_jwt(builder: &mut ServerBuilder) {
+        builder.config.debug = false;
+        builder.config.posture = Posture::Private;
+        builder.config.storage.bucket = Some("test-bucket".to_string());
+        builder.config.compactor_url = Some("http://compactor:8081".to_string());
+        builder.config.jwt.hs256_secret = Some("test-secret".to_string());
+    }
+
+    #[test]
+    fn test_compactor_url_required_when_debug_false() {
+        let mut builder = ServerBuilder::new();
+        builder.config.debug = false;
+        builder.config.posture = Posture::Private;
+        builder.config.storage.bucket = Some("test-bucket".to_string());
+        builder.config.jwt.hs256_secret = Some("test-secret".to_string());
+        builder.config.compactor_url = None;
+
+        let server = builder.build();
+        let err = server.validate_config().unwrap_err();
+        let arco_core::Error::InvalidInput(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert_eq!(
+            message,
+            "ARCO_COMPACTOR_URL is required when ARCO_DEBUG=false"
+        );
+    }
+
+    #[test]
+    fn test_posture_requires_jwt_issuer_outside_dev() {
+        let mut builder = ServerBuilder::new();
+        configure_non_dev_jwt(&mut builder);
+        builder.config.jwt.audience = Some("test-audience".to_string());
+
+        let server = builder.build();
+        let err = server.validate_config().unwrap_err();
+        let arco_core::Error::InvalidInput(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("jwt.issuer"));
+    }
+
+    #[test]
+    fn test_posture_requires_jwt_audience_outside_dev() {
+        let mut builder = ServerBuilder::new();
+        configure_non_dev_jwt(&mut builder);
+        builder.config.jwt.issuer = Some("test-issuer".to_string());
+
+        let server = builder.build();
+        let err = server.validate_config().unwrap_err();
+        let arco_core::Error::InvalidInput(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("jwt.audience"));
+    }
+
+    #[test]
+    fn test_posture_rejects_empty_jwt_claims_outside_dev() {
+        let mut builder = ServerBuilder::new();
+        configure_non_dev_jwt(&mut builder);
+        builder.config.jwt.issuer = Some(" ".to_string());
+        builder.config.jwt.audience = Some("".to_string());
+
+        let server = builder.build();
+        let err = server.validate_config().unwrap_err();
+        let arco_core::Error::InvalidInput(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("jwt.issuer"));
+    }
+
+    #[test]
+    fn test_posture_accepts_jwt_claims_outside_dev() -> Result<()> {
+        let mut builder = ServerBuilder::new();
+        configure_non_dev_jwt(&mut builder);
+        builder.config.jwt.issuer = Some("test-issuer".to_string());
+        builder.config.jwt.audience = Some("test-audience".to_string());
+
+        let server = builder.build();
+        server.validate_config()?;
+        Ok(())
     }
 
     #[tokio::test]

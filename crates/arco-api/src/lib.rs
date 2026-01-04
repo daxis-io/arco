@@ -49,6 +49,7 @@
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 
+pub(crate) mod audit;
 pub mod compactor_client;
 pub mod config;
 pub mod context;

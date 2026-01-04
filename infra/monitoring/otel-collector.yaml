@@ -10,6 +10,10 @@ receivers:
           metrics_path: /metrics
           static_configs:
             - targets: ["arco-compactor:8081"]
+  otlp:
+    protocols:
+      grpc:
+      http:
 
 exporters:
   googlecloud:
@@ -18,5 +22,5 @@ exporters:
 service:
   pipelines:
     metrics:
-      receivers: [prometheus]
+      receivers: [prometheus, otlp]
       exporters: [googlecloud]

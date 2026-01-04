@@ -407,8 +407,8 @@ impl<S: StorageBackend, P: PointerStore> Reconciler for IcebergReconciler<S, P> 
             "Reconciled table"
         );
 
-        metrics::record_reconciler_table(tenant, workspace);
-        metrics::record_reconciler_receipts(tenant, workspace, result.receipts_created as u64);
+        metrics::record_reconciler_table();
+        metrics::record_reconciler_receipts(result.receipts_created as u64);
 
         Ok(result)
     }
@@ -452,7 +452,7 @@ impl<S: StorageBackend, P: PointerStore> Reconciler for IcebergReconciler<S, P> 
             "Completed reconciliation"
         );
 
-        metrics::record_reconciler_duration(tenant, workspace, run_start.elapsed().as_secs_f64());
+        metrics::record_reconciler_duration(run_start.elapsed().as_secs_f64());
 
         Ok(report)
     }

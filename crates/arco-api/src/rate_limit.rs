@@ -21,7 +21,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{MatchedPath, State};
+use axum::extract::State;
 use axum::http::{HeaderValue, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -258,10 +258,7 @@ pub async fn rate_limit_middleware(
     );
 
     let path = req.uri().path();
-    let endpoint = req
-        .extensions()
-        .get::<MatchedPath>()
-        .map_or(path, MatchedPath::as_str);
+    let endpoint = crate::metrics::endpoint_label(&req);
 
     // Check appropriate rate limit based on endpoint
     let result = if path.contains("/browser/urls") {
@@ -297,7 +294,7 @@ pub async fn rate_limit_middleware(
             );
 
             // Record rate limit metric
-            crate::metrics::record_rate_limit_hit(&tenant, endpoint);
+            crate::metrics::record_rate_limit_hit(endpoint.as_str());
 
             rate_limit_response(limit, retry_after_secs)
         }

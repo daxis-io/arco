@@ -59,6 +59,31 @@ pub struct ListTablesQuery {
     pub page_size: Option<u32>,
 }
 
+/// Query parameters for loading a table.
+#[derive(Debug, Clone, Default, Deserialize, utoipa::IntoParams)]
+pub struct LoadTableQuery {
+    /// Controls which snapshots are returned: `all` (default) or `refs`.
+    ///
+    /// - `all`: Returns all snapshots in the table
+    /// - `refs`: Returns only snapshots referenced by branches and tags
+    ///
+    /// **Note**: When `refs` is used, only `metadata.snapshots` is filtered.
+    /// Fields like `current_snapshot_id` and `snapshot_log` are not reconciled.
+    #[serde(default)]
+    pub snapshots: Option<SnapshotsFilter>,
+}
+
+/// Filter for which snapshots to include in `load_table` response.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SnapshotsFilter {
+    /// Return all snapshots (default).
+    #[default]
+    All,
+    /// Return only snapshots referenced by branches and tags.
+    Refs,
+}
+
 /// Response from `GET /v1/{prefix}/namespaces/{namespace}/tables/{table}`.
 ///
 /// Contains the full Iceberg table metadata.
@@ -429,5 +454,25 @@ mod tests {
         let json = serde_json::to_string(&response).expect("serialization failed");
         assert!(json.contains("storage-credentials"));
         assert!(json.contains("gcs.oauth2.token"));
+    }
+
+    #[test]
+    fn test_snapshots_filter_parsing() {
+        let all: SnapshotsFilter = serde_json::from_str(r#""all""#).unwrap();
+        assert_eq!(all, SnapshotsFilter::All);
+
+        let refs: SnapshotsFilter = serde_json::from_str(r#""refs""#).unwrap();
+        assert_eq!(refs, SnapshotsFilter::Refs);
+    }
+
+    #[test]
+    fn test_snapshots_filter_default() {
+        assert_eq!(SnapshotsFilter::default(), SnapshotsFilter::All);
+    }
+
+    #[test]
+    fn test_load_table_query_default() {
+        let query = LoadTableQuery::default();
+        assert!(query.snapshots.is_none());
     }
 }

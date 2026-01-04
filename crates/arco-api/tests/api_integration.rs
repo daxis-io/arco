@@ -11,6 +11,8 @@ use arco_api::config::{Config, CorsConfig, Posture};
 use arco_api::server::{Server, ServerBuilder};
 
 const TEST_JWT_SECRET: &str = "test-jwt-secret";
+const TEST_JWT_ISSUER: &str = "https://issuer.test";
+const TEST_JWT_AUDIENCE: &str = "arco-api";
 
 fn test_router() -> axum::Router {
     ServerBuilder::new().debug(true).build().test_router()
@@ -22,6 +24,24 @@ fn test_router_prod() -> axum::Router {
         posture: Posture::Private,
         jwt: arco_api::config::JwtConfig {
             hs256_secret: Some(TEST_JWT_SECRET.to_string()),
+            issuer: Some(TEST_JWT_ISSUER.to_string()),
+            audience: Some(TEST_JWT_AUDIENCE.to_string()),
+            ..arco_api::config::JwtConfig::default()
+        },
+        ..Config::default()
+    };
+
+    Server::new(config).test_router()
+}
+
+fn test_router_public() -> axum::Router {
+    let config = Config {
+        debug: false,
+        posture: Posture::Public,
+        jwt: arco_api::config::JwtConfig {
+            hs256_secret: Some(TEST_JWT_SECRET.to_string()),
+            issuer: Some(TEST_JWT_ISSUER.to_string()),
+            audience: Some(TEST_JWT_AUDIENCE.to_string()),
             ..arco_api::config::JwtConfig::default()
         },
         ..Config::default()
@@ -82,6 +102,22 @@ async fn test_server_uses_provided_storage_backend() -> Result<()> {
         !objects.is_empty(),
         "expected writes to go to the provided backend"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_public_posture_blocks_metrics() -> Result<()> {
+    let router = test_router_public();
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/metrics")
+        .body(Body::empty())
+        .context("build request")?;
+
+    let response = router.oneshot(request).await.map_err(|err| match err {})?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     Ok(())
 }
@@ -1093,6 +1129,8 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
             tenant: &'a str,
             workspace: &'a str,
             sub: &'a str,
+            iss: &'a str,
+            aud: &'a str,
             exp: u64,
         }
 
@@ -1107,6 +1145,8 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
             tenant,
             workspace,
             sub: TEST_USER_ID,
+            iss: TEST_JWT_ISSUER,
+            aud: TEST_JWT_AUDIENCE,
             exp,
         };
 
@@ -1126,6 +1166,8 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
         struct Claims<'a> {
             tenant: &'a str,
             workspace: &'a str,
+            iss: &'a str,
+            aud: &'a str,
             exp: u64,
         }
 
@@ -1139,6 +1181,80 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
         let claims = Claims {
             tenant,
             workspace,
+            iss: TEST_JWT_ISSUER,
+            aud: TEST_JWT_AUDIENCE,
+            exp,
+        };
+
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        )
+        .context("encode JWT")
+    }
+
+    fn make_test_jwt_missing_issuer(tenant: &str, workspace: &str) -> Result<String> {
+        use serde::Serialize;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        #[derive(Debug, Serialize)]
+        struct Claims<'a> {
+            tenant: &'a str,
+            workspace: &'a str,
+            sub: &'a str,
+            aud: &'a str,
+            exp: u64,
+        }
+
+        let exp = SystemTime::now()
+            .checked_add(Duration::from_secs(60 * 60))
+            .context("compute JWT expiry")?
+            .duration_since(UNIX_EPOCH)
+            .context("system time before unix epoch")?
+            .as_secs();
+
+        let claims = Claims {
+            tenant,
+            workspace,
+            sub: TEST_USER_ID,
+            aud: TEST_JWT_AUDIENCE,
+            exp,
+        };
+
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        )
+        .context("encode JWT")
+    }
+
+    fn make_test_jwt_missing_audience(tenant: &str, workspace: &str) -> Result<String> {
+        use serde::Serialize;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        #[derive(Debug, Serialize)]
+        struct Claims<'a> {
+            tenant: &'a str,
+            workspace: &'a str,
+            sub: &'a str,
+            iss: &'a str,
+            exp: u64,
+        }
+
+        let exp = SystemTime::now()
+            .checked_add(Duration::from_secs(60 * 60))
+            .context("compute JWT expiry")?
+            .duration_since(UNIX_EPOCH)
+            .context("system time before unix epoch")?
+            .as_secs();
+
+        let claims = Claims {
+            tenant,
+            workspace,
+            sub: TEST_USER_ID,
+            iss: TEST_JWT_ISSUER,
             exp,
         };
 
@@ -1159,6 +1275,8 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
             tenant: &'a str,
             workspace: &'a str,
             sub: &'a str,
+            iss: &'a str,
+            aud: &'a str,
             exp: u64,
         }
 
@@ -1173,6 +1291,8 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
             tenant,
             workspace,
             sub: TEST_USER_ID,
+            iss: TEST_JWT_ISSUER,
+            aud: TEST_JWT_AUDIENCE,
             exp,
         };
 
@@ -1271,6 +1391,64 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
     }
 
     #[tokio::test]
+    async fn test_production_mode_rejects_missing_issuer_claim() -> Result<()> {
+        #[derive(Debug, Deserialize)]
+        struct ErrorBody {
+            code: String,
+        }
+
+        let router = test_router_prod();
+        let jwt = make_test_jwt_missing_issuer("test-tenant", "test-workspace")?;
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/namespaces")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(Body::empty())
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .context("read response body")?;
+        let error: ErrorBody = serde_json::from_slice(&body).context("parse JSON body")?;
+        assert_eq!(error.code, "INVALID_TOKEN");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_production_mode_rejects_missing_audience_claim() -> Result<()> {
+        #[derive(Debug, Deserialize)]
+        struct ErrorBody {
+            code: String,
+        }
+
+        let router = test_router_prod();
+        let jwt = make_test_jwt_missing_audience("test-tenant", "test-workspace")?;
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/namespaces")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(Body::empty())
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .context("read response body")?;
+        let error: ErrorBody = serde_json::from_slice(&body).context("parse JSON body")?;
+        assert_eq!(error.code, "INVALID_TOKEN");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_production_mode_accepts_bearer_jwt() -> Result<()> {
         let router = test_router_prod();
 
@@ -1300,6 +1478,8 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
             posture: Posture::Private,
             jwt: arco_api::config::JwtConfig {
                 rs256_public_key_pem: Some(TEST_RSA_PUBLIC_KEY_PEM.to_string()),
+                issuer: Some(TEST_JWT_ISSUER.to_string()),
+                audience: Some(TEST_JWT_AUDIENCE.to_string()),
                 ..arco_api::config::JwtConfig::default()
             },
             ..Config::default()
@@ -1585,6 +1765,94 @@ mod query {
 
         let response = router.oneshot(request).await.map_err(|err| match err {})?;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_audit_emits_auth_allow_on_success() -> Result<()> {
+        use arco_core::audit::{AuditAction, AuditEmitter, TestAuditSink};
+
+        let sink = std::sync::Arc::new(TestAuditSink::new());
+        let emitter = std::sync::Arc::new(AuditEmitter::with_test_sink(sink.clone()));
+
+        let router = ServerBuilder::new()
+            .debug(true)
+            .audit_emitter(emitter)
+            .build()
+            .test_router();
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/namespaces")
+            .header("X-Tenant-Id", "test-tenant")
+            .header("X-Workspace-Id", "test-workspace")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"name": "audit-test-ns", "description": "test"}"#,
+            ))
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let events = sink.events();
+        let auth_allows = events
+            .iter()
+            .filter(|e| e.action == AuditAction::AuthAllow)
+            .count();
+        assert!(auth_allows >= 1, "expected at least one AuthAllow event");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_audit_emits_auth_deny_on_missing_auth() -> Result<()> {
+        use arco_core::audit::{AuditAction, AuditEmitter, TestAuditSink};
+
+        let sink = std::sync::Arc::new(TestAuditSink::new());
+        let emitter = std::sync::Arc::new(AuditEmitter::with_test_sink(sink.clone()));
+
+        let config = Config {
+            debug: false,
+            posture: Posture::Private,
+            jwt: arco_api::config::JwtConfig {
+                hs256_secret: Some(TEST_JWT_SECRET.to_string()),
+                issuer: Some(TEST_JWT_ISSUER.to_string()),
+                audience: Some(TEST_JWT_AUDIENCE.to_string()),
+                ..arco_api::config::JwtConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let router = ServerBuilder::new()
+            .config(config)
+            .storage_backend(std::sync::Arc::new(arco_core::storage::MemoryBackend::new()))
+            .audit_emitter(emitter)
+            .build()
+            .test_router();
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/namespaces")
+            .body(Body::empty())
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let events = sink.events();
+        let auth_denies = events
+            .iter()
+            .filter(|e| e.action == AuditAction::AuthDeny)
+            .count();
+        assert!(auth_denies >= 1, "expected at least one AuthDeny event");
+
+        let deny_event = events
+            .iter()
+            .find(|e| e.action == AuditAction::AuthDeny)
+            .expect("should have AuthDeny event");
+        assert_eq!(deny_event.decision_reason, "missing_token");
 
         Ok(())
     }

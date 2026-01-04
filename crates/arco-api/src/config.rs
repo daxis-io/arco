@@ -1,5 +1,7 @@
 //! Server configuration.
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +100,69 @@ pub struct Config {
     /// Iceberg REST Catalog configuration.
     #[serde(default)]
     pub iceberg: IcebergApiConfig,
+
+    /// Audit configuration for security event logging.
+    #[serde(default)]
+    pub audit: AuditConfig,
+}
+
+/// Audit configuration for security event logging.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct AuditConfig {
+    /// HMAC key for pseudonymizing actor identifiers (base64-encoded).
+    ///
+    /// When set, actor IDs are hashed using HMAC-SHA256 with this key,
+    /// providing stronger pseudonymization than plain SHA-256.
+    /// Recommended: 32+ bytes of cryptographically random data.
+    ///
+    /// If unset, plain SHA-256 is used (less secure, vulnerable to
+    /// dictionary attacks if logs leak).
+    pub actor_hmac_key: Option<String>,
+
+    #[serde(skip)]
+    actor_hmac_key_bytes: Option<Arc<[u8]>>,
+
+    #[serde(skip)]
+    actor_hmac_key_invalid: bool,
+}
+
+impl std::fmt::Debug for AuditConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditConfig")
+            .field(
+                "actor_hmac_key",
+                &self.actor_hmac_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuditConfig {
+    pub(crate) fn prepare(&mut self) {
+        self.actor_hmac_key_bytes = None;
+        self.actor_hmac_key_invalid = false;
+
+        let Some(key_b64) = self.actor_hmac_key.as_deref() else {
+            return;
+        };
+
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64) {
+            Ok(key) => {
+                self.actor_hmac_key_bytes = Some(Arc::from(key));
+            }
+            Err(_) => {
+                self.actor_hmac_key_invalid = true;
+            }
+        }
+    }
+
+    pub(crate) fn actor_hmac_key_bytes(&self) -> Option<&[u8]> {
+        self.actor_hmac_key_bytes.as_deref()
+    }
+
+    pub(crate) const fn actor_hmac_key_invalid(&self) -> bool {
+        self.actor_hmac_key_invalid
+    }
 }
 
 /// CORS configuration for browser-based access.
@@ -138,6 +203,7 @@ impl Default for Config {
             run_key_fingerprint_cutoff: None,
             code_version: None,
             iceberg: IcebergApiConfig::default(),
+            audit: AuditConfig::default(),
         }
     }
 }
@@ -238,6 +304,7 @@ impl Config {
     /// - `ARCO_ICEBERG_NAMESPACE_SEPARATOR`
     /// - `ARCO_ICEBERG_ALLOW_WRITE`
     /// - `ARCO_ICEBERG_CONCURRENCY_LIMIT`
+    /// - `ARCO_AUDIT_ACTOR_HMAC_KEY`
     ///
     /// JWTs must include tenant/workspace/user claims. The user claim defaults
     /// to `sub` unless overridden via `ARCO_JWT_USER_CLAIM`.
@@ -336,19 +403,31 @@ impl Config {
             config.iceberg.concurrency_limit = Some(limit);
         }
 
+        if let Some(key) = env_string("ARCO_AUDIT_ACTOR_HMAC_KEY") {
+            config.audit.actor_hmac_key = Some(key);
+        }
+
         Ok(config)
     }
 }
 
 fn posture_from_env() -> Result<Posture> {
-    let environment = env_string("ARCO_ENVIRONMENT").ok_or_else(|| {
+    let environment = env_string("ARCO_ENVIRONMENT");
+    let api_public = env_string("ARCO_API_PUBLIC");
+
+    posture_from_env_values(environment.as_deref(), api_public.as_deref())
+}
+
+fn posture_from_env_values(environment: Option<&str>, api_public: Option<&str>) -> Result<Posture> {
+    let environment = environment.ok_or_else(|| {
         Error::InvalidInput("ARCO_ENVIRONMENT is required (dev|staging|prod)".to_string())
     })?;
-    let api_public = env_bool("ARCO_API_PUBLIC")?.ok_or_else(|| {
+    let api_public = api_public.ok_or_else(|| {
         Error::InvalidInput("ARCO_API_PUBLIC is required (true/false)".to_string())
     })?;
+    let api_public = parse_bool("ARCO_API_PUBLIC", api_public)?;
 
-    posture_from_values(&environment, api_public)
+    posture_from_values(environment, api_public)
 }
 
 fn posture_from_values(environment: &str, api_public: bool) -> Result<Posture> {
@@ -405,18 +484,22 @@ fn env_usize(name: &str) -> Result<Option<usize>> {
         .map_err(|e| Error::InvalidInput(format!("{name} must be a usize: {e}")))
 }
 
-fn env_bool(name: &str) -> Result<Option<bool>> {
-    let Some(v) = env_string(name) else {
-        return Ok(None);
-    };
-    let v = v.to_ascii_lowercase();
-    match v.as_str() {
-        "true" | "1" | "yes" | "y" => Ok(Some(true)),
-        "false" | "0" | "no" | "n" => Ok(Some(false)),
+fn parse_bool(name: &str, value: &str) -> Result<bool> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "true" | "1" | "yes" | "y" => Ok(true),
+        "false" | "0" | "no" | "n" => Ok(false),
         _ => Err(Error::InvalidInput(format!(
             "{name} must be a boolean (true/false/1/0)"
         ))),
     }
+}
+
+fn env_bool(name: &str) -> Result<Option<bool>> {
+    let Some(v) = env_string(name) else {
+        return Ok(None);
+    };
+    parse_bool(name, &v).map(Some)
 }
 
 fn env_datetime(name: &str) -> Result<Option<DateTime<Utc>>> {
@@ -539,5 +622,23 @@ mod tests {
         assert_eq!(posture_from_values("prod", false)?, Posture::Private);
         assert_eq!(posture_from_values("prod", true)?, Posture::Public);
         Ok(())
+    }
+
+    #[test]
+    fn posture_env_values_require_environment() {
+        let err = posture_from_env_values(None, Some("false")).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)));
+    }
+
+    #[test]
+    fn posture_env_values_require_api_public() {
+        let err = posture_from_env_values(Some("dev"), None).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)));
+    }
+
+    #[test]
+    fn posture_env_values_reject_invalid_api_public() {
+        let err = posture_from_env_values(Some("dev"), Some("maybe")).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)));
     }
 }

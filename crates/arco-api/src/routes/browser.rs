@@ -121,8 +121,19 @@ pub(crate) async fn mint_urls(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MintUrlsRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Parse domain
-    let domain = parse_domain(&req.domain)?;
+    let domain = match parse_domain(&req.domain) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::audit::emit_url_mint_deny(
+                state.audit(),
+                &ctx,
+                &req.domain,
+                crate::audit::REASON_UNKNOWN_DOMAIN,
+                &state.config.audit,
+            );
+            return Err(e);
+        }
+    };
 
     // Bound TTL
     let ttl_seconds = req
@@ -134,6 +145,13 @@ pub(crate) async fn mint_urls(
     // SECURITY: Validate path traversal FIRST (before any I/O)
     for path in &req.paths {
         if path.contains("..") {
+            crate::audit::emit_url_mint_deny(
+                state.audit(),
+                &ctx,
+                &req.domain,
+                crate::audit::REASON_PATH_TRAVERSAL,
+                &state.config.audit,
+            );
             return Err(ApiError::forbidden(format!(
                 "Path traversal not allowed: {path}"
             )));
@@ -165,6 +183,13 @@ pub(crate) async fn mint_urls(
     // Validate ALL requested paths are in allowlist
     for path in &req.paths {
         if !mintable_set.contains(path) {
+            crate::audit::emit_url_mint_deny(
+                state.audit(),
+                &ctx,
+                &req.domain,
+                crate::audit::REASON_NOT_IN_ALLOWLIST,
+                &state.config.audit,
+            );
             return Err(ApiError::forbidden(format!(
                 "Path not in manifest allowlist: {path}"
             )));
@@ -179,7 +204,14 @@ pub(crate) async fn mint_urls(
         .map_err(ApiError::from)?;
 
     // Record metrics for signed URL minting
-    crate::metrics::record_signed_url_minted(&ctx.tenant);
+    crate::metrics::record_signed_url_minted();
+    crate::audit::emit_url_mint_allow(
+        state.audit(),
+        &ctx,
+        &req.domain,
+        req.paths.len(),
+        &state.config.audit,
+    );
 
     let urls = signed
         .into_iter()

@@ -29,7 +29,7 @@ jobs:
       - name: Generate SBOM (CycloneDX JSON)
         run: cargo sbom --output-format cyclone_dx_json_1_6 > arco.cyclonedx.json
       - name: Upload SBOM artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: sbom
           path: |

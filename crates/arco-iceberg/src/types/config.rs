@@ -5,9 +5,7 @@ use std::collections::HashMap;
 
 use crate::state::IcebergConfig;
 
-// Phase B: commit_table is supported; other write endpoints are not yet implemented.
 const COMMIT_ENDPOINT_SUPPORTED: bool = true;
-const WRITE_ENDPOINTS_SUPPORTED: bool = false;
 
 /// Response from the `/v1/config` endpoint.
 ///
@@ -64,13 +62,11 @@ impl ConfigResponse {
             endpoints.push("POST /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string());
         }
 
-        if config.allow_write && WRITE_ENDPOINTS_SUPPORTED {
+        if config.allow_namespace_crud {
             endpoints.extend([
                 "POST /v1/{prefix}/namespaces".to_string(),
                 "DELETE /v1/{prefix}/namespaces/{namespace}".to_string(),
-                "POST /v1/{prefix}/namespaces/{namespace}/tables".to_string(),
-                "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string(),
-                "POST /v1/{prefix}/tables/rename".to_string(),
+                "POST /v1/{prefix}/namespaces/{namespace}/properties".to_string(),
             ]);
         }
 
@@ -143,20 +139,31 @@ mod tests {
     }
 
     #[test]
-    fn test_allow_write_does_not_advertise_without_support() {
+    fn test_allow_write_does_not_advertise_namespace_crud() {
         let mut config = IcebergConfig::default();
         config.allow_write = true;
         let config = ConfigResponse::from_config(&config, false);
         let endpoints = config.endpoints.expect("endpoints should be present");
 
-        // Only commit_table is advertised; other write endpoints stay hidden.
         assert!(
             endpoints
                 .contains(&"POST /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string())
         );
         assert!(!endpoints.contains(&"POST /v1/{prefix}/namespaces".to_string()));
+    }
+
+    #[test]
+    fn test_namespace_crud_advertises_endpoints() {
+        let mut config = IcebergConfig::default();
+        config.allow_namespace_crud = true;
+        let config = ConfigResponse::from_config(&config, false);
+        let endpoints = config.endpoints.expect("endpoints should be present");
+
+        assert!(endpoints.contains(&"POST /v1/{prefix}/namespaces".to_string()));
+        assert!(endpoints.contains(&"DELETE /v1/{prefix}/namespaces/{namespace}".to_string()));
         assert!(
-            !endpoints.contains(&"POST /v1/{prefix}/namespaces/{namespace}/tables".to_string())
+            endpoints
+                .contains(&"POST /v1/{prefix}/namespaces/{namespace}/properties".to_string())
         );
     }
 }

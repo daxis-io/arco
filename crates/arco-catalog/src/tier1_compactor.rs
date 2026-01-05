@@ -702,6 +702,26 @@ fn apply_catalog_event(
             }
             state.namespaces.push(namespace);
         }
+        CatalogDdlEvent::NamespaceUpdated { namespace } => {
+            let Some(existing) = state.namespaces.iter_mut().find(|ns| ns.id == namespace.id)
+            else {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("namespace '{}' not found", namespace.id),
+                });
+            };
+
+            if existing.name != namespace.name {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("namespace identity mismatch for {}", namespace.id),
+                });
+            }
+
+            if existing == &namespace {
+                return Ok(());
+            }
+
+            *existing = namespace;
+        }
         CatalogDdlEvent::NamespaceDeleted {
             namespace_id,
             namespace_name,

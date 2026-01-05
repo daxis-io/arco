@@ -23,8 +23,11 @@ use utoipa::OpenApi;
     paths(
         crate::routes::config::get_config,
         crate::routes::namespaces::list_namespaces,
+        crate::routes::namespaces::create_namespace,
         crate::routes::namespaces::get_namespace,
         crate::routes::namespaces::head_namespace,
+        crate::routes::namespaces::delete_namespace,
+        crate::routes::namespaces::update_namespace_properties,
         crate::routes::tables::list_tables,
         crate::routes::tables::load_table,
         crate::routes::tables::head_table,
@@ -35,7 +38,11 @@ use utoipa::OpenApi;
         schemas(
             crate::types::ConfigResponse,
             crate::types::ListNamespacesResponse,
+            crate::types::CreateNamespaceRequest,
+            crate::types::CreateNamespaceResponse,
             crate::types::GetNamespaceResponse,
+            crate::types::UpdateNamespacePropertiesRequest,
+            crate::types::UpdateNamespacePropertiesResponse,
             crate::types::NamespaceIdent,
             crate::types::ListTablesResponse,
             crate::types::LoadTableResponse,

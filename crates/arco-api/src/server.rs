@@ -20,7 +20,7 @@ use tower_http::trace::TraceLayer;
 
 use arco_flow::orchestration::controllers::{NoopSensorEvaluator, SensorEvaluator};
 use arco_iceberg::context::IcebergRequestContext;
-use arco_iceberg::{IcebergError, IcebergState, iceberg_router};
+use arco_iceberg::{IcebergError, IcebergState, Tier1CompactorFactory, iceberg_router};
 
 use crate::compactor_client::CompactorClient;
 use crate::config::{Config, CorsConfig};
@@ -407,6 +407,7 @@ impl Server {
     }
 
     /// Creates the router with all routes and middleware.
+    #[allow(clippy::cognitive_complexity)]
     fn create_router(&self) -> Router {
         let state = Arc::new(AppState::new_with_audit(
             self.config.clone(),
@@ -461,10 +462,17 @@ impl Server {
         // Mount Iceberg REST Catalog if enabled
         // Uses nest_service since Iceberg router has its own state type
         if state.config.iceberg.enabled {
-            let iceberg_state = IcebergState::with_config(
+            let mut iceberg_state = IcebergState::with_config(
                 Arc::clone(&state.storage),
                 state.config.iceberg.to_iceberg_config(),
             );
+
+            if state.config.iceberg.allow_namespace_crud {
+                iceberg_state =
+                    iceberg_state.with_compactor_factory(Arc::new(Tier1CompactorFactory));
+                tracing::info!("Iceberg namespace CRUD enabled with per-tenant compaction");
+            }
+
             let iceberg_service = ServiceBuilder::new()
                 .layer(middleware::from_fn_with_state(
                     Arc::clone(&state),

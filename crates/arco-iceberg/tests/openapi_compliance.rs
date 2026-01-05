@@ -68,8 +68,11 @@ fn test_openapi_paths_align_with_official_spec() {
     let endpoints = [
         ("/v1/config", "get"),
         ("/v1/{prefix}/namespaces", "get"),
+        ("/v1/{prefix}/namespaces", "post"),
         ("/v1/{prefix}/namespaces/{namespace}", "get"),
         ("/v1/{prefix}/namespaces/{namespace}", "head"),
+        ("/v1/{prefix}/namespaces/{namespace}", "delete"),
+        ("/v1/{prefix}/namespaces/{namespace}/properties", "post"),
         ("/v1/{prefix}/namespaces/{namespace}/tables", "get"),
         ("/v1/{prefix}/namespaces/{namespace}/tables/{table}", "get"),
         ("/v1/{prefix}/namespaces/{namespace}/tables/{table}", "head"),

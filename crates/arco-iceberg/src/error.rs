@@ -18,13 +18,20 @@ pub type IcebergResult<T> = Result<T, IcebergError>;
 /// in the REST Catalog specification.
 #[derive(Debug, Error)]
 pub enum IcebergError {
-    /// Bad request (400) - Invalid input or unsupported operation.
+    /// Bad request (400) - Invalid input.
     #[error("Bad request: {message}")]
     BadRequest {
         /// Human-readable error message.
         message: String,
         /// Iceberg exception type (e.g., `BadRequestException`).
         error_type: &'static str,
+    },
+
+    /// Not acceptable (406) - Unsupported operation.
+    #[error("Unsupported: {message}")]
+    UnsupportedOperation {
+        /// Human-readable error message.
+        message: String,
     },
 
     /// Unauthorized (401) - Authentication required or invalid.
@@ -57,6 +64,13 @@ pub enum IcebergError {
         message: String,
         /// Iceberg exception type (e.g., `CommitFailedException`).
         error_type: &'static str,
+    },
+
+    /// Unprocessable entity (422) - Semantic validation failure.
+    #[error("Unprocessable: {message}")]
+    UnprocessableEntity {
+        /// Human-readable error message.
+        message: String,
     },
 
     /// Service unavailable (503) - Retry after delay.
@@ -95,12 +109,40 @@ impl IcebergError {
         }
     }
 
-    /// Create a not found error for a missing namespace.
+    /// Creates a namespace not found error.
     #[must_use]
     pub fn namespace_not_found(namespace: &str) -> Self {
         Self::NotFound {
             message: format!("Namespace does not exist: {namespace}"),
             error_type: "NoSuchNamespaceException",
+        }
+    }
+
+    /// Creates a namespace not empty error (409).
+    #[must_use]
+    pub fn namespace_not_empty(namespace: &str) -> Self {
+        Self::Conflict {
+            message: format!("Namespace is not empty: {namespace}"),
+            error_type: "NamespaceNotEmptyException",
+        }
+    }
+
+    /// Creates an unsupported operation error (406).
+    #[must_use]
+    pub fn unsupported_operation(message: impl Into<String>) -> Self {
+        Self::UnsupportedOperation {
+            message: message.into(),
+        }
+    }
+
+    /// Creates a 422 error for property keys appearing in both updates and removals.
+    #[must_use]
+    pub fn property_overlap(keys: &[String]) -> Self {
+        Self::UnprocessableEntity {
+            message: format!(
+                "Keys present in both updates and removals: {}",
+                keys.join(", ")
+            ),
         }
     }
 
@@ -127,10 +169,12 @@ impl IcebergError {
     pub const fn status_code(&self) -> StatusCode {
         match self {
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
+            Self::UnsupportedOperation { .. } => StatusCode::NOT_ACCEPTABLE,
             Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
             Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::Conflict { .. } => StatusCode::CONFLICT,
+            Self::UnprocessableEntity { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -143,8 +187,10 @@ impl IcebergError {
             Self::BadRequest { error_type, .. }
             | Self::NotFound { error_type, .. }
             | Self::Conflict { error_type, .. } => error_type,
+            Self::UnsupportedOperation { .. } => "UnsupportedOperationException",
             Self::Unauthorized { .. } => "UnauthorizedException",
             Self::Forbidden { .. } => "ForbiddenException",
+            Self::UnprocessableEntity { .. } => "UnprocessableEntityException",
             Self::ServiceUnavailable { .. } => "ServiceUnavailableException",
             Self::Internal { .. } => "InternalServerException",
         }
@@ -155,10 +201,12 @@ impl IcebergError {
     pub fn message(&self) -> &str {
         match self {
             Self::BadRequest { message, .. }
+            | Self::UnsupportedOperation { message }
             | Self::Unauthorized { message }
             | Self::Forbidden { message }
             | Self::NotFound { message, .. }
             | Self::Conflict { message, .. }
+            | Self::UnprocessableEntity { message }
             | Self::ServiceUnavailable { message, .. }
             | Self::Internal { message } => message,
         }
@@ -221,10 +269,20 @@ impl From<CatalogError> for IcebergError {
                 message: format!("{entity} already exists: {name}"),
                 error_type: "AlreadyExistsException",
             },
-            CatalogError::Validation { message } => Self::BadRequest {
-                message,
-                error_type: "BadRequestException",
-            },
+            CatalogError::Validation { message } => {
+                if message.contains("contains tables, cannot delete") {
+                    let ns_name = message
+                        .strip_prefix("namespace '")
+                        .and_then(|s| s.split('\'').next())
+                        .unwrap_or("unknown");
+                    Self::namespace_not_empty(ns_name)
+                } else {
+                    Self::BadRequest {
+                        message,
+                        error_type: "BadRequestException",
+                    }
+                }
+            }
             CatalogError::PreconditionFailed { message } | CatalogError::CasFailed { message } => {
                 Self::Conflict {
                     message,

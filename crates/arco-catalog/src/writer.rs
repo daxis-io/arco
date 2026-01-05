@@ -521,6 +521,88 @@ impl CatalogWriter {
         result.map(|_| namespace)
     }
 
+    /// Updates a namespace's description.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the namespace doesn't exist or storage operations fail.
+    pub async fn update_namespace(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        opts: WriteOptions,
+    ) -> Result<Namespace> {
+        if let Some(expected) = &opts.if_match {
+            let manifest = self.tier1.read_manifest().await?;
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+
+        let compactor = self.sync_compactor()?;
+
+        let guard = self
+            .tier1
+            .acquire_lock(self.lock_ttl, self.lock_max_retries)
+            .await?;
+
+        let manifest = self.tier1.read_manifest().await?;
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+
+        let existing = state
+            .namespaces
+            .iter()
+            .find(|ns| ns.name == name)
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "namespace".into(),
+                name: name.to_string(),
+            })?;
+
+        let now = Utc::now().timestamp_millis();
+        let namespace = Namespace {
+            id: existing.id.clone(),
+            name: existing.name.clone(),
+            description: description.map(String::from),
+            created_at: existing.created_at,
+            updated_at: now,
+        };
+
+        let event = CatalogDdlEvent::NamespaceUpdated {
+            namespace: NamespaceRecord::from(&namespace),
+        };
+
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
+            .await?;
+
+        let request = SyncCompactRequest {
+            domain: CatalogDomain::Catalog.as_str().to_string(),
+            event_paths: vec![CatalogPaths::ledger_event(
+                CatalogDomain::Catalog,
+                &event_id.to_string(),
+            )],
+            fencing_token: guard.fencing_token().sequence(),
+            request_id: opts.request_id.clone(),
+        };
+
+        let result = compactor.sync_compact(request).await;
+        guard.release().await?;
+        result.map(|_| namespace)
+    }
+
     /// Deletes a namespace.
     ///
     /// # Arguments

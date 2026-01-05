@@ -99,7 +99,10 @@ pub use error::{IcebergError, IcebergResult};
 pub use openapi::{IcebergApiDoc, openapi, openapi_json};
 pub use pointer::IcebergTablePointer;
 pub use router::iceberg_router;
-pub use state::{CredentialProvider, IcebergConfig, IcebergState};
+pub use state::{
+    CredentialProvider, IcebergConfig, IcebergState, SharedCompactorFactory, SyncCompactorFactory,
+    Tier1CompactorFactory,
+};
 
 // Re-export reconciler types
 pub use reconciler::{IcebergReconciler, Reconciler, ReconciliationReport};

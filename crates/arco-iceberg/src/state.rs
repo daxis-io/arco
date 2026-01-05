@@ -5,9 +5,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use arco_catalog::SyncCompactor;
+use arco_core::ScopedStorage;
 use arco_core::storage::StorageBackend;
 
-use crate::error::IcebergResult;
+use crate::error::{IcebergError, IcebergResult};
 use crate::types::{AccessDelegation, StorageCredential, TableIdent};
 
 /// Server-side configuration for the Iceberg REST API.
@@ -21,6 +23,8 @@ pub struct IcebergConfig {
     pub idempotency_key_lifetime: Option<String>,
     /// Enable write endpoints in `/v1/config`.
     pub allow_write: bool,
+    /// Enable namespace create/delete endpoints.
+    pub allow_namespace_crud: bool,
     /// Optional request timeout for handlers.
     pub request_timeout: Option<Duration>,
     /// Optional concurrency limit for handlers.
@@ -34,9 +38,50 @@ impl Default for IcebergConfig {
             namespace_separator: "%1F".to_string(),
             idempotency_key_lifetime: Some("PT1H".to_string()),
             allow_write: false,
+            allow_namespace_crud: false,
             request_timeout: None,
             concurrency_limit: None,
         }
+    }
+}
+
+/// Factory for creating per-tenant `SyncCompactor` instances.
+pub trait SyncCompactorFactory: Send + Sync + 'static {
+    /// Creates a `SyncCompactor` for the given scoped storage.
+    fn create_compactor(&self, storage: ScopedStorage) -> Arc<dyn SyncCompactor>;
+}
+
+/// Factory that creates local `Tier1Compactor` instances.
+///
+/// Use this for testing or single-node deployments where sync compaction
+/// can be performed locally rather than via a remote service.
+pub struct Tier1CompactorFactory;
+
+impl SyncCompactorFactory for Tier1CompactorFactory {
+    fn create_compactor(&self, storage: ScopedStorage) -> Arc<dyn SyncCompactor> {
+        Arc::new(arco_catalog::Tier1Compactor::new(storage))
+    }
+}
+
+/// Factory that shares a single `SyncCompactor` instance across all tenants.
+///
+/// Use this with remote compactor services where tenant scoping is handled
+/// by the service rather than by per-tenant client instances.
+pub struct SharedCompactorFactory {
+    compactor: Arc<dyn SyncCompactor>,
+}
+
+impl SharedCompactorFactory {
+    /// Creates a factory that shares the given compactor.
+    #[must_use]
+    pub fn new(compactor: Arc<dyn SyncCompactor>) -> Self {
+        Self { compactor }
+    }
+}
+
+impl SyncCompactorFactory for SharedCompactorFactory {
+    fn create_compactor(&self, _storage: ScopedStorage) -> Arc<dyn SyncCompactor> {
+        Arc::clone(&self.compactor)
     }
 }
 
@@ -57,6 +102,8 @@ pub struct IcebergState {
     pub config: IcebergConfig,
     /// Optional credential provider for vended credentials.
     pub credential_provider: Option<Arc<dyn CredentialProvider>>,
+    /// Optional factory for creating per-tenant compactors.
+    pub compactor_factory: Option<Arc<dyn SyncCompactorFactory>>,
 }
 
 impl IcebergState {
@@ -67,6 +114,7 @@ impl IcebergState {
             storage,
             config: IcebergConfig::default(),
             credential_provider: None,
+            compactor_factory: None,
         }
     }
 
@@ -77,6 +125,7 @@ impl IcebergState {
             storage,
             config,
             credential_provider: None,
+            compactor_factory: None,
         }
     }
 
@@ -87,10 +136,34 @@ impl IcebergState {
         self
     }
 
+    /// Attaches a compactor factory for namespace CRUD operations.
+    #[must_use]
+    pub fn with_compactor_factory(mut self, factory: Arc<dyn SyncCompactorFactory>) -> Self {
+        self.compactor_factory = Some(factory);
+        self
+    }
+
     /// Returns true when credential vending is enabled.
     #[must_use]
     pub fn credentials_enabled(&self) -> bool {
         self.credential_provider.is_some()
+    }
+
+    /// Creates a compactor for the given scoped storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns `IcebergError::Internal` if no compactor factory is configured.
+    pub fn create_compactor(
+        &self,
+        storage: &ScopedStorage,
+    ) -> IcebergResult<Arc<dyn SyncCompactor>> {
+        self.compactor_factory
+            .as_ref()
+            .map(|f| f.create_compactor(storage.clone()))
+            .ok_or_else(|| IcebergError::Internal {
+                message: "Namespace CRUD requires a compactor factory".to_string(),
+            })
     }
 }
 

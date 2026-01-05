@@ -223,6 +223,9 @@ pub struct IcebergApiConfig {
     /// Enable write endpoints (Phase B+).
     #[serde(default)]
     pub allow_write: bool,
+    /// Enable namespace create/delete endpoints.
+    #[serde(default)]
+    pub allow_namespace_crud: bool,
     /// Optional concurrency limit for Iceberg handlers.
     #[serde(default)]
     pub concurrency_limit: Option<usize>,
@@ -243,6 +246,7 @@ impl Default for IcebergApiConfig {
             prefix: default_iceberg_prefix(),
             namespace_separator: default_namespace_separator(),
             allow_write: false,
+            allow_namespace_crud: false,
             concurrency_limit: None,
         }
     }
@@ -257,6 +261,7 @@ impl IcebergApiConfig {
             namespace_separator: self.namespace_separator.clone(),
             idempotency_key_lifetime: Some("PT1H".to_string()),
             allow_write: self.allow_write,
+            allow_namespace_crud: self.allow_namespace_crud,
             request_timeout: None,
             concurrency_limit: self.concurrency_limit,
         }
@@ -303,6 +308,7 @@ impl Config {
     /// - `ARCO_ICEBERG_PREFIX`
     /// - `ARCO_ICEBERG_NAMESPACE_SEPARATOR`
     /// - `ARCO_ICEBERG_ALLOW_WRITE`
+    /// - `ARCO_ICEBERG_ALLOW_NAMESPACE_CRUD`
     /// - `ARCO_ICEBERG_CONCURRENCY_LIMIT`
     /// - `ARCO_AUDIT_ACTOR_HMAC_KEY`
     ///
@@ -312,6 +318,7 @@ impl Config {
     /// # Errors
     ///
     /// Returns an error if any environment variable is present but cannot be parsed.
+    #[allow(clippy::cognitive_complexity)]
     pub fn from_env() -> Result<Self> {
         let mut config = Self::default();
 
@@ -398,6 +405,9 @@ impl Config {
         }
         if let Some(allow_write) = env_bool("ARCO_ICEBERG_ALLOW_WRITE")? {
             config.iceberg.allow_write = allow_write;
+        }
+        if let Some(allow_crud) = env_bool("ARCO_ICEBERG_ALLOW_NAMESPACE_CRUD")? {
+            config.iceberg.allow_namespace_crud = allow_crud;
         }
         if let Some(limit) = env_usize("ARCO_ICEBERG_CONCURRENCY_LIMIT")? {
             config.iceberg.concurrency_limit = Some(limit);

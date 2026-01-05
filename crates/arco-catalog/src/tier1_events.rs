@@ -19,6 +19,11 @@ pub enum CatalogDdlEvent {
         /// The namespace record to create.
         namespace: NamespaceRecord,
     },
+    /// Update namespace metadata.
+    NamespaceUpdated {
+        /// The updated namespace record.
+        namespace: NamespaceRecord,
+    },
     /// Delete a namespace by ID.
     NamespaceDeleted {
         /// ID of the namespace to delete.

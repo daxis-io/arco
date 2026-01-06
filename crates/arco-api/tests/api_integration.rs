@@ -1517,7 +1517,7 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
             .uri("/api/v1/namespaces")
             .header("X-Tenant-Id", "test-tenant")
             .header("X-Workspace-Id", "test-workspace")
-            .header("Idempotency-Key", "unique-key-123")
+            .header("Idempotency-Key", "01924a7c-8d9f-7000-8000-000000000001")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body))
             .context("build request")?;
@@ -1853,6 +1853,175 @@ mod query {
             .find(|e| e.action == AuditAction::AuthDeny)
             .expect("should have AuthDeny event");
         assert_eq!(deny_event.decision_reason, "missing_token");
+
+        Ok(())
+    }
+}
+
+mod idempotency {
+    use super::*;
+    use serde::Deserialize;
+    use std::sync::Arc;
+
+    use arco_core::storage::MemoryBackend;
+
+    #[derive(Debug, Deserialize)]
+    struct NamespaceResponse {
+        id: String,
+        name: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct TableResponse {
+        id: String,
+        #[allow(dead_code)]
+        name: String,
+    }
+
+    fn router_with_shared_storage() -> (axum::Router, Arc<MemoryBackend>) {
+        let backend = Arc::new(MemoryBackend::new());
+        let router = ServerBuilder::new()
+            .debug(true)
+            .storage_backend(backend.clone())
+            .build()
+            .test_router();
+        (router, backend)
+    }
+
+    #[tokio::test]
+    async fn test_create_namespace_idempotent_replay() -> Result<()> {
+        let (router, _) = router_with_shared_storage();
+        let idempotency_key = "01924a7c-8d9f-7000-8000-000000000001";
+
+        let body = serde_json::json!({
+            "name": "idempotent-ns",
+            "description": "Test namespace"
+        });
+
+        let (status1, ns1): (_, NamespaceResponse) = helpers::post_json_with_headers(
+            router.clone(),
+            "/api/v1/namespaces",
+            body.clone(),
+            &[("Idempotency-Key", idempotency_key)],
+        )
+        .await?;
+        assert_eq!(status1, StatusCode::CREATED);
+
+        let (status2, ns2): (_, NamespaceResponse) = helpers::post_json_with_headers(
+            router.clone(),
+            "/api/v1/namespaces",
+            body,
+            &[("Idempotency-Key", idempotency_key)],
+        )
+        .await?;
+        assert_eq!(status2, StatusCode::CREATED);
+        assert_eq!(ns1.id, ns2.id);
+        assert_eq!(ns1.name, ns2.name);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_namespace_conflict_on_different_payload() -> Result<()> {
+        let (router, _) = router_with_shared_storage();
+        let idempotency_key = "01924a7c-8d9f-7000-8000-000000000002";
+
+        let (status1, _): (_, NamespaceResponse) = helpers::post_json_with_headers(
+            router.clone(),
+            "/api/v1/namespaces",
+            serde_json::json!({
+                "name": "ns-v1",
+                "description": "First version"
+            }),
+            &[("Idempotency-Key", idempotency_key)],
+        )
+        .await?;
+        assert_eq!(status1, StatusCode::CREATED);
+
+        let request = helpers::make_request_with_headers(
+            Method::POST,
+            "/api/v1/namespaces",
+            Some(serde_json::json!({
+                "name": "ns-v2",
+                "description": "Different version"
+            })),
+            &[("Idempotency-Key", idempotency_key)],
+        )?;
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_register_table_idempotent_replay() -> Result<()> {
+        let (router, _) = router_with_shared_storage();
+
+        let (_, _): (_, NamespaceResponse) = helpers::post_json(
+            router.clone(),
+            "/api/v1/namespaces",
+            serde_json::json!({ "name": "test-ns" }),
+        )
+        .await?;
+
+        let idempotency_key = "01924a7c-8d9f-7000-8000-000000000003";
+        let table_body = serde_json::json!({
+            "name": "test-table",
+            "columns": [
+                {"name": "id", "data_type": "INTEGER", "nullable": false}
+            ]
+        });
+
+        let (status1, t1): (_, TableResponse) = helpers::post_json_with_headers(
+            router.clone(),
+            "/api/v1/namespaces/test-ns/tables",
+            table_body.clone(),
+            &[("Idempotency-Key", idempotency_key)],
+        )
+        .await?;
+        assert_eq!(status1, StatusCode::CREATED);
+
+        let (status2, t2): (_, TableResponse) = helpers::post_json_with_headers(
+            router.clone(),
+            "/api/v1/namespaces/test-ns/tables",
+            table_body,
+            &[("Idempotency-Key", idempotency_key)],
+        )
+        .await?;
+        assert_eq!(status2, StatusCode::CREATED);
+        assert_eq!(t1.id, t2.id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_invalid_idempotency_key_rejected() -> Result<()> {
+        let router = test_router();
+
+        let request = helpers::make_request_with_headers(
+            Method::POST,
+            "/api/v1/namespaces",
+            Some(serde_json::json!({ "name": "test-ns" })),
+            &[("Idempotency-Key", "not-a-valid-uuid")],
+        )?;
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_uuidv4_idempotency_key_rejected() -> Result<()> {
+        let router = test_router();
+
+        let request = helpers::make_request_with_headers(
+            Method::POST,
+            "/api/v1/namespaces",
+            Some(serde_json::json!({ "name": "test-ns" })),
+            &[("Idempotency-Key", "550e8400-e29b-41d4-a716-446655440000")],
+        )?;
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         Ok(())
     }

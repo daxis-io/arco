@@ -20,7 +20,9 @@ use tower_http::trace::TraceLayer;
 
 use arco_flow::orchestration::controllers::{NoopSensorEvaluator, SensorEvaluator};
 use arco_iceberg::context::IcebergRequestContext;
-use arco_iceberg::{IcebergError, IcebergState, Tier1CompactorFactory, iceberg_router};
+use arco_iceberg::{
+    IcebergError, IcebergState, SharedCompactorFactory, Tier1CompactorFactory, iceberg_router,
+};
 
 use crate::compactor_client::CompactorClient;
 use crate::config::{Config, CorsConfig};
@@ -467,10 +469,22 @@ impl Server {
                 state.config.iceberg.to_iceberg_config(),
             );
 
-            if state.config.iceberg.allow_namespace_crud {
-                iceberg_state =
-                    iceberg_state.with_compactor_factory(Arc::new(Tier1CompactorFactory));
-                tracing::info!("Iceberg namespace CRUD enabled with per-tenant compaction");
+            if state.config.iceberg.allow_namespace_crud || state.config.iceberg.allow_table_crud {
+                if let Some(compactor) = state.sync_compactor() {
+                    iceberg_state = iceberg_state
+                        .with_compactor_factory(Arc::new(SharedCompactorFactory::new(compactor)));
+                    tracing::info!("Iceberg CRUD enabled with remote sync compaction");
+                } else if state.config.debug {
+                    iceberg_state =
+                        iceberg_state.with_compactor_factory(Arc::new(Tier1CompactorFactory));
+                    tracing::warn!(
+                        "Iceberg CRUD enabled without compactor_url; using local Tier1 compaction (debug mode only)"
+                    );
+                } else {
+                    tracing::error!(
+                        "Iceberg CRUD enabled without compactor_url; CRUD endpoints will fail"
+                    );
+                }
             }
 
             let iceberg_service = ServiceBuilder::new()
@@ -531,6 +545,7 @@ impl Server {
                 header::CONTENT_LENGTH,
                 header::ETAG,
                 header::HeaderName::from_static("x-request-id"),
+                header::HeaderName::from_static("retry-after"),
             ])
             // Set max age for preflight caching
             .max_age(Duration::from_secs(cors_config.max_age_seconds))
@@ -674,6 +689,16 @@ impl Server {
         if !self.config.debug && self.config.compactor_url.is_none() {
             return Err(arco_core::Error::InvalidInput(
                 "ARCO_COMPACTOR_URL is required when ARCO_DEBUG=false".to_string(),
+            ));
+        }
+
+        if self.config.iceberg.enabled
+            && (self.config.iceberg.allow_namespace_crud || self.config.iceberg.allow_table_crud)
+            && !self.config.debug
+            && self.config.compactor_url.is_none()
+        {
+            return Err(arco_core::Error::InvalidInput(
+                "Iceberg CRUD requires ARCO_COMPACTOR_URL when ARCO_DEBUG=false".to_string(),
             ));
         }
 

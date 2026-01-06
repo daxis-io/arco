@@ -104,6 +104,22 @@ pub struct Config {
     /// Audit configuration for security event logging.
     #[serde(default)]
     pub audit: AuditConfig,
+
+    /// Stale timeout for idempotency markers in seconds.
+    ///
+    /// In-progress idempotency markers older than this timeout can be taken over
+    /// by a new request. This prevents stuck requests from blocking retries.
+    ///
+    /// Default: 300 (5 minutes).
+    #[serde(default = "default_idempotency_stale_timeout_secs")]
+    pub idempotency_stale_timeout_secs: u64,
+}
+
+const MIN_IDEMPOTENCY_STALE_TIMEOUT_SECS: u64 = 10;
+const MAX_IDEMPOTENCY_STALE_TIMEOUT_SECS: u64 = 3600; // 1 hour max
+
+fn default_idempotency_stale_timeout_secs() -> u64 {
+    300 // 5 minutes, matching arco_catalog::idempotency::DEFAULT_STALE_TIMEOUT
 }
 
 /// Audit configuration for security event logging.
@@ -204,12 +220,14 @@ impl Default for Config {
             code_version: None,
             iceberg: IcebergApiConfig::default(),
             audit: AuditConfig::default(),
+            idempotency_stale_timeout_secs: default_idempotency_stale_timeout_secs(),
         }
     }
 }
 
 /// Configuration for the Iceberg REST Catalog API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct IcebergApiConfig {
     /// Enable Iceberg REST endpoints at `/iceberg/v1/*`.
     #[serde(default)]
@@ -226,6 +244,9 @@ pub struct IcebergApiConfig {
     /// Enable namespace create/delete endpoints.
     #[serde(default)]
     pub allow_namespace_crud: bool,
+    /// Enable table create/drop/register endpoints.
+    #[serde(default)]
+    pub allow_table_crud: bool,
     /// Optional concurrency limit for Iceberg handlers.
     #[serde(default)]
     pub concurrency_limit: Option<usize>,
@@ -247,6 +268,7 @@ impl Default for IcebergApiConfig {
             namespace_separator: default_namespace_separator(),
             allow_write: false,
             allow_namespace_crud: false,
+            allow_table_crud: false,
             concurrency_limit: None,
         }
     }
@@ -262,6 +284,7 @@ impl IcebergApiConfig {
             idempotency_key_lifetime: Some("PT1H".to_string()),
             allow_write: self.allow_write,
             allow_namespace_crud: self.allow_namespace_crud,
+            allow_table_crud: self.allow_table_crud,
             request_timeout: None,
             concurrency_limit: self.concurrency_limit,
         }
@@ -309,8 +332,10 @@ impl Config {
     /// - `ARCO_ICEBERG_NAMESPACE_SEPARATOR`
     /// - `ARCO_ICEBERG_ALLOW_WRITE`
     /// - `ARCO_ICEBERG_ALLOW_NAMESPACE_CRUD`
+    /// - `ARCO_ICEBERG_ALLOW_TABLE_CRUD`
     /// - `ARCO_ICEBERG_CONCURRENCY_LIMIT`
     /// - `ARCO_AUDIT_ACTOR_HMAC_KEY`
+    /// - `ARCO_IDEMPOTENCY_STALE_TIMEOUT_SECS` (10-3600, default: 300)
     ///
     /// JWTs must include tenant/workspace/user claims. The user claim defaults
     /// to `sub` unless overridden via `ARCO_JWT_USER_CLAIM`.
@@ -318,7 +343,7 @@ impl Config {
     /// # Errors
     ///
     /// Returns an error if any environment variable is present but cannot be parsed.
-    #[allow(clippy::cognitive_complexity)]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     pub fn from_env() -> Result<Self> {
         let mut config = Self::default();
 
@@ -409,6 +434,9 @@ impl Config {
         if let Some(allow_crud) = env_bool("ARCO_ICEBERG_ALLOW_NAMESPACE_CRUD")? {
             config.iceberg.allow_namespace_crud = allow_crud;
         }
+        if let Some(allow_table_crud) = env_bool("ARCO_ICEBERG_ALLOW_TABLE_CRUD")? {
+            config.iceberg.allow_table_crud = allow_table_crud;
+        }
         if let Some(limit) = env_usize("ARCO_ICEBERG_CONCURRENCY_LIMIT")? {
             config.iceberg.concurrency_limit = Some(limit);
         }
@@ -417,7 +445,30 @@ impl Config {
             config.audit.actor_hmac_key = Some(key);
         }
 
+        if let Some(secs) = env_u64("ARCO_IDEMPOTENCY_STALE_TIMEOUT_SECS")? {
+            if secs < MIN_IDEMPOTENCY_STALE_TIMEOUT_SECS {
+                return Err(Error::InvalidInput(format!(
+                    "ARCO_IDEMPOTENCY_STALE_TIMEOUT_SECS must be at least {MIN_IDEMPOTENCY_STALE_TIMEOUT_SECS} seconds"
+                )));
+            }
+            if secs > MAX_IDEMPOTENCY_STALE_TIMEOUT_SECS {
+                return Err(Error::InvalidInput(format!(
+                    "ARCO_IDEMPOTENCY_STALE_TIMEOUT_SECS must be at most {MAX_IDEMPOTENCY_STALE_TIMEOUT_SECS} seconds"
+                )));
+            }
+            config.idempotency_stale_timeout_secs = secs;
+        }
+
         Ok(config)
+    }
+
+    /// Returns the idempotency stale timeout as a `chrono::Duration`.
+    #[must_use]
+    pub fn idempotency_stale_timeout(&self) -> chrono::Duration {
+        let secs = self
+            .idempotency_stale_timeout_secs
+            .min(MAX_IDEMPOTENCY_STALE_TIMEOUT_SECS);
+        chrono::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
     }
 }
 

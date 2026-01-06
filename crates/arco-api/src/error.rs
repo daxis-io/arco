@@ -34,6 +34,7 @@ pub struct ApiError {
     code: &'static str,
     message: String,
     request_id: Option<String>,
+    retry_after_secs: Option<u64>,
 }
 
 impl ApiError {
@@ -101,6 +102,22 @@ impl ApiError {
         Self::new(StatusCode::NOT_IMPLEMENTED, "NOT_IMPLEMENTED", message)
     }
 
+    /// Creates an error from status code and message for idempotency replays.
+    #[must_use]
+    pub fn from_status_and_message(status: u16, message: impl Into<String>) -> Self {
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let code = match status {
+            StatusCode::BAD_REQUEST => "BAD_REQUEST",
+            StatusCode::UNAUTHORIZED => "UNAUTHORIZED",
+            StatusCode::FORBIDDEN => "FORBIDDEN",
+            StatusCode::NOT_FOUND => "NOT_FOUND",
+            StatusCode::CONFLICT => "CONFLICT",
+            StatusCode::PRECONDITION_FAILED => "PRECONDITION_FAILED",
+            _ => "INTERNAL",
+        };
+        Self::new(status, code, message)
+    }
+
     /// Attaches a request ID for correlation.
     #[must_use]
     pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
@@ -138,13 +155,28 @@ impl ApiError {
             code,
             message: message.into(),
             request_id: None,
+            retry_after_secs: None,
         }
+    }
+
+    /// Attaches a Retry-After header value in seconds.
+    #[must_use]
+    pub fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after_secs = Some(seconds);
+        self
+    }
+
+    /// Returns a 409 Conflict for in-progress idempotent requests with Retry-After header.
+    #[must_use]
+    pub fn conflict_in_progress(retry_after_secs: u64) -> Self {
+        Self::conflict("Request already in progress").with_retry_after(retry_after_secs)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let request_id = self.request_id;
+        let retry_after_secs = self.retry_after_secs;
         let mut response = (
             self.status,
             Json(ApiErrorBody {
@@ -160,6 +192,14 @@ impl IntoResponse for ApiError {
                 response
                     .headers_mut()
                     .insert(HeaderName::from_static("x-request-id"), value);
+            }
+        }
+
+        if let Some(secs) = retry_after_secs {
+            if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(HeaderName::from_static("retry-after"), value);
             }
         }
 
@@ -203,5 +243,47 @@ impl From<CoreError> for ApiError {
             | CoreError::Serialization { message }
             | CoreError::Internal { message } => Self::internal(message),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_conflict_in_progress_has_retry_after() {
+        let error = ApiError::conflict_in_progress(5);
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+        assert_eq!(error.code(), "CONFLICT");
+        assert!(error.message().contains("in progress"));
+
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .expect("Retry-After header should be present");
+        assert_eq!(retry_after.to_str().unwrap(), "5");
+    }
+
+    #[test]
+    fn test_with_retry_after_sets_header() {
+        let error = ApiError::conflict("test").with_retry_after(10);
+        let response = error.into_response();
+
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .expect("Retry-After header should be present");
+        assert_eq!(retry_after.to_str().unwrap(), "10");
+    }
+
+    #[test]
+    fn test_regular_conflict_has_no_retry_after() {
+        let error = ApiError::conflict("test");
+        let response = error.into_response();
+
+        assert!(response.headers().get("retry-after").is_none());
     }
 }

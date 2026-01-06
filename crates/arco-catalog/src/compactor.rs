@@ -1168,6 +1168,9 @@ mod tests {
             .expect("compact1");
         assert_eq!(result1.events_processed, 3);
 
+        // Ensure new events have distinct ULID timestamps (ULID uses millisecond precision)
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
         // Write 2 more events and compact again
         for i in 3..5 {
             let event = MaterializationRecord {

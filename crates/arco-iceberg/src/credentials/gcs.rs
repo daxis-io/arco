@@ -149,8 +149,12 @@ impl GcsCredentialProvider {
         if object_path.is_empty() {
             Some(format!("gs://{bucket}/"))
         } else {
-            let normalized = object_path.trim_end_matches('/');
-            Some(format!("gs://{bucket}/{normalized}/"))
+            let normalized = object_path.trim_matches('/');
+            if normalized.is_empty() {
+                Some(format!("gs://{bucket}/"))
+            } else {
+                Some(format!("gs://{bucket}/{normalized}/"))
+            }
         }
     }
 }
@@ -193,8 +197,9 @@ impl CredentialProvider for GcsCredentialProvider {
             warn!("GCS token already expired (expires_at={}, now={}), refusing to vend", token.expires_at, now);
             record_credential_vending("gcs", "error_expired_token");
             record_credential_vending_duration("gcs", start.elapsed().as_secs_f64());
-            return Err(IcebergError::Internal {
+            return Err(IcebergError::ServiceUnavailable {
                 message: "credential provider returned expired token".to_string(),
+                retry_after_seconds: Some(5),
             });
         }
 
@@ -288,6 +293,18 @@ mod tests {
             prefix,
             Some("gs://my-bucket/warehouse/db/table/".to_string())
         );
+    }
+
+    #[test]
+    fn test_extract_gcs_prefix_double_slash_normalized() {
+        let prefix = GcsCredentialProvider::extract_gcs_prefix("gs://my-bucket//foo");
+        assert_eq!(prefix, Some("gs://my-bucket/foo/".to_string()));
+
+        let prefix = GcsCredentialProvider::extract_gcs_prefix("gs://my-bucket//foo/bar//");
+        assert_eq!(prefix, Some("gs://my-bucket/foo/bar/".to_string()));
+
+        let prefix = GcsCredentialProvider::extract_gcs_prefix("gs://my-bucket///");
+        assert_eq!(prefix, Some("gs://my-bucket/".to_string()));
     }
 
     #[test]

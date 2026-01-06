@@ -19,9 +19,12 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use arco_flow::orchestration::controllers::{NoopSensorEvaluator, SensorEvaluator};
+#[cfg(feature = "gcp")]
+use arco_iceberg::GcsCredentialProvider;
 use arco_iceberg::context::IcebergRequestContext;
 use arco_iceberg::{
-    IcebergError, IcebergState, SharedCompactorFactory, Tier1CompactorFactory, iceberg_router,
+    CredentialProvider, IcebergError, IcebergState, SharedCompactorFactory, Tier1CompactorFactory,
+    iceberg_router,
 };
 
 use crate::compactor_client::CompactorClient;
@@ -410,7 +413,7 @@ impl Server {
 
     /// Creates the router with all routes and middleware.
     #[allow(clippy::cognitive_complexity)]
-    fn create_router(&self) -> Router {
+    fn create_router(&self, credential_provider: Option<Arc<dyn CredentialProvider>>) -> Router {
         let state = Arc::new(AppState::new_with_audit(
             self.config.clone(),
             Arc::clone(&self.storage),
@@ -485,6 +488,10 @@ impl Server {
                         "Iceberg CRUD enabled without compactor_url; CRUD endpoints will fail"
                     );
                 }
+            }
+
+            if let Some(provider) = credential_provider {
+                iceberg_state = iceberg_state.with_credentials(provider);
             }
 
             let iceberg_service = ServiceBuilder::new()
@@ -620,8 +627,39 @@ impl Server {
         arco_catalog::metrics::register_metrics();
         arco_iceberg::metrics::register_metrics();
 
+        #[cfg(feature = "gcp")]
+        let credential_provider: Option<Arc<dyn CredentialProvider>> = if self
+            .config
+            .iceberg
+            .enabled
+            && self.config.iceberg.enable_credential_vending
+        {
+            match GcsCredentialProvider::from_environment().await {
+                Ok(provider) => {
+                    tracing::info!("Iceberg credential vending enabled for GCS");
+                    Some(Arc::new(provider))
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to initialize GCS credential provider; credential vending disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        #[cfg(not(feature = "gcp"))]
+        let credential_provider: Option<Arc<dyn CredentialProvider>> = {
+            if self.config.iceberg.enabled && self.config.iceberg.enable_credential_vending {
+                tracing::warn!(
+                    "Credential vending requested but `gcp` feature is not enabled; skipping"
+                );
+            }
+            None
+        };
+
         let addr = SocketAddr::from(([0, 0, 0, 0], self.config.http_port));
-        let router = self.create_router();
+        let router = self.create_router(credential_provider);
 
         tracing::info!(
             http_port = self.config.http_port,
@@ -654,9 +692,10 @@ impl Server {
     ///
     /// This method is intended for testing only. It creates a router
     /// using this server's configured storage backend (default: in-memory).
+    /// Credential vending is disabled in test mode.
     #[doc(hidden)]
     pub fn test_router(&self) -> Router {
-        self.create_router()
+        self.create_router(None)
     }
 
     fn validate_config(&self) -> Result<()> {

@@ -250,6 +250,9 @@ pub struct IcebergApiConfig {
     /// Optional concurrency limit for Iceberg handlers.
     #[serde(default)]
     pub concurrency_limit: Option<usize>,
+    /// Enable credential vending for GCS storage access.
+    #[serde(default)]
+    pub enable_credential_vending: bool,
 }
 
 fn default_iceberg_prefix() -> String {
@@ -270,6 +273,7 @@ impl Default for IcebergApiConfig {
             allow_namespace_crud: false,
             allow_table_crud: false,
             concurrency_limit: None,
+            enable_credential_vending: false,
         }
     }
 }
@@ -334,6 +338,7 @@ impl Config {
     /// - `ARCO_ICEBERG_ALLOW_NAMESPACE_CRUD`
     /// - `ARCO_ICEBERG_ALLOW_TABLE_CRUD`
     /// - `ARCO_ICEBERG_CONCURRENCY_LIMIT`
+    /// - `ARCO_ICEBERG_ENABLE_CREDENTIAL_VENDING`
     /// - `ARCO_AUDIT_ACTOR_HMAC_KEY`
     /// - `ARCO_IDEMPOTENCY_STALE_TIMEOUT_SECS` (10-3600, default: 300)
     ///
@@ -439,6 +444,9 @@ impl Config {
         }
         if let Some(limit) = env_usize("ARCO_ICEBERG_CONCURRENCY_LIMIT")? {
             config.iceberg.concurrency_limit = Some(limit);
+        }
+        if let Some(enable) = env_bool("ARCO_ICEBERG_ENABLE_CREDENTIAL_VENDING")? {
+            config.iceberg.enable_credential_vending = enable;
         }
 
         if let Some(key) = env_string("ARCO_AUDIT_ACTOR_HMAC_KEY") {
@@ -701,5 +709,33 @@ mod tests {
     fn posture_env_values_reject_invalid_api_public() {
         let err = posture_from_env_values(Some("dev"), Some("maybe")).unwrap_err();
         assert!(matches!(err, Error::InvalidInput(_)));
+    }
+
+    #[test]
+    fn iceberg_credential_vending_default_is_false() {
+        let config = IcebergApiConfig::default();
+        assert!(!config.enable_credential_vending);
+    }
+
+    #[test]
+    fn parse_bool_accepts_true_values() {
+        assert!(parse_bool("TEST", "true").unwrap());
+        assert!(parse_bool("TEST", "1").unwrap());
+        assert!(parse_bool("TEST", "yes").unwrap());
+        assert!(parse_bool("TEST", "TRUE").unwrap());
+    }
+
+    #[test]
+    fn parse_bool_accepts_false_values() {
+        assert!(!parse_bool("TEST", "false").unwrap());
+        assert!(!parse_bool("TEST", "0").unwrap());
+        assert!(!parse_bool("TEST", "no").unwrap());
+        assert!(!parse_bool("TEST", "FALSE").unwrap());
+    }
+
+    #[test]
+    fn parse_bool_rejects_invalid_values() {
+        assert!(parse_bool("TEST", "maybe").is_err());
+        assert!(parse_bool("TEST", "").is_err());
     }
 }

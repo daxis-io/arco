@@ -373,6 +373,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "gcp_auth",
  "hex",
  "http",
  "metrics",

@@ -24,11 +24,11 @@ use crate::context::RequestContext;
 use crate::error::ApiError;
 use crate::error::ApiErrorBody;
 use crate::server::AppState;
+use arco_catalog::Tier1Compactor;
 use arco_catalog::idempotency::{
     CatalogOperation, IdempotencyCheck, IdempotencyStore, IdempotencyStoreImpl,
     calculate_retry_after, canonical_request_hash, check_idempotency,
 };
-use arco_catalog::Tier1Compactor;
 
 /// Request to register a table.
 #[derive(Debug, Deserialize, ToSchema)]
@@ -184,9 +184,8 @@ pub(crate) async fn register_table(
         "description": req.description,
         "columns": columns_json
     });
-    let request_hash = canonical_request_hash(&request_json).map_err(|e| {
-        ApiError::internal(format!("Failed to compute request hash: {e}"))
-    })?;
+    let request_hash = canonical_request_hash(&request_json)
+        .map_err(|e| ApiError::internal(format!("Failed to compute request hash: {e}")))?;
 
     let storage_arc = Arc::new(storage.clone());
     let idempotency_store = IdempotencyStoreImpl::new(storage_arc);
@@ -203,14 +202,20 @@ pub(crate) async fn register_table(
     let (marker, marker_version) = match idempotency_check {
         IdempotencyCheck::NoKey => (None, None),
         IdempotencyCheck::Proceed { marker, version } => (Some(marker), Some(version)),
-        IdempotencyCheck::Replay { entity_id, entity_name } => {
+        IdempotencyCheck::Replay {
+            entity_id,
+            entity_name,
+        } => {
             let reader = arco_catalog::CatalogReader::new(storage);
             let table = reader
                 .get_table(&namespace, &entity_name)
                 .await
                 .map_err(ApiError::from)?
                 .ok_or_else(|| ApiError::internal("Cached table not found"))?;
-            let cols = reader.get_columns(&entity_id).await.map_err(ApiError::from)?;
+            let cols = reader
+                .get_columns(&entity_id)
+                .await
+                .map_err(ApiError::from)?;
             let response = TableResponse {
                 id: entity_id,
                 namespace,
@@ -237,11 +242,15 @@ pub(crate) async fn register_table(
                 "Idempotency-Key already used with different request body",
             ));
         }
-        IdempotencyCheck::PreviousFailed { http_status, message } => {
+        IdempotencyCheck::PreviousFailed {
+            http_status,
+            message,
+        } => {
             return Err(ApiError::from_status_and_message(http_status, message));
         }
         IdempotencyCheck::InProgress { started_at } => {
-            let retry_after = calculate_retry_after(started_at, state.config.idempotency_stale_timeout());
+            let retry_after =
+                calculate_retry_after(started_at, state.config.idempotency_stale_timeout());
             return Err(ApiError::conflict_in_progress(retry_after));
         }
     };
@@ -291,8 +300,9 @@ pub(crate) async fn register_table(
     if let (Some(marker), Some(version)) = (&marker, &marker_version) {
         match &register_result {
             Ok(table) => {
-                let finalized =
-                    marker.clone().finalize_committed(table.id.clone(), table.name.clone());
+                let finalized = marker
+                    .clone()
+                    .finalize_committed(table.id.clone(), table.name.clone());
                 if let Err(e) = idempotency_store.finalize(&finalized, version).await {
                     tracing::warn!(
                         idempotency_key = %marker.idempotency_key,
@@ -324,7 +334,10 @@ pub(crate) async fn register_table(
     let table = register_result.map_err(ApiError::from)?;
 
     let reader = arco_catalog::CatalogReader::new(storage);
-    let cols = reader.get_columns(&table.id).await.map_err(ApiError::from)?;
+    let cols = reader
+        .get_columns(&table.id)
+        .await
+        .map_err(ApiError::from)?;
 
     let response = TableResponse {
         id: table.id,

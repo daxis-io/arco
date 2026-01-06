@@ -197,10 +197,12 @@ async fn create_table(
 
     let (table_location, storage_relative_location) = match &req.location {
         Some(loc) => {
-            let resolved = resolve_metadata_path(loc, &ctx.tenant, &ctx.workspace)
-                .map_err(|e| IcebergError::BadRequest {
-                    message: format!("Invalid table location '{loc}': {e}"),
-                    error_type: "BadRequestException",
+            let resolved =
+                resolve_metadata_path(loc, &ctx.tenant, &ctx.workspace).map_err(|e| {
+                    IcebergError::BadRequest {
+                        message: format!("Invalid table location '{loc}': {e}"),
+                        error_type: "BadRequestException",
+                    }
                 })?;
             (loc.clone(), resolved)
         }
@@ -501,7 +503,10 @@ async fn load_table(
     .await?;
 
     let mut config = HashMap::new();
-    if storage_credentials.is_some() && state.credentials_enabled() {
+    let has_credentials = storage_credentials
+        .as_ref()
+        .is_some_and(|creds| !creds.is_empty());
+    if has_credentials && state.credentials_enabled() {
         config.insert(
             "client.refresh-credentials-endpoint".to_string(),
             format!(
@@ -1001,8 +1006,10 @@ async fn register_table(
     metadata.table_uuid = crate::types::TableUuid::new(table_uuid);
     let new_metadata_storage_path =
         format!("{storage_relative_location}/metadata/arco-registered-{table_uuid}.metadata.json");
-    let new_metadata_location =
-        format!("{}/metadata/arco-registered-{table_uuid}.metadata.json", metadata.location);
+    let new_metadata_location = format!(
+        "{}/metadata/arco-registered-{table_uuid}.metadata.json",
+        metadata.location
+    );
 
     let updated_metadata_bytes =
         serde_json::to_vec(&metadata).map_err(|e| IcebergError::Internal {
@@ -1159,10 +1166,12 @@ mod tests {
     use arco_catalog::Tier1Compactor;
     use arco_catalog::write_options::WriteOptions;
     use arco_core::ScopedStorage;
-    use arco_core::storage::{MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
+    use arco_core::storage::{
+        MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+    };
+    use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::Request;
-    use async_trait::async_trait;
     use bytes::Bytes;
     use std::ops::Range;
     use std::sync::Arc;
@@ -1188,7 +1197,11 @@ mod tests {
             self.inner.get(path).await
         }
 
-        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::error::Result<Bytes> {
+        async fn get_range(
+            &self,
+            path: &str,
+            range: Range<u64>,
+        ) -> arco_core::error::Result<Bytes> {
             self.inner.get_range(path, range).await
         }
 
@@ -1221,7 +1234,11 @@ mod tests {
             self.inner.head(path).await
         }
 
-        async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::error::Result<String> {
+        async fn signed_url(
+            &self,
+            path: &str,
+            expiry: Duration,
+        ) -> arco_core::error::Result<String> {
             self.inner.signed_url(path, expiry).await
         }
     }

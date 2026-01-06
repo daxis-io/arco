@@ -43,6 +43,7 @@
 
 pub mod commit;
 pub mod context;
+pub mod credentials;
 pub mod error;
 pub mod events;
 pub mod gc;
@@ -115,3 +116,7 @@ pub use gc::{
 
 // Re-export schema projection types
 pub use schema_projection::{ColumnRecord, IcebergTypeMapper, SchemaProjector};
+
+// Re-export credential types
+#[cfg(feature = "gcp")]
+pub use credentials::{GcsCredentialConfig, GcsCredentialProvider};

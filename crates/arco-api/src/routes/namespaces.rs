@@ -23,11 +23,11 @@ use crate::context::RequestContext;
 use crate::error::ApiError;
 use crate::error::ApiErrorBody;
 use crate::server::AppState;
+use arco_catalog::Tier1Compactor;
 use arco_catalog::idempotency::{
     CatalogOperation, IdempotencyCheck, IdempotencyStore, IdempotencyStoreImpl,
     calculate_retry_after, canonical_request_hash, check_idempotency,
 };
-use arco_catalog::Tier1Compactor;
 
 /// Request to create a namespace.
 #[derive(Debug, Deserialize, ToSchema)]
@@ -110,9 +110,8 @@ pub(crate) async fn create_namespace(
         "name": req.name,
         "description": req.description
     });
-    let request_hash = canonical_request_hash(&request_json).map_err(|e| {
-        ApiError::internal(format!("Failed to compute request hash: {e}"))
-    })?;
+    let request_hash = canonical_request_hash(&request_json)
+        .map_err(|e| ApiError::internal(format!("Failed to compute request hash: {e}")))?;
 
     let storage_arc = Arc::new(storage.clone());
     let idempotency_store = IdempotencyStoreImpl::new(storage_arc);
@@ -129,7 +128,10 @@ pub(crate) async fn create_namespace(
     let (marker, marker_version) = match idempotency_check {
         IdempotencyCheck::NoKey => (None, None),
         IdempotencyCheck::Proceed { marker, version } => (Some(marker), Some(version)),
-        IdempotencyCheck::Replay { entity_id, entity_name } => {
+        IdempotencyCheck::Replay {
+            entity_id,
+            entity_name,
+        } => {
             let reader = arco_catalog::CatalogReader::new(storage);
             let ns = reader
                 .get_namespace(&entity_name)
@@ -150,11 +152,15 @@ pub(crate) async fn create_namespace(
                 "Idempotency-Key already used with different request body",
             ));
         }
-        IdempotencyCheck::PreviousFailed { http_status, message } => {
+        IdempotencyCheck::PreviousFailed {
+            http_status,
+            message,
+        } => {
             return Err(ApiError::from_status_and_message(http_status, message));
         }
         IdempotencyCheck::InProgress { started_at } => {
-            let retry_after = calculate_retry_after(started_at, state.config.idempotency_stale_timeout());
+            let retry_after =
+                calculate_retry_after(started_at, state.config.idempotency_stale_timeout());
             return Err(ApiError::conflict_in_progress(retry_after));
         }
     };
@@ -183,8 +189,9 @@ pub(crate) async fn create_namespace(
     if let (Some(marker), Some(version)) = (&marker, &marker_version) {
         match &create_result {
             Ok(ns) => {
-                let finalized =
-                    marker.clone().finalize_committed(ns.id.clone(), ns.name.clone());
+                let finalized = marker
+                    .clone()
+                    .finalize_committed(ns.id.clone(), ns.name.clone());
                 if let Err(e) = idempotency_store.finalize(&finalized, version).await {
                     tracing::warn!(
                         idempotency_key = %marker.idempotency_key,
@@ -197,9 +204,7 @@ pub(crate) async fn create_namespace(
             Err(e) => {
                 if let Some(status) = e.http_status_code() {
                     if (400..500).contains(&status) {
-                        let finalized = marker
-                            .clone()
-                            .finalize_failed(status, e.to_string());
+                        let finalized = marker.clone().finalize_failed(status, e.to_string());
                         if let Err(fin_err) = idempotency_store.finalize(&finalized, version).await
                         {
                             tracing::warn!(

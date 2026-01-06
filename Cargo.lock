@@ -244,6 +244,7 @@ dependencies = [
  "parquet 54.3.1",
  "proptest",
  "serde",
+ "serde_jcs",
  "serde_json",
  "sha2",
  "tempfile",

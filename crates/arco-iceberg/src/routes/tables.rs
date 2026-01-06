@@ -730,8 +730,7 @@ async fn commit_table(
                 let seq = response
                     .metadata
                     .get("last-sequence-number")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
+                    .and_then(|v| v.as_i64());
                 emit_iceberg_commit(
                     emitter,
                     &ctx.tenant,
@@ -920,7 +919,17 @@ async fn get_credentials(
     headers: HeaderMap,
 ) -> IcebergResult<Json<TableCredentialsResponse>> {
     if let Some(ref plan_id) = query.plan_id {
-        tracing::Span::current().record("plan_id", plan_id.as_str());
+        // UTF-8 safe truncation: find a valid char boundary at or before byte 256
+        let bounded = if plan_id.len() > 256 {
+            let mut end = 256;
+            while end > 0 && !plan_id.is_char_boundary(end) {
+                end -= 1;
+            }
+            &plan_id[..end]
+        } else {
+            plan_id.as_str()
+        };
+        tracing::Span::current().record("plan_id", bounded);
     }
     ensure_prefix(&path.prefix, &state.config)?;
     let separator = state.config.namespace_separator_decoded();

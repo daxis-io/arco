@@ -49,7 +49,7 @@ fn format_table_resource(table: &TableInfo) -> String {
 
 /// Formats a commit resource for audit.
 ///
-/// Format: `iceberg/commit:{namespace}.{table}:{sequence_number}`
+/// Format: `iceberg/commit:{namespace}.{table}` or `iceberg/commit:{namespace}.{table}:seq={n}`
 fn format_commit_resource(namespace: &str, table: &str, sequence_number: Option<i64>) -> String {
     sequence_number.map_or_else(
         || format!("iceberg/commit:{namespace}.{table}"),
@@ -125,7 +125,7 @@ pub fn emit_cred_vend_deny(
 /// * `request_id` - Request ID for correlation
 /// * `namespace` - Table namespace
 /// * `table` - Table name
-/// * `sequence_number` - New sequence number after commit
+/// * `sequence_number` - New sequence number after commit (None if unavailable)
 pub fn emit_iceberg_commit(
     emitter: &AuditEmitter,
     tenant: &str,
@@ -133,9 +133,9 @@ pub fn emit_iceberg_commit(
     request_id: &str,
     namespace: &str,
     table: &str,
-    sequence_number: i64,
+    sequence_number: Option<i64>,
 ) {
-    let resource = format_commit_resource(namespace, table, Some(sequence_number));
+    let resource = format_commit_resource(namespace, table, sequence_number);
 
     if let Ok(event) = AuditEvent::builder()
         .action(AuditAction::IcebergCommit)
@@ -255,7 +255,7 @@ mod tests {
             "req-456",
             "sales",
             "orders",
-            42,
+            Some(42),
         );
 
         let events = sink.events();
@@ -264,6 +264,28 @@ mod tests {
         assert_eq!(events[0].decision_reason, REASON_COMMIT_SUCCESS);
         assert!(events[0].resource.contains("sales.orders"));
         assert!(events[0].resource.contains("seq=42"));
+    }
+
+    #[test]
+    fn test_emit_iceberg_commit_without_sequence() {
+        let sink = Arc::new(TestAuditSink::new());
+        let emitter = AuditEmitter::with_test_sink(sink.clone());
+
+        emit_iceberg_commit(
+            &emitter,
+            "test-tenant",
+            "test-workspace",
+            "req-789",
+            "sales",
+            "orders",
+            None,
+        );
+
+        let events = sink.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, AuditAction::IcebergCommit);
+        assert!(events[0].resource.contains("sales.orders"));
+        assert!(!events[0].resource.contains("seq="));
     }
 
     #[test]

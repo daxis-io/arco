@@ -1,7 +1,7 @@
 # Plan Deltas After Security/Ops + Parity Review
 
-**Date:** 2026-01-02  
-**Commit:** 966b8eecce6348821c258e38553ed945e314cfde  
+**Date:** 2026-01-02 (updated 2026-01-06)  
+**Commit:** 966b8eecce6348821c258e38553ed945e314cfde (updated with P0 gap closures)  
 **Inputs:**
 - `docs/catalog-metastore/evidence/security-ops-evidence-pack.md`
 - Parity/PRD working docs (local, not in repo):
@@ -50,11 +50,11 @@ This is a minimal traceability slice for the metastore/security-critical items.
 | Iceberg REST: commit-table (`requirements` + `updates`) + idempotency key | P0 | ✅ | `crates/arco-iceberg/src/routes/tables.rs:333`, `crates/arco-iceberg/src/routes/tables.rs:406`, `crates/arco-iceberg/src/types/commit.rs:20`, `crates/arco-iceberg/src/types/commit.rs:78` |
 | Iceberg REST: namespace create/delete/properties | P0 | ❌ | Not routed; write endpoints are explicitly disabled (`crates/arco-iceberg/src/types/config.rs:10`, `crates/arco-iceberg/src/routes/namespaces.rs:30`) |
 | Iceberg REST: table create/drop/register/rename/metrics/transactions | P0/P1 | ❌ | Not routed; only `commit_table` is treated as supported write endpoint (`crates/arco-iceberg/src/router.rs:37`, `crates/arco-iceberg/src/types/config.rs:63`) |
-| Iceberg REST: spec-declared params are actually parsed | P0 | ✅ | `snapshots` query param now parsed via `LoadTableQuery` (`crates/arco-iceberg/src/routes/tables.rs:133`, `crates/arco-iceberg/src/types/table.rs:63-87`). Filtering implemented: `refs` returns only snapshots referenced by branches/tags (`crates/arco-iceberg/src/routes/tables.rs:241-244`). `planId` removed from OpenAPI (scan planning not implemented). |
-| Iceberg REST: credential vending endpoint is wired and audited | P0 | 🔨 | Endpoint exists; provider is optional and currently not wired (`crates/arco-iceberg/src/state.rs:58`, `crates/arco-api/src/server.rs:402`, `crates/arco-iceberg/src/routes/tables.rs:578`) |
+| Iceberg REST: spec-declared params are actually parsed | P0 | ✅ | `snapshots` query param now parsed via `LoadTableQuery` (`crates/arco-iceberg/src/routes/tables.rs:133`, `crates/arco-iceberg/src/types/table.rs:63-87`). Filtering implemented: `refs` returns only snapshots referenced by branches/tags (`crates/arco-iceberg/src/routes/tables.rs:241-244`). `planId` documented in OpenAPI (`crates/arco-iceberg/src/routes/tables.rs:900`) and parsed/logged via `CredentialsQuery` (`crates/arco-iceberg/src/routes/tables.rs:919-924`); no behavioral effect yet (scan planning not implemented). |
+| Iceberg REST: credential vending endpoint is wired and audited | P0 | ✅ | Endpoint wired with GCS provider (`crates/arco-api/src/server.rs:630-637`); audit events emitted via `emit_cred_vend_allow`/`emit_cred_vend_deny` (`crates/arco-iceberg/src/audit.rs:67,96`); handler at `crates/arco-iceberg/src/routes/tables.rs:940-960` |
 | Browser read path: signed URL minting allowlisted + tenant-scoped + TTL bounded | P0 | ✅ | `crates/arco-api/src/routes/browser.rs:119`, `crates/arco-api/src/routes/browser.rs:165`, `crates/arco-catalog/src/reader.rs:494`, `crates/arco-catalog/src/reader.rs:601` |
 | API auth: debug headers for dev posture vs Bearer JWT for non-dev | P0 | ⚠️ | `crates/arco-api/src/context.rs:80`, `crates/arco-api/src/context.rs:94`, `crates/arco-api/src/context.rs:297` |
-| Security audit trail for decisions + mutations | P0 | ⚠️ | Auth allow/deny + URL mint allow/deny implemented (`crates/arco-api/src/audit.rs`, `crates/arco-api/src/context.rs:314-319`, `crates/arco-api/src/routes/browser.rs:140,177,198`). Remaining: credential vending + Iceberg commit audit (P1). Tier-1 commit records provide tamper-evident mutation history but lack principal attribution (`crates/arco-catalog/src/manifest.rs:738`) |
+| Security audit trail for decisions + mutations | P0 | ✅ | Auth allow/deny + URL mint allow/deny + credential vending + Iceberg commit audit all implemented. Auth: `crates/arco-api/src/audit.rs`, `crates/arco-api/src/context.rs:314-319`. URL mint: `crates/arco-api/src/routes/browser.rs:140,177,198`. Credential vending: `crates/arco-iceberg/src/audit.rs:67,96`. Iceberg commit: `crates/arco-iceberg/src/audit.rs:129,165`. Tier-1 commit records provide tamper-evident mutation history but lack principal attribution (`crates/arco-catalog/src/manifest.rs:738`) |
 | Engine interop: Spark/Flink/Trino “MUST PASS” matrix + known-good configs | P0 | ❌ | Not present in repo; the existing Iceberg test uses custom headers (`crates/arco-integration-tests/tests/iceberg_rest_catalog.rs:132`) |
 
 ---
@@ -75,7 +75,7 @@ This is a minimal traceability slice for the metastore/security-critical items.
 
 8. Fix “spec says it exists but handler can’t read it” issues (query params, capability advertisement truthfulness) before adding new endpoints.
 9. Implement missing Iceberg REST baseline endpoints: namespaces CRUD + properties, tables create/drop/register/rename, metrics POST, transactions commit, and required semantics (e.g., `purgeRequested`).
-10. Wire Iceberg credential vending end-to-end (at least one cloud) and audit vend/deny decisions.
+10. ✅ Wire Iceberg credential vending end-to-end (GCS) and audit vend/deny decisions — COMPLETE (`crates/arco-api/src/server.rs:630-637`, `crates/arco-iceberg/src/audit.rs:67,96`).
 11. Establish an engine compatibility bar: Spark/Flink/Trino configs + an interop test matrix/conformance suite that runs through the API-layer auth model.
 
 ---
@@ -153,11 +153,11 @@ See `docs/runbooks/metrics-access.md`.
 
 | PR | Goal | Scope | Tests/Verification |
 |----|------|-------|-------------------|
-| PR-11 | Iceberg REST parameter correctness | ✅ Implemented: `LoadTableQuery` struct parses `snapshots` param (`crates/arco-iceberg/src/types/table.rs:63-87`). `SnapshotsFilter::Refs` filters to referenced snapshots only (`crates/arco-iceberg/src/routes/tables.rs:241-244`). `planId` removed from OpenAPI (scan planning not implemented). | Unit tests for query parsing + filter default (`crates/arco-iceberg/src/types/table.rs:457-470`) |
+| PR-11 | Iceberg REST parameter correctness | ✅ Implemented: `LoadTableQuery` struct parses `snapshots` param (`crates/arco-iceberg/src/types/table.rs:63-87`). `SnapshotsFilter::Refs` filters to referenced snapshots only (`crates/arco-iceberg/src/routes/tables.rs:241-244`). `planId` documented in OpenAPI and parsed/logged (`crates/arco-iceberg/src/routes/tables.rs:900,919-924`); accepted but no behavioral effect yet (scan planning not implemented). | Unit tests for query parsing + filter default (`crates/arco-iceberg/src/types/table.rs:457-470`) |
 | PR-7 | Iceberg REST write endpoints (namespaces) | Add namespace create/delete/properties endpoints; keep `/v1/config` capability hiding accurate. | Route tests; engine-oriented integration tests through API JWT auth |
 | PR-8 | Iceberg REST write endpoints (tables) | Add table create/drop/register endpoints; implement `purgeRequested` semantics. | Route tests; integration tests exercising storage layout invariants |
 | PR-9 | Iceberg REST rename + metrics correctness | Implement `POST /v1/{prefix}/tables/rename` and `POST .../metrics` (method/path correctness). | OpenAPI compliance + request parsing tests |
-| PR-10 | Iceberg credential vending (GCS first) | Implement and wire a safe `CredentialProvider` for GCS. See **PR-10 Design** below. Depends on PR-6a. | Unit tests for scope/TTL; integration test hitting `/credentials` |
+| PR-10 | Iceberg credential vending (GCS first) | ✅ COMPLETE: GCS `CredentialProvider` wired (`crates/arco-api/src/server.rs:630-637`); audit events implemented (`crates/arco-iceberg/src/audit.rs:67,96,129,165`); TTL bounded (`crates/arco-iceberg/src/credentials/mod.rs:33,44`). See **PR-10 Design** below. | Unit tests for scope/TTL; integration test hitting `/credentials` |
 
 #### PR-10 Design: GCS Credential Vending
 

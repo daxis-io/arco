@@ -1,12 +1,68 @@
 #!/bin/bash
 # iam-list-verify.sh
 # Verify prefix-scoped IAM list semantics for Arco catalog bucket
+#
+# SAFETY: This script writes test objects to the bucket. It is designed
+# for sandbox/staging environments. Running against production requires
+# explicit acknowledgment via --allow-prod flag.
+#
+# Usage:
+#   PROJECT_ID=my-sandbox BUCKET=my-sandbox-arco-catalog ./iam-list-verify.sh
+#   PROJECT_ID=my-prod BUCKET=my-prod-arco-catalog ./iam-list-verify.sh --allow-prod
 
 set -euo pipefail
 
-PROJECT_ID="${PROJECT_ID:-your-project-id}"
-BUCKET="${BUCKET:-${PROJECT_ID}-arco-catalog-prod}"
+# Parse arguments
+ALLOW_PROD=false
+for arg in "$@"; do
+  case $arg in
+    --allow-prod)
+      ALLOW_PROD=true
+      shift
+      ;;
+  esac
+done
+
+# Require explicit PROJECT_ID and BUCKET
+if [[ -z "${PROJECT_ID:-}" ]]; then
+  echo "ERROR: PROJECT_ID environment variable is required" >&2
+  echo "Usage: PROJECT_ID=your-project BUCKET=your-bucket ./iam-list-verify.sh" >&2
+  exit 1
+fi
+
+if [[ -z "${BUCKET:-}" ]]; then
+  echo "ERROR: BUCKET environment variable is required" >&2
+  echo "Usage: PROJECT_ID=your-project BUCKET=your-bucket ./iam-list-verify.sh" >&2
+  exit 1
+fi
+
+# Safety check for production buckets
+if [[ "$BUCKET" == *"-prod"* ]] || [[ "$BUCKET" == *"_prod"* ]] || [[ "$BUCKET" == *"production"* ]]; then
+  if [[ "$ALLOW_PROD" != "true" ]]; then
+    echo "ERROR: Bucket name '$BUCKET' appears to be a production bucket." >&2
+    echo "This script writes test objects and should be run against sandbox/staging." >&2
+    echo "To override, pass --allow-prod flag." >&2
+    exit 1
+  fi
+  echo "WARNING: Running against production bucket '$BUCKET' with --allow-prod flag"
+fi
+
 ANTI_ENTROPY_SA="arco-compactor-antientropy@${PROJECT_ID}.iam.gserviceaccount.com"
+TEST_TENANT="tenant=test-iam"
+TEST_WORKSPACE="workspace=verify"
+TEST_OBJECTS_CREATED=false
+
+cleanup() {
+  if [[ "$TEST_OBJECTS_CREATED" == "true" ]]; then
+    echo ""
+    echo "Cleaning up test objects..."
+    gsutil rm -f "gs://${BUCKET}/${TEST_TENANT}/${TEST_WORKSPACE}/ledger/test-event.json" 2>/dev/null || true
+    gsutil rm -f "gs://${BUCKET}/${TEST_TENANT}/${TEST_WORKSPACE}/commits/test-commit.json" 2>/dev/null || true
+    gsutil rm -f "gs://${BUCKET}/${TEST_TENANT}/${TEST_WORKSPACE}/state/test-state.parquet" 2>/dev/null || true
+  fi
+}
+
+trap cleanup EXIT INT TERM
 
 echo "=== IAM List Semantics Verification ==="
 echo "Project: ${PROJECT_ID}"
@@ -14,11 +70,8 @@ echo "Bucket: ${BUCKET}"
 echo "Anti-entropy SA: ${ANTI_ENTROPY_SA}"
 echo ""
 
-# Step 1: Create test objects in different prefixes
 echo "Step 1: Creating test objects..."
-TEST_TENANT="tenant=test-iam"
-TEST_WORKSPACE="workspace=verify"
-
+TEST_OBJECTS_CREATED=true
 gsutil cp /dev/null "gs://${BUCKET}/${TEST_TENANT}/${TEST_WORKSPACE}/ledger/test-event.json"
 gsutil cp /dev/null "gs://${BUCKET}/${TEST_TENANT}/${TEST_WORKSPACE}/commits/test-commit.json"
 gsutil cp /dev/null "gs://${BUCKET}/${TEST_TENANT}/${TEST_WORKSPACE}/state/test-state.parquet"
@@ -50,12 +103,13 @@ echo "--- Attempting to list bucket root (should fail or be empty) ---"
 gcloud storage ls "gs://${BUCKET}/${TEST_TENANT}/${TEST_WORKSPACE}/" \
   --impersonate-service-account="${ANTI_ENTROPY_SA}" 2>&1 || true
 
-# Step 3: Cleanup
+# Step 3: Cleanup (handled by trap, but mark as done for clarity)
 echo ""
 echo "Step 3: Cleaning up test objects..."
 gsutil rm "gs://${BUCKET}/${TEST_TENANT}/${TEST_WORKSPACE}/ledger/test-event.json"
 gsutil rm "gs://${BUCKET}/${TEST_TENANT}/${TEST_WORKSPACE}/commits/test-commit.json"
 gsutil rm "gs://${BUCKET}/${TEST_TENANT}/${TEST_WORKSPACE}/state/test-state.parquet"
+TEST_OBJECTS_CREATED=false
 
 echo ""
 echo "=== Verification Complete ==="

@@ -131,6 +131,17 @@ impl AccessDelegation {
     }
 }
 
+/// Query parameters for the credentials endpoint.
+#[derive(Debug, Clone, Default, Deserialize, utoipa::IntoParams)]
+pub struct CredentialsQuery {
+    /// Plan ID for server-side scan planning.
+    ///
+    /// This parameter is accepted but currently not used.
+    /// Future versions may use it to scope credentials to specific file sets.
+    #[serde(rename = "planId")]
+    pub plan_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

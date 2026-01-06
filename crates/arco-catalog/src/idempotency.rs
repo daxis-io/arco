@@ -263,7 +263,9 @@ pub enum CanonicalizationError {
 /// # Errors
 ///
 /// Returns an error if the JSON value cannot be canonicalized.
-pub fn canonical_request_hash(value: &serde_json::Value) -> std::result::Result<String, CanonicalizationError> {
+pub fn canonical_request_hash(
+    value: &serde_json::Value,
+) -> std::result::Result<String, CanonicalizationError> {
     let canonical = serde_jcs::to_string(value)?;
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
@@ -484,25 +486,25 @@ impl<S: StorageBackend> IdempotencyStore for IdempotencyStoreImpl<S> {
     ) -> Result<Option<(CatalogIdempotencyMarker, ObjectVersion)>> {
         let path = CatalogIdempotencyMarker::storage_path(operation, idempotency_key_hash);
 
-        let meta = self
-            .storage
-            .head(&path)
-            .await
-            .map_err(|e| CatalogError::InvariantViolation {
-                message: format!("Failed to check idempotency marker existence: {e}"),
-            })?;
+        let meta =
+            self.storage
+                .head(&path)
+                .await
+                .map_err(|e| CatalogError::InvariantViolation {
+                    message: format!("Failed to check idempotency marker existence: {e}"),
+                })?;
 
         let Some(meta) = meta else {
             return Ok(None);
         };
 
-        let bytes = self
-            .storage
-            .get(&path)
-            .await
-            .map_err(|e| CatalogError::InvariantViolation {
-                message: format!("Failed to read idempotency marker: {e}"),
-            })?;
+        let bytes =
+            self.storage
+                .get(&path)
+                .await
+                .map_err(|e| CatalogError::InvariantViolation {
+                    message: format!("Failed to read idempotency marker: {e}"),
+                })?;
 
         let marker: CatalogIdempotencyMarker =
             serde_json::from_slice(&bytes).map_err(|e| CatalogError::InvariantViolation {
@@ -555,9 +557,10 @@ impl<S: StorageBackend> IdempotencyStore for IdempotencyStoreImpl<S> {
         );
 
         let path = refreshed.path();
-        let bytes = serde_json::to_vec(&refreshed).map_err(|e| CatalogError::InvariantViolation {
-            message: format!("Failed to serialize idempotency marker: {e}"),
-        })?;
+        let bytes =
+            serde_json::to_vec(&refreshed).map_err(|e| CatalogError::InvariantViolation {
+                message: format!("Failed to serialize idempotency marker: {e}"),
+            })?;
 
         let precondition = WritePrecondition::MatchesVersion(expected_version.as_str().to_string());
 
@@ -660,7 +663,10 @@ pub async fn check_idempotency<S: StorageBackend>(
             record_idempotency_check(op_str, "proceed");
             Ok(IdempotencyCheck::Proceed { marker, version })
         }
-        ClaimResult::Exists { marker: existing, version: existing_version } => {
+        ClaimResult::Exists {
+            marker: existing,
+            version: existing_version,
+        } => {
             if existing.request_hash != request_hash {
                 record_idempotency_check(op_str, "conflict");
                 return Ok(IdempotencyCheck::Conflict);
@@ -676,10 +682,16 @@ pub async fn check_idempotency<S: StorageBackend>(
                             "Taking over stale in-progress idempotency marker"
                         );
                         match store.takeover(&existing, &existing_version).await? {
-                            TakeoverResult::Success { marker: refreshed, version } => {
+                            TakeoverResult::Success {
+                                marker: refreshed,
+                                version,
+                            } => {
                                 record_idempotency_takeover(op_str, "success");
                                 record_idempotency_check(op_str, "proceed");
-                                Ok(IdempotencyCheck::Proceed { marker: refreshed, version })
+                                Ok(IdempotencyCheck::Proceed {
+                                    marker: refreshed,
+                                    version,
+                                })
                             }
                             TakeoverResult::RaceDetected { current_marker, .. } => {
                                 record_idempotency_takeover(op_str, "race_detected");
@@ -706,28 +718,24 @@ fn handle_marker_status(marker: &CatalogIdempotencyMarker) -> Result<Idempotency
         IdempotencyStatus::InProgress => Ok(IdempotencyCheck::InProgress {
             started_at: marker.started_at,
         }),
-        IdempotencyStatus::Committed => {
-            match (&marker.entity_id, &marker.entity_name) {
-                (Some(id), Some(name)) => Ok(IdempotencyCheck::Replay {
-                    entity_id: id.clone(),
-                    entity_name: name.clone(),
-                }),
-                _ => Err(CatalogError::InvariantViolation {
-                    message: "Committed marker missing entity info".to_string(),
-                }),
-            }
-        }
-        IdempotencyStatus::Failed => {
-            match (marker.error_http_status, &marker.error_message) {
-                (Some(status), Some(msg)) => Ok(IdempotencyCheck::PreviousFailed {
-                    http_status: status,
-                    message: msg.clone(),
-                }),
-                _ => Err(CatalogError::InvariantViolation {
-                    message: "Failed marker missing error info".to_string(),
-                }),
-            }
-        }
+        IdempotencyStatus::Committed => match (&marker.entity_id, &marker.entity_name) {
+            (Some(id), Some(name)) => Ok(IdempotencyCheck::Replay {
+                entity_id: id.clone(),
+                entity_name: name.clone(),
+            }),
+            _ => Err(CatalogError::InvariantViolation {
+                message: "Committed marker missing entity info".to_string(),
+            }),
+        },
+        IdempotencyStatus::Failed => match (marker.error_http_status, &marker.error_message) {
+            (Some(status), Some(msg)) => Ok(IdempotencyCheck::PreviousFailed {
+                http_status: status,
+                message: msg.clone(),
+            }),
+            _ => Err(CatalogError::InvariantViolation {
+                message: "Failed marker missing error info".to_string(),
+            }),
+        },
     }
 }
 
@@ -766,8 +774,7 @@ mod tests {
         let key_hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
         let path =
             CatalogIdempotencyMarker::storage_path(CatalogOperation::CreateNamespace, key_hash);
-        let expected =
-            format!("{CATALOG_IDEMPOTENCY_PREFIX}/create_namespace/ab/{key_hash}.json");
+        let expected = format!("{CATALOG_IDEMPOTENCY_PREFIX}/create_namespace/ab/{key_hash}.json");
         assert_eq!(path, expected);
     }
 
@@ -907,7 +914,10 @@ mod tests {
 
         // Finalize with correct version
         let finalized = marker.finalize_committed("ns_001".to_string(), "my-namespace".to_string());
-        let result = store.finalize(&finalized, &version).await.expect("finalize");
+        let result = store
+            .finalize(&finalized, &version)
+            .await
+            .expect("finalize");
         assert!(matches!(result, FinalizeResult::Success { .. }));
 
         // Load and verify
@@ -1001,7 +1011,10 @@ mod tests {
             panic!("expected success");
         };
         let finalized = marker.finalize_committed("ns_001".to_string(), "my-namespace".to_string());
-        store.finalize(&finalized, &version).await.expect("finalize");
+        store
+            .finalize(&finalized, &version)
+            .await
+            .expect("finalize");
 
         let result = check_idempotency(
             &store,
@@ -1013,7 +1026,10 @@ mod tests {
         .await
         .expect("check");
         match result {
-            IdempotencyCheck::Replay { entity_id, entity_name } => {
+            IdempotencyCheck::Replay {
+                entity_id,
+                entity_name,
+            } => {
                 assert_eq!(entity_id, "ns_001");
                 assert_eq!(entity_name, "my-namespace");
             }
@@ -1038,7 +1054,10 @@ mod tests {
             panic!("expected success");
         };
         let finalized = marker.finalize_committed("ns_001".to_string(), "my-namespace".to_string());
-        store.finalize(&finalized, &version).await.expect("finalize");
+        store
+            .finalize(&finalized, &version)
+            .await
+            .expect("finalize");
 
         let result = check_idempotency(
             &store,
@@ -1140,7 +1159,10 @@ mod tests {
         };
 
         let finalized = marker.finalize_committed("ns_001".to_string(), "my-namespace".to_string());
-        store.finalize(&finalized, &version).await.expect("finalize");
+        store
+            .finalize(&finalized, &version)
+            .await
+            .expect("finalize");
 
         let result = check_idempotency(
             &store,
@@ -1153,7 +1175,10 @@ mod tests {
         .expect("check");
 
         match result {
-            IdempotencyCheck::Replay { entity_id, entity_name } => {
+            IdempotencyCheck::Replay {
+                entity_id,
+                entity_name,
+            } => {
                 assert_eq!(entity_id, "ns_001");
                 assert_eq!(entity_name, "my-namespace");
             }
@@ -1222,11 +1247,19 @@ mod tests {
             panic!("expected success");
         };
 
-        let finalized = marker.clone().finalize_committed("ns_001".to_string(), "my-namespace".to_string());
-        store.finalize(&finalized, &version).await.expect("finalize");
+        let finalized = marker
+            .clone()
+            .finalize_committed("ns_001".to_string(), "my-namespace".to_string());
+        store
+            .finalize(&finalized, &version)
+            .await
+            .expect("finalize");
 
         let stale_version = ObjectVersion::new("stale_version");
-        let takeover_result = store.takeover(&marker, &stale_version).await.expect("takeover");
+        let takeover_result = store
+            .takeover(&marker, &stale_version)
+            .await
+            .expect("takeover");
 
         match takeover_result {
             TakeoverResult::RaceDetected { current_marker, .. } => {

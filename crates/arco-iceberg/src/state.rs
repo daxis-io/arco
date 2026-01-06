@@ -7,6 +7,7 @@ use async_trait::async_trait;
 
 use arco_catalog::SyncCompactor;
 use arco_core::ScopedStorage;
+use arco_core::audit::AuditEmitter;
 use arco_core::storage::StorageBackend;
 
 use crate::error::{IcebergError, IcebergResult};
@@ -107,6 +108,8 @@ pub struct IcebergState {
     pub credential_provider: Option<Arc<dyn CredentialProvider>>,
     /// Optional factory for creating per-tenant compactors.
     pub compactor_factory: Option<Arc<dyn SyncCompactorFactory>>,
+    /// Optional audit emitter for security event logging.
+    pub audit_emitter: Option<AuditEmitter>,
 }
 
 impl IcebergState {
@@ -118,6 +121,7 @@ impl IcebergState {
             config: IcebergConfig::default(),
             credential_provider: None,
             compactor_factory: None,
+            audit_emitter: None,
         }
     }
 
@@ -129,6 +133,7 @@ impl IcebergState {
             config,
             credential_provider: None,
             compactor_factory: None,
+            audit_emitter: None,
         }
     }
 
@@ -144,6 +149,19 @@ impl IcebergState {
     pub fn with_compactor_factory(mut self, factory: Arc<dyn SyncCompactorFactory>) -> Self {
         self.compactor_factory = Some(factory);
         self
+    }
+
+    /// Attaches an audit emitter for security event logging.
+    #[must_use]
+    pub fn with_audit_emitter(mut self, emitter: AuditEmitter) -> Self {
+        self.audit_emitter = Some(emitter);
+        self
+    }
+
+    /// Returns a reference to the audit emitter, if configured.
+    #[must_use]
+    pub fn audit(&self) -> Option<&AuditEmitter> {
+        self.audit_emitter.as_ref()
     }
 
     /// Returns true when credential vending is enabled.

@@ -137,10 +137,15 @@ impl GcsCredentialProvider {
             return None;
         }
 
-        let (bucket, object_path) = path_after_scheme.find('/').map_or(
-            (path_after_scheme, ""),
-            |slash_idx| (&path_after_scheme[..slash_idx], &path_after_scheme[slash_idx + 1..]),
-        );
+        let (bucket, object_path) =
+            path_after_scheme
+                .find('/')
+                .map_or((path_after_scheme, ""), |slash_idx| {
+                    (
+                        &path_after_scheme[..slash_idx],
+                        &path_after_scheme[slash_idx + 1..],
+                    )
+                });
 
         if bucket.is_empty() {
             return None;
@@ -194,7 +199,10 @@ impl CredentialProvider for GcsCredentialProvider {
 
         let now = Utc::now();
         if token.expires_at <= now {
-            warn!("GCS token already expired (expires_at={}, now={}), refusing to vend", token.expires_at, now);
+            warn!(
+                "GCS token already expired (expires_at={}, now={}), refusing to vend",
+                token.expires_at, now
+            );
             record_credential_vending("gcs", "error_expired_token");
             record_credential_vending_duration("gcs", start.elapsed().as_secs_f64());
             return Err(IcebergError::ServiceUnavailable {
@@ -229,9 +237,8 @@ mod tests {
 
     #[test]
     fn test_extract_gcs_prefix_with_nested_path() {
-        let prefix = GcsCredentialProvider::extract_gcs_prefix(
-            "gs://my-bucket/warehouse/db/table/data",
-        );
+        let prefix =
+            GcsCredentialProvider::extract_gcs_prefix("gs://my-bucket/warehouse/db/table/data");
         assert_eq!(
             prefix,
             Some("gs://my-bucket/warehouse/db/table/data/".to_string())

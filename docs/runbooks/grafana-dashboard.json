@@ -448,7 +448,7 @@
       },
       "id": 9,
       "panels": [],
-      "title": "Per-Tenant View",
+      "title": "Resource Usage",
       "type": "row"
     },
     {
@@ -502,7 +502,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 24,
         "x": 0,
         "y": 15
       },
@@ -521,88 +521,11 @@
       "targets": [
         {
           "expr": "arco_flow_active_runs",
-          "legendFormat": "{{ tenant }}",
+          "legendFormat": "Active Runs",
           "refId": "A"
         }
       ],
-      "title": "Active Runs by Tenant",
-      "type": "timeseries"
-    },
-    {
-      "datasource": "Prometheus",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "percentunit"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 15
-      },
-      "id": 11,
-      "options": {
-        "legend": {
-          "calcs": ["mean", "max"],
-          "displayMode": "table",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "pluginVersion": "9.0.0",
-      "targets": [
-        {
-          "expr": "arco_flow_quota_usage_ratio",
-          "legendFormat": "{{ tenant }}",
-          "refId": "A"
-        }
-      ],
-      "title": "Quota Usage by Tenant",
+      "title": "Active Runs",
       "type": "timeseries"
     },
     {

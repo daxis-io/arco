@@ -84,7 +84,10 @@ pub fn register_metrics() {
     describe_gauge!(STORAGE_OBJECTS_TOTAL, "Total objects in storage by prefix");
     describe_gauge!(STORAGE_BYTES_TOTAL, "Total bytes in storage by prefix");
     describe_counter!(IDEMPOTENCY_CHECK, "Total idempotency checks by result");
-    describe_counter!(IDEMPOTENCY_TAKEOVER, "Total idempotency marker takeover attempts by result");
+    describe_counter!(
+        IDEMPOTENCY_TAKEOVER,
+        "Total idempotency marker takeover attempts by result"
+    );
 }
 
 // ============================================================================

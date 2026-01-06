@@ -140,25 +140,10 @@ groups:
             Workers may be falling behind or Cloud Tasks is throttling.
           runbook_url: https://docs.arco.dev/runbooks/scheduler-not-progressing
 
-      # Quota Saturation
-      - alert: ArcoFlowTenantQuotaSaturated
-        expr: |
-          arco_flow_quota_usage_ratio > 0.9
-        for: 10m
-        labels:
-          severity: warning
-          team: data-platform
-        annotations:
-          summary: Tenant quota nearly saturated
-          description: |
-            Tenant {{ $labels.tenant }} is at {{ $value | humanizePercentage }} quota usage.
-            Consider increasing quota or investigating high task volume.
-          runbook_url: https://docs.arco.dev/runbooks/scheduler-not-progressing
-
-      # Active Runs Limit
+      # Active Runs Limit (uses max to avoid double-counting during leader failover)
       - alert: ArcoFlowHighActiveRuns
         expr: |
-          sum(arco_flow_active_runs) by (tenant) > 100
+          max(arco_flow_active_runs) > 100
         for: 10m
         labels:
           severity: warning
@@ -166,7 +151,7 @@ groups:
         annotations:
           summary: High number of active runs
           description: |
-            Tenant {{ $labels.tenant }} has {{ $value }} active runs.
+            System has {{ $value }} active runs.
             This may indicate stuck runs or excessive parallelism.
           runbook_url: https://docs.arco.dev/runbooks/scheduler-not-progressing
 

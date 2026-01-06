@@ -22,6 +22,13 @@ use tracing::instrument;
 use arco_catalog::write_options::WriteOptions;
 use arco_catalog::{CatalogReader, CatalogWriter};
 
+use crate::audit::{
+    REASON_COMMIT_CACHED_FAILURE, REASON_COMMIT_CAS_CONFLICT, REASON_COMMIT_IN_PROGRESS,
+    REASON_COMMIT_INTERNAL_ERROR, REASON_COMMIT_REQUIREMENTS_FAILED,
+    REASON_CRED_VEND_ACCESS_DENIED, REASON_CRED_VEND_DISABLED, REASON_CRED_VEND_PROVIDER_ERROR,
+    REASON_CRED_VEND_UNSUPPORTED_DELEGATION, emit_cred_vend_allow, emit_cred_vend_deny,
+    emit_iceberg_commit, emit_iceberg_commit_deny,
+};
 use crate::commit::{CommitError, CommitService};
 use crate::context::IcebergRequestContext;
 use crate::error::{IcebergError, IcebergResult};
@@ -32,9 +39,10 @@ use crate::pointer::UpdateSource;
 use crate::routes::utils::{ensure_prefix, join_namespace, paginate, parse_namespace};
 use crate::state::{CredentialRequest, IcebergState, TableInfo};
 use crate::types::{
-    AccessDelegation, CommitTableRequest, CommitTableResponse, CreateTableRequest, DropTableQuery,
-    ListTablesQuery, ListTablesResponse, LoadTableQuery, LoadTableResponse, RegisterTableRequest,
-    SnapshotsFilter, TableCredentialsResponse, TableIdent, TableMetadata,
+    AccessDelegation, CommitTableRequest, CommitTableResponse, CreateTableRequest,
+    CredentialsQuery, DropTableQuery, ListTablesQuery, ListTablesResponse, LoadTableQuery,
+    LoadTableResponse, RegisterTableRequest, SnapshotsFilter, TableCredentialsResponse, TableIdent,
+    TableMetadata,
 };
 
 /// Creates table routes.
@@ -337,6 +345,7 @@ async fn create_table(
 
     let storage_credentials = maybe_vended_credentials(
         &state,
+        &ctx,
         headers.get("X-Iceberg-Access-Delegation"),
         None,
         TableInfo {
@@ -492,6 +501,7 @@ async fn load_table(
 
     let storage_credentials = maybe_vended_credentials(
         &state,
+        &ctx,
         headers.get("X-Iceberg-Access-Delegation"),
         None,
         TableInfo {
@@ -700,7 +710,7 @@ async fn commit_table(
 
     let commit_service = CommitService::new(Arc::new(storage));
 
-    match commit_service
+    let result = commit_service
         .commit_table(
             table_uuid,
             &namespace_name,
@@ -712,18 +722,84 @@ async fn commit_table(
             &ctx.tenant,
             &ctx.workspace,
         )
-        .await
-    {
-        Ok(response) => Ok(Json::<CommitTableResponse>(response).into_response()),
-        Err(CommitError::Iceberg(err)) => Err(err),
+        .await;
+
+    match result {
+        Ok(response) => {
+            if let Some(emitter) = state.audit() {
+                let seq = response
+                    .metadata
+                    .get("last-sequence-number")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                emit_iceberg_commit(
+                    emitter,
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    &ctx.request_id,
+                    &namespace_name,
+                    &path.table,
+                    seq,
+                );
+            }
+            Ok(Json::<CommitTableResponse>(response).into_response())
+        }
+        Err(CommitError::Iceberg(err)) => {
+            if let Some(emitter) = state.audit() {
+                let reason = match &err {
+                    IcebergError::Conflict { .. } => REASON_COMMIT_CAS_CONFLICT,
+                    IcebergError::BadRequest { .. } => REASON_COMMIT_REQUIREMENTS_FAILED,
+                    _ => REASON_COMMIT_INTERNAL_ERROR,
+                };
+                emit_iceberg_commit_deny(
+                    emitter,
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    &ctx.request_id,
+                    &namespace_name,
+                    &path.table,
+                    reason,
+                );
+            }
+            Err(err)
+        }
         Err(CommitError::CachedFailure { status, payload }) => {
+            if let Some(emitter) = state.audit() {
+                let reason = match status {
+                    409 => REASON_COMMIT_CAS_CONFLICT,
+                    400 => REASON_COMMIT_REQUIREMENTS_FAILED,
+                    _ => REASON_COMMIT_CACHED_FAILURE,
+                };
+                emit_iceberg_commit_deny(
+                    emitter,
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    &ctx.request_id,
+                    &namespace_name,
+                    &path.table,
+                    reason,
+                );
+            }
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT);
             Ok((status, Json(payload)).into_response())
         }
-        Err(CommitError::RetryAfter { seconds }) => Err(IcebergError::ServiceUnavailable {
-            message: "Commit already in progress".to_string(),
-            retry_after_seconds: Some(seconds),
-        }),
+        Err(CommitError::RetryAfter { seconds }) => {
+            if let Some(emitter) = state.audit() {
+                emit_iceberg_commit_deny(
+                    emitter,
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    &ctx.request_id,
+                    &namespace_name,
+                    &path.table,
+                    REASON_COMMIT_IN_PROGRESS,
+                );
+            }
+            Err(IcebergError::ServiceUnavailable {
+                message: "Commit already in progress".to_string(),
+                retry_after_seconds: Some(seconds),
+            })
+        }
     }
 }
 
@@ -835,13 +911,17 @@ async fn drop_table(
     ),
     tag = "Tables"
 )]
-#[instrument(skip_all, fields(request_id = %ctx.request_id, tenant = %ctx.tenant, workspace = %ctx.workspace, prefix = %path.prefix, namespace = %path.namespace, table = %path.table))]
+#[instrument(skip_all, fields(request_id = %ctx.request_id, tenant = %ctx.tenant, workspace = %ctx.workspace, prefix = %path.prefix, namespace = %path.namespace, table = %path.table, plan_id))]
 async fn get_credentials(
     Extension(ctx): Extension<IcebergRequestContext>,
     State(state): State<IcebergState>,
     Path(path): Path<TablePath>,
+    Query(query): Query<CredentialsQuery>,
     headers: HeaderMap,
 ) -> IcebergResult<Json<TableCredentialsResponse>> {
+    if let Some(ref plan_id) = query.plan_id {
+        tracing::Span::current().record("plan_id", plan_id.as_str());
+    }
     ensure_prefix(&path.prefix, &state.config)?;
     let separator = state.config.namespace_separator_decoded();
     let namespace_ident = parse_namespace(&path.namespace, &separator)?;
@@ -859,6 +939,7 @@ async fn get_credentials(
 
     let credentials = maybe_vended_credentials(
         &state,
+        &ctx,
         headers.get("X-Iceberg-Access-Delegation"),
         Some(AccessDelegation::VendedCredentials),
         TableInfo {
@@ -1124,6 +1205,7 @@ fn normalize_etag(value: &str) -> &str {
 
 async fn maybe_vended_credentials(
     state: &IcebergState,
+    ctx: &IcebergRequestContext,
     delegation_header: Option<&HeaderValue>,
     default_delegation: Option<AccessDelegation>,
     table: TableInfo,
@@ -1137,23 +1219,58 @@ async fn maybe_vended_credentials(
         return Ok(None);
     };
     if !delegation.is_supported() {
+        if let Some(emitter) = state.audit() {
+            emit_cred_vend_deny(
+                emitter,
+                ctx,
+                &table,
+                REASON_CRED_VEND_UNSUPPORTED_DELEGATION,
+            );
+        }
         return Err(IcebergError::BadRequest {
             message: format!("Unsupported access delegation: {delegation:?}"),
             error_type: "BadRequestException",
         });
     }
 
-    let provider = state
-        .credential_provider
-        .as_ref()
-        .ok_or_else(|| IcebergError::BadRequest {
-            message: "Credential vending is not enabled".to_string(),
-            error_type: "BadRequestException",
-        })?;
+    let provider = match state.credential_provider.as_ref() {
+        Some(p) => p,
+        None => {
+            if let Some(emitter) = state.audit() {
+                emit_cred_vend_deny(emitter, ctx, &table, REASON_CRED_VEND_DISABLED);
+            }
+            return Err(IcebergError::BadRequest {
+                message: "Credential vending is not enabled".to_string(),
+                error_type: "BadRequestException",
+            });
+        }
+    };
 
-    let credentials = provider
-        .vended_credentials(CredentialRequest { table, delegation })
-        .await?;
+    let credentials = match provider
+        .vended_credentials(CredentialRequest {
+            table: table.clone(),
+            delegation,
+        })
+        .await
+    {
+        Ok(creds) => creds,
+        Err(err) => {
+            if let Some(emitter) = state.audit() {
+                let reason = match &err {
+                    IcebergError::Forbidden { .. } | IcebergError::Unauthorized { .. } => {
+                        REASON_CRED_VEND_ACCESS_DENIED
+                    }
+                    _ => REASON_CRED_VEND_PROVIDER_ERROR,
+                };
+                emit_cred_vend_deny(emitter, ctx, &table, reason);
+            }
+            return Err(err);
+        }
+    };
+
+    if let Some(emitter) = state.audit() {
+        emit_cred_vend_allow(emitter, ctx, &table);
+    }
 
     Ok(Some(credentials))
 }

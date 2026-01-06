@@ -101,12 +101,11 @@ pub trait TaskTokenValidator: Send + Sync {
     ) -> impl Future<Output = Result<(), String>> + Send;
 }
 
-fn record_callback_metrics<T>(handler: &str, result: &CallbackResult<T>, tenant_id: &str) {
+fn record_callback_metrics<T>(handler: &str, result: &CallbackResult<T>) {
     let status = result.status_code().to_string();
     metrics::counter!(
         metrics_names::ORCH_CALLBACKS_TOTAL,
         metrics_labels::HANDLER => handler.to_string(),
-        metrics_labels::TENANT => tenant_id.to_string(),
         metrics_labels::RESULT => status.clone(),
     )
     .increment(1);
@@ -115,19 +114,14 @@ fn record_callback_metrics<T>(handler: &str, result: &CallbackResult<T>, tenant_
         metrics::counter!(
             metrics_names::ORCH_CALLBACK_ERRORS_TOTAL,
             metrics_labels::HANDLER => handler.to_string(),
-            metrics_labels::TENANT => tenant_id.to_string(),
             metrics_labels::RESULT => status,
         )
         .increment(1);
     }
 }
 
-fn finish_callback<T>(
-    handler: &str,
-    result: CallbackResult<T>,
-    tenant_id: &str,
-) -> CallbackResult<T> {
-    record_callback_metrics(handler, &result, tenant_id);
+fn finish_callback<T>(handler: &str, result: CallbackResult<T>) -> CallbackResult<T> {
+    record_callback_metrics(handler, &result);
     result
 }
 
@@ -176,7 +170,6 @@ where
         return finish_callback(
             "task_started",
             CallbackResult::Unauthorized(CallbackError::invalid_token(&reason)),
-            &ctx.tenant_id,
         );
     }
 
@@ -192,7 +185,6 @@ where
         return finish_callback(
             "task_started",
             CallbackResult::BadRequest(CallbackError::invalid_argument("attempt", "must be >= 1")),
-            &ctx.tenant_id,
         );
     }
 
@@ -203,15 +195,10 @@ where
             return finish_callback(
                 "task_started",
                 CallbackResult::NotFound(CallbackError::task_not_found(task_id)),
-                &ctx.tenant_id,
             );
         }
         Err(e) => {
-            return finish_callback(
-                "task_started",
-                CallbackResult::InternalError(e),
-                &ctx.tenant_id,
-            );
+            return finish_callback("task_started", CallbackResult::InternalError(e));
         }
     };
 
@@ -228,7 +215,6 @@ where
         return finish_callback(
             "task_started",
             CallbackResult::Conflict(CallbackError::task_already_terminal(&state.state)),
-            &ctx.tenant_id,
         );
     }
 
@@ -237,7 +223,6 @@ where
         return finish_callback(
             "task_started",
             CallbackResult::Conflict(CallbackError::attempt_mismatch(state.attempt, attempt)),
-            &ctx.tenant_id,
         );
     }
 
@@ -248,7 +233,6 @@ where
                 &state.attempt_id,
                 &attempt_id,
             )),
-            &ctx.tenant_id,
         );
     }
 
@@ -257,7 +241,6 @@ where
         return finish_callback(
             "task_started",
             CallbackResult::Conflict(CallbackError::task_already_terminal("CANCELLED")),
-            &ctx.tenant_id,
         );
     }
 
@@ -279,7 +262,6 @@ where
         return finish_callback(
             "task_started",
             CallbackResult::InternalError(format!("Failed to write event: {e}")),
-            &ctx.tenant_id,
         );
     }
 
@@ -289,7 +271,6 @@ where
             acknowledged: true,
             server_time: Utc::now(),
         }),
-        &ctx.tenant_id,
     )
 }
 
@@ -338,7 +319,6 @@ where
         return finish_callback(
             "heartbeat",
             CallbackResult::Unauthorized(CallbackError::invalid_token(&reason)),
-            &ctx.tenant_id,
         );
     }
 
@@ -359,7 +339,6 @@ where
         return finish_callback(
             "heartbeat",
             CallbackResult::BadRequest(CallbackError::invalid_argument("attempt", "must be >= 1")),
-            &ctx.tenant_id,
         );
     }
 
@@ -371,7 +350,6 @@ where
                     "progressPct",
                     "must be between 0 and 100",
                 )),
-                &ctx.tenant_id,
             );
         }
     }
@@ -383,15 +361,10 @@ where
             return finish_callback(
                 "heartbeat",
                 CallbackResult::NotFound(CallbackError::task_not_found(task_id)),
-                &ctx.tenant_id,
             );
         }
         Err(e) => {
-            return finish_callback(
-                "heartbeat",
-                CallbackResult::InternalError(e),
-                &ctx.tenant_id,
-            );
+            return finish_callback("heartbeat", CallbackResult::InternalError(e));
         }
     };
 
@@ -407,7 +380,7 @@ where
     if state.is_terminal() {
         let mut error = CallbackError::task_expired();
         error.state = Some(state.state.clone());
-        return finish_callback("heartbeat", CallbackResult::Gone(error), &ctx.tenant_id);
+        return finish_callback("heartbeat", CallbackResult::Gone(error));
     }
 
     // Validate attempt number
@@ -415,7 +388,6 @@ where
         return finish_callback(
             "heartbeat",
             CallbackResult::Conflict(CallbackError::attempt_mismatch(state.attempt, attempt)),
-            &ctx.tenant_id,
         );
     }
 
@@ -426,7 +398,6 @@ where
                 &state.attempt_id,
                 &attempt_id,
             )),
-            &ctx.tenant_id,
         );
     }
 
@@ -451,7 +422,6 @@ where
         return finish_callback(
             "heartbeat",
             CallbackResult::InternalError(format!("Failed to write event: {e}")),
-            &ctx.tenant_id,
         );
     }
 
@@ -470,7 +440,6 @@ where
             cancel_reason,
             server_time: Utc::now(),
         }),
-        &ctx.tenant_id,
     )
 }
 
@@ -519,7 +488,6 @@ where
         return finish_callback(
             "task_completed",
             CallbackResult::Unauthorized(CallbackError::invalid_token(&reason)),
-            &ctx.tenant_id,
         );
     }
 
@@ -541,7 +509,6 @@ where
         return finish_callback(
             "task_completed",
             CallbackResult::BadRequest(CallbackError::invalid_argument("attempt", "must be >= 1")),
-            &ctx.tenant_id,
         );
     }
 
@@ -552,15 +519,10 @@ where
             return finish_callback(
                 "task_completed",
                 CallbackResult::NotFound(CallbackError::task_not_found(task_id)),
-                &ctx.tenant_id,
             );
         }
         Err(e) => {
-            return finish_callback(
-                "task_completed",
-                CallbackResult::InternalError(e),
-                &ctx.tenant_id,
-            );
+            return finish_callback("task_completed", CallbackResult::InternalError(e));
         }
     };
 
@@ -577,7 +539,6 @@ where
         return finish_callback(
             "task_completed",
             CallbackResult::Conflict(CallbackError::task_already_terminal(&state.state)),
-            &ctx.tenant_id,
         );
     }
 
@@ -586,7 +547,6 @@ where
         return finish_callback(
             "task_completed",
             CallbackResult::Conflict(CallbackError::attempt_mismatch(state.attempt, attempt)),
-            &ctx.tenant_id,
         );
     }
 
@@ -597,7 +557,6 @@ where
                 &state.attempt_id,
                 &attempt_id,
             )),
-            &ctx.tenant_id,
         );
     }
 
@@ -620,7 +579,6 @@ where
                 return finish_callback(
                     "task_completed",
                     CallbackResult::InternalError(format!("Failed to serialize task output: {e}")),
-                    &ctx.tenant_id,
                 );
             }
         },
@@ -640,7 +598,6 @@ where
                 return finish_callback(
                     "task_completed",
                     CallbackResult::InternalError(format!("Failed to serialize task error: {e}")),
-                    &ctx.tenant_id,
                 );
             }
         },
@@ -653,7 +610,6 @@ where
                 return finish_callback(
                     "task_completed",
                     CallbackResult::InternalError(format!("Failed to serialize task metrics: {e}")),
-                    &ctx.tenant_id,
                 );
             }
         },
@@ -689,7 +645,6 @@ where
         return finish_callback(
             "task_completed",
             CallbackResult::InternalError(format!("Failed to write event: {e}")),
-            &ctx.tenant_id,
         );
     }
 
@@ -707,7 +662,6 @@ where
             final_state: final_state.to_string(),
             server_time: Utc::now(),
         }),
-        &ctx.tenant_id,
     )
 }
 

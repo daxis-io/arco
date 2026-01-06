@@ -41,6 +41,7 @@
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 
+pub mod audit;
 pub mod commit;
 pub mod context;
 pub mod credentials;

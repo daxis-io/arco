@@ -99,9 +99,9 @@ pub use compactor::{CompactionResult, Compactor, MaterializationRecord};
 pub use error::{CatalogError, Result};
 pub use event_writer::EventWriter;
 pub use idempotency::{
-    CatalogIdempotencyMarker, CatalogOperation, ClaimResult, FinalizeResult, IdempotencyCheck,
-    IdempotencyStatus, IdempotencyStoreImpl, ObjectVersion, TakeoverResult,
-    canonical_request_hash, check_idempotency, validate_uuidv7, DEFAULT_STALE_TIMEOUT,
+    CatalogIdempotencyMarker, CatalogOperation, ClaimResult, DEFAULT_STALE_TIMEOUT, FinalizeResult,
+    IdempotencyCheck, IdempotencyStatus, IdempotencyStoreImpl, ObjectVersion, TakeoverResult,
+    canonical_request_hash, check_idempotency, validate_uuidv7,
 };
 pub use lock::{DistributedLock, LockGuard, LockInfo};
 pub use manifest::{

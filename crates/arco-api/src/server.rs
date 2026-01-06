@@ -494,6 +494,9 @@ impl Server {
                 iceberg_state = iceberg_state.with_credentials(provider);
             }
 
+            // Wire audit emitter for security event logging
+            iceberg_state = iceberg_state.with_audit_emitter(state.audit().clone());
+
             let iceberg_service = ServiceBuilder::new()
                 .layer(middleware::from_fn_with_state(
                     Arc::clone(&state),

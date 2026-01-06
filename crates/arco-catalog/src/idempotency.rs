@@ -42,6 +42,37 @@ pub const CATALOG_IDEMPOTENCY_PREFIX: &str = "_catalog/idempotency";
 /// Default timeout for stale in-progress markers (5 minutes).
 pub const DEFAULT_STALE_TIMEOUT: chrono::Duration = chrono::Duration::minutes(5);
 
+/// Calculates Retry-After value with jitter to prevent thundering herd.
+///
+/// Returns remaining time until marker becomes stale, with +0% to +20% jitter,
+/// clamped to `[1, 300]` seconds. Jitter is non-negative so clients retry
+/// at or after the stale deadline, avoiding wasted 409 responses.
+#[must_use]
+pub fn calculate_retry_after(started_at: DateTime<Utc>, stale_timeout: chrono::Duration) -> u64 {
+    calculate_retry_after_at(Utc::now(), started_at, stale_timeout)
+}
+
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn calculate_retry_after_at(
+    now: DateTime<Utc>,
+    started_at: DateTime<Utc>,
+    stale_timeout: chrono::Duration,
+) -> u64 {
+    let elapsed = now.signed_duration_since(started_at);
+    let remaining_secs = (stale_timeout - elapsed).num_seconds().max(0) as f64;
+
+    let nanos = f64::from(now.timestamp_subsec_nanos());
+    let jitter_factor = nanos.mul_add(0.2 / 1_000_000_000.0, 1.0);
+    let with_jitter = (remaining_secs * jitter_factor) as u64;
+
+    with_jitter.clamp(1, 300)
+}
+
 /// Type of catalog DDL operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -589,7 +620,10 @@ pub enum IdempotencyCheck {
         message: String,
     },
     /// Previous request still in progress.
-    InProgress,
+    InProgress {
+        /// When the in-progress request started (for Retry-After calculation).
+        started_at: DateTime<Utc>,
+    },
 }
 
 /// Checks idempotency for a catalog DDL request.
@@ -654,7 +688,9 @@ pub async fn check_idempotency<S: StorageBackend>(
                         }
                     } else {
                         record_idempotency_check(op_str, "in_progress");
-                        Ok(IdempotencyCheck::InProgress)
+                        Ok(IdempotencyCheck::InProgress {
+                            started_at: existing.started_at,
+                        })
                     }
                 }
                 IdempotencyStatus::Committed | IdempotencyStatus::Failed => {
@@ -667,7 +703,9 @@ pub async fn check_idempotency<S: StorageBackend>(
 
 fn handle_marker_status(marker: &CatalogIdempotencyMarker) -> Result<IdempotencyCheck> {
     match marker.status {
-        IdempotencyStatus::InProgress => Ok(IdempotencyCheck::InProgress),
+        IdempotencyStatus::InProgress => Ok(IdempotencyCheck::InProgress {
+            started_at: marker.started_at,
+        }),
         IdempotencyStatus::Committed => {
             match (&marker.entity_id, &marker.entity_name) {
                 (Some(id), Some(name)) => Ok(IdempotencyCheck::Replay {
@@ -699,7 +737,7 @@ fn handle_marker_status_with_metrics(
 ) -> Result<IdempotencyCheck> {
     let result = handle_marker_status(marker)?;
     match &result {
-        IdempotencyCheck::InProgress => record_idempotency_check(operation, "in_progress"),
+        IdempotencyCheck::InProgress { .. } => record_idempotency_check(operation, "in_progress"),
         IdempotencyCheck::Replay { .. } => record_idempotency_check(operation, "replay"),
         IdempotencyCheck::PreviousFailed { .. } => {
             record_idempotency_check(operation, "previous_failed");
@@ -1076,7 +1114,7 @@ mod tests {
         .expect("check");
 
         assert!(
-            matches!(result, IdempotencyCheck::InProgress),
+            matches!(result, IdempotencyCheck::InProgress { .. }),
             "fresh in-progress marker should not allow takeover, got {result:?}"
         );
     }
@@ -1121,6 +1159,47 @@ mod tests {
             }
             _ => panic!("expected Replay after concurrent finalization, got {result:?}"),
         }
+    }
+
+    #[test]
+    fn test_calculate_retry_after_bounds() {
+        let stale_timeout = chrono::Duration::minutes(5);
+
+        let fresh_start = Utc::now();
+        let retry = calculate_retry_after(fresh_start, stale_timeout);
+        assert!(retry >= 1 && retry <= 300, "fresh marker retry={retry}");
+
+        let old_start = Utc::now() - chrono::Duration::minutes(10);
+        let retry = calculate_retry_after(old_start, stale_timeout);
+        assert_eq!(retry, 1, "expired marker should return min bound");
+    }
+
+    #[test]
+    fn test_calculate_retry_after_jitter_range() {
+        let stale_timeout = chrono::Duration::seconds(100);
+        let started_at = DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let now_min_jitter = DateTime::parse_from_rfc3339("2025-01-01T00:00:00.000000000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let retry_min = calculate_retry_after_at(now_min_jitter, started_at, stale_timeout);
+        assert_eq!(retry_min, 100, "0 nanos → factor 1.0 → 100s");
+
+        let now_max_jitter = DateTime::parse_from_rfc3339("2025-01-01T00:00:00.999999999Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let retry_max = calculate_retry_after_at(now_max_jitter, started_at, stale_timeout);
+        assert!(
+            (118..=120).contains(&retry_max),
+            "999M nanos → factor ~1.2 → ~120s, got {retry_max}"
+        );
+
+        assert!(
+            retry_max >= retry_min,
+            "jitter must be non-negative: min={retry_min}, max={retry_max}"
+        );
     }
 
     #[tokio::test]

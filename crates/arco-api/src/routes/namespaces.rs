@@ -25,7 +25,7 @@ use crate::error::ApiErrorBody;
 use crate::server::AppState;
 use arco_catalog::idempotency::{
     CatalogOperation, IdempotencyCheck, IdempotencyStore, IdempotencyStoreImpl,
-    canonical_request_hash, check_idempotency,
+    calculate_retry_after, canonical_request_hash, check_idempotency,
 };
 use arco_catalog::Tier1Compactor;
 
@@ -153,8 +153,9 @@ pub(crate) async fn create_namespace(
         IdempotencyCheck::PreviousFailed { http_status, message } => {
             return Err(ApiError::from_status_and_message(http_status, message));
         }
-        IdempotencyCheck::InProgress => {
-            return Err(ApiError::conflict_in_progress(5));
+        IdempotencyCheck::InProgress { started_at } => {
+            let retry_after = calculate_retry_after(started_at, state.config.idempotency_stale_timeout());
+            return Err(ApiError::conflict_in_progress(retry_after));
         }
     };
 

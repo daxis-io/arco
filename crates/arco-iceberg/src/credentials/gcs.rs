@@ -14,6 +14,7 @@ struct TokenWithExpiry {
 }
 
 use crate::error::{IcebergError, IcebergResult};
+use crate::metrics::{record_credential_vending, record_credential_vending_duration};
 use crate::state::{CredentialProvider, CredentialRequest};
 use crate::types::StorageCredential;
 
@@ -105,44 +106,52 @@ impl GcsCredentialProvider {
         })
     }
 
+    /// Normalizes a GCS table location into a prefix for credential scoping.
+    ///
+    /// Iceberg table locations are expected to be directory paths. This function
+    /// normalizes the path by ensuring a trailing slash, without attempting to
+    /// parse or validate the path structure.
+    ///
+    /// # Contract
+    ///
+    /// - Input MUST be a directory path (table location), not a file path
+    /// - Output is the same path with a normalized trailing slash
+    /// - Invalid inputs (empty bucket, non-GCS scheme) return `None`
+    ///
+    /// # Examples
+    ///
+    /// - `gs://bucket/warehouse/db/table/` → `gs://bucket/warehouse/db/table/`
+    /// - `gs://bucket/warehouse/db/table` → `gs://bucket/warehouse/db/table/`
+    /// - `gs://bucket/` → `gs://bucket/`
+    /// - `gs://bucket` → `gs://bucket/`
+    /// - `gs://` → `None` (invalid: empty bucket)
+    /// - `s3://bucket/path` → `None` (not GCS)
     fn extract_gcs_prefix(location: &str) -> Option<String> {
         if !location.starts_with("gs://") {
             return None;
         }
 
-        let path = &location[5..];
-        path.find('/').map_or_else(
-            || Some(format!("gs://{path}/")),
-            |slash_idx| {
-                let bucket = &path[..slash_idx];
-                let object_path = &path[slash_idx + 1..];
+        let path_after_scheme = &location[5..];
 
-                if object_path.is_empty() {
-                    return Some(format!("gs://{bucket}/"));
-                }
+        if path_after_scheme.is_empty() {
+            return None;
+        }
 
-                // For directory-like locations (no file extension), include the full path
-                // For file paths, extract the directory portion
-                let prefix = if object_path.ends_with('/') {
-                    object_path.to_string()
-                } else if object_path.contains('.') && !object_path.ends_with('/') {
-                    // Likely a file path - extract directory
-                    let prefix_end = object_path.rfind('/').map_or(0, |idx| idx + 1);
-                    format!("{}/", &object_path[..prefix_end].trim_end_matches('/'))
-                        .trim_start_matches('/')
-                        .to_string()
-                } else {
-                    // Directory-like path without trailing slash
-                    format!("{object_path}/")
-                };
+        let (bucket, object_path) = path_after_scheme.find('/').map_or(
+            (path_after_scheme, ""),
+            |slash_idx| (&path_after_scheme[..slash_idx], &path_after_scheme[slash_idx + 1..]),
+        );
 
-                if prefix.is_empty() || prefix == "/" {
-                    Some(format!("gs://{bucket}/"))
-                } else {
-                    Some(format!("gs://{bucket}/{prefix}"))
-                }
-            },
-        )
+        if bucket.is_empty() {
+            return None;
+        }
+
+        if object_path.is_empty() {
+            Some(format!("gs://{bucket}/"))
+        } else {
+            let normalized = object_path.trim_end_matches('/');
+            Some(format!("gs://{bucket}/{normalized}/"))
+        }
     }
 }
 
@@ -153,6 +162,8 @@ impl CredentialProvider for GcsCredentialProvider {
         &self,
         request: CredentialRequest,
     ) -> IcebergResult<Vec<StorageCredential>> {
+        let start = std::time::Instant::now();
+
         let location = request
             .table
             .location
@@ -163,20 +174,41 @@ impl CredentialProvider for GcsCredentialProvider {
 
         if !location.starts_with("gs://") {
             warn!(location = %location, "credential vending requested for non-GCS location");
+            record_credential_vending("gcs", "skipped_non_gcs");
+            record_credential_vending_duration("gcs", start.elapsed().as_secs_f64());
             return Ok(vec![]);
         }
 
-        let token = self.fetch_token().await?;
+        let token = match self.fetch_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                record_credential_vending("gcs", "error");
+                record_credential_vending_duration("gcs", start.elapsed().as_secs_f64());
+                return Err(e);
+            }
+        };
 
-        // Use the minimum of configured TTL and actual token expiry
+        let now = Utc::now();
+        if token.expires_at <= now {
+            warn!("GCS token already expired (expires_at={}, now={}), refusing to vend", token.expires_at, now);
+            record_credential_vending("gcs", "error_expired_token");
+            record_credential_vending_duration("gcs", start.elapsed().as_secs_f64());
+            return Err(IcebergError::Internal {
+                message: "credential provider returned expired token".to_string(),
+            });
+        }
+
         let ttl_seconds = i64::try_from(self.config.ttl.as_secs()).unwrap_or(3600);
-        let configured_expiry = Utc::now() + chrono::Duration::seconds(ttl_seconds);
+        let configured_expiry = now + chrono::Duration::seconds(ttl_seconds);
         let expires_at = configured_expiry.min(token.expires_at);
         let expires_at_str = expires_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
         let prefix = Self::extract_gcs_prefix(&location).unwrap_or(location);
 
         debug!(prefix = %prefix, expires_at = %expires_at_str, "vending GCS credentials");
+
+        record_credential_vending("gcs", "success");
+        record_credential_vending_duration("gcs", start.elapsed().as_secs_f64());
 
         Ok(vec![StorageCredential::gcs(
             prefix,
@@ -191,9 +223,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_gcs_prefix_with_path() {
+    fn test_extract_gcs_prefix_with_nested_path() {
         let prefix = GcsCredentialProvider::extract_gcs_prefix(
-            "gs://my-bucket/warehouse/db/table/data/file.parquet",
+            "gs://my-bucket/warehouse/db/table/data",
         );
         assert_eq!(
             prefix,
@@ -204,6 +236,12 @@ mod tests {
     #[test]
     fn test_extract_gcs_prefix_bucket_only() {
         let prefix = GcsCredentialProvider::extract_gcs_prefix("gs://my-bucket/");
+        assert_eq!(prefix, Some("gs://my-bucket/".to_string()));
+    }
+
+    #[test]
+    fn test_extract_gcs_prefix_bucket_no_slash() {
+        let prefix = GcsCredentialProvider::extract_gcs_prefix("gs://my-bucket");
         assert_eq!(prefix, Some("gs://my-bucket/".to_string()));
     }
 
@@ -223,8 +261,50 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_gcs_prefix_directory_with_dots() {
+        let prefix = GcsCredentialProvider::extract_gcs_prefix("gs://my-bucket/v1.0.0/data");
+        assert_eq!(prefix, Some("gs://my-bucket/v1.0.0/data/".to_string()));
+
+        let prefix =
+            GcsCredentialProvider::extract_gcs_prefix("gs://my-bucket/releases/v2.1.3/tables");
+        assert_eq!(
+            prefix,
+            Some("gs://my-bucket/releases/v2.1.3/tables/".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_gcs_prefix_trailing_slash_normalized() {
+        let prefix =
+            GcsCredentialProvider::extract_gcs_prefix("gs://my-bucket/warehouse/db/table/");
+        assert_eq!(
+            prefix,
+            Some("gs://my-bucket/warehouse/db/table/".to_string())
+        );
+
+        let prefix =
+            GcsCredentialProvider::extract_gcs_prefix("gs://my-bucket/warehouse/db/table///");
+        assert_eq!(
+            prefix,
+            Some("gs://my-bucket/warehouse/db/table/".to_string())
+        );
+    }
+
+    #[test]
     fn test_extract_gcs_prefix_non_gcs() {
         let prefix = GcsCredentialProvider::extract_gcs_prefix("s3://my-bucket/path");
+        assert!(prefix.is_none());
+
+        let prefix = GcsCredentialProvider::extract_gcs_prefix("abfs://container/path");
+        assert!(prefix.is_none());
+    }
+
+    #[test]
+    fn test_extract_gcs_prefix_empty_bucket_rejected() {
+        let prefix = GcsCredentialProvider::extract_gcs_prefix("gs://");
+        assert!(prefix.is_none());
+
+        let prefix = GcsCredentialProvider::extract_gcs_prefix("gs:///path/to/data");
         assert!(prefix.is_none());
     }
 

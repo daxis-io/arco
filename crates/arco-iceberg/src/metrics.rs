@@ -57,6 +57,17 @@ pub const GC_RECEIPTS_DELETED: &str = "iceberg_gc_receipts_deleted_total";
 
 /// GC duration histogram.
 pub const GC_DURATION: &str = "iceberg_gc_duration_seconds";
+
+// ============================================================================
+// Credential Vending Metrics
+// ============================================================================
+
+/// Credential vending request counter.
+pub const CREDENTIAL_VENDING_TOTAL: &str = "iceberg_credential_vending_total";
+
+/// Credential vending duration histogram.
+pub const CREDENTIAL_VENDING_DURATION: &str = "iceberg_credential_vending_duration_seconds";
+
 const UNMATCHED_ENDPOINT: &str = "unmatched";
 
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
@@ -121,6 +132,15 @@ pub fn register_metrics() {
             "Total number of event receipts deleted by GC"
         );
         describe_histogram!(GC_DURATION, "Duration of GC runs in seconds");
+
+        describe_counter!(
+            CREDENTIAL_VENDING_TOTAL,
+            "Total number of credential vending requests"
+        );
+        describe_histogram!(
+            CREDENTIAL_VENDING_DURATION,
+            "Duration of credential vending requests in seconds"
+        );
     });
 }
 
@@ -275,6 +295,27 @@ pub fn record_gc_duration(gc_type: &str, duration_secs: f64) {
     register_metrics();
     let labels = [("type", gc_type.to_string())];
     histogram!(GC_DURATION, &labels).record(duration_secs);
+}
+
+// ============================================================================
+// Credential Vending Metrics Recording
+// ============================================================================
+
+/// Records a credential vending request.
+pub fn record_credential_vending(provider: &str, status: &str) {
+    register_metrics();
+    let labels = [
+        ("provider", provider.to_string()),
+        ("status", status.to_string()),
+    ];
+    counter!(CREDENTIAL_VENDING_TOTAL, &labels).increment(1);
+}
+
+/// Records credential vending duration.
+pub fn record_credential_vending_duration(provider: &str, duration_secs: f64) {
+    register_metrics();
+    let labels = [("provider", provider.to_string())];
+    histogram!(CREDENTIAL_VENDING_DURATION, &labels).record(duration_secs);
 }
 
 fn status_class(status: StatusCode) -> &'static str {

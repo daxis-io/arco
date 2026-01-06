@@ -2,13 +2,13 @@
 //!
 //! Provides the router builder for mounting Iceberg endpoints.
 
+use axum::Router;
 use axum::error_handling::HandleErrorLayer;
 use axum::http::StatusCode;
 use axum::middleware;
-use axum::Router;
+use tower::ServiceBuilder;
 use tower::limit::ConcurrencyLimitLayer;
 use tower::timeout::TimeoutLayer;
-use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 
 use crate::context::context_middleware;
@@ -53,7 +53,9 @@ pub fn iceberg_router(state: IcebergState) -> Router {
     router.with_state(state)
 }
 
-async fn handle_timeout_error(_err: tower::BoxError) -> (StatusCode, axum::Json<IcebergErrorResponse>) {
+async fn handle_timeout_error(
+    _err: tower::BoxError,
+) -> (StatusCode, axum::Json<IcebergErrorResponse>) {
     let response = IcebergErrorResponse {
         error: IcebergErrorDetail {
             message: "Request timed out".to_string(),
@@ -67,8 +69,8 @@ async fn handle_timeout_error(_err: tower::BoxError) -> (StatusCode, axum::Json<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arco_core::storage::MemoryBackend;
     use crate::state::IcebergConfig;
+    use arco_core::storage::MemoryBackend;
     use std::sync::Arc;
     use std::time::Duration;
 

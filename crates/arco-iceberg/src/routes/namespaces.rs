@@ -817,10 +817,7 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            json["error"]["type"],
-            "UnprocessableEntityException"
-        );
+        assert_eq!(json["error"]["type"], "UnprocessableEntityException");
     }
 
     #[tokio::test]
@@ -854,7 +851,12 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["updated"].as_array().unwrap().contains(&serde_json::json!("comment")));
+        assert!(
+            json["updated"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("comment"))
+        );
 
         let router2 = app(state);
         let get_response = router2

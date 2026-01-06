@@ -70,6 +70,14 @@ impl ConfigResponse {
             ]);
         }
 
+        if config.allow_table_crud {
+            endpoints.extend([
+                "POST /v1/{prefix}/namespaces/{namespace}/tables".to_string(),
+                "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string(),
+                "POST /v1/{prefix}/namespaces/{namespace}/register".to_string(),
+            ]);
+        }
+
         Self {
             defaults: HashMap::new(),
             overrides: HashMap::from([
@@ -162,8 +170,38 @@ mod tests {
         assert!(endpoints.contains(&"POST /v1/{prefix}/namespaces".to_string()));
         assert!(endpoints.contains(&"DELETE /v1/{prefix}/namespaces/{namespace}".to_string()));
         assert!(
+            endpoints.contains(&"POST /v1/{prefix}/namespaces/{namespace}/properties".to_string())
+        );
+    }
+
+    #[test]
+    fn test_table_crud_advertises_endpoints() {
+        let mut config = IcebergConfig::default();
+        config.allow_table_crud = true;
+        let config = ConfigResponse::from_config(&config, false);
+        let endpoints = config.endpoints.expect("endpoints should be present");
+
+        assert!(endpoints.contains(&"POST /v1/{prefix}/namespaces/{namespace}/tables".to_string()));
+        assert!(
             endpoints
-                .contains(&"POST /v1/{prefix}/namespaces/{namespace}/properties".to_string())
+                .contains(&"DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string())
+        );
+        assert!(
+            endpoints.contains(&"POST /v1/{prefix}/namespaces/{namespace}/register".to_string())
+        );
+    }
+
+    #[test]
+    fn test_table_crud_not_advertised_by_default() {
+        let config = ConfigResponse::from_config(&IcebergConfig::default(), false);
+        let endpoints = config.endpoints.expect("endpoints should be present");
+
+        assert!(
+            !endpoints.contains(&"POST /v1/{prefix}/namespaces/{namespace}/tables".to_string())
+        );
+        assert!(
+            !endpoints
+                .contains(&"DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string())
         );
     }
 }

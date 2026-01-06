@@ -74,9 +74,12 @@ fn test_openapi_paths_align_with_official_spec() {
         ("/v1/{prefix}/namespaces/{namespace}", "delete"),
         ("/v1/{prefix}/namespaces/{namespace}/properties", "post"),
         ("/v1/{prefix}/namespaces/{namespace}/tables", "get"),
+        ("/v1/{prefix}/namespaces/{namespace}/tables", "post"),
         ("/v1/{prefix}/namespaces/{namespace}/tables/{table}", "get"),
         ("/v1/{prefix}/namespaces/{namespace}/tables/{table}", "head"),
+        ("/v1/{prefix}/namespaces/{namespace}/tables/{table}", "delete"),
         ("/v1/{prefix}/namespaces/{namespace}/tables/{table}", "post"),
+        ("/v1/{prefix}/namespaces/{namespace}/register", "post"),
         (
             "/v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials",
             "get",

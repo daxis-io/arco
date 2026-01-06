@@ -25,6 +25,8 @@ pub struct IcebergConfig {
     pub allow_write: bool,
     /// Enable namespace create/delete endpoints.
     pub allow_namespace_crud: bool,
+    /// Enable table create/drop/register endpoints.
+    pub allow_table_crud: bool,
     /// Optional request timeout for handlers.
     pub request_timeout: Option<Duration>,
     /// Optional concurrency limit for handlers.
@@ -39,6 +41,7 @@ impl Default for IcebergConfig {
             idempotency_key_lifetime: Some("PT1H".to_string()),
             allow_write: false,
             allow_namespace_crud: false,
+            allow_table_crud: false,
             request_timeout: None,
             concurrency_limit: None,
         }
@@ -162,7 +165,7 @@ impl IcebergState {
             .as_ref()
             .map(|f| f.create_compactor(storage.clone()))
             .ok_or_else(|| IcebergError::Internal {
-                message: "Namespace CRUD requires a compactor factory".to_string(),
+                message: "Catalog CRUD operations require a compactor factory".to_string(),
             })
     }
 }

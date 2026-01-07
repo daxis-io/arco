@@ -77,7 +77,7 @@ This is a minimal traceability slice for the metastore/security-critical items.
 ### 3.2 Iceberg Parity / Engine Readiness (P0)
 
 8. Fix “spec says it exists but handler can’t read it” issues (query params, capability advertisement truthfulness) before adding new endpoints.
-9. Implement missing Iceberg REST baseline endpoints: namespaces CRUD + properties, tables create/drop/register/rename, metrics POST, transactions commit, and required semantics (e.g., `purgeRequested`).
+9. ~~Implement missing Iceberg REST baseline endpoints~~: ✅ Table rename implemented (`crates/arco-iceberg/src/routes/catalog.rs:59`); ✅ metrics reporting implemented (`crates/arco-iceberg/src/routes/tables.rs:999`); ⚠️ transactions/commit single-table bridge only (`crates/arco-iceberg/src/routes/catalog.rs:132`, not advertised). Remaining: namespaces CRUD + properties, `purgeRequested` semantics, multi-table atomic transactions.
 10. ✅ Wire Iceberg credential vending end-to-end (GCS) and audit vend/deny decisions — COMPLETE (`crates/arco-api/src/server.rs:630-637`, `crates/arco-iceberg/src/audit.rs:67,96`).
 11. Establish an engine compatibility bar: Spark/Flink/Trino configs + an interop test matrix/conformance suite that runs through the API-layer auth model.
 
@@ -159,7 +159,7 @@ See `docs/runbooks/metrics-access.md`.
 | PR-11 | Iceberg REST parameter correctness | ✅ Implemented: `LoadTableQuery` struct parses `snapshots` param (`crates/arco-iceberg/src/types/table.rs:63-87`). `SnapshotsFilter::Refs` filters to referenced snapshots only (`crates/arco-iceberg/src/routes/tables.rs:241-244`). `planId` documented in OpenAPI and parsed/logged (`crates/arco-iceberg/src/routes/tables.rs:900,919-924`); accepted but no behavioral effect yet (scan planning not implemented). | Unit tests for query parsing + filter default (`crates/arco-iceberg/src/types/table.rs:457-470`) |
 | PR-7 | Iceberg REST write endpoints (namespaces) | Add namespace create/delete/properties endpoints; keep `/v1/config` capability hiding accurate. | Route tests; engine-oriented integration tests through API JWT auth |
 | PR-8 | Iceberg REST write endpoints (tables) | Add table create/drop/register endpoints; implement `purgeRequested` semantics. | Route tests; integration tests exercising storage layout invariants |
-| PR-9 | Iceberg REST rename + metrics correctness | Implement `POST /v1/{prefix}/tables/rename` and `POST .../metrics` (method/path correctness). | OpenAPI compliance + request parsing tests |
+| PR-9 | Iceberg REST rename + metrics correctness | ✅ COMPLETE: Rename at `crates/arco-iceberg/src/routes/catalog.rs:59`; metrics at `crates/arco-iceberg/src/routes/tables.rs:999`. | Tests at `crates/arco-iceberg/src/routes/catalog.rs:415`, `crates/arco-iceberg/src/routes/tables.rs:2561` |
 | PR-10 | Iceberg credential vending (GCS first) | ✅ COMPLETE: GCS `CredentialProvider` wired (`crates/arco-api/src/server.rs:630-637`); audit events implemented (`crates/arco-iceberg/src/audit.rs:67,96,129,165`); TTL bounded (`crates/arco-iceberg/src/credentials/mod.rs:33,44`). See **PR-10 Design** below. | Unit tests for scope/TTL; integration test hitting `/credentials` |
 
 #### PR-10 Design: GCS Credential Vending

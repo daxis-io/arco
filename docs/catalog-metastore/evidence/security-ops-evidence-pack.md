@@ -3,7 +3,7 @@
 **Date:** 2026-01-02 (updated 2026-01-06)  
 **Commit:** 966b8eecce6348821c258e38553ed945e314cfde (evidence updated with P0 gap closures)  
 **Scope:** Catalog/metastore security posture (API authN/authZ, storage isolation & IAM, read-path URL minting, observability/monitoring, Iceberg REST + credential vending)  
-**Overall status:** ⚠️ **Near audit-ready** (Security audit trail complete for auth, URL mint, credential vending, and Iceberg commits. Credential vending is wired with GCS provider. P0 gaps closed. Remaining: Iceberg REST parity endpoints (rename, transactions, metrics), compactor `/metrics` relies on infra isolation; see `crates/arco-api/src/server.rs:374`, `crates/arco-api/src/server.rs:384`, `crates/arco-compactor/src/main.rs:963`).
+**Overall status:** ⚠️ **Near audit-ready** (Security audit trail complete for auth, URL mint, credential vending, and Iceberg commits. Credential vending is wired with GCS provider. P0 gaps closed. Iceberg REST parity: rename (ICE-6) and metrics (ICE-8) implemented; transactions/commit (ICE-7) partial (single-table bridge only, not advertised). Remaining: compactor `/metrics` relies on infra isolation; see `crates/arco-api/src/server.rs:374`, `crates/arco-api/src/server.rs:384`, `crates/arco-compactor/src/main.rs:963`).
 
 ## Status Legend
 
@@ -26,7 +26,7 @@
 | Tenant/workspace storage isolation | ✅ | P0 | High | Code + tests | `crates/arco-core/src/scoped_storage.rs:1`, `crates/arco-core/src/scoped_storage.rs:115`, `crates/arco-core/src/scoped_storage.rs:821` | If debug is enabled (dev posture), scope selection becomes attacker-controlled | Keep guardrail + add e2e coverage |
 | Browser-direct read path (signed URLs) | ✅ | P0 | High | Code review | `crates/arco-api/src/routes/browser.rs:5`, `crates/arco-api/src/routes/browser.rs:119`, `crates/arco-catalog/src/reader.rs:494`, `crates/arco-api/src/routes/browser.rs:140,177,198` (audit) | URL mint allow/deny audit events implemented; redaction enforced via "do not log" policy (`crates/arco-api/src/routes/browser.rs:167`) | Complete: audit events emit at mint time for allow/deny decisions |
 | Observability & monitoring | ✅ | P1 | Medium | Code + infra | `crates/arco-core/src/observability.rs:43`, `crates/arco-api/src/metrics.rs:41`, `crates/arco-api/src/server.rs:384`, `crates/arco-compactor/src/main.rs:963`, `infra/monitoring/otel-collector.yaml:1`, `crates/arco-iceberg/src/audit.rs:67-188` | Auth + URL mint + credential vending + Iceberg commit audit events all implemented; API `/metrics` blocked in public posture; compactor relies on infra isolation; metrics labels are bounded | Keep compactor internal or add metrics auth; keep label tests; tenant label removed from flow metrics |
-| Iceberg REST surface | 🔨 | P0 | Medium | Code review | `crates/arco-api/src/server.rs:219`, `crates/arco-iceberg/src/router.rs:37`, `crates/arco-iceberg/src/types/config.rs:8` | Many PRD endpoints missing; query params declared but ignored | Slice PRs for endpoint completeness + parameter parsing |
+| Iceberg REST surface | ⚠️ | P0 | Medium | Code review | `crates/arco-api/src/server.rs:219`, `crates/arco-iceberg/src/router.rs:37`, `crates/arco-iceberg/src/types/config.rs:8` | Rename (ICE-6) + metrics (ICE-8) implemented; transactions (ICE-7) single-table bridge only | Multi-table atomic transactions remain backlog |
 | Iceberg credential vending | ✅ | P0 | High | Code review | `crates/arco-api/src/server.rs:630-637` (provider wiring), `crates/arco-iceberg/src/routes/tables.rs:940-960` (handler), `crates/arco-iceberg/src/audit.rs:67,96` (audit helpers) | Provider wired when GCP feature enabled; vend/deny audit trail implemented | Complete: GCS credential provider wired + audit events emitted |
 
 ---
@@ -362,8 +362,10 @@ If these assumptions change, evidence must be re-collected.
 **Known gaps (PRD P0/P1):**
 
 - Namespace create/delete/properties are not implemented (only list/get/HEAD exist) (`crates/arco-iceberg/src/routes/namespaces.rs:30`).
-- Table create/drop/register/rename are not implemented (only list/load/HEAD/commit exist) and are not advertised in `/v1/config` (`crates/arco-iceberg/src/router.rs:37`, `crates/arco-iceberg/src/types/config.rs:63`).
-- Iceberg spec endpoints not implemented: metrics (`POST .../metrics`) and multi-table transactions (`POST /transactions/commit`) (not routed; not advertised) (`crates/arco-iceberg/src/router.rs:37`, `crates/arco-iceberg/src/types/config.rs:10`).
+- Table create/drop/register are routed when `allow_table_crud` enabled (`crates/arco-iceberg/src/routes/tables.rs:44-58`). ✅ Table rename is implemented at `crates/arco-iceberg/src/routes/catalog.rs:59` (within-namespace only; advertised when `allow_table_crud`).
+- ✅ Table rename implemented at `crates/arco-iceberg/src/routes/catalog.rs:59`; within-namespace only; advertised when `allow_table_crud`.
+- ✅ Metrics reporting implemented at `crates/arco-iceberg/src/routes/tables.rs:999`; uses official table-scoped path `POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics`; always advertised.
+- ⚠️ Transactions/commit (`POST /v1/{prefix}/transactions/commit`) implemented as single-table bridge only (`crates/arco-iceberg/src/routes/catalog.rs:132`); NOT advertised in `/v1/config` (interop bridge); multi-table atomic remains backlog.
 - Drop-table `purgeRequested` semantics are not implemented (drop-table endpoint itself is missing) (`crates/arco-iceberg/src/types/config.rs:67`).
 - Parity docs call out engine/client auth schemes (SigV4, Google Auth, token rotation/revocation); current API supports debug headers or `Authorization: Bearer <jwt>` only (`crates/arco-api/src/context.rs:80`, `crates/arco-api/src/context.rs:237`).
 - ✅ Query parameters now properly parsed: `snapshots` param parsed via `LoadTableQuery` (`crates/arco-iceberg/src/types/table.rs:63-87`), filtering implemented (`crates/arco-iceberg/src/routes/tables.rs:241-244`). `planId` removed from OpenAPI (scan planning not implemented).
@@ -493,7 +495,7 @@ If these assumptions change, evidence must be re-collected.
 | Debug mode outside dev posture (regression risk) | Caller chooses tenant/workspace via headers; task callbacks accept any bearer token; cross-tenant read/write | Guardrail enforced at startup; keep regression tests (`crates/arco-api/src/server.rs:578`, `crates/arco-api/src/server.rs:784`) | ✅ Mitigated |
 | Compactor `/metrics` unauthenticated (ensure internal-only ingress) | Identifier leakage + endpoint surface disclosure; potential DoS of monitoring pipeline if exposed | API blocks `/metrics` in public posture; keep compactor internal or add metrics auth (`crates/arco-api/src/server.rs:374`, `crates/arco-api/src/server.rs:384`, `crates/arco-compactor/src/main.rs:963`, `infra/terraform/cloud_run.tf:25`) | ⚠️ Infra-dependent |
 | ~~Iceberg credential vending not wired~~ | ~~Engines cannot rely on scoped access delegation; blocks secure multi-engine use~~ | GCS `CredentialProvider` wired (`crates/arco-api/src/server.rs:630-637`); vend/deny audit events implemented (`crates/arco-iceberg/src/audit.rs:67,96`) | ✅ **Closed** |
-| Iceberg REST baseline endpoints missing | Engines/clients cannot fully use Arco as Iceberg REST catalog; parity gate fails | Implement rename, metrics, transactions; keep `/v1/config` capability hiding accurate (`crates/arco-iceberg/src/router.rs:37`, `crates/arco-iceberg/src/types/config.rs:10`) | Open (rename/txn/metrics) |
+| ~~Iceberg REST baseline endpoints missing~~ | ~~Engines/clients cannot fully use Arco as Iceberg REST catalog; parity gate fails~~ | Rename + metrics implemented; transactions single-table bridge only (`crates/arco-iceberg/src/routes/catalog.rs:59,132`, `crates/arco-iceberg/src/routes/tables.rs:999`) | **Mostly Closed** (multi-table txn backlog) |
 
 ### P1 (High)
 

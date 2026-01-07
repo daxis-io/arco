@@ -680,7 +680,7 @@ async fn read_lineage_event(
     Ok(envelope.payload)
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::indexing_slicing)]
 fn apply_catalog_event(
     state: &mut crate::state::CatalogState,
     event: CatalogDdlEvent,

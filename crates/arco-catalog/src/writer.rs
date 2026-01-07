@@ -1027,6 +1027,7 @@ impl CatalogWriter {
     /// - Source and destination namespaces differ (cross-namespace rename not supported)
     /// - A table with the destination name already exists
     /// - Lock acquisition or storage operations fail
+    #[allow(clippy::too_many_lines)]
     pub async fn rename_table(
         &self,
         source_namespace: &str,
@@ -1111,19 +1112,16 @@ impl CatalogWriter {
         let namespace_id = ns.id.clone();
 
         // Find source table
-        let table = match state
+        let Some(table) = state
             .tables
             .iter()
             .find(|t| t.namespace_id == namespace_id && t.name == source_name)
-        {
-            Some(t) => t,
-            None => {
-                guard.release().await?;
-                return Err(CatalogError::NotFound {
-                    entity: "table".into(),
-                    name: format!("{}.{}", source_namespace, source_name),
-                });
-            }
+        else {
+            guard.release().await?;
+            return Err(CatalogError::NotFound {
+                entity: "table".into(),
+                name: format!("{}.{}", source_namespace, source_name),
+            });
         };
 
         let table_id = table.id.clone();

@@ -450,6 +450,23 @@ pub struct DropTableQuery {
     pub purge_requested: bool,
 }
 
+/// Request body for `POST /v1/{prefix}/tables/rename`.
+///
+/// Renames a table within the catalog. The table's UUID and data remain unchanged.
+///
+/// # Cross-Namespace Rename
+///
+/// Arco does not currently support cross-namespace rename. If `source.namespace`
+/// differs from `destination.namespace`, the server returns 406 Not Acceptable.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RenameTableRequest {
+    /// The current table identifier.
+    pub source: TableIdent,
+
+    /// The new table identifier.
+    pub destination: TableIdent,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

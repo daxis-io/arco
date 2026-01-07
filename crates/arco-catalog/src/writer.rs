@@ -1010,6 +1010,183 @@ impl CatalogWriter {
         result.map(|_| ())
     }
 
+    /// Renames a table within the same namespace.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_namespace` - Namespace containing the table
+    /// * `source_name` - Current table name
+    /// * `dest_namespace` - Destination namespace (must match source)
+    /// * `dest_name` - New table name
+    /// * `opts` - Write options
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Source table doesn't exist
+    /// - Source and destination namespaces differ (cross-namespace rename not supported)
+    /// - A table with the destination name already exists
+    /// - Lock acquisition or storage operations fail
+    pub async fn rename_table(
+        &self,
+        source_namespace: &str,
+        source_name: &str,
+        dest_namespace: &str,
+        dest_name: &str,
+        opts: WriteOptions,
+    ) -> Result<Table> {
+        // Cross-namespace rename is not supported
+        if source_namespace != dest_namespace {
+            return Err(CatalogError::UnsupportedOperation {
+                message: format!(
+                    "cross-namespace rename not supported: '{}' -> '{}'",
+                    source_namespace, dest_namespace
+                ),
+            });
+        }
+
+        // No-op if names are the same
+        if source_name == dest_name {
+            // Still need to find and return the table
+            let manifest = self.tier1.read_manifest().await?;
+            let state =
+                tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path)
+                    .await?;
+
+            let ns = state
+                .namespaces
+                .iter()
+                .find(|ns| ns.name == source_namespace)
+                .ok_or_else(|| CatalogError::NotFound {
+                    entity: "namespace".into(),
+                    name: source_namespace.to_string(),
+                })?;
+
+            let table = state
+                .tables
+                .iter()
+                .find(|t| t.namespace_id == ns.id && t.name == source_name)
+                .ok_or_else(|| CatalogError::NotFound {
+                    entity: "table".into(),
+                    name: format!("{}.{}", source_namespace, source_name),
+                })?;
+
+            return Ok(Table::from(table.clone()));
+        }
+
+        // Check optimistic locking
+        if let Some(expected) = &opts.if_match {
+            let manifest = self.tier1.read_manifest().await?;
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+
+        let compactor = self.sync_compactor()?;
+
+        let guard = self
+            .tier1
+            .acquire_lock(self.lock_ttl, self.lock_max_retries)
+            .await?;
+
+        let manifest = self.tier1.read_manifest().await?;
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+
+        // Find namespace
+        let ns = state
+            .namespaces
+            .iter()
+            .find(|ns| ns.name == source_namespace)
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "namespace".into(),
+                name: source_namespace.to_string(),
+            })?;
+        let namespace_id = ns.id.clone();
+
+        // Find source table
+        let table = match state
+            .tables
+            .iter()
+            .find(|t| t.namespace_id == namespace_id && t.name == source_name)
+        {
+            Some(t) => t,
+            None => {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "table".into(),
+                    name: format!("{}.{}", source_namespace, source_name),
+                });
+            }
+        };
+
+        let table_id = table.id.clone();
+
+        // Check destination name doesn't conflict
+        if state
+            .tables
+            .iter()
+            .any(|t| t.namespace_id == namespace_id && t.name == dest_name)
+        {
+            guard.release().await?;
+            return Err(CatalogError::AlreadyExists {
+                entity: "table".into(),
+                name: format!("{}.{}", dest_namespace, dest_name),
+            });
+        }
+
+        let now = Utc::now().timestamp_millis();
+
+        let event = CatalogDdlEvent::TableRenamed {
+            table_id: table_id.clone(),
+            namespace_id: namespace_id.clone(),
+            old_name: source_name.to_string(),
+            new_name: dest_name.to_string(),
+            updated_at: now,
+        };
+
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
+            .await?;
+
+        let request = SyncCompactRequest {
+            domain: CatalogDomain::Catalog.as_str().to_string(),
+            event_paths: vec![CatalogPaths::ledger_event(
+                CatalogDomain::Catalog,
+                &event_id.to_string(),
+            )],
+            fencing_token: guard.fencing_token().sequence(),
+            request_id: opts.request_id.clone(),
+        };
+
+        let result = compactor.sync_compact(request).await;
+        guard.release().await?;
+
+        // Construct the renamed table for return
+        result.map(|_| Table {
+            id: table_id,
+            namespace_id,
+            name: dest_name.to_string(),
+            description: table.description.clone(),
+            location: table.location.clone(),
+            format: table.format.clone(),
+            created_at: table.created_at,
+            updated_at: now,
+        })
+    }
+
     // ========================================================================
     // Lineage (Tier 1 - lineage domain, separate lock)
     // ========================================================================
@@ -1363,5 +1540,213 @@ mod tests {
 
         let graph2 = reader.get_lineage("table_a").await.expect("lineage 2");
         assert_eq!(graph2.downstream.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_rename_table() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_namespace("default", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+
+        writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "default".to_string(),
+                    name: "old_name".to_string(),
+                    description: Some("Test table".to_string()),
+                    location: Some("s3://bucket/old_name".to_string()),
+                    format: Some("iceberg".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+
+        let renamed = writer
+            .rename_table(
+                "default",
+                "old_name",
+                "default",
+                "new_name",
+                WriteOptions::default(),
+            )
+            .await
+            .expect("rename table");
+
+        assert_eq!(renamed.name, "new_name");
+        assert_eq!(renamed.description, Some("Test table".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_cross_namespace_fails() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_namespace("ns1", None, WriteOptions::default())
+            .await
+            .expect("create ns1");
+
+        writer
+            .create_namespace("ns2", None, WriteOptions::default())
+            .await
+            .expect("create ns2");
+
+        writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "ns1".to_string(),
+                    name: "my_table".to_string(),
+                    description: None,
+                    location: None,
+                    format: Some("iceberg".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+
+        let result = writer
+            .rename_table(
+                "ns1",
+                "my_table",
+                "ns2",
+                "my_table",
+                WriteOptions::default(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            CatalogError::UnsupportedOperation { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_conflict_fails() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_namespace("default", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+
+        writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "default".to_string(),
+                    name: "table_a".to_string(),
+                    description: None,
+                    location: None,
+                    format: Some("iceberg".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table_a");
+
+        writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "default".to_string(),
+                    name: "table_b".to_string(),
+                    description: None,
+                    location: None,
+                    format: Some("iceberg".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table_b");
+
+        let result = writer
+            .rename_table(
+                "default",
+                "table_a",
+                "default",
+                "table_b",
+                WriteOptions::default(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            CatalogError::AlreadyExists { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_not_found_fails() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_namespace("default", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+
+        let result = writer
+            .rename_table(
+                "default",
+                "nonexistent",
+                "default",
+                "new_name",
+                WriteOptions::default(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), CatalogError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_rename_table_same_name_noop() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_namespace("default", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+
+        let table = writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "default".to_string(),
+                    name: "my_table".to_string(),
+                    description: Some("Original".to_string()),
+                    location: None,
+                    format: Some("iceberg".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+
+        let renamed = writer
+            .rename_table(
+                "default",
+                "my_table",
+                "default",
+                "my_table",
+                WriteOptions::default(),
+            )
+            .await
+            .expect("same name rename should succeed");
+
+        assert_eq!(renamed.id, table.id);
+        assert_eq!(renamed.name, "my_table");
     }
 }

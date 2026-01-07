@@ -50,6 +50,7 @@ impl ConfigResponse {
             "GET /v1/{prefix}/namespaces/{namespace}/tables".to_string(),
             "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string(),
             "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string(),
+            "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics".to_string(),
         ];
 
         if credentials_enabled {
@@ -75,6 +76,7 @@ impl ConfigResponse {
                 "POST /v1/{prefix}/namespaces/{namespace}/tables".to_string(),
                 "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string(),
                 "POST /v1/{prefix}/namespaces/{namespace}/register".to_string(),
+                "POST /v1/{prefix}/tables/rename".to_string(),
             ]);
         }
 
@@ -203,5 +205,44 @@ mod tests {
             !endpoints
                 .contains(&"DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string())
         );
+    }
+
+    #[test]
+    fn test_metrics_endpoint_always_advertised() {
+        let config = ConfigResponse::from_config(&IcebergConfig::default(), false);
+        let endpoints = config.endpoints.expect("endpoints should be present");
+
+        assert!(endpoints.contains(
+            &"POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics".to_string()
+        ));
+    }
+
+    #[test]
+    fn test_rename_endpoint_advertised_with_table_crud() {
+        let mut config = IcebergConfig::default();
+        config.allow_table_crud = true;
+        let response = ConfigResponse::from_config(&config, false);
+        let endpoints = response.endpoints.expect("endpoints should be present");
+
+        assert!(endpoints.contains(&"POST /v1/{prefix}/tables/rename".to_string()));
+    }
+
+    #[test]
+    fn test_rename_endpoint_not_advertised_without_table_crud() {
+        let config = ConfigResponse::from_config(&IcebergConfig::default(), false);
+        let endpoints = config.endpoints.expect("endpoints should be present");
+
+        assert!(!endpoints.contains(&"POST /v1/{prefix}/tables/rename".to_string()));
+    }
+
+    #[test]
+    fn test_transactions_commit_not_advertised() {
+        let mut config = IcebergConfig::default();
+        config.allow_table_crud = true;
+        config.allow_write = true;
+        let response = ConfigResponse::from_config(&config, false);
+        let endpoints = response.endpoints.expect("endpoints should be present");
+
+        assert!(!endpoints.contains(&"POST /v1/{prefix}/transactions/commit".to_string()));
     }
 }

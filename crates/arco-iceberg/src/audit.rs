@@ -33,6 +33,8 @@ pub const REASON_COMMIT_INTERNAL_ERROR: &str = "internal_error";
 pub const REASON_COMMIT_IN_PROGRESS: &str = "commit_in_progress";
 /// Commit denied: cached failure from previous attempt.
 pub const REASON_COMMIT_CACHED_FAILURE: &str = "cached_failure";
+/// Commit denied: multi-table transactions not supported.
+pub const REASON_COMMIT_MULTI_TABLE: &str = "multi_table_unsupported";
 
 /// Formats a table identifier for audit resource field.
 ///

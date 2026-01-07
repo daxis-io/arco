@@ -36,6 +36,9 @@ use utoipa::OpenApi;
         crate::routes::tables::register_table,
         crate::routes::tables::get_credentials,
         crate::routes::tables::commit_table,
+        crate::routes::tables::report_metrics,
+        crate::routes::catalog::rename_table,
+        crate::routes::catalog::commit_transaction,
     ),
     components(
         schemas(
@@ -71,6 +74,9 @@ use utoipa::OpenApi;
             crate::types::StorageCredential,
             crate::types::CreateTableRequest,
             crate::types::RegisterTableRequest,
+            crate::types::RenameTableRequest,
+            crate::types::CommitTransactionRequest,
+            crate::types::ReportMetricsRequest,
             crate::error::IcebergErrorResponse,
         )
     ),
@@ -78,6 +84,7 @@ use utoipa::OpenApi;
         (name = "Configuration", description = "Catalog configuration endpoint"),
         (name = "Namespaces", description = "Namespace management operations"),
         (name = "Tables", description = "Table management and loading operations"),
+        (name = "Catalog", description = "Catalog-level operations (rename, transactions)"),
     ),
 )]
 pub struct IcebergApiDoc;

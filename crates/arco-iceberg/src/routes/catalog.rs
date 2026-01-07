@@ -153,6 +153,7 @@ async fn rename_table(
     ),
     tag = "Catalog"
 )]
+#[allow(clippy::too_many_lines)]
 #[instrument(skip_all, fields(request_id = %ctx.request_id, tenant = %ctx.tenant, workspace = %ctx.workspace, prefix = %path.prefix))]
 async fn commit_transaction(
     Extension(ctx): Extension<IcebergRequestContext>,
@@ -289,7 +290,7 @@ async fn commit_transaction(
                 let seq = response
                     .metadata
                     .get("last-sequence-number")
-                    .and_then(|v| v.as_i64());
+                    .and_then(serde_json::Value::as_i64);
                 emit_iceberg_commit(
                     emitter,
                     &ctx.tenant,

@@ -629,6 +629,7 @@ async fn head_table(
     ),
     tag = "Tables"
 )]
+#[allow(clippy::too_many_lines)]
 #[instrument(skip_all, fields(request_id = %ctx.request_id, tenant = %ctx.tenant, workspace = %ctx.workspace, prefix = %path.prefix, namespace = %path.namespace, table = %path.table))]
 async fn commit_table(
     Extension(ctx): Extension<IcebergRequestContext>,
@@ -737,7 +738,7 @@ async fn commit_table(
                 let seq = response
                     .metadata
                     .get("last-sequence-number")
-                    .and_then(|v| v.as_i64());
+                    .and_then(serde_json::Value::as_i64);
                 emit_iceberg_commit(
                     emitter,
                     &ctx.tenant,
@@ -1307,17 +1308,14 @@ async fn maybe_vended_credentials(
         });
     }
 
-    let provider = match state.credential_provider.as_ref() {
-        Some(p) => p,
-        None => {
-            if let Some(emitter) = state.audit() {
-                emit_cred_vend_deny(emitter, ctx, &table, REASON_CRED_VEND_DISABLED);
-            }
-            return Err(IcebergError::BadRequest {
-                message: "Credential vending is not enabled".to_string(),
-                error_type: "BadRequestException",
-            });
+    let Some(provider) = state.credential_provider.as_ref() else {
+        if let Some(emitter) = state.audit() {
+            emit_cred_vend_deny(emitter, ctx, &table, REASON_CRED_VEND_DISABLED);
         }
+        return Err(IcebergError::BadRequest {
+            message: "Credential vending is not enabled".to_string(),
+            error_type: "BadRequestException",
+        });
     };
 
     let credentials = match provider

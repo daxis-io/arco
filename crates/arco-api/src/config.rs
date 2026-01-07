@@ -291,6 +291,7 @@ impl IcebergApiConfig {
             allow_table_crud: self.allow_table_crud,
             request_timeout: None,
             concurrency_limit: self.concurrency_limit,
+            allow_multi_table_transactions: false,
         }
     }
 }

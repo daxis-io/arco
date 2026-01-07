@@ -25,9 +25,12 @@ use crate::audit::{
 };
 use crate::commit::{CommitError, CommitService};
 use crate::context::IcebergRequestContext;
+use crate::coordinator::{
+    MultiTableCommitError, MultiTableTransactionCoordinator, TableCommitInput,
+};
 use crate::error::{IcebergError, IcebergResult};
 use crate::idempotency::{IdempotencyMarker, canonical_request_hash};
-use crate::pointer::UpdateSource;
+use crate::pointer::{PointerStoreImpl, UpdateSource};
 use crate::routes::utils::{ensure_prefix, is_iceberg_table, join_namespace};
 use crate::state::{IcebergConfig, IcebergState};
 use crate::types::{CommitTransactionRequest, RenameTableRequest};
@@ -173,12 +176,15 @@ async fn commit_transaction(
 
     if req.table_changes.is_empty() {
         return Err(IcebergError::BadRequest {
-            message: "table-changes must contain exactly one entry".to_string(),
+            message: "table-changes must contain at least one entry".to_string(),
             error_type: "BadRequestException",
         });
     }
 
     if req.table_changes.len() > 1 {
+        if state.config.allow_multi_table_transactions {
+            return handle_multi_table_commit(ctx, state, headers, req).await;
+        }
         if let Some(emitter) = state.audit() {
             let separator = state.config.namespace_separator_decoded();
             for change in &req.table_changes {
@@ -361,6 +367,118 @@ async fn commit_transaction(
             }
             Err(IcebergError::ServiceUnavailable {
                 message: "Commit already in progress".to_string(),
+                retry_after_seconds: Some(seconds),
+            })
+        }
+    }
+}
+
+async fn handle_multi_table_commit(
+    ctx: IcebergRequestContext,
+    state: IcebergState,
+    headers: HeaderMap,
+    req: CommitTransactionRequest,
+) -> IcebergResult<Response> {
+    let tx_id = ctx
+        .idempotency_key
+        .clone()
+        .ok_or_else(|| IcebergError::BadRequest {
+            message: "Missing Idempotency-Key header for multi-table transaction".to_string(),
+            error_type: "BadRequestException",
+        })?;
+
+    IdempotencyMarker::validate_uuidv7(&tx_id)
+        .map_err(|err| IcebergError::invalid_idempotency_key(err.to_string()))?;
+
+    let request_value =
+        serde_json::to_value(&req.table_changes).map_err(|e| IcebergError::Internal {
+            message: format!("Failed to serialize commit request: {e}"),
+        })?;
+    let request_hash =
+        canonical_request_hash(&request_value).map_err(|err| IcebergError::BadRequest {
+            message: format!("Invalid commit request: {err}"),
+            error_type: "BadRequestException",
+        })?;
+
+    let separator = state.config.namespace_separator_decoded();
+    let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
+    let reader = CatalogReader::new(storage.clone());
+
+    let mut table_inputs = Vec::with_capacity(req.table_changes.len());
+    for change in req.table_changes {
+        if let Some(reason) = change.check_guardrails() {
+            return Err(IcebergError::BadRequest {
+                message: reason,
+                error_type: "BadRequestException",
+            });
+        }
+
+        let identifier = change
+            .identifier
+            .clone()
+            .ok_or_else(|| IcebergError::BadRequest {
+                message: "Table identifier is required in table-changes".to_string(),
+                error_type: "BadRequestException",
+            })?;
+
+        let namespace_name = join_namespace(&identifier.namespace, &separator)?;
+        let table = reader
+            .get_table(&namespace_name, &identifier.name)
+            .await
+            .map_err(IcebergError::from)?
+            .filter(|t| is_iceberg_table(t.format.as_deref()))
+            .ok_or_else(|| IcebergError::table_not_found(&namespace_name, &identifier.name))?;
+
+        let table_uuid = uuid::Uuid::parse_str(&table.id).map_err(|_| IcebergError::Internal {
+            message: format!("Invalid table UUID: {}", table.id),
+        })?;
+
+        table_inputs.push(TableCommitInput {
+            table_uuid,
+            namespace: namespace_name,
+            table_name: identifier.name,
+            request: change,
+        });
+    }
+
+    let client_info = headers
+        .get(http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
+    let source = UpdateSource::IcebergRest {
+        client_info,
+        principal: None,
+    };
+
+    let pointer_store = Arc::new(PointerStoreImpl::new(Arc::new(storage.clone())));
+    let coordinator = MultiTableTransactionCoordinator::new(Arc::new(storage), pointer_store);
+
+    match coordinator
+        .commit(
+            tx_id,
+            request_hash,
+            table_inputs,
+            source,
+            &ctx.tenant,
+            &ctx.workspace,
+        )
+        .await
+    {
+        Ok(_result) => Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(axum::body::Body::empty())
+            .map_err(|e| IcebergError::Internal {
+                message: format!("Failed to build response: {e}"),
+            }),
+        Err(MultiTableCommitError::Iceberg(err)) => Err(err),
+        Err(MultiTableCommitError::Aborted { reason }) => Err(IcebergError::Conflict {
+            message: format!("Transaction aborted: {reason}"),
+            error_type: "CommitFailedException",
+        }),
+        Err(MultiTableCommitError::RetryAfter { seconds }) => {
+            Err(IcebergError::ServiceUnavailable {
+                message: "Multi-table transaction in progress".to_string(),
                 retry_after_seconds: Some(seconds),
             })
         }

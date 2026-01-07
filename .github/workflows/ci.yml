@@ -50,8 +50,8 @@ jobs:
       - name: Setup Buf
         uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1
         with:
-          # Pin to a stable version that supports buf.yaml v2 format
           version: '1.47.2'
+          github_token: ${{ github.token }}
       - run: cargo xtask doctor
       - run: cargo xtask adr-check
       - run: cargo xtask verify-integrity
@@ -65,6 +65,8 @@ jobs:
         with:
           toolchain: 1.85
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo check --workspace --all-features
 
   fmt:
@@ -88,6 +90,8 @@ jobs:
           toolchain: 1.85
           components: clippy
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo clippy --workspace --all-features -- -D warnings
 
   test:
@@ -99,6 +103,8 @@ jobs:
         with:
           toolchain: 1.85
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo test --workspace --all-features --exclude arco-flow
       - run: cargo test -p arco-flow --all-features --no-run
       - run: cargo test -p arco-flow --features test-utils
@@ -131,6 +137,8 @@ jobs:
         with:
           toolchain: 1.85
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo doc --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
@@ -144,6 +152,8 @@ jobs:
         with:
           toolchain: 1.85
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo test --doc --workspace
 
   deny:
@@ -190,8 +200,8 @@ jobs:
       - name: Setup Buf
         uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1
         with:
-          # Pin to a stable version that supports buf.yaml v2 format
           version: '1.47.2'
+          github_token: ${{ github.token }}
 
       - name: Lint protos
         run: buf lint proto/
@@ -221,6 +231,8 @@ jobs:
         with:
           toolchain: 1.85
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Authenticate to GCP (API SA)
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v2

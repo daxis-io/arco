@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security Vulnerability
+    url: https://github.com/daxis-io/arco/security/advisories/new
+    about: Report security vulnerabilities privately via GitHub Security Advisories
+  - name: Questions & Discussions
+    url: https://github.com/daxis-io/arco/discussions
+    about: Ask questions or start discussions about Arco

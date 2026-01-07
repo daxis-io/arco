@@ -30,7 +30,9 @@ pub fn iceberg_router(state: IcebergState) -> Router {
         .route("/v1/config", axum::routing::get(routes::config::get_config))
         .nest(
             "/v1/:prefix",
-            routes::namespaces::routes().merge(routes::tables::routes()),
+            routes::namespaces::routes()
+                .merge(routes::tables::routes())
+                .merge(routes::catalog::routes()),
         )
         .layer(middleware::from_fn(context_middleware))
         .layer(middleware::from_fn(metrics_middleware))

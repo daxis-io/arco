@@ -6,6 +6,7 @@
 //! - `GET /v1/{prefix}/namespaces/{namespace}/tables/{table}` - Load table
 //! - `POST /v1/{prefix}/namespaces/{namespace}/tables/{table}` - Commit table updates
 //! - `GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials` - Get credentials
+//! - `POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics` - Report metrics (ICE-8)
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,13 +37,15 @@ use crate::idempotency::{IdempotencyMarker, canonical_request_hash};
 use crate::paths::resolve_metadata_path;
 use crate::pointer::IcebergTablePointer;
 use crate::pointer::UpdateSource;
-use crate::routes::utils::{ensure_prefix, join_namespace, paginate, parse_namespace};
+use crate::routes::utils::{
+    ensure_prefix, is_iceberg_table, join_namespace, paginate, parse_namespace,
+};
 use crate::state::{CredentialRequest, IcebergState, TableInfo};
 use crate::types::{
     AccessDelegation, CommitTableRequest, CommitTableResponse, CreateTableRequest,
     CredentialsQuery, DropTableQuery, ListTablesQuery, ListTablesResponse, LoadTableQuery,
-    LoadTableResponse, RegisterTableRequest, SnapshotsFilter, TableCredentialsResponse, TableIdent,
-    TableMetadata,
+    LoadTableResponse, RegisterTableRequest, ReportMetricsRequest, SnapshotsFilter,
+    TableCredentialsResponse, TableIdent, TableMetadata,
 };
 
 /// Creates table routes.
@@ -62,6 +65,10 @@ pub fn routes() -> Router<IcebergState> {
         .route(
             "/namespaces/:namespace/tables/:table/credentials",
             get(get_credentials),
+        )
+        .route(
+            "/namespaces/:namespace/tables/:table/metrics",
+            axum::routing::post(report_metrics),
         )
         .route(
             "/namespaces/:namespace/register",
@@ -622,6 +629,7 @@ async fn head_table(
     ),
     tag = "Tables"
 )]
+#[allow(clippy::too_many_lines)]
 #[instrument(skip_all, fields(request_id = %ctx.request_id, tenant = %ctx.tenant, workspace = %ctx.workspace, prefix = %path.prefix, namespace = %path.namespace, table = %path.table))]
 async fn commit_table(
     Extension(ctx): Extension<IcebergRequestContext>,
@@ -730,7 +738,7 @@ async fn commit_table(
                 let seq = response
                     .metadata
                     .get("last-sequence-number")
-                    .and_then(|v| v.as_i64());
+                    .and_then(serde_json::Value::as_i64);
                 emit_iceberg_commit(
                     emitter,
                     &ctx.tenant,
@@ -968,6 +976,68 @@ async fn get_credentials(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics",
+    params(
+        ("prefix" = String, Path, description = "Catalog prefix"),
+        ("namespace" = String, Path, description = "Namespace name"),
+        ("table" = String, Path, description = "Table name"),
+    ),
+    request_body = ReportMetricsRequest,
+    responses(
+        (status = 204, description = "Metrics reported"),
+        (status = 400, description = "Bad request", body = crate::error::IcebergErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::error::IcebergErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::error::IcebergErrorResponse),
+        (status = 404, description = "Table not found", body = crate::error::IcebergErrorResponse),
+        (status = 419, description = "Authentication timeout", body = crate::error::IcebergErrorResponse),
+        (status = 503, description = "Service unavailable", body = crate::error::IcebergErrorResponse),
+        (status = 500, description = "Internal error", body = crate::error::IcebergErrorResponse),
+    ),
+    tag = "Tables"
+)]
+#[instrument(skip_all, fields(request_id = %ctx.request_id, tenant = %ctx.tenant, workspace = %ctx.workspace, prefix = %path.prefix, namespace = %path.namespace, table = %path.table))]
+async fn report_metrics(
+    Extension(ctx): Extension<IcebergRequestContext>,
+    State(state): State<IcebergState>,
+    Path(path): Path<TablePath>,
+    Json(req): Json<ReportMetricsRequest>,
+) -> IcebergResult<Response> {
+    ensure_prefix(&path.prefix, &state.config)?;
+
+    if req.report_type != "scan-report" && req.report_type != "commit-report" {
+        return Err(IcebergError::BadRequest {
+            message: format!(
+                "Invalid report-type '{}'; expected 'scan-report' or 'commit-report'",
+                req.report_type
+            ),
+            error_type: "BadRequestException",
+        });
+    }
+
+    let separator = state.config.namespace_separator_decoded();
+    let namespace_ident = parse_namespace(&path.namespace, &separator)?;
+    let namespace_name = join_namespace(&namespace_ident, &separator)?;
+
+    let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
+    let reader = CatalogReader::new(storage);
+
+    reader
+        .get_table(&namespace_name, &path.table)
+        .await
+        .map_err(IcebergError::from)?
+        .filter(|table| is_iceberg_table(table.format.as_deref()))
+        .ok_or_else(|| IcebergError::table_not_found(&namespace_name, &path.table))?;
+
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(axum::body::Body::empty())
+        .map_err(|e| IcebergError::Internal {
+            message: format!("Failed to build response: {e}"),
+        })
+}
+
 /// Register an existing Iceberg table with the catalog.
 ///
 /// This endpoint creates a new metadata file with the catalog-assigned UUID,
@@ -1185,10 +1255,6 @@ async fn register_table(
     Ok(Json(response).into_response())
 }
 
-fn is_iceberg_table(format: Option<&str>) -> bool {
-    format.is_some_and(|value| value.eq_ignore_ascii_case("iceberg"))
-}
-
 fn ensure_table_crud_enabled(config: &crate::state::IcebergConfig) -> IcebergResult<()> {
     if !config.allow_table_crud {
         return Err(IcebergError::unsupported_operation(
@@ -1242,17 +1308,14 @@ async fn maybe_vended_credentials(
         });
     }
 
-    let provider = match state.credential_provider.as_ref() {
-        Some(p) => p,
-        None => {
-            if let Some(emitter) = state.audit() {
-                emit_cred_vend_deny(emitter, ctx, &table, REASON_CRED_VEND_DISABLED);
-            }
-            return Err(IcebergError::BadRequest {
-                message: "Credential vending is not enabled".to_string(),
-                error_type: "BadRequestException",
-            });
+    let Some(provider) = state.credential_provider.as_ref() else {
+        if let Some(emitter) = state.audit() {
+            emit_cred_vend_deny(emitter, ctx, &table, REASON_CRED_VEND_DISABLED);
         }
+        return Err(IcebergError::BadRequest {
+            message: "Credential vending is not enabled".to_string(),
+            error_type: "BadRequestException",
+        });
     };
 
     let credentials = match provider
@@ -2491,5 +2554,99 @@ mod tests {
             objects[0].as_str(),
             "warehouse/imported/metadata/v1.metadata.json"
         );
+    }
+
+    #[tokio::test]
+    async fn test_report_metrics_returns_204_for_existing_table() {
+        let state = build_state();
+        seed_table(&state, "sales", "orders").await;
+
+        let app = app(state);
+        let req_body = serde_json::json!({
+            "report-type": "scan-report",
+            "table-name": "sales.orders",
+            "snapshot-id": 123456789,
+            "filter": {"type": "true"},
+            "schema-id": 0,
+            "projected-field-ids": [1],
+            "projected-field-names": ["id"],
+            "metrics": {}
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/sales/tables/orders/metrics")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&req_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_report_metrics_returns_404_for_missing_table() {
+        let state = build_state();
+        seed_namespace_only(&state, "sales").await;
+
+        let app = app(state);
+        let req_body = serde_json::json!({
+            "report-type": "scan-report",
+            "table-name": "sales.missing",
+            "snapshot-id": 123456789,
+            "metrics": {}
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/sales/tables/missing/metrics")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&req_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_report_metrics_rejects_invalid_report_type() {
+        let state = build_state();
+        seed_table(&state, "sales", "orders").await;
+
+        let app = app(state);
+        let req_body = serde_json::json!({
+            "report-type": "invalid-type",
+            "table-name": "sales.orders",
+            "snapshot-id": 123456789,
+            "metrics": {}
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/sales/tables/orders/metrics")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&req_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

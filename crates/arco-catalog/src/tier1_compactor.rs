@@ -680,7 +680,7 @@ async fn read_lineage_event(
     Ok(envelope.payload)
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::indexing_slicing)]
 fn apply_catalog_event(
     state: &mut crate::state::CatalogState,
     event: CatalogDdlEvent,
@@ -836,6 +836,60 @@ fn apply_catalog_event(
             }
             state.tables.remove(index);
             state.columns.retain(|c| c.table_id != table_id);
+        }
+        CatalogDdlEvent::TableRenamed {
+            table_id,
+            namespace_id,
+            old_name,
+            new_name,
+            updated_at,
+        } => {
+            let table_idx = state
+                .tables
+                .iter()
+                .position(|t| t.id == table_id)
+                .ok_or_else(|| Tier1CompactionError::ProcessingError {
+                    message: format!("table '{table_id}' not found for rename"),
+                })?;
+
+            let existing = &state.tables[table_idx];
+
+            if existing.namespace_id != namespace_id {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!(
+                        "namespace mismatch for table {table_id}: expected {}, got {namespace_id}",
+                        existing.namespace_id
+                    ),
+                });
+            }
+
+            if existing.name != old_name {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!(
+                        "table name mismatch for {table_id}: expected '{}', got '{old_name}'",
+                        existing.name
+                    ),
+                });
+            }
+
+            if existing.name == new_name {
+                return Ok(());
+            }
+
+            if state
+                .tables
+                .iter()
+                .any(|t| t.namespace_id == namespace_id && t.name == new_name)
+            {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!(
+                        "table '{new_name}' already exists in namespace {namespace_id}"
+                    ),
+                });
+            }
+
+            state.tables[table_idx].name.clone_from(&new_name);
+            state.tables[table_idx].updated_at = updated_at;
         }
     }
 

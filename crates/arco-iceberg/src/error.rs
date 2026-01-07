@@ -296,6 +296,9 @@ impl From<CatalogError> for IcebergError {
             CatalogError::Serialization { message }
             | CatalogError::Parquet { message }
             | CatalogError::InvariantViolation { message } => Self::Internal { message },
+            CatalogError::UnsupportedOperation { message } => {
+                Self::UnsupportedOperation { message }
+            }
         }
     }
 }

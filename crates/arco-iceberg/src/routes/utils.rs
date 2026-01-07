@@ -48,6 +48,11 @@ pub fn join_namespace(ident: &[String], separator: &str) -> IcebergResult<String
     Ok(ident.join(separator))
 }
 
+/// Checks if a table format string indicates an Iceberg table.
+pub fn is_iceberg_table(format: Option<&str>) -> bool {
+    format.is_some_and(|f| f.eq_ignore_ascii_case("iceberg"))
+}
+
 /// Applies page token and size to a vector of items.
 pub fn paginate<T>(
     mut items: Vec<T>,

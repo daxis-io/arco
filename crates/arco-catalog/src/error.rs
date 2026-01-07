@@ -76,6 +76,13 @@ pub enum CatalogError {
         /// Description of the invariant violation.
         message: String,
     },
+
+    /// The requested operation is not supported.
+    #[error("unsupported operation: {message}")]
+    UnsupportedOperation {
+        /// Description of why the operation is not supported.
+        message: String,
+    },
 }
 
 impl CatalogError {
@@ -95,6 +102,7 @@ impl CatalogError {
             Self::AlreadyExists { .. } | Self::CasFailed { .. } => Some(409),
             Self::NotFound { .. } => Some(404),
             Self::PreconditionFailed { .. } => Some(412),
+            Self::UnsupportedOperation { .. } => Some(406),
             Self::Storage { .. }
             | Self::Serialization { .. }
             | Self::Parquet { .. }

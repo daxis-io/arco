@@ -97,6 +97,11 @@ impl ApiError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", message)
     }
 
+    /// Returns an error response for unsupported operations (406).
+    pub fn not_acceptable(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_ACCEPTABLE, "NOT_ACCEPTABLE", message)
+    }
+
     /// Returns a not implemented error response.
     pub fn not_implemented(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_IMPLEMENTED, "NOT_IMPLEMENTED", message)
@@ -223,6 +228,7 @@ impl From<CatalogError> for ApiError {
             | CatalogError::Serialization { message }
             | CatalogError::Parquet { message }
             | CatalogError::InvariantViolation { message } => Self::internal(message),
+            CatalogError::UnsupportedOperation { message } => Self::not_acceptable(message),
         }
     }
 }

@@ -2,7 +2,7 @@
 
 > **⚠️ HISTORICAL SNAPSHOT**: This prompt was generated to drive the P0 gap closure work.
 > The gaps listed here have been **resolved**. Claim counts below reflect the pre-fix state.
-> For current status, see `2026-01-06-traceability-matrix.md` (38 Implemented, 7 Partial, 6 Missing).
+> For current status, see `2026-01-06-traceability-matrix.md` (40 Implemented, 8 Partial, 3 Missing).
 
 **Generated**: 2026-01-06  
 **Reference Docs**:
@@ -86,16 +86,23 @@ I have a comprehensive audit of our Security/Ops P0 and Iceberg Parity P0 implem
 
 **Fix**: Extract the embedded script (from `docs/runbooks/iam-list-semantics-verification.md:41`) into `docs/runbooks/iam-list-verify.sh` and make it executable.
 
-### 6. Missing Iceberg endpoints (ICE-6, ICE-7, ICE-8) — MISSING
+### 6. Missing Iceberg endpoints (ICE-6, ICE-7, ICE-8) — ~~MISSING~~ **RESOLVED**
 
-These are P0/P1 boundary. The current router at `crates/arco-iceberg/src/router.rs:31` is limited to namespaces+tables.
+> **Resolution (2026-01-07)**:
+> - **ICE-6 (rename)**: Implemented at `crates/arco-iceberg/src/routes/catalog.rs:59`. Advertised in `/v1/config` when `allow_table_crud` enabled. Within-namespace only; cross-namespace returns 406.
+> - **ICE-7 (transactions)**: Partial — single-table bridge at `crates/arco-iceberg/src/routes/catalog.rs:132`. NOT advertised in `/v1/config` (interop bridge only). Multi-table atomic commit remains backlog.
+> - **ICE-8 (metrics)**: Implemented at `crates/arco-iceberg/src/routes/tables.rs:999`. Uses official table-scoped path `POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics` (not the catalog-level path shown below). Always advertised.
+>
+> See `2026-01-06-traceability-matrix.md` ICE-6/7/8 rows for authoritative current status.
 
-**Missing per Iceberg REST spec**:
-- `POST /v1/{prefix}/tables/rename` — Table rename endpoint (ICE-6)
-- `POST /v1/{prefix}/transactions/commit` — Multi-table atomic commit (ICE-7)
-- `POST /v1/{prefix}/metrics` — Client metrics reporting (ICE-8, P1)
+These ~~are~~ were P0/P1 boundary. The ~~current~~ router at `crates/arco-iceberg/src/router.rs:31` ~~is limited to namespaces+tables~~ now includes catalog-level routes.
 
-**Note**: `/v1/config` at `crates/arco-iceberg/src/types/config.rs:44` is currently truthful (doesn't advertise these). After implementing, update config to advertise them.
+**~~Missing~~ Originally missing per Iceberg REST spec** (historical reference):
+- `POST /v1/{prefix}/tables/rename` — Table rename endpoint (ICE-6) ✅
+- `POST /v1/{prefix}/transactions/commit` — Multi-table atomic commit (ICE-7) ⚠️ single-table only
+- `POST /v1/{prefix}/metrics` — Client metrics reporting (ICE-8, P1) ✅ (note: actual path is table-scoped)
+
+**Note**: `/v1/config` at `crates/arco-iceberg/src/types/config.rs:44` ~~is currently truthful (doesn't advertise these). After implementing, update config to advertise them.~~ now advertises rename (when enabled) and metrics (always); transactions/commit is intentionally NOT advertised.
 
 ---
 
@@ -155,9 +162,9 @@ For each fix, add appropriate unit tests. Mark the corresponding items in the tr
 | MET-5 | Tenant label in metrics | `crates/arco-flow/src/metrics.rs` | ~95, ~142 |
 | MET-5 | Tenant label in callbacks | `crates/arco-flow/src/orchestration/callbacks/handlers.rs` | ~109 |
 | IAM-4 | Runbook script extraction | `docs/runbooks/iam-list-semantics-verification.md` | ~41, ~175 |
-| ICE-6 | Table rename endpoint | `crates/arco-iceberg/src/router.rs` | ~31 |
-| ICE-7 | Transactions commit endpoint | `crates/arco-iceberg/src/router.rs` | ~31 |
-| ICE-8 | Metrics endpoint | `crates/arco-iceberg/src/router.rs` | ~31 |
+| ICE-6 | Table rename endpoint | `crates/arco-iceberg/src/routes/catalog.rs` | 59 | ✅ Implemented |
+| ICE-7 | Transactions commit endpoint | `crates/arco-iceberg/src/routes/catalog.rs` | 132 | ⚠️ Partial (single-table) |
+| ICE-8 | Metrics endpoint | `crates/arco-iceberg/src/routes/tables.rs` | 999 | ✅ Implemented |
 
 ---
 

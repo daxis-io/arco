@@ -52,6 +52,19 @@ pub enum CatalogDdlEvent {
         /// Name of the table (for verification).
         table_name: String,
     },
+    /// Rename a table within the same namespace.
+    TableRenamed {
+        /// ID of the table to rename.
+        table_id: String,
+        /// Namespace ID (must match existing table).
+        namespace_id: String,
+        /// Current name of the table (for verification).
+        old_name: String,
+        /// New name for the table.
+        new_name: String,
+        /// Updated timestamp in milliseconds.
+        updated_at: i64,
+    },
 }
 
 impl CatalogEventPayload for CatalogDdlEvent {

@@ -87,6 +87,12 @@ fn test_openapi_paths_align_with_official_spec() {
             "/v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials",
             "get",
         ),
+        ("/v1/{prefix}/tables/rename", "post"),
+        (
+            "/v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics",
+            "post",
+        ),
+        ("/v1/{prefix}/transactions/commit", "post"),
     ];
 
     for (path, method) in endpoints {

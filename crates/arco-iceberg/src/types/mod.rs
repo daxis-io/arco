@@ -6,6 +6,7 @@ pub mod commit;
 mod config;
 mod credentials;
 mod ids;
+mod metrics;
 mod namespace;
 mod table;
 
@@ -13,5 +14,6 @@ pub use commit::*;
 pub use config::*;
 pub use credentials::*;
 pub use ids::*;
+pub use metrics::*;
 pub use namespace::*;
 pub use table::*;

@@ -64,12 +64,15 @@
 
 ## Iceberg Parity P0 Status
 
-### 2.1 Missing endpoints + semantics: Partial
+### 2.1 Missing endpoints + semantics: ~~Partial~~ **Implemented** (updated 2026-01-07)
+
+> **Update 2026-01-07**: ICE-6 (rename), ICE-8 (metrics) now implemented. ICE-7 (transactions) partial (single-table bridge).
+> See `2026-01-06-traceability-matrix.md` ICE rows for authoritative status.
 
 - **Implemented + routed**: namespaces CRUD/properties and tables create/drop/register/commit/credentials (see route wiring `crates/arco-iceberg/src/routes/namespaces.rs:40` and `crates/arco-iceberg/src/routes/tables.rs:41`).
-- `/v1/config` capability advertisement is "truthful" and config-driven: `crates/arco-iceberg/src/types/config.rs:44` (note it does not advertise rename/transactions/metrics).
+- `/v1/config` capability advertisement is "truthful" and config-driven: `crates/arco-iceberg/src/types/config.rs:44`. ~~(note it does not advertise rename/transactions/metrics)~~ Now advertises rename (when enabled) and metrics (always); transactions NOT advertised (interop bridge only).
 - `purgeRequested` behavior is minimal-but-correct (rejects purge): `crates/arco-iceberg/src/routes/tables.rs:764`.
-- **Still missing vs Iceberg spec checklist**: table rename (`POST /v1/{prefix}/tables/rename`), metrics reporting endpoint(s), and transactions commit (`POST /v1/{prefix}/transactions/commit`) (per spec from the librarian agent; and none of these appear in the current routing surfaces above).
+- ~~**Still missing vs Iceberg spec checklist**: table rename, metrics reporting, and transactions commit.~~ **Now implemented**: rename (`crates/arco-iceberg/src/routes/catalog.rs:59`), metrics (`crates/arco-iceberg/src/routes/tables.rs:999`), transactions single-table bridge (`crates/arco-iceberg/src/routes/catalog.rs:132`).
 
 ### 2.2 Parameter correctness + OpenAPI alignment: Partial
 

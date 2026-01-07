@@ -369,6 +369,29 @@ pub struct CommitTableResponse {
     pub metadata: serde_json::Value,
 }
 
+/// Request body for `POST /v1/{prefix}/transactions/commit`.
+///
+/// Commits changes to multiple tables atomically.
+///
+/// # Arco Implementation
+///
+/// Arco only supports single-table commits through this endpoint. Requests with
+/// more than one table change will return 406 Not Acceptable. This endpoint is
+/// **not advertised** in `/v1/config` because true multi-table atomicity is not
+/// supported.
+///
+/// Single-table requests are delegated to the same commit logic as the
+/// per-table commit endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CommitTransactionRequest {
+    /// Table changes to commit atomically.
+    ///
+    /// Each entry must include an `identifier` field. Arco requires exactly
+    /// one entry; multiple entries will be rejected with 406.
+    #[serde(rename = "table-changes")]
+    pub table_changes: Vec<CommitTableRequest>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

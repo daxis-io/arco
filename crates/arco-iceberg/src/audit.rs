@@ -33,6 +33,8 @@ pub const REASON_COMMIT_INTERNAL_ERROR: &str = "internal_error";
 pub const REASON_COMMIT_IN_PROGRESS: &str = "commit_in_progress";
 /// Commit denied: cached failure from previous attempt.
 pub const REASON_COMMIT_CACHED_FAILURE: &str = "cached_failure";
+/// Commit denied: multi-table transactions not supported.
+pub const REASON_COMMIT_MULTI_TABLE: &str = "multi_table_unsupported";
 
 /// Formats a table identifier for audit resource field.
 ///
@@ -62,7 +64,7 @@ fn format_commit_resource(namespace: &str, table: &str, sequence_number: Option<
 /// # Arguments
 ///
 /// * `emitter` - The audit emitter to use
-/// * `ctx` - Request context with tenant, workspace, and request_id
+/// * `ctx` - Request context with tenant, workspace, and `request_id`
 /// * `table` - Table info for which credentials were vended
 pub fn emit_cred_vend_allow(
     emitter: &AuditEmitter,
@@ -90,9 +92,9 @@ pub fn emit_cred_vend_allow(
 /// # Arguments
 ///
 /// * `emitter` - The audit emitter to use
-/// * `ctx` - Request context with tenant, workspace, and request_id
+/// * `ctx` - Request context with tenant, workspace, and `request_id`
 /// * `table` - Table info for which credentials were denied
-/// * `reason` - Reason for denial (use REASON_CRED_VEND_* constants)
+/// * `reason` - Reason for denial (use `REASON_CRED_VEND_*` constants)
 pub fn emit_cred_vend_deny(
     emitter: &AuditEmitter,
     ctx: &IcebergRequestContext,
@@ -161,7 +163,7 @@ pub fn emit_iceberg_commit(
 /// * `request_id` - Request ID for correlation
 /// * `namespace` - Table namespace
 /// * `table` - Table name
-/// * `reason` - Reason for denial (use REASON_COMMIT_* constants)
+/// * `reason` - Reason for denial (use `REASON_COMMIT_*` constants)
 pub fn emit_iceberg_commit_deny(
     emitter: &AuditEmitter,
     tenant: &str,

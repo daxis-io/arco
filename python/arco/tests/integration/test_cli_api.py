@@ -271,10 +271,11 @@ def test_cli_deploy_hits_api(
     api_server: dict[str, Any],
     arco_flow_env: None,
     project_with_assets: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = CliRunner()
-    with runner.isolated_filesystem(temp_dir=project_with_assets):
-        result = runner.invoke(app, ["deploy"])
+    monkeypatch.chdir(project_with_assets)
+    result = runner.invoke(app, ["deploy"])
     assert result.exit_code == 0
 
     deploy_request = _find_request(

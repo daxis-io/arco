@@ -97,12 +97,12 @@
 |----------|-------|--------|----------|--------------|
 | ICE-1 | Iceberg router exposes only /openapi.json, /v1/config, and /v1/:prefix (namespaces + tables) | Implemented | `crates/arco-iceberg/src/router.rs:25`; `crates/arco-iceberg/src/router.rs:31` | Supports the "truthful capabilities" approach. |
 | ICE-2 | Namespace CRUD + properties endpoints exist (gated by config) | Implemented | Route surface: `crates/arco-iceberg/src/routes/namespaces.rs:40`; properties route `crates/arco-iceberg/src/routes/namespaces.rs:47` | Gating uses `allow_namespace_crud` (see file for checks). |
-| ICE-3 | Table create/drop/register/commit + credentials endpoints exist | Implemented | Route surface: `crates/arco-iceberg/src/routes/tables.rs:44`; credentials route `crates/arco-iceberg/src/routes/tables.rs:55`; register route `crates/arco-iceberg/src/routes/tables.rs:58` | Rename/transactions/metrics still missing. |
-| ICE-4 | /v1/config advertises supported endpoints based on enabled features/flags | Implemented | `crates/arco-iceberg/src/types/config.rs:44`; `crates/arco-iceberg/src/routes/config.rs:35` | Currently does not advertise rename/transactions/metrics. |
+| ICE-3 | Table create/drop/register/commit + credentials endpoints exist | Implemented | Route surface: `crates/arco-iceberg/src/routes/tables.rs:44`; credentials route `crates/arco-iceberg/src/routes/tables.rs:55`; register route `crates/arco-iceberg/src/routes/tables.rs:58` | Rename/metrics now implemented; transactions partial (single-table bridge). |
+| ICE-4 | /v1/config advertises supported endpoints based on enabled features/flags | Implemented | `crates/arco-iceberg/src/types/config.rs:44`; `crates/arco-iceberg/src/routes/config.rs:35` | Rename advertised when `allow_table_crud`; metrics always advertised; transactions NOT advertised (interop bridge only). |
 | ICE-5 | purgeRequested=true is handled (rejected with unsupported operation) | Implemented | `crates/arco-iceberg/src/routes/tables.rs:764` | Minimal-but-correct "purge not supported" stance. |
-| ICE-6 | Table rename endpoint exists (POST /v1/{prefix}/tables/rename) | Missing | Router limited to namespaces+tables: `crates/arco-iceberg/src/router.rs:31` | Spec requires it; not currently routed/implemented. |
-| ICE-7 | Multi-table transaction commit endpoint exists (POST /v1/{prefix}/transactions/commit) | Missing | Router limited to namespaces+tables: `crates/arco-iceberg/src/router.rs:31` | Spec requires it; not currently routed/implemented. |
-| ICE-8 | Metrics reporting endpoint exists (Iceberg REST "report metrics") | Missing | Router limited to namespaces+tables: `crates/arco-iceberg/src/router.rs:31` | Spec requires it; not currently routed/implemented. |
+| ICE-6 | Table rename endpoint exists (POST /v1/{prefix}/tables/rename) | Implemented | Router merges catalog routes: `crates/arco-iceberg/src/router.rs:31`; Handler: `crates/arco-iceberg/src/routes/catalog.rs:59`; Advertised when `allow_table_crud`: `crates/arco-iceberg/src/types/config.rs:74`; Tests: `crates/arco-iceberg/src/routes/catalog.rs:415` | Within-namespace rename supported; cross-namespace returns 406. |
+| ICE-7 | Multi-table transaction commit endpoint exists (POST /v1/{prefix}/transactions/commit) | Partial | Handler: `crates/arco-iceberg/src/routes/catalog.rs:132`; Single-table enforcement: `crates/arco-iceberg/src/routes/catalog.rs:180`; NOT advertised in `/v1/config`: `crates/arco-iceberg/src/types/config.rs:44`; Tests: `crates/arco-iceberg/tests/commit_flow.rs:307` | Single-table bridge only; multi-table atomic commit remains backlog. Endpoint exists but not advertised (interop bridge). |
+| ICE-8 | Metrics reporting endpoint exists (POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics) | Implemented | Handler: `crates/arco-iceberg/src/routes/tables.rs:999`; Route: `crates/arco-iceberg/src/routes/tables.rs:66`; Advertised: `crates/arco-iceberg/src/types/config.rs:53`; Tests: `crates/arco-iceberg/src/routes/tables.rs:2561` | Fire-and-forget 204; validates report-type. Uses official table-scoped spec path. |
 
 ### 2.2 Params correctness + OpenAPI alignment
 
@@ -149,11 +149,11 @@
 | 1.4 Audit events | 6 | 0 | 0 | 6 |
 | 1.5 Terraform PAP | 2 | 0 | 0 | 2 |
 | 1.6 IAM list semantics | 4 | 0 | 0 | 4 |
-| 2.1 Iceberg endpoints | 5 | 0 | 3 | 8 |
+| 2.1 Iceberg endpoints | 7 | 1 | 0 | 8 |
 | 2.2 OpenAPI alignment | 2 | 2 | 0 | 4 |
 | 3) Credential vending | 5 | 0 | 0 | 5 |
 | 4) Engine interop | 1 | 1 | 2 | 4 |
-| **TOTAL** | **38** | **7** | **6** | **51** |
+| **TOTAL** | **40** | **8** | **3** | **51** |
 
 ---
 
@@ -161,7 +161,8 @@
 
 | Gap | Evidence | Priority | Status |
 |-----|----------|----------|--------|
-| Iceberg REST parity gaps: rename / metrics reporting / transactions commit | Router limitations `crates/arco-iceberg/src/router.rs:25` | P0 | Open |
+| ~~Iceberg REST parity gaps: rename / metrics reporting~~ | `crates/arco-iceberg/src/routes/catalog.rs:59`, `crates/arco-iceberg/src/routes/tables.rs:999` | ~~P0~~ | **Closed** |
+| Iceberg REST: multi-table atomic transactions | `crates/arco-iceberg/src/routes/catalog.rs:180` (single-table bridge only) | P1 | Partial (bridge exists, multi-table backlog) |
 | OpenAPI/runtime mismatches: pagination token numeric | `crates/arco-iceberg/src/routes/utils.rs:57` | P1 | Open |
 | IAM list semantics: runbook exists but execution evidence missing | `docs/catalog-metastore/evidence/security-ops-evidence-pack.md:154` | P1 | Open |
 | JWKS explicitly backlog / not wired | `docs/catalog-metastore/evidence/plan-deltas.md:234`; `crates/arco-api/src/lib.rs:52` | Backlog | Deferred |
@@ -174,4 +175,5 @@
 ---
 
 *Generated 2026-01-06 by automated audit*  
-*Updated 2026-01-06: AUD-5, AUD-6, OAS-3, MET-5, IAM-4 verified as Implemented; CRED-5 verified as Implemented*
+*Updated 2026-01-06: AUD-5, AUD-6, OAS-3, MET-5, IAM-4 verified as Implemented; CRED-5 verified as Implemented*  
+*Updated 2026-01-07: ICE-6 (rename), ICE-8 (metrics) verified as Implemented; ICE-7 (transactions) verified as Partial (single-table bridge)*

@@ -80,6 +80,10 @@ impl ConfigResponse {
             ]);
         }
 
+        if config.allow_write && config.allow_multi_table_transactions {
+            endpoints.push("POST /v1/{prefix}/transactions/commit".to_string());
+        }
+
         Self {
             defaults: HashMap::new(),
             overrides: HashMap::from([
@@ -236,13 +240,36 @@ mod tests {
     }
 
     #[test]
-    fn test_transactions_commit_not_advertised() {
-        let mut config = IcebergConfig::default();
-        config.allow_table_crud = true;
-        config.allow_write = true;
+    fn test_transactions_commit_not_advertised_by_default() {
+        let config = IcebergConfig::default();
         let response = ConfigResponse::from_config(&config, false);
         let endpoints = response.endpoints.expect("endpoints should be present");
 
         assert!(!endpoints.contains(&"POST /v1/{prefix}/transactions/commit".to_string()));
+    }
+
+    #[test]
+    fn test_transactions_commit_not_advertised_without_write() {
+        let mut config = IcebergConfig::default();
+        config.allow_multi_table_transactions = true;
+        config.allow_write = false;
+        let response = ConfigResponse::from_config(&config, false);
+        let endpoints = response.endpoints.expect("endpoints should be present");
+
+        assert!(
+            !endpoints.contains(&"POST /v1/{prefix}/transactions/commit".to_string()),
+            "transactions/commit requires allow_write=true"
+        );
+    }
+
+    #[test]
+    fn test_transactions_commit_advertised_when_both_flags_enabled() {
+        let mut config = IcebergConfig::default();
+        config.allow_write = true;
+        config.allow_multi_table_transactions = true;
+        let response = ConfigResponse::from_config(&config, false);
+        let endpoints = response.endpoints.expect("endpoints should be present");
+
+        assert!(endpoints.contains(&"POST /v1/{prefix}/transactions/commit".to_string()));
     }
 }

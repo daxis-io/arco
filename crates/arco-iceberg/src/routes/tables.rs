@@ -35,12 +35,12 @@ use crate::context::IcebergRequestContext;
 use crate::error::{IcebergError, IcebergResult};
 use crate::idempotency::{IdempotencyMarker, canonical_request_hash};
 use crate::paths::resolve_metadata_path;
-use crate::pointer::IcebergTablePointer;
-use crate::pointer::UpdateSource;
+use crate::pointer::{IcebergTablePointer, UpdateSource, resolve_effective_metadata_location};
 use crate::routes::utils::{
     ensure_prefix, is_iceberg_table, join_namespace, paginate, parse_namespace,
 };
 use crate::state::{CredentialRequest, IcebergState, TableInfo};
+use crate::transactions::TransactionStoreImpl;
 use crate::types::{
     AccessDelegation, CommitTableRequest, CommitTableResponse, CreateTableRequest,
     CredentialsQuery, DropTableQuery, ListTablesQuery, ListTablesResponse, LoadTableQuery,
@@ -480,11 +480,11 @@ async fn load_table(
             message: err.to_string(),
         })?;
 
-    let metadata_path = resolve_metadata_path(
-        &pointer.current_metadata_location,
-        &ctx.tenant,
-        &ctx.workspace,
-    )?;
+    let tx_store = TransactionStoreImpl::new(Arc::new(storage.clone()));
+    let effective = resolve_effective_metadata_location(&pointer, &tx_store).await?;
+
+    let metadata_path =
+        resolve_metadata_path(&effective.metadata_location, &ctx.tenant, &ctx.workspace)?;
     let metadata_bytes =
         storage
             .get_raw(&metadata_path)
@@ -534,7 +534,7 @@ async fn load_table(
     }
 
     let response = LoadTableResponse {
-        metadata_location: pointer.current_metadata_location,
+        metadata_location: effective.metadata_location,
         metadata,
         config,
         storage_credentials,

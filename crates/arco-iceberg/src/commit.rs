@@ -20,7 +20,11 @@ use crate::metrics;
 use crate::paths::resolve_metadata_path;
 use crate::pointer::{
     CasResult, IcebergTablePointer, PointerStore, PointerStoreImpl, SnapshotRef, SnapshotRefType,
-    UpdateSource,
+    UpdateSource, resolve_effective_metadata_location,
+};
+use crate::transactions::{
+    DEFAULT_TRANSACTION_TIMEOUT, TransactionCasResult, TransactionStatus, TransactionStore,
+    TransactionStoreImpl,
 };
 use crate::types::commit::{
     CommitTableRequest, CommitTableResponse, SnapshotRefType as UpdateSnapshotRefType, TableUpdate,
@@ -137,7 +141,12 @@ const MAX_TAKEOVER_ATTEMPTS: usize = 3;
 const COMMIT_ENDPOINT: &str = "/v1/{prefix}/namespaces/{namespace}/tables/{table}";
 const COMMIT_METHOD: &str = "POST";
 
-/// Commit flow error that may carry a cached error response.
+enum PendingHandleAction {
+    Retry,
+    RetryAfter { seconds: u32 },
+}
+
+/// Error returned from commit operations that may carry cached failure state.
 #[derive(Debug)]
 pub enum CommitError {
     /// Standard Iceberg error response.
@@ -202,8 +211,9 @@ impl<S: StorageBackend> CommitService<S> {
         let idempotency_store = IdempotencyStoreImpl::new(Arc::clone(&self.storage));
         let idempotency_key_hash = IdempotencyMarker::hash_key(&idempotency_key);
 
+        let tx_store = TransactionStoreImpl::new(Arc::clone(&self.storage));
+
         for _ in 0..MAX_TAKEOVER_ATTEMPTS {
-            // Step 2: Load pointer + version
             let (pointer, pointer_version) = pointer_store
                 .load(&table_uuid)
                 .await?
@@ -214,7 +224,23 @@ impl<S: StorageBackend> CommitService<S> {
                     message: err.to_string(),
                 })?;
 
-            // Step 3: Load base metadata file
+            if let Some(action) = self
+                .handle_pending_transaction(
+                    &pointer_store,
+                    &table_uuid,
+                    &pointer,
+                    &pointer_version,
+                    &tx_store,
+                )
+                .await?
+            {
+                match action {
+                    PendingHandleAction::Retry => continue,
+                    PendingHandleAction::RetryAfter { seconds } => {
+                        return Err(CommitError::RetryAfter { seconds });
+                    }
+                }
+            }
             let base_metadata = self
                 .load_metadata(&pointer.current_metadata_location, tenant, workspace)
                 .await?;
@@ -259,14 +285,17 @@ impl<S: StorageBackend> CommitService<S> {
                         return Err(CommitError::CachedFailure { status, payload });
                     }
                     IdempotencyStatus::InProgress => {
-                        // Crash recovery: check if pointer already reflects this commit.
                         let current_pointer = pointer_store
                             .load(&table_uuid)
                             .await?
                             .ok_or_else(|| IcebergError::table_not_found(namespace, table))?
                             .0;
 
-                        if current_pointer.current_metadata_location == existing.metadata_location {
+                        let effective =
+                            resolve_effective_metadata_location(&current_pointer, &tx_store)
+                                .await?;
+
+                        if effective.metadata_location == existing.metadata_location {
                             let response = self
                                 .response_from_location(
                                     &existing.metadata_location,
@@ -433,6 +462,100 @@ impl<S: StorageBackend> CommitService<S> {
     fn retry_after_seconds(&self) -> u32 {
         let seconds = self.in_progress_timeout.num_seconds().max(0);
         u32::try_from(seconds).unwrap_or(u32::MAX)
+    }
+
+    async fn handle_pending_transaction(
+        &self,
+        pointer_store: &PointerStoreImpl<S>,
+        table_uuid: &Uuid,
+        pointer: &IcebergTablePointer,
+        pointer_version: &crate::types::ObjectVersion,
+        tx_store: &TransactionStoreImpl<S>,
+    ) -> Result<Option<PendingHandleAction>, CommitError> {
+        let Some(pending) = &pointer.pending else {
+            return Ok(None);
+        };
+
+        let tx_result = tx_store.load(&pending.tx_id).await?;
+
+        if let Some((tx_record, tx_version)) = tx_result {
+            match tx_record.status {
+                TransactionStatus::Committed => {
+                    tracing::info!(
+                        tx_id = %pending.tx_id,
+                        table_uuid = %table_uuid,
+                        "Finalizing committed transaction pending state"
+                    );
+                    let finalized_pointer = pointer.clone().finalize_pending();
+                    let _ = pointer_store
+                        .compare_and_swap(table_uuid, pointer_version, &finalized_pointer)
+                        .await?;
+                    Ok(Some(PendingHandleAction::Retry))
+                }
+                TransactionStatus::Preparing => {
+                    if tx_record.is_stale(DEFAULT_TRANSACTION_TIMEOUT) {
+                        tracing::warn!(
+                            tx_id = %pending.tx_id,
+                            table_uuid = %table_uuid,
+                            started_at = %tx_record.started_at,
+                            "Aborting stale multi-table transaction"
+                        );
+                        let aborted_record =
+                            tx_record.abort("Stale transaction aborted by single-table commit");
+
+                        if let TransactionCasResult::Success { .. } = tx_store
+                            .compare_and_swap(&aborted_record, &tx_version)
+                            .await?
+                        {
+                            let cleared_pointer = IcebergTablePointer {
+                                pending: None,
+                                ..pointer.clone()
+                            };
+                            let _ = pointer_store
+                                .compare_and_swap(table_uuid, pointer_version, &cleared_pointer)
+                                .await;
+                        }
+                        Ok(Some(PendingHandleAction::Retry))
+                    } else {
+                        tracing::info!(
+                            tx_id = %pending.tx_id,
+                            table_uuid = %table_uuid,
+                            "Table has active multi-table transaction in progress"
+                        );
+                        Ok(Some(PendingHandleAction::RetryAfter { seconds: 30 }))
+                    }
+                }
+                TransactionStatus::Aborted => {
+                    tracing::info!(
+                        tx_id = %pending.tx_id,
+                        table_uuid = %table_uuid,
+                        "Clearing pending state from aborted transaction"
+                    );
+                    let cleared_pointer = IcebergTablePointer {
+                        pending: None,
+                        ..pointer.clone()
+                    };
+                    let _ = pointer_store
+                        .compare_and_swap(table_uuid, pointer_version, &cleared_pointer)
+                        .await;
+                    Ok(Some(PendingHandleAction::Retry))
+                }
+            }
+        } else {
+            tracing::warn!(
+                tx_id = %pending.tx_id,
+                table_uuid = %table_uuid,
+                "Clearing orphaned pending state (transaction record not found)"
+            );
+            let cleared_pointer = IcebergTablePointer {
+                pending: None,
+                ..pointer.clone()
+            };
+            let _ = pointer_store
+                .compare_and_swap(table_uuid, pointer_version, &cleared_pointer)
+                .await;
+            Ok(Some(PendingHandleAction::Retry))
+        }
     }
 
     async fn load_metadata(
@@ -841,6 +964,7 @@ fn pointer_from_metadata(
         previous_metadata_location: Some(pointer.current_metadata_location.clone()),
         updated_at: Utc::now(),
         updated_by: source.clone(),
+        pending: None,
     })
 }
 

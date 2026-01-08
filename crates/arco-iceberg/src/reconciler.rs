@@ -33,11 +33,12 @@ use uuid::Uuid;
 use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
 use bytes::Bytes;
 
-use crate::error::IcebergResult;
+use crate::error::{IcebergError, IcebergResult};
 use crate::events::CommittedReceipt;
 use crate::metrics;
 use crate::paths::resolve_metadata_path;
-use crate::pointer::{PointerStore, UpdateSource};
+use crate::pointer::{PointerStore, UpdateSource, resolve_effective_metadata_location};
+use crate::transactions::TransactionStoreImpl;
 use crate::types::{CommitKey, SnapshotRefMetadata};
 
 /// Default maximum depth for metadata log traversal.
@@ -370,6 +371,16 @@ impl<S: StorageBackend, P: PointerStore> Reconciler for IcebergReconciler<S, P> 
             return Ok(result);
         };
 
+        pointer
+            .validate_version()
+            .map_err(|e| IcebergError::Internal {
+                message: format!("Unsupported pointer version: {e}"),
+            })?;
+
+        // Resolve effective metadata location (handles pending multi-table transactions)
+        let tx_store = TransactionStoreImpl::new(Arc::clone(&self.storage));
+        let effective = resolve_effective_metadata_location(&pointer, &tx_store).await?;
+
         // Walk the metadata log
         let walker = MetadataLogWalker::with_max_depth(
             Arc::clone(&self.storage),
@@ -379,7 +390,7 @@ impl<S: StorageBackend, P: PointerStore> Reconciler for IcebergReconciler<S, P> 
         );
 
         let walk_result = walker
-            .walk_with_report(&pointer.current_metadata_location)
+            .walk_with_report(&effective.metadata_location)
             .await?;
 
         result.metadata_entries_found = walk_result.entries.len();

@@ -15,6 +15,7 @@ use crate::types::{AccessDelegation, StorageCredential, TableIdent};
 
 /// Server-side configuration for the Iceberg REST API.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct IcebergConfig {
     /// Catalog prefix advertised in `/v1/config`.
     pub prefix: String,
@@ -28,6 +29,8 @@ pub struct IcebergConfig {
     pub allow_namespace_crud: bool,
     /// Enable table create/drop/register endpoints.
     pub allow_table_crud: bool,
+    /// Enable multi-table atomic transactions (ICE-7).
+    pub allow_multi_table_transactions: bool,
     /// Optional request timeout for handlers.
     pub request_timeout: Option<Duration>,
     /// Optional concurrency limit for handlers.
@@ -43,6 +46,7 @@ impl Default for IcebergConfig {
             allow_write: false,
             allow_namespace_crud: false,
             allow_table_crud: false,
+            allow_multi_table_transactions: false,
             request_timeout: None,
             concurrency_limit: None,
         }

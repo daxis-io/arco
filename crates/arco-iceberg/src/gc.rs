@@ -29,7 +29,8 @@ use crate::paths::{
     ICEBERG_IDEMPOTENCY_PREFIX, iceberg_committed_receipt_prefix, iceberg_idempotency_table_prefix,
     iceberg_pending_receipt_prefix, resolve_metadata_path,
 };
-use crate::pointer::PointerStore;
+use crate::pointer::{PointerStore, resolve_effective_metadata_location};
+use crate::transactions::TransactionStoreImpl;
 use crate::types::{ObjectVersion, TableMetadata};
 
 /// Default grace period added to marker lifetime before deletion.
@@ -466,12 +467,12 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
     /// Determines the action to take for an in-progress marker.
     ///
     /// Per design doc Section 9.2:
-    /// - If `pointer.metadata_location != marker.metadata_location`, safe to delete
+    /// - If effective metadata location != `marker.metadata_location`, safe to delete
     /// - Otherwise, mark as Failed before deleting
     ///
     /// # Errors
     ///
-    /// Returns error if pointer loading fails.
+    /// Returns error if pointer loading or effective resolution fails.
     pub async fn check_in_progress_action(
         &self,
         marker: &IdempotencyMarker,
@@ -479,17 +480,20 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
         let pointer = self.pointer_store.load(&marker.table_uuid).await?;
 
         match pointer {
-            None => {
-                // Pointer not found - table may have been deleted
-                Ok(InProgressAction::PointerNotFound)
-            }
+            None => Ok(InProgressAction::PointerNotFound),
             Some((pointer, _version)) => {
-                if pointer.current_metadata_location == marker.metadata_location {
-                    // Pointer still points to this marker's metadata
-                    // The commit may have succeeded but finalization failed
+                pointer
+                    .validate_version()
+                    .map_err(|e| IcebergError::Internal {
+                        message: format!("Unsupported pointer version: {e}"),
+                    })?;
+
+                let tx_store = TransactionStoreImpl::new(Arc::clone(&self.storage));
+                let effective = resolve_effective_metadata_location(&pointer, &tx_store).await?;
+
+                if effective.metadata_location == marker.metadata_location {
                     Ok(InProgressAction::MarkFailedThenDelete)
                 } else {
-                    // Pointer has moved past this marker
                     Ok(InProgressAction::SafeToDelete)
                 }
             }
@@ -1068,8 +1072,16 @@ impl<S: StorageBackend, P: PointerStore> MetadataGcPlanner<S, P> {
             });
         };
 
-        let current_path =
-            resolve_metadata_path(&pointer.current_metadata_location, tenant, workspace)?;
+        pointer
+            .validate_version()
+            .map_err(|e| IcebergError::Internal {
+                message: format!("Unsupported pointer version: {e}"),
+            })?;
+
+        let tx_store = TransactionStoreImpl::new(Arc::clone(&self.storage));
+        let effective = resolve_effective_metadata_location(&pointer, &tx_store).await?;
+
+        let current_path = resolve_metadata_path(&effective.metadata_location, tenant, workspace)?;
         let metadata_bytes =
             self.storage
                 .get(&current_path)
@@ -1088,6 +1100,18 @@ impl<S: StorageBackend, P: PointerStore> MetadataGcPlanner<S, P> {
 
         let mut allowlist = HashSet::new();
         allowlist.insert(current_path);
+
+        let stable_path =
+            resolve_metadata_path(&pointer.current_metadata_location, tenant, workspace)?;
+        allowlist.insert(stable_path);
+
+        if let Some(ref pending) = pointer.pending {
+            if let Ok(pending_path) =
+                resolve_metadata_path(&pending.metadata_location, tenant, workspace)
+            {
+                allowlist.insert(pending_path);
+            }
+        }
 
         if let Some(previous) = pointer.previous_metadata_location.as_deref() {
             match resolve_metadata_path(previous, tenant, workspace) {
@@ -1130,7 +1154,7 @@ impl<S: StorageBackend, P: PointerStore> MetadataGcPlanner<S, P> {
 
         Ok(MetadataGcPlan {
             table_uuid: *table_uuid,
-            current_metadata_location: pointer.current_metadata_location,
+            current_metadata_location: effective.metadata_location,
             metadata_prefix,
             allowlist,
             policy,

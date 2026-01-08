@@ -375,19 +375,17 @@ pub struct CommitTableResponse {
 ///
 /// # Arco Implementation
 ///
-/// Arco only supports single-table commits through this endpoint. Requests with
-/// more than one table change will return 406 Not Acceptable. This endpoint is
-/// **not advertised** in `/v1/config` because true multi-table atomicity is not
-/// supported.
+/// Multi-table atomic transactions are supported when `allow_multi_table_transactions`
+/// is enabled. When disabled (default), requests with more than one table change
+/// return 406 Not Acceptable.
 ///
-/// Single-table requests are delegated to the same commit logic as the
-/// per-table commit endpoint.
+/// The endpoint is advertised in `/v1/config` only when both `allow_write` and
+/// `allow_multi_table_transactions` are enabled.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CommitTransactionRequest {
     /// Table changes to commit atomically.
     ///
-    /// Each entry must include an `identifier` field. Arco requires exactly
-    /// one entry; multiple entries will be rejected with 406.
+    /// Each entry must include an `identifier` field.
     #[serde(rename = "table-changes")]
     pub table_changes: Vec<CommitTableRequest>,
 }

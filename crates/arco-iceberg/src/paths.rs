@@ -8,6 +8,7 @@ use crate::types::CommitKey;
 
 pub const ICEBERG_POINTER_PREFIX: &str = "_catalog/iceberg_pointers";
 pub const ICEBERG_IDEMPOTENCY_PREFIX: &str = "_catalog/iceberg_idempotency";
+pub const ICEBERG_TRANSACTIONS_PREFIX: &str = "_catalog/iceberg_transactions";
 
 pub fn iceberg_pointer_path(table_uuid: &Uuid) -> String {
     format!("{ICEBERG_POINTER_PREFIX}/{table_uuid}.json")
@@ -20,6 +21,10 @@ pub fn iceberg_idempotency_table_prefix(table_uuid: &Uuid) -> String {
 pub fn iceberg_idempotency_marker_path(table_uuid: &Uuid, key_hash: &str) -> String {
     let prefix = &key_hash[..2.min(key_hash.len())];
     format!("{ICEBERG_IDEMPOTENCY_PREFIX}/{table_uuid}/{prefix}/{key_hash}.json")
+}
+
+pub fn iceberg_transaction_record_path(tx_id: &str) -> String {
+    format!("{ICEBERG_TRANSACTIONS_PREFIX}/{tx_id}.json")
 }
 
 pub fn iceberg_pending_receipt_prefix(date: NaiveDate) -> String {

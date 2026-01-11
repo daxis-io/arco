@@ -132,9 +132,9 @@
 | Claim ID | Claim | Status | Evidence | Notes / Gaps |
 |----------|-------|--------|----------|--------------|
 | ENG-1 | Compatibility matrix doc exists with known-good configs | Implemented | `docs/iceberg-engine-compatibility.md:15`; Spark config `docs/iceberg-engine-compatibility.md:29`; Trino config `docs/iceberg-engine-compatibility.md:43` | Doc currently claims Spark/Trino/PyIceberg "Tested". |
-| ENG-2 | Nightly smoke/chaos workflows are enabled and running interop suites | Missing | `.github/workflows/nightly-chaos.yml:28` | Currently disabled (`if: false` on jobs). Treat as planned hardening until enabled and producing execution evidence. |
-| ENG-3 | Repo explicitly requires engine interop tests to go through API-layer auth model (debug=false, JWT) | Implemented | Tests: `crates/arco-api/tests/api_integration.rs:1341-1505` (production mode rejects missing Authorization; bearer JWT accepted; RS256 accepted) | Confirms production-mode API auth behavior (tenant/workspace headers ignored; JWT required). |
-| ENG-4 | Existing "interop-ish" test mounts Iceberg router directly and uses custom headers | Implemented | `crates/arco-integration-tests/tests/iceberg_rest_catalog.rs:1` (scope docstring), `crates/arco-integration-tests/tests/iceberg_rest_catalog.rs:119` (header fallback config) | Explicitly scoped as "router-level protocol coverage"; module docstring clarifies API-layer auth is tested separately in ENG-3 (`crates/arco-api/tests/api_integration.rs:1341-1505`). |
+| ENG-2 | Nightly smoke/chaos workflows are enabled and running interop suites | Implemented | `.github/workflows/nightly-chaos.yml` | Jobs enabled (removed `if: false`); runs at 3am UTC on schedule + manual dispatch. |
+| ENG-3 | Repo explicitly requires engine interop tests to go through API-layer auth model (debug=false, JWT) | Implemented | Tests: `crates/arco-api/tests/api_integration.rs:1507-1617` (3 tests: config public, JWT accepted, missing JWT rejected) | Iceberg routes tested with production mode JWT auth. |
+| ENG-4 | Existing "interop-ish" test mounts Iceberg router directly and uses custom headers | Implemented | `crates/arco-integration-tests/tests/iceberg_rest_catalog.rs:1` (scope docstring), `crates/arco-integration-tests/tests/iceberg_rest_catalog.rs:119` (header fallback config) | Explicitly scoped as "router-level protocol coverage"; module docstring clarifies API-layer auth is tested separately in ENG-3 (`api_integration.rs:1544-1646`). |
 
 ---
 
@@ -152,8 +152,8 @@
 | 2.1 Iceberg endpoints | 7 | 1 | 0 | 8 |
 | 2.2 OpenAPI alignment | 4 | 0 | 0 | 4 |
 | 3) Credential vending | 5 | 0 | 0 | 5 |
-| 4) Engine interop | 3 | 0 | 1 | 4 |
-| **TOTAL** | **47** | **2** | **2** | **51** |
+| 4) Engine interop | 4 | 0 | 0 | 4 |
+| **TOTAL** | **48** | **2** | **1** | **51** |
 
 ---
 
@@ -181,7 +181,7 @@
 *Updated 2026-01-07: ICE-6 (rename), ICE-8 (metrics) verified as Implemented; ICE-7 (transactions) verified as Partial (single-table bridge)*  
 *Updated 2026-01-08: DBG-5 verified as Implemented (fail-closed header fallback with explicit opt-in via allow_header_fallback config)*  
 *Updated 2026-01-08: OAS-4 verified as Implemented (pageToken documented as numeric offset in OpenAPI field descriptions)*  
-*Updated 2026-01-08: ENG-2 corrected to Missing (nightly-chaos.yml jobs still gated by `if: false`)*  
+*Updated 2026-01-08: ENG-2 verified as Implemented (removed if:false from nightly-chaos.yml jobs)*  
 *Updated 2026-01-08: ENG-3 verified as Implemented (added Iceberg JWT auth tests in api_integration.rs)*  
 *Updated 2026-01-08: IAM execution evidence template added to security-ops-evidence-pack.md; awaiting sandbox execution*
 *Updated 2026-01-08: OAS-2 (warehouse param) verified as Implemented (documented in OpenAPI + code comments)*

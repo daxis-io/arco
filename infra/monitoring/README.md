@@ -18,8 +18,12 @@ Expose metrics from:
 
 Use the OpenTelemetry Collector to scrape Prometheus endpoints and export to
 Cloud Monitoring. The collector also accepts OTLP metrics for push-based
-pipelines (useful when `/metrics` is unavailable). Update `GCP_PROJECT_ID` and
-target addresses as needed.
+pipelines (useful when `/metrics` is unavailable). Set `GCP_PROJECT_ID` (used as
+`${env:GCP_PROJECT_ID}` in `otel-collector.yaml`) and update target addresses as
+needed.
+
+If the compactor `/metrics` shared-secret gate is enabled, also set
+`ARCO_METRICS_SECRET` so the collector can scrape it.
 
 ```bash
 otelcol --config infra/monitoring/otel-collector.yaml

@@ -1,13 +1,20 @@
 # Execution Session Prompt — P0 Gap Closure
 
-> **⚠️ HISTORICAL SNAPSHOT**: This prompt was generated to drive the P0 gap closure work.
-> The gaps listed here have been **resolved**. Claim counts below reflect the pre-fix state.
-> For current status, see `2026-01-06-traceability-matrix.md` (40 Implemented, 8 Partial, 3 Missing).
+> **ARCHIVED — DO NOT EXECUTE**
+>
+> This document is a **historical artifact** from the 2026-01-06 P0 gap closure session.
+> The prompt content below is preserved for audit trail purposes only.
+>
+> **Authoritative current status**: See [`2026-01-06-traceability-matrix.md`](./2026-01-06-traceability-matrix.md)
+>
+> Do not re-execute this prompt. Use the traceability matrix for current gap tracking.
 
-**Generated**: 2026-01-06  
+---
+
+**Generated**: 2026-01-06 (archived 2026-01-08)  
 **Reference Docs**:
 - `docs/catalog-metastore/evidence/2026-01-06-audit-review.md` (narrative review, historical)
-- `docs/catalog-metastore/evidence/2026-01-06-traceability-matrix.md` (claim-by-claim status, **updated**)
+- `docs/catalog-metastore/evidence/2026-01-06-traceability-matrix.md` (claim-by-claim status, **authoritative**)
 
 ---
 
@@ -113,7 +120,7 @@ These ~~are~~ were P0/P1 boundary. The ~~current~~ router at `crates/arco-iceber
 | pageToken is numeric offset, not opaque | OAS-4 | `crates/arco-iceberg/src/routes/utils.rs:57` | Document deviation or migrate to opaque |
 | Nightly interop suite disabled | ENG-2 | `.github/workflows/nightly-chaos.yml:30` | All jobs `if: false` |
 | JWKS not wired | JWT-6 | `crates/arco-api/src/lib.rs:52` | `auth.rs` exists but not compiled; explicit backlog |
-| Compactor /metrics unauthenticated | MET-4 | `crates/arco-compactor/src/main.rs:963` | Relies on infra isolation |
+| Compactor /metrics optional shared-secret gate | MET-4 | `crates/arco-compactor/src/main.rs:895-1003` | Gate enabled by non-empty (trimmed) `ARCO_METRICS_SECRET`; infra isolation remains primary defense in Cloud Run |
 
 ---
 

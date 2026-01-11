@@ -3,7 +3,7 @@
 **Date:** 2026-01-02 (updated 2026-01-06)  
 **Commit:** 966b8eecce6348821c258e38553ed945e314cfde (evidence updated with P0 gap closures)  
 **Scope:** Catalog/metastore security posture (API authN/authZ, storage isolation & IAM, read-path URL minting, observability/monitoring, Iceberg REST + credential vending)  
-**Overall status:** ⚠️ **Near audit-ready** (Security audit trail complete for auth, URL mint, credential vending, and Iceberg commits. Credential vending is wired with GCS provider. P0 gaps closed. Iceberg REST parity: rename (ICE-6) and metrics (ICE-8) implemented; transactions/commit (ICE-7) partial (single-table bridge only, not advertised). Remaining: compactor `/metrics` relies on infra isolation; see `crates/arco-api/src/server.rs:374`, `crates/arco-api/src/server.rs:384`, `crates/arco-compactor/src/main.rs:963`).
+**Overall status:** ⚠️ **Near audit-ready** (Security audit trail complete for auth, URL mint, credential vending, and Iceberg commits. Credential vending is wired with GCS provider. P0 gaps closed. Iceberg REST parity: rename (ICE-6) and metrics (ICE-8) implemented; transactions/commit (ICE-7) partial (single-table bridge only, not advertised). Compactor `/metrics` supports optional code-level gate via non-empty `ARCO_METRICS_SECRET` (empty/whitespace disables the gate); see `crates/arco-compactor/src/main.rs:895-1003`, `docs/runbooks/metrics-access.md:63`, `infra/monitoring/otel-collector.yaml:9`. Remaining: IAM list semantics execution evidence pending; MET-2 infra-dependent).
 
 ## Status Legend
 
@@ -25,7 +25,7 @@
 | Runtime posture contract (dev/private/public) | ✅ | P0 | Medium | Code + tests | `crates/arco-api/src/config.rs:13`, `crates/arco-api/src/config.rs:343`, `crates/arco-api/src/config.rs:545`, `crates/arco-api/src/server.rs:578`, `crates/arco-api/src/server.rs:784`, `infra/terraform/cloud_run.tf:119`, `infra/terraform/cloud_run.tf:125` | Posture depends on correct env/ingress wiring | Add deployment validation for `ARCO_ENVIRONMENT`/`ARCO_API_PUBLIC` and keep guardrail tests |
 | Tenant/workspace storage isolation | ✅ | P0 | High | Code + tests | `crates/arco-core/src/scoped_storage.rs:1`, `crates/arco-core/src/scoped_storage.rs:115`, `crates/arco-core/src/scoped_storage.rs:821` | If debug is enabled (dev posture), scope selection becomes attacker-controlled | Keep guardrail + add e2e coverage |
 | Browser-direct read path (signed URLs) | ✅ | P0 | High | Code review | `crates/arco-api/src/routes/browser.rs:5`, `crates/arco-api/src/routes/browser.rs:119`, `crates/arco-catalog/src/reader.rs:494`, `crates/arco-api/src/routes/browser.rs:140,177,198` (audit) | URL mint allow/deny audit events implemented; redaction enforced via "do not log" policy (`crates/arco-api/src/routes/browser.rs:167`) | Complete: audit events emit at mint time for allow/deny decisions |
-| Observability & monitoring | ✅ | P1 | Medium | Code + infra | `crates/arco-core/src/observability.rs:43`, `crates/arco-api/src/metrics.rs:41`, `crates/arco-api/src/server.rs:384`, `crates/arco-compactor/src/main.rs:963`, `infra/monitoring/otel-collector.yaml:1`, `crates/arco-iceberg/src/audit.rs:67-188` | Auth + URL mint + credential vending + Iceberg commit audit events all implemented; API `/metrics` blocked in public posture; compactor relies on infra isolation; metrics labels are bounded | Keep compactor internal or add metrics auth; keep label tests; tenant label removed from flow metrics |
+| Observability & monitoring | ✅ | P1 | Medium | Code + infra | `crates/arco-core/src/observability.rs:43`, `crates/arco-api/src/metrics.rs:41`, `crates/arco-api/src/server.rs:384`, `crates/arco-compactor/src/main.rs:895-1003`, `infra/monitoring/otel-collector.yaml:9`, `docs/runbooks/metrics-access.md:63`, `crates/arco-iceberg/src/audit.rs:67-188` | Auth + URL mint + credential vending + Iceberg commit audit events all implemented; API `/metrics` blocked in public posture; compactor gate trims empty/whitespace secrets; metrics labels are bounded | Keep label tests; use code gate for defense-in-depth in non-Cloud-Run environments |
 | Iceberg REST surface | ⚠️ | P0 | Medium | Code review | `crates/arco-api/src/server.rs:219`, `crates/arco-iceberg/src/router.rs:37`, `crates/arco-iceberg/src/types/config.rs:8` | Rename (ICE-6) + metrics (ICE-8) implemented; transactions (ICE-7) single-table bridge only | Multi-table atomic transactions remain backlog |
 | Iceberg credential vending | ✅ | P0 | High | Code review | `crates/arco-api/src/server.rs:630-637` (provider wiring), `crates/arco-iceberg/src/routes/tables.rs:940-960` (handler), `crates/arco-iceberg/src/audit.rs:67,96` (audit helpers) | Provider wired when GCP feature enabled; vend/deny audit trail implemented | Complete: GCS credential provider wired + audit events emitted |
 
@@ -150,12 +150,25 @@ If these assumptions change, evidence must be re-collected.
 **IAM list semantics verification (P0-6):**
 
 - Runbook created: `docs/runbooks/iam-list-semantics-verification.md`
-- Script tests whether conditional IAM constrains `storage.objects.list` results
-- Pending execution in sandbox environment to capture evidence
+- Executable script: `docs/runbooks/iam-list-verify.sh` (69 lines, executable)
+- Evidence capture template: documented in runbook (lines 183-195)
+- CI integration template: documented in runbook (lines 162-179)
+
+**Execution Evidence (PENDING):**
+
+```markdown
+- Verification date: [NOT YET EXECUTED]
+- Verification environment: [SANDBOX_PROJECT_ID]
+- Result: [Scenario A/B/C - pending execution]
+- Evidence artifact: [link to CI run or manual capture]
+- Action taken: [None / Document limitation / Remediation PR]
+```
 
 **Recommended actions (PRD-aligned):**
 
-- Execute IAM list semantics verification script in sandbox environment and document results.
+- Execute `docs/runbooks/iam-list-verify.sh` in sandbox environment
+- Capture output and update evidence block above
+- If Scenario B/C encountered, evaluate remediation options per runbook
 
 ### A.2 Service Account Design (API vs Compactor)
 
@@ -256,8 +269,8 @@ If these assumptions change, evidence must be re-collected.
 
 - Prometheus exporter + middleware exist (`crates/arco-api/src/metrics.rs:41`, `crates/arco-api/src/metrics.rs:94`).
 - API `/metrics` returns 404 in public posture and is otherwise open (`crates/arco-api/src/server.rs:374`, `crates/arco-api/src/server.rs:384`).
-- Compactor `/metrics` is mounted without auth in serve mode (`crates/arco-compactor/src/main.rs:963`).
-- OTel Collector scrapes Prometheus endpoints and exports to Cloud Monitoring (`infra/monitoring/otel-collector.yaml:1`, `infra/monitoring/README.md:17`).
+- Compactor `/metrics` supports optional shared-secret gate via non-empty `ARCO_METRICS_SECRET` (`crates/arco-compactor/src/main.rs:895-1003`); empty/whitespace disables the gate; requests use `X-Metrics-Secret` or `Authorization: Bearer`.
+- OTel Collector scrapes Prometheus endpoints and exports to Cloud Monitoring (`infra/monitoring/otel-collector.yaml:9`, `infra/monitoring/README.md:17`).
 
 **Label policy evidence:**
 
@@ -267,7 +280,7 @@ If these assumptions change, evidence must be re-collected.
 **Recommended actions:**
 
 - Protect `/metrics` in public deployments (and document scraper migration).
-- Keep label-policy regression tests; add compactor `/metrics` auth if internal-only ingress is not guaranteed.
+- Keep label-policy regression tests; compactor gate behavior and empty/whitespace handling documented (`docs/runbooks/metrics-access.md:63`).
 
 ### C.3 Audit Trail (Security Decisions + Mutations)
 
@@ -347,8 +360,8 @@ If these assumptions change, evidence must be re-collected.
 
 **Risk:**
 
-- Iceberg crate has a fallback context middleware that accepts `X-Tenant-Id`/`X-Workspace-Id` if context is not injected (`crates/arco-iceberg/src/context.rs:97`). This is safe in current API mounting, but unsafe if the Iceberg router is mounted standalone.
-- Iceberg endpoints are protected by auth, but are not currently behind the API rate limiting layer (rate limiting is applied to `/api/v1/*`, not `/iceberg/*`) (`crates/arco-api/src/server.rs:384`, `crates/arco-api/src/server.rs:409`).
+- ~~Iceberg crate has a fallback context middleware that accepts `X-Tenant-Id`/`X-Workspace-Id` if context is not injected.~~ **RESOLVED:** Iceberg now defaults to fail-closed (`allow_header_fallback=false`); header fallback requires explicit opt-in (`crates/arco-iceberg/src/state.rs:38`).
+- ~~Iceberg endpoints are protected by auth, but are not currently behind the API rate limiting layer.~~ **RESOLVED:** Iceberg routes now have rate limiting via `iceberg_rate_limit_middleware` (`crates/arco-api/src/server.rs:310-351`, `crates/arco-api/src/server.rs:508`).
 
 ### D.2 Implemented Endpoints & Capability Hiding
 
@@ -368,8 +381,10 @@ If these assumptions change, evidence must be re-collected.
 - ⚠️ Transactions/commit (`POST /v1/{prefix}/transactions/commit`) implemented as single-table bridge only (`crates/arco-iceberg/src/routes/catalog.rs:132`); NOT advertised in `/v1/config` (interop bridge); multi-table atomic remains backlog.
 - Drop-table `purgeRequested` semantics are not implemented (drop-table endpoint itself is missing) (`crates/arco-iceberg/src/types/config.rs:67`).
 - Parity docs call out engine/client auth schemes (SigV4, Google Auth, token rotation/revocation); current API supports debug headers or `Authorization: Bearer <jwt>` only (`crates/arco-api/src/context.rs:80`, `crates/arco-api/src/context.rs:237`).
-- ✅ Query parameters now properly parsed: `snapshots` param parsed via `LoadTableQuery` (`crates/arco-iceberg/src/types/table.rs:63-87`), filtering implemented (`crates/arco-iceberg/src/routes/tables.rs:241-244`). `planId` removed from OpenAPI (scan planning not implemented).
-- Test signal is weaker than it appears: the OpenAPI compliance test checks parameter-name and numeric status-code subsets (not full schema/behavior), and the integration test exercises the Iceberg router directly using custom tenancy headers (not API-layer JWT auth) (`crates/arco-iceberg/tests/openapi_compliance.rs:107`, `crates/arco-integration-tests/tests/iceberg_rest_catalog.rs:132`).
+- ✅ Query parameters now properly parsed: `snapshots` param parsed via `LoadTableQuery` (`crates/arco-iceberg/src/types/table.rs:63-87`), filtering implemented (`crates/arco-iceberg/src/routes/tables.rs:241-244`). `planId` is accepted, parsed, and logged for observability (`crates/arco-iceberg/src/routes/tables.rs:907,926`) but ignored for behavior (scan planning not implemented).
+- ✅ `/v1/config` warehouse param behavior documented (OAS-2): `warehouse` query param is accepted for Iceberg client compatibility but explicitly ignored (`crates/arco-iceberg/src/routes/config.rs:34`). OpenAPI documentation states this clearly (`crates/arco-iceberg/src/routes/config.rs:18`). Arco uses tenant/workspace scoping via `RequestContext` rather than warehouse routing.
+- ✅ Test coverage positioning clarified (ENG-4): The Iceberg integration test (`crates/arco-integration-tests/tests/iceberg_rest_catalog.rs`) is explicitly scoped as "router-level protocol coverage" via module docstring. It uses header-based auth (`allow_header_fallback: true`) intentionally for client library compatibility testing. API-layer JWT auth coverage is provided separately by ENG-3 tests in `crates/arco-api/tests/api_integration.rs:1544-1646`.
+- OpenAPI compliance test checks parameter-name and numeric status-code subsets (not full schema/behavior) (`crates/arco-iceberg/tests/openapi_compliance.rs:107`).
 
 ### D.3 ETag / If-None-Match & Idempotency
 
@@ -493,7 +508,7 @@ If these assumptions change, evidence must be re-collected.
 | Gap | Risk | Mitigation | Status |
 |-----|------|------------|--------|
 | Debug mode outside dev posture (regression risk) | Caller chooses tenant/workspace via headers; task callbacks accept any bearer token; cross-tenant read/write | Guardrail enforced at startup; keep regression tests (`crates/arco-api/src/server.rs:578`, `crates/arco-api/src/server.rs:784`) | ✅ Mitigated |
-| Compactor `/metrics` unauthenticated (ensure internal-only ingress) | Identifier leakage + endpoint surface disclosure; potential DoS of monitoring pipeline if exposed | API blocks `/metrics` in public posture; keep compactor internal or add metrics auth (`crates/arco-api/src/server.rs:374`, `crates/arco-api/src/server.rs:384`, `crates/arco-compactor/src/main.rs:963`, `infra/terraform/cloud_run.tf:25`) | ⚠️ Infra-dependent |
+| ~~Compactor `/metrics` unauthenticated~~ | ~~Identifier leakage + endpoint surface disclosure~~ | Compactor now supports non-empty `ARCO_METRICS_SECRET` code-level gate (empty/whitespace disables) (`crates/arco-compactor/src/main.rs:895-1003`); infra controls remain primary defense for Cloud Run | ✅ **Mitigated** (code gate available) |
 | ~~Iceberg credential vending not wired~~ | ~~Engines cannot rely on scoped access delegation; blocks secure multi-engine use~~ | GCS `CredentialProvider` wired (`crates/arco-api/src/server.rs:630-637`); vend/deny audit events implemented (`crates/arco-iceberg/src/audit.rs:67,96`) | ✅ **Closed** |
 | ~~Iceberg REST baseline endpoints missing~~ | ~~Engines/clients cannot fully use Arco as Iceberg REST catalog; parity gate fails~~ | Rename + metrics implemented; transactions single-table bridge only (`crates/arco-iceberg/src/routes/catalog.rs:59,132`, `crates/arco-iceberg/src/routes/tables.rs:999`) | **Mostly Closed** (multi-table txn backlog) |
 
@@ -523,7 +538,22 @@ If these assumptions change, evidence must be re-collected.
 
 ---
 
-## 7) Appendix: File Reference Index
+## 7) Explicitly Deferred Items (Auditor-Ready Backlog)
+
+The following items are explicitly deferred from the auditor-ready milestone. They are tracked in `docs/catalog-metastore/evidence/plan-deltas.md` as P1/next-quarter work.
+
+| Item | Traceability ID | Current State | Rationale for Deferral | Tracking |
+|------|-----------------|---------------|------------------------|----------|
+| **JWKS support** | JWT-6 | Missing | `auth.rs` exists but not wired. Current JWT validation uses static secret/public key. JWKS requires caching, rotation, and `kid` selection logic. | `plan-deltas.md:218` (PR-13) |
+| **Multi-table atomic transactions** | ICE-7 | Partial (single-table bridge) | Endpoint exists at `/v1/{prefix}/transactions/commit` but only processes single-table commits. Multi-table atomic semantics require catalog transaction manager. NOT advertised in `/v1/config`. | `plan-deltas.md:72`, `traceability-matrix.md:104` |
+| **Catalog actor attribution** | — | Partial | Catalog mutations use `api:{tenant}` rather than authenticated principal identity. Reduces forensic/audit value. | `plan-deltas.md:219` (PR-14) |
+| **ID spec alignment** | — | Partial | Underscore/format inconsistencies between API validation and ADR wire formats for `TenantId`/`WorkspaceId`. | `plan-deltas.md:220` (PR-15) |
+
+**Acceptance for auditor-ready:** These items are explicitly out of scope. Auditors should evaluate the implemented controls (47/51 claims) and note these as documented backlog with clear rationale.
+
+---
+
+## 8) Appendix: File Reference Index
 
 | Component | Primary Files |
 |-----------|---------------|

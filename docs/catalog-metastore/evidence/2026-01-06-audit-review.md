@@ -37,7 +37,7 @@
 ### 1.3 /metrics protection + label policy: Partial
 
 - API `/metrics` is hidden (404) in public posture: `crates/arco-api/src/server.rs:442`, tested by `crates/arco-api/tests/api_integration.rs:110`.
-- Compactor always serves `/metrics` without auth in code: `crates/arco-compactor/src/main.rs:963` (security depends on infra-only reachability).
+- Compactor `/metrics` supports an optional shared-secret gate when `ARCO_METRICS_SECRET` is non-empty (trimmed): `crates/arco-compactor/src/main.rs:895-1003` (infra-only reachability remains the primary control in Cloud Run).
 - API request metric labels are bounded via `MatchedPath` templates (no raw paths): `crates/arco-api/src/metrics.rs:90`.
 - **High-cardinality / identifier leakage risk** still present in flow/orchestration metrics: `tenant` is a label key and is emitted in counters: `crates/arco-flow/src/metrics.rs:95`, `crates/arco-flow/src/metrics.rs:142`, and callback metrics include `tenant` label too: `crates/arco-flow/src/orchestration/callbacks/handlers.rs:109`.
 

@@ -13,7 +13,7 @@ It focuses on how `/metrics` is exposed (or intentionally not exposed) in differ
 
 - API `/metrics` is intentionally unavailable in `Posture::Public` (HTTP 404) to prevent exposing attacker-amplifiable, high-cardinality metrics surfaces on a public endpoint.
 - API `/metrics` remains available (unauthenticated) in `Posture::Dev` and `Posture::Private` where the service is not publicly reachable.
-- Compactor `/metrics` remains mounted without auth in code, and is protected via infrastructure controls:
+- Compactor `/metrics` is mounted with an optional auth gate in code, and is protected via infrastructure controls:
   - Internal-only ingress
   - Cloud Run IAM (restrict which principals can invoke the service)
 
@@ -43,14 +43,74 @@ Notes:
 
 Source: `crates/arco-compactor/src/main.rs` (router wiring).
 
-- The compactor serves `/metrics` without an auth gate in code.
-- The intended protection is infrastructure-level:
-  - On GCP Cloud Run, the compactor service is configured with internal-only ingress (`infra/terraform/cloud_run.tf`).
-  - Cloud Run IAM is used to restrict who can invoke the service (for example, scheduled triggers use OIDC tokens; see `infra/terraform/cloud_run.tf`).
+The compactor supports two layers of `/metrics` protection:
+
+### Layer 1: Infrastructure Controls (Primary)
+
+- On GCP Cloud Run, the compactor service is configured with internal-only ingress (`infra/terraform/cloud_run.tf`).
+- Cloud Run IAM is used to restrict who can invoke the service (for example, scheduled triggers use OIDC tokens; see `infra/terraform/cloud_run.tf`).
+
+### Layer 2: Code-Level Secret Gate (Defense-in-Depth)
+
+For environments where infrastructure controls are insufficient or as additional defense-in-depth, the compactor supports an optional shared-secret header gate:
+
+```bash
+# Enable metrics gate by setting the secret
+export ARCO_METRICS_SECRET="your-shared-secret"
+arco-compactor serve --port 8081
+```
+
+When `ARCO_METRICS_SECRET` is set to a non-empty value:
+- Requests to `/metrics` must include the secret via either:
+  - `X-Metrics-Secret: <secret>` header (custom header), or
+  - `Authorization: Bearer <secret>` header (standard Bearer auth)
+- Authorization header must use the `Bearer` prefix (case-sensitive)
+- Requests without a valid header receive HTTP 403 Forbidden
+- Empty/whitespace values are treated as unset, so `/metrics` behaves as before (open access)
+
+Example scrape configuration with secret (Prometheus-native):
+
+```yaml
+# prometheus.yml - uses standard Authorization: Bearer header
+scrape_configs:
+  - job_name: 'arco-compactor'
+    static_configs:
+      - targets: ['compactor:8081']
+    authorization:
+      type: Bearer
+      credentials: 'your-shared-secret'
+```
+
+Example scrape configuration with secret (OpenTelemetry Collector):
+
+```yaml
+receivers:
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: arco-compactor
+          metrics_path: /metrics
+          static_configs:
+            - targets: ["arco-compactor:8081"]
+          authorization:
+            type: Bearer
+            credentials: ${env:ARCO_METRICS_SECRET:-}
+```
+
+Or via curl (either header works):
+
+```bash
+# Using Authorization: Bearer (Prometheus-compatible)
+curl -H "Authorization: Bearer your-shared-secret" http://compactor:8081/metrics
+
+# Using X-Metrics-Secret (custom header)
+curl -H "X-Metrics-Secret: your-shared-secret" http://compactor:8081/metrics
+```
 
 Operational implication:
 
-- Treat the compactor metrics endpoint as safe only when the network path is internal and IAM does not allow broad invocation.
+- For Cloud Run deployments: rely primarily on infrastructure controls (internal ingress + IAM)
+- For non-Cloud-Run or defense-in-depth: set `ARCO_METRICS_SECRET` and configure collectors accordingly
 
 ## Residual Risk: Non-Cloud-Run Deployments
 
@@ -66,6 +126,7 @@ Required mitigations in non-Cloud-Run environments:
 
 - Ensure the compactor listener is only reachable from a trusted network segment.
 - Prefer an internal load balancer / ingress that enforces authentication and rate limits.
+- If untrusted scrapes are possible, enforce an explicit scrape rate limit at the ingress/LB (treat `/metrics` as a DoS surface).
 - Do not expose `/metrics` directly on a public interface.
 
 ## Operational Guidance: Public Deployments

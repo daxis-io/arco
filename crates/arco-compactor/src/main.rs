@@ -159,6 +159,13 @@ enum Commands {
             help = "HTTP timeout for auto anti-entropy reprocessing requests (seconds)."
         )]
         anti_entropy_reprocess_timeout_secs: u64,
+
+        #[arg(
+            long,
+            env = "ARCO_METRICS_SECRET",
+            help = "Optional shared secret for /metrics endpoint. Non-empty (trimmed) values enable the gate; requests must include X-Metrics-Secret or Authorization: Bearer header."
+        )]
+        metrics_secret: Option<String>,
     },
 
     /// Run a single compaction pass.
@@ -854,6 +861,225 @@ async fn run_auto_anti_entropy(state: &Arc<ServiceState>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arco_core::storage::MemoryBackend;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::util::ServiceExt;
+
+    fn test_state() -> Arc<ServiceState> {
+        let storage = Arc::new(MemoryBackend::new());
+        let scoped_storage =
+            ScopedStorage::new(storage, "acme", "analytics").expect("scoped storage");
+        let compactor_state = Arc::new(CompactorState::new(60));
+        let notification_consumer = NotificationConsumer::new(
+            scoped_storage.clone(),
+            NotificationConsumerConfig::default(),
+        );
+        let auto_anti_entropy = AutoAntiEntropyConfig {
+            compactor_url: "http://127.0.0.1:8081".to_string(),
+            compactor_audience: None,
+            compactor_id_token: None,
+            max_objects_per_run: 0,
+            reprocess_batch_size: 0,
+            reprocess_timeout_secs: 30,
+        };
+        Arc::new(ServiceState {
+            compactor: compactor_state,
+            storage: scoped_storage,
+            tenant_id: "acme".to_string(),
+            workspace_id: "analytics".to_string(),
+            notification_consumer: Arc::new(Mutex::new(notification_consumer)),
+            auto_anti_entropy,
+        })
+    }
+
+    #[test]
+    fn test_normalize_metrics_secret_trims_empty() {
+        assert!(normalize_metrics_secret(Some("  ".to_string())).is_none());
+        assert_eq!(
+            normalize_metrics_secret(Some("  secret  ".to_string())),
+            Some("secret".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_gate_disabled_when_secret_empty() {
+        metrics::init_metrics();
+        let state = test_state();
+        let router = build_router(state, normalize_metrics_secret(Some("  ".to_string())));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_gate_accepts_x_metrics_secret() {
+        metrics::init_metrics();
+        let state = test_state();
+        let router = build_router(state, Some("topsecret".to_string()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("X-Metrics-Secret", "topsecret")
+                    .body(Body::empty())
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_gate_accepts_bearer_secret() {
+        metrics::init_metrics();
+        let state = test_state();
+        let router = build_router(state, Some("topsecret".to_string()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("Authorization", "Bearer topsecret")
+                    .body(Body::empty())
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_gate_rejects_missing_or_wrong_secret() {
+        let state = test_state();
+        let router = build_router(Arc::clone(&state), Some("topsecret".to_string()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let router = build_router(state, Some("topsecret".to_string()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("X-Metrics-Secret", "wrong")
+                    .body(Body::empty())
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_gate_accepts_when_both_headers_present() {
+        metrics::init_metrics();
+        let state = test_state();
+        let router = build_router(state, Some("topsecret".to_string()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("X-Metrics-Secret", "wrong")
+                    .header("Authorization", "Bearer topsecret")
+                    .body(Body::empty())
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+fn normalize_metrics_secret(secret: Option<String>) -> Option<String> {
+    secret.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for i in 0..max_len {
+        let left_byte = *left.get(i).unwrap_or(&0);
+        let right_byte = *right.get(i).unwrap_or(&0);
+        diff |= (left_byte ^ right_byte) as usize;
+    }
+    diff == 0
+}
+
+fn build_router(state: Arc<ServiceState>, metrics_secret: Option<String>) -> Router {
+    // Build HTTP router
+    // Note: /internal/anti-entropy is separate from /internal/sync-compact
+    // because they have different IAM requirements:
+    // - sync-compact: compactor-fastpath-sa (NO list)
+    // - anti-entropy: compactor-antientropy-sa (WITH list)
+    let base_router = Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/compact", post(compact))
+        .route("/internal/notify", post(notify_handler))
+        .route("/internal/sync-compact", post(sync_compact_handler))
+        .route("/internal/anti-entropy", post(anti_entropy_handler));
+
+    let router = if let Some(secret) = metrics_secret {
+        tracing::info!(
+            "Metrics endpoint protected (accepts X-Metrics-Secret or Authorization: Bearer)"
+        );
+        let secret = Arc::<str>::from(secret);
+        base_router.route(
+            "/metrics",
+            get(move |headers: axum::http::HeaderMap| {
+                let secret = Arc::clone(&secret);
+                async move {
+                    let from_custom = headers
+                        .get("X-Metrics-Secret")
+                        .and_then(|v| v.to_str().ok());
+                    let from_bearer = headers
+                        .get("Authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "));
+                    let secret_bytes = secret.as_bytes();
+                    let matches_custom = from_custom
+                        .is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
+                    let matches_bearer = from_bearer
+                        .is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
+                    if matches_custom || matches_bearer {
+                        metrics::serve_metrics().await.into_response()
+                    } else {
+                        StatusCode::FORBIDDEN.into_response()
+                    }
+                }
+            }),
+        )
+    } else {
+        base_router.route("/metrics", get(metrics::serve_metrics))
+    };
+
+    router.with_state(state)
+}
+
 // ============================================================================
 // Main Entry Point
 // ============================================================================
@@ -884,8 +1110,10 @@ async fn main() -> Result<()> {
             anti_entropy_max_objects_per_run,
             anti_entropy_reprocess_batch_size,
             anti_entropy_reprocess_timeout_secs,
+            metrics_secret,
         } => {
             let scoped_storage = scoped.scoped_storage()?;
+            let metrics_secret = normalize_metrics_secret(metrics_secret);
 
             // Initialize metrics before starting
             metrics::init_metrics();
@@ -952,20 +1180,7 @@ async fn main() -> Result<()> {
                 }
             });
 
-            // Build HTTP router
-            // Note: /internal/anti-entropy is separate from /internal/sync-compact
-            // because they have different IAM requirements:
-            // - sync-compact: compactor-fastpath-sa (NO list)
-            // - anti-entropy: compactor-antientropy-sa (WITH list)
-            let router = Router::new()
-                .route("/health", get(health))
-                .route("/ready", get(ready))
-                .route("/metrics", get(metrics::serve_metrics))
-                .route("/compact", post(compact))
-                .route("/internal/notify", post(notify_handler))
-                .route("/internal/sync-compact", post(sync_compact_handler))
-                .route("/internal/anti-entropy", post(anti_entropy_handler))
-                .with_state(Arc::clone(&state));
+            let router = build_router(Arc::clone(&state), metrics_secret);
 
             // Spawn compaction loop
             let state_clone = Arc::clone(&state);

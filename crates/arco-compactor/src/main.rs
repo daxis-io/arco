@@ -1070,11 +1070,9 @@ fn build_router(state: Arc<ServiceState>, metrics_secret: Option<String>) -> Rou
                         .and_then(|v| v.strip_prefix("Bearer "));
                     let secret_bytes = secret.as_bytes();
                     let matches_custom = from_custom
-                        .map(|value| constant_time_eq(value.as_bytes(), secret_bytes))
-                        .unwrap_or(false);
+                        .is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
                     let matches_bearer = from_bearer
-                        .map(|value| constant_time_eq(value.as_bytes(), secret_bytes))
-                        .unwrap_or(false);
+                        .is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
                     if matches_custom || matches_bearer {
                         metrics::serve_metrics().await.into_response()
                     } else {

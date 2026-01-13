@@ -126,6 +126,7 @@ Required mitigations in non-Cloud-Run environments:
 
 - Ensure the compactor listener is only reachable from a trusted network segment.
 - Prefer an internal load balancer / ingress that enforces authentication and rate limits.
+- If untrusted scrapes are possible, enforce an explicit scrape rate limit at the ingress/LB (treat `/metrics` as a DoS surface).
 - Do not expose `/metrics` directly on a public interface.
 
 ## Operational Guidance: Public Deployments

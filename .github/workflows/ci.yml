@@ -103,8 +103,15 @@ jobs:
         with:
           toolchain: 1.85
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-targets: "false"
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Free disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          df -h
       - run: cargo test --workspace --all-features --exclude arco-flow
       - run: cargo test -p arco-flow --all-features --no-run
       - run: cargo test -p arco-flow --features test-utils
@@ -152,8 +159,15 @@ jobs:
         with:
           toolchain: 1.85
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-targets: "false"
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Free disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          df -h
       - run: cargo test --doc --workspace
 
   deny:

@@ -109,7 +109,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
           toolchain: 1.85
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
         with:
           cache-targets: "false"
       - name: Install protoc
@@ -119,19 +119,9 @@ jobs:
           df -h
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
           df -h
-      - name: Prepare cargo target dir
-        run: |
-          sudo mkdir -p /mnt/target
-          sudo chown -R "$(id -u):$(id -g)" /mnt/target
-      - run: cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
-      - run: cargo test -p arco-api --all-features --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_
-      - run: cargo test -p arco-api --all-features --test orchestration_parity_gates_m1
-      - run: cargo test -p arco-flow --features test-utils --no-run
-      - run: cargo test -p arco-flow --features test-utils --lib
-      - run: cargo test -p arco-flow --features test-utils --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_
-      - run: cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m1
-      - run: cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m2
-      - run: cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m3
+      - run: cargo test --workspace --all-features --exclude arco-flow
+      - run: cargo test -p arco-flow --all-features --no-run
+      - run: cargo test -p arco-flow --features test-utils
 
   python-tests:
     name: Python Tests
@@ -178,7 +168,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
           toolchain: 1.85
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
         with:
           cache-targets: "false"
       - name: Install protoc

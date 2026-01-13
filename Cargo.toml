@@ -62,7 +62,7 @@ missing_panics_doc = "allow"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.49", features = ["full"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

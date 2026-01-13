@@ -41,3 +41,5 @@ Each ADR follows this structure:
 | [025](adr-025-backfill-controller.md) | Backfill controller | Accepted |
 | [026](adr-026-partition-status-tracking.md) | Partition status tracking | Accepted |
 | [027](adr-027-datafusion-query-endpoint.md) | DataFusion query endpoint | Accepted |
+| [028](adr-028-gcp-oidc-authentication.md) | GCP OIDC authentication | Accepted |
+| [029](adr-029-iceberg-multi-table-transactions.md) | Iceberg multi-table transactions (ICE-7) | Accepted |

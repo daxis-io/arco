@@ -247,6 +247,9 @@ pub struct IcebergApiConfig {
     /// Enable table create/drop/register endpoints.
     #[serde(default)]
     pub allow_table_crud: bool,
+    /// Enable multi-table atomic transactions (ICE-7).
+    #[serde(default)]
+    pub allow_multi_table_transactions: bool,
     /// Optional concurrency limit for Iceberg handlers.
     #[serde(default)]
     pub concurrency_limit: Option<usize>,
@@ -272,6 +275,7 @@ impl Default for IcebergApiConfig {
             allow_write: false,
             allow_namespace_crud: false,
             allow_table_crud: false,
+            allow_multi_table_transactions: false,
             concurrency_limit: None,
             enable_credential_vending: false,
         }
@@ -289,6 +293,7 @@ impl IcebergApiConfig {
             allow_write: self.allow_write,
             allow_namespace_crud: self.allow_namespace_crud,
             allow_table_crud: self.allow_table_crud,
+            allow_multi_table_transactions: self.allow_multi_table_transactions,
             request_timeout: None,
             concurrency_limit: self.concurrency_limit,
         }
@@ -337,6 +342,7 @@ impl Config {
     /// - `ARCO_ICEBERG_ALLOW_WRITE`
     /// - `ARCO_ICEBERG_ALLOW_NAMESPACE_CRUD`
     /// - `ARCO_ICEBERG_ALLOW_TABLE_CRUD`
+    /// - `ARCO_ICEBERG_ALLOW_MULTI_TABLE_TRANSACTIONS`
     /// - `ARCO_ICEBERG_CONCURRENCY_LIMIT`
     /// - `ARCO_ICEBERG_ENABLE_CREDENTIAL_VENDING`
     /// - `ARCO_AUDIT_ACTOR_HMAC_KEY`
@@ -441,6 +447,10 @@ impl Config {
         }
         if let Some(allow_table_crud) = env_bool("ARCO_ICEBERG_ALLOW_TABLE_CRUD")? {
             config.iceberg.allow_table_crud = allow_table_crud;
+        }
+        if let Some(allow_multi_table_tx) = env_bool("ARCO_ICEBERG_ALLOW_MULTI_TABLE_TRANSACTIONS")?
+        {
+            config.iceberg.allow_multi_table_transactions = allow_multi_table_tx;
         }
         if let Some(limit) = env_usize("ARCO_ICEBERG_CONCURRENCY_LIMIT")? {
             config.iceberg.concurrency_limit = Some(limit);
@@ -715,6 +725,12 @@ mod tests {
     fn iceberg_credential_vending_default_is_false() {
         let config = IcebergApiConfig::default();
         assert!(!config.enable_credential_vending);
+    }
+
+    #[test]
+    fn iceberg_multi_table_transactions_default_is_false() {
+        let config = IcebergApiConfig::default();
+        assert!(!config.allow_multi_table_transactions);
     }
 
     #[test]

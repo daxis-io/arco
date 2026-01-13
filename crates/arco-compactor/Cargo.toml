@@ -63,3 +63,5 @@ clap = { version = "4", features = ["derive", "env"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tower = { workspace = true }
+

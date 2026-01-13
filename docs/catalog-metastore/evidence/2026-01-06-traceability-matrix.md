@@ -36,7 +36,7 @@
 | DBG-2 | Header-based tenant/workspace scoping only allowed when debug && posture.is_dev() (main API auth path) | Implemented | `crates/arco-api/src/context.rs:344` (test sets posture/dev); (gate referenced in evidence pack) `docs/catalog-metastore/evidence/security-ops-evidence-pack.md:190` | Main auth middleware emits allow/deny audits; see AUD-2. |
 | DBG-3 | Task callback header scoping only allowed when debug && posture.is_dev() | Implemented | `crates/arco-api/src/routes/tasks.rs:609` | Outside dev it decodes JWT claims for tenant/workspace: `crates/arco-api/src/routes/tasks.rs:625`. |
 | DBG-4 | Terraform prevents ARCO_DEBUG=true except dev && !api_public | Implemented | `infra/terraform/cloud_run.tf:94` | Couples infra posture to config. |
-| DBG-5 | Iceberg router accepts X-Tenant-Id / X-Workspace-Id headers if no injected context exists | Partial | `crates/arco-iceberg/src/context.rs:47`; `crates/arco-iceberg/src/context.rs:107` | Footgun if arco-iceberg is ever exposed standalone; safe only when mounted behind API that injects context. |
+| DBG-5 | Iceberg router header fallback is fail-closed by default (rejects headers unless explicitly enabled) | Implemented | Config: `crates/arco-iceberg/src/state.rs:38`; Middleware: `crates/arco-iceberg/src/context.rs:107-120`; Tests: `crates/arco-iceberg/src/context.rs:198-229` | `allow_header_fallback=false` (default) rejects header-based context when no injected context exists; explicit opt-in required for standalone testing. |
 
 ### 1.2 JWT policy hardening
 
@@ -46,7 +46,7 @@
 | JWT-2 | When issuer/audience are configured, tokens must actually contain iss and aud claims (presence check) | Implemented | `crates/arco-api/src/context.rs:139`; `crates/arco-api/src/context.rs:142` | This is the "fail closed when unset/empty" runtime behavior if config has them. |
 | JWT-3 | Empty env vars are treated as unset (env_string trims + empty => None) | Implemented | `crates/arco-api/src/config.rs:518` | Enables the "empty env var behaves as unset" requirement. |
 | JWT-4 | Prod posture (non-dev + debug=false) fails closed unless non-empty jwt.issuer and jwt.audience are set | Implemented | (startup validation referenced in audit findings) `docs/catalog-metastore/evidence/plan-deltas.md:34` (describes requirement); core enforcement location identified in repo analysis | If you want this row to be purely code-cited, we should pin the exact `validate_config()` lines in `crates/arco-api/src/server.rs` in the matrix. |
-| JWT-5 | Task callback JWT validation sets issuer/audience constraints but does not mirror main-path "claim must be present/non-empty" checks | Partial | `crates/arco-api/src/routes/tasks.rs:572`; `crates/arco-api/src/routes/tasks.rs:575`; compare to main-path presence checks `crates/arco-api/src/context.rs:139` | Might still be OK if jsonwebtoken rejects missing claims under `set_issuer`/`set_audience`, but this is not the same explicit "presence" logic as main path. |
+| JWT-5 | Task callback JWT validation mirrors main-path "claim must be present/non-empty" checks for issuer and audience | Implemented | `crates/arco-api/src/routes/tasks.rs:590-606` (`require_task_issuer_claim`, `require_task_audience_claim`); tests at `crates/arco-api/src/routes/tasks.rs:1373-1452` | Now matches main-path behavior: when issuer/audience are configured, tokens without those claims are rejected. |
 | JWT-6 | JWKS is not implemented/wired (file existence != feature) | Missing | `docs/catalog-metastore/evidence/plan-deltas.md:234`; `crates/arco-api/src/lib.rs:52` | No `mod auth;` so `crates/arco-api/src/auth.rs` isn't compiled into the crate. |
 
 ### 1.3 /metrics protection + label policy
@@ -56,7 +56,7 @@
 | MET-1 | In Public posture, API /metrics is not reachable (404) | Implemented | `crates/arco-api/src/server.rs:442`; test `crates/arco-api/tests/api_integration.rs:109` | "Protection" is obscuring (404), not auth gating. |
 | MET-2 | In Dev/Private posture, API /metrics is reachable with no auth middleware | Partial | Router mounts metrics outside auth: `crates/arco-api/src/server.rs:448`; `crates/arco-api/src/server.rs:452` | Security depends on infra preventing untrusted reachability when api_public=false. |
 | MET-3 | API request metrics use route templates (not raw path) via MatchedPath | Implemented | `crates/arco-api/src/metrics.rs:90`; `crates/arco-api/src/metrics.rs:91` | Prevents raw-URL identifier leakage/high cardinality at the API layer. |
-| MET-4 | Compactor serves /metrics with no auth in code | Partial | `crates/arco-compactor/src/main.rs:960`; `crates/arco-compactor/src/main.rs:963` | Must be protected by infra (internal-only ingress / IAM). |
+| MET-4 | Compactor serves /metrics with optional auth gate | Implemented | `crates/arco-compactor/src/main.rs:895-1003` (trim + secret gate); `docs/runbooks/metrics-access.md:63`; `infra/monitoring/otel-collector.yaml:9` | `ARCO_METRICS_SECRET` is trimmed; empty/whitespace disables the gate; infra controls remain primary defense. |
 | MET-5 | Flow/orchestration metrics do not include tenant as a Prometheus label | Implemented | Label module `crates/arco-flow/src/metrics.rs:91-114` defines only safe labels (STATE, FROM_STATE, TO_STATE, OPERATION, QUEUE, RESULT, HANDLER, CONTROLLER, STATUS, SOURCE, SENSOR_TYPE); no tenant label present | Tenant label removed to prevent identifier leakage and cardinality risk. |
 
 ### 1.4 Minimal structured audit events
@@ -109,9 +109,9 @@
 | Claim ID | Claim | Status | Evidence | Notes / Gaps |
 |----------|-------|--------|----------|--------------|
 | OAS-1 | OpenAPI compliance test checks param-name + response-code subset vs spec | Implemented | `crates/arco-iceberg/tests/openapi_compliance.rs:116`; `crates/arco-iceberg/tests/openapi_compliance.rs:124` | This does not prove runtime behavior/schema. |
-| OAS-2 | /v1/config accepts warehouse query param but ignores it | Partial | `crates/arco-iceberg/src/routes/config.rs:34` | "Accepted-but-ignored" should be documented as such. |
+| OAS-2 | /v1/config accepts warehouse query param but ignores it | Implemented | `crates/arco-iceberg/src/routes/config.rs:18` (OpenAPI), `crates/arco-iceberg/src/routes/config.rs:34` (handler) | Documented in OpenAPI and code: accepted for compatibility, ignored (Arco uses tenant/workspace scoping). |
 | OAS-3 | /credentials documents planId and handler parses it (logged for observability) | Implemented | Doc param: `crates/arco-iceberg/src/routes/tables.rs:900`; `CredentialsQuery` extractor: `crates/arco-iceberg/src/routes/tables.rs:919`; span recording: `crates/arco-iceberg/src/routes/tables.rs:922-924` | planId is parsed and recorded in tracing span. OpenAPI documentation notes it's accepted but ignored for now (scan planning not implemented). |
-| OAS-4 | Pagination token pageToken is numeric offset (not opaque) | Partial | `crates/arco-iceberg/src/routes/utils.rs:57` | Potential incompatibility with clients expecting opaque tokens. |
+| OAS-4 | Pagination token pageToken is numeric offset (not opaque) | Implemented | `crates/arco-iceberg/src/routes/utils.rs:57`; OpenAPI docs: `crates/arco-iceberg/src/types/namespace.rs:17,29`, `crates/arco-iceberg/src/types/table.rs:45,53` | Documented as Arco-specific deviation from opaque token spec in OpenAPI field descriptions. |
 
 ---
 
@@ -132,9 +132,9 @@
 | Claim ID | Claim | Status | Evidence | Notes / Gaps |
 |----------|-------|--------|----------|--------------|
 | ENG-1 | Compatibility matrix doc exists with known-good configs | Implemented | `docs/iceberg-engine-compatibility.md:15`; Spark config `docs/iceberg-engine-compatibility.md:29`; Trino config `docs/iceberg-engine-compatibility.md:43` | Doc currently claims Spark/Trino/PyIceberg "Tested". |
-| ENG-2 | Nightly smoke/chaos workflows are enabled and running interop suites | Missing | `.github/workflows/nightly-chaos.yml:30`; `.github/workflows/nightly-chaos.yml:65` | All jobs are currently `if: false`. |
-| ENG-3 | Repo explicitly requires engine interop tests to go through API-layer auth model (debug=false, JWT) | Missing | `docs/catalog-metastore/evidence/plan-deltas.md:228` | Current automated interop doesn't meet this bar. |
-| ENG-4 | Existing "interop-ish" test mounts Iceberg router directly and uses custom headers | Partial | `crates/arco-integration-tests/tests/iceberg_rest_catalog.rs:121`; headers `crates/arco-integration-tests/tests/iceberg_rest_catalog.rs:131` | Good for protocol coverage, not end-to-end auth/infra posture. |
+| ENG-2 | Nightly smoke/chaos workflows are enabled and running interop suites | Missing | `.github/workflows/nightly-chaos.yml:28` | Currently disabled (`if: false` on jobs). Treat as planned hardening until enabled and producing execution evidence. |
+| ENG-3 | Repo explicitly requires engine interop tests to go through API-layer auth model (debug=false, JWT) | Implemented | Tests: `crates/arco-api/tests/api_integration.rs:1341-1505` (production mode rejects missing Authorization; bearer JWT accepted; RS256 accepted) | Confirms production-mode API auth behavior (tenant/workspace headers ignored; JWT required). |
+| ENG-4 | Existing "interop-ish" test mounts Iceberg router directly and uses custom headers | Implemented | `crates/arco-integration-tests/tests/iceberg_rest_catalog.rs:1` (scope docstring), `crates/arco-integration-tests/tests/iceberg_rest_catalog.rs:119` (header fallback config) | Explicitly scoped as "router-level protocol coverage"; module docstring clarifies API-layer auth is tested separately in ENG-3 (`crates/arco-api/tests/api_integration.rs:1341-1505`). |
 
 ---
 
@@ -143,17 +143,17 @@
 | Section | Implemented | Partial | Missing | Total |
 |---------|-------------|---------|---------|-------|
 | 0) Baseline | 2 | 0 | 0 | 2 |
-| 1.1 Debug guardrail | 4 | 1 | 0 | 5 |
-| 1.2 JWT policy | 4 | 1 | 1 | 6 |
-| 1.3 Metrics protection | 3 | 2 | 0 | 5 |
+| 1.1 Debug guardrail | 5 | 0 | 0 | 5 |
+| 1.2 JWT policy | 5 | 0 | 1 | 6 |
+| 1.3 Metrics protection | 4 | 1 | 0 | 5 |
 | 1.4 Audit events | 6 | 0 | 0 | 6 |
 | 1.5 Terraform PAP | 2 | 0 | 0 | 2 |
 | 1.6 IAM list semantics | 4 | 0 | 0 | 4 |
 | 2.1 Iceberg endpoints | 7 | 1 | 0 | 8 |
-| 2.2 OpenAPI alignment | 2 | 2 | 0 | 4 |
+| 2.2 OpenAPI alignment | 4 | 0 | 0 | 4 |
 | 3) Credential vending | 5 | 0 | 0 | 5 |
-| 4) Engine interop | 1 | 1 | 2 | 4 |
-| **TOTAL** | **40** | **8** | **3** | **51** |
+| 4) Engine interop | 3 | 0 | 1 | 4 |
+| **TOTAL** | **47** | **2** | **2** | **51** |
 
 ---
 
@@ -163,9 +163,11 @@
 |-----|----------|----------|--------|
 | ~~Iceberg REST parity gaps: rename / metrics reporting~~ | `crates/arco-iceberg/src/routes/catalog.rs:59`, `crates/arco-iceberg/src/routes/tables.rs:999` | ~~P0~~ | **Closed** |
 | Iceberg REST: multi-table atomic transactions | `crates/arco-iceberg/src/routes/catalog.rs:180` (single-table bridge only) | P1 | Partial (bridge exists, multi-table backlog) |
-| OpenAPI/runtime mismatches: pagination token numeric | `crates/arco-iceberg/src/routes/utils.rs:57` | P1 | Open |
-| IAM list semantics: runbook exists but execution evidence missing | `docs/catalog-metastore/evidence/security-ops-evidence-pack.md:154` | P1 | Open |
-| JWKS explicitly backlog / not wired | `docs/catalog-metastore/evidence/plan-deltas.md:234`; `crates/arco-api/src/lib.rs:52` | Backlog | Deferred |
+| ~~OpenAPI/runtime mismatches: pagination token numeric~~ | `crates/arco-iceberg/src/types/namespace.rs:17,29`, `crates/arco-iceberg/src/types/table.rs:45,53` | ~~P1~~ | **Closed** |
+| IAM list semantics: runbook exists but execution evidence missing | `docs/catalog-metastore/evidence/security-ops-evidence-pack.md:154` | P1 | Open (awaiting sandbox execution) |
+| JWKS explicitly backlog / not wired | `docs/catalog-metastore/evidence/plan-deltas.md:218`; `crates/arco-api/src/lib.rs:52` | Backlog | Deferred (PR-13) |
+| Catalog actor attribution | `docs/catalog-metastore/evidence/plan-deltas.md:219` | Backlog | Deferred (PR-14) |
+| ID spec alignment | `docs/catalog-metastore/evidence/plan-deltas.md:220` | Backlog | Deferred (PR-15) |
 | ~~OpenAPI/runtime mismatches: planId documented but ignored~~ | `crates/arco-iceberg/src/routes/tables.rs:919-924` | ~~P0~~ | **Closed** |
 | ~~Credential vending auditing: audit action exists but not emitted~~ | `crates/arco-iceberg/src/audit.rs:67,96`; `crates/arco-iceberg/src/routes/tables.rs:1223-1272` | ~~P0~~ | **Closed** |
 | ~~Iceberg commit auditing: audit action exists but not emitted~~ | `crates/arco-iceberg/src/audit.rs:129,165`; `crates/arco-iceberg/src/routes/tables.rs:735-788` | ~~P0~~ | **Closed** |
@@ -176,4 +178,13 @@
 
 *Generated 2026-01-06 by automated audit*  
 *Updated 2026-01-06: AUD-5, AUD-6, OAS-3, MET-5, IAM-4 verified as Implemented; CRED-5 verified as Implemented*  
-*Updated 2026-01-07: ICE-6 (rename), ICE-8 (metrics) verified as Implemented; ICE-7 (transactions) verified as Partial (single-table bridge)*
+*Updated 2026-01-07: ICE-6 (rename), ICE-8 (metrics) verified as Implemented; ICE-7 (transactions) verified as Partial (single-table bridge)*  
+*Updated 2026-01-08: DBG-5 verified as Implemented (fail-closed header fallback with explicit opt-in via allow_header_fallback config)*  
+*Updated 2026-01-08: OAS-4 verified as Implemented (pageToken documented as numeric offset in OpenAPI field descriptions)*  
+*Updated 2026-01-08: ENG-2 corrected to Missing (nightly-chaos.yml jobs still gated by `if: false`)*  
+*Updated 2026-01-08: ENG-3 verified as Implemented (added Iceberg JWT auth tests in api_integration.rs)*  
+*Updated 2026-01-08: IAM execution evidence template added to security-ops-evidence-pack.md; awaiting sandbox execution*
+*Updated 2026-01-08: OAS-2 (warehouse param) verified as Implemented (documented in OpenAPI + code comments)*
+*Updated 2026-01-08: ENG-4 (interop test scope) verified as Implemented (module docstring clarifies router-level vs API-layer coverage)*
+*Updated 2026-01-08: Backlog items explicitly documented (JWKS PR-13, actor attribution PR-14, ID spec PR-15)*
+*Updated 2026-01-08: MET-4 (compactor /metrics) upgraded to Implemented via ARCO_METRICS_SECRET code gate*

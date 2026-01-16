@@ -2,7 +2,7 @@
 //!
 //! Run with: `cargo xtask <command>`
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::Path;
 use std::process::Command;
@@ -70,6 +70,7 @@ enum Commands {
         #[arg(long, value_name = "BUCKET")]
         bucket: Option<String>,
     },
+    ParityMatrixCheck,
 }
 
 fn main() -> Result<()> {
@@ -81,6 +82,7 @@ fn main() -> Result<()> {
         Commands::Coverage => run_coverage(),
         Commands::Doctor => run_doctor(),
         Commands::AdrCheck => run_adr_check(),
+        Commands::ParityMatrixCheck => run_parity_matrix_check(),
         Commands::VerifyIntegrity {
             verbose,
             dry_run,
@@ -97,6 +99,7 @@ fn run_ci() -> Result<()> {
 
     run_doctor()?;
     run_adr_check()?;
+    run_parity_matrix_check()?;
 
     run_cmd("cargo", &["check", "--workspace", "--all-features"])?;
     run_cmd("cargo", &["fmt", "--all", "--check"])?;
@@ -342,6 +345,164 @@ fn run_adr_check() -> Result<()> {
 
     println!("All ADRs present and indexed!");
     Ok(())
+}
+
+fn run_parity_matrix_check() -> Result<()> {
+    println!("Validating parity matrix evidence...\n");
+
+    let matrix_path = "docs/parity/dagster-parity-matrix.md";
+    let content = std::fs::read_to_string(matrix_path)
+        .with_context(|| format!("Parity matrix not found: {matrix_path}"))?;
+
+    let mut current_section: Option<String> = None;
+    let mut header: Option<HashMap<String, usize>> = None;
+    let mut in_table = false;
+    let mut errors = Vec::new();
+
+    for (idx, raw_line) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw_line.trim();
+
+        if let Some(section) = line.strip_prefix("## ") {
+            current_section = Some(section.trim().to_string());
+            header = None;
+            in_table = false;
+            continue;
+        }
+
+        if line.starts_with('|') && line.contains("Capability") && line.contains("Status") {
+            let headers = split_md_table_row(line);
+            let header_map: HashMap<String, usize> = headers
+                .into_iter()
+                .enumerate()
+                .map(|(i, h)| (h, i))
+                .collect();
+
+            let required_cols = [
+                "Capability",
+                "Status",
+                "Evidence (Code)",
+                "Evidence (Tests)",
+                "Evidence (CI)",
+            ];
+            for col in required_cols {
+                if !header_map.contains_key(col) {
+                    errors.push(format!(
+                        "{matrix_path}:{line_no}: missing required column '{col}' in table header"
+                    ));
+                }
+            }
+
+            header = Some(header_map);
+            in_table = true;
+            continue;
+        }
+
+        if !line.starts_with('|') {
+            in_table = false;
+            continue;
+        }
+
+        if !in_table {
+            continue;
+        }
+
+        if line.starts_with("|---") || line.contains("|---|") {
+            continue;
+        }
+
+        let Some(header) = header.as_ref() else {
+            continue;
+        };
+
+        let row = split_md_table_row(line);
+
+        let get = |name: &str| -> Option<&str> {
+            header
+                .get(name)
+                .and_then(|idx| row.get(*idx))
+                .map(String::as_str)
+        };
+
+        let status = get("Status").unwrap_or("").trim();
+        if !status.starts_with("Implemented") {
+            continue;
+        }
+
+        let capability = get("Capability").unwrap_or("<missing capability>").trim();
+        let code = get("Evidence (Code)").unwrap_or("").trim();
+        let tests = get("Evidence (Tests)").unwrap_or("").trim();
+        let ci = get("Evidence (CI)").unwrap_or("").trim();
+
+        let location = match current_section.as_deref() {
+            Some(section) => format!("{matrix_path}:{line_no} [{section}] {capability}"),
+            None => format!("{matrix_path}:{line_no} {capability}"),
+        };
+
+        if code.is_empty() {
+            errors.push(format!("{location}: missing Evidence (Code)"));
+        }
+        if tests.is_empty() {
+            errors.push(format!("{location}: missing Evidence (Tests)"));
+        }
+        if ci.is_empty() {
+            errors.push(format!("{location}: missing Evidence (CI)"));
+        }
+
+        for field in [code, tests, ci] {
+            if field.contains("docs/plans/") {
+                errors.push(format!(
+                    "{location}: contains forbidden docs/plans reference in evidence"
+                ));
+            }
+        }
+
+        if !ci.contains(".github/workflows/ci.yml") {
+            errors.push(format!(
+                "{location}: Evidence (CI) must reference .github/workflows/ci.yml"
+            ));
+        }
+
+        let tests_looks_real = tests.contains("pytest")
+            || tests.contains("cargo test")
+            || tests.contains("--test")
+            || tests.contains("crates/")
+            || tests.contains(".rs:")
+            || tests.contains("test_")
+            || tests.contains("parity_");
+        if !tests_looks_real {
+            errors.push(format!(
+                "{location}: Evidence (Tests) must point at a CI-gated test (expected file path, 'cargo test', 'pytest', or a test identifier)"
+            ));
+        }
+
+        let ci_looks_real = ci.contains("cargo ") || ci.contains("pytest");
+        if !ci_looks_real {
+            errors.push(format!(
+                "{location}: Evidence (CI) must include the job command (expected 'cargo …' or 'pytest …')"
+            ));
+        }
+    }
+
+    if !errors.is_empty() {
+        println!("Parity matrix evidence errors:");
+        for err in &errors {
+            println!("  - {err}");
+        }
+        anyhow::bail!("Parity matrix check failed with {} error(s)", errors.len());
+    }
+
+    println!("Parity matrix evidence looks good!");
+    Ok(())
+}
+
+fn split_md_table_row(line: &str) -> Vec<String> {
+    line.trim()
+        .trim_start_matches('|')
+        .trim_end_matches('|')
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
 }
 
 // ============================================================================

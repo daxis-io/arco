@@ -1,0 +1,86 @@
+# Dagster OSS → Arco Parity Matrix
+
+Governed by:
+- `docs/parity/dagster-parity-01-charter.md`
+- `docs/parity/dagster-parity-matrix-template.md`
+
+**Evidence rules**
+- “Implemented” rows MUST include: code path(s) + CI-gated proving test(s) + CI job/command from `.github/workflows/ci.yml`.
+- Do not use `docs/plans/**` as evidence.
+
+**CI anchors (most common)**
+- Rust (non-`arco-flow`) tests: `.github/workflows/ci.yml:115` (`test` job)
+- `arco-flow` tests: `.github/workflows/ci.yml:117` (`test` job) runs `cargo test -p arco-flow --features test-utils`
+- Python CLI integration tests: `.github/workflows/ci.yml:135` (`python-tests` job)
+
+## Scheduling
+
+| Capability | Arco Feature | Status | Proof Level Required | Evidence (Code) | Evidence (Tests) | Evidence (CI) | Owner | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Schedule tick idempotency key uses `tick_id` | Orchestration event envelope + tick modeling | Implemented | integration | `crates/arco-flow/src/orchestration/events/mod.rs:688` | `crates/arco-flow/tests/orchestration_automation_tests.rs:10` (`test_schedule_ticked_event_idempotency_key`) | `.github/workflows/ci.yml:117` (job `test`) | TBD | Narrow proof: key format only (not full scheduler daemon parity) |
+| Duplicate schedule ticks with same `tick_id` are projection-idempotent | Compactor fold: schedule tick projection | Implemented | integration | `crates/arco-flow/src/orchestration/compactor/fold.rs:1048` (global idempotency gate)<br>`crates/arco-flow/src/orchestration/compactor/fold.rs:4620` (`test_fold_schedule_ticked_idempotent_with_same_tick_id`) | `crates/arco-flow/src/orchestration/compactor/fold.rs:4620` (`test_fold_schedule_ticked_idempotent_with_same_tick_id`) | `.github/workflows/ci.yml:117` (job `test`) | TBD | Proves replay/duplicate-safe projection updates (not “catchup” scheduling) |
+| Tick history and primary key schema are stable | Layer-2 Parquet schema | Implemented | integration | `crates/arco-flow/src/orchestration/compactor/fold.rs:962` (`schedule_ticks` keyed by `tick_id`)<br>`crates/arco-flow/src/orchestration/compactor/fold.rs:533` (`ScheduleTickRow`) | `crates/arco-flow/tests/orchestration_schema_tests.rs:58` (`test_schedule_tick_row_schema`) | `.github/workflows/ci.yml:117` (job `test`) | TBD | Schema invariants only |
+| Catchup semantics (evaluate missed ticks after outage) | Schedule controller | Planned | integration | `crates/arco-flow/src/orchestration/controllers/schedule.rs` | Missing proof: CI-gated test asserting bounded catchup + tick creation + no duplicates | `.github/workflows/ci.yml:117` (job `test`) | TBD | Dagster bounds catchup runs; Arco needs parity test for outage recovery |
+
+## Sensors
+
+| Capability | Arco Feature | Status | Proof Level Required | Evidence (Code) | Evidence (Tests) | Evidence (CI) | Owner | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Push sensor idempotency keys dedupe duplicate deliveries (message-id based) | SensorEvaluated event idempotency + compactor fold dedupe | Implemented | integration | `crates/arco-flow/src/orchestration/events/mod.rs:690` (push: `sensor_eval:{sensor_id}:msg:{message_id}`)<br>`crates/arco-flow/src/orchestration/compactor/fold.rs:1048` (global idempotency gate) | `crates/arco-flow/tests/orchestration_sensor_tests.rs:29` (`test_sensor_eval_idempotency_dedupes_duplicate_message`) | `.github/workflows/ci.yml:117` (job `test`) | TBD | Proof is on projection dedupe, not on external Pub/Sub ingestion |
+| Poll sensor idempotency based on input cursor (CAS-friendly) | SensorEvaluated idempotency for poll sensors | Implemented | unit | `crates/arco-flow/src/orchestration/events/mod.rs:699` (poll: includes `poll_epoch` + `sha256(cursor_before)` ) | `crates/arco-flow/tests/orchestration_automation_tests.rs:152` (`test_sensor_evaluated_poll_idempotency_uses_cursor_before`) | `.github/workflows/ci.yml:117` (job `test`) | TBD | Dagster sensor cursors are durable; Arco parity still needs end-to-end cursor persistence tests |
+| Durable sensor cursor + minimum evaluation interval | Sensor controller + state model | Planned | integration | `crates/arco-flow/src/orchestration/controllers/sensor.rs` | Missing proof: CI-gated test proving cursor persistence across restarts and min-interval behavior | `.github/workflows/ci.yml:117` (job `test`) | TBD | Dagster semantics: cursor persists and `minimum_interval_seconds` bounds evaluations |
+
+## run_key / run identity
+
+| Capability | Arco Feature | Status | Proof Level Required | Evidence (Code) | Evidence (Tests) | Evidence (CI) | Owner | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Strong idempotency: duplicate `run_key` returns existing run (reservation blob) | `run_key` reservation in storage (`DoesNotExist` precondition) | Implemented | integration | `crates/arco-flow/src/orchestration/run_key.rs:143` (`reserve_run_key`)<br>`crates/arco-flow/src/orchestration/run_key.rs:233` (`get_reservation`) | `crates/arco-flow/src/orchestration/run_key.rs:322` (`test_reserve_run_key_duplicate_returns_existing`) | `.github/workflows/ci.yml:117` (job `test`) | TBD | Reservation path is hashed (`run_keys/{sha256[..40]}.json`) |
+| Conflict detection: same `run_key` + different trigger payload is detected | Reservation fingerprint check + API behavior | Implemented | integration | `crates/arco-flow/src/orchestration/run_key.rs:102` (`ReservationResult::FingerprintMismatch`)<br>`crates/arco-api/src/routes/orchestration.rs:3653` (`test_trigger_run_conflicts_on_fingerprint_mismatch`) | `crates/arco-flow/src/orchestration/run_key.rs:391` (`test_reserve_run_key_detects_fingerprint_mismatch`)<br>`crates/arco-api/src/routes/orchestration.rs:3653` (`test_trigger_run_conflicts_on_fingerprint_mismatch`) | `.github/workflows/ci.yml:115` + `.github/workflows/ci.yml:117` (job `test`) | TBD | Dagster uses `run_key` to prevent duplicates; Arco adds payload fingerprinting to prevent semantic drift |
+| run_key indexing + conflict recording in projections | Compactor fold RunRequested logic + conflict table | Implemented | integration | `crates/arco-flow/src/orchestration/compactor/fold.rs:2348` (`fold_run_requested`) | `crates/arco-flow/tests/orchestration_correctness_tests.rs:510` (`test_fold_run_requested_creates_run_key_index`)<br>`crates/arco-flow/tests/orchestration_correctness_tests.rs:528` (`test_fold_run_requested_detects_conflict_on_fingerprint_mismatch`) | `.github/workflows/ci.yml:117` (job `test`) | TBD | This is projection-level; reservation semantics are the strong API-level gate |
+
+## Partitions
+
+| Capability | Arco Feature | Status | Proof Level Required | Evidence (Code) | Evidence (Tests) | Evidence (CI) | Owner | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Canonical partition key encoding is deterministic (order-insensitive) | TriggerRun partition key canonicalization | Implemented | unit | `crates/arco-api/src/routes/orchestration.rs:1317` (`build_partition_key` → canonical string)<br>`crates/arco-api/src/routes/orchestration.rs:3505` (test) | `crates/arco-api/src/routes/orchestration.rs:3505` (`test_build_task_defs_canonical_partition_key`) | `.github/workflows/ci.yml:115` (job `test`) | TBD | Enables stable request fingerprinting across client ordering |
+| Backfill supports range/filter partition selectors | Backfill API + partition resolver | Partial | integration | `crates/arco-flow/src/orchestration/events/backfill_events.rs:49` (`PartitionSelector::{Range,Filter}`)<br>`crates/arco-api/src/routes/orchestration.rs:2825` (`create_backfill` rejects non-explicit selectors today) | Existing CI proves current limitation: `crates/arco-api/tests/orchestration_api_tests.rs:96` (`test_create_backfill_rejects_non_explicit_selector`) | `.github/workflows/ci.yml:115` (job `test`) | TBD | Parity gap: API currently supports explicit lists only; needs a `PartitionResolver` and CI parity tests |
+| Partition definitions (daily/static/multi-dim/dynamic) | SDK + planner + catalog | Planned | e2e | `python/arco/src/arco_flow/types` (partition types) | Missing proof: CI-gated E2E test that defines partitioned assets and triggers partitioned runs/backfills | `.github/workflows/ci.yml` | TBD | Dagster supports multiple partition definition types |
+
+## Backfills
+
+| Capability | Arco Feature | Status | Proof Level Required | Evidence (Code) | Evidence (Tests) | Evidence (CI) | Owner | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Backfill selector is compact (uses selector, not full list) | BackfillCreated event schema | Implemented | integration | `crates/arco-flow/src/orchestration/events/backfill_events.rs:49` (`PartitionSelector`)<br>`crates/arco-flow/src/orchestration/events/mod.rs:716` (BackfillCreated idempotency) | `crates/arco-flow/tests/orchestration_automation_tests.rs:283` (`test_backfill_created_uses_compact_selector`) | `.github/workflows/ci.yml:117` (job `test`) | TBD | Proves event representation; does not prove resolver exists for all selector types |
+| Backfill state transitions are monotonic via `state_version` | BackfillStateChanged event idempotency | Implemented | integration | `crates/arco-flow/src/orchestration/events/mod.rs:726` (`backfill_state:{backfill_id}:{state_version}`) | `crates/arco-flow/tests/orchestration_automation_tests.rs:261` (`test_backfill_state_changed_uses_state_version`) | `.github/workflows/ci.yml:117` (job `test`) | TBD | This is event/idempotency semantics, not full pause/resume execution |
+| Backfill create is idempotent on `Idempotency-Key` header | REST API idempotency | Implemented | integration | `crates/arco-api/src/routes/orchestration.rs:2825` (`create_backfill`) | `crates/arco-api/tests/orchestration_api_tests.rs:129` (`test_create_backfill_idempotent_on_key`) | `.github/workflows/ci.yml:115` (job `test`) | TBD | Dagster parity target: backfill create must be duplicate-safe |
+| Backfill pause/resume/cancel/retry-failed semantics | Backfill controller + API | Planned | e2e | `crates/arco-flow/src/orchestration/controllers/backfill.rs` | Missing proof: CI-gated tests for pause/resume/cancel and retry-failed scope (suggested in `docs/parity/dagster-parity-09-partitions-backfills.md:62`) | `.github/workflows/ci.yml:117` (job `test`) | TBD | Must prove no duplicate partitions and retry-failed targets only failures |
+
+## Partition status
+
+| Capability | Arco Feature | Status | Proof Level Required | Evidence (Code) | Evidence (Tests) | Evidence (CI) | Owner | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Partition status row has stable primary keys and required fields | Layer-2 schema for partition status | Implemented | integration | `crates/arco-flow/src/orchestration/compactor/fold.rs:782` (`PartitionStatusRow`) | `crates/arco-flow/tests/orchestration_schema_tests.rs:228` (`test_partition_status_row_schema`) | `.github/workflows/ci.yml:117` (job `test`) | TBD | Schema invariants only |
+| Staleness reasons match core Dagster concepts (never materialized, freshness, upstream change, code change) | Query-time staleness computation | Implemented | unit | `crates/arco-flow/src/orchestration/controllers/partition_status.rs:71` (`compute_staleness`)<br>`crates/arco-flow/src/orchestration/controllers/partition_status.rs:132` (`compute_staleness_with_upstreams`) | `crates/arco-flow/src/orchestration/controllers/partition_status.rs:233` (`test_staleness_never_materialized`) | `.github/workflows/ci.yml:117` (job `test`) | TBD | Does not yet prove API report pagination or explanation fidelity |
+
+## Staleness / reconciliation
+
+| Capability | Arco Feature | Status | Proof Level Required | Evidence (Code) | Evidence (Tests) | Evidence (CI) | Owner | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Read-only staleness report: “what is stale and why” | Partition status + staleness computation | Partial | integration | `docs/parity/dagster-parity-10-staleness-reconciliation.md:25` (target semantics)<br>`crates/arco-flow/src/orchestration/controllers/partition_status.rs:71` | Missing proof: CI-gated API test that lists stale partitions with deterministic ordering and stable reason codes | `.github/workflows/ci.yml` | TBD | Current unit tests cover computation but not operator-facing report |
+| Reconciliation planning: deterministic “what should run” for stale assets | Reconciliation planner | Planned | integration | (no single owner module yet) | Missing proof: new CI-gated tests (suggested `crates/arco-flow/tests/orchestration_staleness_tests.rs` in `docs/parity/dagster-parity-10-staleness-reconciliation.md:76`) | `.github/workflows/ci.yml:117` (job `test`) | TBD | Dagster OSS has declarative automation; Arco tracks EX-09 phased delivery in `docs/audits/arco-flow-dagster-exception-planning.md:47` |
+
+## Selection / reruns (run UX)
+
+| Capability | Arco Feature | Status | Proof Level Required | Evidence (Code) | Evidence (Tests) | Evidence (CI) | Owner | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Trigger run with explicit selection and partitions (API contract) | REST TriggerRun + request fingerprinting | Implemented | integration | `crates/arco-api/src/routes/orchestration.rs:1678` (`trigger_run`)<br>`crates/arco-api/src/routes/orchestration.rs:1719` (run_key reservation path) | `crates/arco-api/src/routes/orchestration.rs:3548` (`test_trigger_run_reemits_when_reservation_exists`) | `.github/workflows/ci.yml:115` (job `test`) | TBD | Proves run_key “existing run returned” behavior and ledger persistence; does not prove selection closure semantics |
+| CLI surface: `run` sends selection/partition/runKey; `status` and `logs` query the run | Python CLI integration | Implemented | integration | `python/arco/src/arco_flow/cli/commands/run.py`<br>`python/arco/src/arco_flow/cli/commands/status.py`<br>`python/arco/src/arco_flow/cli/commands/logs.py` | `python/arco/tests/integration/test_cli_api.py:222` (`test_cli_run_status_logs`) | `.github/workflows/ci.yml:135` (job `python-tests`) | TBD | Operator UX parity is CLI-first; UI parity is deferred per `docs/audits/arco-flow-dagster-exception-planning.md:40` |
+| Rerun-from-failure and subset reruns | API + planner + run lineage | Planned | e2e | `docs/parity/dagster-parity-08-run-ux-gaps.md:23` (requirements) | Missing proof: “uncheatable” selection + rerun tests (suggested `docs/parity/dagster-parity-08-run-ux-gaps.md:60`) | `.github/workflows/ci.yml` | TBD | Dagster UI has “Re-execute”; Arco parity requires explicit contract + lineage |
+
+## Production hardening
+
+| Capability | Arco Feature | Status | Proof Level Required | Evidence (Code) | Evidence (Tests) | Evidence (CI) | Owner | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Duplicate/out-of-order delivery does not create duplicate projections (global idempotency gate) | Compactor fold idempotency index | Implemented | integration | `crates/arco-flow/src/orchestration/compactor/fold.rs:1048` (drops already-seen idempotency keys)<br>`crates/arco-flow/src/orchestration/compactor/fold.rs:2689` (`record_idempotency_key`) | `crates/arco-flow/tests/orchestration_sensor_tests.rs:29` (`test_sensor_eval_idempotency_dedupes_duplicate_message`) | `.github/workflows/ci.yml:117` (job `test`) | TBD | Serves as a core at-least-once safety primitive |
+| HA / leader election prevents duplicate ticks/evals under leader churn | Evaluator HA | Planned | prod | `docs/parity/dagster-parity-11-production-hardening.md:50` (requirements) | Missing proof: deterministic simulation tests for leader change mid-evaluation | `.github/workflows/ci.yml` | TBD | Charter requires CI-gated proofs for “Implemented” parity claims |
+| DR: rebuild projections from ledger without bucket listing | Compactor/manifest-driven rebuild | Planned | prod | `docs/parity/dagster-parity-11-production-hardening.md:54` | Missing proof: CI-gated rebuild-from-ledger test and documented procedure | `.github/workflows/ci.yml` | TBD | Must be repeatable and auditable

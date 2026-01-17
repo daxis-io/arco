@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use chrono::{Duration, TimeZone, Utc};
 
+use arco_flow::orchestration::compactor::FoldState;
 use arco_flow::orchestration::compactor::fold::{
     BackfillChunkRow, BackfillRow, RunRow, ScheduleDefinitionRow, ScheduleStateRow, SensorStateRow,
 };
@@ -16,7 +17,8 @@ use arco_flow::orchestration::controllers::backfill::{BackfillController, Partit
 use arco_flow::orchestration::controllers::schedule::ScheduleController;
 use arco_flow::orchestration::controllers::sensor::PollSensorController;
 use arco_flow::orchestration::events::{
-    BackfillState, OrchestrationEventData, SensorStatus, SourceRef, TickStatus,
+    BackfillState, ChunkState, OrchestrationEvent, OrchestrationEventData, SensorEvalStatus,
+    SensorStatus, SourceRef, TickStatus, TriggerSource,
 };
 
 #[derive(Debug)]
@@ -364,4 +366,278 @@ fn parity_m2_backfill_reconcile_returns_empty_when_compaction_watermarks_are_sta
     );
 
     assert!(events.is_empty());
+}
+
+fn poll_sensor_evaluated_event(
+    sensor_id: &str,
+    cursor_before: Option<&str>,
+    cursor_after: Option<&str>,
+    expected_state_version: Option<u32>,
+) -> OrchestrationEvent {
+    OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::SensorEvaluated {
+            sensor_id: sensor_id.to_string(),
+            eval_id: format!("eval_{sensor_id}"),
+            cursor_before: cursor_before.map(ToString::to_string),
+            cursor_after: cursor_after.map(ToString::to_string),
+            expected_state_version,
+            trigger_source: TriggerSource::Poll {
+                poll_epoch: 1736935200,
+            },
+            run_requests: vec![],
+            status: SensorEvalStatus::NoNewData,
+        },
+    )
+}
+
+#[test]
+fn parity_m2_poll_sensor_cursor_cas_rejects_stale_expected_version() {
+    let mut state = FoldState::new();
+
+    state.sensor_state.insert(
+        "01HQ456POLLSENSOR".into(),
+        SensorStateRow {
+            tenant_id: "tenant-abc".into(),
+            workspace_id: "workspace-prod".into(),
+            sensor_id: "01HQ456POLLSENSOR".into(),
+            cursor: Some("cursor_v1".into()),
+            last_evaluation_at: None,
+            last_eval_id: None,
+            status: SensorStatus::Active,
+            state_version: 2,
+            row_version: String::new(),
+        },
+    );
+
+    let event = poll_sensor_evaluated_event(
+        "01HQ456POLLSENSOR",
+        Some("cursor_v1"),
+        Some("cursor_v2"),
+        Some(1),
+    );
+
+    state.fold_event(&event);
+
+    let sensor_state = state
+        .sensor_state
+        .get("01HQ456POLLSENSOR")
+        .expect("sensor state should exist");
+
+    assert_eq!(sensor_state.cursor.as_deref(), Some("cursor_v1"));
+    assert_eq!(sensor_state.state_version, 2);
+
+    let eval_id = match &event.data {
+        OrchestrationEventData::SensorEvaluated { eval_id, .. } => eval_id,
+        _ => unreachable!("expected SensorEvaluated"),
+    };
+    let eval_row = state
+        .sensor_evals
+        .get(eval_id)
+        .expect("sensor eval row should exist");
+    assert!(matches!(
+        eval_row.status,
+        SensorEvalStatus::SkippedStaleCursor
+    ));
+}
+
+#[test]
+fn parity_m2_poll_sensor_cursor_cas_accepts_matching_expected_version() {
+    let mut state = FoldState::new();
+
+    state.sensor_state.insert(
+        "01HQ456POLLSENSOR".into(),
+        SensorStateRow {
+            tenant_id: "tenant-abc".into(),
+            workspace_id: "workspace-prod".into(),
+            sensor_id: "01HQ456POLLSENSOR".into(),
+            cursor: Some("cursor_v1".into()),
+            last_evaluation_at: None,
+            last_eval_id: None,
+            status: SensorStatus::Active,
+            state_version: 2,
+            row_version: String::new(),
+        },
+    );
+
+    let event = poll_sensor_evaluated_event(
+        "01HQ456POLLSENSOR",
+        Some("cursor_v1"),
+        Some("cursor_v2"),
+        Some(2),
+    );
+
+    state.fold_event(&event);
+
+    let sensor_state = state
+        .sensor_state
+        .get("01HQ456POLLSENSOR")
+        .expect("sensor state should exist");
+
+    assert_eq!(sensor_state.cursor.as_deref(), Some("cursor_v2"));
+    assert_eq!(sensor_state.state_version, 3);
+}
+
+#[test]
+fn parity_m2_backfill_pause_resume_cancel_transitions_are_monotonic() {
+    let resolver = Arc::new(StaticPartitionResolver::new(vec!["2025-01-01".into()]));
+    let controller = BackfillController::new(resolver);
+
+    let current = BackfillRow {
+        tenant_id: "tenant-abc".into(),
+        workspace_id: "workspace-prod".into(),
+        backfill_id: "bf_001".into(),
+        asset_selection: vec!["analytics.daily".into()],
+        partition_selector: arco_flow::orchestration::events::PartitionSelector::Explicit {
+            partition_keys: vec!["2025-01-01".into()],
+        },
+        chunk_size: 2,
+        max_concurrent_runs: 1,
+        state: BackfillState::Running,
+        state_version: 7,
+        total_partitions: 1,
+        planned_chunks: 0,
+        completed_chunks: 0,
+        failed_chunks: 0,
+        parent_backfill_id: None,
+        created_at: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+        row_version: "row_01".into(),
+    };
+
+    let paused = controller
+        .pause("bf_001", &current, "tenant-abc", "workspace-prod")
+        .expect("pause should succeed");
+
+    assert_eq!(paused.idempotency_key, "backfill_state:bf_001:8:PAUSED");
+    let OrchestrationEventData::BackfillStateChanged {
+        from_state,
+        to_state,
+        state_version,
+        ..
+    } = &paused.data
+    else {
+        panic!("expected BackfillStateChanged");
+    };
+    assert_eq!(*from_state, BackfillState::Running);
+    assert_eq!(*to_state, BackfillState::Paused);
+    assert_eq!(*state_version, 8);
+
+    let paused_row = BackfillRow {
+        state: BackfillState::Paused,
+        state_version: 8,
+        ..current.clone()
+    };
+
+    let resumed = controller
+        .resume("bf_001", &paused_row, "tenant-abc", "workspace-prod")
+        .expect("resume should succeed");
+
+    assert_eq!(resumed.idempotency_key, "backfill_state:bf_001:9:RUNNING");
+    let OrchestrationEventData::BackfillStateChanged {
+        from_state,
+        to_state,
+        state_version,
+        ..
+    } = &resumed.data
+    else {
+        panic!("expected BackfillStateChanged");
+    };
+    assert_eq!(*from_state, BackfillState::Paused);
+    assert_eq!(*to_state, BackfillState::Running);
+    assert_eq!(*state_version, 9);
+
+    let cancelled = controller
+        .cancel("bf_001", &current, "tenant-abc", "workspace-prod")
+        .expect("cancel should succeed");
+
+    assert_eq!(
+        cancelled.idempotency_key,
+        "backfill_state:bf_001:8:CANCELLED"
+    );
+}
+
+#[test]
+fn parity_m2_retry_failed_only_targets_failed_partitions_deterministically() {
+    let resolver = Arc::new(StaticPartitionResolver::new(vec!["2025-01-01".into()]));
+    let controller = BackfillController::new(resolver);
+
+    let parent = BackfillRow {
+        tenant_id: "tenant-abc".into(),
+        workspace_id: "workspace-prod".into(),
+        backfill_id: "bf_parent".into(),
+        asset_selection: vec!["analytics.daily".into()],
+        partition_selector: arco_flow::orchestration::events::PartitionSelector::Range {
+            start: "2025-01-01".into(),
+            end: "2025-01-03".into(),
+        },
+        chunk_size: 2,
+        max_concurrent_runs: 1,
+        state: BackfillState::Failed,
+        state_version: 3,
+        total_partitions: 3,
+        planned_chunks: 2,
+        completed_chunks: 1,
+        failed_chunks: 1,
+        parent_backfill_id: None,
+        created_at: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+        row_version: "row_parent".into(),
+    };
+
+    let failed_chunks = vec![BackfillChunkRow {
+        tenant_id: "tenant-abc".into(),
+        workspace_id: "workspace-prod".into(),
+        chunk_id: "bf_parent:0".into(),
+        backfill_id: "bf_parent".into(),
+        chunk_index: 0,
+        partition_keys: vec![
+            "2025-01-02".into(),
+            "2025-01-01".into(),
+            "2025-01-01".into(),
+        ],
+        run_key: "backfill:bf_parent:chunk:0".into(),
+        run_id: None,
+        state: ChunkState::Failed,
+        row_version: "row_chunk".into(),
+    }];
+
+    let event = controller
+        .retry_failed(
+            "bf_retry",
+            &parent,
+            &failed_chunks,
+            "retry_req_001",
+            "tenant-abc",
+            "workspace-prod",
+        )
+        .expect("retry_failed should succeed");
+
+    assert_eq!(
+        event.idempotency_key,
+        "backfill_retry:bf_parent:retry_req_001"
+    );
+
+    let OrchestrationEventData::BackfillCreated {
+        backfill_id,
+        parent_backfill_id,
+        partition_selector,
+        ..
+    } = &event.data
+    else {
+        panic!("expected BackfillCreated");
+    };
+
+    assert_eq!(backfill_id, "bf_retry");
+    assert_eq!(parent_backfill_id.as_deref(), Some("bf_parent"));
+
+    let arco_flow::orchestration::events::PartitionSelector::Explicit { partition_keys } =
+        partition_selector
+    else {
+        panic!("expected explicit partition selector");
+    };
+
+    assert_eq!(
+        partition_keys,
+        &vec!["2025-01-01".to_string(), "2025-01-02".to_string()]
+    );
 }

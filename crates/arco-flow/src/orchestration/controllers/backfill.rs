@@ -1237,7 +1237,9 @@ mod tests {
 
         // Idempotency key uses state_version
         assert!(
-            event.idempotency_key.contains("backfill_state:bf_001:3"),
+            event
+                .idempotency_key
+                .contains("backfill_state:bf_001:3:PAUSED"),
             "Idempotency key should contain version: {}",
             event.idempotency_key
         );

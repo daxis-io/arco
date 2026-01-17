@@ -13,7 +13,8 @@ use arco_core::{MemoryBackend, ScopedStorage};
 use arco_flow::error::Result;
 use arco_flow::orchestration::compactor::FoldState;
 use arco_flow::orchestration::events::{
-    OrchestrationEvent, OrchestrationEventData, SensorEvalStatus, TickStatus, TriggerSource,
+    OrchestrationEvent, OrchestrationEventData, SensorEvalStatus, TaskDef, TaskOutcome, TickStatus,
+    TriggerInfo, TriggerSource,
 };
 use arco_flow::orchestration::{
     FingerprintPolicy, ReservationResult, RunKeyReservation, reserve_run_key,
@@ -190,6 +191,203 @@ async fn parity_m1_run_key_reservation_detects_fingerprint_conflict() -> Result<
         }
         other => panic!("expected FingerprintMismatch, got {other:?}"),
     }
+
+    Ok(())
+}
+
+fn run_triggered_event(
+    run_id: &str,
+    plan_id: &str,
+    root_assets: Vec<String>,
+) -> OrchestrationEvent {
+    OrchestrationEvent::new(
+        "tenant",
+        "workspace",
+        OrchestrationEventData::RunTriggered {
+            run_id: run_id.to_string(),
+            plan_id: plan_id.to_string(),
+            trigger: TriggerInfo::Manual {
+                user_id: "tester".to_string(),
+            },
+            root_assets,
+            run_key: None,
+            labels: std::collections::HashMap::new(),
+            code_version: None,
+        },
+    )
+}
+
+fn plan_created_event(run_id: &str, plan_id: &str, tasks: Vec<TaskDef>) -> OrchestrationEvent {
+    OrchestrationEvent::new(
+        "tenant",
+        "workspace",
+        OrchestrationEventData::PlanCreated {
+            run_id: run_id.to_string(),
+            plan_id: plan_id.to_string(),
+            tasks,
+        },
+    )
+}
+
+fn task_finished_event(
+    run_id: &str,
+    task_key: &str,
+    attempt: u32,
+    attempt_id: &str,
+    outcome: TaskOutcome,
+) -> OrchestrationEvent {
+    OrchestrationEvent::new(
+        "tenant",
+        "workspace",
+        OrchestrationEventData::TaskFinished {
+            run_id: run_id.to_string(),
+            task_key: task_key.to_string(),
+            attempt,
+            attempt_id: attempt_id.to_string(),
+            worker_id: "worker-1".to_string(),
+            outcome,
+            materialization_id: None,
+            error_message: None,
+            output: None,
+            error: None,
+            metrics: None,
+            cancelled_during_phase: None,
+            partial_progress: None,
+            asset_key: None,
+            partition_key: None,
+            code_version: None,
+        },
+    )
+}
+
+fn default_task_def(key: &str, depends_on: Vec<&str>) -> TaskDef {
+    TaskDef {
+        key: key.to_string(),
+        depends_on: depends_on.into_iter().map(|dep| dep.to_string()).collect(),
+        asset_key: None,
+        partition_key: None,
+        max_attempts: 3,
+        heartbeat_timeout_sec: 60,
+    }
+}
+
+#[tokio::test]
+async fn parity_m1_compactor_persists_out_of_order_dispatch_fields() -> Result<()> {
+    use arco_core::WritePrecondition;
+    use arco_flow::orchestration::compactor::MicroCompactor;
+    use arco_flow::orchestration::compactor::fold::DispatchOutboxRow;
+    fn orchestration_event_path(date: &str, event_id: &str) -> String {
+        format!("ledger/orchestration/{date}/{event_id}.json")
+    }
+    use bytes::Bytes;
+
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let compactor = MicroCompactor::new(storage.clone());
+
+    let dispatch_id = DispatchOutboxRow::dispatch_id("run_01", "extract", 1);
+
+    let mut enqueued = OrchestrationEvent::new(
+        "tenant",
+        "workspace",
+        OrchestrationEventData::DispatchEnqueued {
+            dispatch_id: dispatch_id.clone(),
+            run_id: Some("run_01".to_string()),
+            task_key: Some("extract".to_string()),
+            attempt: Some(1),
+            cloud_task_id: "d_cloud123".to_string(),
+        },
+    );
+    enqueued.event_id = "01B".to_string();
+    let path1 = orchestration_event_path("2025-01-15", &enqueued.event_id);
+    storage
+        .put_raw(
+            &path1,
+            Bytes::from(serde_json::to_string(&enqueued).expect("serialize")),
+            WritePrecondition::None,
+        )
+        .await?;
+    compactor.compact_events(vec![path1]).await?;
+
+    let mut requested = OrchestrationEvent::new(
+        "tenant",
+        "workspace",
+        OrchestrationEventData::DispatchRequested {
+            run_id: "run_01".to_string(),
+            task_key: "extract".to_string(),
+            attempt: 1,
+            attempt_id: "01HQ123ATT".to_string(),
+            worker_queue: "default-queue".to_string(),
+            dispatch_id: dispatch_id.clone(),
+        },
+    );
+    requested.event_id = "01A".to_string();
+    let path2 = orchestration_event_path("2025-01-15", &requested.event_id);
+    storage
+        .put_raw(
+            &path2,
+            Bytes::from(serde_json::to_string(&requested).expect("serialize")),
+            WritePrecondition::None,
+        )
+        .await?;
+    compactor.compact_events(vec![path2]).await?;
+
+    let (_, state) = compactor.load_state().await?;
+    let row = state.dispatch_outbox.get(&dispatch_id).expect("outbox row");
+
+    assert_eq!(row.attempt_id, "01HQ123ATT");
+    assert_eq!(row.cloud_task_id.as_deref(), Some("d_cloud123"));
+
+    Ok(())
+}
+
+#[test]
+fn parity_m1_duplicate_task_finished_event_is_noop() -> Result<()> {
+    let run_id = "run-dup";
+    let plan_id = "plan-dup";
+    let attempt_id = ulid::Ulid::new().to_string();
+
+    let tasks = vec![default_task_def("extract", vec![])];
+
+    let mut state = FoldState::new();
+    state.fold_event(&run_triggered_event(
+        run_id,
+        plan_id,
+        vec!["raw.events".to_string()],
+    ));
+    state.fold_event(&plan_created_event(run_id, plan_id, tasks));
+
+    let event1 = task_finished_event(run_id, "extract", 1, &attempt_id, TaskOutcome::Succeeded);
+    let event2 = task_finished_event(
+        run_id,
+        "extract",
+        1,
+        "attempt_other",
+        TaskOutcome::Succeeded,
+    );
+
+    assert_ne!(event1.event_id, event2.event_id);
+    assert_eq!(event1.idempotency_key, event2.idempotency_key);
+
+    state.fold_event(&event1);
+
+    let snapshot = (
+        state.runs.clone(),
+        state.tasks.clone(),
+        state.dep_satisfaction.clone(),
+        state.dispatch_outbox.clone(),
+        state.timers.clone(),
+        state.idempotency_keys.clone(),
+    );
+
+    state.fold_event(&event2);
+
+    assert_eq!(snapshot.0, state.runs);
+    assert_eq!(snapshot.1, state.tasks);
+    assert_eq!(snapshot.2, state.dep_satisfaction);
+    assert_eq!(snapshot.3, state.dispatch_outbox);
+    assert_eq!(snapshot.4, state.timers);
+    assert_eq!(snapshot.5, state.idempotency_keys);
 
     Ok(())
 }

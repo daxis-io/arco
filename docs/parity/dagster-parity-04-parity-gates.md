@@ -27,6 +27,20 @@ A “gate” is a test suite or script that:
    - Gate M3: staleness/reconciliation + advanced UX
 2. CI wiring that makes it hard to “cheat” by changing docs only.
 
+## Gate Commands (Copy/Paste)
+
+These are the intended **single-command** entry points for each gate suite.
+
+- Gate M1 (PR-gated, hermetic):
+  - `cargo test -p arco-api --all-features --test orchestration_parity_gates_m1 && cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m1`
+- Gate M2 (PR-gated, hermetic):
+  - `cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m2`
+- Gate M3 (PR-gated, hermetic):
+  - `cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m3`
+
+Related operator-surface proof (CLI-first UX):
+- `cd python/arco && python -m pytest tests/integration/test_cli_api.py -v`
+
 ## Recommended Gate Structure
 ### Gate class A — Hermetic (PR-gated)
 - Deterministic, local tests.

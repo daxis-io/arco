@@ -69,7 +69,7 @@ BackfillStateChanged {
     to_state: BackfillState,
     state_version: u32, // Monotonic
 }
-// idempotency_key = backfill_state:{backfill_id}:{state_version}
+// idempotency_key = backfill_state:{backfill_id}:{state_version}:{to_state}
 ```
 
 ### Chunk Idempotency

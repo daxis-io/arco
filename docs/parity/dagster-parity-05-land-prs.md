@@ -86,7 +86,7 @@ This item is explicitly about **sequencing and stability**.
   - `cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m3`
   - `cargo test -p arco-api --all-features --test orchestration_parity_gates_m1`
 - Main CI:
-  - https://github.com/daxis-io/arco/actions/runs/21101331321 (in-progress at time of this update).
+  - https://github.com/daxis-io/arco/actions/runs/21101331321 (completed failure: `IAM Smoke Tests` failed because `google-github-actions/auth` did not receive `credentials_json`; this PR makes the smoke steps conditional on secrets/vars being present).
 - Parity matrix updates: included in PR 25 (`docs/parity/dagster-parity-matrix.md`).
 
 ## Acceptance Criteria

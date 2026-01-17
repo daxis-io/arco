@@ -482,6 +482,18 @@ fn run_parity_matrix_check() -> Result<()> {
                 "{location}: Evidence (CI) must include the job command (expected 'cargo …' or 'pytest …')"
             ));
         }
+
+        for evidence_field in [code, tests, ci] {
+            for span in extract_backtick_spans(evidence_field) {
+                if let Some(path) = normalize_repo_path(&span) {
+                    if !Path::new(&path).exists() {
+                        errors.push(format!(
+                            "{location}: evidence references missing path '{path}'"
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     if !errors.is_empty() {
@@ -503,6 +515,52 @@ fn split_md_table_row(line: &str) -> Vec<String> {
         .split('|')
         .map(|cell| cell.trim().to_string())
         .collect()
+}
+
+fn extract_backtick_spans(text: &str) -> Vec<String> {
+    let mut spans = Vec::new();
+    let mut in_ticks = false;
+    let mut buf = String::new();
+
+    for ch in text.chars() {
+        if ch == '`' {
+            if in_ticks {
+                spans.push(buf.clone());
+                buf.clear();
+            }
+            in_ticks = !in_ticks;
+            continue;
+        }
+
+        if in_ticks {
+            buf.push(ch);
+        }
+    }
+
+    spans
+}
+
+fn normalize_repo_path(span: &str) -> Option<String> {
+    let candidate = span.trim();
+
+    let (prefix, rest) = candidate.split_once(':').unwrap_or((candidate, ""));
+    let _ = rest;
+
+    let path = prefix.trim();
+    if path.is_empty() {
+        return None;
+    }
+
+    let is_repo_path = path.starts_with("crates/")
+        || path.starts_with("python/")
+        || path.starts_with("docs/")
+        || path.starts_with(".github/");
+
+    if !is_repo_path {
+        return None;
+    }
+
+    Some(path.to_string())
 }
 
 // ============================================================================

@@ -272,8 +272,8 @@ fn parity_m2_backfill_plan_chunk_emits_chunk_and_run_requested_with_partition_se
         .filter(|e| matches!(&e.data, OrchestrationEventData::RunRequested { .. }))
         .count();
 
-    assert!(planned_count >= 1);
-    assert!(run_req_count >= 1);
+    assert_eq!(planned_count, 1);
+    assert_eq!(run_req_count, 1);
 
     let planned = events
         .iter()

@@ -76,8 +76,18 @@ This item is explicitly about **sequencing and stability**.
 - If conflicts appear, keep the fix minimal and preserve CI-gated proofs (no doc-only merges).
 
 ### Step 4 — Post-merge stabilization
-- Run full CI.
-- Update parity matrix rows that now become “Implemented” with evidence links.
+- Merge result:
+  - https://github.com/daxis-io/arco/pull/25 merged to `main` as `8cddf3c2f56d5756ec5e3a129268649001eff542`.
+- Local post-merge gates (ran on `main`):
+  - `cargo xtask parity-matrix-check`
+  - `cargo test -p arco-flow --features test-utils --test orchestration_correctness_tests`
+  - `cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m1`
+  - `cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m2`
+  - `cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m3`
+  - `cargo test -p arco-api --all-features --test orchestration_parity_gates_m1`
+- Main CI:
+  - https://github.com/daxis-io/arco/actions/runs/21101331321 (in-progress at time of this update).
+- Parity matrix updates: included in PR 25 (`docs/parity/dagster-parity-matrix.md`).
 
 ## Acceptance Criteria
 - CI green on main.

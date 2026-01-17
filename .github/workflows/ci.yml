@@ -240,7 +240,7 @@ jobs:
     name: IAM Smoke Tests
     runs-on: ubuntu-latest
     # Only run on main branch pushes, not PRs (requires deployed infrastructure)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.GCP_SA_KEY_API != '' && vars.ARCO_BUCKET_DEV != ''
     environment: dev
     needs: [check, test]
     permissions:

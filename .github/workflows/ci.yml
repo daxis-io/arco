@@ -255,18 +255,34 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
+      - name: Check IAM smoke prerequisites
+        id: iam_smoke_prereq
+        run: |
+          if [ -z "${{ secrets.GCP_SA_KEY_API }}" ] || [ -z "${{ vars.ARCO_BUCKET_DEV }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Authenticate to GCP (API SA)
+        if: steps.iam_smoke_prereq.outputs.skip != 'true'
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY_API }}
 
       - name: Run API IAM smoke tests
+        if: steps.iam_smoke_prereq.outputs.skip != 'true'
         env:
           ARCO_TEST_BUCKET: ${{ vars.ARCO_BUCKET_DEV }}
         run: |
           cargo test --package arco-integration-tests \
             --features iam-smoke \
             -- --ignored --test-threads=1
+
+      - name: Skip IAM smoke tests (missing config)
+        if: steps.iam_smoke_prereq.outputs.skip == 'true'
+        run: |
+          echo "Skipping IAM smoke tests: missing secrets.GCP_SA_KEY_API or vars.ARCO_BUCKET_DEV"
 
   # ==========================================================================
   # Compile-Negative Tests (Gate 5 trait separation)

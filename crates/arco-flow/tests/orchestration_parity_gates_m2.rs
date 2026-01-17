@@ -479,6 +479,165 @@ fn parity_m2_poll_sensor_cursor_cas_accepts_matching_expected_version() {
     assert_eq!(sensor_state.state_version, 3);
 }
 
+#[tokio::test]
+async fn parity_m2_poll_sensor_cursor_and_min_interval_survive_compactor_reload()
+-> arco_flow::error::Result<()> {
+    use arco_core::{MemoryBackend, ScopedStorage, WritePrecondition};
+    use arco_flow::orchestration::compactor::MicroCompactor;
+    use bytes::Bytes;
+
+    fn orchestration_event_path(date: &str, event_id: &str) -> String {
+        format!("ledger/orchestration/{date}/{event_id}.json")
+    }
+
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+
+    let sensor_id = "01HQ456POLLSENSOR";
+    let eval1_millis = Utc::now().timestamp_millis() - 120_000;
+    let eval1_time = Utc
+        .timestamp_millis_opt(eval1_millis)
+        .single()
+        .expect("valid millis timestamp");
+    let eval2_time = eval1_time + Duration::seconds(60);
+
+    let compactor = MicroCompactor::new(storage.clone());
+
+    let mut event1 = OrchestrationEvent::new_with_timestamp(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::SensorEvaluated {
+            sensor_id: sensor_id.to_string(),
+            eval_id: format!("eval_{sensor_id}_01"),
+            cursor_before: None,
+            cursor_after: Some("cursor_v1".to_string()),
+            expected_state_version: None,
+            trigger_source: TriggerSource::Poll {
+                poll_epoch: eval1_time.timestamp(),
+            },
+            run_requests: vec![],
+            status: SensorEvalStatus::NoNewData,
+        },
+        eval1_time,
+    );
+    event1.event_id = "evt_01_sensor_eval".to_string();
+
+    let path1 = orchestration_event_path("2025-01-01", &event1.event_id);
+    storage
+        .put_raw(
+            &path1,
+            Bytes::from(serde_json::to_string(&event1).expect("serialize")),
+            WritePrecondition::None,
+        )
+        .await?;
+    compactor.compact_events(vec![path1]).await?;
+
+    let compactor_reloaded = MicroCompactor::new(storage.clone());
+    let (_, state1) = compactor_reloaded.load_state().await?;
+    let row1 = state1
+        .sensor_state
+        .get(sensor_id)
+        .expect("sensor state should exist");
+
+    assert_eq!(row1.cursor.as_deref(), Some("cursor_v1"));
+    assert_eq!(row1.last_evaluation_at, Some(eval1_time));
+    assert_eq!(row1.state_version, 1);
+
+    let controller = PollSensorController::with_min_interval(Duration::seconds(30));
+    assert!(!controller.should_evaluate(row1, eval1_time + Duration::seconds(10)));
+    assert!(controller.should_evaluate(row1, eval1_time + Duration::seconds(31)));
+
+    let mut event2 = OrchestrationEvent::new_with_timestamp(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::SensorEvaluated {
+            sensor_id: sensor_id.to_string(),
+            eval_id: format!("eval_{sensor_id}_02"),
+            cursor_before: Some("cursor_v1".to_string()),
+            cursor_after: Some("cursor_v2".to_string()),
+            expected_state_version: Some(row1.state_version),
+            trigger_source: TriggerSource::Poll {
+                poll_epoch: eval2_time.timestamp(),
+            },
+            run_requests: vec![],
+            status: SensorEvalStatus::NoNewData,
+        },
+        eval2_time,
+    );
+    event2.event_id = "evt_02_sensor_eval".to_string();
+
+    let path2 = orchestration_event_path("2025-01-01", &event2.event_id);
+    storage
+        .put_raw(
+            &path2,
+            Bytes::from(serde_json::to_string(&event2).expect("serialize")),
+            WritePrecondition::None,
+        )
+        .await?;
+    compactor_reloaded.compact_events(vec![path2]).await?;
+
+    let compactor_reloaded_again = MicroCompactor::new(storage.clone());
+    let (_, state2) = compactor_reloaded_again.load_state().await?;
+    let row2 = state2
+        .sensor_state
+        .get(sensor_id)
+        .expect("sensor state should exist");
+
+    assert_eq!(row2.cursor.as_deref(), Some("cursor_v2"));
+    assert_eq!(row2.last_evaluation_at, Some(eval2_time));
+    assert_eq!(row2.state_version, 2);
+
+    let eval3_time = eval2_time + Duration::seconds(60);
+    let stale_eval_id = format!("eval_{sensor_id}_stale");
+    let mut event3 = OrchestrationEvent::new_with_timestamp(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::SensorEvaluated {
+            sensor_id: sensor_id.to_string(),
+            eval_id: stale_eval_id.clone(),
+            cursor_before: Some("cursor_v1".to_string()),
+            cursor_after: Some("cursor_v3".to_string()),
+            expected_state_version: Some(1),
+            trigger_source: TriggerSource::Poll {
+                poll_epoch: eval3_time.timestamp(),
+            },
+            run_requests: vec![],
+            status: SensorEvalStatus::NoNewData,
+        },
+        eval3_time,
+    );
+    event3.event_id = "evt_03_sensor_eval".to_string();
+
+    let path3 = orchestration_event_path("2025-01-01", &event3.event_id);
+    storage
+        .put_raw(
+            &path3,
+            Bytes::from(serde_json::to_string(&event3).expect("serialize")),
+            WritePrecondition::None,
+        )
+        .await?;
+    compactor_reloaded_again.compact_events(vec![path3]).await?;
+
+    let compactor_final = MicroCompactor::new(storage);
+    let (_, state3) = compactor_final.load_state().await?;
+    let row3 = state3
+        .sensor_state
+        .get(sensor_id)
+        .expect("sensor state should exist");
+
+    assert_eq!(row3.cursor.as_deref(), Some("cursor_v2"));
+    assert_eq!(row3.last_evaluation_at, Some(eval2_time));
+    assert_eq!(row3.state_version, 2);
+
+    let eval3 = state3
+        .sensor_evals
+        .get(stale_eval_id.as_str())
+        .expect("stale eval row should be recorded");
+    assert!(matches!(eval3.status, SensorEvalStatus::SkippedStaleCursor));
+
+    Ok(())
+}
+
 #[test]
 fn parity_m2_backfill_pause_resume_cancel_transitions_are_monotonic() {
     let resolver = Arc::new(StaticPartitionResolver::new(vec!["2025-01-01".into()]));

@@ -341,6 +341,99 @@ async fn parity_m1_compactor_persists_out_of_order_dispatch_fields() -> Result<(
     Ok(())
 }
 
+#[tokio::test]
+async fn parity_m1_compactor_rejects_stale_task_finished_after_retry_started() -> Result<()> {
+    use arco_core::WritePrecondition;
+    use arco_flow::orchestration::compactor::MicroCompactor;
+    use bytes::Bytes;
+
+    fn orchestration_event_path(date: &str, event_id: &str) -> String {
+        format!("ledger/orchestration/{date}/{event_id}.json")
+    }
+
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let compactor = MicroCompactor::new(storage.clone());
+
+    let base_time = Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap();
+
+    let run_id = "run_01";
+    let plan_id = "plan_01";
+    let task_key = "extract";
+
+    let mut triggered = run_triggered_event(run_id, plan_id, vec!["raw.events".to_string()]);
+    triggered.event_id = "evt_01_run_triggered".to_string();
+    triggered.timestamp = base_time;
+
+    let mut planned = plan_created_event(run_id, plan_id, vec![default_task_def(task_key, vec![])]);
+    planned.event_id = "evt_02_plan_created".to_string();
+    planned.timestamp = base_time + chrono::Duration::seconds(1);
+
+    let attempt_1_id = "att-1";
+    let attempt_2_id = "att-2";
+
+    let mut started_1 = OrchestrationEvent::new(
+        "tenant",
+        "workspace",
+        OrchestrationEventData::TaskStarted {
+            run_id: run_id.to_string(),
+            task_key: task_key.to_string(),
+            attempt: 1,
+            attempt_id: attempt_1_id.to_string(),
+            worker_id: "worker-1".to_string(),
+        },
+    );
+    started_1.event_id = "evt_03_task_started_1".to_string();
+    started_1.timestamp = base_time + chrono::Duration::seconds(2);
+
+    let mut started_2 = OrchestrationEvent::new(
+        "tenant",
+        "workspace",
+        OrchestrationEventData::TaskStarted {
+            run_id: run_id.to_string(),
+            task_key: task_key.to_string(),
+            attempt: 2,
+            attempt_id: attempt_2_id.to_string(),
+            worker_id: "worker-2".to_string(),
+        },
+    );
+    started_2.event_id = "evt_04_task_started_2".to_string();
+    started_2.timestamp = base_time + chrono::Duration::seconds(3);
+
+    let mut stale_finished =
+        task_finished_event(run_id, task_key, 1, attempt_1_id, TaskOutcome::Succeeded);
+    stale_finished.event_id = "evt_05_task_finished_1_stale".to_string();
+    stale_finished.timestamp = base_time + chrono::Duration::seconds(4);
+
+    for event in [triggered, planned, started_1, started_2, stale_finished] {
+        let path = orchestration_event_path("2025-01-15", &event.event_id);
+        storage
+            .put_raw(
+                &path,
+                Bytes::from(serde_json::to_string(&event).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
+        compactor.compact_events(vec![path]).await?;
+    }
+
+    let (_, state) = compactor.load_state().await?;
+    let task = state
+        .tasks
+        .get(&(run_id.to_string(), task_key.to_string()))
+        .expect("task row should exist");
+
+    assert_eq!(task.attempt, 2);
+    assert_eq!(task.attempt_id.as_deref(), Some(attempt_2_id));
+    assert_eq!(
+        task.state,
+        arco_flow::orchestration::compactor::fold::TaskState::Running
+    );
+    assert!(task.completed_at.is_none());
+
+    Ok(())
+}
+
 #[test]
 fn parity_m1_duplicate_task_finished_event_is_noop() -> Result<()> {
     let run_id = "run-dup";

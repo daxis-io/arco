@@ -688,8 +688,19 @@ impl OrchestrationEventData {
             Self::BackfillStateChanged {
                 backfill_id,
                 state_version,
+                to_state,
                 ..
-            } => format!("backfill_state:{backfill_id}:{state_version}"),
+            } => {
+                let to_state = match to_state {
+                    BackfillState::Pending => "PENDING",
+                    BackfillState::Running => "RUNNING",
+                    BackfillState::Paused => "PAUSED",
+                    BackfillState::Succeeded => "SUCCEEDED",
+                    BackfillState::Failed => "FAILED",
+                    BackfillState::Cancelled => "CANCELLED",
+                };
+                format!("backfill_state:{backfill_id}:{state_version}:{to_state}")
+            }
         }
     }
 

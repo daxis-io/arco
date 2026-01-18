@@ -449,6 +449,24 @@ pub enum OrchestrationEventData {
     // ========================================================================
     // Automation Events (Layer 2)
     // ========================================================================
+    /// Upserts the schedule definition used for tick evaluation.
+    ScheduleDefinitionUpserted {
+        /// Schedule identifier (ULID).
+        schedule_id: String,
+        /// Cron expression for the schedule.
+        cron_expression: String,
+        /// IANA timezone used for evaluation.
+        timezone: String,
+        /// Maximum time window for catchup.
+        catchup_window_minutes: u32,
+        /// Asset selection snapshot stored with the definition.
+        asset_selection: Vec<String>,
+        /// Maximum number of ticks to catch up per evaluation.
+        max_catchup_ticks: u32,
+        /// Whether the schedule is enabled.
+        enabled: bool,
+    },
+
     /// A schedule tick has been evaluated.
     ScheduleTicked {
         /// Schedule identifier (ULID).
@@ -591,6 +609,7 @@ impl OrchestrationEventData {
             Self::DispatchEnqueued { .. } => "DispatchEnqueued",
             Self::TimerEnqueued { .. } => "TimerEnqueued",
             Self::TimerFired { .. } => "TimerFired",
+            Self::ScheduleDefinitionUpserted { .. } => "ScheduleDefinitionUpserted",
             Self::ScheduleTicked { .. } => "ScheduleTicked",
             Self::SensorEvaluated { .. } => "SensorEvaluated",
             Self::RunRequested { .. } => "RunRequested",
@@ -646,6 +665,26 @@ impl OrchestrationEventData {
             Self::DispatchEnqueued { dispatch_id, .. } => format!("dispatch_ack:{dispatch_id}"),
             Self::TimerEnqueued { timer_id, .. } => format!("timer_ack:{timer_id}"),
             Self::TimerFired { timer_id, .. } => format!("timer_fired:{timer_id}"),
+
+            Self::ScheduleDefinitionUpserted {
+                schedule_id,
+                cron_expression,
+                timezone,
+                catchup_window_minutes,
+                asset_selection,
+                max_catchup_ticks,
+                enabled,
+            } => {
+                let mut asset_selection = asset_selection.clone();
+                asset_selection.sort();
+
+                let input = format!(
+                    "{cron_expression}|{timezone}|{catchup_window_minutes}|{max_catchup_ticks}|{enabled}|{}",
+                    asset_selection.join(",")
+                );
+                let fp = sha256_hex(&input);
+                format!("sched_def:{schedule_id}:{fp}")
+            }
 
             Self::ScheduleTicked { tick_id, .. } => format!("sched_tick:{tick_id}"),
 
@@ -722,7 +761,8 @@ impl OrchestrationEventData {
             | Self::TimerFired { run_id, .. } => run_id.as_deref(),
 
             // Automation events don't have direct run_id (runs are created at fold time)
-            Self::ScheduleTicked { .. }
+            Self::ScheduleDefinitionUpserted { .. }
+            | Self::ScheduleTicked { .. }
             | Self::SensorEvaluated { .. }
             | Self::RunRequested { .. }
             | Self::BackfillCreated { .. }

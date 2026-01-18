@@ -5043,9 +5043,41 @@
         "type": "object",
         "description": "Schedule state response.",
         "required": [
-          "scheduleId"
+          "scheduleId",
+          "cronExpression",
+          "timezone",
+          "catchupWindowMinutes",
+          "maxCatchupTicks",
+          "assetSelection",
+          "enabled",
+          "definitionVersion"
         ],
         "properties": {
+          "assetSelection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Asset selection snapshot stored with the definition."
+          },
+          "catchupWindowMinutes": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Maximum time window for catchup.",
+            "minimum": 0
+          },
+          "cronExpression": {
+            "type": "string",
+            "description": "Cron expression for the schedule."
+          },
+          "definitionVersion": {
+            "type": "string",
+            "description": "Current definition version."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the schedule is enabled."
+          },
           "lastRunKey": {
             "type": [
               "string",
@@ -5068,9 +5100,19 @@
             ],
             "description": "Last tick ID that was processed."
           },
+          "maxCatchupTicks": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Maximum number of ticks to catch up per evaluation.",
+            "minimum": 0
+          },
           "scheduleId": {
             "type": "string",
             "description": "Schedule identifier."
+          },
+          "timezone": {
+            "type": "string",
+            "description": "IANA timezone used for evaluation."
           }
         }
       },
@@ -5091,6 +5133,13 @@
               "type": "string"
             },
             "description": "Asset selection at tick time."
+          },
+          "errorMessage": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Error message when status is `FAILED`."
           },
           "runId": {
             "type": [
@@ -5114,6 +5163,13 @@
             "type": "string",
             "format": "date-time",
             "description": "When this tick was scheduled for."
+          },
+          "skipReason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Skip reason when status is `SKIPPED`."
           },
           "status": {
             "$ref": "#/components/schemas/TickStatusResponse",

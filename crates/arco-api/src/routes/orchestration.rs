@@ -19,6 +19,7 @@
 //! - `POST   /tasks/{task_id}/completed` - Worker finished execution
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::extract::Query as AxumQuery;
@@ -42,8 +43,8 @@ use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResul
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::{
     BackfillChunkRow, BackfillRow, FoldState, MicroCompactor, PartitionStatusRow, RunRow,
-    RunState as FoldRunState, ScheduleStateRow, ScheduleTickRow, SensorEvalRow, SensorStateRow,
-    TaskRow, TaskState as FoldTaskState,
+    RunState as FoldRunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
+    SensorEvalRow, SensorStateRow, TaskRow, TaskState as FoldTaskState,
 };
 use arco_flow::orchestration::controllers::{PubSubMessage, PushSensorHandler};
 use arco_flow::orchestration::events::{
@@ -437,6 +438,20 @@ pub struct RunRequestResponse {
 pub struct ScheduleResponse {
     /// Schedule identifier.
     pub schedule_id: String,
+    /// Cron expression for the schedule.
+    pub cron_expression: String,
+    /// IANA timezone used for evaluation.
+    pub timezone: String,
+    /// Maximum time window for catchup.
+    pub catchup_window_minutes: u32,
+    /// Maximum number of ticks to catch up per evaluation.
+    pub max_catchup_ticks: u32,
+    /// Asset selection snapshot stored with the definition.
+    pub asset_selection: Vec<String>,
+    /// Whether the schedule is enabled.
+    pub enabled: bool,
+    /// Current definition version.
+    pub definition_version: String,
     /// Last `scheduled_for` timestamp that was processed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_scheduled_for: Option<DateTime<Utc>>,
@@ -459,6 +474,25 @@ pub struct ListSchedulesResponse {
     pub next_cursor: Option<String>,
 }
 
+/// Request body for creating/updating a schedule definition.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertScheduleRequest {
+    /// Cron expression for the schedule.
+    pub cron_expression: String,
+    /// IANA timezone used for evaluation.
+    pub timezone: String,
+    /// Maximum time window for catchup.
+    pub catchup_window_minutes: u32,
+    /// Maximum number of ticks to catch up per evaluation.
+    pub max_catchup_ticks: u32,
+    /// Asset selection snapshot stored with the definition.
+    #[serde(default)]
+    pub asset_selection: Vec<String>,
+    /// Whether the schedule is enabled.
+    pub enabled: bool,
+}
+
 /// Schedule tick response.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -473,6 +507,12 @@ pub struct ScheduleTickResponse {
     pub asset_selection: Vec<String>,
     /// Tick status.
     pub status: TickStatusResponse,
+    /// Skip reason when status is `SKIPPED`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    /// Error message when status is `FAILED`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
     /// Run key if a run was requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_key: Option<String>,
@@ -1433,13 +1473,87 @@ fn map_run_requests(run_requests: &[RunRequest]) -> Vec<RunRequestResponse> {
 // Schedule/Sensor/Backfill/Partition Mapping Helpers
 // ============================================================================
 
-fn map_schedule_state(row: &ScheduleStateRow) -> ScheduleResponse {
+fn map_schedule(def: &ScheduleDefinitionRow, state: Option<&ScheduleStateRow>) -> ScheduleResponse {
     ScheduleResponse {
-        schedule_id: row.schedule_id.clone(),
-        last_scheduled_for: row.last_scheduled_for,
-        last_tick_id: row.last_tick_id.clone(),
-        last_run_key: row.last_run_key.clone(),
+        schedule_id: def.schedule_id.clone(),
+        cron_expression: def.cron_expression.clone(),
+        timezone: def.timezone.clone(),
+        catchup_window_minutes: def.catchup_window_minutes,
+        max_catchup_ticks: def.max_catchup_ticks,
+        asset_selection: def.asset_selection.clone(),
+        enabled: def.enabled,
+        definition_version: def.row_version.clone(),
+        last_scheduled_for: state.and_then(|row| row.last_scheduled_for),
+        last_tick_id: state.and_then(|row| row.last_tick_id.clone()),
+        last_run_key: state.and_then(|row| row.last_run_key.clone()),
     }
+}
+
+fn normalize_asset_selection(values: &[String]) -> Vec<String> {
+    let mut values = values.to_vec();
+    values.sort();
+    values
+}
+
+fn schedule_definition_matches_request(
+    def: &ScheduleDefinitionRow,
+    request: &UpsertScheduleRequest,
+) -> bool {
+    def.cron_expression == request.cron_expression
+        && def.timezone == request.timezone
+        && def.catchup_window_minutes == request.catchup_window_minutes
+        && def.max_catchup_ticks == request.max_catchup_ticks
+        && def.enabled == request.enabled
+        && normalize_asset_selection(&def.asset_selection)
+            == normalize_asset_selection(&request.asset_selection)
+}
+
+fn validate_schedule_upsert(
+    schedule_id: &str,
+    request: &UpsertScheduleRequest,
+) -> Result<(), ApiError> {
+    if schedule_id.is_empty() {
+        return Err(ApiError::bad_request("schedule_id cannot be empty"));
+    }
+
+    if request.asset_selection.is_empty() {
+        return Err(ApiError::bad_request("assetSelection cannot be empty"));
+    }
+
+    for asset in &request.asset_selection {
+        if asset.is_empty() {
+            return Err(ApiError::bad_request(
+                "assetSelection items cannot be empty",
+            ));
+        }
+    }
+
+    if request.max_catchup_ticks == 0 {
+        return Err(ApiError::bad_request("maxCatchupTicks must be >= 1"));
+    }
+
+    let field_count = request.cron_expression.split_whitespace().count();
+    if field_count != 5 && field_count != 6 {
+        return Err(ApiError::bad_request(
+            "cronExpression must have 5 fields (min..dow) or 6 fields (sec..dow)",
+        ));
+    }
+
+    let normalized = if field_count == 5 {
+        format!("0 {}", request.cron_expression)
+    } else {
+        request.cron_expression.clone()
+    };
+
+    if cron::Schedule::from_str(&normalized).is_err() {
+        return Err(ApiError::bad_request("invalid cronExpression"));
+    }
+
+    if request.timezone.parse::<chrono_tz::Tz>().is_err() {
+        return Err(ApiError::bad_request("invalid timezone"));
+    }
+
+    Ok(())
 }
 
 fn map_tick_status(status: &TickStatus) -> TickStatusResponse {
@@ -1451,12 +1565,20 @@ fn map_tick_status(status: &TickStatus) -> TickStatusResponse {
 }
 
 fn map_schedule_tick(row: &ScheduleTickRow) -> ScheduleTickResponse {
+    let (skip_reason, error_message) = match &row.status {
+        TickStatus::Skipped { reason } => (Some(reason.clone()), None),
+        TickStatus::Failed { error } => (None, Some(error.clone())),
+        TickStatus::Triggered => (None, None),
+    };
+
     ScheduleTickResponse {
         tick_id: row.tick_id.clone(),
         schedule_id: row.schedule_id.clone(),
         scheduled_for: row.scheduled_for,
         asset_selection: row.asset_selection.clone(),
         status: map_tick_status(&row.status),
+        skip_reason,
+        error_message,
         run_key: row.run_key.clone(),
         run_id: row.run_id.clone(),
     }
@@ -2555,9 +2677,12 @@ pub(crate) async fn list_schedules(
     let fold_state = load_orchestration_state(&ctx, &state).await?;
 
     let mut schedules: Vec<ScheduleResponse> = fold_state
-        .schedule_state
+        .schedule_definitions
         .values()
-        .map(map_schedule_state)
+        .map(|def| {
+            let state = fold_state.schedule_state.get(def.schedule_id.as_str());
+            map_schedule(def, state)
+        })
         .collect();
     schedules.sort_by(|a, b| a.schedule_id.cmp(&b.schedule_id));
 
@@ -2592,12 +2717,257 @@ pub(crate) async fn get_schedule(
     ensure_workspace(&ctx, &workspace_id)?;
     let fold_state = load_orchestration_state(&ctx, &state).await?;
 
-    let schedule = fold_state
-        .schedule_state
-        .get(&schedule_id)
+    let definition = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
         .ok_or_else(|| ApiError::not_found(format!("schedule not found: {schedule_id}")))?;
 
-    Ok(Json(map_schedule_state(schedule)))
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    Ok(Json(map_schedule(definition, schedule_state)))
+}
+
+pub(crate) async fn upsert_schedule(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, schedule_id)): Path<(String, String)>,
+    Json(request): Json<UpsertScheduleRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    validate_schedule_upsert(&schedule_id, &request)?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let existing = fold_state.schedule_definitions.get(schedule_id.as_str());
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    if let Some(existing) = existing {
+        if schedule_definition_matches_request(existing, &request) {
+            return Ok((StatusCode::OK, Json(map_schedule(existing, schedule_state))));
+        }
+    }
+
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+
+    let ledger = LedgerWriter::new(storage.clone());
+    let existed = existing.is_some();
+
+    let mut event = OrchestrationEvent::new(
+        &ctx.tenant,
+        &workspace_id,
+        OrchestrationEventData::ScheduleDefinitionUpserted {
+            schedule_id: schedule_id.clone(),
+            cron_expression: request.cron_expression,
+            timezone: request.timezone,
+            catchup_window_minutes: request.catchup_window_minutes,
+            asset_selection: request.asset_selection,
+            max_catchup_ticks: request.max_catchup_ticks,
+            enabled: request.enabled,
+        },
+    );
+
+    if let Some(existing) = existing {
+        while event.event_id <= existing.row_version {
+            event.event_id = Ulid::new().to_string();
+        }
+    }
+
+    let request_key = ctx
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| event.event_id.clone());
+    event.idempotency_key = format!("sched_def_api:{schedule_id}:{request_key}");
+
+    let event_path = LedgerWriter::event_path(&event);
+
+    ledger.append(event).await.map_err(|e| {
+        ApiError::internal(format!("failed to append schedule definition event: {e}"))
+    })?;
+
+    compact_orchestration_events(&state.config, storage, vec![event_path]).await?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let definition = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
+        .ok_or_else(|| ApiError::internal("schedule definition missing after upsert"))?;
+
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    let status_code = if existed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+
+    Ok((status_code, Json(map_schedule(definition, schedule_state))))
+}
+
+pub(crate) async fn enable_schedule(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, schedule_id)): Path<(String, String)>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let existing = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
+        .ok_or_else(|| ApiError::not_found(format!("schedule not found: {schedule_id}")))?;
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    if existing.enabled {
+        return Ok((StatusCode::OK, Json(map_schedule(existing, schedule_state))));
+    }
+
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+
+    let ledger = LedgerWriter::new(storage.clone());
+    let mut event = OrchestrationEvent::new(
+        &ctx.tenant,
+        &workspace_id,
+        OrchestrationEventData::ScheduleDefinitionUpserted {
+            schedule_id: schedule_id.clone(),
+            cron_expression: existing.cron_expression.clone(),
+            timezone: existing.timezone.clone(),
+            catchup_window_minutes: existing.catchup_window_minutes,
+            asset_selection: existing.asset_selection.clone(),
+            max_catchup_ticks: existing.max_catchup_ticks,
+            enabled: true,
+        },
+    );
+
+    while event.event_id <= existing.row_version {
+        event.event_id = Ulid::new().to_string();
+    }
+
+    let request_key = ctx
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| event.event_id.clone());
+    event.idempotency_key = format!("sched_enable:{schedule_id}:{request_key}");
+
+    let event_path = LedgerWriter::event_path(&event);
+
+    ledger.append(event).await.map_err(|e| {
+        ApiError::internal(format!("failed to append schedule definition event: {e}"))
+    })?;
+
+    compact_orchestration_events(&state.config, storage, vec![event_path]).await?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let definition = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
+        .ok_or_else(|| ApiError::internal("schedule definition missing after enable"))?;
+
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    Ok((
+        StatusCode::OK,
+        Json(map_schedule(definition, schedule_state)),
+    ))
+}
+
+pub(crate) async fn disable_schedule(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, schedule_id)): Path<(String, String)>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let existing = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
+        .ok_or_else(|| ApiError::not_found(format!("schedule not found: {schedule_id}")))?;
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    if !existing.enabled {
+        return Ok((StatusCode::OK, Json(map_schedule(existing, schedule_state))));
+    }
+
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+
+    let ledger = LedgerWriter::new(storage.clone());
+    let mut event = OrchestrationEvent::new(
+        &ctx.tenant,
+        &workspace_id,
+        OrchestrationEventData::ScheduleDefinitionUpserted {
+            schedule_id: schedule_id.clone(),
+            cron_expression: existing.cron_expression.clone(),
+            timezone: existing.timezone.clone(),
+            catchup_window_minutes: existing.catchup_window_minutes,
+            asset_selection: existing.asset_selection.clone(),
+            max_catchup_ticks: existing.max_catchup_ticks,
+            enabled: false,
+        },
+    );
+
+    while event.event_id <= existing.row_version {
+        event.event_id = Ulid::new().to_string();
+    }
+
+    let request_key = ctx
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| event.event_id.clone());
+    event.idempotency_key = format!("sched_disable:{schedule_id}:{request_key}");
+
+    let event_path = LedgerWriter::event_path(&event);
+
+    ledger.append(event).await.map_err(|e| {
+        ApiError::internal(format!("failed to append schedule definition event: {e}"))
+    })?;
+
+    compact_orchestration_events(&state.config, storage, vec![event_path]).await?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let definition = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
+        .ok_or_else(|| ApiError::internal("schedule definition missing after disable"))?;
+
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    Ok((
+        StatusCode::OK,
+        Json(map_schedule(definition, schedule_state)),
+    ))
+}
+
+pub(crate) async fn get_schedule_tick(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, schedule_id, tick_id)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    if !fold_state
+        .schedule_definitions
+        .contains_key(schedule_id.as_str())
+    {
+        return Err(ApiError::not_found(format!(
+            "schedule not found: {schedule_id}"
+        )));
+    }
+
+    let tick = fold_state
+        .schedule_ticks
+        .get(tick_id.as_str())
+        .ok_or_else(|| ApiError::not_found(format!("tick not found: {tick_id}")))?;
+
+    if tick.schedule_id != schedule_id {
+        return Err(ApiError::not_found(format!("tick not found: {tick_id}")));
+    }
+
+    Ok(Json(map_schedule_tick(tick)))
 }
 
 /// List schedule ticks.
@@ -2637,7 +3007,11 @@ pub(crate) async fn list_schedule_ticks(
         .map(map_schedule_tick)
         .collect();
     filter_ticks_by_status(&mut ticks, query.status);
-    ticks.sort_by(|a, b| b.scheduled_for.cmp(&a.scheduled_for));
+    ticks.sort_by(|a, b| {
+        b.scheduled_for
+            .cmp(&a.scheduled_for)
+            .then_with(|| b.tick_id.cmp(&a.tick_id))
+    });
 
     let (page, next_cursor) = paginate(&ticks, limit, offset);
 
@@ -3188,11 +3562,23 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/workspaces/:workspace_id/schedules", get(list_schedules))
         .route(
             "/workspaces/:workspace_id/schedules/:schedule_id",
-            get(get_schedule),
+            get(get_schedule).put(upsert_schedule),
+        )
+        .route(
+            "/workspaces/:workspace_id/schedules/:schedule_id/enable",
+            post(enable_schedule),
+        )
+        .route(
+            "/workspaces/:workspace_id/schedules/:schedule_id/disable",
+            post(disable_schedule),
         )
         .route(
             "/workspaces/:workspace_id/schedules/:schedule_id/ticks",
             get(list_schedule_ticks),
+        )
+        .route(
+            "/workspaces/:workspace_id/schedules/:schedule_id/ticks/:tick_id",
+            get(get_schedule_tick),
         )
         // Sensors
         .route("/workspaces/:workspace_id/sensors", get(list_sensors))
@@ -3401,6 +3787,8 @@ mod tests {
                 scheduled_for: Utc::now(),
                 asset_selection: vec![],
                 status: TickStatusResponse::Triggered,
+                skip_reason: None,
+                error_message: None,
                 run_key: None,
                 run_id: None,
             },
@@ -3410,6 +3798,8 @@ mod tests {
                 scheduled_for: Utc::now(),
                 asset_selection: vec![],
                 status: TickStatusResponse::Failed,
+                skip_reason: None,
+                error_message: Some("boom".to_string()),
                 run_key: None,
                 run_id: None,
             },

@@ -10,6 +10,9 @@
 //! - `sensor_evals.parquet`
 //! - `partition_status.parquet`
 //! - `idempotency_keys.parquet`
+//! - `schedule_definitions.parquet`
+//! - `schedule_state.parquet`
+//! - `schedule_ticks.parquet`
 //!
 //! These schemas are the contract for orchestration controllers reading state.
 //! Keep changes backwards-compatible and gated by snapshot versioning.
@@ -29,12 +32,12 @@ use parquet::format::KeyValue;
 
 use super::fold::{
     DepResolution, DepSatisfactionRow, DispatchOutboxRow, DispatchStatus, IdempotencyKeyRow,
-    PartitionStatusRow, RunRow, RunState, SensorEvalRow, SensorStateRow, TaskRow, TaskState,
-    TimerRow, TimerState, TimerType,
+    PartitionStatusRow, RunRow, RunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
+    SensorEvalRow, SensorStateRow, TaskRow, TaskState, TimerRow, TimerState, TimerType,
 };
 use crate::error::{Error, Result};
 use crate::orchestration::events::{
-    RunRequest, SensorEvalStatus, SensorStatus, TaskOutcome, TriggerSource,
+    RunRequest, SensorEvalStatus, SensorStatus, TaskOutcome, TickStatus, TriggerSource,
 };
 
 // ============================================================================
@@ -185,6 +188,52 @@ fn idempotency_keys_schema() -> Arc<Schema> {
         Field::new("event_id", DataType::Utf8, false),
         Field::new("event_type", DataType::Utf8, false),
         Field::new("recorded_at", DataType::Int64, false),
+        Field::new("row_version", DataType::Utf8, false),
+    ]))
+}
+
+fn schedule_definitions_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("tenant_id", DataType::Utf8, false),
+        Field::new("workspace_id", DataType::Utf8, false),
+        Field::new("schedule_id", DataType::Utf8, false),
+        Field::new("cron_expression", DataType::Utf8, false),
+        Field::new("timezone", DataType::Utf8, false),
+        Field::new("catchup_window_minutes", DataType::UInt32, false),
+        Field::new("asset_selection", DataType::Utf8, true),
+        Field::new("max_catchup_ticks", DataType::UInt32, false),
+        Field::new("enabled", DataType::Boolean, false),
+        Field::new("created_at", DataType::Int64, false),
+        Field::new("row_version", DataType::Utf8, false),
+    ]))
+}
+
+fn schedule_state_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("tenant_id", DataType::Utf8, false),
+        Field::new("workspace_id", DataType::Utf8, false),
+        Field::new("schedule_id", DataType::Utf8, false),
+        Field::new("last_scheduled_for", DataType::Int64, true),
+        Field::new("last_tick_id", DataType::Utf8, true),
+        Field::new("last_run_key", DataType::Utf8, true),
+        Field::new("row_version", DataType::Utf8, false),
+    ]))
+}
+
+fn schedule_ticks_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("tenant_id", DataType::Utf8, false),
+        Field::new("workspace_id", DataType::Utf8, false),
+        Field::new("tick_id", DataType::Utf8, false),
+        Field::new("schedule_id", DataType::Utf8, false),
+        Field::new("scheduled_for", DataType::Int64, false),
+        Field::new("definition_version", DataType::Utf8, false),
+        Field::new("asset_selection", DataType::Utf8, true),
+        Field::new("partition_selection", DataType::Utf8, true),
+        Field::new("status", DataType::Utf8, false),
+        Field::new("run_key", DataType::Utf8, true),
+        Field::new("run_id", DataType::Utf8, true),
+        Field::new("request_fingerprint", DataType::Utf8, true),
         Field::new("row_version", DataType::Utf8, false),
     ]))
 }
@@ -1032,6 +1081,259 @@ pub fn write_idempotency_keys(rows: &[IdempotencyKeyRow]) -> Result<Bytes> {
     write_single_batch(schema, &batch)
 }
 
+/// Writes `schedule_definitions.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet serialization fails.
+pub fn write_schedule_definitions(rows: &[ScheduleDefinitionRow]) -> Result<Bytes> {
+    let schema = schedule_definitions_schema();
+
+    let tenant_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.tenant_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let workspace_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.workspace_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let schedule_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.schedule_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let cron_expressions = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.cron_expression.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let timezones = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.timezone.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let catchup_window_minutes = UInt32Array::from(
+        rows.iter()
+            .map(|r| r.catchup_window_minutes)
+            .collect::<Vec<_>>(),
+    );
+    let asset_selection = rows
+        .iter()
+        .map(|r| {
+            if r.asset_selection.is_empty() {
+                Ok(None)
+            } else {
+                serde_json::to_string(&r.asset_selection).map(Some)
+            }
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::parquet(format!("failed to serialize asset selection: {e}")))?;
+    let asset_selection = StringArray::from(asset_selection);
+    let max_catchup_ticks =
+        UInt32Array::from(rows.iter().map(|r| r.max_catchup_ticks).collect::<Vec<_>>());
+    let enabled = BooleanArray::from(rows.iter().map(|r| r.enabled).collect::<Vec<_>>());
+    let created_at = Int64Array::from(
+        rows.iter()
+            .map(|r| r.created_at.timestamp_millis())
+            .collect::<Vec<_>>(),
+    );
+    let row_versions = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.row_version.as_str()))
+            .collect::<Vec<_>>(),
+    );
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(tenant_ids),
+            Arc::new(workspace_ids),
+            Arc::new(schedule_ids),
+            Arc::new(cron_expressions),
+            Arc::new(timezones),
+            Arc::new(catchup_window_minutes),
+            Arc::new(asset_selection),
+            Arc::new(max_catchup_ticks),
+            Arc::new(enabled),
+            Arc::new(created_at),
+            Arc::new(row_versions),
+        ],
+    )
+    .map_err(|e| Error::parquet(format!("record batch build failed: {e}")))?;
+
+    write_single_batch(schema, &batch)
+}
+
+/// Writes `schedule_state.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet serialization fails.
+pub fn write_schedule_state(rows: &[ScheduleStateRow]) -> Result<Bytes> {
+    let schema = schedule_state_schema();
+
+    let tenant_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.tenant_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let workspace_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.workspace_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let schedule_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.schedule_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let last_scheduled_for = Int64Array::from(
+        rows.iter()
+            .map(|r| r.last_scheduled_for.map(|t| t.timestamp_millis()))
+            .collect::<Vec<_>>(),
+    );
+    let last_tick_id = StringArray::from(
+        rows.iter()
+            .map(|r| r.last_tick_id.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let last_run_key = StringArray::from(
+        rows.iter()
+            .map(|r| r.last_run_key.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let row_versions = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.row_version.as_str()))
+            .collect::<Vec<_>>(),
+    );
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(tenant_ids),
+            Arc::new(workspace_ids),
+            Arc::new(schedule_ids),
+            Arc::new(last_scheduled_for),
+            Arc::new(last_tick_id),
+            Arc::new(last_run_key),
+            Arc::new(row_versions),
+        ],
+    )
+    .map_err(|e| Error::parquet(format!("record batch build failed: {e}")))?;
+
+    write_single_batch(schema, &batch)
+}
+
+/// Writes `schedule_ticks.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet serialization fails.
+pub fn write_schedule_ticks(rows: &[ScheduleTickRow]) -> Result<Bytes> {
+    let schema = schedule_ticks_schema();
+
+    let tenant_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.tenant_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let workspace_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.workspace_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let tick_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.tick_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let schedule_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.schedule_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let scheduled_for = Int64Array::from(
+        rows.iter()
+            .map(|r| r.scheduled_for.timestamp_millis())
+            .collect::<Vec<_>>(),
+    );
+    let definition_versions = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.definition_version.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let asset_selection = rows
+        .iter()
+        .map(|r| {
+            if r.asset_selection.is_empty() {
+                Ok(None)
+            } else {
+                serde_json::to_string(&r.asset_selection).map(Some)
+            }
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::parquet(format!("failed to serialize tick asset selection: {e}")))?;
+    let asset_selection = StringArray::from(asset_selection);
+    let partition_selection = rows
+        .iter()
+        .map(|r| {
+            r.partition_selection
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::parquet(format!("failed to serialize partition selection: {e}")))?;
+    let partition_selection = StringArray::from(partition_selection);
+    let status = rows
+        .iter()
+        .map(|r| serde_json::to_string(&r.status))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::parquet(format!("failed to serialize tick status: {e}")))?;
+    let status = StringArray::from(status.iter().map(|s| Some(s.as_str())).collect::<Vec<_>>());
+    let run_key = StringArray::from(
+        rows.iter()
+            .map(|r| r.run_key.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let run_id = StringArray::from(rows.iter().map(|r| r.run_id.as_deref()).collect::<Vec<_>>());
+    let request_fingerprint = StringArray::from(
+        rows.iter()
+            .map(|r| r.request_fingerprint.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let row_versions = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.row_version.as_str()))
+            .collect::<Vec<_>>(),
+    );
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(tenant_ids),
+            Arc::new(workspace_ids),
+            Arc::new(tick_ids),
+            Arc::new(schedule_ids),
+            Arc::new(scheduled_for),
+            Arc::new(definition_versions),
+            Arc::new(asset_selection),
+            Arc::new(partition_selection),
+            Arc::new(status),
+            Arc::new(run_key),
+            Arc::new(run_id),
+            Arc::new(request_fingerprint),
+            Arc::new(row_versions),
+        ],
+    )
+    .map_err(|e| Error::parquet(format!("record batch build failed: {e}")))?;
+
+    write_single_batch(schema, &batch)
+}
+
 // ============================================================================
 // Readers
 // ============================================================================
@@ -1706,6 +2008,200 @@ pub fn read_idempotency_keys(bytes: &Bytes) -> Result<Vec<IdempotencyKeyRow>> {
     Ok(out)
 }
 
+/// Reads `schedule_definitions.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet decoding fails or required columns are missing.
+pub fn read_schedule_definitions(bytes: &Bytes) -> Result<Vec<ScheduleDefinitionRow>> {
+    let mut out = Vec::new();
+    for batch in read_batches(bytes)? {
+        let tenant_id = col_string(&batch, "tenant_id")?;
+        let workspace_id = col_string(&batch, "workspace_id")?;
+        let schedule_id = col_string(&batch, "schedule_id")?;
+        let cron_expression = col_string(&batch, "cron_expression")?;
+        let timezone = col_string(&batch, "timezone")?;
+        let catchup_window_minutes = col_u32(&batch, "catchup_window_minutes")?;
+        let asset_selection = col_string_opt(&batch, "asset_selection");
+        let max_catchup_ticks = col_u32(&batch, "max_catchup_ticks")?;
+        let enabled = col_bool(&batch, "enabled")?;
+        let created_at = col_i64(&batch, "created_at")?;
+        let row_version = col_string(&batch, "row_version")?;
+
+        for row in 0..batch.num_rows() {
+            let asset_selection = if let Some(col) = asset_selection {
+                if col.is_null(row) {
+                    Vec::new()
+                } else {
+                    serde_json::from_str::<Vec<String>>(col.value(row)).map_err(|e| {
+                        Error::parquet(format!("failed to parse asset selection: {e}"))
+                    })?
+                }
+            } else {
+                Vec::new()
+            };
+
+            out.push(ScheduleDefinitionRow {
+                tenant_id: tenant_id.value(row).to_string(),
+                workspace_id: workspace_id.value(row).to_string(),
+                schedule_id: schedule_id.value(row).to_string(),
+                cron_expression: cron_expression.value(row).to_string(),
+                timezone: timezone.value(row).to_string(),
+                catchup_window_minutes: catchup_window_minutes.value(row),
+                asset_selection,
+                max_catchup_ticks: max_catchup_ticks.value(row),
+                enabled: enabled.value(row),
+                created_at: millis_to_datetime(created_at.value(row)),
+                row_version: row_version.value(row).to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Reads `schedule_state.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet decoding fails or required columns are missing.
+pub fn read_schedule_state(bytes: &Bytes) -> Result<Vec<ScheduleStateRow>> {
+    let mut out = Vec::new();
+    for batch in read_batches(bytes)? {
+        let tenant_id = col_string(&batch, "tenant_id")?;
+        let workspace_id = col_string(&batch, "workspace_id")?;
+        let schedule_id = col_string(&batch, "schedule_id")?;
+        let last_scheduled_for = col_i64_opt(&batch, "last_scheduled_for");
+        let last_tick_id = col_string_opt(&batch, "last_tick_id");
+        let last_run_key = col_string_opt(&batch, "last_run_key");
+        let row_version = col_string(&batch, "row_version")?;
+
+        for row in 0..batch.num_rows() {
+            out.push(ScheduleStateRow {
+                tenant_id: tenant_id.value(row).to_string(),
+                workspace_id: workspace_id.value(row).to_string(),
+                schedule_id: schedule_id.value(row).to_string(),
+                last_scheduled_for: last_scheduled_for.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(millis_to_datetime(col.value(row)))
+                    }
+                }),
+                last_tick_id: last_tick_id.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                last_run_key: last_run_key.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                row_version: row_version.value(row).to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Reads `schedule_ticks.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet decoding fails or required columns are missing.
+pub fn read_schedule_ticks(bytes: &Bytes) -> Result<Vec<ScheduleTickRow>> {
+    let mut out = Vec::new();
+    for batch in read_batches(bytes)? {
+        let tenant_id = col_string(&batch, "tenant_id")?;
+        let workspace_id = col_string(&batch, "workspace_id")?;
+        let tick_id = col_string(&batch, "tick_id")?;
+        let schedule_id = col_string(&batch, "schedule_id")?;
+        let scheduled_for = col_i64(&batch, "scheduled_for")?;
+        let definition_version = col_string(&batch, "definition_version")?;
+        let asset_selection = col_string_opt(&batch, "asset_selection");
+        let partition_selection = col_string_opt(&batch, "partition_selection");
+        let status = col_string(&batch, "status")?;
+        let run_key = col_string_opt(&batch, "run_key");
+        let run_id = col_string_opt(&batch, "run_id");
+        let request_fingerprint = col_string_opt(&batch, "request_fingerprint");
+        let row_version = col_string(&batch, "row_version")?;
+
+        for row in 0..batch.num_rows() {
+            let status = if status.is_null(row) {
+                return Err(Error::parquet("schedule tick missing status".to_string()));
+            } else {
+                serde_json::from_str::<TickStatus>(status.value(row))
+                    .map_err(|e| Error::parquet(format!("failed to parse tick status: {e}")))?
+            };
+
+            let asset_selection = if let Some(col) = asset_selection {
+                if col.is_null(row) {
+                    Vec::new()
+                } else {
+                    serde_json::from_str::<Vec<String>>(col.value(row)).map_err(|e| {
+                        Error::parquet(format!("failed to parse tick asset selection: {e}"))
+                    })?
+                }
+            } else {
+                Vec::new()
+            };
+
+            let partition_selection = if let Some(col) = partition_selection {
+                if col.is_null(row) {
+                    None
+                } else {
+                    Some(
+                        serde_json::from_str::<Vec<String>>(col.value(row)).map_err(|e| {
+                            Error::parquet(format!("failed to parse partition selection: {e}"))
+                        })?,
+                    )
+                }
+            } else {
+                None
+            };
+
+            out.push(ScheduleTickRow {
+                tenant_id: tenant_id.value(row).to_string(),
+                workspace_id: workspace_id.value(row).to_string(),
+                tick_id: tick_id.value(row).to_string(),
+                schedule_id: schedule_id.value(row).to_string(),
+                scheduled_for: millis_to_datetime(scheduled_for.value(row)),
+                definition_version: definition_version.value(row).to_string(),
+                asset_selection,
+                partition_selection,
+                status,
+                run_key: run_key.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                run_id: run_id.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                request_fingerprint: request_fingerprint.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                row_version: row_version.value(row).to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
 // ============================================================================
 // State Conversion Helpers
 // ============================================================================
@@ -2169,6 +2665,70 @@ mod tests {
             "sensor_eval:sensor-01:msg:abc123"
         );
         assert_eq!(parsed[0].event_type, "SensorEvaluated");
+    }
+
+    #[test]
+    fn test_schedule_definitions_roundtrip() {
+        let rows = vec![ScheduleDefinitionRow {
+            tenant_id: "tenant-01".to_string(),
+            workspace_id: "workspace-01".to_string(),
+            schedule_id: "daily-etl".to_string(),
+            cron_expression: "0 10 * * *".to_string(),
+            timezone: "UTC".to_string(),
+            catchup_window_minutes: 60,
+            asset_selection: vec!["analytics.summary".to_string()],
+            max_catchup_ticks: 3,
+            enabled: true,
+            created_at: Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap(),
+            row_version: "01HQXYZ789".to_string(),
+        }];
+
+        let bytes = write_schedule_definitions(&rows).expect("write");
+        let parsed = read_schedule_definitions(&bytes).expect("read");
+
+        assert_eq!(parsed, rows);
+    }
+
+    #[test]
+    fn test_schedule_state_roundtrip() {
+        let rows = vec![ScheduleStateRow {
+            tenant_id: "tenant-01".to_string(),
+            workspace_id: "workspace-01".to_string(),
+            schedule_id: "daily-etl".to_string(),
+            last_scheduled_for: Some(Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap()),
+            last_tick_id: Some("daily-etl:1736935200".to_string()),
+            last_run_key: Some("sched:daily-etl:1736935200".to_string()),
+            row_version: "01HQXYZ790".to_string(),
+        }];
+
+        let bytes = write_schedule_state(&rows).expect("write");
+        let parsed = read_schedule_state(&bytes).expect("read");
+
+        assert_eq!(parsed, rows);
+    }
+
+    #[test]
+    fn test_schedule_ticks_roundtrip() {
+        let rows = vec![ScheduleTickRow {
+            tenant_id: "tenant-01".to_string(),
+            workspace_id: "workspace-01".to_string(),
+            tick_id: "daily-etl:1736935200".to_string(),
+            schedule_id: "daily-etl".to_string(),
+            scheduled_for: Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap(),
+            definition_version: "01HQDEF".to_string(),
+            asset_selection: vec!["analytics.summary".to_string()],
+            partition_selection: Some(vec!["2025-01-15".to_string()]),
+            status: TickStatus::Triggered,
+            run_key: Some("sched:daily-etl:1736935200".to_string()),
+            run_id: Some("run_01HQXYZ123".to_string()),
+            request_fingerprint: Some("fp_123".to_string()),
+            row_version: "01HQXYZ791".to_string(),
+        }];
+
+        let bytes = write_schedule_ticks(&rows).expect("write");
+        let parsed = read_schedule_ticks(&bytes).expect("read");
+
+        assert_eq!(parsed, rows);
     }
 
     #[test]

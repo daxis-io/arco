@@ -158,6 +158,18 @@ pub struct TablePaths {
     /// Path to `idempotency_keys.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_keys: Option<String>,
+
+    /// Path to `schedule_definitions.parquet` (relative to storage root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_definitions: Option<String>,
+
+    /// Path to `schedule_state.parquet` (relative to storage root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_state: Option<String>,
+
+    /// Path to `schedule_ticks.parquet` (relative to storage root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_ticks: Option<String>,
 }
 
 impl TablePaths {
@@ -191,6 +203,15 @@ impl TablePaths {
         }
         if let Some(ref p) = self.idempotency_keys {
             paths.insert("idempotency_keys", p.as_str());
+        }
+        if let Some(ref p) = self.schedule_definitions {
+            paths.insert("schedule_definitions", p.as_str());
+        }
+        if let Some(ref p) = self.schedule_state {
+            paths.insert("schedule_state", p.as_str());
+        }
+        if let Some(ref p) = self.schedule_ticks {
+            paths.insert("schedule_ticks", p.as_str());
         }
         paths
     }
@@ -233,6 +254,7 @@ pub struct EventRange {
 
 /// Row counts for merge optimization.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct RowCounts {
     /// Rows in runs table.
     pub runs: u32,
@@ -260,6 +282,15 @@ pub struct RowCounts {
 
     /// Rows in `idempotency_keys` table.
     pub idempotency_keys: u32,
+
+    /// Rows in `schedule_definitions` table.
+    pub schedule_definitions: u32,
+
+    /// Rows in `schedule_state` table.
+    pub schedule_state: u32,
+
+    /// Rows in `schedule_ticks` table.
+    pub schedule_ticks: u32,
 }
 
 impl RowCounts {
@@ -275,6 +306,9 @@ impl RowCounts {
             + self.sensor_evals
             + self.partition_status
             + self.idempotency_keys
+            + self.schedule_definitions
+            + self.schedule_state
+            + self.schedule_ticks
     }
 }
 
@@ -373,6 +407,9 @@ mod tests {
             sensor_evals: 7,
             partition_status: 9,
             idempotency_keys: 8,
+            schedule_definitions: 0,
+            schedule_state: 0,
+            schedule_ticks: 0,
         };
 
         assert_eq!(counts.total(), 529);

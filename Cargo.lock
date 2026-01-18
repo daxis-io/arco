@@ -200,6 +200,8 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "chrono-tz",
+ "cron",
  "datafusion",
  "duckdb",
  "futures",

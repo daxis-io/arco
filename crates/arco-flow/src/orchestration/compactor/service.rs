@@ -22,16 +22,17 @@ use crate::paths::{orchestration_l0_dir, orchestration_manifest_path};
 
 use super::fold::{
     FoldState, merge_dep_satisfaction_rows, merge_dispatch_outbox_rows, merge_idempotency_key_rows,
-    merge_partition_status_rows, merge_run_rows, merge_sensor_eval_rows, merge_sensor_state_rows,
-    merge_task_rows, merge_timer_rows,
+    merge_partition_status_rows, merge_run_rows, merge_schedule_definition_rows,
+    merge_schedule_state_rows, merge_schedule_tick_rows, merge_sensor_eval_rows,
+    merge_sensor_state_rows, merge_task_rows, merge_timer_rows,
 };
 use super::manifest::{
     EventRange, L0Delta, OrchestrationManifest, RowCounts, TablePaths, Watermarks,
 };
 use super::parquet_util::{
     read_partition_status, write_dep_satisfaction, write_dispatch_outbox, write_idempotency_keys,
-    write_partition_status, write_runs, write_sensor_evals, write_sensor_state, write_tasks,
-    write_timers,
+    write_partition_status, write_runs, write_schedule_definitions, write_schedule_state,
+    write_schedule_ticks, write_sensor_evals, write_sensor_state, write_tasks, write_timers,
 };
 
 const SENSOR_EVAL_RETENTION_DAYS: i64 = 30;
@@ -188,6 +189,10 @@ impl MicroCompactor {
             sensor_evals: u32::try_from(delta_state.sensor_evals.len()).unwrap_or(u32::MAX),
             partition_status: u32::try_from(delta_state.partition_status.len()).unwrap_or(u32::MAX),
             idempotency_keys: u32::try_from(delta_state.idempotency_keys.len()).unwrap_or(u32::MAX),
+            schedule_definitions: u32::try_from(delta_state.schedule_definitions.len())
+                .unwrap_or(u32::MAX),
+            schedule_state: u32::try_from(delta_state.schedule_state.len()).unwrap_or(u32::MAX),
+            schedule_ticks: u32::try_from(delta_state.schedule_ticks.len()).unwrap_or(u32::MAX),
         };
 
         // Create L0 delta entry when changes exist
@@ -380,7 +385,39 @@ impl MicroCompactor {
             }
         }
 
+        self.load_schedule_tables(&mut state, tables).await?;
+
         Ok(state)
+    }
+
+    async fn load_schedule_tables(&self, state: &mut FoldState, tables: &TablePaths) -> Result<()> {
+        if let Some(ref schedule_definitions_path) = tables.schedule_definitions {
+            let data = self.storage.get_raw(schedule_definitions_path).await?;
+            let rows = super::parquet_util::read_schedule_definitions(&data)?;
+            for row in rows {
+                state
+                    .schedule_definitions
+                    .insert(row.schedule_id.clone(), row);
+            }
+        }
+
+        if let Some(ref schedule_state_path) = tables.schedule_state {
+            let data = self.storage.get_raw(schedule_state_path).await?;
+            let rows = super::parquet_util::read_schedule_state(&data)?;
+            for row in rows {
+                state.schedule_state.insert(row.schedule_id.clone(), row);
+            }
+        }
+
+        if let Some(ref schedule_ticks_path) = tables.schedule_ticks {
+            let data = self.storage.get_raw(schedule_ticks_path).await?;
+            let rows = super::parquet_util::read_schedule_ticks(&data)?;
+            for row in rows {
+                state.schedule_ticks.insert(row.tick_id.clone(), row);
+            }
+        }
+
+        Ok(())
     }
 
     /// Loads state from an L0 delta.
@@ -467,6 +504,30 @@ impl MicroCompactor {
             let path = format!("{base_path}/idempotency_keys.parquet");
             self.write_parquet_file(&path, bytes).await?;
             paths.idempotency_keys = Some(path);
+        }
+
+        if !state.schedule_definitions.is_empty() {
+            let rows: Vec<_> = state.schedule_definitions.values().cloned().collect();
+            let bytes = write_schedule_definitions(&rows)?;
+            let path = format!("{base_path}/schedule_definitions.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.schedule_definitions = Some(path);
+        }
+
+        if !state.schedule_state.is_empty() {
+            let rows: Vec<_> = state.schedule_state.values().cloned().collect();
+            let bytes = write_schedule_state(&rows)?;
+            let path = format!("{base_path}/schedule_state.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.schedule_state = Some(path);
+        }
+
+        if !state.schedule_ticks.is_empty() {
+            let rows: Vec<_> = state.schedule_ticks.values().cloned().collect();
+            let bytes = write_schedule_ticks(&rows)?;
+            let path = format!("{base_path}/schedule_ticks.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.schedule_ticks = Some(path);
         }
 
         Ok(paths)
@@ -651,6 +712,48 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
             .or_insert(row);
     }
 
+    for (schedule_id, row) in delta.schedule_definitions {
+        merged
+            .schedule_definitions
+            .entry(schedule_id)
+            .and_modify(|existing| {
+                if let Some(merged_row) =
+                    merge_schedule_definition_rows(vec![existing.clone(), row.clone()])
+                {
+                    *existing = merged_row;
+                }
+            })
+            .or_insert(row);
+    }
+
+    for (schedule_id, row) in delta.schedule_state {
+        merged
+            .schedule_state
+            .entry(schedule_id)
+            .and_modify(|existing| {
+                if let Some(merged_row) =
+                    merge_schedule_state_rows(vec![existing.clone(), row.clone()])
+                {
+                    *existing = merged_row;
+                }
+            })
+            .or_insert(row);
+    }
+
+    for (tick_id, row) in delta.schedule_ticks {
+        merged
+            .schedule_ticks
+            .entry(tick_id)
+            .and_modify(|existing| {
+                if let Some(merged_row) =
+                    merge_schedule_tick_rows(vec![existing.clone(), row.clone()])
+                {
+                    *existing = merged_row;
+                }
+            })
+            .or_insert(row);
+    }
+
     merged
 }
 
@@ -715,6 +818,28 @@ fn delta_from_states(base: &FoldState, current: &FoldState) -> FoldState {
         }
     }
 
+    for (schedule_id, row) in &current.schedule_definitions {
+        if base.schedule_definitions.get(schedule_id) != Some(row) {
+            delta
+                .schedule_definitions
+                .insert(schedule_id.clone(), row.clone());
+        }
+    }
+
+    for (schedule_id, row) in &current.schedule_state {
+        if base.schedule_state.get(schedule_id) != Some(row) {
+            delta
+                .schedule_state
+                .insert(schedule_id.clone(), row.clone());
+        }
+    }
+
+    for (tick_id, row) in &current.schedule_ticks {
+        if base.schedule_ticks.get(tick_id) != Some(row) {
+            delta.schedule_ticks.insert(tick_id.clone(), row.clone());
+        }
+    }
+
     delta
 }
 
@@ -728,6 +853,9 @@ fn delta_state_is_empty(state: &FoldState) -> bool {
         && state.sensor_evals.is_empty()
         && state.partition_status.is_empty()
         && state.idempotency_keys.is_empty()
+        && state.schedule_definitions.is_empty()
+        && state.schedule_state.is_empty()
+        && state.schedule_ticks.is_empty()
 }
 
 fn prune_sensor_evals(state: &mut FoldState) {

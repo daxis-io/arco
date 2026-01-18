@@ -951,6 +951,9 @@ pub struct FoldState {
     // ========================================================================
     // Layer 2: Schedule/Sensor Automation
     // ========================================================================
+    /// Schedule definition rows keyed by `schedule_id`.
+    pub schedule_definitions: HashMap<String, ScheduleDefinitionRow>,
+
     /// Schedule state rows keyed by `schedule_id`.
     pub schedule_state: HashMap<String, ScheduleStateRow>,
 
@@ -1226,6 +1229,30 @@ impl FoldState {
             }
 
             // Layer 2 automation events
+            OrchestrationEventData::ScheduleDefinitionUpserted {
+                schedule_id,
+                cron_expression,
+                timezone,
+                catchup_window_minutes,
+                asset_selection,
+                max_catchup_ticks,
+                enabled,
+            } => {
+                self.fold_schedule_definition_upserted(
+                    &event.tenant_id,
+                    &event.workspace_id,
+                    schedule_id,
+                    cron_expression,
+                    timezone,
+                    *catchup_window_minutes,
+                    asset_selection,
+                    *max_catchup_ticks,
+                    *enabled,
+                    event.timestamp,
+                    &event.event_id,
+                );
+            }
+
             OrchestrationEventData::ScheduleTicked {
                 schedule_id,
                 scheduled_for,
@@ -2032,6 +2059,50 @@ impl FoldState {
     // Layer 2: Schedule Fold Logic
     // ========================================================================
 
+    #[allow(clippy::too_many_arguments)]
+    fn fold_schedule_definition_upserted(
+        &mut self,
+        tenant_id: &str,
+        workspace_id: &str,
+        schedule_id: &str,
+        cron_expression: &str,
+        timezone: &str,
+        catchup_window_minutes: u32,
+        asset_selection: &[String],
+        max_catchup_ticks: u32,
+        enabled: bool,
+        timestamp: DateTime<Utc>,
+        event_id: &str,
+    ) {
+        let created_at = self
+            .schedule_definitions
+            .get(schedule_id)
+            .map_or(timestamp, |row| row.created_at);
+
+        if let Some(existing) = self.schedule_definitions.get(schedule_id) {
+            if event_id <= existing.row_version.as_str() {
+                return;
+            }
+        }
+
+        self.schedule_definitions.insert(
+            schedule_id.to_string(),
+            ScheduleDefinitionRow {
+                tenant_id: tenant_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                schedule_id: schedule_id.to_string(),
+                cron_expression: cron_expression.to_string(),
+                timezone: timezone.to_string(),
+                catchup_window_minutes,
+                asset_selection: asset_selection.to_vec(),
+                max_catchup_ticks,
+                enabled,
+                created_at,
+                row_version: event_id.to_string(),
+            },
+        );
+    }
+
     /// Folds a `ScheduleTicked` event into state.
     ///
     /// Updates:
@@ -2087,6 +2158,10 @@ impl FoldState {
             }
         }
 
+        let run_id = run_key.as_deref().map(|run_key| {
+            run_id_from_run_key(tenant_id, workspace_id, run_key, &self.tenant_secret)
+        });
+
         self.schedule_ticks.insert(
             tick_id.to_string(),
             ScheduleTickRow {
@@ -2100,7 +2175,7 @@ impl FoldState {
                 partition_selection,
                 status,
                 run_key,
-                run_id: None, // Filled by fold_run_requested correlation
+                run_id,
                 request_fingerprint,
                 row_version: event_id.to_string(),
             },
@@ -2875,6 +2950,38 @@ pub fn merge_idempotency_key_rows(rows: Vec<IdempotencyKeyRow>) -> Option<Idempo
 /// Merges partition status rows from base snapshot and L0 deltas.
 #[must_use]
 pub fn merge_partition_status_rows(rows: Vec<PartitionStatusRow>) -> Option<PartitionStatusRow> {
+    rows.into_iter()
+        .reduce(|best, row| match row.row_version.cmp(&best.row_version) {
+            std::cmp::Ordering::Less => best,
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => row,
+        })
+}
+
+/// Merges schedule definition rows from base snapshot and L0 deltas.
+#[must_use]
+pub fn merge_schedule_definition_rows(
+    rows: Vec<ScheduleDefinitionRow>,
+) -> Option<ScheduleDefinitionRow> {
+    rows.into_iter()
+        .reduce(|best, row| match row.row_version.cmp(&best.row_version) {
+            std::cmp::Ordering::Less => best,
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => row,
+        })
+}
+
+/// Merges schedule state rows from base snapshot and L0 deltas.
+#[must_use]
+pub fn merge_schedule_state_rows(rows: Vec<ScheduleStateRow>) -> Option<ScheduleStateRow> {
+    rows.into_iter()
+        .reduce(|best, row| match row.row_version.cmp(&best.row_version) {
+            std::cmp::Ordering::Less => best,
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => row,
+        })
+}
+
+/// Merges schedule tick rows from base snapshot and L0 deltas.
+#[must_use]
+pub fn merge_schedule_tick_rows(rows: Vec<ScheduleTickRow>) -> Option<ScheduleTickRow> {
     rows.into_iter()
         .reduce(|best, row| match row.row_version.cmp(&best.row_version) {
             std::cmp::Ordering::Less => best,

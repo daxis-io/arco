@@ -27,6 +27,12 @@ struct TriggerRunResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct DeployManifestResponse {
+    manifest_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TaskSummary {
     task_key: String,
     asset_key: Option<String>,
@@ -153,6 +159,141 @@ async fn parity_m1_selection_does_not_autofill_tasks() -> Result<()> {
     for task in &run.tasks {
         assert_eq!(task.asset_key.as_deref(), Some(task.task_key.as_str()));
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn parity_m1_selection_include_downstream_uses_manifest_graph() -> Result<()> {
+    let router = test_router();
+
+    let (status, manifest): (_, DeployManifestResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/manifests",
+                Some(serde_json::json!({
+                    "manifestVersion": "1.0",
+                    "codeVersionId": "abc123",
+                    "assets": [
+                        {
+                            "key": { "namespace": "analytics", "name": "a" },
+                            "id": "01HQAAAAAAA",
+                            "dependencies": []
+                        },
+                        {
+                            "key": { "namespace": "analytics", "name": "b" },
+                            "id": "01HQBBBBBBB",
+                            "dependencies": [
+                                { "upstreamKey": { "namespace": "analytics", "name": "a" } }
+                            ]
+                        },
+                        {
+                            "key": { "namespace": "analytics", "name": "c" },
+                            "id": "01HQCCCCCCC",
+                            "dependencies": [
+                                { "upstreamKey": { "namespace": "analytics", "name": "b" } }
+                            ]
+                        }
+                    ],
+                    "schedules": []
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let _ = manifest.manifest_id;
+
+    let (status, created_root_only): (_, TriggerRunResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/runs",
+                Some(serde_json::json!({
+                    "selection": ["analytics.a"],
+                    "partitions": [],
+                    "labels": {},
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::CREATED);
+
+    let run_id = created_root_only.run_id;
+    let (status, run): (_, RunResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::GET,
+                &format!("/api/v1/workspaces/test-workspace/runs/{run_id}"),
+                None,
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let mut actual_task_keys: Vec<String> = run.tasks.iter().map(|t| t.task_key.clone()).collect();
+    actual_task_keys.sort();
+    assert_eq!(actual_task_keys, vec!["analytics.a".to_string()]);
+
+    let (status, created_with_downstream): (_, TriggerRunResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/runs",
+                Some(serde_json::json!({
+                    "selection": ["analytics.a"],
+                    "includeDownstream": true,
+                    "partitions": [],
+                    "labels": {},
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::CREATED);
+
+    let run_id = created_with_downstream.run_id;
+    let (status, run): (_, RunResponse) = helpers::response_json(
+        helpers::send(
+            router,
+            helpers::make_request(
+                Method::GET,
+                &format!("/api/v1/workspaces/test-workspace/runs/{run_id}"),
+                None,
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let mut actual_task_keys: Vec<String> = run.tasks.iter().map(|t| t.task_key.clone()).collect();
+    actual_task_keys.sort();
+
+    let mut expected_task_keys = vec![
+        "analytics.a".to_string(),
+        "analytics.b".to_string(),
+        "analytics.c".to_string(),
+    ];
+    expected_task_keys.sort();
+
+    assert_eq!(actual_task_keys, expected_task_keys);
 
     Ok(())
 }

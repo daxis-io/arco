@@ -4709,6 +4709,14 @@
           "runKey"
         ],
         "properties": {
+          "includeDownstream": {
+            "type": "boolean",
+            "description": "Include downstream dependents of the selection."
+          },
+          "includeUpstream": {
+            "type": "boolean",
+            "description": "Include upstream dependencies of the selection."
+          },
           "labels": {
             "type": "object",
             "description": "Additional labels for the run.",
@@ -5918,6 +5926,14 @@
         "type": "object",
         "description": "Request to trigger a new run.",
         "properties": {
+          "includeDownstream": {
+            "type": "boolean",
+            "description": "Include downstream dependents of the selection."
+          },
+          "includeUpstream": {
+            "type": "boolean",
+            "description": "Include upstream dependencies of the selection."
+          },
           "labels": {
             "type": "object",
             "description": "Additional labels for the run.",

@@ -37,7 +37,8 @@ use utoipa::{IntoParams, ToSchema};
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
 use crate::orchestration_compaction::compact_orchestration_events;
-use crate::paths::backfill_idempotency_path;
+use crate::paths::{MANIFEST_IDEMPOTENCY_PREFIX, MANIFEST_PREFIX, backfill_idempotency_path};
+use crate::routes::manifests::StoredManifest;
 use crate::server::AppState;
 use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
 use arco_flow::orchestration::LedgerWriter;
@@ -68,6 +69,12 @@ pub struct TriggerRunRequest {
     /// Asset selection (asset keys to materialize).
     #[serde(default)]
     pub selection: Vec<String>,
+    /// Include upstream dependencies of the selection.
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default)]
+    pub include_downstream: bool,
     /// Partition overrides (key=value pairs).
     #[serde(default)]
     pub partitions: Vec<PartitionValue>,
@@ -89,6 +96,12 @@ pub struct RunKeyBackfillRequest {
     /// Asset selection (asset keys to materialize).
     #[serde(default)]
     pub selection: Vec<String>,
+    /// Include upstream dependencies of the selection.
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default)]
+    pub include_downstream: bool,
     /// Partition overrides (key=value pairs).
     #[serde(default)]
     pub partitions: Vec<PartitionValue>,
@@ -966,6 +979,65 @@ fn ensure_workspace(ctx: &RequestContext, workspace_id: &str) -> Result<(), ApiE
     Ok(())
 }
 
+async fn load_latest_asset_graph(
+    storage: &ScopedStorage,
+) -> Result<arco_flow::orchestration::AssetGraph, ApiError> {
+    let entries = storage
+        .list_meta(MANIFEST_PREFIX)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to list manifests: {e}")))?;
+
+    let mut latest: Option<StoredManifest> = None;
+
+    for entry in entries {
+        let path = entry.path.as_str();
+        if path.starts_with(MANIFEST_IDEMPOTENCY_PREFIX) || path.ends_with("_index.json") {
+            continue;
+        }
+        if !path.ends_with(".json") {
+            continue;
+        }
+
+        let bytes = match storage.get_raw(path).await {
+            Ok(b) => b,
+            Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => continue,
+            Err(err) => {
+                return Err(ApiError::internal(format!(
+                    "failed to read manifest {path}: {err}"
+                )));
+            }
+        };
+
+        let stored: StoredManifest = serde_json::from_slice(&bytes)
+            .map_err(|e| ApiError::internal(format!("failed to parse manifest {path}: {e}")))?;
+
+        let should_replace = latest
+            .as_ref()
+            .is_none_or(|existing| stored.deployed_at > existing.deployed_at);
+
+        if should_replace {
+            latest = Some(stored);
+        }
+    }
+
+    let Some(stored) = latest else {
+        return Ok(arco_flow::orchestration::AssetGraph::new());
+    };
+
+    let mut graph = arco_flow::orchestration::AssetGraph::new();
+    for asset in stored.assets {
+        let asset_key = format!("{}.{}", asset.key.namespace, asset.key.name);
+        let upstream = asset
+            .dependencies
+            .iter()
+            .map(|dep| format!("{}.{}", dep.upstream_key.namespace, dep.upstream_key.name))
+            .collect();
+        graph.insert_asset(asset_key, upstream);
+    }
+
+    Ok(graph)
+}
+
 fn parse_pagination(limit: u32, cursor: Option<&str>) -> Result<(usize, usize), ApiError> {
     if limit == 0 || limit > MAX_LIST_LIMIT {
         return Err(ApiError::bad_request(format!(
@@ -1337,23 +1409,6 @@ fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
     }
 }
 
-fn build_task_defs(request: &TriggerRunRequest) -> Result<Vec<TaskDef>, ApiError> {
-    let partition_key = build_partition_key(&request.partitions)?;
-
-    Ok(request
-        .selection
-        .iter()
-        .map(|asset_key| TaskDef {
-            key: asset_key.clone(), // task_key = asset_key for simple case
-            depends_on: vec![],
-            asset_key: Some(asset_key.clone()),
-            partition_key: partition_key.clone(),
-            max_attempts: 3,
-            heartbeat_timeout_sec: 300,
-        })
-        .collect())
-}
-
 fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, ApiError> {
     if partitions.is_empty() {
         return Ok(None);
@@ -1411,11 +1466,20 @@ fn build_request_fingerprint(request: &TriggerRunRequest) -> Result<String, ApiE
     #[derive(Serialize)]
     struct FingerprintPayload {
         selection: Vec<String>,
+        include_upstream: bool,
+        include_downstream: bool,
         partitions: Vec<PartitionValue>,
         labels: BTreeMap<String, String>,
     }
 
-    let mut selection = request.selection.clone();
+    let mut selection: Vec<String> = request
+        .selection
+        .iter()
+        .map(|value| {
+            arco_flow::orchestration::canonicalize_asset_key(value)
+                .map_err(|err| ApiError::bad_request(err))
+        })
+        .collect::<Result<_, _>>()?;
     selection.sort();
 
     let mut partitions = request.partitions.clone();
@@ -1429,6 +1493,8 @@ fn build_request_fingerprint(request: &TriggerRunRequest) -> Result<String, ApiE
 
     let payload = FingerprintPayload {
         selection,
+        include_upstream: request.include_upstream,
+        include_downstream: request.include_downstream,
         partitions,
         labels,
     };
@@ -1810,9 +1876,6 @@ pub(crate) async fn trigger_run(
         return Err(ApiError::bad_request("selection cannot be empty"));
     }
 
-    let tasks = build_task_defs(&request)?;
-    let root_assets = request.selection.clone();
-
     // Generate IDs upfront (needed for reservation)
     let run_id = Ulid::new().to_string();
     let plan_id = Ulid::new().to_string();
@@ -1823,6 +1886,29 @@ pub(crate) async fn trigger_run(
     let storage = ctx.scoped_storage(backend)?;
     let ledger = LedgerWriter::new(storage.clone());
     let mut run_event_overrides: Option<RunEventOverrides> = None;
+
+    let graph = load_latest_asset_graph(&storage).await?;
+    let partition_key = build_partition_key(&request.partitions)?;
+    let options = arco_flow::orchestration::SelectionOptions {
+        include_upstream: request.include_upstream,
+        include_downstream: request.include_downstream,
+    };
+    let tasks = arco_flow::orchestration::build_task_defs_for_selection(
+        &graph,
+        &request.selection,
+        options,
+        partition_key,
+    )
+    .map_err(|err| ApiError::bad_request(err))?;
+
+    let root_assets: Vec<String> = request
+        .selection
+        .iter()
+        .map(|value| {
+            arco_flow::orchestration::canonicalize_asset_key(value)
+                .map_err(|err| ApiError::bad_request(err))
+        })
+        .collect::<Result<_, _>>()?;
 
     let request_fingerprint = if request.run_key.is_some() {
         Some(build_request_fingerprint(&request)?)
@@ -2160,6 +2246,8 @@ pub(crate) async fn backfill_run_key(
 
     let fingerprint_request = TriggerRunRequest {
         selection: request.selection.clone(),
+        include_upstream: request.include_upstream,
+        include_downstream: request.include_downstream,
         partitions: request.partitions.clone(),
         run_key: Some(request.run_key.clone()),
         labels: request.labels.clone(),
@@ -3819,6 +3907,8 @@ mod tests {
 
         let request_a = TriggerRunRequest {
             selection: vec!["b".to_string(), "a".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![
                 PartitionValue {
                     key: "date".to_string(),
@@ -3839,6 +3929,8 @@ mod tests {
 
         let request_b = TriggerRunRequest {
             selection: vec!["a".to_string(), "b".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![
                 PartitionValue {
                     key: "region".to_string(),
@@ -3863,46 +3955,37 @@ mod tests {
     }
 
     #[test]
-    fn test_build_task_defs_canonical_partition_key() -> Result<()> {
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string()],
-            partitions: vec![
-                PartitionValue {
-                    key: "region".to_string(),
-                    value: "us-east-1".to_string(),
-                },
-                PartitionValue {
-                    key: "date".to_string(),
-                    value: "2024-01-15".to_string(),
-                },
-            ],
-            run_key: None,
-            labels: HashMap::new(),
-        };
+    fn test_build_partition_key_canonical_string() -> Result<()> {
+        let partitions = vec![
+            PartitionValue {
+                key: "region".to_string(),
+                value: "us-east-1".to_string(),
+            },
+            PartitionValue {
+                key: "date".to_string(),
+                value: "2024-01-15".to_string(),
+            },
+        ];
 
-        let tasks = build_task_defs(&request).map_err(|err| anyhow!("{err:?}"))?;
+        let partition_key = build_partition_key(&partitions).map_err(|err| anyhow!("{err:?}"))?;
+
         let mut pk = PartitionKey::new();
         pk.insert("region", ScalarValue::String("us-east-1".to_string()));
         pk.insert("date", ScalarValue::String("2024-01-15".to_string()));
         let expected = pk.canonical_string();
 
-        assert_eq!(tasks[0].partition_key.as_deref(), Some(expected.as_str()));
+        assert_eq!(partition_key.as_deref(), Some(expected.as_str()));
         Ok(())
     }
 
     #[test]
-    fn test_build_task_defs_rejects_invalid_partition_key() {
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string()],
-            partitions: vec![PartitionValue {
-                key: "Date".to_string(),
-                value: "2024-01-15".to_string(),
-            }],
-            run_key: None,
-            labels: HashMap::new(),
-        };
+    fn test_build_partition_key_rejects_invalid_partition_key() {
+        let partitions = vec![PartitionValue {
+            key: "Date".to_string(),
+            value: "2024-01-15".to_string(),
+        }];
 
-        assert!(build_task_defs(&request).is_err());
+        assert!(build_partition_key(&partitions).is_err());
     }
 
     #[tokio::test]
@@ -3921,6 +4004,8 @@ mod tests {
 
         let request = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
             run_key: Some("daily:2024-01-01".to_string()),
             labels: HashMap::new(),
@@ -3973,7 +4058,7 @@ mod tests {
                 trigger: TriggerInfo::Manual {
                     user_id: user_id_for_events(&ctx),
                 },
-                root_assets: vec!["analytics/users".to_string()],
+                root_assets: vec!["analytics.users".to_string()],
                 run_key: Some(reservation.run_key.clone()),
                 labels: request.labels.clone(),
                 code_version: None,
@@ -3997,7 +4082,22 @@ mod tests {
             OrchestrationEventData::PlanCreated {
                 run_id: reservation.run_id.clone(),
                 plan_id: reservation.plan_id.clone(),
-                tasks: build_task_defs(&request).map_err(|err| anyhow!("{err:?}"))?,
+                tasks: {
+                    let graph = arco_flow::orchestration::AssetGraph::new();
+                    let partition_key = build_partition_key(&request.partitions)
+                        .map_err(|err| anyhow!("{err:?}"))?;
+                    let options = arco_flow::orchestration::SelectionOptions {
+                        include_upstream: request.include_upstream,
+                        include_downstream: request.include_downstream,
+                    };
+                    arco_flow::orchestration::build_task_defs_for_selection(
+                        &graph,
+                        &request.selection,
+                        options,
+                        partition_key,
+                    )
+                    .map_err(|err| anyhow!("{err}"))?
+                },
             },
         );
         apply_event_metadata(&mut plan_event, &plan_event_id, reservation.created_at);
@@ -4026,6 +4126,8 @@ mod tests {
 
         let request_a = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
             run_key: Some("daily:2024-01-01".to_string()),
             labels: HashMap::new(),
@@ -4033,6 +4135,8 @@ mod tests {
 
         let request_b = TriggerRunRequest {
             selection: vec!["analytics/orders".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
             run_key: Some("daily:2024-01-01".to_string()),
             labels: HashMap::new(),
@@ -4092,12 +4196,16 @@ mod tests {
         let request = RunKeyBackfillRequest {
             run_key: "daily:2024-01-01".to_string(),
             selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
             labels: HashMap::new(),
         };
 
         let fingerprint_request = TriggerRunRequest {
             selection: request.selection.clone(),
+            include_upstream: request.include_upstream,
+            include_downstream: request.include_downstream,
             partitions: request.partitions.clone(),
             run_key: Some(request.run_key.clone()),
             labels: request.labels.clone(),
@@ -4160,6 +4268,8 @@ mod tests {
 
         let request_a = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
             run_key: Some("daily:2024-01-01".to_string()),
             labels: HashMap::new(),
@@ -4168,6 +4278,8 @@ mod tests {
         let request_b = RunKeyBackfillRequest {
             run_key: "daily:2024-01-01".to_string(),
             selection: vec!["analytics/orders".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
             labels: HashMap::new(),
         };

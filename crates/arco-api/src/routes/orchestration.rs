@@ -18,7 +18,7 @@
 //! - `POST   /tasks/{task_id}/heartbeat` - Worker heartbeat
 //! - `POST   /tasks/{task_id}/completed` - Worker finished execution
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -85,6 +85,69 @@ pub struct TriggerRunRequest {
     /// Additional labels for the run.
     #[serde(default)]
     pub labels: HashMap<String, String>,
+}
+
+/// Rerun mode values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum RerunMode {
+    /// Rerun all tasks that did not succeed in the parent run.
+    FromFailure,
+    /// Rerun a user-chosen subset of tasks from the parent plan.
+    Subset,
+}
+
+/// Rerun kind values exposed in responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RerunKindResponse {
+    /// Rerun tasks that did not succeed.
+    FromFailure,
+    /// Rerun a selected subset.
+    Subset,
+}
+
+/// Request to rerun a prior run.
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RerunRunRequest {
+    /// Rerun mode.
+    pub mode: RerunMode,
+    /// Selection roots for subset reruns.
+    #[serde(default)]
+    pub selection: Vec<String>,
+    /// Include upstream dependencies of the subset.
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the subset.
+    #[serde(default)]
+    pub include_downstream: bool,
+    /// Optional run key override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Additional labels for the rerun.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+/// Response after triggering a rerun.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RerunRunResponse {
+    /// Run ID (ULID).
+    pub run_id: String,
+    /// Plan ID for this run.
+    pub plan_id: String,
+    /// Current run state.
+    pub state: RunStateResponse,
+    /// Whether this is a new run or an existing one (`run_key` deduplication).
+    pub created: bool,
+    /// Run creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Parent run ID.
+    pub parent_run_id: String,
+    /// Rerun kind.
+    pub rerun_kind: RerunKindResponse,
 }
 
 /// Request to backfill a `run_key` reservation fingerprint.
@@ -198,6 +261,12 @@ pub struct RunResponse {
     /// Run labels.
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Parent run ID (for reruns).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    /// Rerun kind (for reruns).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerun_kind: Option<RerunKindResponse>,
 }
 
 /// Task execution summary.
@@ -317,6 +386,12 @@ pub struct RunListItem {
     pub tasks_succeeded: u32,
     /// Tasks failed.
     pub tasks_failed: u32,
+    /// Parent run ID (for reruns).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    /// Rerun kind (for reruns).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerun_kind: Option<RerunKindResponse>,
 }
 
 /// Request to cancel a run.
@@ -1142,11 +1217,11 @@ async fn plan_tasks_and_root_assets(
         graph.insert_asset(asset_key, upstream);
     }
 
-    let mut roots = std::collections::BTreeSet::new();
-    let mut unknown_roots = std::collections::BTreeSet::new();
+    let mut roots = BTreeSet::new();
+    let mut unknown_roots = BTreeSet::new();
     for root in &request.selection {
         let canonical = arco_flow::orchestration::canonicalize_asset_key(root)
-            .map_err(|err| ApiError::bad_request(err))?;
+            .map_err(ApiError::bad_request)?;
 
         if known_assets.contains(&canonical) {
             roots.insert(canonical);
@@ -1176,9 +1251,219 @@ async fn plan_tasks_and_root_assets(
         options,
         partition_key,
     )
-    .map_err(|err| ApiError::bad_request(err))?;
+    .map_err(ApiError::bad_request)?;
 
     Ok((manifest_id, deployed_at, root_assets, tasks))
+}
+
+type PlanGraph = (
+    HashMap<String, TaskRow>,
+    HashMap<String, Vec<String>>,
+    HashMap<String, Vec<String>>,
+);
+
+fn build_plan_graph_for_run(fold_state: &FoldState, run_id: &str) -> PlanGraph {
+    let mut tasks_by_key = HashMap::new();
+    for row in fold_state.tasks.values().filter(|row| row.run_id == run_id) {
+        tasks_by_key.insert(row.task_key.clone(), row.clone());
+    }
+
+    let mut upstream_by_task: HashMap<String, Vec<String>> = HashMap::new();
+    let mut downstream_by_task: HashMap<String, Vec<String>> = HashMap::new();
+
+    for task_key in tasks_by_key.keys() {
+        upstream_by_task.insert(task_key.clone(), Vec::new());
+        downstream_by_task.insert(task_key.clone(), Vec::new());
+    }
+
+    for edge in fold_state
+        .dep_satisfaction
+        .values()
+        .filter(|edge| edge.run_id == run_id)
+    {
+        if !tasks_by_key.contains_key(&edge.upstream_task_key)
+            || !tasks_by_key.contains_key(&edge.downstream_task_key)
+        {
+            continue;
+        }
+
+        upstream_by_task
+            .entry(edge.downstream_task_key.clone())
+            .or_default()
+            .push(edge.upstream_task_key.clone());
+        downstream_by_task
+            .entry(edge.upstream_task_key.clone())
+            .or_default()
+            .push(edge.downstream_task_key.clone());
+    }
+
+    for value in upstream_by_task.values_mut() {
+        value.sort();
+        value.dedup();
+    }
+    for value in downstream_by_task.values_mut() {
+        value.sort();
+        value.dedup();
+    }
+
+    (tasks_by_key, upstream_by_task, downstream_by_task)
+}
+
+fn close_task_selection(
+    roots: &[String],
+    include_upstream: bool,
+    include_downstream: bool,
+    upstream_by_task: &HashMap<String, Vec<String>>,
+    downstream_by_task: &HashMap<String, Vec<String>>,
+) -> BTreeSet<String> {
+    let mut selected: BTreeSet<String> = roots.iter().cloned().collect();
+
+    if include_upstream {
+        let mut queue: VecDeque<String> = roots.iter().cloned().collect();
+        while let Some(current) = queue.pop_front() {
+            let upstream = upstream_by_task.get(&current).cloned().unwrap_or_default();
+            for upstream_key in upstream {
+                if selected.insert(upstream_key.clone()) {
+                    queue.push_back(upstream_key);
+                }
+            }
+        }
+    }
+
+    if include_downstream {
+        let mut queue: VecDeque<String> = roots.iter().cloned().collect();
+        while let Some(current) = queue.pop_front() {
+            let downstream = downstream_by_task
+                .get(&current)
+                .cloned()
+                .unwrap_or_default();
+            for downstream_key in downstream {
+                if selected.insert(downstream_key.clone()) {
+                    queue.push_back(downstream_key);
+                }
+            }
+        }
+    }
+
+    selected
+}
+
+fn task_defs_for_rerun(
+    tasks_by_key: &HashMap<String, TaskRow>,
+    selected: &BTreeSet<String>,
+    upstream_by_task: &HashMap<String, Vec<String>>,
+) -> Vec<TaskDef> {
+    let mut tasks = Vec::new();
+
+    for task_key in selected {
+        let Some(task_row) = tasks_by_key.get(task_key) else {
+            continue;
+        };
+
+        let mut depends_on: Vec<String> = upstream_by_task
+            .get(task_key)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|upstream| selected.contains(upstream))
+            .collect();
+        depends_on.sort();
+
+        tasks.push(TaskDef {
+            key: task_key.clone(),
+            depends_on,
+            asset_key: task_row.asset_key.clone(),
+            partition_key: task_row.partition_key.clone(),
+            max_attempts: task_row.max_attempts,
+            heartbeat_timeout_sec: task_row.heartbeat_timeout_sec,
+        });
+    }
+
+    tasks.sort_by(|a, b| a.key.cmp(&b.key));
+    tasks
+}
+
+fn compute_rerun_run_key(
+    parent_run_id: &str,
+    rerun_kind: RerunKindResponse,
+    selected_tasks: &BTreeSet<String>,
+    partition_keys: &BTreeSet<String>,
+) -> Result<String, ApiError> {
+    #[derive(Serialize)]
+    struct Payload {
+        parent_run_id: String,
+        rerun_kind: RerunKindResponse,
+        selected_tasks: Vec<String>,
+        partition_keys: Vec<String>,
+    }
+
+    let payload = Payload {
+        parent_run_id: parent_run_id.to_string(),
+        rerun_kind,
+        selected_tasks: selected_tasks.iter().cloned().collect(),
+        partition_keys: partition_keys.iter().cloned().collect(),
+    };
+
+    let json = serde_json::to_vec(&payload).map_err(|e| {
+        ApiError::internal(format!("failed to serialize rerun run_key payload: {e}"))
+    })?;
+    let hash = Sha256::digest(&json);
+    let hex_hash = hex::encode(hash);
+
+    let kind = match rerun_kind {
+        RerunKindResponse::FromFailure => "from_failure",
+        RerunKindResponse::Subset => "subset",
+    };
+
+    Ok(format!("rerun:{parent_run_id}:{kind}:{}", &hex_hash[..16]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_rerun_request_fingerprint(
+    parent_run_id: &str,
+    rerun_kind: RerunKindResponse,
+    roots: &[String],
+    include_upstream: bool,
+    include_downstream: bool,
+    selected_tasks: &BTreeSet<String>,
+    partition_keys: &BTreeSet<String>,
+    labels: &HashMap<String, String>,
+) -> Result<String, ApiError> {
+    #[derive(Serialize)]
+    struct Payload {
+        parent_run_id: String,
+        rerun_kind: RerunKindResponse,
+        roots: Vec<String>,
+        include_upstream: bool,
+        include_downstream: bool,
+        selected_tasks: Vec<String>,
+        partition_keys: Vec<String>,
+        labels: BTreeMap<String, String>,
+    }
+
+    let labels = labels
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let payload = Payload {
+        parent_run_id: parent_run_id.to_string(),
+        rerun_kind,
+        roots: roots.to_vec(),
+        include_upstream,
+        include_downstream,
+        selected_tasks: selected_tasks.iter().cloned().collect(),
+        partition_keys: partition_keys.iter().cloned().collect(),
+        labels,
+    };
+
+    let json = serde_json::to_vec(&payload).map_err(|e| {
+        ApiError::internal(format!(
+            "failed to serialize rerun request fingerprint: {e}"
+        ))
+    })?;
+    let hash = Sha256::digest(&json);
+    Ok(hex::encode(hash))
 }
 
 fn parse_pagination(limit: u32, cursor: Option<&str>) -> Result<(usize, usize), ApiError> {
@@ -1524,6 +1809,43 @@ fn map_task_state(state: FoldTaskState) -> TaskStateResponse {
     }
 }
 
+const LABEL_PARENT_RUN_ID: &str = "arco.parent_run_id";
+const LABEL_RERUN_KIND: &str = "arco.rerun.kind";
+
+fn rerun_kind_from_label(value: &str) -> Option<RerunKindResponse> {
+    match value {
+        "FROM_FAILURE" => Some(RerunKindResponse::FromFailure),
+        "SUBSET" => Some(RerunKindResponse::Subset),
+        _ => None,
+    }
+}
+
+fn lineage_from_labels(
+    labels: &HashMap<String, String>,
+) -> (Option<String>, Option<RerunKindResponse>) {
+    let parent = labels.get(LABEL_PARENT_RUN_ID).cloned();
+    let kind = labels
+        .get(LABEL_RERUN_KIND)
+        .and_then(|value| rerun_kind_from_label(value));
+    (parent, kind)
+}
+
+fn reject_reserved_lineage_labels(labels: &HashMap<String, String>) -> Result<(), ApiError> {
+    let forbidden = [LABEL_PARENT_RUN_ID, LABEL_RERUN_KIND]
+        .into_iter()
+        .filter(|key| labels.contains_key(*key))
+        .collect::<Vec<_>>();
+
+    if forbidden.is_empty() {
+        return Ok(());
+    }
+
+    Err(ApiError::bad_request(format!(
+        "labels cannot include reserved keys: {}",
+        forbidden.join(", ")
+    )))
+}
+
 fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
     let mut pending = 0;
     let mut queued = 0;
@@ -1619,8 +1941,7 @@ fn build_request_fingerprint(request: &TriggerRunRequest) -> Result<String, ApiE
         .selection
         .iter()
         .map(|value| {
-            arco_flow::orchestration::canonicalize_asset_key(value)
-                .map_err(|err| ApiError::bad_request(err))
+            arco_flow::orchestration::canonicalize_asset_key(value).map_err(ApiError::bad_request)
         })
         .collect::<Result<_, _>>()?;
     selection.sort();
@@ -2020,6 +2341,8 @@ pub(crate) async fn trigger_run(
         return Err(ApiError::bad_request("selection cannot be empty"));
     }
 
+    reject_reserved_lineage_labels(&request.labels)?;
+
     // Generate IDs upfront (needed for reservation)
     let run_id = Ulid::new().to_string();
     let plan_id = Ulid::new().to_string();
@@ -2344,6 +2667,289 @@ pub(crate) async fn trigger_run(
     ))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/runs/{run_id}/rerun",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("run_id" = String, Path, description = "Run ID")
+    ),
+    request_body = RerunRunRequest,
+    responses(
+        (status = 201, description = "Rerun created", body = RerunRunResponse),
+        (status = 200, description = "Existing rerun returned (run_key match)", body = RerunRunResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorBody),
+        (status = 409, description = "Conflict", body = ApiErrorBody),
+        (status = 404, description = "Run not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(
+        ("bearerAuth" = [])
+    )
+)]
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn rerun_run(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, parent_run_id)): Path<(String, String)>,
+    Json(request): Json<RerunRunRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    reject_reserved_lineage_labels(&request.labels)?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let parent_run = fold_state
+        .runs
+        .get(&parent_run_id)
+        .ok_or_else(|| ApiError::not_found(format!("run not found: {parent_run_id}")))?;
+
+    let rerun_kind = match request.mode {
+        RerunMode::FromFailure => RerunKindResponse::FromFailure,
+        RerunMode::Subset => RerunKindResponse::Subset,
+    };
+
+    if rerun_kind == RerunKindResponse::FromFailure && parent_run.state != FoldRunState::Failed {
+        return Err(ApiError::conflict(
+            "rerun-from-failure requires a FAILED parent run".to_string(),
+        ));
+    }
+
+    let (tasks_by_key, upstream_by_task, downstream_by_task) =
+        build_plan_graph_for_run(&fold_state, &parent_run_id);
+
+    if tasks_by_key.is_empty() {
+        return Err(ApiError::conflict(
+            "parent run has no plan; cannot rerun".to_string(),
+        ));
+    }
+
+    let (roots, selected, include_upstream, include_downstream) = match rerun_kind {
+        RerunKindResponse::FromFailure => {
+            let mut selected = BTreeSet::new();
+            for (task_key, task_row) in &tasks_by_key {
+                if task_row.state != FoldTaskState::Succeeded {
+                    selected.insert(task_key.clone());
+                }
+            }
+
+            let roots: Vec<String> = selected.iter().cloned().collect();
+            (roots, selected, false, false)
+        }
+        RerunKindResponse::Subset => {
+            if request.selection.is_empty() {
+                return Err(ApiError::bad_request("selection cannot be empty"));
+            }
+
+            let mut roots = BTreeSet::new();
+            let mut unknown = BTreeSet::new();
+            for value in &request.selection {
+                let canonical = arco_flow::orchestration::canonicalize_asset_key(value)
+                    .map_err(ApiError::bad_request)?;
+
+                if tasks_by_key.contains_key(&canonical) {
+                    roots.insert(canonical);
+                } else {
+                    unknown.insert(canonical);
+                }
+            }
+
+            if !unknown.is_empty() {
+                return Err(ApiError::bad_request(format!(
+                    "unknown task keys: {}",
+                    unknown.into_iter().collect::<Vec<_>>().join(", ")
+                )));
+            }
+
+            let roots_vec: Vec<String> = roots.iter().cloned().collect();
+            let selected = close_task_selection(
+                &roots_vec,
+                request.include_upstream,
+                request.include_downstream,
+                &upstream_by_task,
+                &downstream_by_task,
+            );
+
+            (
+                roots_vec,
+                selected,
+                request.include_upstream,
+                request.include_downstream,
+            )
+        }
+    };
+
+    if selected.is_empty() {
+        return Err(ApiError::bad_request("rerun selection is empty"));
+    }
+
+    let mut partition_keys = BTreeSet::new();
+    for task_key in &selected {
+        let Some(row) = tasks_by_key.get(task_key) else {
+            continue;
+        };
+        if let Some(partition_key) = row.partition_key.as_ref() {
+            partition_keys.insert(partition_key.clone());
+        }
+    }
+
+    let root_assets = roots.clone();
+    let tasks = task_defs_for_rerun(&tasks_by_key, &selected, &upstream_by_task);
+
+    let mut labels = request.labels.clone();
+    labels.insert(LABEL_PARENT_RUN_ID.to_string(), parent_run_id.clone());
+    labels.insert(
+        LABEL_RERUN_KIND.to_string(),
+        match rerun_kind {
+            RerunKindResponse::FromFailure => "FROM_FAILURE".to_string(),
+            RerunKindResponse::Subset => "SUBSET".to_string(),
+        },
+    );
+
+    let run_key = match request.run_key.clone() {
+        Some(value) => value,
+        None => compute_rerun_run_key(&parent_run_id, rerun_kind, &selected, &partition_keys)?,
+    };
+
+    let request_fingerprint = Some(compute_rerun_request_fingerprint(
+        &parent_run_id,
+        rerun_kind,
+        &root_assets,
+        include_upstream,
+        include_downstream,
+        &selected,
+        &partition_keys,
+        &labels,
+    )?);
+
+    let now = Utc::now();
+    let run_id = Ulid::new().to_string();
+    let plan_id = Ulid::new().to_string();
+
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+    let ledger = LedgerWriter::new(storage.clone());
+
+    let fingerprint_policy =
+        FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff);
+
+    let run_event_id = Ulid::new().to_string();
+    let plan_event_id = Ulid::new().to_string();
+
+    let reservation = RunKeyReservation {
+        run_key: run_key.clone(),
+        run_id: run_id.clone(),
+        plan_id: plan_id.clone(),
+        event_id: run_event_id.clone(),
+        plan_event_id: Some(plan_event_id.clone()),
+        request_fingerprint: request_fingerprint.clone(),
+        created_at: now,
+    };
+
+    let run_event_overrides = match reserve_run_key(&storage, &reservation, fingerprint_policy)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to reserve run_key: {e}")))?
+    {
+        ReservationResult::Reserved => Some(RunEventOverrides {
+            run_event_id,
+            plan_event_id,
+            created_at: now,
+        }),
+        ReservationResult::AlreadyExists(existing) => {
+            let mut run_state = RunStateResponse::Pending;
+            let mut run_found = false;
+
+            if let Ok(fold_state) = load_orchestration_state(&ctx, &state).await {
+                if let Some(run) = fold_state.runs.get(&existing.run_id) {
+                    run_state = map_run_row_state(run);
+                    run_found = true;
+                }
+            }
+
+            if !run_found {
+                let user_id = user_id_for_events(&ctx);
+                let plan_event_id = existing
+                    .plan_event_id
+                    .clone()
+                    .unwrap_or_else(|| Ulid::new().to_string());
+
+                let event_paths = append_run_events(
+                    &ledger,
+                    &ctx.tenant,
+                    &workspace_id,
+                    user_id,
+                    &existing.run_id,
+                    &existing.plan_id,
+                    Some(existing.run_key.clone()),
+                    labels.clone(),
+                    parent_run.code_version.clone(),
+                    root_assets.clone(),
+                    tasks.clone(),
+                    Some(RunEventOverrides {
+                        run_event_id: existing.event_id.clone(),
+                        plan_event_id,
+                        created_at: existing.created_at,
+                    }),
+                )
+                .await?;
+
+                compact_orchestration_events(&state.config, storage.clone(), event_paths).await?;
+            }
+
+            return Ok((
+                StatusCode::OK,
+                Json(RerunRunResponse {
+                    run_id: existing.run_id,
+                    plan_id: existing.plan_id,
+                    state: run_state,
+                    created: false,
+                    created_at: existing.created_at,
+                    parent_run_id,
+                    rerun_kind,
+                }),
+            ));
+        }
+        ReservationResult::FingerprintMismatch { existing, .. } => {
+            return Err(ApiError::conflict(format!(
+                "run_key '{}' already reserved with different trigger payload",
+                existing.run_key
+            )));
+        }
+    };
+
+    let user_id = user_id_for_events(&ctx);
+
+    let event_paths = append_run_events(
+        &ledger,
+        &ctx.tenant,
+        &workspace_id,
+        user_id,
+        &run_id,
+        &plan_id,
+        Some(run_key),
+        labels,
+        parent_run.code_version.clone(),
+        root_assets,
+        tasks,
+        run_event_overrides,
+    )
+    .await?;
+
+    compact_orchestration_events(&state.config, storage.clone(), event_paths).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(RerunRunResponse {
+            run_id,
+            plan_id,
+            state: RunStateResponse::Pending,
+            created: true,
+            created_at: now,
+            parent_run_id,
+            rerun_kind,
+        }),
+    ))
+}
+
 /// Manually evaluate a sensor with an arbitrary payload.
 #[utoipa::path(
     post,
@@ -2650,6 +3256,8 @@ pub(crate) async fn get_run(
         })
         .collect::<Vec<_>>();
 
+    let (parent_run_id, rerun_kind) = lineage_from_labels(&run.labels);
+
     let response = RunResponse {
         run_id: run.run_id.clone(),
         workspace_id,
@@ -2661,6 +3269,8 @@ pub(crate) async fn get_run(
         tasks: task_summaries,
         task_counts,
         labels: run.labels.clone(),
+        parent_run_id,
+        rerun_kind,
     };
 
     Ok(Json(response))
@@ -2741,14 +3351,19 @@ pub(crate) async fn list_runs(
 
     let items = page
         .iter()
-        .map(|row| RunListItem {
-            run_id: row.run_id.clone(),
-            state: map_run_row_state(row),
-            created_at: row.triggered_at,
-            completed_at: row.completed_at,
-            task_count: row.tasks_total,
-            tasks_succeeded: row.tasks_succeeded,
-            tasks_failed: row.tasks_failed,
+        .map(|row| {
+            let (parent_run_id, rerun_kind) = lineage_from_labels(&row.labels);
+            RunListItem {
+                run_id: row.run_id.clone(),
+                state: map_run_row_state(row),
+                created_at: row.triggered_at,
+                completed_at: row.completed_at,
+                task_count: row.tasks_total,
+                tasks_succeeded: row.tasks_succeeded,
+                tasks_failed: row.tasks_failed,
+                parent_run_id,
+                rerun_kind,
+            }
         })
         .collect::<Vec<_>>();
 
@@ -3888,6 +4503,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/workspaces/:workspace_id/runs", get(list_runs))
         .route("/workspaces/:workspace_id/runs/:run_id", get(get_run))
         .route(
+            "/workspaces/:workspace_id/runs/:run_id/rerun",
+            post(rerun_run),
+        )
+        .route(
             "/workspaces/:workspace_id/runs/run-key/backfill",
             post(backfill_run_key),
         )
@@ -3996,6 +4615,8 @@ mod tests {
             tasks: vec![],
             task_counts: TaskCounts::default(),
             labels: HashMap::new(),
+            parent_run_id: None,
+            rerun_kind: None,
         };
 
         let json = serde_json::to_string(&response).expect("serialize");

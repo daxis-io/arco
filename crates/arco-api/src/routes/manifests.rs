@@ -311,7 +311,7 @@ fn validate_manifest(request: &DeployManifestRequest) -> Result<(), ApiError> {
             "{}/{}",
             asset.key.namespace, asset.key.name
         ))
-        .map_err(|err| ApiError::bad_request(err))?;
+        .map_err(ApiError::bad_request)?;
 
         if !asset_keys.insert(canonical) {
             return Err(ApiError::bad_request("duplicate asset key in manifest"));
@@ -323,14 +323,14 @@ fn validate_manifest(request: &DeployManifestRequest) -> Result<(), ApiError> {
             "{}/{}",
             asset.key.namespace, asset.key.name
         ))
-        .map_err(|err| ApiError::bad_request(err))?;
+        .map_err(ApiError::bad_request)?;
 
         for dependency in &asset.dependencies {
             let upstream = arco_flow::orchestration::canonicalize_asset_key(&format!(
                 "{}/{}",
                 dependency.upstream_key.namespace, dependency.upstream_key.name
             ))
-            .map_err(|err| ApiError::bad_request(err))?;
+            .map_err(ApiError::bad_request)?;
 
             if !asset_keys.contains(&upstream) {
                 return Err(ApiError::bad_request(format!(
@@ -375,7 +375,7 @@ fn validate_manifest(request: &DeployManifestRequest) -> Result<(), ApiError> {
 
         for asset in &schedule.assets {
             let canonical = arco_flow::orchestration::canonicalize_asset_key(asset)
-                .map_err(|err| ApiError::bad_request(err))?;
+                .map_err(ApiError::bad_request)?;
 
             if !asset_keys.contains(&canonical) {
                 return Err(ApiError::bad_request(format!(
@@ -478,7 +478,7 @@ async fn upsert_schedule_definitions(
     for schedule in schedules {
         let existing = fold_state.schedule_definitions.get(schedule.id.as_str());
 
-        let enabled = existing.map_or(true, |row| row.enabled);
+        let enabled = existing.is_none_or(|row| row.enabled);
         let catchup_window_minutes = existing.map_or(0, |row| row.catchup_window_minutes);
         let max_catchup_ticks = existing.map_or(1, |row| row.max_catchup_ticks);
 

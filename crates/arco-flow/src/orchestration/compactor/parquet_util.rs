@@ -34,8 +34,9 @@ use parquet::format::KeyValue;
 
 use super::fold::{
     DepResolution, DepSatisfactionRow, DispatchOutboxRow, DispatchStatus, IdempotencyKeyRow,
-    PartitionStatusRow, RunRow, RunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
-    SensorEvalRow, SensorStateRow, TaskRow, TaskState, TimerRow, TimerState, TimerType,
+    PartitionStatusRow, RunKeyConflictRow, RunKeyIndexRow, RunRow, RunState, ScheduleDefinitionRow,
+    ScheduleStateRow, ScheduleTickRow, SensorEvalRow, SensorStateRow, TaskRow, TaskState, TimerRow,
+    TimerState, TimerType,
 };
 use crate::error::{Error, Result};
 use crate::orchestration::events::{
@@ -949,10 +950,7 @@ pub fn write_sensor_evals(rows: &[SensorEvalRow]) -> Result<Bytes> {
 }
 
 /// Writes `run_key_index.parquet`.
-///
-/// # Errors
-/// Returns an error if Parquet encoding fails.
-pub(super) fn write_run_key_index(rows: &[RunKeyIndexRow]) -> Result<Bytes> {
+pub fn write_run_key_index(rows: &[RunKeyIndexRow]) -> Result<Bytes> {
     let schema = run_key_index_schema();
 
     let tenant_ids = StringArray::from(
@@ -1009,10 +1007,7 @@ pub(super) fn write_run_key_index(rows: &[RunKeyIndexRow]) -> Result<Bytes> {
 }
 
 /// Writes `run_key_conflicts.parquet`.
-///
-/// # Errors
-/// Returns an error if Parquet encoding fails.
-pub(super) fn write_run_key_conflicts(rows: &[RunKeyConflictRow]) -> Result<Bytes> {
+pub fn write_run_key_conflicts(rows: &[RunKeyConflictRow]) -> Result<Bytes> {
     let schema = run_key_conflicts_schema();
 
     let tenant_ids = StringArray::from(

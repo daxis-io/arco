@@ -42,8 +42,9 @@ use super::manifest::{
 };
 use super::parquet_util::{
     read_partition_status, write_dep_satisfaction, write_dispatch_outbox, write_idempotency_keys,
-    write_partition_status, write_runs, write_schedule_definitions, write_schedule_state,
-    write_schedule_ticks, write_sensor_evals, write_sensor_state, write_tasks, write_timers,
+    write_partition_status, write_run_key_conflicts, write_run_key_index, write_runs,
+    write_schedule_definitions, write_schedule_state, write_schedule_ticks, write_sensor_evals,
+    write_sensor_state, write_tasks, write_timers,
 };
 
 const SENSOR_EVAL_RETENTION_DAYS: i64 = 30;
@@ -613,22 +614,6 @@ impl MicroCompactor {
             }
         }
 
-        if let Some(ref backfills_path) = tables.backfills {
-            let data = self.storage.get_raw(backfills_path).await?;
-            let rows = super::parquet_util::read_backfills(&data)?;
-            for row in rows {
-                state.backfills.insert(row.backfill_id.clone(), row);
-            }
-        }
-
-        if let Some(ref backfill_chunks_path) = tables.backfill_chunks {
-            let data = self.storage.get_raw(backfill_chunks_path).await?;
-            let rows = super::parquet_util::read_backfill_chunks(&data)?;
-            for row in rows {
-                state.backfill_chunks.insert(row.chunk_id.clone(), row);
-            }
-        }
-
         if let Some(ref run_key_index_path) = tables.run_key_index {
             let data = self.storage.get_raw(run_key_index_path).await?;
             let rows = super::parquet_util::read_run_key_index(&data)?;
@@ -793,18 +778,78 @@ impl MicroCompactor {
             &mut paths.schedule_ticks
         );
 
-        write_table!(
-            "backfills.parquet",
-            &state.backfills,
-            write_backfills,
-            &mut paths.backfills
-        );
-        write_table!(
-            "backfill_chunks.parquet",
-            &state.backfill_chunks,
-            write_backfill_chunks,
-            &mut paths.backfill_chunks
-        );
+        // Write dep_satisfaction
+        if !state.dep_satisfaction.is_empty() {
+            let rows: Vec<_> = state.dep_satisfaction.values().cloned().collect();
+            let bytes = write_dep_satisfaction(&rows)?;
+            let path = format!("{base_path}/dep_satisfaction.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.dep_satisfaction = Some(path);
+        }
+
+        if !state.timers.is_empty() {
+            let rows: Vec<_> = state.timers.values().cloned().collect();
+            let bytes = write_timers(&rows)?;
+            let path = format!("{base_path}/timers.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.timers = Some(path);
+        }
+
+        if !state.dispatch_outbox.is_empty() {
+            let rows: Vec<_> = state.dispatch_outbox.values().cloned().collect();
+            let bytes = write_dispatch_outbox(&rows)?;
+            let path = format!("{base_path}/dispatch_outbox.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.dispatch_outbox = Some(path);
+        }
+
+        if !state.sensor_state.is_empty() {
+            let rows: Vec<_> = state.sensor_state.values().cloned().collect();
+            let bytes = write_sensor_state(&rows)?;
+            let path = format!("{base_path}/sensor_state.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.sensor_state = Some(path);
+        }
+
+        if !state.sensor_evals.is_empty() {
+            let rows: Vec<_> = state.sensor_evals.values().cloned().collect();
+            let bytes = write_sensor_evals(&rows)?;
+            let path = format!("{base_path}/sensor_evals.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.sensor_evals = Some(path);
+        }
+
+        if !state.run_key_index.is_empty() {
+            let rows: Vec<_> = state.run_key_index.values().cloned().collect();
+            let bytes = write_run_key_index(&rows)?;
+            let path = format!("{base_path}/run_key_index.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.run_key_index = Some(path);
+        }
+
+        if !state.run_key_conflicts.is_empty() {
+            let rows: Vec<_> = state.run_key_conflicts.values().cloned().collect();
+            let bytes = write_run_key_conflicts(&rows)?;
+            let path = format!("{base_path}/run_key_conflicts.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.run_key_conflicts = Some(path);
+        }
+
+        if !state.partition_status.is_empty() {
+            let rows: Vec<_> = state.partition_status.values().cloned().collect();
+            let bytes = write_partition_status(&rows)?;
+            let path = format!("{base_path}/partition_status.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.partition_status = Some(path);
+        }
+
+        if !state.idempotency_keys.is_empty() {
+            let rows: Vec<_> = state.idempotency_keys.values().cloned().collect();
+            let bytes = write_idempotency_keys(&rows)?;
+            let path = format!("{base_path}/idempotency_keys.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.idempotency_keys = Some(path);
+        }
 
         if !state.schedule_definitions.is_empty() {
             let rows: Vec<_> = state.schedule_definitions.values().cloned().collect();
@@ -1132,32 +1177,6 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
             .or_insert(row);
     }
 
-    for (backfill_id, row) in delta.backfills {
-        merged
-            .backfills
-            .entry(backfill_id)
-            .and_modify(|existing| {
-                if let Some(merged_row) = merge_backfill_rows(vec![existing.clone(), row.clone()]) {
-                    *existing = merged_row;
-                }
-            })
-            .or_insert(row);
-    }
-
-    for (chunk_id, row) in delta.backfill_chunks {
-        merged
-            .backfill_chunks
-            .entry(chunk_id)
-            .and_modify(|existing| {
-                if let Some(merged_row) =
-                    merge_backfill_chunk_rows(vec![existing.clone(), row.clone()])
-                {
-                    *existing = merged_row;
-                }
-            })
-            .or_insert(row);
-    }
-
     for (run_key, row) in delta.run_key_index {
         merged
             .run_key_index
@@ -1297,47 +1316,71 @@ fn delta_from_states(base: &FoldState, current: &FoldState) -> FoldState {
         &current.sensor_evals,
     );
 
-    insert_changed(&mut delta.backfills, &base.backfills, &current.backfills);
-    insert_changed(
-        &mut delta.backfill_chunks,
-        &base.backfill_chunks,
-        &current.backfill_chunks,
-    );
-    insert_changed(
-        &mut delta.run_key_index,
-        &base.run_key_index,
-        &current.run_key_index,
-    );
-    insert_changed(
-        &mut delta.run_key_conflicts,
-        &base.run_key_conflicts,
-        &current.run_key_conflicts,
-    );
-    insert_changed(
-        &mut delta.partition_status,
-        &base.partition_status,
-        &current.partition_status,
-    );
-    insert_changed(
-        &mut delta.idempotency_keys,
-        &base.idempotency_keys,
-        &current.idempotency_keys,
-    );
-    insert_changed(
-        &mut delta.schedule_definitions,
-        &base.schedule_definitions,
-        &current.schedule_definitions,
-    );
-    insert_changed(
-        &mut delta.schedule_state,
-        &base.schedule_state,
-        &current.schedule_state,
-    );
-    insert_changed(
-        &mut delta.schedule_ticks,
-        &base.schedule_ticks,
-        &current.schedule_ticks,
-    );
+    for (key, row) in &current.tasks {
+        if base.tasks.get(key) != Some(row) {
+            delta.tasks.insert(key.clone(), row.clone());
+        }
+    }
+
+    for (key, row) in &current.dep_satisfaction {
+        if base.dep_satisfaction.get(key) != Some(row) {
+            delta.dep_satisfaction.insert(key.clone(), row.clone());
+        }
+    }
+
+    for (timer_id, row) in &current.timers {
+        if base.timers.get(timer_id) != Some(row) {
+            delta.timers.insert(timer_id.clone(), row.clone());
+        }
+    }
+
+    for (dispatch_id, row) in &current.dispatch_outbox {
+        if base.dispatch_outbox.get(dispatch_id) != Some(row) {
+            delta
+                .dispatch_outbox
+                .insert(dispatch_id.clone(), row.clone());
+        }
+    }
+
+    for (sensor_id, row) in &current.sensor_state {
+        if base.sensor_state.get(sensor_id) != Some(row) {
+            delta.sensor_state.insert(sensor_id.clone(), row.clone());
+        }
+    }
+
+    for (eval_id, row) in &current.sensor_evals {
+        if base.sensor_evals.get(eval_id) != Some(row) {
+            delta.sensor_evals.insert(eval_id.clone(), row.clone());
+        }
+    }
+
+    for (run_key, row) in &current.run_key_index {
+        if base.run_key_index.get(run_key) != Some(row) {
+            delta.run_key_index.insert(run_key.clone(), row.clone());
+        }
+    }
+
+    for (conflict_id, row) in &current.run_key_conflicts {
+        if base.run_key_conflicts.get(conflict_id) != Some(row) {
+            delta
+                .run_key_conflicts
+                .insert(conflict_id.clone(), row.clone());
+        }
+    }
+
+    for (key, row) in &current.partition_status {
+        if base.partition_status.get(key) != Some(row) {
+            delta.partition_status.insert(key.clone(), row.clone());
+        }
+    }
+
+    for (idempotency_key, row) in &current.idempotency_keys {
+        if base.idempotency_keys.get(idempotency_key) != Some(row) {
+            delta
+                .idempotency_keys
+                .insert(idempotency_key.clone(), row.clone());
+        }
+    }
 
     for (schedule_id, row) in &current.schedule_definitions {
         if base.schedule_definitions.get(schedule_id) != Some(row) {
@@ -1372,8 +1415,6 @@ fn delta_state_is_empty(state: &FoldState) -> bool {
         && state.dispatch_outbox.is_empty()
         && state.sensor_state.is_empty()
         && state.sensor_evals.is_empty()
-        && state.backfills.is_empty()
-        && state.backfill_chunks.is_empty()
         && state.run_key_index.is_empty()
         && state.run_key_conflicts.is_empty()
         && state.partition_status.is_empty()

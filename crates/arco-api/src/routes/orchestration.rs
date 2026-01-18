@@ -75,6 +75,12 @@ pub struct TriggerRunRequest {
     /// Include downstream dependents of the selection.
     #[serde(default)]
     pub include_downstream: bool,
+    /// Partition overrides (key=value pairs).
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default)]
+    pub include_downstream: bool,
     /// Partition overrides (key=value strings). Backward-compatible with older clients.
     #[serde(default)]
     pub partitions: Vec<PartitionValue>,
@@ -249,8 +255,7 @@ pub struct RunKeyBackfillRequest {
     /// Include downstream dependents of the selection.
     #[serde(default)]
     pub include_downstream: bool,
-    /// Partition overrides (key=value pairs). Backward-compatible with older clients.
-    /// Cannot be combined with `partitionKey`.
+    /// Partition overrides (key=value pairs).
     #[serde(default)]
     pub partitions: Vec<PartitionValue>,
     /// Canonical partition key string (ADR-011). Preferred; cannot be combined with `partitions`.
@@ -1155,207 +1160,9 @@ fn ensure_workspace(ctx: &RequestContext, workspace_id: &str) -> Result<(), ApiE
     Ok(())
 }
 
-const MANIFEST_LATEST_INDEX_PATH: &str = "manifests/_index.json";
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LatestManifestIndex {
-    latest_manifest_id: String,
-    deployed_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct PartitioningSpec {
-    is_partitioned: bool,
-    dimensions: Vec<DimensionSpec>,
-}
-
-impl PartitioningSpec {
-    fn from_value(value: &serde_json::Value) -> Self {
-        let Some(obj) = value.as_object() else {
-            return Self::default();
-        };
-
-        let dimensions: Vec<DimensionSpec> = obj
-            .get("dimensions")
-            .and_then(|dims| dims.as_array())
-            .map(|dims| dims.iter().filter_map(DimensionSpec::from_value).collect())
-            .unwrap_or_default();
-
-        let is_partitioned_value = obj
-            .get("is_partitioned")
-            .or_else(|| obj.get("isPartitioned"))
-            .and_then(serde_json::Value::as_bool);
-        let is_partitioned = if is_partitioned_value == Some(false) && !dimensions.is_empty() {
-            let dimension_names = dimensions
-                .iter()
-                .map(|dim| dim.name.clone())
-                .collect::<Vec<_>>();
-            tracing::warn!(
-                dimensions = ?dimension_names,
-                "manifest partitioning marked unpartitioned despite dimensions; treating as partitioned"
-            );
-            true
-        } else {
-            is_partitioned_value.unwrap_or(!dimensions.is_empty())
-        };
-
-        Self {
-            is_partitioned,
-            dimensions,
-        }
-    }
-
-    fn matches(&self, other: &Self) -> bool {
-        if self.is_partitioned != other.is_partitioned {
-            return false;
-        }
-        if !self.is_partitioned {
-            return true;
-        }
-        partitioning_signature(self) == partitioning_signature(other)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct DimensionSignature {
-    kind: String,
-    granularity: Option<String>,
-    values: Option<BTreeSet<String>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DimensionSpec {
-    name: String,
-    kind: String,
-    granularity: Option<String>,
-    values: Option<Vec<String>>,
-}
-
-impl DimensionSpec {
-    fn from_value(value: &serde_json::Value) -> Option<Self> {
-        let obj = value.as_object()?;
-        let name = obj.get("name")?.as_str()?.to_string();
-        let kind = obj.get("kind")?.as_str()?.to_string();
-        let granularity = obj
-            .get("granularity")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        let values = obj
-            .get("values")
-            .and_then(|value| value.as_array())
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(|value| value.as_str().map(str::to_string))
-                    .collect::<Vec<_>>()
-            });
-
-        Some(Self {
-            name,
-            kind,
-            granularity,
-            values,
-        })
-    }
-
-    fn signature(&self) -> DimensionSignature {
-        let values = self
-            .values
-            .as_ref()
-            .filter(|values| !values.is_empty())
-            .map(|values| values.iter().cloned().collect::<BTreeSet<_>>());
-
-        DimensionSignature {
-            kind: self.kind.clone(),
-            granularity: self.granularity.clone(),
-            values,
-        }
-    }
-}
-
-fn partitioning_signature(spec: &PartitioningSpec) -> BTreeMap<String, DimensionSignature> {
-    spec.dimensions
-        .iter()
-        .map(|dim| (dim.name.clone(), dim.signature()))
-        .collect()
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedPartitionKey {
-    canonical: Option<String>,
-    legacy_canonical: Option<String>,
-}
-
-impl ResolvedPartitionKey {
-    fn canonical(&self) -> Option<&str> {
-        self.canonical.as_deref()
-    }
-}
-
-struct ManifestContext {
-    manifest_id: String,
-    deployed_at: DateTime<Utc>,
-    graph: arco_flow::orchestration::AssetGraph,
-    known_assets: HashSet<String>,
-    partitioning_specs: HashMap<String, PartitioningSpec>,
-}
-
-struct RunPlanContext {
-    manifest_id: String,
-    deployed_at: DateTime<Utc>,
-    graph: arco_flow::orchestration::AssetGraph,
-    root_assets: Vec<String>,
-    partitioning_spec: PartitioningSpec,
-}
-
-async fn load_latest_manifest(storage: &ScopedStorage) -> Result<Option<StoredManifest>, ApiError> {
-    match storage.get_raw(MANIFEST_LATEST_INDEX_PATH).await {
-        Ok(bytes) => match serde_json::from_slice::<LatestManifestIndex>(&bytes) {
-            Ok(index) => {
-                let path = crate::paths::manifest_path(&index.latest_manifest_id);
-                match storage.get_raw(&path).await {
-                    Ok(bytes) => match serde_json::from_slice::<StoredManifest>(&bytes) {
-                        Ok(stored) => return Ok(Some(stored)),
-                        Err(err) => {
-                            tracing::warn!(
-                                manifest_id = %index.latest_manifest_id,
-                                error = ?err,
-                                "failed to parse manifest referenced by latest index; falling back to scan"
-                            );
-                        }
-                    },
-                    Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => {
-                        tracing::warn!(
-                            manifest_id = %index.latest_manifest_id,
-                            "latest manifest index referenced missing manifest; falling back to scan"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            manifest_id = %index.latest_manifest_id,
-                            error = ?err,
-                            "failed to read manifest referenced by latest index; falling back to scan"
-                        );
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    error = ?err,
-                    "failed to parse latest manifest index; falling back to scan"
-                );
-            }
-        },
-        Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => {}
-        Err(err) => {
-            tracing::warn!(
-                error = ?err,
-                "failed to read latest manifest index; falling back to scan"
-            );
-        }
-    }
-
+async fn load_latest_asset_graph(
+    storage: &ScopedStorage,
+) -> Result<arco_flow::orchestration::AssetGraph, ApiError> {
     let entries = storage
         .list_meta(MANIFEST_PREFIX)
         .await
@@ -1368,10 +1175,7 @@ async fn load_latest_manifest(storage: &ScopedStorage) -> Result<Option<StoredMa
         if path.starts_with(MANIFEST_IDEMPOTENCY_PREFIX) || path.ends_with("_index.json") {
             continue;
         }
-        if !std::path::Path::new(path)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
-        {
+        if !path.ends_with(".json") {
             continue;
         }
 
@@ -1379,18 +1183,14 @@ async fn load_latest_manifest(storage: &ScopedStorage) -> Result<Option<StoredMa
             Ok(b) => b,
             Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => continue,
             Err(err) => {
-                tracing::warn!(path = %path, error = ?err, "failed to read manifest; skipping");
-                continue;
+                return Err(ApiError::internal(format!(
+                    "failed to read manifest {path}: {err}"
+                )));
             }
         };
 
-        let stored: StoredManifest = match serde_json::from_slice(&bytes) {
-            Ok(stored) => stored,
-            Err(err) => {
-                tracing::warn!(path = %path, error = ?err, "failed to parse manifest; skipping");
-                continue;
-            }
-        };
+        let stored: StoredManifest = serde_json::from_slice(&bytes)
+            .map_err(|e| ApiError::internal(format!("failed to parse manifest {path}: {e}")))?;
 
         let should_replace = latest
             .as_ref()
@@ -1401,383 +1201,22 @@ async fn load_latest_manifest(storage: &ScopedStorage) -> Result<Option<StoredMa
         }
     }
 
-    Ok(latest)
-}
-
-fn build_manifest_context(stored: &StoredManifest) -> Result<ManifestContext, ApiError> {
-    let mut known_assets = HashSet::new();
-    let mut manifest_assets = Vec::with_capacity(stored.assets.len());
-    let mut partitioning_specs = HashMap::with_capacity(stored.assets.len());
-
-    for asset in &stored.assets {
-        let key = arco_flow::orchestration::canonicalize_asset_key(&format!(
-            "{}/{}",
-            asset.key.namespace, asset.key.name
-        ))
-        .map_err(|err| {
-            ApiError::internal(format!(
-                "invalid asset key in manifest {}: {err}",
-                stored.manifest_id
-            ))
-        })?;
-
-        known_assets.insert(key.clone());
-        manifest_assets.push((key.clone(), asset.dependencies.as_slice()));
-        partitioning_specs.insert(key, PartitioningSpec::from_value(&asset.partitioning));
-    }
+    let Some(stored) = latest else {
+        return Ok(arco_flow::orchestration::AssetGraph::new());
+    };
 
     let mut graph = arco_flow::orchestration::AssetGraph::new();
-    for (asset_key, deps) in manifest_assets {
-        let mut upstream = Vec::new();
-        for dep in deps {
-            let upstream_key = arco_flow::orchestration::canonicalize_asset_key(&format!(
-                "{}/{}",
-                dep.upstream_key.namespace, dep.upstream_key.name
-            ))
-            .map_err(|err| {
-                ApiError::internal(format!(
-                    "invalid asset dependency key in manifest {}: {err}",
-                    stored.manifest_id
-                ))
-            })?;
-
-            if known_assets.contains(&upstream_key) {
-                upstream.push(upstream_key);
-            } else {
-                tracing::warn!(
-                    asset_key = %asset_key,
-                    upstream_key = %upstream_key,
-                    manifest_id = %stored.manifest_id,
-                    "dropping dependency edge to unknown upstream"
-                );
-            }
-        }
+    for asset in stored.assets {
+        let asset_key = format!("{}.{}", asset.key.namespace, asset.key.name);
+        let upstream = asset
+            .dependencies
+            .iter()
+            .map(|dep| format!("{}.{}", dep.upstream_key.namespace, dep.upstream_key.name))
+            .collect();
         graph.insert_asset(asset_key, upstream);
     }
 
-    Ok(ManifestContext {
-        manifest_id: stored.manifest_id.clone(),
-        deployed_at: stored.deployed_at,
-        graph,
-        known_assets,
-        partitioning_specs,
-    })
-}
-
-fn resolve_root_assets(
-    request: &TriggerRunRequest,
-    known_assets: &HashSet<String>,
-) -> Result<Vec<String>, ApiError> {
-    let mut roots = BTreeSet::new();
-    let mut unknown_roots = BTreeSet::new();
-
-    for root in &request.selection {
-        let canonical = arco_flow::orchestration::canonicalize_asset_key(root)
-            .map_err(ApiError::bad_request)?;
-
-        if known_assets.contains(&canonical) {
-            roots.insert(canonical);
-        } else {
-            unknown_roots.insert(canonical);
-        }
-    }
-
-    if !unknown_roots.is_empty() {
-        return Err(ApiError::bad_request(format!(
-            "unknown asset keys: {}",
-            unknown_roots.into_iter().collect::<Vec<_>>().join(", ")
-        )));
-    }
-
-    Ok(roots.into_iter().collect())
-}
-
-fn derive_run_partitioning_spec(
-    root_assets: &[String],
-    partitioning_specs: &HashMap<String, PartitioningSpec>,
-    has_partition_request: bool,
-) -> Result<PartitioningSpec, ApiError> {
-    let mut base_spec: Option<PartitioningSpec> = None;
-
-    for root in root_assets {
-        let spec = partitioning_specs.get(root).cloned().unwrap_or_default();
-
-        if has_partition_request && !spec.is_partitioned {
-            return Err(ApiError::bad_request(format!(
-                "partition key provided for unpartitioned asset: {root}"
-            )));
-        }
-
-        if let Some(existing) = base_spec.as_ref() {
-            if has_partition_request && !existing.matches(&spec) {
-                return Err(ApiError::bad_request(
-                    "partitioned root assets must share identical partitioning".to_string(),
-                ));
-            }
-        } else {
-            base_spec = Some(spec);
-        }
-    }
-
-    Ok(base_spec.unwrap_or_default())
-}
-
-async fn load_run_plan_context(
-    storage: &ScopedStorage,
-    request: &TriggerRunRequest,
-) -> Result<RunPlanContext, ApiError> {
-    let stored = load_latest_manifest(storage).await?;
-    let Some(stored) = stored else {
-        return Err(ApiError::bad_request(
-            "no manifest deployed for workspace; deploy a manifest before triggering a run",
-        ));
-    };
-
-    let manifest_context = build_manifest_context(&stored)?;
-    let root_assets = resolve_root_assets(request, &manifest_context.known_assets)?;
-    let has_partition_request = request.partition_key.is_some() || !request.partitions.is_empty();
-    let partitioning_spec = derive_run_partitioning_spec(
-        &root_assets,
-        &manifest_context.partitioning_specs,
-        has_partition_request,
-    )?;
-
-    Ok(RunPlanContext {
-        manifest_id: manifest_context.manifest_id,
-        deployed_at: manifest_context.deployed_at,
-        graph: manifest_context.graph,
-        root_assets,
-        partitioning_spec,
-    })
-}
-
-fn build_task_defs_for_request(
-    context: &RunPlanContext,
-    request: &TriggerRunRequest,
-    partition_key: Option<&str>,
-) -> Result<Vec<TaskDef>, ApiError> {
-    let options = arco_flow::orchestration::SelectionOptions {
-        include_upstream: request.include_upstream,
-        include_downstream: request.include_downstream,
-    };
-
-    arco_flow::orchestration::build_task_defs_for_selection(
-        &context.graph,
-        &context.root_assets,
-        options,
-        partition_key,
-    )
-    .map_err(ApiError::bad_request)
-}
-
-type PlanGraph = (
-    HashMap<String, TaskRow>,
-    HashMap<String, Vec<String>>,
-    HashMap<String, Vec<String>>,
-);
-
-fn build_plan_graph_for_run(fold_state: &FoldState, run_id: &str) -> PlanGraph {
-    let mut tasks_by_key = HashMap::new();
-    for row in fold_state.tasks.values().filter(|row| row.run_id == run_id) {
-        tasks_by_key.insert(row.task_key.clone(), row.clone());
-    }
-
-    let mut upstream_by_task: HashMap<String, Vec<String>> = HashMap::new();
-    let mut downstream_by_task: HashMap<String, Vec<String>> = HashMap::new();
-
-    for task_key in tasks_by_key.keys() {
-        upstream_by_task.insert(task_key.clone(), Vec::new());
-        downstream_by_task.insert(task_key.clone(), Vec::new());
-    }
-
-    for edge in fold_state
-        .dep_satisfaction
-        .values()
-        .filter(|edge| edge.run_id == run_id)
-    {
-        if !tasks_by_key.contains_key(&edge.upstream_task_key)
-            || !tasks_by_key.contains_key(&edge.downstream_task_key)
-        {
-            continue;
-        }
-
-        upstream_by_task
-            .entry(edge.downstream_task_key.clone())
-            .or_default()
-            .push(edge.upstream_task_key.clone());
-        downstream_by_task
-            .entry(edge.upstream_task_key.clone())
-            .or_default()
-            .push(edge.downstream_task_key.clone());
-    }
-
-    for value in upstream_by_task.values_mut() {
-        value.sort();
-        value.dedup();
-    }
-    for value in downstream_by_task.values_mut() {
-        value.sort();
-        value.dedup();
-    }
-
-    (tasks_by_key, upstream_by_task, downstream_by_task)
-}
-
-fn close_task_selection(
-    roots: &[String],
-    include_upstream: bool,
-    include_downstream: bool,
-    upstream_by_task: &HashMap<String, Vec<String>>,
-    downstream_by_task: &HashMap<String, Vec<String>>,
-) -> BTreeSet<String> {
-    let mut selected: BTreeSet<String> = roots.iter().cloned().collect();
-
-    if include_upstream {
-        let mut queue: VecDeque<String> = roots.iter().cloned().collect();
-        while let Some(current) = queue.pop_front() {
-            let upstream = upstream_by_task.get(&current).cloned().unwrap_or_default();
-            for upstream_key in upstream {
-                if selected.insert(upstream_key.clone()) {
-                    queue.push_back(upstream_key);
-                }
-            }
-        }
-    }
-
-    if include_downstream {
-        let mut queue: VecDeque<String> = roots.iter().cloned().collect();
-        while let Some(current) = queue.pop_front() {
-            let downstream = downstream_by_task
-                .get(&current)
-                .cloned()
-                .unwrap_or_default();
-            for downstream_key in downstream {
-                if selected.insert(downstream_key.clone()) {
-                    queue.push_back(downstream_key);
-                }
-            }
-        }
-    }
-
-    selected
-}
-
-fn task_defs_for_rerun(
-    tasks_by_key: &HashMap<String, TaskRow>,
-    selected: &BTreeSet<String>,
-    upstream_by_task: &HashMap<String, Vec<String>>,
-) -> Vec<TaskDef> {
-    let mut tasks = Vec::new();
-
-    for task_key in selected {
-        let Some(task_row) = tasks_by_key.get(task_key) else {
-            continue;
-        };
-
-        let mut depends_on: Vec<String> = upstream_by_task
-            .get(task_key)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|upstream| selected.contains(upstream))
-            .collect();
-        depends_on.sort();
-
-        tasks.push(TaskDef {
-            key: task_key.clone(),
-            depends_on,
-            asset_key: task_row.asset_key.clone(),
-            partition_key: task_row.partition_key.clone(),
-            max_attempts: task_row.max_attempts,
-            heartbeat_timeout_sec: task_row.heartbeat_timeout_sec,
-        });
-    }
-
-    tasks.sort_by(|a, b| a.key.cmp(&b.key));
-    tasks
-}
-
-fn compute_rerun_run_key(
-    parent_run_id: &str,
-    rerun_kind: RerunKindResponse,
-    selected_tasks: &BTreeSet<String>,
-    partition_keys: &BTreeSet<String>,
-) -> Result<String, ApiError> {
-    #[derive(Serialize)]
-    struct Payload {
-        parent_run_id: String,
-        rerun_kind: RerunKindResponse,
-        selected_tasks: Vec<String>,
-        partition_keys: Vec<String>,
-    }
-
-    let payload = Payload {
-        parent_run_id: parent_run_id.to_string(),
-        rerun_kind,
-        selected_tasks: selected_tasks.iter().cloned().collect(),
-        partition_keys: partition_keys.iter().cloned().collect(),
-    };
-
-    let json = serde_json::to_vec(&payload).map_err(|e| {
-        ApiError::internal(format!("failed to serialize rerun run_key payload: {e}"))
-    })?;
-    let hash = Sha256::digest(&json);
-    let hex_hash = hex::encode(hash);
-
-    let kind = match rerun_kind {
-        RerunKindResponse::FromFailure => "from_failure",
-        RerunKindResponse::Subset => "subset",
-    };
-
-    Ok(format!("rerun:{parent_run_id}:{kind}:{}", &hex_hash[..16]))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compute_rerun_request_fingerprint(
-    parent_run_id: &str,
-    rerun_kind: RerunKindResponse,
-    roots: &[String],
-    include_upstream: bool,
-    include_downstream: bool,
-    selected_tasks: &BTreeSet<String>,
-    partition_keys: &BTreeSet<String>,
-    labels: &HashMap<String, String>,
-) -> Result<String, ApiError> {
-    #[derive(Serialize)]
-    struct Payload {
-        parent_run_id: String,
-        rerun_kind: RerunKindResponse,
-        roots: Vec<String>,
-        include_upstream: bool,
-        include_downstream: bool,
-        selected_tasks: Vec<String>,
-        partition_keys: Vec<String>,
-        labels: BTreeMap<String, String>,
-    }
-
-    let labels = labels
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<BTreeMap<_, _>>();
-
-    let payload = Payload {
-        parent_run_id: parent_run_id.to_string(),
-        rerun_kind,
-        roots: roots.to_vec(),
-        include_upstream,
-        include_downstream,
-        selected_tasks: selected_tasks.iter().cloned().collect(),
-        partition_keys: partition_keys.iter().cloned().collect(),
-        labels,
-    };
-
-    let json = serde_json::to_vec(&payload).map_err(|e| {
-        ApiError::internal(format!(
-            "failed to serialize rerun request fingerprint: {e}"
-        ))
-    })?;
-    let hash = Sha256::digest(&json);
-    Ok(hex::encode(hash))
+    Ok(graph)
 }
 
 fn parse_pagination(limit: u32, cursor: Option<&str>) -> Result<(usize, usize), ApiError> {
@@ -2323,112 +1762,6 @@ fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
     }
 }
 
-fn resolve_partition_key(
-    request: &TriggerRunRequest,
-    partitioning: &PartitioningSpec,
-    cutoff: Option<DateTime<Utc>>,
-) -> Result<ResolvedPartitionKey, ApiError> {
-    if request.partition_key.is_some() && !request.partitions.is_empty() {
-        return Err(ApiError::bad_request(
-            "use either partitionKey or partitions, not both",
-        ));
-    }
-
-    let has_partition_request = request.partition_key.is_some() || !request.partitions.is_empty();
-    if has_partition_request && !partitioning.is_partitioned {
-        return Err(ApiError::bad_request(
-            "partition key provided for unpartitioned assets",
-        ));
-    }
-
-    if let Some(raw) = request.partition_key.as_deref() {
-        if raw.is_empty() {
-            return Err(ApiError::bad_request("partitionKey cannot be empty"));
-        }
-
-        let parsed = arco_core::partition::PartitionKey::parse(raw)
-            .map_err(|err| ApiError::bad_request(format!("invalid partitionKey: {err}")))?;
-        let canonical = parsed.canonical_string();
-        if canonical != raw {
-            return Err(ApiError::bad_request(format!(
-                "partitionKey must be canonical: expected '{canonical}'"
-            )));
-        }
-
-        let raw_dimensions = parsed
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<HashMap<_, _>>();
-        let (normalized_key, normalized) =
-            normalize_partition_key(&raw_dimensions, partitioning, cutoff)?;
-        let normalized_canonical = normalized_key.canonical_string();
-
-        // Validate that normalization produced a fully canonical, ADR-011 compliant key.
-        arco_core::partition::PartitionKey::parse(&normalized_canonical)
-            .map_err(|err| ApiError::bad_request(format!("invalid partitionKey: {err}")))?;
-
-        if normalized_canonical.len() > MAX_PARTITION_KEY_LEN {
-            return Err(ApiError::bad_request(format!(
-                "partitionKey exceeds max length ({MAX_PARTITION_KEY_LEN})"
-            )));
-        }
-
-        let legacy_canonical = if normalized && normalized_canonical != raw {
-            Some(raw.to_string())
-        } else {
-            None
-        };
-
-        return Ok(ResolvedPartitionKey {
-            canonical: Some(normalized_canonical),
-            legacy_canonical,
-        });
-    }
-
-    let raw_values = parse_partition_values(&request.partitions)?;
-    if raw_values.is_empty() {
-        return Ok(ResolvedPartitionKey {
-            canonical: None,
-            legacy_canonical: None,
-        });
-    }
-
-    let raw_dimensions = raw_values
-        .iter()
-        .map(|(key, value)| {
-            (
-                key.clone(),
-                arco_core::partition::ScalarValue::String(value.clone()),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let (normalized_key, normalized) =
-        normalize_partition_key(&raw_dimensions, partitioning, cutoff)?;
-    let normalized_canonical = normalized_key.canonical_string();
-
-    // Validate that normalization produced a fully canonical, ADR-011 compliant key.
-    arco_core::partition::PartitionKey::parse(&normalized_canonical)
-        .map_err(|err| ApiError::bad_request(format!("invalid partitionKey: {err}")))?;
-
-    if normalized_canonical.len() > MAX_PARTITION_KEY_LEN {
-        return Err(ApiError::bad_request(format!(
-            "partitionKey exceeds max length ({MAX_PARTITION_KEY_LEN})"
-        )));
-    }
-
-    let legacy_canonical = if normalized {
-        let legacy = build_partition_key(&request.partitions)?;
-        legacy.filter(|legacy| legacy != &normalized_canonical)
-    } else {
-        None
-    };
-
-    Ok(ResolvedPartitionKey {
-        canonical: Some(normalized_canonical),
-        legacy_canonical,
-    })
-}
-
 fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, ApiError> {
     let values = parse_partition_values(partitions)?;
     if values.is_empty() {
@@ -2711,8 +2044,7 @@ fn build_request_fingerprint(
         selection: Vec<String>,
         include_upstream: bool,
         include_downstream: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        partition_key: Option<String>,
+        partitions: Vec<PartitionValue>,
         labels: BTreeMap<String, String>,
     }
 
@@ -2720,7 +2052,8 @@ fn build_request_fingerprint(
         .selection
         .iter()
         .map(|value| {
-            arco_flow::orchestration::canonicalize_asset_key(value).map_err(ApiError::bad_request)
+            arco_flow::orchestration::canonicalize_asset_key(value)
+                .map_err(|err| ApiError::bad_request(err))
         })
         .collect::<Result<_, _>>()?;
     selection.sort();
@@ -2738,7 +2071,7 @@ fn build_request_fingerprint(
         selection,
         include_upstream: request.include_upstream,
         include_downstream: request.include_downstream,
-        partition_key,
+        partitions,
         labels,
     };
     let json = serde_json::to_vec(&payload).map_err(|e| {
@@ -3360,10 +2693,6 @@ pub(crate) async fn trigger_run(
         return Err(ApiError::bad_request("selection cannot be empty"));
     }
 
-    validate_trigger_run_request_limits(&request)?;
-
-    reject_reserved_lineage_labels(&request.labels)?;
-
     // Generate IDs upfront (needed for reservation)
     let run_id = Ulid::new().to_string();
     let plan_id = Ulid::new().to_string();
@@ -3375,13 +2704,31 @@ pub(crate) async fn trigger_run(
     let ledger = LedgerWriter::new(storage.clone());
     let mut run_event_overrides: Option<RunEventOverrides> = None;
 
-    let has_partition_request = request.partition_key.is_some() || !request.partitions.is_empty();
-    let mut plan_context: Option<RunPlanContext> = None;
-    let partitioning_spec = if has_partition_request {
-        let context = load_run_plan_context(&storage, &request).await?;
-        let spec = context.partitioning_spec.clone();
-        plan_context = Some(context);
-        spec
+    let graph = load_latest_asset_graph(&storage).await?;
+    let partition_key = build_partition_key(&request.partitions)?;
+    let options = arco_flow::orchestration::SelectionOptions {
+        include_upstream: request.include_upstream,
+        include_downstream: request.include_downstream,
+    };
+    let tasks = arco_flow::orchestration::build_task_defs_for_selection(
+        &graph,
+        &request.selection,
+        options,
+        partition_key,
+    )
+    .map_err(|err| ApiError::bad_request(err))?;
+
+    let root_assets: Vec<String> = request
+        .selection
+        .iter()
+        .map(|value| {
+            arco_flow::orchestration::canonicalize_asset_key(value)
+                .map_err(|err| ApiError::bad_request(err))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let request_fingerprint = if request.run_key.is_some() {
+        Some(build_request_fingerprint(&request)?)
     } else {
         PartitioningSpec::default()
     };
@@ -6433,7 +5780,7 @@ mod tests {
         labels.insert("team".to_string(), "infra".to_string());
 
         let request_a = TriggerRunRequest {
-            selection: vec!["analytics.b".to_string(), "analytics.a".to_string()],
+            selection: vec!["b".to_string(), "a".to_string()],
             include_upstream: false,
             include_downstream: false,
             partitions: vec![
@@ -6456,7 +5803,7 @@ mod tests {
         labels_reordered.insert("env".to_string(), "prod".to_string());
 
         let request_b = TriggerRunRequest {
-            selection: vec!["analytics.a".to_string(), "analytics.b".to_string()],
+            selection: vec!["a".to_string(), "b".to_string()],
             include_upstream: false,
             include_downstream: false,
             partitions: vec![
@@ -6519,91 +5866,6 @@ mod tests {
         }];
 
         assert!(build_partition_key(&partitions).is_err());
-    }
-
-    #[test]
-    fn test_derive_run_partitioning_spec_rejects_mismatched_root_partitioning() -> Result<()> {
-        let stored_manifest = StoredManifest {
-            manifest_id: Ulid::new().to_string(),
-            tenant_id: "tenant".to_string(),
-            workspace_id: "workspace".to_string(),
-            manifest_version: "1.0".to_string(),
-            code_version_id: "abc123".to_string(),
-            fingerprint: "fp".to_string(),
-            git: GitContext::default(),
-            assets: vec![
-                AssetEntry {
-                    key: AssetKey {
-                        namespace: "analytics".to_string(),
-                        name: "users".to_string(),
-                    },
-                    id: "01HQXYZ123".to_string(),
-                    description: String::new(),
-                    owners: vec![],
-                    tags: serde_json::Value::Null,
-                    partitioning: json!({
-                        "is_partitioned": true,
-                        "dimensions": [{
-                            "name": "date",
-                            "kind": "time",
-                            "granularity": "day"
-                        }]
-                    }),
-                    dependencies: vec![],
-                    code: serde_json::Value::Null,
-                    checks: vec![],
-                    execution: serde_json::Value::Null,
-                    resources: serde_json::Value::Null,
-                    io: serde_json::Value::Null,
-                    transform_fingerprint: String::new(),
-                },
-                AssetEntry {
-                    key: AssetKey {
-                        namespace: "analytics".to_string(),
-                        name: "orders".to_string(),
-                    },
-                    id: "01HQXYZ124".to_string(),
-                    description: String::new(),
-                    owners: vec![],
-                    tags: serde_json::Value::Null,
-                    partitioning: json!({
-                        "is_partitioned": true,
-                        "dimensions": [{
-                            "name": "date",
-                            "kind": "time",
-                            "granularity": "hour"
-                        }]
-                    }),
-                    dependencies: vec![],
-                    code: serde_json::Value::Null,
-                    checks: vec![],
-                    execution: serde_json::Value::Null,
-                    resources: serde_json::Value::Null,
-                    io: serde_json::Value::Null,
-                    transform_fingerprint: String::new(),
-                },
-            ],
-            schedules: vec![],
-            deployed_at: Utc::now(),
-            deployed_by: "test".to_string(),
-            metadata: serde_json::Value::Null,
-        };
-
-        let manifest_context =
-            build_manifest_context(&stored_manifest).map_err(|err| anyhow!("{err:?}"))?;
-        let root_assets = vec![
-            arco_flow::orchestration::canonicalize_asset_key("analytics/users")
-                .map_err(anyhow::Error::msg)?,
-            arco_flow::orchestration::canonicalize_asset_key("analytics/orders")
-                .map_err(anyhow::Error::msg)?,
-        ];
-
-        let err =
-            derive_run_partitioning_spec(&root_assets, &manifest_context.partitioning_specs, true)
-                .expect_err("expected error");
-        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        assert!(err.message().contains("identical partitioning"));
-        Ok(())
     }
 
     #[tokio::test]
@@ -6765,6 +6027,8 @@ mod tests {
                 plan_id: reservation.plan_id.clone(),
                 tasks: {
                     let graph = arco_flow::orchestration::AssetGraph::new();
+                    let partition_key = build_partition_key(&request.partitions)
+                        .map_err(|err| anyhow!("{err:?}"))?;
                     let options = arco_flow::orchestration::SelectionOptions {
                         include_upstream: request.include_upstream,
                         include_downstream: request.include_downstream,
@@ -6773,7 +6037,7 @@ mod tests {
                         &graph,
                         &request.selection,
                         options,
-                        resolved_partition_key.canonical.as_deref(),
+                        partition_key,
                     )
                     .map_err(|err| anyhow!("{err}"))?
                 },

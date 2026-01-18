@@ -51,34 +51,39 @@ impl AssetGraph {
 
     /// Inserts an asset and its upstream dependencies.
     pub fn insert_asset(&mut self, asset_key: String, upstream_deps: Vec<String>) {
+        self.upstream
+            .insert(asset_key.clone(), upstream_deps.clone());
         self.downstream.entry(asset_key.clone()).or_default();
 
-        for upstream in &upstream_deps {
+        for upstream in upstream_deps {
             self.downstream
-                .entry(upstream.clone())
+                .entry(upstream)
                 .or_default()
                 .push(asset_key.clone());
         }
-
-        self.upstream.insert(asset_key, upstream_deps);
     }
 
     /// Returns upstream dependencies for `asset_key`.
     #[must_use]
     pub fn upstream_of(&self, asset_key: &str) -> &[String] {
-        self.upstream.get(asset_key).map_or(&[], Vec::as_slice)
+        self.upstream
+            .get(asset_key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Returns downstream dependents for `asset_key`.
     #[must_use]
     pub fn downstream_of(&self, asset_key: &str) -> &[String] {
-        self.downstream.get(asset_key).map_or(&[], Vec::as_slice)
+        self.downstream
+            .get(asset_key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Computes the closure of a selection.
     ///
     /// Returned set is deterministic (sorted).
-    #[must_use]
     pub fn close_selection(&self, roots: &[String], options: SelectionOptions) -> BTreeSet<String> {
         let mut selected: BTreeSet<String> = roots.iter().cloned().collect();
 
@@ -111,104 +116,34 @@ impl AssetGraph {
 /// Canonicalizes an asset key string.
 ///
 /// Accepts either `namespace.name` or `namespace/name`.
-///
-/// # Errors
-/// Returns an error if the input is empty, contains whitespace, has an invalid format,
-/// or contains invalid characters.
 pub fn canonicalize_asset_key(input: &str) -> Result<String, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err("asset key cannot be empty".to_string());
     }
-    if trimmed != input {
-        return Err("asset key cannot have leading/trailing whitespace".to_string());
-    }
-    if trimmed.chars().any(char::is_whitespace) {
-        return Err("asset key cannot contain whitespace".to_string());
-    }
 
-    let has_slash = trimmed.contains('/');
-    let has_dot = trimmed.contains('.');
-
-    let (namespace, name) = if has_slash {
-        let Some((namespace, name)) = trimmed.split_once('/') else {
+    if trimmed.contains('/') {
+        let parts: Vec<&str> = trimmed.split('/').collect();
+        if parts.len() != 2 {
             return Err(format!(
                 "invalid asset key '{trimmed}': expected 'namespace/name'"
             ));
-        };
-        (namespace, name)
-    } else if has_dot {
-        let mut parts = trimmed.splitn(2, '.');
-        (
-            parts.next().unwrap_or_default(),
-            parts.next().unwrap_or_default(),
-        )
-    } else {
-        return Err(format!(
-            "invalid asset key '{trimmed}': expected 'namespace.name' or 'namespace/name'"
-        ));
-    };
-
-    if namespace.is_empty() || name.is_empty() {
-        return Err(format!(
-            "invalid asset key '{trimmed}': namespace and name must be non-empty"
-        ));
+        }
+        return Ok(format!("{}.{}", parts[0], parts[1]));
     }
 
-    if !is_valid_asset_namespace(namespace) {
-        return Err(format!(
-            "invalid asset key '{trimmed}': invalid namespace '{namespace}'"
-        ));
-    }
-    if !is_valid_asset_name(name) {
-        return Err(format!(
-            "invalid asset key '{trimmed}': invalid name '{name}'"
-        ));
-    }
-
-    Ok(format!("{namespace}.{name}"))
-}
-
-fn is_valid_asset_namespace(namespace: &str) -> bool {
-    is_valid_asset_segment(namespace)
-}
-
-fn is_valid_asset_name(name: &str) -> bool {
-    let segments: Vec<&str> = name.split('.').collect();
-    if segments.is_empty() || segments.iter().any(|segment| segment.is_empty()) {
-        return false;
-    }
-
-    segments
-        .iter()
-        .all(|segment| is_valid_asset_segment(segment))
-}
-
-fn is_valid_asset_segment(segment: &str) -> bool {
-    let mut chars = segment.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_lowercase() {
-        return false;
-    }
-    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    Ok(trimmed.to_string())
 }
 
 /// Builds `TaskDef`s for a selection against a graph.
 ///
 /// Dependencies are included only when both sides are present in the final planned set.
-///
-/// # Errors
-/// Returns an error if any asset key in `roots` is invalid.
 pub fn build_task_defs_for_selection(
     graph: &AssetGraph,
     roots: &[String],
     options: SelectionOptions,
-    partition_key: Option<&str>,
+    partition_key: Option<String>,
 ) -> Result<Vec<TaskDef>, String> {
-    let partition_key = partition_key.map(str::to_string);
-
     let mut canonical_roots = Vec::with_capacity(roots.len());
     for root in roots {
         canonical_roots.push(canonicalize_asset_key(root)?);
@@ -244,10 +179,7 @@ pub fn build_task_defs_for_selection(
 
 /// Computes a deterministic fingerprint for selection parameters.
 ///
-/// Intended for `run_key` payload consistency and idempotency.
-///
-/// # Errors
-/// Returns an error if any asset key is invalid or if serialization fails.
+/// Intended for run_key payload consistency and idempotency.
 pub fn compute_selection_fingerprint(
     selection: &[String],
     options: SelectionOptions,
@@ -264,7 +196,6 @@ pub fn compute_selection_fingerprint(
         .map(|s| canonicalize_asset_key(s))
         .collect::<Result<_, _>>()?;
     canonical.sort();
-    canonical.dedup();
 
     let payload = Payload {
         selection: canonical,

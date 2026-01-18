@@ -251,6 +251,14 @@ pub struct ListManifestsResponse {
 }
 
 const MAX_MANIFEST_BYTES: usize = 10 * 1024 * 1024;
+const MANIFEST_LATEST_INDEX_PATH: &str = "manifests/_index.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LatestManifestIndex {
+    latest_manifest_id: String,
+    deployed_at: DateTime<Utc>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -298,9 +306,37 @@ fn validate_manifest(request: &DeployManifestRequest) -> Result<(), ApiError> {
         if asset.id.trim().is_empty() {
             return Err(ApiError::bad_request("asset id is required"));
         }
-        let key = format!("{}/{}", asset.key.namespace, asset.key.name);
-        if !asset_keys.insert(key) {
+
+        let canonical = arco_flow::orchestration::canonicalize_asset_key(&format!(
+            "{}/{}",
+            asset.key.namespace, asset.key.name
+        ))
+        .map_err(|err| ApiError::bad_request(err))?;
+
+        if !asset_keys.insert(canonical) {
             return Err(ApiError::bad_request("duplicate asset key in manifest"));
+        }
+    }
+
+    for asset in &request.assets {
+        let asset_key = arco_flow::orchestration::canonicalize_asset_key(&format!(
+            "{}/{}",
+            asset.key.namespace, asset.key.name
+        ))
+        .map_err(|err| ApiError::bad_request(err))?;
+
+        for dependency in &asset.dependencies {
+            let upstream = arco_flow::orchestration::canonicalize_asset_key(&format!(
+                "{}/{}",
+                dependency.upstream_key.namespace, dependency.upstream_key.name
+            ))
+            .map_err(|err| ApiError::bad_request(err))?;
+
+            if !asset_keys.contains(&upstream) {
+                return Err(ApiError::bad_request(format!(
+                    "asset '{asset_key}' depends on unknown asset '{upstream}'",
+                )));
+            }
         }
     }
 
@@ -336,6 +372,19 @@ fn validate_manifest(request: &DeployManifestRequest) -> Result<(), ApiError> {
                 "schedule must include at least one asset",
             ));
         }
+
+        for asset in &schedule.assets {
+            let canonical = arco_flow::orchestration::canonicalize_asset_key(asset)
+                .map_err(|err| ApiError::bad_request(err))?;
+
+            if !asset_keys.contains(&canonical) {
+                return Err(ApiError::bad_request(format!(
+                    "schedule '{}' references unknown asset '{canonical}'",
+                    schedule.id
+                )));
+            }
+        }
+
         if !schedule_ids.insert(schedule.id.clone()) {
             return Err(ApiError::bad_request("duplicate schedule id in manifest"));
         }
@@ -640,6 +689,21 @@ pub(crate) async fn deploy_manifest(
             );
         }
     }
+
+    let index = LatestManifestIndex {
+        latest_manifest_id: manifest_id.clone(),
+        deployed_at: now,
+    };
+    let index_json = serde_json::to_string(&index)
+        .map_err(|e| ApiError::internal(format!("failed to serialize manifest index: {e}")))?;
+    storage
+        .put_raw(
+            MANIFEST_LATEST_INDEX_PATH,
+            Bytes::from(index_json),
+            WritePrecondition::None,
+        )
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to store manifest index: {e}")))?;
 
     upsert_schedule_definitions(
         state.as_ref(),

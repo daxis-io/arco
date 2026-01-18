@@ -121,18 +121,80 @@ pub fn canonicalize_asset_key(input: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("asset key cannot be empty".to_string());
     }
+    if trimmed != input {
+        return Err("asset key cannot have leading/trailing whitespace".to_string());
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err("asset key cannot contain whitespace".to_string());
+    }
 
-    if trimmed.contains('/') {
+    let has_slash = trimmed.contains('/');
+    let has_dot = trimmed.contains('.');
+
+    let (namespace, name) = if has_slash {
         let parts: Vec<&str> = trimmed.split('/').collect();
         if parts.len() != 2 {
             return Err(format!(
                 "invalid asset key '{trimmed}': expected 'namespace/name'"
             ));
         }
-        return Ok(format!("{}.{}", parts[0], parts[1]));
+        (parts[0], parts[1])
+    } else if has_dot {
+        let mut parts = trimmed.splitn(2, '.');
+        (
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+        )
+    } else {
+        return Err(format!(
+            "invalid asset key '{trimmed}': expected 'namespace.name' or 'namespace/name'"
+        ));
+    };
+
+    if namespace.is_empty() || name.is_empty() {
+        return Err(format!(
+            "invalid asset key '{trimmed}': namespace and name must be non-empty"
+        ));
     }
 
-    Ok(trimmed.to_string())
+    if !is_valid_asset_namespace(namespace) {
+        return Err(format!(
+            "invalid asset key '{trimmed}': invalid namespace '{namespace}'"
+        ));
+    }
+    if !is_valid_asset_name(name) {
+        return Err(format!(
+            "invalid asset key '{trimmed}': invalid name '{name}'"
+        ));
+    }
+
+    Ok(format!("{namespace}.{name}"))
+}
+
+fn is_valid_asset_namespace(namespace: &str) -> bool {
+    is_valid_asset_segment(namespace)
+}
+
+fn is_valid_asset_name(name: &str) -> bool {
+    let segments: Vec<&str> = name.split('.').collect();
+    if segments.is_empty() || segments.iter().any(|segment| segment.is_empty()) {
+        return false;
+    }
+
+    segments
+        .iter()
+        .all(|segment| is_valid_asset_segment(segment))
+}
+
+fn is_valid_asset_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// Builds `TaskDef`s for a selection against a graph.
@@ -196,6 +258,7 @@ pub fn compute_selection_fingerprint(
         .map(|s| canonicalize_asset_key(s))
         .collect::<Result<_, _>>()?;
     canonical.sort();
+    canonical.dedup();
 
     let payload = Payload {
         selection: canonical,

@@ -108,6 +108,38 @@ async fn parity_m1_selection_does_not_autofill_tasks() -> Result<()> {
     // Unsorted selection on purpose.
     let selection = vec!["analytics.orders", "analytics.users"];
 
+    let (status, manifest): (_, DeployManifestResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/manifests",
+                Some(serde_json::json!({
+                    "manifestVersion": "1.0",
+                    "codeVersionId": "abc123",
+                    "assets": [
+                        {
+                            "key": { "namespace": "analytics", "name": "orders" },
+                            "id": "01HQORDERS01",
+                            "dependencies": []
+                        },
+                        {
+                            "key": { "namespace": "analytics", "name": "users" },
+                            "id": "01HQUSERS001",
+                            "dependencies": []
+                        }
+                    ],
+                    "schedules": []
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let _ = manifest.manifest_id;
+
     let (status, created): (_, TriggerRunResponse) = helpers::response_json(
         helpers::send(
             router.clone(),
@@ -164,6 +196,110 @@ async fn parity_m1_selection_does_not_autofill_tasks() -> Result<()> {
 }
 
 #[tokio::test]
+async fn parity_m1_deploy_rejects_invalid_manifest_asset_key() -> Result<()> {
+    let router = test_router();
+
+    let request = helpers::make_request(
+        Method::POST,
+        "/api/v1/workspaces/test-workspace/manifests",
+        Some(serde_json::json!({
+            "manifestVersion": "1.0",
+            "codeVersionId": "abc123",
+            "assets": [
+                {
+                    "key": { "namespace": "analytics", "name": "users..daily" },
+                    "id": "01HQBADKEY01",
+                    "dependencies": []
+                }
+            ],
+            "schedules": []
+        })),
+    )?;
+
+    let response = helpers::send(router, request).await?;
+    let (status, error): (_, ApiErrorResponse) = helpers::response_json(response).await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        error.message.contains("invalid asset key") || error.message.contains("asset key"),
+        "unexpected error message: {}",
+        error.message
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn parity_m1_run_key_is_not_reserved_on_bad_request() -> Result<()> {
+    let router = test_router();
+
+    let (status, manifest): (_, DeployManifestResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/manifests",
+                Some(serde_json::json!({
+                    "manifestVersion": "1.0",
+                    "codeVersionId": "abc123",
+                    "assets": [
+                        {
+                            "key": { "namespace": "analytics", "name": "orders" },
+                            "id": "01HQORDERS01",
+                            "dependencies": []
+                        }
+                    ],
+                    "schedules": []
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let _ = manifest.manifest_id;
+
+    let request = helpers::make_request(
+        Method::POST,
+        "/api/v1/workspaces/test-workspace/runs",
+        Some(serde_json::json!({
+            "selection": ["analytics.unknown"],
+            "partitions": [],
+            "runKey": "rk-parity-poison-001",
+            "labels": {},
+        })),
+    )?;
+
+    let response = helpers::send(router.clone(), request).await?;
+    let (status, _error): (_, ApiErrorResponse) = helpers::response_json(response).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, created): (_, TriggerRunResponse) = helpers::response_json(
+        helpers::send(
+            router,
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/runs",
+                Some(serde_json::json!({
+                    "selection": ["analytics.orders"],
+                    "partitions": [],
+                    "runKey": "rk-parity-poison-001",
+                    "labels": {},
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(created.created);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn parity_m1_selection_include_downstream_uses_manifest_graph() -> Result<()> {
     let router = test_router();
 
@@ -179,21 +315,25 @@ async fn parity_m1_selection_include_downstream_uses_manifest_graph() -> Result<
                     "assets": [
                         {
                             "key": { "namespace": "analytics", "name": "a" },
-                            "id": "01HQAAAAAAA",
+                            "id": "01HQA000001",
                             "dependencies": []
                         },
                         {
                             "key": { "namespace": "analytics", "name": "b" },
-                            "id": "01HQBBBBBBB",
+                            "id": "01HQB000001",
                             "dependencies": [
-                                { "upstreamKey": { "namespace": "analytics", "name": "a" } }
+                                {
+                                    "upstreamKey": { "namespace": "analytics", "name": "a" }
+                                }
                             ]
                         },
                         {
                             "key": { "namespace": "analytics", "name": "c" },
-                            "id": "01HQCCCCCCC",
+                            "id": "01HQC000001",
                             "dependencies": [
-                                { "upstreamKey": { "namespace": "analytics", "name": "b" } }
+                                {
+                                    "upstreamKey": { "namespace": "analytics", "name": "b" }
+                                }
                             ]
                         }
                     ],
@@ -302,6 +442,38 @@ async fn parity_m1_selection_include_downstream_uses_manifest_graph() -> Result<
 async fn parity_m1_run_key_idempotency_is_order_insensitive_for_selection() -> Result<()> {
     let router = test_router();
 
+    let (status, manifest): (_, DeployManifestResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/manifests",
+                Some(serde_json::json!({
+                    "manifestVersion": "1.0",
+                    "codeVersionId": "abc123",
+                    "assets": [
+                        {
+                            "key": { "namespace": "analytics", "name": "orders" },
+                            "id": "01HQORDERS01",
+                            "dependencies": []
+                        },
+                        {
+                            "key": { "namespace": "analytics", "name": "users" },
+                            "id": "01HQUSERS001",
+                            "dependencies": []
+                        }
+                    ],
+                    "schedules": []
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let _ = manifest.manifest_id;
+
     let (status, first): (_, TriggerRunResponse) = helpers::response_json(
         helpers::send(
             router.clone(),
@@ -356,6 +528,38 @@ async fn parity_m1_run_key_idempotency_is_order_insensitive_for_selection() -> R
 async fn parity_m1_run_key_conflicts_on_payload_mismatch() -> Result<()> {
     let router = test_router();
 
+    let (status, manifest): (_, DeployManifestResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/manifests",
+                Some(serde_json::json!({
+                    "manifestVersion": "1.0",
+                    "codeVersionId": "abc123",
+                    "assets": [
+                        {
+                            "key": { "namespace": "analytics", "name": "orders" },
+                            "id": "01HQORDERS01",
+                            "dependencies": []
+                        },
+                        {
+                            "key": { "namespace": "analytics", "name": "users" },
+                            "id": "01HQUSERS001",
+                            "dependencies": []
+                        }
+                    ],
+                    "schedules": []
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let _ = manifest.manifest_id;
+
     let (status, first): (_, TriggerRunResponse) = helpers::response_json(
         helpers::send(
             router.clone(),
@@ -396,6 +600,114 @@ async fn parity_m1_run_key_conflicts_on_payload_mismatch() -> Result<()> {
     assert!(
         error.message.contains("run_key"),
         "expected conflict error to mention run_key"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn parity_m1_rejects_invalid_asset_keys() -> Result<()> {
+    let router = test_router();
+
+    let (status, manifest): (_, DeployManifestResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/manifests",
+                Some(serde_json::json!({
+                    "manifestVersion": "1.0",
+                    "codeVersionId": "abc123",
+                    "assets": [
+                        {
+                            "key": { "namespace": "analytics", "name": "orders" },
+                            "id": "01HQORDERS01",
+                            "dependencies": []
+                        }
+                    ],
+                    "schedules": []
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let _ = manifest.manifest_id;
+
+    let request = helpers::make_request(
+        Method::POST,
+        "/api/v1/workspaces/test-workspace/runs",
+        Some(serde_json::json!({
+            "selection": ["analytics/"],
+            "partitions": [],
+            "labels": {},
+        })),
+    )?;
+
+    let response = helpers::send(router, request).await?;
+    let (status, error): (_, ApiErrorResponse) = helpers::response_json(response).await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        error.message.contains("invalid asset key") || error.message.contains("asset key"),
+        "unexpected error message: {}",
+        error.message
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn parity_m1_rejects_unknown_assets() -> Result<()> {
+    let router = test_router();
+
+    let (status, manifest): (_, DeployManifestResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/manifests",
+                Some(serde_json::json!({
+                    "manifestVersion": "1.0",
+                    "codeVersionId": "abc123",
+                    "assets": [
+                        {
+                            "key": { "namespace": "analytics", "name": "orders" },
+                            "id": "01HQORDERS01",
+                            "dependencies": []
+                        }
+                    ],
+                    "schedules": []
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let _ = manifest.manifest_id;
+
+    let request = helpers::make_request(
+        Method::POST,
+        "/api/v1/workspaces/test-workspace/runs",
+        Some(serde_json::json!({
+            "selection": ["analytics.unknown"],
+            "partitions": [],
+            "labels": {},
+        })),
+    )?;
+
+    let response = helpers::send(router, request).await?;
+    let (status, error): (_, ApiErrorResponse) = helpers::response_json(response).await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        error.message.contains("unknown asset keys"),
+        "unexpected error message: {}",
+        error.message
     );
 
     Ok(())

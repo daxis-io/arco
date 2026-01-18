@@ -979,9 +979,62 @@ fn ensure_workspace(ctx: &RequestContext, workspace_id: &str) -> Result<(), ApiE
     Ok(())
 }
 
-async fn load_latest_asset_graph(
-    storage: &ScopedStorage,
-) -> Result<arco_flow::orchestration::AssetGraph, ApiError> {
+const MANIFEST_LATEST_INDEX_PATH: &str = "manifests/_index.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LatestManifestIndex {
+    latest_manifest_id: String,
+    deployed_at: DateTime<Utc>,
+}
+
+async fn load_latest_manifest(storage: &ScopedStorage) -> Result<Option<StoredManifest>, ApiError> {
+    match storage.get_raw(MANIFEST_LATEST_INDEX_PATH).await {
+        Ok(bytes) => match serde_json::from_slice::<LatestManifestIndex>(&bytes) {
+            Ok(index) => {
+                let path = crate::paths::manifest_path(&index.latest_manifest_id);
+                match storage.get_raw(&path).await {
+                    Ok(bytes) => match serde_json::from_slice::<StoredManifest>(&bytes) {
+                        Ok(stored) => return Ok(Some(stored)),
+                        Err(err) => {
+                            tracing::warn!(
+                                manifest_id = %index.latest_manifest_id,
+                                error = ?err,
+                                "failed to parse manifest referenced by latest index; falling back to scan"
+                            );
+                        }
+                    },
+                    Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => {
+                        tracing::warn!(
+                            manifest_id = %index.latest_manifest_id,
+                            "latest manifest index referenced missing manifest; falling back to scan"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            manifest_id = %index.latest_manifest_id,
+                            error = ?err,
+                            "failed to read manifest referenced by latest index; falling back to scan"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    "failed to parse latest manifest index; falling back to scan"
+                );
+            }
+        },
+        Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => {}
+        Err(err) => {
+            tracing::warn!(
+                error = ?err,
+                "failed to read latest manifest index; falling back to scan"
+            );
+        }
+    }
+
     let entries = storage
         .list_meta(MANIFEST_PREFIX)
         .await
@@ -1002,14 +1055,18 @@ async fn load_latest_asset_graph(
             Ok(b) => b,
             Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => continue,
             Err(err) => {
-                return Err(ApiError::internal(format!(
-                    "failed to read manifest {path}: {err}"
-                )));
+                tracing::warn!(path = %path, error = ?err, "failed to read manifest; skipping");
+                continue;
             }
         };
 
-        let stored: StoredManifest = serde_json::from_slice(&bytes)
-            .map_err(|e| ApiError::internal(format!("failed to parse manifest {path}: {e}")))?;
+        let stored: StoredManifest = match serde_json::from_slice(&bytes) {
+            Ok(stored) => stored,
+            Err(err) => {
+                tracing::warn!(path = %path, error = ?err, "failed to parse manifest; skipping");
+                continue;
+            }
+        };
 
         let should_replace = latest
             .as_ref()
@@ -1020,22 +1077,108 @@ async fn load_latest_asset_graph(
         }
     }
 
-    let Some(stored) = latest else {
-        return Ok(arco_flow::orchestration::AssetGraph::new());
+    Ok(latest)
+}
+
+async fn plan_tasks_and_root_assets(
+    storage: &ScopedStorage,
+    request: &TriggerRunRequest,
+) -> Result<(String, DateTime<Utc>, Vec<String>, Vec<TaskDef>), ApiError> {
+    let stored = load_latest_manifest(storage).await?;
+    let Some(stored) = stored else {
+        return Err(ApiError::bad_request(
+            "no manifest deployed for workspace; deploy a manifest before triggering a run",
+        ));
     };
 
+    let manifest_id = stored.manifest_id.clone();
+    let deployed_at = stored.deployed_at;
+
+    let mut known_assets = HashSet::new();
+    let mut manifest_assets = Vec::with_capacity(stored.assets.len());
+
+    for asset in &stored.assets {
+        let key = arco_flow::orchestration::canonicalize_asset_key(&format!(
+            "{}/{}",
+            asset.key.namespace, asset.key.name
+        ))
+        .map_err(|err| {
+            ApiError::internal(format!(
+                "invalid asset key in manifest {}: {err}",
+                stored.manifest_id
+            ))
+        })?;
+
+        known_assets.insert(key.clone());
+        manifest_assets.push((key, asset.dependencies.as_slice()));
+    }
+
     let mut graph = arco_flow::orchestration::AssetGraph::new();
-    for asset in stored.assets {
-        let asset_key = format!("{}.{}", asset.key.namespace, asset.key.name);
-        let upstream = asset
-            .dependencies
-            .iter()
-            .map(|dep| format!("{}.{}", dep.upstream_key.namespace, dep.upstream_key.name))
-            .collect();
+    for (asset_key, deps) in manifest_assets {
+        let mut upstream = Vec::new();
+        for dep in deps {
+            let upstream_key = arco_flow::orchestration::canonicalize_asset_key(&format!(
+                "{}/{}",
+                dep.upstream_key.namespace, dep.upstream_key.name
+            ))
+            .map_err(|err| {
+                ApiError::internal(format!(
+                    "invalid asset dependency key in manifest {}: {err}",
+                    stored.manifest_id
+                ))
+            })?;
+
+            if known_assets.contains(&upstream_key) {
+                upstream.push(upstream_key);
+            } else {
+                tracing::warn!(
+                    asset_key = %asset_key,
+                    upstream_key = %upstream_key,
+                    manifest_id = %stored.manifest_id,
+                    "dropping dependency edge to unknown upstream"
+                );
+            }
+        }
         graph.insert_asset(asset_key, upstream);
     }
 
-    Ok(graph)
+    let mut roots = std::collections::BTreeSet::new();
+    let mut unknown_roots = std::collections::BTreeSet::new();
+    for root in &request.selection {
+        let canonical = arco_flow::orchestration::canonicalize_asset_key(root)
+            .map_err(|err| ApiError::bad_request(err))?;
+
+        if known_assets.contains(&canonical) {
+            roots.insert(canonical);
+        } else {
+            unknown_roots.insert(canonical);
+        }
+    }
+
+    if !unknown_roots.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "unknown asset keys: {}",
+            unknown_roots.into_iter().collect::<Vec<_>>().join(", ")
+        )));
+    }
+
+    let root_assets: Vec<String> = roots.iter().cloned().collect();
+
+    let partition_key = build_partition_key(&request.partitions)?;
+    let options = arco_flow::orchestration::SelectionOptions {
+        include_upstream: request.include_upstream,
+        include_downstream: request.include_downstream,
+    };
+
+    let tasks = arco_flow::orchestration::build_task_defs_for_selection(
+        &graph,
+        &root_assets,
+        options,
+        partition_key,
+    )
+    .map_err(|err| ApiError::bad_request(err))?;
+
+    Ok((manifest_id, deployed_at, root_assets, tasks))
 }
 
 fn parse_pagination(limit: u32, cursor: Option<&str>) -> Result<(usize, usize), ApiError> {
@@ -1481,6 +1624,7 @@ fn build_request_fingerprint(request: &TriggerRunRequest) -> Result<String, ApiE
         })
         .collect::<Result<_, _>>()?;
     selection.sort();
+    selection.dedup();
 
     let mut partitions = request.partitions.clone();
     partitions.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.value.cmp(&b.value)));
@@ -1887,34 +2031,130 @@ pub(crate) async fn trigger_run(
     let ledger = LedgerWriter::new(storage.clone());
     let mut run_event_overrides: Option<RunEventOverrides> = None;
 
-    let graph = load_latest_asset_graph(&storage).await?;
-    let partition_key = build_partition_key(&request.partitions)?;
-    let options = arco_flow::orchestration::SelectionOptions {
-        include_upstream: request.include_upstream,
-        include_downstream: request.include_downstream,
-    };
-    let tasks = arco_flow::orchestration::build_task_defs_for_selection(
-        &graph,
-        &request.selection,
-        options,
-        partition_key,
-    )
-    .map_err(|err| ApiError::bad_request(err))?;
-
-    let root_assets: Vec<String> = request
-        .selection
-        .iter()
-        .map(|value| {
-            arco_flow::orchestration::canonicalize_asset_key(value)
-                .map_err(|err| ApiError::bad_request(err))
-        })
-        .collect::<Result<_, _>>()?;
-
     let request_fingerprint = if request.run_key.is_some() {
         Some(build_request_fingerprint(&request)?)
     } else {
         None
     };
+
+    if let Some(ref run_key) = request.run_key {
+        let fingerprint_policy =
+            FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff);
+
+        let existing = get_reservation(&storage, run_key)
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to read run_key reservation: {e}")))?;
+
+        if let Some(existing) = existing {
+            let fingerprints_match = match (
+                existing.request_fingerprint.as_deref(),
+                request_fingerprint.as_deref(),
+            ) {
+                (Some(a), Some(b)) => a == b,
+                (None, None) => true,
+                (None, Some(_)) => match fingerprint_policy.cutoff {
+                    None => true,
+                    Some(cutoff) => existing.created_at < cutoff,
+                },
+                (Some(_), None) => false,
+            };
+
+            if !fingerprints_match {
+                tracing::warn!(
+                    run_key = %existing.run_key,
+                    run_id = %existing.run_id,
+                    existing_fingerprint = ?existing.request_fingerprint,
+                    requested_fingerprint = ?request_fingerprint,
+                    existing_created_at = %existing.created_at,
+                    fingerprint_cutoff = ?fingerprint_policy.cutoff,
+                    "run_key reused with different trigger payload (fingerprint mismatch)"
+                );
+
+                return Err(ApiError::conflict(format!(
+                    "run_key '{}' already reserved with different trigger payload",
+                    existing.run_key
+                )));
+            }
+
+            let mut run_state = RunStateResponse::Pending;
+            let mut run_found = false;
+
+            match load_orchestration_state(&ctx, &state).await {
+                Ok(fold_state) => {
+                    if let Some(run) = fold_state.runs.get(&existing.run_id) {
+                        run_state = map_run_row_state(run);
+                        run_found = true;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        run_key = %existing.run_key,
+                        run_id = %existing.run_id,
+                        error = ?err,
+                        "failed to load orchestration state for run_key lookup"
+                    );
+                }
+            }
+
+            if !run_found {
+                let (manifest_id, deployed_at, root_assets, tasks) =
+                    plan_tasks_and_root_assets(&storage, &request).await?;
+
+                let plan_event_id = existing.plan_event_id.clone().unwrap_or_else(|| {
+                    let new_id = Ulid::new().to_string();
+                    tracing::warn!(
+                        run_key = %existing.run_key,
+                        run_id = %existing.run_id,
+                        "missing plan_event_id in reservation; generating new plan event id"
+                    );
+                    new_id
+                });
+
+                tracing::info!(
+                    manifest_id = %manifest_id,
+                    manifest_deployed_at = %deployed_at,
+                    run_id = %existing.run_id,
+                    "re-emitting run plan from latest manifest"
+                );
+
+                let event_paths = append_run_events(
+                    &ledger,
+                    &ctx.tenant,
+                    &workspace_id,
+                    user_id.clone(),
+                    &existing.run_id,
+                    &existing.plan_id,
+                    Some(existing.run_key.clone()),
+                    request.labels.clone(),
+                    state.config.code_version.clone(),
+                    root_assets,
+                    tasks,
+                    Some(RunEventOverrides {
+                        run_event_id: existing.event_id.clone(),
+                        plan_event_id,
+                        created_at: existing.created_at,
+                    }),
+                )
+                .await?;
+
+                compact_orchestration_events(&state.config, storage.clone(), event_paths).await?;
+            }
+
+            return Ok((
+                StatusCode::OK,
+                Json(TriggerRunResponse {
+                    run_id: existing.run_id,
+                    plan_id: existing.plan_id,
+                    state: run_state,
+                    created: false,
+                    created_at: existing.created_at,
+                }),
+            ));
+        }
+    }
+
+    let (manifest_id, deployed_at, root_assets, tasks) =
+        plan_tasks_and_root_assets(&storage, &request).await?;
 
     // If run_key provided, attempt to reserve it (strong idempotency)
     if let Some(ref run_key) = request.run_key {
@@ -2001,6 +2241,13 @@ pub(crate) async fn trigger_run(
                         new_id
                     });
 
+                    tracing::info!(
+                        manifest_id = %manifest_id,
+                        manifest_deployed_at = %deployed_at,
+                        run_id = %existing.run_id,
+                        "re-emitting run plan from latest manifest"
+                    );
+
                     let event_paths = append_run_events(
                         &ledger,
                         &ctx.tenant,
@@ -2056,6 +2303,16 @@ pub(crate) async fn trigger_run(
             }
         }
     }
+
+    tracing::info!(
+        manifest_id = %manifest_id,
+        manifest_deployed_at = %deployed_at,
+        root_assets = ?root_assets,
+        include_upstream = request.include_upstream,
+        include_downstream = request.include_downstream,
+        planned_tasks = tasks.len(),
+        "planning run from latest manifest"
+    );
 
     let event_paths = append_run_events(
         &ledger,
@@ -3706,6 +3963,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes::manifests::{AssetEntry, AssetKey, GitContext};
     use anyhow::{Result, anyhow};
     use arco_core::partition::{PartitionKey, ScalarValue};
     use axum::http::StatusCode;
@@ -3906,7 +4164,7 @@ mod tests {
         labels.insert("team".to_string(), "infra".to_string());
 
         let request_a = TriggerRunRequest {
-            selection: vec!["b".to_string(), "a".to_string()],
+            selection: vec!["analytics.b".to_string(), "analytics.a".to_string()],
             include_upstream: false,
             include_downstream: false,
             partitions: vec![
@@ -3928,7 +4186,7 @@ mod tests {
         labels_reordered.insert("env".to_string(), "prod".to_string());
 
         let request_b = TriggerRunRequest {
-            selection: vec!["a".to_string(), "b".to_string()],
+            selection: vec!["analytics.a".to_string(), "analytics.b".to_string()],
             include_upstream: false,
             include_downstream: false,
             partitions: vec![
@@ -4013,6 +4271,58 @@ mod tests {
 
         let backend = state.storage_backend()?;
         let storage = ctx.scoped_storage(backend)?;
+
+        let manifest_id = Ulid::new().to_string();
+        let stored_manifest = StoredManifest {
+            manifest_id: manifest_id.clone(),
+            tenant_id: ctx.tenant.clone(),
+            workspace_id: ctx.workspace.clone(),
+            manifest_version: "1.0".to_string(),
+            code_version_id: "abc123".to_string(),
+            fingerprint: "fp".to_string(),
+            git: GitContext::default(),
+            assets: vec![AssetEntry {
+                key: AssetKey {
+                    namespace: "analytics".to_string(),
+                    name: "users".to_string(),
+                },
+                id: "01HQXYZ123".to_string(),
+                description: String::new(),
+                owners: vec![],
+                tags: serde_json::Value::Null,
+                partitioning: serde_json::Value::Null,
+                dependencies: vec![],
+                code: serde_json::Value::Null,
+                checks: vec![],
+                execution: serde_json::Value::Null,
+                resources: serde_json::Value::Null,
+                io: serde_json::Value::Null,
+                transform_fingerprint: String::new(),
+            }],
+            schedules: vec![],
+            deployed_at: Utc::now(),
+            deployed_by: "test".to_string(),
+            metadata: serde_json::Value::Null,
+        };
+
+        let manifest_path = crate::paths::manifest_path(&manifest_id);
+        storage
+            .put_raw(
+                &manifest_path,
+                Bytes::from(serde_json::to_vec(&stored_manifest)?),
+                WritePrecondition::None,
+            )
+            .await?;
+        storage
+            .put_raw(
+                MANIFEST_LATEST_INDEX_PATH,
+                Bytes::from(serde_json::to_vec(&LatestManifestIndex {
+                    latest_manifest_id: manifest_id,
+                    deployed_at: stored_manifest.deployed_at,
+                })?),
+                WritePrecondition::None,
+            )
+            .await?;
 
         let reservation = RunKeyReservation {
             run_key: "daily:2024-01-01".to_string(),
@@ -4174,6 +4484,100 @@ mod tests {
         };
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_trigger_run_falls_back_to_scan_when_index_points_to_missing_manifest()
+    -> Result<()> {
+        let mut config = crate::config::Config::default();
+        config.debug = true;
+        let state = Arc::new(AppState::with_memory_storage(config));
+
+        let ctx = RequestContext {
+            tenant: "tenant".to_string(),
+            workspace: "workspace".to_string(),
+            user_id: Some("user@example.com".to_string()),
+            request_id: "req_01".to_string(),
+            idempotency_key: None,
+        };
+
+        let backend = state.storage_backend()?;
+        let storage = ctx.scoped_storage(backend)?;
+
+        let manifest_id = Ulid::new().to_string();
+        let stored_manifest = StoredManifest {
+            manifest_id: manifest_id.clone(),
+            tenant_id: ctx.tenant.clone(),
+            workspace_id: ctx.workspace.clone(),
+            manifest_version: "1.0".to_string(),
+            code_version_id: "abc123".to_string(),
+            fingerprint: "fp".to_string(),
+            git: GitContext::default(),
+            assets: vec![AssetEntry {
+                key: AssetKey {
+                    namespace: "analytics".to_string(),
+                    name: "orders".to_string(),
+                },
+                id: "01HQXYZ123".to_string(),
+                description: String::new(),
+                owners: vec![],
+                tags: serde_json::Value::Null,
+                partitioning: serde_json::Value::Null,
+                dependencies: vec![],
+                code: serde_json::Value::Null,
+                checks: vec![],
+                execution: serde_json::Value::Null,
+                resources: serde_json::Value::Null,
+                io: serde_json::Value::Null,
+                transform_fingerprint: String::new(),
+            }],
+            schedules: vec![],
+            deployed_at: Utc::now(),
+            deployed_by: "test".to_string(),
+            metadata: serde_json::Value::Null,
+        };
+
+        let manifest_path = crate::paths::manifest_path(&manifest_id);
+        storage
+            .put_raw(
+                &manifest_path,
+                Bytes::from(serde_json::to_vec(&stored_manifest)?),
+                WritePrecondition::None,
+            )
+            .await?;
+
+        storage
+            .put_raw(
+                MANIFEST_LATEST_INDEX_PATH,
+                Bytes::from(serde_json::to_vec(&LatestManifestIndex {
+                    latest_manifest_id: "missing".to_string(),
+                    deployed_at: stored_manifest.deployed_at,
+                })?),
+                WritePrecondition::None,
+            )
+            .await?;
+
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/orders".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let response = trigger_run(
+            State(state),
+            ctx.clone(),
+            Path(ctx.workspace.clone()),
+            Json(request),
+        )
+        .await
+        .map_err(|err| anyhow!("{err:?}"))?
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
         Ok(())
     }
 

@@ -462,11 +462,11 @@ async fn upsert_schedule_definitions(
         return Ok(());
     }
 
-    let normalize_asset_selection = |values: &[String]| -> Vec<String> {
+    fn normalize_asset_selection(values: &[String]) -> Vec<String> {
         let mut values = values.to_vec();
         values.sort();
         values
-    };
+    }
 
     let compactor = MicroCompactor::new(storage.clone());
     let (_, fold_state) = compactor
@@ -476,15 +476,14 @@ async fn upsert_schedule_definitions(
 
     let mut events: Vec<OrchestrationEvent> = Vec::new();
     for schedule in schedules {
-        let schedule_cron_expression = schedule.cron.as_str();
         let existing = fold_state.schedule_definitions.get(schedule.id.as_str());
 
-        let enabled = existing.is_none_or(|row| row.enabled);
+        let enabled = existing.map_or(true, |row| row.enabled);
         let catchup_window_minutes = existing.map_or(0, |row| row.catchup_window_minutes);
         let max_catchup_ticks = existing.map_or(1, |row| row.max_catchup_ticks);
 
         let needs_upsert = existing.is_none_or(|row| {
-            row.cron_expression != schedule_cron_expression
+            row.cron_expression != schedule.cron
                 || row.timezone != schedule.timezone
                 || row.enabled != enabled
                 || row.catchup_window_minutes != catchup_window_minutes
@@ -690,21 +689,6 @@ pub(crate) async fn deploy_manifest(
             );
         }
     }
-
-    let index = LatestManifestIndex {
-        latest_manifest_id: manifest_id.clone(),
-        deployed_at: now,
-    };
-    let index_json = serde_json::to_string(&index)
-        .map_err(|e| ApiError::internal(format!("failed to serialize manifest index: {e}")))?;
-    storage
-        .put_raw(
-            MANIFEST_LATEST_INDEX_PATH,
-            Bytes::from(index_json),
-            WritePrecondition::None,
-        )
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to store manifest index: {e}")))?;
 
     upsert_schedule_definitions(
         state.as_ref(),

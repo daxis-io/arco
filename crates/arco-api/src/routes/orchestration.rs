@@ -18,7 +18,7 @@
 //! - `POST   /tasks/{task_id}/heartbeat` - Worker heartbeat
 //! - `POST   /tasks/{task_id}/completed` - Worker finished execution
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 

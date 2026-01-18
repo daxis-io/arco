@@ -672,15 +672,17 @@ impl OrchestrationEventData {
                 asset_selection,
                 max_catchup_ticks,
                 enabled,
-            } => Self::schedule_definition_idempotency_key(
-                schedule_id,
-                cron_expression,
-                timezone,
-                *catchup_window_minutes,
-                asset_selection,
-                *max_catchup_ticks,
-                *enabled,
-            ),
+            } => {
+                let mut asset_selection = asset_selection.clone();
+                asset_selection.sort();
+
+                let input = format!(
+                    "{cron_expression}|{timezone}|{catchup_window_minutes}|{max_catchup_ticks}|{enabled}|{}",
+                    asset_selection.join(",")
+                );
+                let fp = sha256_hex(&input);
+                format!("sched_def:{schedule_id}:{fp}")
+            }
 
             Self::ScheduleTicked { tick_id, .. } => format!("sched_tick:{tick_id}"),
 

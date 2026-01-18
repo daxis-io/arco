@@ -15,8 +15,6 @@
 //! - `schedule_definitions.parquet`
 //! - `schedule_state.parquet`
 //! - `schedule_ticks.parquet`
-//! - `backfills.parquet`
-//! - `backfill_chunks.parquet`
 //!
 //! These schemas are the contract for orchestration controllers reading state.
 //! Keep changes backwards-compatible and gated by snapshot versioning.
@@ -35,15 +33,13 @@ use parquet::file::properties::WriterProperties;
 use parquet::format::KeyValue;
 
 use super::fold::{
-    BackfillChunkRow, BackfillRow, DepResolution, DepSatisfactionRow, DispatchOutboxRow,
-    DispatchStatus, IdempotencyKeyRow, PartitionStatusRow, RunKeyConflictRow, RunKeyIndexRow,
-    RunRow, RunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow, SensorEvalRow,
-    SensorStateRow, TaskRow, TaskState, TimerRow, TimerState, TimerType,
+    DepResolution, DepSatisfactionRow, DispatchOutboxRow, DispatchStatus, IdempotencyKeyRow,
+    PartitionStatusRow, RunRow, RunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
+    SensorEvalRow, SensorStateRow, TaskRow, TaskState, TimerRow, TimerState, TimerType,
 };
 use crate::error::{Error, Result};
 use crate::orchestration::events::{
-    BackfillState, ChunkState, PartitionSelector, RunRequest, SensorEvalStatus, SensorStatus,
-    TaskOutcome, TickStatus, TriggerSource,
+    RunRequest, SensorEvalStatus, SensorStatus, TaskOutcome, TickStatus, TriggerSource,
 };
 
 // ============================================================================
@@ -264,42 +260,6 @@ fn schedule_ticks_schema() -> Arc<Schema> {
         Field::new("run_key", DataType::Utf8, true),
         Field::new("run_id", DataType::Utf8, true),
         Field::new("request_fingerprint", DataType::Utf8, true),
-        Field::new("row_version", DataType::Utf8, false),
-    ]))
-}
-
-fn backfills_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("tenant_id", DataType::Utf8, false),
-        Field::new("workspace_id", DataType::Utf8, false),
-        Field::new("backfill_id", DataType::Utf8, false),
-        Field::new("asset_selection", DataType::Utf8, false),
-        Field::new("partition_selector", DataType::Utf8, false),
-        Field::new("chunk_size", DataType::UInt32, false),
-        Field::new("max_concurrent_runs", DataType::UInt32, false),
-        Field::new("state", DataType::Utf8, false),
-        Field::new("state_version", DataType::UInt32, false),
-        Field::new("total_partitions", DataType::UInt32, false),
-        Field::new("planned_chunks", DataType::UInt32, false),
-        Field::new("completed_chunks", DataType::UInt32, false),
-        Field::new("failed_chunks", DataType::UInt32, false),
-        Field::new("parent_backfill_id", DataType::Utf8, true),
-        Field::new("created_at", DataType::Int64, false),
-        Field::new("row_version", DataType::Utf8, false),
-    ]))
-}
-
-fn backfill_chunks_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("tenant_id", DataType::Utf8, false),
-        Field::new("workspace_id", DataType::Utf8, false),
-        Field::new("chunk_id", DataType::Utf8, false),
-        Field::new("backfill_id", DataType::Utf8, false),
-        Field::new("chunk_index", DataType::UInt32, false),
-        Field::new("partition_keys", DataType::Utf8, false),
-        Field::new("run_key", DataType::Utf8, false),
-        Field::new("run_id", DataType::Utf8, true),
-        Field::new("state", DataType::Utf8, false),
         Field::new("row_version", DataType::Utf8, false),
     ]))
 }
@@ -1532,194 +1492,6 @@ pub fn write_schedule_ticks(rows: &[ScheduleTickRow]) -> Result<Bytes> {
     write_single_batch(schema, &batch)
 }
 
-/// Writes `backfills.parquet`.
-///
-/// # Errors
-/// Returns an error if Parquet serialization fails.
-#[allow(clippy::too_many_lines)]
-pub fn write_backfills(rows: &[BackfillRow]) -> Result<Bytes> {
-    let schema = backfills_schema();
-
-    let tenant_ids = StringArray::from(
-        rows.iter()
-            .map(|r| Some(r.tenant_id.as_str()))
-            .collect::<Vec<_>>(),
-    );
-    let workspace_ids = StringArray::from(
-        rows.iter()
-            .map(|r| Some(r.workspace_id.as_str()))
-            .collect::<Vec<_>>(),
-    );
-    let backfill_ids = StringArray::from(
-        rows.iter()
-            .map(|r| Some(r.backfill_id.as_str()))
-            .collect::<Vec<_>>(),
-    );
-    let asset_selection = rows
-        .iter()
-        .map(|r| serde_json::to_string(&r.asset_selection))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| {
-            Error::parquet(format!("failed to serialize backfill asset_selection: {e}"))
-        })?;
-    let asset_selection = StringArray::from(
-        asset_selection
-            .iter()
-            .map(|s| Some(s.as_str()))
-            .collect::<Vec<_>>(),
-    );
-    let partition_selector = rows
-        .iter()
-        .map(|r| serde_json::to_string(&r.partition_selector))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| {
-            Error::parquet(format!(
-                "failed to serialize backfill partition_selector: {e}"
-            ))
-        })?;
-    let partition_selector = StringArray::from(
-        partition_selector
-            .iter()
-            .map(|s| Some(s.as_str()))
-            .collect::<Vec<_>>(),
-    );
-    let chunk_size = UInt32Array::from(rows.iter().map(|r| r.chunk_size).collect::<Vec<_>>());
-    let max_concurrent_runs = UInt32Array::from(
-        rows.iter()
-            .map(|r| r.max_concurrent_runs)
-            .collect::<Vec<_>>(),
-    );
-    let state = StringArray::from(
-        rows.iter()
-            .map(|r| Some(backfill_state_to_str(r.state)))
-            .collect::<Vec<_>>(),
-    );
-    let state_version = UInt32Array::from(rows.iter().map(|r| r.state_version).collect::<Vec<_>>());
-    let total_partitions =
-        UInt32Array::from(rows.iter().map(|r| r.total_partitions).collect::<Vec<_>>());
-    let planned_chunks =
-        UInt32Array::from(rows.iter().map(|r| r.planned_chunks).collect::<Vec<_>>());
-    let completed_chunks =
-        UInt32Array::from(rows.iter().map(|r| r.completed_chunks).collect::<Vec<_>>());
-    let failed_chunks = UInt32Array::from(rows.iter().map(|r| r.failed_chunks).collect::<Vec<_>>());
-    let parent_backfill_id = StringArray::from(
-        rows.iter()
-            .map(|r| r.parent_backfill_id.as_deref())
-            .collect::<Vec<_>>(),
-    );
-    let created_at = Int64Array::from(
-        rows.iter()
-            .map(|r| r.created_at.timestamp_millis())
-            .collect::<Vec<_>>(),
-    );
-    let row_versions = StringArray::from(
-        rows.iter()
-            .map(|r| Some(r.row_version.as_str()))
-            .collect::<Vec<_>>(),
-    );
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(tenant_ids),
-            Arc::new(workspace_ids),
-            Arc::new(backfill_ids),
-            Arc::new(asset_selection),
-            Arc::new(partition_selector),
-            Arc::new(chunk_size),
-            Arc::new(max_concurrent_runs),
-            Arc::new(state),
-            Arc::new(state_version),
-            Arc::new(total_partitions),
-            Arc::new(planned_chunks),
-            Arc::new(completed_chunks),
-            Arc::new(failed_chunks),
-            Arc::new(parent_backfill_id),
-            Arc::new(created_at),
-            Arc::new(row_versions),
-        ],
-    )
-    .map_err(|e| Error::parquet(format!("record batch build failed: {e}")))?;
-
-    write_single_batch(schema, &batch)
-}
-
-/// Writes `backfill_chunks.parquet`.
-///
-/// # Errors
-/// Returns an error if Parquet serialization fails.
-pub fn write_backfill_chunks(rows: &[BackfillChunkRow]) -> Result<Bytes> {
-    let schema = backfill_chunks_schema();
-
-    let tenant_ids = StringArray::from(
-        rows.iter()
-            .map(|r| Some(r.tenant_id.as_str()))
-            .collect::<Vec<_>>(),
-    );
-    let workspace_ids = StringArray::from(
-        rows.iter()
-            .map(|r| Some(r.workspace_id.as_str()))
-            .collect::<Vec<_>>(),
-    );
-    let chunk_ids = StringArray::from(
-        rows.iter()
-            .map(|r| Some(r.chunk_id.as_str()))
-            .collect::<Vec<_>>(),
-    );
-    let backfill_ids = StringArray::from(
-        rows.iter()
-            .map(|r| Some(r.backfill_id.as_str()))
-            .collect::<Vec<_>>(),
-    );
-    let chunk_index = UInt32Array::from(rows.iter().map(|r| r.chunk_index).collect::<Vec<_>>());
-    let partition_keys = rows
-        .iter()
-        .map(|r| serde_json::to_string(&r.partition_keys))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| Error::parquet(format!("failed to serialize chunk partition_keys: {e}")))?;
-    let partition_keys = StringArray::from(
-        partition_keys
-            .iter()
-            .map(|s| Some(s.as_str()))
-            .collect::<Vec<_>>(),
-    );
-    let run_key = StringArray::from(
-        rows.iter()
-            .map(|r| Some(r.run_key.as_str()))
-            .collect::<Vec<_>>(),
-    );
-    let run_id = StringArray::from(rows.iter().map(|r| r.run_id.as_deref()).collect::<Vec<_>>());
-    let state = StringArray::from(
-        rows.iter()
-            .map(|r| Some(chunk_state_to_str(r.state)))
-            .collect::<Vec<_>>(),
-    );
-    let row_versions = StringArray::from(
-        rows.iter()
-            .map(|r| Some(r.row_version.as_str()))
-            .collect::<Vec<_>>(),
-    );
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(tenant_ids),
-            Arc::new(workspace_ids),
-            Arc::new(chunk_ids),
-            Arc::new(backfill_ids),
-            Arc::new(chunk_index),
-            Arc::new(partition_keys),
-            Arc::new(run_key),
-            Arc::new(run_id),
-            Arc::new(state),
-            Arc::new(row_versions),
-        ],
-    )
-    .map_err(|e| Error::parquet(format!("record batch build failed: {e}")))?;
-
-    write_single_batch(schema, &batch)
-}
-
 // ============================================================================
 // Readers
 // ============================================================================
@@ -2643,119 +2415,6 @@ pub fn read_schedule_ticks(bytes: &Bytes) -> Result<Vec<ScheduleTickRow>> {
                         Some(col.value(row).to_string())
                     }
                 }),
-                row_version: row_version.value(row).to_string(),
-            });
-        }
-    }
-    Ok(out)
-}
-
-/// Reads `backfills.parquet`.
-///
-/// # Errors
-/// Returns an error if Parquet decoding fails or required columns are missing.
-#[allow(clippy::too_many_lines)]
-pub fn read_backfills(bytes: &Bytes) -> Result<Vec<BackfillRow>> {
-    let mut out = Vec::new();
-    for batch in read_batches(bytes)? {
-        let tenant_id = col_string(&batch, "tenant_id")?;
-        let workspace_id = col_string(&batch, "workspace_id")?;
-        let backfill_id = col_string(&batch, "backfill_id")?;
-        let asset_selection = col_string(&batch, "asset_selection")?;
-        let partition_selector = col_string(&batch, "partition_selector")?;
-        let chunk_size = col_u32(&batch, "chunk_size")?;
-        let max_concurrent_runs = col_u32(&batch, "max_concurrent_runs")?;
-        let state = col_string(&batch, "state")?;
-        let state_version = col_u32(&batch, "state_version")?;
-        let total_partitions = col_u32(&batch, "total_partitions")?;
-        let planned_chunks = col_u32(&batch, "planned_chunks")?;
-        let completed_chunks = col_u32(&batch, "completed_chunks")?;
-        let failed_chunks = col_u32(&batch, "failed_chunks")?;
-        let parent_backfill_id = col_string_opt(&batch, "parent_backfill_id");
-        let created_at = col_i64(&batch, "created_at")?;
-        let row_version = col_string(&batch, "row_version")?;
-
-        for row in 0..batch.num_rows() {
-            let asset_selection = serde_json::from_str::<Vec<String>>(asset_selection.value(row))
-                .map_err(|e| {
-                Error::parquet(format!("failed to parse backfill asset_selection: {e}"))
-            })?;
-            let partition_selector = serde_json::from_str::<PartitionSelector>(
-                partition_selector.value(row),
-            )
-            .map_err(|e| Error::parquet(format!("failed to parse partition_selector: {e}")))?;
-
-            out.push(BackfillRow {
-                tenant_id: tenant_id.value(row).to_string(),
-                workspace_id: workspace_id.value(row).to_string(),
-                backfill_id: backfill_id.value(row).to_string(),
-                asset_selection,
-                partition_selector,
-                chunk_size: chunk_size.value(row),
-                max_concurrent_runs: max_concurrent_runs.value(row),
-                state: str_to_backfill_state(state.value(row))?,
-                state_version: state_version.value(row),
-                total_partitions: total_partitions.value(row),
-                planned_chunks: planned_chunks.value(row),
-                completed_chunks: completed_chunks.value(row),
-                failed_chunks: failed_chunks.value(row),
-                parent_backfill_id: parent_backfill_id.as_ref().and_then(|col| {
-                    if col.is_null(row) {
-                        None
-                    } else {
-                        Some(col.value(row).to_string())
-                    }
-                }),
-                created_at: millis_to_datetime(created_at.value(row)),
-                row_version: row_version.value(row).to_string(),
-            });
-        }
-    }
-    Ok(out)
-}
-
-/// Reads `backfill_chunks.parquet`.
-///
-/// # Errors
-/// Returns an error if Parquet decoding fails or required columns are missing.
-pub fn read_backfill_chunks(bytes: &Bytes) -> Result<Vec<BackfillChunkRow>> {
-    let mut out = Vec::new();
-    for batch in read_batches(bytes)? {
-        let tenant_id = col_string(&batch, "tenant_id")?;
-        let workspace_id = col_string(&batch, "workspace_id")?;
-        let chunk_id = col_string(&batch, "chunk_id")?;
-        let backfill_id = col_string(&batch, "backfill_id")?;
-        let chunk_index = col_u32(&batch, "chunk_index")?;
-        let partition_keys = col_string(&batch, "partition_keys")?;
-        let run_key = col_string(&batch, "run_key")?;
-        let run_id = col_string_opt(&batch, "run_id");
-        let state = col_string(&batch, "state")?;
-        let row_version = col_string(&batch, "row_version")?;
-
-        for row in 0..batch.num_rows() {
-            let partition_keys = serde_json::from_str::<Vec<String>>(partition_keys.value(row))
-                .map_err(|e| {
-                    Error::parquet(format!(
-                        "failed to parse backfill chunk partition_keys: {e}"
-                    ))
-                })?;
-
-            out.push(BackfillChunkRow {
-                tenant_id: tenant_id.value(row).to_string(),
-                workspace_id: workspace_id.value(row).to_string(),
-                chunk_id: chunk_id.value(row).to_string(),
-                backfill_id: backfill_id.value(row).to_string(),
-                chunk_index: chunk_index.value(row),
-                partition_keys,
-                run_key: run_key.value(row).to_string(),
-                run_id: run_id.as_ref().and_then(|col| {
-                    if col.is_null(row) {
-                        None
-                    } else {
-                        Some(col.value(row).to_string())
-                    }
-                }),
-                state: str_to_chunk_state(state.value(row))?,
                 row_version: row_version.value(row).to_string(),
             });
         }

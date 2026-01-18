@@ -31,20 +31,18 @@ use arco_core::publish::{
 };
 
 use super::fold::{
-    FoldState, merge_backfill_chunk_rows, merge_backfill_rows, merge_dep_satisfaction_rows,
-    merge_dispatch_outbox_rows, merge_idempotency_key_rows, merge_partition_status_rows,
-    merge_run_rows, merge_schedule_definition_rows, merge_schedule_state_rows,
-    merge_schedule_tick_rows, merge_sensor_eval_rows, merge_sensor_state_rows, merge_task_rows,
-    merge_timer_rows,
+    FoldState, merge_dep_satisfaction_rows, merge_dispatch_outbox_rows, merge_idempotency_key_rows,
+    merge_partition_status_rows, merge_run_rows, merge_schedule_definition_rows,
+    merge_schedule_state_rows, merge_schedule_tick_rows, merge_sensor_eval_rows,
+    merge_sensor_state_rows, merge_task_rows, merge_timer_rows,
 };
 use super::manifest::{
     EventRange, L0Delta, OrchestrationManifest, OrchestrationManifestPointer, RowCounts,
     TablePaths, Watermarks, next_manifest_id,
 };
 use super::parquet_util::{
-    read_partition_status, write_backfill_chunks, write_backfills, write_dep_satisfaction,
-    write_dispatch_outbox, write_idempotency_keys, write_partition_status, write_run_key_conflicts,
-    write_run_key_index, write_runs, write_schedule_definitions, write_schedule_state,
+    read_partition_status, write_dep_satisfaction, write_dispatch_outbox, write_idempotency_keys,
+    write_partition_status, write_runs, write_schedule_definitions, write_schedule_state,
     write_schedule_ticks, write_sensor_evals, write_sensor_state, write_tasks, write_timers,
 };
 
@@ -359,8 +357,6 @@ impl MicroCompactor {
                 .unwrap_or(u32::MAX),
             schedule_state: u32::try_from(delta_state.schedule_state.len()).unwrap_or(u32::MAX),
             schedule_ticks: u32::try_from(delta_state.schedule_ticks.len()).unwrap_or(u32::MAX),
-            backfills: u32::try_from(delta_state.backfills.len()).unwrap_or(u32::MAX),
-            backfill_chunks: u32::try_from(delta_state.backfill_chunks.len()).unwrap_or(u32::MAX),
         };
 
         // Create L0 delta entry when changes exist
@@ -809,6 +805,30 @@ impl MicroCompactor {
             write_backfill_chunks,
             &mut paths.backfill_chunks
         );
+
+        if !state.schedule_definitions.is_empty() {
+            let rows: Vec<_> = state.schedule_definitions.values().cloned().collect();
+            let bytes = write_schedule_definitions(&rows)?;
+            let path = format!("{base_path}/schedule_definitions.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.schedule_definitions = Some(path);
+        }
+
+        if !state.schedule_state.is_empty() {
+            let rows: Vec<_> = state.schedule_state.values().cloned().collect();
+            let bytes = write_schedule_state(&rows)?;
+            let path = format!("{base_path}/schedule_state.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.schedule_state = Some(path);
+        }
+
+        if !state.schedule_ticks.is_empty() {
+            let rows: Vec<_> = state.schedule_ticks.values().cloned().collect();
+            let bytes = write_schedule_ticks(&rows)?;
+            let path = format!("{base_path}/schedule_ticks.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.schedule_ticks = Some(path);
+        }
 
         Ok(paths)
     }
@@ -1318,6 +1338,28 @@ fn delta_from_states(base: &FoldState, current: &FoldState) -> FoldState {
         &base.schedule_ticks,
         &current.schedule_ticks,
     );
+
+    for (schedule_id, row) in &current.schedule_definitions {
+        if base.schedule_definitions.get(schedule_id) != Some(row) {
+            delta
+                .schedule_definitions
+                .insert(schedule_id.clone(), row.clone());
+        }
+    }
+
+    for (schedule_id, row) in &current.schedule_state {
+        if base.schedule_state.get(schedule_id) != Some(row) {
+            delta
+                .schedule_state
+                .insert(schedule_id.clone(), row.clone());
+        }
+    }
+
+    for (tick_id, row) in &current.schedule_ticks {
+        if base.schedule_ticks.get(tick_id) != Some(row) {
+            delta.schedule_ticks.insert(tick_id.clone(), row.clone());
+        }
+    }
 
     delta
 }

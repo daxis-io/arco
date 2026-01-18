@@ -1160,9 +1160,62 @@ fn ensure_workspace(ctx: &RequestContext, workspace_id: &str) -> Result<(), ApiE
     Ok(())
 }
 
-async fn load_latest_asset_graph(
-    storage: &ScopedStorage,
-) -> Result<arco_flow::orchestration::AssetGraph, ApiError> {
+const MANIFEST_LATEST_INDEX_PATH: &str = "manifests/_index.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LatestManifestIndex {
+    latest_manifest_id: String,
+    deployed_at: DateTime<Utc>,
+}
+
+async fn load_latest_manifest(storage: &ScopedStorage) -> Result<Option<StoredManifest>, ApiError> {
+    match storage.get_raw(MANIFEST_LATEST_INDEX_PATH).await {
+        Ok(bytes) => match serde_json::from_slice::<LatestManifestIndex>(&bytes) {
+            Ok(index) => {
+                let path = crate::paths::manifest_path(&index.latest_manifest_id);
+                match storage.get_raw(&path).await {
+                    Ok(bytes) => match serde_json::from_slice::<StoredManifest>(&bytes) {
+                        Ok(stored) => return Ok(Some(stored)),
+                        Err(err) => {
+                            tracing::warn!(
+                                manifest_id = %index.latest_manifest_id,
+                                error = ?err,
+                                "failed to parse manifest referenced by latest index; falling back to scan"
+                            );
+                        }
+                    },
+                    Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => {
+                        tracing::warn!(
+                            manifest_id = %index.latest_manifest_id,
+                            "latest manifest index referenced missing manifest; falling back to scan"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            manifest_id = %index.latest_manifest_id,
+                            error = ?err,
+                            "failed to read manifest referenced by latest index; falling back to scan"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    "failed to parse latest manifest index; falling back to scan"
+                );
+            }
+        },
+        Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => {}
+        Err(err) => {
+            tracing::warn!(
+                error = ?err,
+                "failed to read latest manifest index; falling back to scan"
+            );
+        }
+    }
+
     let entries = storage
         .list_meta(MANIFEST_PREFIX)
         .await
@@ -1183,14 +1236,18 @@ async fn load_latest_asset_graph(
             Ok(b) => b,
             Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => continue,
             Err(err) => {
-                return Err(ApiError::internal(format!(
-                    "failed to read manifest {path}: {err}"
-                )));
+                tracing::warn!(path = %path, error = ?err, "failed to read manifest; skipping");
+                continue;
             }
         };
 
-        let stored: StoredManifest = serde_json::from_slice(&bytes)
-            .map_err(|e| ApiError::internal(format!("failed to parse manifest {path}: {e}")))?;
+        let stored: StoredManifest = match serde_json::from_slice(&bytes) {
+            Ok(stored) => stored,
+            Err(err) => {
+                tracing::warn!(path = %path, error = ?err, "failed to parse manifest; skipping");
+                continue;
+            }
+        };
 
         let should_replace = latest
             .as_ref()
@@ -1201,22 +1258,108 @@ async fn load_latest_asset_graph(
         }
     }
 
-    let Some(stored) = latest else {
-        return Ok(arco_flow::orchestration::AssetGraph::new());
+    Ok(latest)
+}
+
+async fn plan_tasks_and_root_assets(
+    storage: &ScopedStorage,
+    request: &TriggerRunRequest,
+) -> Result<(String, DateTime<Utc>, Vec<String>, Vec<TaskDef>), ApiError> {
+    let stored = load_latest_manifest(storage).await?;
+    let Some(stored) = stored else {
+        return Err(ApiError::bad_request(
+            "no manifest deployed for workspace; deploy a manifest before triggering a run",
+        ));
     };
 
+    let manifest_id = stored.manifest_id.clone();
+    let deployed_at = stored.deployed_at;
+
+    let mut known_assets = HashSet::new();
+    let mut manifest_assets = Vec::with_capacity(stored.assets.len());
+
+    for asset in &stored.assets {
+        let key = arco_flow::orchestration::canonicalize_asset_key(&format!(
+            "{}/{}",
+            asset.key.namespace, asset.key.name
+        ))
+        .map_err(|err| {
+            ApiError::internal(format!(
+                "invalid asset key in manifest {}: {err}",
+                stored.manifest_id
+            ))
+        })?;
+
+        known_assets.insert(key.clone());
+        manifest_assets.push((key, asset.dependencies.as_slice()));
+    }
+
     let mut graph = arco_flow::orchestration::AssetGraph::new();
-    for asset in stored.assets {
-        let asset_key = format!("{}.{}", asset.key.namespace, asset.key.name);
-        let upstream = asset
-            .dependencies
-            .iter()
-            .map(|dep| format!("{}.{}", dep.upstream_key.namespace, dep.upstream_key.name))
-            .collect();
+    for (asset_key, deps) in manifest_assets {
+        let mut upstream = Vec::new();
+        for dep in deps {
+            let upstream_key = arco_flow::orchestration::canonicalize_asset_key(&format!(
+                "{}/{}",
+                dep.upstream_key.namespace, dep.upstream_key.name
+            ))
+            .map_err(|err| {
+                ApiError::internal(format!(
+                    "invalid asset dependency key in manifest {}: {err}",
+                    stored.manifest_id
+                ))
+            })?;
+
+            if known_assets.contains(&upstream_key) {
+                upstream.push(upstream_key);
+            } else {
+                tracing::warn!(
+                    asset_key = %asset_key,
+                    upstream_key = %upstream_key,
+                    manifest_id = %stored.manifest_id,
+                    "dropping dependency edge to unknown upstream"
+                );
+            }
+        }
         graph.insert_asset(asset_key, upstream);
     }
 
-    Ok(graph)
+    let mut roots = std::collections::BTreeSet::new();
+    let mut unknown_roots = std::collections::BTreeSet::new();
+    for root in &request.selection {
+        let canonical = arco_flow::orchestration::canonicalize_asset_key(root)
+            .map_err(|err| ApiError::bad_request(err))?;
+
+        if known_assets.contains(&canonical) {
+            roots.insert(canonical);
+        } else {
+            unknown_roots.insert(canonical);
+        }
+    }
+
+    if !unknown_roots.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "unknown asset keys: {}",
+            unknown_roots.into_iter().collect::<Vec<_>>().join(", ")
+        )));
+    }
+
+    let root_assets: Vec<String> = roots.iter().cloned().collect();
+
+    let partition_key = build_partition_key(&request.partitions)?;
+    let options = arco_flow::orchestration::SelectionOptions {
+        include_upstream: request.include_upstream,
+        include_downstream: request.include_downstream,
+    };
+
+    let tasks = arco_flow::orchestration::build_task_defs_for_selection(
+        &graph,
+        &root_assets,
+        options,
+        partition_key,
+    )
+    .map_err(|err| ApiError::bad_request(err))?;
+
+    Ok((manifest_id, deployed_at, root_assets, tasks))
 }
 
 fn parse_pagination(limit: u32, cursor: Option<&str>) -> Result<(usize, usize), ApiError> {
@@ -2704,47 +2847,10 @@ pub(crate) async fn trigger_run(
     let ledger = LedgerWriter::new(storage.clone());
     let mut run_event_overrides: Option<RunEventOverrides> = None;
 
-    let graph = load_latest_asset_graph(&storage).await?;
-    let partition_key = build_partition_key(&request.partitions)?;
-    let options = arco_flow::orchestration::SelectionOptions {
-        include_upstream: request.include_upstream,
-        include_downstream: request.include_downstream,
-    };
-    let tasks = arco_flow::orchestration::build_task_defs_for_selection(
-        &graph,
-        &request.selection,
-        options,
-        partition_key,
-    )
-    .map_err(|err| ApiError::bad_request(err))?;
-
-    let root_assets: Vec<String> = request
-        .selection
-        .iter()
-        .map(|value| {
-            arco_flow::orchestration::canonicalize_asset_key(value)
-                .map_err(|err| ApiError::bad_request(err))
-        })
-        .collect::<Result<_, _>>()?;
-
     let request_fingerprint = if request.run_key.is_some() {
         Some(build_request_fingerprint(&request)?)
     } else {
         PartitioningSpec::default()
-    };
-
-    let resolved_partition_key = resolve_partition_key(
-        &request,
-        &partitioning_spec,
-        state.config.partition_time_string_cutoff,
-    )?;
-
-    let (request_fingerprint, request_fingerprint_variants) = if request.run_key.is_some() {
-        let (primary, variants) =
-            build_request_fingerprint_variants(&request, &resolved_partition_key)?;
-        (Some(primary), variants)
-    } else {
-        (None, Vec::new())
     };
 
     if let Some(ref run_key) = request.run_key {
@@ -2760,9 +2866,7 @@ pub(crate) async fn trigger_run(
                 existing.request_fingerprint.as_deref(),
                 request_fingerprint.as_deref(),
             ) {
-                (Some(existing_fp), Some(_)) => request_fingerprint_variants
-                    .iter()
-                    .any(|fp| fp == existing_fp),
+                (Some(a), Some(b)) => a == b,
                 (None, None) => true,
                 (None, Some(_)) => match fingerprint_policy.cutoff {
                     None => true,
@@ -2809,18 +2913,8 @@ pub(crate) async fn trigger_run(
             }
 
             if !run_found {
-                if plan_context.is_none() {
-                    plan_context = Some(load_run_plan_context(&storage, &request).await?);
-                }
-                let Some(plan_context_ref) = plan_context.as_ref() else {
-                    return Err(ApiError::internal("internal error: missing plan context"));
-                };
-
-                let tasks = build_task_defs_for_request(
-                    plan_context_ref,
-                    &request,
-                    resolved_partition_key.canonical(),
-                )?;
+                let (manifest_id, deployed_at, root_assets, tasks) =
+                    plan_tasks_and_root_assets(&storage, &request).await?;
 
                 let plan_event_id = existing.plan_event_id.clone().unwrap_or_else(|| {
                     let new_id = Ulid::new().to_string();
@@ -2833,8 +2927,8 @@ pub(crate) async fn trigger_run(
                 });
 
                 tracing::info!(
-                    manifest_id = %plan_context_ref.manifest_id,
-                    manifest_deployed_at = %plan_context_ref.deployed_at,
+                    manifest_id = %manifest_id,
+                    manifest_deployed_at = %deployed_at,
                     run_id = %existing.run_id,
                     "re-emitting run plan from latest manifest"
                 );
@@ -2849,7 +2943,7 @@ pub(crate) async fn trigger_run(
                     Some(existing.run_key.clone()),
                     request.labels.clone(),
                     state.config.code_version.clone(),
-                    plan_context_ref.root_assets.clone(),
+                    root_assets,
                     tasks,
                     Some(RunEventOverrides {
                         run_event_id: existing.event_id.clone(),
@@ -2874,6 +2968,9 @@ pub(crate) async fn trigger_run(
             ));
         }
     }
+
+    let (manifest_id, deployed_at, root_assets, tasks) =
+        plan_tasks_and_root_assets(&storage, &request).await?;
 
     // If run_key provided, attempt to reserve it (strong idempotency)
     if let Some(ref run_key) = request.run_key {
@@ -2987,8 +3084,8 @@ pub(crate) async fn trigger_run(
                     });
 
                     tracing::info!(
-                        manifest_id = %plan_context_ref.manifest_id,
-                        manifest_deployed_at = %plan_context_ref.deployed_at,
+                        manifest_id = %manifest_id,
+                        manifest_deployed_at = %deployed_at,
                         run_id = %existing.run_id,
                         "re-emitting run plan from latest manifest"
                     );
@@ -3049,22 +3146,10 @@ pub(crate) async fn trigger_run(
         }
     }
 
-    if plan_context.is_none() {
-        plan_context = Some(load_run_plan_context(&storage, &request).await?);
-    }
-    let Some(plan_context_ref) = plan_context.as_ref() else {
-        return Err(ApiError::internal("internal error: missing plan context"));
-    };
-    let tasks = build_task_defs_for_request(
-        plan_context_ref,
-        &request,
-        resolved_partition_key.canonical(),
-    )?;
-
     tracing::info!(
-        manifest_id = %plan_context_ref.manifest_id,
-        manifest_deployed_at = %plan_context_ref.deployed_at,
-        root_assets = ?plan_context_ref.root_assets,
+        manifest_id = %manifest_id,
+        manifest_deployed_at = %deployed_at,
+        root_assets = ?root_assets,
         include_upstream = request.include_upstream,
         include_downstream = request.include_downstream,
         planned_tasks = tasks.len(),
@@ -5780,7 +5865,7 @@ mod tests {
         labels.insert("team".to_string(), "infra".to_string());
 
         let request_a = TriggerRunRequest {
-            selection: vec!["b".to_string(), "a".to_string()],
+            selection: vec!["analytics.b".to_string(), "analytics.a".to_string()],
             include_upstream: false,
             include_downstream: false,
             partitions: vec![
@@ -5803,7 +5888,7 @@ mod tests {
         labels_reordered.insert("env".to_string(), "prod".to_string());
 
         let request_b = TriggerRunRequest {
-            selection: vec!["a".to_string(), "b".to_string()],
+            selection: vec!["analytics.a".to_string(), "analytics.b".to_string()],
             include_upstream: false,
             include_downstream: false,
             partitions: vec![
@@ -5948,9 +6033,6 @@ mod tests {
             )
             .await?;
 
-        let partitioning = PartitioningSpec::default();
-        let resolved_partition_key = resolve_partition_key(&request, &partitioning, None)
-            .map_err(|err| anyhow!("{err:?}"))?;
         let reservation = RunKeyReservation {
             run_key: "daily:2024-01-01".to_string(),
             run_id: Ulid::new().to_string(),
@@ -6232,7 +6314,6 @@ mod tests {
             tenant: "tenant".to_string(),
             workspace: "workspace".to_string(),
             user_id: Some("user@example.com".to_string()),
-            groups: vec![],
             request_id: "req_01".to_string(),
             idempotency_key: None,
         };
@@ -6298,7 +6379,6 @@ mod tests {
             include_upstream: false,
             include_downstream: false,
             partitions: vec![],
-            partition_key: None,
             run_key: None,
             labels: HashMap::new(),
         };

@@ -18,7 +18,7 @@
 //! - `POST   /tasks/{task_id}/heartbeat` - Worker heartbeat
 //! - `POST   /tasks/{task_id}/completed` - Worker finished execution
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -144,37 +144,6 @@ pub(crate) struct TriggerRunRequestWithPartitions {
     /// Additional labels for the run.
     #[serde(default)]
     pub labels: HashMap<String, String>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize, ToSchema, Clone)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct TriggerRunRequestUnpartitioned {
-    /// Asset selection (asset keys to materialize).
-    #[serde(default)]
-    pub selection: Vec<String>,
-    /// Include upstream dependencies of the selection.
-    #[serde(default)]
-    pub include_upstream: bool,
-    /// Include downstream dependents of the selection.
-    #[serde(default)]
-    pub include_downstream: bool,
-    /// Idempotency key for deduplication (409 if reused with different payload).
-    /// Reservations created before the fingerprint cutoff remain lenient.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_key: Option<String>,
-    /// Additional labels for the run.
-    #[serde(default)]
-    pub labels: HashMap<String, String>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize, ToSchema, Clone)]
-#[serde(untagged)]
-pub(crate) enum TriggerRunRequestOpenApi {
-    WithPartitionKey(TriggerRunRequestWithPartitionKey),
-    WithPartitions(TriggerRunRequestWithPartitions),
-    Unpartitioned(TriggerRunRequestUnpartitioned),
 }
 
 /// Rerun mode values.
@@ -1323,11 +1292,11 @@ async fn plan_tasks_and_root_assets(
         graph.insert_asset(asset_key, upstream);
     }
 
-    let mut roots = std::collections::BTreeSet::new();
-    let mut unknown_roots = std::collections::BTreeSet::new();
+    let mut roots = BTreeSet::new();
+    let mut unknown_roots = BTreeSet::new();
     for root in &request.selection {
         let canonical = arco_flow::orchestration::canonicalize_asset_key(root)
-            .map_err(|err| ApiError::bad_request(err))?;
+            .map_err(ApiError::bad_request)?;
 
         if known_assets.contains(&canonical) {
             roots.insert(canonical);
@@ -1357,9 +1326,219 @@ async fn plan_tasks_and_root_assets(
         options,
         partition_key,
     )
-    .map_err(|err| ApiError::bad_request(err))?;
+    .map_err(ApiError::bad_request)?;
 
     Ok((manifest_id, deployed_at, root_assets, tasks))
+}
+
+type PlanGraph = (
+    HashMap<String, TaskRow>,
+    HashMap<String, Vec<String>>,
+    HashMap<String, Vec<String>>,
+);
+
+fn build_plan_graph_for_run(fold_state: &FoldState, run_id: &str) -> PlanGraph {
+    let mut tasks_by_key = HashMap::new();
+    for row in fold_state.tasks.values().filter(|row| row.run_id == run_id) {
+        tasks_by_key.insert(row.task_key.clone(), row.clone());
+    }
+
+    let mut upstream_by_task: HashMap<String, Vec<String>> = HashMap::new();
+    let mut downstream_by_task: HashMap<String, Vec<String>> = HashMap::new();
+
+    for task_key in tasks_by_key.keys() {
+        upstream_by_task.insert(task_key.clone(), Vec::new());
+        downstream_by_task.insert(task_key.clone(), Vec::new());
+    }
+
+    for edge in fold_state
+        .dep_satisfaction
+        .values()
+        .filter(|edge| edge.run_id == run_id)
+    {
+        if !tasks_by_key.contains_key(&edge.upstream_task_key)
+            || !tasks_by_key.contains_key(&edge.downstream_task_key)
+        {
+            continue;
+        }
+
+        upstream_by_task
+            .entry(edge.downstream_task_key.clone())
+            .or_default()
+            .push(edge.upstream_task_key.clone());
+        downstream_by_task
+            .entry(edge.upstream_task_key.clone())
+            .or_default()
+            .push(edge.downstream_task_key.clone());
+    }
+
+    for value in upstream_by_task.values_mut() {
+        value.sort();
+        value.dedup();
+    }
+    for value in downstream_by_task.values_mut() {
+        value.sort();
+        value.dedup();
+    }
+
+    (tasks_by_key, upstream_by_task, downstream_by_task)
+}
+
+fn close_task_selection(
+    roots: &[String],
+    include_upstream: bool,
+    include_downstream: bool,
+    upstream_by_task: &HashMap<String, Vec<String>>,
+    downstream_by_task: &HashMap<String, Vec<String>>,
+) -> BTreeSet<String> {
+    let mut selected: BTreeSet<String> = roots.iter().cloned().collect();
+
+    if include_upstream {
+        let mut queue: VecDeque<String> = roots.iter().cloned().collect();
+        while let Some(current) = queue.pop_front() {
+            let upstream = upstream_by_task.get(&current).cloned().unwrap_or_default();
+            for upstream_key in upstream {
+                if selected.insert(upstream_key.clone()) {
+                    queue.push_back(upstream_key);
+                }
+            }
+        }
+    }
+
+    if include_downstream {
+        let mut queue: VecDeque<String> = roots.iter().cloned().collect();
+        while let Some(current) = queue.pop_front() {
+            let downstream = downstream_by_task
+                .get(&current)
+                .cloned()
+                .unwrap_or_default();
+            for downstream_key in downstream {
+                if selected.insert(downstream_key.clone()) {
+                    queue.push_back(downstream_key);
+                }
+            }
+        }
+    }
+
+    selected
+}
+
+fn task_defs_for_rerun(
+    tasks_by_key: &HashMap<String, TaskRow>,
+    selected: &BTreeSet<String>,
+    upstream_by_task: &HashMap<String, Vec<String>>,
+) -> Vec<TaskDef> {
+    let mut tasks = Vec::new();
+
+    for task_key in selected {
+        let Some(task_row) = tasks_by_key.get(task_key) else {
+            continue;
+        };
+
+        let mut depends_on: Vec<String> = upstream_by_task
+            .get(task_key)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|upstream| selected.contains(upstream))
+            .collect();
+        depends_on.sort();
+
+        tasks.push(TaskDef {
+            key: task_key.clone(),
+            depends_on,
+            asset_key: task_row.asset_key.clone(),
+            partition_key: task_row.partition_key.clone(),
+            max_attempts: task_row.max_attempts,
+            heartbeat_timeout_sec: task_row.heartbeat_timeout_sec,
+        });
+    }
+
+    tasks.sort_by(|a, b| a.key.cmp(&b.key));
+    tasks
+}
+
+fn compute_rerun_run_key(
+    parent_run_id: &str,
+    rerun_kind: RerunKindResponse,
+    selected_tasks: &BTreeSet<String>,
+    partition_keys: &BTreeSet<String>,
+) -> Result<String, ApiError> {
+    #[derive(Serialize)]
+    struct Payload {
+        parent_run_id: String,
+        rerun_kind: RerunKindResponse,
+        selected_tasks: Vec<String>,
+        partition_keys: Vec<String>,
+    }
+
+    let payload = Payload {
+        parent_run_id: parent_run_id.to_string(),
+        rerun_kind,
+        selected_tasks: selected_tasks.iter().cloned().collect(),
+        partition_keys: partition_keys.iter().cloned().collect(),
+    };
+
+    let json = serde_json::to_vec(&payload).map_err(|e| {
+        ApiError::internal(format!("failed to serialize rerun run_key payload: {e}"))
+    })?;
+    let hash = Sha256::digest(&json);
+    let hex_hash = hex::encode(hash);
+
+    let kind = match rerun_kind {
+        RerunKindResponse::FromFailure => "from_failure",
+        RerunKindResponse::Subset => "subset",
+    };
+
+    Ok(format!("rerun:{parent_run_id}:{kind}:{}", &hex_hash[..16]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_rerun_request_fingerprint(
+    parent_run_id: &str,
+    rerun_kind: RerunKindResponse,
+    roots: &[String],
+    include_upstream: bool,
+    include_downstream: bool,
+    selected_tasks: &BTreeSet<String>,
+    partition_keys: &BTreeSet<String>,
+    labels: &HashMap<String, String>,
+) -> Result<String, ApiError> {
+    #[derive(Serialize)]
+    struct Payload {
+        parent_run_id: String,
+        rerun_kind: RerunKindResponse,
+        roots: Vec<String>,
+        include_upstream: bool,
+        include_downstream: bool,
+        selected_tasks: Vec<String>,
+        partition_keys: Vec<String>,
+        labels: BTreeMap<String, String>,
+    }
+
+    let labels = labels
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let payload = Payload {
+        parent_run_id: parent_run_id.to_string(),
+        rerun_kind,
+        roots: roots.to_vec(),
+        include_upstream,
+        include_downstream,
+        selected_tasks: selected_tasks.iter().cloned().collect(),
+        partition_keys: partition_keys.iter().cloned().collect(),
+        labels,
+    };
+
+    let json = serde_json::to_vec(&payload).map_err(|e| {
+        ApiError::internal(format!(
+            "failed to serialize rerun request fingerprint: {e}"
+        ))
+    })?;
+    let hash = Sha256::digest(&json);
+    Ok(hex::encode(hash))
 }
 
 fn parse_pagination(limit: u32, cursor: Option<&str>) -> Result<(usize, usize), ApiError> {
@@ -1742,141 +1921,6 @@ fn reject_reserved_lineage_labels(labels: &HashMap<String, String>) -> Result<()
     )))
 }
 
-fn validate_selection_limits(selection: &[String]) -> Result<(), ApiError> {
-    if selection.len() > MAX_SELECTION_ITEMS {
-        return Err(ApiError::bad_request(format!(
-            "selection exceeds max items ({MAX_SELECTION_ITEMS})"
-        )));
-    }
-    for value in selection {
-        if value.len() > MAX_SELECTION_ITEM_LEN {
-            return Err(ApiError::bad_request(format!(
-                "selection item exceeds max length ({MAX_SELECTION_ITEM_LEN})"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_labels_limits(labels: &HashMap<String, String>) -> Result<(), ApiError> {
-    if labels.len() > MAX_LABELS {
-        return Err(ApiError::bad_request(format!(
-            "labels exceed max properties ({MAX_LABELS})"
-        )));
-    }
-
-    for (key, value) in labels {
-        if key.len() > MAX_LABEL_KEY_LEN {
-            return Err(ApiError::bad_request(format!(
-                "label key exceeds max length ({MAX_LABEL_KEY_LEN})"
-            )));
-        }
-        if value.len() > MAX_LABEL_VALUE_LEN {
-            return Err(ApiError::bad_request(format!(
-                "label value exceeds max length ({MAX_LABEL_VALUE_LEN})"
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_partitions_limits(partitions: &[PartitionValue]) -> Result<(), ApiError> {
-    if partitions.len() > MAX_PARTITIONS {
-        return Err(ApiError::bad_request(format!(
-            "partitions exceed max items ({MAX_PARTITIONS})"
-        )));
-    }
-
-    for partition in partitions {
-        if partition.key.len() > MAX_PARTITION_DIM_LEN {
-            return Err(ApiError::bad_request(format!(
-                "partition key exceeds max length ({MAX_PARTITION_DIM_LEN})"
-            )));
-        }
-        if partition.value.len() > MAX_PARTITION_VALUE_LEN {
-            return Err(ApiError::bad_request(format!(
-                "partition value exceeds max length ({MAX_PARTITION_VALUE_LEN})"
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_trigger_run_request_limits(request: &TriggerRunRequest) -> Result<(), ApiError> {
-    validate_selection_limits(&request.selection)?;
-    validate_labels_limits(&request.labels)?;
-    validate_partitions_limits(&request.partitions)?;
-
-    if let Some(run_key) = request.run_key.as_deref() {
-        if run_key.len() > MAX_RUN_KEY_LEN {
-            return Err(ApiError::bad_request(format!(
-                "runKey exceeds max length ({MAX_RUN_KEY_LEN})"
-            )));
-        }
-    }
-
-    if let Some(partition_key) = request.partition_key.as_deref() {
-        if partition_key.len() > MAX_PARTITION_KEY_LEN {
-            return Err(ApiError::bad_request(format!(
-                "partitionKey exceeds max length ({MAX_PARTITION_KEY_LEN})"
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-fn parse_partition_values(
-    partitions: &[PartitionValue],
-) -> Result<BTreeMap<String, String>, ApiError> {
-    if partitions.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-
-    if partitions.len() > MAX_PARTITIONS {
-        return Err(ApiError::bad_request(format!(
-            "partitions exceed max items ({MAX_PARTITIONS})"
-        )));
-    }
-
-    let mut seen = HashSet::new();
-    let mut values = BTreeMap::new();
-
-    for partition in partitions {
-        let key = partition.key.trim();
-        if key.is_empty() {
-            return Err(ApiError::bad_request("partition key cannot be empty"));
-        }
-        if key.len() > MAX_PARTITION_DIM_LEN {
-            return Err(ApiError::bad_request(format!(
-                "partition key exceeds max length ({MAX_PARTITION_DIM_LEN})"
-            )));
-        }
-        if !is_valid_partition_key(key) {
-            return Err(ApiError::bad_request(format!(
-                "invalid partition key: {key}"
-            )));
-        }
-        if !seen.insert(key.to_string()) {
-            return Err(ApiError::bad_request(format!(
-                "duplicate partition key: {key}"
-            )));
-        }
-
-        if partition.value.len() > MAX_PARTITION_VALUE_LEN {
-            return Err(ApiError::bad_request(format!(
-                "partition value exceeds max length ({MAX_PARTITION_VALUE_LEN})"
-            )));
-        }
-
-        values.insert(key.to_string(), partition.value.clone());
-    }
-
-    Ok(values)
-}
-
 fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
     let mut pending = 0;
     let mut queued = 0;
@@ -2195,8 +2239,7 @@ fn build_request_fingerprint(
         .selection
         .iter()
         .map(|value| {
-            arco_flow::orchestration::canonicalize_asset_key(value)
-                .map_err(|err| ApiError::bad_request(err))
+            arco_flow::orchestration::canonicalize_asset_key(value).map_err(ApiError::bad_request)
         })
         .collect::<Result<_, _>>()?;
     selection.sort();
@@ -2836,6 +2879,8 @@ pub(crate) async fn trigger_run(
         return Err(ApiError::bad_request("selection cannot be empty"));
     }
 
+    reject_reserved_lineage_labels(&request.labels)?;
+
     // Generate IDs upfront (needed for reservation)
     let run_id = Ulid::new().to_string();
     let plan_id = Ulid::new().to_string();
@@ -3214,17 +3259,6 @@ pub(crate) async fn rerun_run(
     Json(request): Json<RerunRunRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
-
-    validate_labels_limits(&request.labels)?;
-    validate_selection_limits(&request.selection)?;
-    if let Some(run_key) = request.run_key.as_deref() {
-        if run_key.len() > MAX_RUN_KEY_LEN {
-            return Err(ApiError::bad_request(format!(
-                "runKey exceeds max length ({MAX_RUN_KEY_LEN})"
-            )));
-        }
-    }
-
     reject_reserved_lineage_labels(&request.labels)?;
 
     let fold_state = load_orchestration_state(&ctx, &state).await?;

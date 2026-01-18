@@ -1316,7 +1316,7 @@ impl FoldState {
                 trigger_source_ref,
                 labels,
             } => {
-                if !self.should_drop_run_requested(trigger_source_ref) {
+                if !self.should_drop_run_requested_for_stale_sensor_eval(trigger_source_ref) {
                     self.fold_run_requested(
                         &event.tenant_id,
                         &event.workspace_id,
@@ -2284,11 +2284,6 @@ impl FoldState {
         // Increment state_version for CAS (poll sensors)
         state.state_version += 1;
 
-        // Update status if evaluation errored
-        if matches!(status, SensorEvalStatus::Error { .. }) {
-            state.status = SensorStatus::Error;
-        }
-
         // NOTE: Per P0-1, fold does NOT emit RunRequested events.
         // The controller already emitted SensorEvaluated + RunRequested(s) atomically.
         // fold_run_requested handles each RunRequested event separately.
@@ -2672,13 +2667,21 @@ impl FoldState {
             });
     }
 
-    fn should_drop_run_requested(&self, trigger_source_ref: &SourceRef) -> bool {
-        if let SourceRef::Sensor { eval_id, .. } = trigger_source_ref {
-            if let Some(eval) = self.sensor_evals.get(eval_id) {
-                return matches!(eval.status, SensorEvalStatus::SkippedStaleCursor);
+    fn should_drop_run_requested_for_stale_sensor_eval(
+        &self,
+        trigger_source_ref: &SourceRef,
+    ) -> bool {
+        match trigger_source_ref {
+            SourceRef::Sensor { eval_id, .. } => {
+                let eval = self.sensor_evals.get(eval_id);
+                debug_assert!(
+                    eval.is_some(),
+                    "expected SensorEvaluated to be folded before RunRequested for sensor sources"
+                );
+                eval.is_some_and(|e| matches!(e.status, SensorEvalStatus::SkippedStaleCursor))
             }
+            _ => false,
         }
-        false
     }
 
     fn satisfy_downstream_edges(
@@ -5029,7 +5032,7 @@ mod tests {
         };
 
         assert!(
-            state.should_drop_run_requested(&source_ref),
+            state.should_drop_run_requested_for_stale_sensor_eval(&source_ref),
             "RunRequested should be dropped when eval is stale"
         );
     }
@@ -5124,12 +5127,10 @@ mod tests {
         );
     }
 
-    /// Error status should update sensor status to Error.
     #[test]
-    fn test_fold_sensor_evaluated_error_updates_status() {
+    fn test_fold_sensor_evaluated_error_does_not_update_status() {
         let mut state = FoldState::new();
 
-        // Create error event
         let event = OrchestrationEvent::new(
             "tenant-abc",
             "workspace-prod",
@@ -5152,11 +5153,7 @@ mod tests {
         state.fold_event(&event);
 
         let sensor_state = state.sensor_state.get("01HQ123ERRORSENSOR").unwrap();
-        assert_eq!(
-            sensor_state.status,
-            SensorStatus::Error,
-            "Sensor status should be Error after error eval"
-        );
+        assert_eq!(sensor_state.status, SensorStatus::Active);
 
         let eval_id = match &event.data {
             OrchestrationEventData::SensorEvaluated { eval_id, .. } => eval_id,

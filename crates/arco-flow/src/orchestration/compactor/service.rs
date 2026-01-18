@@ -31,8 +31,9 @@ use super::manifest::{
 };
 use super::parquet_util::{
     read_partition_status, write_dep_satisfaction, write_dispatch_outbox, write_idempotency_keys,
-    write_partition_status, write_runs, write_schedule_definitions, write_schedule_state,
-    write_schedule_ticks, write_sensor_evals, write_sensor_state, write_tasks, write_timers,
+    write_partition_status, write_run_key_conflicts, write_run_key_index, write_runs,
+    write_schedule_definitions, write_schedule_state, write_schedule_ticks, write_sensor_evals,
+    write_sensor_state, write_tasks, write_timers,
 };
 
 const SENSOR_EVAL_RETENTION_DAYS: i64 = 30;
@@ -187,6 +188,9 @@ impl MicroCompactor {
             dispatch_outbox: u32::try_from(delta_state.dispatch_outbox.len()).unwrap_or(u32::MAX),
             sensor_state: u32::try_from(delta_state.sensor_state.len()).unwrap_or(u32::MAX),
             sensor_evals: u32::try_from(delta_state.sensor_evals.len()).unwrap_or(u32::MAX),
+            run_key_index: u32::try_from(delta_state.run_key_index.len()).unwrap_or(u32::MAX),
+            run_key_conflicts: u32::try_from(delta_state.run_key_conflicts.len())
+                .unwrap_or(u32::MAX),
             partition_status: u32::try_from(delta_state.partition_status.len()).unwrap_or(u32::MAX),
             idempotency_keys: u32::try_from(delta_state.idempotency_keys.len()).unwrap_or(u32::MAX),
             schedule_definitions: u32::try_from(delta_state.schedule_definitions.len())
@@ -366,6 +370,23 @@ impl MicroCompactor {
             }
         }
 
+        if let Some(ref run_key_index_path) = tables.run_key_index {
+            let data = self.storage.get_raw(run_key_index_path).await?;
+            let rows = super::parquet_util::read_run_key_index(&data)?;
+            for row in rows {
+                state.run_key_index.insert(row.run_key.clone(), row);
+            }
+        }
+
+        if let Some(ref run_key_conflicts_path) = tables.run_key_conflicts {
+            let data = self.storage.get_raw(run_key_conflicts_path).await?;
+            let rows = super::parquet_util::read_run_key_conflicts(&data)?;
+            for row in rows {
+                let conflict_id = format!("conflict:{}:{}", row.run_key, row.conflicting_event_id);
+                state.run_key_conflicts.insert(conflict_id, row);
+            }
+        }
+
         if let Some(ref partition_status_path) = tables.partition_status {
             let data = self.storage.get_raw(partition_status_path).await?;
             let rows = read_partition_status(&data)?;
@@ -488,6 +509,22 @@ impl MicroCompactor {
             let path = format!("{base_path}/sensor_evals.parquet");
             self.write_parquet_file(&path, bytes).await?;
             paths.sensor_evals = Some(path);
+        }
+
+        if !state.run_key_index.is_empty() {
+            let rows: Vec<_> = state.run_key_index.values().cloned().collect();
+            let bytes = write_run_key_index(&rows)?;
+            let path = format!("{base_path}/run_key_index.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.run_key_index = Some(path);
+        }
+
+        if !state.run_key_conflicts.is_empty() {
+            let rows: Vec<_> = state.run_key_conflicts.values().cloned().collect();
+            let bytes = write_run_key_conflicts(&rows)?;
+            let path = format!("{base_path}/run_key_conflicts.parquet");
+            self.write_parquet_file(&path, bytes).await?;
+            paths.run_key_conflicts = Some(path);
         }
 
         if !state.partition_status.is_empty() {
@@ -682,6 +719,22 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
             .or_insert(row);
     }
 
+    for (run_key, row) in delta.run_key_index {
+        merged
+            .run_key_index
+            .entry(run_key)
+            .and_modify(|existing| {
+                if row.row_version > existing.row_version {
+                    *existing = row.clone();
+                }
+            })
+            .or_insert(row);
+    }
+
+    for (conflict_id, row) in delta.run_key_conflicts {
+        merged.run_key_conflicts.entry(conflict_id).or_insert(row);
+    }
+
     // Merge partition status
     for (key, row) in delta.partition_status {
         merged
@@ -804,6 +857,20 @@ fn delta_from_states(base: &FoldState, current: &FoldState) -> FoldState {
         }
     }
 
+    for (run_key, row) in &current.run_key_index {
+        if base.run_key_index.get(run_key) != Some(row) {
+            delta.run_key_index.insert(run_key.clone(), row.clone());
+        }
+    }
+
+    for (conflict_id, row) in &current.run_key_conflicts {
+        if base.run_key_conflicts.get(conflict_id) != Some(row) {
+            delta
+                .run_key_conflicts
+                .insert(conflict_id.clone(), row.clone());
+        }
+    }
+
     for (key, row) in &current.partition_status {
         if base.partition_status.get(key) != Some(row) {
             delta.partition_status.insert(key.clone(), row.clone());
@@ -851,6 +918,8 @@ fn delta_state_is_empty(state: &FoldState) -> bool {
         && state.dispatch_outbox.is_empty()
         && state.sensor_state.is_empty()
         && state.sensor_evals.is_empty()
+        && state.run_key_index.is_empty()
+        && state.run_key_conflicts.is_empty()
         && state.partition_status.is_empty()
         && state.idempotency_keys.is_empty()
         && state.schedule_definitions.is_empty()

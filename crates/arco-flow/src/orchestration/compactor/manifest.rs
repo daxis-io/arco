@@ -151,6 +151,14 @@ pub struct TablePaths {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sensor_evals: Option<String>,
 
+    /// Path to `run_key_index.parquet` (relative to storage root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key_index: Option<String>,
+
+    /// Path to `run_key_conflicts.parquet` (relative to storage root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key_conflicts: Option<String>,
+
     /// Path to `partition_status.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partition_status: Option<String>,
@@ -197,6 +205,12 @@ impl TablePaths {
         }
         if let Some(ref p) = self.sensor_evals {
             paths.insert("sensor_evals", p.as_str());
+        }
+        if let Some(ref p) = self.run_key_index {
+            paths.insert("run_key_index", p.as_str());
+        }
+        if let Some(ref p) = self.run_key_conflicts {
+            paths.insert("run_key_conflicts", p.as_str());
         }
         if let Some(ref p) = self.partition_status {
             paths.insert("partition_status", p.as_str());
@@ -277,6 +291,12 @@ pub struct RowCounts {
     /// Rows in `sensor_evals` table.
     pub sensor_evals: u32,
 
+    /// Rows in `run_key_index` table.
+    pub run_key_index: u32,
+
+    /// Rows in `run_key_conflicts` table.
+    pub run_key_conflicts: u32,
+
     /// Rows in `partition_status` table.
     pub partition_status: u32,
 
@@ -304,6 +324,8 @@ impl RowCounts {
             + self.dispatch_outbox
             + self.sensor_state
             + self.sensor_evals
+            + self.run_key_index
+            + self.run_key_conflicts
             + self.partition_status
             + self.idempotency_keys
             + self.schedule_definitions
@@ -405,6 +427,8 @@ mod tests {
             dispatch_outbox: 40,
             sensor_state: 5,
             sensor_evals: 7,
+            run_key_index: 0,
+            run_key_conflicts: 0,
             partition_status: 9,
             idempotency_keys: 8,
             schedule_definitions: 0,

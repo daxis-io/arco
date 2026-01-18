@@ -8,6 +8,8 @@
 //! - `dispatch_outbox.parquet`
 //! - `sensor_state.parquet`
 //! - `sensor_evals.parquet`
+//! - `run_key_index.parquet`
+//! - `run_key_conflicts.parquet`
 //! - `partition_status.parquet`
 //! - `idempotency_keys.parquet`
 //! - `schedule_definitions.parquet`
@@ -32,8 +34,9 @@ use parquet::format::KeyValue;
 
 use super::fold::{
     DepResolution, DepSatisfactionRow, DispatchOutboxRow, DispatchStatus, IdempotencyKeyRow,
-    PartitionStatusRow, RunRow, RunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
-    SensorEvalRow, SensorStateRow, TaskRow, TaskState, TimerRow, TimerState, TimerType,
+    PartitionStatusRow, RunKeyConflictRow, RunKeyIndexRow, RunRow, RunState, ScheduleDefinitionRow,
+    ScheduleStateRow, ScheduleTickRow, SensorEvalRow, SensorStateRow, TaskRow, TaskState, TimerRow,
+    TimerState, TimerType,
 };
 use crate::error::{Error, Result};
 use crate::orchestration::events::{
@@ -161,6 +164,30 @@ fn sensor_evals_schema() -> Arc<Schema> {
     ]))
 }
 
+fn run_key_index_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("tenant_id", DataType::Utf8, false),
+        Field::new("workspace_id", DataType::Utf8, false),
+        Field::new("run_key", DataType::Utf8, false),
+        Field::new("run_id", DataType::Utf8, false),
+        Field::new("request_fingerprint", DataType::Utf8, false),
+        Field::new("created_at", DataType::Int64, false),
+        Field::new("row_version", DataType::Utf8, false),
+    ]))
+}
+
+fn run_key_conflicts_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("tenant_id", DataType::Utf8, false),
+        Field::new("workspace_id", DataType::Utf8, false),
+        Field::new("run_key", DataType::Utf8, false),
+        Field::new("existing_fingerprint", DataType::Utf8, false),
+        Field::new("conflicting_fingerprint", DataType::Utf8, false),
+        Field::new("conflicting_event_id", DataType::Utf8, false),
+        Field::new("detected_at", DataType::Int64, false),
+    ]))
+}
+
 fn partition_status_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("tenant_id", DataType::Utf8, false),
@@ -282,6 +309,18 @@ pub fn sensor_state_parquet_schema() -> Schema {
 #[must_use]
 pub fn sensor_evals_parquet_schema() -> Schema {
     (*sensor_evals_schema()).clone()
+}
+
+/// Returns the `run_key_index` schema for golden file comparison.
+#[must_use]
+pub fn run_key_index_parquet_schema() -> Schema {
+    (*run_key_index_schema()).clone()
+}
+
+/// Returns the `run_key_conflicts` schema for golden file comparison.
+#[must_use]
+pub fn run_key_conflicts_parquet_schema() -> Schema {
+    (*run_key_conflicts_schema()).clone()
 }
 
 /// Returns the `partition_status` schema for golden file comparison.
@@ -903,6 +942,120 @@ pub fn write_sensor_evals(rows: &[SensorEvalRow]) -> Result<Bytes> {
             Arc::new(statuses),
             Arc::new(evaluated_at),
             Arc::new(row_versions),
+        ],
+    )
+    .map_err(|e| Error::parquet(format!("record batch build failed: {e}")))?;
+
+    write_single_batch(schema, &batch)
+}
+
+/// Writes `run_key_index.parquet`.
+pub fn write_run_key_index(rows: &[RunKeyIndexRow]) -> Result<Bytes> {
+    let schema = run_key_index_schema();
+
+    let tenant_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.tenant_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let workspace_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.workspace_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let run_keys = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.run_key.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let run_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.run_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let request_fingerprints = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.request_fingerprint.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let created_at = Int64Array::from(
+        rows.iter()
+            .map(|r| r.created_at.timestamp_millis())
+            .collect::<Vec<_>>(),
+    );
+    let row_versions = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.row_version.as_str()))
+            .collect::<Vec<_>>(),
+    );
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(tenant_ids),
+            Arc::new(workspace_ids),
+            Arc::new(run_keys),
+            Arc::new(run_ids),
+            Arc::new(request_fingerprints),
+            Arc::new(created_at),
+            Arc::new(row_versions),
+        ],
+    )
+    .map_err(|e| Error::parquet(format!("record batch build failed: {e}")))?;
+
+    write_single_batch(schema, &batch)
+}
+
+/// Writes `run_key_conflicts.parquet`.
+pub fn write_run_key_conflicts(rows: &[RunKeyConflictRow]) -> Result<Bytes> {
+    let schema = run_key_conflicts_schema();
+
+    let tenant_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.tenant_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let workspace_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.workspace_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let run_keys = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.run_key.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let existing_fingerprints = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.existing_fingerprint.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let conflicting_fingerprints = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.conflicting_fingerprint.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let conflicting_event_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.conflicting_event_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let detected_at = Int64Array::from(
+        rows.iter()
+            .map(|r| r.detected_at.timestamp_millis())
+            .collect::<Vec<_>>(),
+    );
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(tenant_ids),
+            Arc::new(workspace_ids),
+            Arc::new(run_keys),
+            Arc::new(existing_fingerprints),
+            Arc::new(conflicting_fingerprints),
+            Arc::new(conflicting_event_ids),
+            Arc::new(detected_at),
         ],
     )
     .map_err(|e| Error::parquet(format!("record batch build failed: {e}")))?;
@@ -1858,6 +2011,68 @@ pub fn read_sensor_evals(bytes: &Bytes) -> Result<Vec<SensorEvalRow>> {
                 status,
                 evaluated_at: millis_to_datetime(evaluated_at.value(row)),
                 row_version: row_version.value(row).to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Reads `run_key_index.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet decoding fails or required columns are missing.
+pub fn read_run_key_index(bytes: &Bytes) -> Result<Vec<RunKeyIndexRow>> {
+    let mut out = Vec::new();
+    for batch in read_batches(bytes)? {
+        let tenant_id = col_string(&batch, "tenant_id")?;
+        let workspace_id = col_string(&batch, "workspace_id")?;
+        let run_key = col_string(&batch, "run_key")?;
+        let run_id = col_string(&batch, "run_id")?;
+        let request_fingerprint = col_string(&batch, "request_fingerprint")?;
+        let created_at = col_i64(&batch, "created_at")?;
+        let row_version = col_string(&batch, "row_version")?;
+
+        for row in 0..batch.num_rows() {
+            out.push(RunKeyIndexRow {
+                tenant_id: tenant_id.value(row).to_string(),
+                workspace_id: workspace_id.value(row).to_string(),
+                run_key: run_key.value(row).to_string(),
+                run_id: run_id.value(row).to_string(),
+                request_fingerprint: request_fingerprint.value(row).to_string(),
+                created_at: millis_to_datetime(created_at.value(row)),
+                row_version: row_version.value(row).to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Reads `run_key_conflicts.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet decoding fails or required columns are missing.
+pub fn read_run_key_conflicts(bytes: &Bytes) -> Result<Vec<RunKeyConflictRow>> {
+    let mut out = Vec::new();
+    for batch in read_batches(bytes)? {
+        let tenant_id = col_string(&batch, "tenant_id")?;
+        let workspace_id = col_string(&batch, "workspace_id")?;
+        let run_key = col_string(&batch, "run_key")?;
+        let existing_fingerprint = col_string(&batch, "existing_fingerprint")?;
+        let conflicting_fingerprint = col_string(&batch, "conflicting_fingerprint")?;
+        let conflicting_event_id = col_string(&batch, "conflicting_event_id")?;
+        let detected_at = col_i64(&batch, "detected_at")?;
+
+        for row in 0..batch.num_rows() {
+            out.push(RunKeyConflictRow {
+                tenant_id: tenant_id.value(row).to_string(),
+                workspace_id: workspace_id.value(row).to_string(),
+                run_key: run_key.value(row).to_string(),
+                existing_fingerprint: existing_fingerprint.value(row).to_string(),
+                conflicting_fingerprint: conflicting_fingerprint.value(row).to_string(),
+                conflicting_event_id: conflicting_event_id.value(row).to_string(),
+                detected_at: millis_to_datetime(detected_at.value(row)),
             });
         }
     }

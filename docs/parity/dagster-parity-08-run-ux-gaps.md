@@ -72,6 +72,18 @@ Suggested locations:
 - Rerun workflows behave as operators expect.
 - CI prevents regressions.
 
+## Evidence (parity-08)
+- Code: `crates/arco-api/src/routes/orchestration.rs:2691` (`rerun_run` endpoint)
+- Code: `crates/arco-api/src/routes/orchestration.rs:1823` (lineage extraction) and `crates/arco-api/src/routes/orchestration.rs:1833` (reject reserved lineage labels)
+- Tests: `crates/arco-api/tests/orchestration_parity_gates_m1.rs:809` (`parity_m1_rerun_from_failure_plans_only_unsucceeded_tasks`)
+- Tests: `crates/arco-api/tests/orchestration_parity_gates_m1.rs:1105` (`parity_m1_rerun_subset_respects_include_downstream`)
+- Tests: `crates/arco-api/tests/orchestration_parity_gates_m1.rs:1261` (`parity_m1_rerun_from_failure_rejects_succeeded_parent`)
+- Tests: `crates/arco-api/tests/orchestration_parity_gates_m1.rs:1398` (`parity_m1_trigger_rejects_reserved_lineage_labels`)
+- CI: `.github/workflows/ci.yml:118` (job `test`: `cargo test -p arco-api --all-features --test orchestration_parity_gates_m1`)
+
+## Operator surface (still open)
+- The rerun operator surface/CLI work called out in `docs/parity/dagster-parity-08-run-ux-gaps.md:54` is not implemented yet.
+
 ## Risks / Edge Cases
 - Ambiguity around upstream dependency inclusion (must be explicit).
 - Deterministic lineage identifiers.

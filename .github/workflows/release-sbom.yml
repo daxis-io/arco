@@ -21,7 +21,7 @@ jobs:
         with:
           toolchain: 1.85
       - name: Install cargo-sbom
-        uses: taiki-e/install-action@3522286d40783523f9c7880e33f785905b4c20d0 # v2
+        uses: taiki-e/install-action@542cebaaed782771e619bd5609d97659d109c492 # v2
         with:
           tool: cargo-sbom@0.10.0
       - name: Generate SBOM (SPDX JSON)

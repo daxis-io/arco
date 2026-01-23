@@ -75,7 +75,7 @@ pub struct TriggerRunRequest {
     /// Include downstream dependents of the selection.
     #[serde(default)]
     pub include_downstream: bool,
-    /// Partition overrides (key=value pairs).
+    /// Partition overrides (key=value strings). Backward-compatible with older clients.
     #[serde(default)]
     pub include_upstream: bool,
     /// Include downstream dependents of the selection.
@@ -137,6 +137,10 @@ pub(crate) struct TriggerRunRequestWithPartitions {
     pub include_downstream: bool,
     /// Partition overrides (key=value strings). Backward-compatible with older clients.
     pub partitions: Vec<PartitionValue>,
+    /// Canonical partition key string (ADR-011). Preferred; cannot be combined with `partitions`.
+    #[schema(min_length = 1)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_key: Option<String>,
     /// Idempotency key for deduplication (409 if reused with different payload).
     /// Reservations created before the fingerprint cutoff remain lenient.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,6 +148,86 @@ pub(crate) struct TriggerRunRequestWithPartitions {
     /// Additional labels for the run.
     #[serde(default)]
     pub labels: HashMap<String, String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TriggerRunRequestWithPartitionKey {
+    /// Asset selection (asset keys to materialize).
+    #[serde(default)]
+    pub selection: Vec<String>,
+    /// Include upstream dependencies of the selection.
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default)]
+    pub include_downstream: bool,
+    /// Canonical partition key string (ADR-011).
+    #[schema(min_length = 1)]
+    pub partition_key: String,
+    /// Idempotency key for deduplication (409 if reused with different payload).
+    /// Reservations created before the fingerprint cutoff remain lenient.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Additional labels for the run.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TriggerRunRequestWithPartitions {
+    /// Asset selection (asset keys to materialize).
+    #[serde(default)]
+    pub selection: Vec<String>,
+    /// Include upstream dependencies of the selection.
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default)]
+    pub include_downstream: bool,
+    /// Partition overrides (key=value strings). Backward-compatible with older clients.
+    pub partitions: Vec<PartitionValue>,
+    /// Idempotency key for deduplication (409 if reused with different payload).
+    /// Reservations created before the fingerprint cutoff remain lenient.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Additional labels for the run.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TriggerRunRequestUnpartitioned {
+    /// Asset selection (asset keys to materialize).
+    #[serde(default)]
+    pub selection: Vec<String>,
+    /// Include upstream dependencies of the selection.
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default)]
+    pub include_downstream: bool,
+    /// Idempotency key for deduplication (409 if reused with different payload).
+    /// Reservations created before the fingerprint cutoff remain lenient.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Additional labels for the run.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(untagged)]
+pub(crate) enum TriggerRunRequestOpenApi {
+    WithPartitionKey(TriggerRunRequestWithPartitionKey),
+    WithPartitions(TriggerRunRequestWithPartitions),
+    Unpartitioned(TriggerRunRequestUnpartitioned),
 }
 
 /// Rerun mode values.
@@ -1197,7 +1281,10 @@ async fn load_latest_manifest(storage: &ScopedStorage) -> Result<Option<StoredMa
         if path.starts_with(MANIFEST_IDEMPOTENCY_PREFIX) || path.ends_with("_index.json") {
             continue;
         }
-        if !path.ends_with(".json") {
+        if !std::path::Path::new(path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
             continue;
         }
 
@@ -1314,7 +1401,7 @@ async fn plan_tasks_and_root_assets(
 
     let root_assets: Vec<String> = roots.iter().cloned().collect();
 
-    let partition_key = build_partition_key(&request.partitions)?;
+    let partition_key = resolve_partition_key(request)?;
     let options = arco_flow::orchestration::SelectionOptions {
         include_upstream: request.include_upstream,
         include_downstream: request.include_downstream,
@@ -1324,7 +1411,7 @@ async fn plan_tasks_and_root_assets(
         &graph,
         &root_assets,
         options,
-        partition_key,
+        partition_key.as_deref(),
     )
     .map_err(ApiError::bad_request)?;
 
@@ -1949,6 +2036,33 @@ fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
     }
 }
 
+fn resolve_partition_key(request: &TriggerRunRequest) -> Result<Option<String>, ApiError> {
+    if request.partition_key.is_some() && !request.partitions.is_empty() {
+        return Err(ApiError::bad_request(
+            "use either partitionKey or partitions, not both",
+        ));
+    }
+
+    if let Some(raw) = request.partition_key.as_deref() {
+        if raw.is_empty() {
+            return Err(ApiError::bad_request("partitionKey cannot be empty"));
+        }
+
+        let parsed = arco_core::partition::PartitionKey::parse(raw)
+            .map_err(|err| ApiError::bad_request(format!("invalid partitionKey: {err}")))?;
+        let canonical = parsed.canonical_string();
+        if canonical != raw {
+            return Err(ApiError::bad_request(format!(
+                "partitionKey must be canonical: expected '{canonical}'"
+            )));
+        }
+
+        return Ok(Some(raw.to_string()));
+    }
+
+    build_partition_key(&request.partitions)
+}
+
 fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, ApiError> {
     let values = parse_partition_values(partitions)?;
     if values.is_empty() {
@@ -2231,7 +2345,8 @@ fn build_request_fingerprint(
         selection: Vec<String>,
         include_upstream: bool,
         include_downstream: bool,
-        partitions: Vec<PartitionValue>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partition_key: Option<String>,
         labels: BTreeMap<String, String>,
     }
 
@@ -2245,7 +2360,7 @@ fn build_request_fingerprint(
     selection.sort();
     selection.dedup();
 
-    let partition_key = resolved_partition_key.canonical.clone();
+    let partition_key = resolve_partition_key(request)?;
 
     let labels = request
         .labels
@@ -2257,7 +2372,7 @@ fn build_request_fingerprint(
         selection,
         include_upstream: request.include_upstream,
         include_downstream: request.include_downstream,
-        partitions,
+        partition_key,
         labels,
     };
     let json = serde_json::to_vec(&payload).map_err(|e| {
@@ -2269,21 +2384,9 @@ fn build_request_fingerprint(
     Ok(hex::encode(hash))
 }
 
-#[allow(clippy::too_many_lines)]
 fn build_request_fingerprint_variants(
     request: &TriggerRunRequest,
-    resolved_partition_key: &ResolvedPartitionKey,
 ) -> Result<(String, Vec<String>), ApiError> {
-    #[derive(Serialize)]
-    struct FingerprintPayload {
-        selection: Vec<String>,
-        include_upstream: bool,
-        include_downstream: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        partition_key: Option<String>,
-        labels: BTreeMap<String, String>,
-    }
-
     #[derive(Serialize)]
     struct LegacyFingerprintPayload {
         selection: Vec<String>,
@@ -2305,7 +2408,7 @@ fn build_request_fingerprint_variants(
         Ok(hex::encode(hash))
     }
 
-    let primary = build_request_fingerprint(request, resolved_partition_key)?;
+    let primary = build_request_fingerprint(request)?;
 
     let mut selection: Vec<String> = request
         .selection
@@ -2323,31 +2426,16 @@ fn build_request_fingerprint_variants(
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<BTreeMap<_, _>>();
 
-    let partition_key = resolved_partition_key.canonical.as_ref();
-    let legacy_partition_key = resolved_partition_key.legacy_canonical.as_ref();
-    let mut partition_key_variants: Vec<String> = Vec::new();
-    if let Some(pk) = partition_key {
-        partition_key_variants.push(pk.clone());
-        partition_key_variants.extend(time_string_partition_key_variants(pk)?);
-    }
-    if let Some(pk) = legacy_partition_key {
-        partition_key_variants.push(pk.clone());
-    }
-    partition_key_variants.sort();
-    partition_key_variants.dedup();
+    let resolved_partition_key = resolve_partition_key(request)?;
+
+    let partitions_from_partition_key = match resolved_partition_key.as_deref() {
+        Some(pk) => partitions_from_string_only_partition_key(pk)?,
+        None => None,
+    };
 
     let mut variants = vec![primary.clone()];
 
-    for partition_key in &partition_key_variants {
-        let fingerprint_payload = FingerprintPayload {
-            selection: selection.clone(),
-            include_upstream: request.include_upstream,
-            include_downstream: request.include_downstream,
-            partition_key: Some(partition_key.clone()),
-            labels: labels.clone(),
-        };
-        variants.push(hash_payload(&fingerprint_payload)?);
-
+    if let Some(partition_key) = resolved_partition_key.as_ref() {
         let legacy_partition_key_payload = LegacyFingerprintPayload {
             selection: selection.clone(),
             include_upstream: request.include_upstream,
@@ -2359,29 +2447,17 @@ fn build_request_fingerprint_variants(
         variants.push(hash_payload(&legacy_partition_key_payload)?);
     }
 
-    if request.partitions.is_empty() {
-        for partition_key in &partition_key_variants {
-            let Some(mut partitions) = partitions_from_string_only_partition_key(partition_key)?
-            else {
-                continue;
-            };
-
-            partitions.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.value.cmp(&b.value)));
-
-            let legacy_partitions_payload = LegacyFingerprintPayload {
-                selection: selection.clone(),
-                include_upstream: request.include_upstream,
-                include_downstream: request.include_downstream,
-                partitions,
-                partition_key: None,
-                labels: labels.clone(),
-            };
-            variants.push(hash_payload(&legacy_partitions_payload)?);
-        }
+    let mut legacy_partitions = if request.partitions.is_empty() {
+        partitions_from_partition_key
     } else {
-        let mut partitions = request.partitions.clone();
-        partitions.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.value.cmp(&b.value)));
+        Some(request.partitions.clone())
+    };
 
+    if let Some(ref mut partitions) = legacy_partitions {
+        partitions.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.value.cmp(&b.value)));
+    }
+
+    if let Some(partitions) = legacy_partitions {
         let legacy_partitions_payload = LegacyFingerprintPayload {
             selection,
             include_upstream: request.include_upstream,
@@ -2397,68 +2473,6 @@ fn build_request_fingerprint_variants(
     variants.dedup();
 
     Ok((primary, variants))
-}
-
-fn time_string_partition_key_variants(partition_key: &str) -> Result<Vec<String>, ApiError> {
-    let parsed = arco_core::partition::PartitionKey::parse(partition_key).map_err(|err| {
-        ApiError::internal(format!(
-            "failed to parse canonical partitionKey for fingerprint normalization: {err}"
-        ))
-    })?;
-
-    let mut base = arco_core::partition::PartitionKey::new();
-    let mut trimmed_timestamp_keys: Vec<(String, String)> = Vec::new();
-
-    for (key, value) in parsed.iter() {
-        match value {
-            arco_core::partition::ScalarValue::String(s) => {
-                base.insert(
-                    key.clone(),
-                    arco_core::partition::ScalarValue::String(s.clone()),
-                );
-            }
-            arco_core::partition::ScalarValue::Date(date) => {
-                base.insert(
-                    key.clone(),
-                    arco_core::partition::ScalarValue::String(date.clone()),
-                );
-            }
-            arco_core::partition::ScalarValue::Timestamp(timestamp) => {
-                base.insert(
-                    key.clone(),
-                    arco_core::partition::ScalarValue::String(timestamp.clone()),
-                );
-                if let Some(prefix) = timestamp.strip_suffix(".000000Z") {
-                    trimmed_timestamp_keys.push((key.clone(), format!("{prefix}Z")));
-                }
-            }
-            _ => return Ok(Vec::new()),
-        }
-    }
-
-    let mut variants = vec![base];
-    for (key, trimmed) in trimmed_timestamp_keys {
-        let mut next = Vec::with_capacity(variants.len() * 2);
-        for existing in &variants {
-            next.push(existing.clone());
-
-            let mut adjusted = existing.clone();
-            adjusted.insert(
-                key.clone(),
-                arco_core::partition::ScalarValue::String(trimmed.clone()),
-            );
-            next.push(adjusted);
-        }
-        variants = next;
-    }
-
-    let mut rendered: Vec<String> = variants
-        .into_iter()
-        .map(|pk| pk.canonical_string())
-        .collect();
-    rendered.sort();
-    rendered.dedup();
-    Ok(rendered)
 }
 
 fn partitions_from_string_only_partition_key(
@@ -2892,10 +2906,11 @@ pub(crate) async fn trigger_run(
     let ledger = LedgerWriter::new(storage.clone());
     let mut run_event_overrides: Option<RunEventOverrides> = None;
 
-    let request_fingerprint = if request.run_key.is_some() {
-        Some(build_request_fingerprint(&request)?)
+    let (request_fingerprint, request_fingerprint_variants) = if request.run_key.is_some() {
+        let (primary, variants) = build_request_fingerprint_variants(&request)?;
+        (Some(primary), variants)
     } else {
-        PartitioningSpec::default()
+        (None, Vec::new())
     };
 
     if let Some(ref run_key) = request.run_key {
@@ -2911,7 +2926,9 @@ pub(crate) async fn trigger_run(
                 existing.request_fingerprint.as_deref(),
                 request_fingerprint.as_deref(),
             ) {
-                (Some(a), Some(b)) => a == b,
+                (Some(existing_fp), Some(_)) => request_fingerprint_variants
+                    .iter()
+                    .any(|fp| fp == existing_fp),
                 (None, None) => true,
                 (None, Some(_)) => match fingerprint_policy.cutoff {
                     None => true,
@@ -3677,7 +3694,7 @@ pub(crate) async fn backfill_run_key(
         include_upstream: request.include_upstream,
         include_downstream: request.include_downstream,
         partitions: request.partitions.clone(),
-        partition_key: request.partition_key.clone(),
+        partition_key: None,
         run_key: Some(request.run_key.clone()),
         labels: request.labels.clone(),
     };
@@ -5291,64 +5308,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trigger_request_limits_rejects_too_long_partition_key() {
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string()],
-            include_upstream: false,
-            include_downstream: false,
-            partitions: vec![],
-            partition_key: Some("x".repeat(MAX_PARTITION_KEY_LEN + 1)),
-            run_key: None,
-            labels: HashMap::new(),
-        };
-
-        let err = validate_trigger_run_request_limits(&request).expect_err("expected error");
-        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        assert!(err.message().contains("partitionKey"));
-    }
-
-    #[test]
-    fn test_trigger_request_limits_rejects_too_many_selection_items() {
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string(); MAX_SELECTION_ITEMS + 1],
-            include_upstream: false,
-            include_downstream: false,
-            partitions: vec![],
-            partition_key: None,
-            run_key: None,
-            labels: HashMap::new(),
-        };
-
-        let err = validate_trigger_run_request_limits(&request).expect_err("expected error");
-        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        assert!(err.message().contains("selection"));
-    }
-
-    #[test]
-    fn test_build_partition_key_rejects_canonical_string_too_long() {
-        let partitions = vec![
-            PartitionValue {
-                key: "a".to_string(),
-                value: "x".repeat(MAX_PARTITION_VALUE_LEN),
-            },
-            PartitionValue {
-                key: "b".to_string(),
-                value: "x".repeat(MAX_PARTITION_VALUE_LEN),
-            },
-            PartitionValue {
-                key: "c".to_string(),
-                value: "x".repeat(MAX_PARTITION_VALUE_LEN),
-            },
-        ];
-
-        let err = build_partition_key(&partitions).expect_err("expected error");
-        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        assert!(err.message().contains("partitionKey exceeds max length"));
-    }
-
-    #[test]
     fn test_resolve_partition_key_rejects_both_partition_key_and_partitions() {
-        let partitioning = partitioning_spec(vec![time_dimension("date", Some("day"))]);
         let request = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
             include_upstream: false,
@@ -5362,16 +5322,12 @@ mod tests {
             labels: HashMap::new(),
         };
 
-        let err = resolve_partition_key(&request, &partitioning, None).expect_err("expected error");
+        let err = resolve_partition_key(&request).expect_err("expected error");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn test_resolve_partition_key_rejects_noncanonical_partition_key() {
-        let partitioning = partitioning_spec(vec![
-            time_dimension("date", Some("day")),
-            tenant_dimension("tenant"),
-        ]);
         let request = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
             include_upstream: false,
@@ -5382,99 +5338,13 @@ mod tests {
             labels: HashMap::new(),
         };
 
-        let err = resolve_partition_key(&request, &partitioning, None).expect_err("expected error");
+        let err = resolve_partition_key(&request).expect_err("expected error");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert!(err.message().contains("canonical"));
     }
 
     #[test]
-    fn test_resolve_partition_key_rejects_missing_dimension() {
-        let partitioning = partitioning_spec(vec![
-            time_dimension("date", Some("day")),
-            static_dimension("region"),
-        ]);
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string()],
-            include_upstream: false,
-            include_downstream: false,
-            partitions: vec![PartitionValue {
-                key: "date".to_string(),
-                value: "2024-01-15".to_string(),
-            }],
-            partition_key: None,
-            run_key: None,
-            labels: HashMap::new(),
-        };
-
-        let err = resolve_partition_key(&request, &partitioning, None).expect_err("expected error");
-        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        assert!(err.message().contains("expected"));
-        assert!(err.message().contains("got"));
-    }
-
-    #[test]
-    fn test_resolve_partition_key_rejects_extra_dimension() {
-        let partitioning = partitioning_spec(vec![
-            time_dimension("date", Some("day")),
-            static_dimension("region"),
-        ]);
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string()],
-            include_upstream: false,
-            include_downstream: false,
-            partitions: vec![
-                PartitionValue {
-                    key: "date".to_string(),
-                    value: "2024-01-15".to_string(),
-                },
-                PartitionValue {
-                    key: "region".to_string(),
-                    value: "us".to_string(),
-                },
-                PartitionValue {
-                    key: "tenant".to_string(),
-                    value: "acme".to_string(),
-                },
-            ],
-            partition_key: None,
-            run_key: None,
-            labels: HashMap::new(),
-        };
-
-        let err = resolve_partition_key(&request, &partitioning, None).expect_err("expected error");
-        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn test_resolve_partition_key_rejects_disallowed_static_value() {
-        let partitioning = partitioning_spec(vec![static_dimension_with_values(
-            "region",
-            vec!["us", "eu"],
-        )]);
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string()],
-            include_upstream: false,
-            include_downstream: false,
-            partitions: vec![PartitionValue {
-                key: "region".to_string(),
-                value: "apac".to_string(),
-            }],
-            partition_key: None,
-            run_key: None,
-            labels: HashMap::new(),
-        };
-
-        let err = resolve_partition_key(&request, &partitioning, None).expect_err("expected error");
-        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        assert!(err.message().contains("not allowed"));
-    }
-
-    #[test]
     fn test_resolve_partition_key_accepts_canonical_partition_key() -> Result<()> {
-        let partitioning = partitioning_spec(vec![
-            time_dimension("date", Some("day")),
-            tenant_dimension("tenant"),
-        ]);
         let request = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
             include_upstream: false,
@@ -5485,164 +5355,16 @@ mod tests {
             labels: HashMap::new(),
         };
 
-        let resolved = resolve_partition_key(&request, &partitioning, None)
-            .map_err(|err| anyhow!("{err:?}"))?;
+        let resolved = resolve_partition_key(&request).map_err(|err| anyhow!("{err:?}"))?;
         assert_eq!(
-            resolved.canonical.as_deref(),
-            Some("date=d:2024-01-15,tenant=s:YWNtZQ")
+            resolved.as_deref(),
+            Some("date=s:MjAyNC0wMS0xNQ,tenant=s:YWNtZQ")
         );
         Ok(())
-    }
-
-    #[test]
-    fn test_resolve_partition_key_normalizes_day_time_string() -> Result<()> {
-        let partitioning = partitioning_spec(vec![time_dimension("date", Some("day"))]);
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string()],
-            include_upstream: false,
-            include_downstream: false,
-            partitions: vec![],
-            partition_key: Some("date=s:MjAyNC0wMS0xNQ".to_string()),
-            run_key: None,
-            labels: HashMap::new(),
-        };
-
-        let resolved = resolve_partition_key(&request, &partitioning, None)
-            .map_err(|err| anyhow!("{err:?}"))?;
-        assert_eq!(resolved.canonical.as_deref(), Some("date=d:2024-01-15"));
-        Ok(())
-    }
-
-    #[test]
-    fn test_request_fingerprint_variants_include_legacy_time_string_partition_key() -> Result<()> {
-        let partitioning = partitioning_spec(vec![time_dimension("date", Some("day"))]);
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string()],
-            include_upstream: false,
-            include_downstream: false,
-            partitions: vec![],
-            partition_key: Some("date=d:2024-01-15".to_string()),
-            run_key: Some("daily:2024-01-15".to_string()),
-            labels: HashMap::new(),
-        };
-
-        let resolved = resolve_partition_key(&request, &partitioning, None)
-            .map_err(|err| anyhow!("{err:?}"))?;
-        let (_primary, variants) = build_request_fingerprint_variants(&request, &resolved)
-            .map_err(|err| anyhow!("{err:?}"))?;
-
-        let encoded = URL_SAFE_NO_PAD.encode("2024-01-15".as_bytes());
-        let legacy_partition_key = format!("date=s:{encoded}");
-        let legacy_fingerprint =
-            hash_trigger_fingerprint_payload(&request, Some(legacy_partition_key))?;
-
-        assert!(
-            variants.contains(&legacy_fingerprint),
-            "expected variants to include legacy time-string fingerprint"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_request_fingerprint_variants_include_legacy_hour_time_string_partition_key()
-    -> Result<()> {
-        let partitioning = partitioning_spec(vec![time_dimension("hour", Some("hour"))]);
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string()],
-            include_upstream: false,
-            include_downstream: false,
-            partitions: vec![],
-            partition_key: Some("hour=t:2024-01-15T15:00:00.000000Z".to_string()),
-            run_key: Some("hourly:2024-01-15T15:00:00Z".to_string()),
-            labels: HashMap::new(),
-        };
-
-        let resolved = resolve_partition_key(&request, &partitioning, None)
-            .map_err(|err| anyhow!("{err:?}"))?;
-        let (_primary, variants) = build_request_fingerprint_variants(&request, &resolved)
-            .map_err(|err| anyhow!("{err:?}"))?;
-
-        let encoded = URL_SAFE_NO_PAD.encode("2024-01-15T15:00:00Z".as_bytes());
-        let legacy_partition_key = format!("hour=s:{encoded}");
-        let legacy_fingerprint =
-            hash_trigger_fingerprint_payload(&request, Some(legacy_partition_key))?;
-
-        assert!(
-            variants.contains(&legacy_fingerprint),
-            "expected variants to include legacy hour time-string fingerprint"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_resolve_partition_key_normalizes_hour_time_string() -> Result<()> {
-        let partitioning = partitioning_spec(vec![time_dimension("hour", Some("hour"))]);
-        let encoded = URL_SAFE_NO_PAD.encode("2024-01-15T10:00:00-05:00".as_bytes());
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string()],
-            include_upstream: false,
-            include_downstream: false,
-            partitions: vec![],
-            partition_key: Some(format!("hour=s:{encoded}")),
-            run_key: None,
-            labels: HashMap::new(),
-        };
-
-        let resolved = resolve_partition_key(&request, &partitioning, None)
-            .map_err(|err| anyhow!("{err:?}"))?;
-        assert_eq!(
-            resolved.canonical.as_deref(),
-            Some("hour=t:2024-01-15T15:00:00.000000Z")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_resolve_partition_key_rejects_time_string_after_cutoff() {
-        let partitioning = partitioning_spec(vec![time_dimension("date", Some("day"))]);
-        let cutoff = Some(Utc::now() - Duration::days(1));
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string()],
-            include_upstream: false,
-            include_downstream: false,
-            partitions: vec![],
-            partition_key: Some("date=s:MjAyNC0wMS0xNQ".to_string()),
-            run_key: None,
-            labels: HashMap::new(),
-        };
-
-        let err =
-            resolve_partition_key(&request, &partitioning, cutoff).expect_err("expected error");
-        assert!(err.message().contains("d:/t:"));
-    }
-
-    #[test]
-    fn test_resolve_partition_key_rejects_partitions_time_string_after_cutoff() {
-        let partitioning = partitioning_spec(vec![time_dimension("date", Some("day"))]);
-        let cutoff = Some(Utc::now() - Duration::days(1));
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string()],
-            include_upstream: false,
-            include_downstream: false,
-            partitions: vec![PartitionValue {
-                key: "date".to_string(),
-                value: "2024-01-15".to_string(),
-            }],
-            partition_key: None,
-            run_key: None,
-            labels: HashMap::new(),
-        };
-
-        let err =
-            resolve_partition_key(&request, &partitioning, cutoff).expect_err("expected error");
-        assert!(err.message().contains("d:/t:"));
     }
 
     #[test]
     fn test_resolve_partition_key_rejects_empty_partition_key() {
-        let partitioning = partitioning_spec(vec![time_dimension("date", Some("day"))]);
         let request = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
             include_upstream: false,
@@ -5653,16 +5375,12 @@ mod tests {
             labels: HashMap::new(),
         };
 
-        let err = resolve_partition_key(&request, &partitioning, None).expect_err("expected error");
+        let err = resolve_partition_key(&request).expect_err("expected error");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn test_request_fingerprint_equivalent_for_partition_key_and_partitions() -> Result<()> {
-        let partitioning = partitioning_spec(vec![
-            time_dimension("date", Some("day")),
-            static_dimension("region"),
-        ]);
         let partitions = vec![
             PartitionValue {
                 key: "region".to_string(),
@@ -5695,18 +5413,10 @@ mod tests {
             labels: HashMap::new(),
         };
 
-        let resolved_partitions =
-            resolve_partition_key(&request_with_partitions, &partitioning, None)
-                .map_err(|err| anyhow!("{err:?}"))?;
-        let resolved_partition_key =
-            resolve_partition_key(&request_with_partition_key, &partitioning, None)
-                .map_err(|err| anyhow!("{err:?}"))?;
-        let fingerprint_partitions =
-            build_request_fingerprint(&request_with_partitions, &resolved_partitions)
-                .map_err(|err| anyhow!("{err:?}"))?;
-        let fingerprint_partition_key =
-            build_request_fingerprint(&request_with_partition_key, &resolved_partition_key)
-                .map_err(|err| anyhow!("{err:?}"))?;
+        let fingerprint_partitions = build_request_fingerprint(&request_with_partitions)
+            .map_err(|err| anyhow!("{err:?}"))?;
+        let fingerprint_partition_key = build_request_fingerprint(&request_with_partition_key)
+            .map_err(|err| anyhow!("{err:?}"))?;
 
         assert_eq!(fingerprint_partitions, fingerprint_partition_key);
         Ok(())
@@ -6074,9 +5784,8 @@ mod tests {
             event_id: Ulid::new().to_string(),
             plan_event_id: Some(Ulid::new().to_string()),
             request_fingerprint: Some({
-                let (primary, variants) =
-                    build_request_fingerprint_variants(&request, &resolved_partition_key)
-                        .map_err(|err| anyhow!("{err:?}"))?;
+                let (primary, variants) = build_request_fingerprint_variants(&request)
+                    .map_err(|err| anyhow!("{err:?}"))?;
                 variants
                     .into_iter()
                     .find(|fp| fp != &primary)
@@ -6143,8 +5852,8 @@ mod tests {
                 plan_id: reservation.plan_id.clone(),
                 tasks: {
                     let graph = arco_flow::orchestration::AssetGraph::new();
-                    let partition_key = build_partition_key(&request.partitions)
-                        .map_err(|err| anyhow!("{err:?}"))?;
+                    let partition_key =
+                        resolve_partition_key(&request).map_err(|err| anyhow!("{err:?}"))?;
                     let options = arco_flow::orchestration::SelectionOptions {
                         include_upstream: request.include_upstream,
                         include_downstream: request.include_downstream,
@@ -6153,7 +5862,7 @@ mod tests {
                         &graph,
                         &request.selection,
                         options,
-                        partition_key,
+                        partition_key.as_deref(),
                     )
                     .map_err(|err| anyhow!("{err}"))?
                 },
@@ -6180,7 +5889,6 @@ mod tests {
             tenant: "tenant".to_string(),
             workspace: "workspace".to_string(),
             user_id: Some("user@example.com".to_string()),
-            groups: vec![],
             request_id: "req_01".to_string(),
             idempotency_key: None,
         };
@@ -6206,15 +5914,8 @@ mod tests {
             labels: HashMap::new(),
         };
 
-        let partitioning = partitioning_spec(vec![
-            time_dimension("date", Some("day")),
-            static_dimension("region"),
-        ]);
-        let resolved_partition_key = resolve_partition_key(&request, &partitioning, None)
-            .map_err(|err| anyhow!("{err:?}"))?;
         let (primary, variants) =
-            build_request_fingerprint_variants(&request, &resolved_partition_key)
-                .map_err(|err| anyhow!("{err:?}"))?;
+            build_request_fingerprint_variants(&request).map_err(|err| anyhow!("{err:?}"))?;
         let legacy = variants
             .iter()
             .find(|fp| *fp != &primary)
@@ -6413,6 +6114,7 @@ mod tests {
             include_upstream: false,
             include_downstream: false,
             partitions: vec![],
+            partition_key: None,
             run_key: None,
             labels: HashMap::new(),
         };

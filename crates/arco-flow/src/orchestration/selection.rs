@@ -51,39 +51,34 @@ impl AssetGraph {
 
     /// Inserts an asset and its upstream dependencies.
     pub fn insert_asset(&mut self, asset_key: String, upstream_deps: Vec<String>) {
-        self.upstream
-            .insert(asset_key.clone(), upstream_deps.clone());
         self.downstream.entry(asset_key.clone()).or_default();
 
-        for upstream in upstream_deps {
+        for upstream in &upstream_deps {
             self.downstream
-                .entry(upstream)
+                .entry(upstream.clone())
                 .or_default()
                 .push(asset_key.clone());
         }
+
+        self.upstream.insert(asset_key, upstream_deps);
     }
 
     /// Returns upstream dependencies for `asset_key`.
     #[must_use]
     pub fn upstream_of(&self, asset_key: &str) -> &[String] {
-        self.upstream
-            .get(asset_key)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.upstream.get(asset_key).map_or(&[], Vec::as_slice)
     }
 
     /// Returns downstream dependents for `asset_key`.
     #[must_use]
     pub fn downstream_of(&self, asset_key: &str) -> &[String] {
-        self.downstream
-            .get(asset_key)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.downstream.get(asset_key).map_or(&[], Vec::as_slice)
     }
 
     /// Computes the closure of a selection.
     ///
     /// Returned set is deterministic (sorted).
+    #[must_use]
     pub fn close_selection(&self, roots: &[String], options: SelectionOptions) -> BTreeSet<String> {
         let mut selected: BTreeSet<String> = roots.iter().cloned().collect();
 
@@ -116,6 +111,10 @@ impl AssetGraph {
 /// Canonicalizes an asset key string.
 ///
 /// Accepts either `namespace.name` or `namespace/name`.
+///
+/// # Errors
+/// Returns an error if the input is empty, contains whitespace, has an invalid format,
+/// or contains invalid characters.
 pub fn canonicalize_asset_key(input: &str) -> Result<String, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -132,13 +131,12 @@ pub fn canonicalize_asset_key(input: &str) -> Result<String, String> {
     let has_dot = trimmed.contains('.');
 
     let (namespace, name) = if has_slash {
-        let parts: Vec<&str> = trimmed.split('/').collect();
-        if parts.len() != 2 {
+        let Some((namespace, name)) = trimmed.split_once('/') else {
             return Err(format!(
                 "invalid asset key '{trimmed}': expected 'namespace/name'"
             ));
-        }
-        (parts[0], parts[1])
+        };
+        (namespace, name)
     } else if has_dot {
         let mut parts = trimmed.splitn(2, '.');
         (
@@ -200,12 +198,17 @@ fn is_valid_asset_segment(segment: &str) -> bool {
 /// Builds `TaskDef`s for a selection against a graph.
 ///
 /// Dependencies are included only when both sides are present in the final planned set.
+///
+/// # Errors
+/// Returns an error if any asset key in `roots` is invalid.
 pub fn build_task_defs_for_selection(
     graph: &AssetGraph,
     roots: &[String],
     options: SelectionOptions,
-    partition_key: Option<String>,
+    partition_key: Option<&str>,
 ) -> Result<Vec<TaskDef>, String> {
+    let partition_key = partition_key.map(str::to_string);
+
     let mut canonical_roots = Vec::with_capacity(roots.len());
     for root in roots {
         canonical_roots.push(canonicalize_asset_key(root)?);
@@ -241,7 +244,10 @@ pub fn build_task_defs_for_selection(
 
 /// Computes a deterministic fingerprint for selection parameters.
 ///
-/// Intended for run_key payload consistency and idempotency.
+/// Intended for `run_key` payload consistency and idempotency.
+///
+/// # Errors
+/// Returns an error if any asset key is invalid or if serialization fails.
 pub fn compute_selection_fingerprint(
     selection: &[String],
     options: SelectionOptions,

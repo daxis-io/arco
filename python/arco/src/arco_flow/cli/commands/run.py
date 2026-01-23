@@ -98,11 +98,18 @@ def run_asset(
     if partition_dict:
         console.print(f"  Partitions: {partition_dict}")
 
+    partition_key = None
+    if partition_dict:
+        partition_dims: dict[str, PartitionDimensionValue] = {
+            key: value for key, value in partition_dict.items()
+        }
+        partition_key = PartitionKey(partition_dims).canonical_string()
+
     try:
         with ArcoFlowApiClient(config) as client:
             response = client.trigger_run(
                 workspace_id=config.workspace_id,
-                selection=selection,
+                selection=[asset],
                 partition_key=partition_key,
                 run_key=run_key,
                 include_upstream=include_upstream,

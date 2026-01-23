@@ -49,8 +49,3 @@ coverage/
 *.tfstate
 *.tfstate.backup
 *.tfplan
-
-# Claude/AI config and planning
-.claude/
-docs/plans/
-.worktrees/

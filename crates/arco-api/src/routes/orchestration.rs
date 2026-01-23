@@ -2008,6 +2008,92 @@ fn reject_reserved_lineage_labels(labels: &HashMap<String, String>) -> Result<()
     )))
 }
 
+fn validate_selection_limits(selection: &[String]) -> Result<(), ApiError> {
+    if selection.len() > MAX_SELECTION_ITEMS {
+        return Err(ApiError::bad_request(format!(
+            "selection exceeds max items ({MAX_SELECTION_ITEMS})"
+        )));
+    }
+    for value in selection {
+        if value.len() > MAX_SELECTION_ITEM_LEN {
+            return Err(ApiError::bad_request(format!(
+                "selection item exceeds max length ({MAX_SELECTION_ITEM_LEN})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_labels_limits(labels: &HashMap<String, String>) -> Result<(), ApiError> {
+    if labels.len() > MAX_LABELS {
+        return Err(ApiError::bad_request(format!(
+            "labels exceed max properties ({MAX_LABELS})"
+        )));
+    }
+
+    for (key, value) in labels {
+        if key.len() > MAX_LABEL_KEY_LEN {
+            return Err(ApiError::bad_request(format!(
+                "label key exceeds max length ({MAX_LABEL_KEY_LEN})"
+            )));
+        }
+        if value.len() > MAX_LABEL_VALUE_LEN {
+            return Err(ApiError::bad_request(format!(
+                "label value exceeds max length ({MAX_LABEL_VALUE_LEN})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_partitions_limits(partitions: &[PartitionValue]) -> Result<(), ApiError> {
+    if partitions.len() > MAX_PARTITIONS {
+        return Err(ApiError::bad_request(format!(
+            "partitions exceed max items ({MAX_PARTITIONS})"
+        )));
+    }
+
+    for partition in partitions {
+        if partition.key.len() > MAX_PARTITION_DIM_LEN {
+            return Err(ApiError::bad_request(format!(
+                "partition key exceeds max length ({MAX_PARTITION_DIM_LEN})"
+            )));
+        }
+        if partition.value.len() > MAX_PARTITION_VALUE_LEN {
+            return Err(ApiError::bad_request(format!(
+                "partition value exceeds max length ({MAX_PARTITION_VALUE_LEN})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_trigger_run_request_limits(request: &TriggerRunRequest) -> Result<(), ApiError> {
+    validate_selection_limits(&request.selection)?;
+    validate_labels_limits(&request.labels)?;
+    validate_partitions_limits(&request.partitions)?;
+
+    if let Some(run_key) = request.run_key.as_deref() {
+        if run_key.len() > MAX_RUN_KEY_LEN {
+            return Err(ApiError::bad_request(format!(
+                "runKey exceeds max length ({MAX_RUN_KEY_LEN})"
+            )));
+        }
+    }
+
+    if let Some(partition_key) = request.partition_key.as_deref() {
+        if partition_key.len() > MAX_PARTITION_KEY_LEN {
+            return Err(ApiError::bad_request(format!(
+                "partitionKey exceeds max length ({MAX_PARTITION_KEY_LEN})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
     let mut pending = 0;
     let mut queued = 0;
@@ -2069,9 +2155,46 @@ fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, 
         return Ok(None);
     }
 
+    if partitions.len() > MAX_PARTITIONS {
+        return Err(ApiError::bad_request(format!(
+            "partitions exceed max items ({MAX_PARTITIONS})"
+        )));
+    }
+
+    let mut seen = HashSet::new();
     let mut partition_key = arco_core::partition::PartitionKey::new();
-    for (key, value) in values {
-        partition_key.insert(key, arco_core::partition::ScalarValue::String(value));
+
+    for partition in partitions {
+        let key = partition.key.trim();
+        if key.is_empty() {
+            return Err(ApiError::bad_request("partition key cannot be empty"));
+        }
+        if key.len() > MAX_PARTITION_DIM_LEN {
+            return Err(ApiError::bad_request(format!(
+                "partition key exceeds max length ({MAX_PARTITION_DIM_LEN})"
+            )));
+        }
+        if !is_valid_partition_key(key) {
+            return Err(ApiError::bad_request(format!(
+                "invalid partition key: {key}"
+            )));
+        }
+        if !seen.insert(key.to_string()) {
+            return Err(ApiError::bad_request(format!(
+                "duplicate partition key: {key}"
+            )));
+        }
+
+        if partition.value.len() > MAX_PARTITION_VALUE_LEN {
+            return Err(ApiError::bad_request(format!(
+                "partition value exceeds max length ({MAX_PARTITION_VALUE_LEN})"
+            )));
+        }
+
+        partition_key.insert(
+            key.to_string(),
+            arco_core::partition::ScalarValue::String(partition.value.clone()),
+        );
     }
 
     let canonical = partition_key.canonical_string();
@@ -2082,238 +2205,6 @@ fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, 
     }
 
     Ok(Some(canonical))
-}
-
-fn normalize_partition_key(
-    raw_dimensions: &HashMap<String, arco_core::partition::ScalarValue>,
-    partitioning: &PartitioningSpec,
-    cutoff: Option<DateTime<Utc>>,
-) -> Result<(arco_core::partition::PartitionKey, bool), ApiError> {
-    let provided_keys: HashSet<&str> = raw_dimensions.keys().map(String::as_str).collect();
-    let expected_keys: HashSet<&str> = partitioning
-        .dimensions
-        .iter()
-        .map(|dim| dim.name.as_str())
-        .collect();
-
-    if partitioning.is_partitioned && provided_keys != expected_keys {
-        let expected = partitioning
-            .dimensions
-            .iter()
-            .map(|dim| dim.name.as_str())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .join(", ");
-        let provided = provided_keys
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(ApiError::bad_request(format!(
-            "partitionKey dimensions must match manifest dimensions: expected [{expected}], got [{provided}]"
-        )));
-    }
-
-    let cutoff_active = cutoff.is_some_and(|cutoff| Utc::now() >= cutoff);
-    let mut normalized = arco_core::partition::PartitionKey::new();
-    let mut normalized_time_string = false;
-
-    for dim in &partitioning.dimensions {
-        let Some(value) = raw_dimensions.get(&dim.name) else {
-            continue;
-        };
-
-        let (normalized_value, did_normalize) = match dim.kind.as_str() {
-            "time" => normalize_time_dimension_value(dim, value, cutoff_active)?,
-            "static" => normalize_static_dimension_value(dim, value)?,
-            "tenant" => normalize_tenant_dimension_value(dim, value)?,
-            _ => {
-                return Err(ApiError::bad_request(format!(
-                    "unsupported partition dimension kind '{}' for '{}'",
-                    dim.kind, dim.name
-                )));
-            }
-        };
-
-        if did_normalize {
-            normalized_time_string = true;
-        }
-
-        normalized.insert(dim.name.clone(), normalized_value);
-    }
-
-    Ok((normalized, normalized_time_string))
-}
-
-fn normalize_time_dimension_value(
-    dim: &DimensionSpec,
-    value: &arco_core::partition::ScalarValue,
-    cutoff_active: bool,
-) -> Result<(arco_core::partition::ScalarValue, bool), ApiError> {
-    match value {
-        arco_core::partition::ScalarValue::Date(date) => {
-            enforce_time_granularity(dim, "day")?;
-            Ok((arco_core::partition::ScalarValue::Date(date.clone()), false))
-        }
-        arco_core::partition::ScalarValue::Timestamp(timestamp) => {
-            enforce_time_granularity(dim, "hour")?;
-
-            if dim.granularity.as_deref() == Some("hour") {
-                // Hour-partitioned dimensions must be aligned to the hour.
-                let parsed = DateTime::parse_from_rfc3339(timestamp).map_err(|_| {
-                    ApiError::bad_request(format!(
-                        "time dimension '{}' must use canonical UTC timestamp",
-                        dim.name
-                    ))
-                })?;
-                let utc = parsed.with_timezone(&Utc);
-                if utc.minute() != 0 || utc.second() != 0 || utc.nanosecond() != 0 {
-                    return Err(ApiError::bad_request(format!(
-                        "time dimension '{}' must be aligned to the hour",
-                        dim.name
-                    )));
-                }
-            }
-
-            Ok((
-                arco_core::partition::ScalarValue::Timestamp(timestamp.clone()),
-                false,
-            ))
-        }
-        arco_core::partition::ScalarValue::String(raw) => {
-            if cutoff_active {
-                return Err(ApiError::bad_request(format!(
-                    "time partition values must use d:/t: tags for '{}'",
-                    dim.name
-                )));
-            }
-
-            let normalized = match dim.granularity.as_deref() {
-                Some("day") => {
-                    let parsed = parse_date(raw).ok_or_else(|| {
-                        ApiError::bad_request(format!(
-                            "time dimension '{}' expects YYYY-MM-DD",
-                            dim.name
-                        ))
-                    })?;
-                    arco_core::partition::ScalarValue::Date(parsed)
-                }
-                Some("hour") => {
-                    let parsed = parse_rfc3339_timestamp(raw, true).ok_or_else(|| {
-                        ApiError::bad_request(format!(
-                            "time dimension '{}' expects RFC3339 timestamp",
-                            dim.name
-                        ))
-                    })?;
-                    arco_core::partition::ScalarValue::Timestamp(parsed)
-                }
-                Some(granularity) => {
-                    return Err(ApiError::bad_request(format!(
-                        "unsupported time granularity '{}' for '{}'",
-                        granularity, dim.name
-                    )));
-                }
-                None => {
-                    if let Some(parsed) = parse_date(raw) {
-                        arco_core::partition::ScalarValue::Date(parsed)
-                    } else if let Some(parsed) = parse_rfc3339_timestamp(raw, false) {
-                        arco_core::partition::ScalarValue::Timestamp(parsed)
-                    } else {
-                        return Err(ApiError::bad_request(format!(
-                            "time dimension '{}' expects YYYY-MM-DD or RFC3339 timestamp",
-                            dim.name
-                        )));
-                    }
-                }
-            };
-
-            tracing::warn!(
-                dimension = %dim.name,
-                value = %raw,
-                "normalized time partition string to tagged value"
-            );
-
-            Ok((normalized, true))
-        }
-        _ => Err(ApiError::bad_request(format!(
-            "time dimension '{}' must use d:/t: or s: value",
-            dim.name
-        ))),
-    }
-}
-
-fn normalize_static_dimension_value(
-    dim: &DimensionSpec,
-    value: &arco_core::partition::ScalarValue,
-) -> Result<(arco_core::partition::ScalarValue, bool), ApiError> {
-    let arco_core::partition::ScalarValue::String(raw) = value else {
-        return Err(ApiError::bad_request(format!(
-            "dimension '{}' must use string values",
-            dim.name
-        )));
-    };
-
-    if let Some(values) = dim.values.as_ref().filter(|values| !values.is_empty()) {
-        if !values.contains(raw) {
-            return Err(ApiError::bad_request(format!(
-                "dimension '{}' value '{}' is not allowed",
-                dim.name, raw
-            )));
-        }
-    }
-
-    Ok((
-        arco_core::partition::ScalarValue::String(raw.clone()),
-        false,
-    ))
-}
-
-fn normalize_tenant_dimension_value(
-    dim: &DimensionSpec,
-    value: &arco_core::partition::ScalarValue,
-) -> Result<(arco_core::partition::ScalarValue, bool), ApiError> {
-    let arco_core::partition::ScalarValue::String(raw) = value else {
-        return Err(ApiError::bad_request(format!(
-            "dimension '{}' must use string values",
-            dim.name
-        )));
-    };
-
-    Ok((
-        arco_core::partition::ScalarValue::String(raw.clone()),
-        false,
-    ))
-}
-
-fn enforce_time_granularity(dim: &DimensionSpec, expected: &str) -> Result<(), ApiError> {
-    match dim.granularity.as_deref() {
-        Some(granularity) if granularity == expected => Ok(()),
-        Some(_granularity) => Err(ApiError::bad_request(format!(
-            "time dimension '{}' expects {} granularity",
-            dim.name, expected
-        ))),
-        None => Ok(()),
-    }
-}
-
-fn parse_date(value: &str) -> Option<String> {
-    NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .ok()
-        .map(|date| date.format("%Y-%m-%d").to_string())
-}
-
-fn parse_rfc3339_timestamp(value: &str, require_hour_boundary: bool) -> Option<String> {
-    let parsed = DateTime::parse_from_rfc3339(value).ok()?;
-    let utc = parsed.with_timezone(&Utc);
-
-    if require_hour_boundary && (utc.minute() != 0 || utc.second() != 0 || utc.nanosecond() != 0) {
-        return None;
-    }
-
-    Some(utc.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
 }
 
 fn is_valid_partition_key(key: &str) -> bool {
@@ -2893,6 +2784,8 @@ pub(crate) async fn trigger_run(
         return Err(ApiError::bad_request("selection cannot be empty"));
     }
 
+    validate_trigger_run_request_limits(&request)?;
+
     reject_reserved_lineage_labels(&request.labels)?;
 
     // Generate IDs upfront (needed for reservation)
@@ -3276,6 +3169,17 @@ pub(crate) async fn rerun_run(
     Json(request): Json<RerunRunRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
+
+    validate_labels_limits(&request.labels)?;
+    validate_selection_limits(&request.selection)?;
+    if let Some(run_key) = request.run_key.as_deref() {
+        if run_key.len() > MAX_RUN_KEY_LEN {
+            return Err(ApiError::bad_request(format!(
+                "runKey exceeds max length ({MAX_RUN_KEY_LEN})"
+            )));
+        }
+    }
+
     reject_reserved_lineage_labels(&request.labels)?;
 
     let fold_state = load_orchestration_state(&ctx, &state).await?;
@@ -3700,6 +3604,7 @@ pub(crate) async fn backfill_run_key(
     };
 
     validate_trigger_run_request_limits(&fingerprint_request)?;
+    let request_fingerprint = build_request_fingerprint(&fingerprint_request)?;
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
@@ -5305,6 +5210,62 @@ mod tests {
             Some("date=s:MjAyNC0wMS0xNQ")
         );
         assert!(request.partitions.is_empty());
+    }
+
+    #[test]
+    fn test_trigger_request_limits_rejects_too_long_partition_key() {
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: Some("x".repeat(MAX_PARTITION_KEY_LEN + 1)),
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err = validate_trigger_run_request_limits(&request).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.message().contains("partitionKey"));
+    }
+
+    #[test]
+    fn test_trigger_request_limits_rejects_too_many_selection_items() {
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string(); MAX_SELECTION_ITEMS + 1],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: None,
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err = validate_trigger_run_request_limits(&request).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.message().contains("selection"));
+    }
+
+    #[test]
+    fn test_build_partition_key_rejects_canonical_string_too_long() {
+        let partitions = vec![
+            PartitionValue {
+                key: "a".to_string(),
+                value: "x".repeat(MAX_PARTITION_VALUE_LEN),
+            },
+            PartitionValue {
+                key: "b".to_string(),
+                value: "x".repeat(MAX_PARTITION_VALUE_LEN),
+            },
+            PartitionValue {
+                key: "c".to_string(),
+                value: "x".repeat(MAX_PARTITION_VALUE_LEN),
+            },
+        ];
+
+        let err = build_partition_key(&partitions).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.message().contains("partitionKey exceeds max length"));
     }
 
     #[test]

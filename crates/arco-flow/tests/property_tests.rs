@@ -303,6 +303,12 @@ proptest! {
             Err(arco_flow::error::Error::DependencyNotFound { .. }) => {
                 // Valid rejection - missing deps correctly detected
             }
+            Err(arco_flow::error::Error::PlanGenerationFailed { message })
+                if message.contains("duplicate TaskKey") || message.contains("duplicate task_id") =>
+            {
+                // Valid rejection - input contains duplicate semantic tasks or duplicate IDs.
+                // (These inputs are possible in the proptest generator and should be rejected.)
+            }
             Err(e) => {
                 prop_assert!(false, "Unexpected error: {e:?}");
             }

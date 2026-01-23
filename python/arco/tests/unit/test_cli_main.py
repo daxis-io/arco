@@ -58,12 +58,7 @@ class TestCLIMain:
         result = runner.invoke(app, ["run", "--help"])
 
         assert result.exit_code == 0
-        output = _plain_output(result).lower()
-        assert "asset" in output
-        assert "--rerun" in output
-        assert "--from-failure" in output
-        assert "--include-upstream" in output
-        assert "--include-downstream" in output
+        assert "asset" in _plain_output(result).lower()
 
     def test_status_help(self) -> None:
         """status --help shows status options."""

@@ -156,6 +156,8 @@ class ArcoFlowApiClient:
         selection: list[str],
         partitions: list[dict[str, str]] | None = None,
         partition_key: str | None = None,
+        include_upstream: bool = False,
+        include_downstream: bool = False,
         run_key: str | None = None,
     ) -> ApiResponse:
         headers = self._build_headers(workspace_id=workspace_id)
@@ -176,6 +178,11 @@ class ArcoFlowApiClient:
             payload["partitionKey"] = partition_key
         elif partitions:
             payload["partitions"] = partitions
+
+        if include_upstream:
+            payload["includeUpstream"] = True
+        if include_downstream:
+            payload["includeDownstream"] = True
 
         if run_key:
             payload["runKey"] = run_key

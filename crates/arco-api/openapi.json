@@ -1985,7 +1985,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/TriggerRunRequest"
+                "$ref": "#/components/schemas/TriggerRunRequestOpenApi"
               }
             }
           },
@@ -3080,7 +3080,7 @@
           },
           "id": {
             "type": "string",
-            "description": "Asset ID (ULID)."
+            "description": "Asset ID (UUID)."
           },
           "io": {
             "description": "I/O configuration."
@@ -6158,9 +6158,108 @@
           "FAILED"
         ]
       },
-      "TriggerRunRequest": {
+      "TriggerRunRequestOpenApi": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/TriggerRunRequestWithPartitionKey"
+          },
+          {
+            "$ref": "#/components/schemas/TriggerRunRequestWithPartitions"
+          },
+          {
+            "$ref": "#/components/schemas/TriggerRunRequestUnpartitioned"
+          }
+        ]
+      },
+      "TriggerRunRequestUnpartitioned": {
         "type": "object",
-        "description": "Request to trigger a new run.",
+        "properties": {
+          "includeDownstream": {
+            "type": "boolean",
+            "description": "Include downstream dependents of the selection."
+          },
+          "includeUpstream": {
+            "type": "boolean",
+            "description": "Include upstream dependencies of the selection."
+          },
+          "labels": {
+            "type": "object",
+            "description": "Additional labels for the run.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "runKey": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Idempotency key for deduplication (409 if reused with different payload).\nReservations created before the fingerprint cutoff remain lenient."
+          },
+          "selection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Asset selection (asset keys to materialize)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "TriggerRunRequestWithPartitionKey": {
+        "type": "object",
+        "required": [
+          "partitionKey"
+        ],
+        "properties": {
+          "includeDownstream": {
+            "type": "boolean",
+            "description": "Include downstream dependents of the selection."
+          },
+          "includeUpstream": {
+            "type": "boolean",
+            "description": "Include upstream dependencies of the selection."
+          },
+          "labels": {
+            "type": "object",
+            "description": "Additional labels for the run.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "partitionKey": {
+            "type": "string",
+            "description": "Canonical partition key string (ADR-011).",
+            "minLength": 1
+          },
+          "runKey": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Idempotency key for deduplication (409 if reused with different payload).\nReservations created before the fingerprint cutoff remain lenient."
+          },
+          "selection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Asset selection (asset keys to materialize)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "TriggerRunRequestWithPartitions": {
+        "type": "object",
+        "required": [
+          "partitions"
+        ],
         "properties": {
           "includeDownstream": {
             "type": "boolean",
@@ -6185,7 +6284,7 @@
             "items": {
               "$ref": "#/components/schemas/PartitionValue"
             },
-            "description": "Partition overrides (key=value pairs)."
+            "description": "Partition overrides (key=value strings). Backward-compatible with older clients."
           },
           "runKey": {
             "type": [
@@ -6201,7 +6300,8 @@
             },
             "description": "Asset selection (asset keys to materialize)."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "TriggerRunResponse": {
         "type": "object",

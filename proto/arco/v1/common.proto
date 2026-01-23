@@ -21,7 +21,7 @@ message WorkspaceId {
 }
 
 message AssetId {
-  // ULID-based asset identifier
+  // UUID-based asset identifier (generated as UUIDv7 in canonical implementation)
   string value = 1;
 }
 

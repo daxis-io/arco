@@ -8,6 +8,8 @@ from rich.console import Console
 
 from arco_flow.cli.config import get_config
 from arco_flow.client import ApiError, ArcoFlowApiClient
+from arco_flow.types import PartitionKey
+from arco_flow.types.scalar import PartitionDimensionValue
 
 console = Console()
 err_console = Console(stderr=True)
@@ -54,14 +56,19 @@ def run_asset(
     if partition_dict:
         console.print(f"  Partitions: {partition_dict}")
 
-    partition_payload = [{"key": key, "value": value} for key, value in partition_dict.items()]
+    partition_key = None
+    if partition_dict:
+        partition_dims: dict[str, PartitionDimensionValue] = {
+            key: value for key, value in partition_dict.items()
+        }
+        partition_key = PartitionKey(partition_dims).canonical_string()
 
     try:
         with ArcoFlowApiClient(config) as client:
             response = client.trigger_run(
                 workspace_id=config.workspace_id,
                 selection=[asset],
-                partitions=partition_payload,
+                partition_key=partition_key,
                 run_key=run_key,
             ).payload
     except ApiError as err:

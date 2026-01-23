@@ -29,6 +29,7 @@ dependencies = [
     "httpx>=0.25.0",
     "rich>=13.0.0",
     "ulid-py>=1.1.0",
+    "uuid6>=2024.7.10",
     "structlog>=23.2.0",
     "typing-extensions>=4.8.0",
 ]

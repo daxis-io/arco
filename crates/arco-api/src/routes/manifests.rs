@@ -93,7 +93,7 @@ pub struct GitContext {
 pub struct AssetEntry {
     /// Asset key (namespace + name).
     pub key: AssetKey,
-    /// Asset ID (ULID).
+    /// Asset ID (UUID).
     pub id: String,
     /// Asset description.
     #[serde(default)]
@@ -462,11 +462,11 @@ async fn upsert_schedule_definitions(
         return Ok(());
     }
 
-    fn normalize_asset_selection(values: &[String]) -> Vec<String> {
+    let normalize_asset_selection = |values: &[String]| -> Vec<String> {
         let mut values = values.to_vec();
         values.sort();
         values
-    }
+    };
 
     let compactor = MicroCompactor::new(storage.clone());
     let (_, fold_state) = compactor
@@ -476,6 +476,7 @@ async fn upsert_schedule_definitions(
 
     let mut events: Vec<OrchestrationEvent> = Vec::new();
     for schedule in schedules {
+        let schedule_cron_expression = schedule.cron.as_str();
         let existing = fold_state.schedule_definitions.get(schedule.id.as_str());
 
         let enabled = existing.is_none_or(|row| row.enabled);
@@ -483,7 +484,7 @@ async fn upsert_schedule_definitions(
         let max_catchup_ticks = existing.map_or(1, |row| row.max_catchup_ticks);
 
         let needs_upsert = existing.is_none_or(|row| {
-            row.cron_expression != schedule.cron
+            row.cron_expression != schedule_cron_expression
                 || row.timezone != schedule.timezone
                 || row.enabled != enabled
                 || row.catchup_window_minutes != catchup_window_minutes

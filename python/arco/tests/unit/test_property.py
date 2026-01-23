@@ -36,10 +36,8 @@ class TestPartitionKeyProperties:
         """Canonical form is deterministic regardless of insertion order."""
         from arco_flow.types.partition import PartitionKey
 
-        # Create with original order
         pk1 = PartitionKey(dims)
 
-        # Create with reversed order
         reversed_dims = dict(reversed(list(dims.items())))
         pk2 = PartitionKey(reversed_dims)
 
@@ -70,7 +68,7 @@ class TestPartitionKeyProperties:
         fp2 = pk.fingerprint()
 
         assert fp1 == fp2
-        assert len(fp1) == 64  # SHA-256 hex
+        assert len(fp1) == 64
 
 
 class TestAssetKeyProperties:
@@ -96,21 +94,21 @@ class TestIdProperties:
     @given(count=st.integers(min_value=1, max_value=100))
     def test_ulid_uniqueness(self, count: int) -> None:
         """Generated ULIDs are unique."""
-        from arco_flow.types.ids import AssetId
+        from arco_flow.types.ids import RunId
 
-        ids = {AssetId.generate() for _ in range(count)}
+        ids = {RunId.generate() for _ in range(count)}
         assert len(ids) == count
 
-    @settings(max_examples=10)  # Reduce examples due to sleep
+    @settings(max_examples=10)
     @given(count=st.integers(min_value=2, max_value=10))
     def test_ulid_lexicographic_order(self, count: int) -> None:
         """Sequential ULIDs are lexicographically ordered."""
-        from arco_flow.types.ids import AssetId
+        from arco_flow.types.ids import RunId
 
         ids = []
         for _ in range(count):
-            ids.append(AssetId.generate())
-            time.sleep(0.002)  # Small delay to ensure different timestamps
+            ids.append(RunId.generate())
+            time.sleep(0.002)
 
         assert ids == sorted(ids)
 

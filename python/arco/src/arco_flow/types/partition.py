@@ -1,15 +1,8 @@
-"""Partition strategy types for multi-dimensional partitioning.
-
-Partitions enable:
-- Parallel execution across partition values
-- Incremental processing (only new partitions)
-- Intelligent backfills (date ranges, specific tenants)
-"""
+"""Partition strategy types for multi-dimensional partitioning."""
 
 from __future__ import annotations
 
 import hashlib
-import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
@@ -26,6 +19,18 @@ def _canonicalize_date(value: date, granularity: Literal["year", "month", "day",
     if granularity == "year":
         return str(value.year)
     return value.isoformat()
+
+
+def _is_valid_dimension_key(key: str) -> bool:
+    if not key:
+        return False
+    first = key[0]
+    if not ("a" <= first <= "z"):
+        return False
+    for c in key[1:]:
+        if not ("a" <= c <= "z" or "0" <= c <= "9" or c == "_"):
+            return False
+    return True
 
 
 class DimensionKind(str, Enum):
@@ -51,24 +56,18 @@ class PartitionDimension(ABC):
 
 @dataclass(frozen=True)
 class TimeDimension(PartitionDimension):
-    """Time-based partition dimension (date, hour, etc.).
-
-    Example:
-        >>> dim = TimeDimension(name="date", granularity="day")
-        >>> dim.canonical_value(date(2024, 1, 15))
-        "2024-01-15"
-    """
+    """Time-based partition dimension (date, hour, etc.)."""
 
     granularity: Literal["year", "month", "day", "hour"] = "day"
     kind: DimensionKind = field(default=DimensionKind.TIME, init=False)
 
     def canonical_value(self, value: PartitionDimensionValue) -> str:
-        """Convert to ISO format string."""
         if isinstance(value, str):
             return value
         if isinstance(value, datetime):
             value = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
             if self.granularity == "hour":
+                value = value.replace(minute=0, second=0, microsecond=0)
                 return value.strftime("%Y-%m-%dT%H:00:00Z")
             value = value.date()
         if isinstance(value, date):
@@ -78,17 +77,12 @@ class TimeDimension(PartitionDimension):
 
 @dataclass(frozen=True)
 class StaticDimension(PartitionDimension):
-    """Static partition dimension with predefined values.
-
-    Example:
-        >>> dim = StaticDimension(name="region", values=["us", "eu", "apac"])
-    """
+    """Static partition dimension with predefined values."""
 
     values: tuple[str, ...] = ()
     kind: DimensionKind = field(default=DimensionKind.STATIC, init=False)
 
     def canonical_value(self, value: PartitionDimensionValue) -> str:
-        """Validate against allowed values."""
         str_value = str(value) if value is not None else ""
         if self.values and str_value not in self.values:
             msg = f"Invalid value {str_value!r} for dimension {self.name!r}. Allowed: {self.values}"
@@ -98,43 +92,27 @@ class StaticDimension(PartitionDimension):
 
 @dataclass(frozen=True)
 class TenantDimension(PartitionDimension):
-    """Tenant partition dimension for multi-tenant isolation.
-
-    Example:
-        >>> dim = TenantDimension(name="tenant_id")
-    """
+    """Tenant partition dimension for multi-tenant isolation."""
 
     kind: DimensionKind = field(default=DimensionKind.TENANT, init=False)
 
     def canonical_value(self, value: PartitionDimensionValue) -> str:
-        """Return tenant ID as-is."""
         return str(value) if value is not None else ""
 
 
-# Convenience constructors
 class DailyPartition(TimeDimension):
-    """Daily partition by date.
-
-    Example:
-        >>> partitions = DailyPartition("date")
-    """
+    """Daily partition by date."""
 
     def __init__(self, name: str = "date") -> None:
-        """Create a daily partition dimension."""
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "granularity", "day")
         object.__setattr__(self, "kind", DimensionKind.TIME)
 
 
 class HourlyPartition(TimeDimension):
-    """Hourly partition by timestamp.
-
-    Example:
-        >>> partitions = HourlyPartition("hour")
-    """
+    """Hourly partition by timestamp."""
 
     def __init__(self, name: str = "hour") -> None:
-        """Create an hourly partition dimension."""
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "granularity", "hour")
         object.__setattr__(self, "kind", DimensionKind.TIME)
@@ -142,80 +120,59 @@ class HourlyPartition(TimeDimension):
 
 @dataclass(frozen=True)
 class PartitionKey:
-    """Multi-dimensional partition key with canonical serialization.
-
-    Dimensions are stored as ScalarValue internally but serialize to
-    proto-compatible map<string,string> using type-tagged encoding.
-
-    Example:
-        >>> key = PartitionKey({"date": date(2024, 1, 15), "tenant": "acme"})
-        >>> key.to_proto_dict()
-        {'date': 'd:2024-01-15', 'tenant': 's:acme'}
-    """
+    """Multi-dimensional partition key with ADR-011 canonical encoding."""
 
     dimensions: FrozenDict[str, ScalarValue] = field(default_factory=FrozenDict)
 
     def __init__(self, dims: dict[str, PartitionDimensionValue] | None = None) -> None:
-        """Create partition key from dimension values."""
         if dims is None:
             dims = {}
-        converted = FrozenDict({k: ScalarValue.from_value(v) for k, v in dims.items()})
-        object.__setattr__(self, "dimensions", converted)
+
+        converted: dict[str, ScalarValue] = {}
+        for key, raw_value in dims.items():
+            if not _is_valid_dimension_key(key):
+                msg = f"Invalid partition dimension key: {key!r}"
+                raise ValueError(msg)
+            converted[key] = ScalarValue.from_value(raw_value)
+
+        object.__setattr__(self, "dimensions", FrozenDict(converted))
 
     def to_proto_dict(self) -> dict[str, str]:
-        """Convert to proto-compatible map<string,string>.
-
-        Returns:
-            Dict with type-tagged string values.
-        """
         return {k: v.to_tagged_string() for k, v in sorted(self.dimensions.items())}
 
     @classmethod
     def from_proto_dict(cls, proto_dict: dict[str, str]) -> PartitionKey:
-        """Create from proto-format dict with tagged strings.
-
-        Args:
-            proto_dict: Dict with type-tagged string values.
-
-        Returns:
-            PartitionKey with parsed dimensions.
-        """
         instance = cls.__new__(cls)
-        dims = {}
-        for k, tagged in proto_dict.items():
-            dims[k] = ScalarValue.from_tagged_string(tagged)
+        dims: dict[str, ScalarValue] = {}
+        for key, tagged in proto_dict.items():
+            if not _is_valid_dimension_key(key):
+                msg = f"Invalid partition dimension key: {key!r}"
+                raise ValueError(msg)
+            dims[key] = ScalarValue.from_tagged_string(tagged)
         object.__setattr__(instance, "dimensions", FrozenDict(dims))
         return instance
 
+    def canonical_string(self) -> str:
+        if not self.dimensions:
+            return ""
+        return ",".join(
+            f"{key}={value.to_tagged_string()}" for key, value in sorted(self.dimensions.items())
+        )
+
     def to_canonical(self) -> str:
-        """Serialize to canonical JSON using type-tagged strings.
-
-        Uses type-tagged strings for cross-language determinism.
-        Keys are sorted alphabetically.
-
-        Returns:
-            Canonical JSON string with no whitespace.
-        """
-        proto_dict = self.to_proto_dict()
-        return json.dumps(proto_dict, separators=(",", ":"), sort_keys=True)
+        return self.canonical_string()
 
     def fingerprint(self) -> str:
-        """Compute SHA-256 fingerprint of canonical form."""
-        canonical = self.to_canonical()
+        canonical = self.canonical_string()
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     def to_dict(self) -> dict[str, str]:
-        """Convert to proto-compatible dict (alias for to_proto_dict)."""
         return self.to_proto_dict()
 
 
 @dataclass(frozen=True)
 class PartitionStrategy:
-    """Complete partition strategy for an asset.
-
-    Example:
-        >>> strategy = PartitionStrategy(dimensions=[DailyPartition("date")])
-    """
+    """Complete partition strategy for an asset."""
 
     dimensions: tuple[PartitionDimension, ...] = field(default_factory=tuple)
 
@@ -224,10 +181,8 @@ class PartitionStrategy:
 
     @property
     def is_partitioned(self) -> bool:
-        """Check if the asset is partitioned."""
         return len(self.dimensions) > 0
 
     @property
     def dimension_names(self) -> list[str]:
-        """Get list of dimension names."""
         return [d.name for d in self.dimensions]

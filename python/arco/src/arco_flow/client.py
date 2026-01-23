@@ -154,16 +154,32 @@ class ArcoFlowApiClient:
         *,
         workspace_id: str,
         selection: list[str],
-        partitions: list[dict[str, str]],
+        partitions: list[dict[str, str]] | None = None,
+        partition_key: str | None = None,
         run_key: str | None = None,
     ) -> ApiResponse:
         headers = self._build_headers(workspace_id=workspace_id)
+
+        if partitions is None:
+            partitions = []
+
+        if partition_key == "":
+            raise ValueError("partition_key cannot be empty")
+
+        if partition_key and partitions:
+            raise ValueError("use either partition_key or partitions, not both")
+
         payload: dict[str, Any] = {
             "selection": selection,
-            "partitions": partitions,
         }
+        if partition_key:
+            payload["partitionKey"] = partition_key
+        elif partitions:
+            payload["partitions"] = partitions
+
         if run_key:
             payload["runKey"] = run_key
+
         response = self._request_json(
             "POST",
             f"/workspaces/{workspace_id}/runs",

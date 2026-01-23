@@ -950,7 +950,10 @@ pub fn write_sensor_evals(rows: &[SensorEvalRow]) -> Result<Bytes> {
 }
 
 /// Writes `run_key_index.parquet`.
-pub fn write_run_key_index(rows: &[RunKeyIndexRow]) -> Result<Bytes> {
+///
+/// # Errors
+/// Returns an error if Parquet encoding fails.
+pub(super) fn write_run_key_index(rows: &[RunKeyIndexRow]) -> Result<Bytes> {
     let schema = run_key_index_schema();
 
     let tenant_ids = StringArray::from(
@@ -1007,7 +1010,10 @@ pub fn write_run_key_index(rows: &[RunKeyIndexRow]) -> Result<Bytes> {
 }
 
 /// Writes `run_key_conflicts.parquet`.
-pub fn write_run_key_conflicts(rows: &[RunKeyConflictRow]) -> Result<Bytes> {
+///
+/// # Errors
+/// Returns an error if Parquet encoding fails.
+pub(super) fn write_run_key_conflicts(rows: &[RunKeyConflictRow]) -> Result<Bytes> {
     let schema = run_key_conflicts_schema();
 
     let tenant_ids = StringArray::from(

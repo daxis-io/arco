@@ -79,7 +79,7 @@ use utoipa::{Modify, OpenApi};
             crate::routes::browser::MintUrlsResponse,
             crate::routes::browser::SignedUrl,
             crate::routes::query::QueryRequest,
-            crate::routes::orchestration::TriggerRunRequest,
+            crate::routes::orchestration::TriggerRunRequestOpenApi,
             crate::routes::orchestration::TriggerRunResponse,
             crate::routes::orchestration::RerunMode,
             crate::routes::orchestration::RerunKindResponse,

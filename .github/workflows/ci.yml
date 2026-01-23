@@ -138,6 +138,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
         working-directory: python/arco
+      - name: Run Python unit tests
+        run: python -m pytest tests/unit -v
+        working-directory: python/arco
       - name: Run Python CLI API tests
         run: python -m pytest tests/integration/test_cli_api.py -v
         working-directory: python/arco

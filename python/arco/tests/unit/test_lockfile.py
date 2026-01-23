@@ -57,8 +57,11 @@ class TestLockfile:
 
         asset_id, created = lf.get_or_create(key)
 
+        from arco_flow.types.ids import AssetId
+
         assert asset_id is not None
-        assert len(str(asset_id)) == 26  # ULID length
+        # AssetId is a UUID (UUIDv7 generated); validate roundtrip.
+        assert AssetId.validate(str(asset_id)) == asset_id
         assert created is True
         assert "raw.events" in lf.asset_ids
 

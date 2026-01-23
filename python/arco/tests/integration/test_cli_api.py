@@ -242,7 +242,8 @@ def test_cli_run_status_logs(api_server: dict[str, Any], arco_flow_env: None) ->
     )
     payload = json.loads(run_request.body)
     assert payload["selection"] == ["raw.events"]
-    assert payload["partitions"] == [{"key": "date", "value": "2025-01-15"}]
+    assert payload["partitionKey"] == "date=s:MjAyNS0wMS0xNQ"
+    assert "partitions" not in payload
     assert payload["runKey"] == "rk-001"
     assert run_request.headers.get("X-Tenant-Id") == "test-tenant"
     assert run_request.headers.get("X-Workspace-Id") == "test-workspace"

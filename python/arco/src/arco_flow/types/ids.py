@@ -1,15 +1,24 @@
-"""Strongly-typed identifier types using ULID format.
+"""Strongly-typed identifier types.
 
-All IDs use ULID format for:
-- Lexicographic ordering = chronological ordering
-- URL-safe (alphanumeric only)
-- Collision-resistant (128-bit)
+Canonical Rust implementation (`crates/arco-core/src/id.rs`) uses:
+- `AssetId`: UUID (generated as UUIDv7)
+- `RunId`, `TaskId`, `MaterializationId`: ULID
+
+Wire format is plain strings:
+- UUID: hyphenated 36-character canonical form
+- ULID: 26-character Crockford base32
 """
+
 from __future__ import annotations
 
+import threading
+import uuid
+
 import ulid
+import uuid6
 
 _ULID_LENGTH = 26
+_UUIDV7_LOCK = threading.Lock()
 
 
 def _validate_ulid(value: str) -> str:
@@ -22,33 +31,49 @@ def _validate_ulid(value: str) -> str:
     except ValueError as exc:
         msg = f"Invalid ULID format: {value!r}"
         raise ValueError(msg) from exc
-    return str(parsed)
+    return str(parsed).upper()
 
 
 def _generate_ulid() -> str:
-    """Generate a new ULID."""
+    """Generate a new ULID (uppercase)."""
     return str(ulid.new()).upper()
+
+
+def _validate_uuid(value: str) -> str:
+    """Validate UUID format and normalize to canonical string."""
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as exc:
+        msg = f"Invalid UUID format: {value!r}"
+        raise ValueError(msg) from exc
+    return str(parsed)
+
+
+def _generate_uuidv7() -> str:
+    """Generate a new UUIDv7 in canonical string form."""
+    with _UUIDV7_LOCK:
+        return str(uuid6.uuid7())
 
 
 class AssetId(str):
     """Unique identifier for an asset definition.
 
-    Format: 26-character ULID (uppercase alphanumeric).
+    Format: UUID string (generated as UUIDv7).
 
     Example:
         >>> asset_id = AssetId.generate()
-        >>> print(asset_id)  # e.g., "01HX9ABC..."
+        >>> print(asset_id)  # e.g., "01930a0b-1234-7abc-9def-0123456789ab"
     """
 
     @classmethod
     def generate(cls) -> AssetId:
         """Generate a new unique AssetId."""
-        return cls(_generate_ulid())
+        return cls(_generate_uuidv7())
 
     @classmethod
     def validate(cls, value: str) -> AssetId:
         """Validate and normalize the ID."""
-        return cls(_validate_ulid(value))
+        return cls(_validate_uuid(value))
 
 
 class RunId(str):

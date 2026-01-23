@@ -98,6 +98,12 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    env:
+      # Prevent ENOSPC during large debug/test links by moving artifacts off /
+      CARGO_TARGET_DIR: /mnt/target
+      # Reduce disk usage (debuginfo is a major contributor)
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
       - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
@@ -113,10 +119,14 @@ jobs:
           df -h
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
           df -h
+      - name: Prepare cargo target dir
+        run: |
+          sudo mkdir -p /mnt/target
+          sudo chown -R "$(id -u):$(id -g)" /mnt/target
       - run: cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
       - run: cargo test -p arco-api --all-features --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_
       - run: cargo test -p arco-api --all-features --test orchestration_parity_gates_m1
-      - run: cargo test -p arco-flow --all-features --no-run
+      - run: cargo test -p arco-flow --features test-utils --no-run
       - run: cargo test -p arco-flow --features test-utils --lib
       - run: cargo test -p arco-flow --features test-utils --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_
       - run: cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m1
@@ -137,6 +147,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
+        working-directory: python/arco
+      - name: Run Python unit tests
+        run: python -m pytest tests/unit -v
         working-directory: python/arco
       - name: Run Python CLI API tests
         run: python -m pytest tests/integration/test_cli_api.py -v

@@ -72,6 +72,48 @@ Suggested locations:
 - Rerun workflows behave as operators expect.
 - CI prevents regressions.
 
+## Evidence (parity-08)
+- Code: `crates/arco-api/src/routes/orchestration.rs:2691` (`rerun_run` endpoint)
+- Code: `crates/arco-api/src/routes/orchestration.rs:1823` (lineage extraction) and `crates/arco-api/src/routes/orchestration.rs:1833` (reject reserved lineage labels)
+- Tests: `crates/arco-api/tests/orchestration_parity_gates_m1.rs:809` (`parity_m1_rerun_from_failure_plans_only_unsucceeded_tasks`)
+- Tests: `crates/arco-api/tests/orchestration_parity_gates_m1.rs:1105` (`parity_m1_rerun_subset_respects_include_downstream`)
+- Tests: `crates/arco-api/tests/orchestration_parity_gates_m1.rs:1261` (`parity_m1_rerun_from_failure_rejects_succeeded_parent`)
+- Tests: `crates/arco-api/tests/orchestration_parity_gates_m1.rs:1398` (`parity_m1_trigger_rejects_reserved_lineage_labels`)
+- CI: `.github/workflows/ci.yml:118` (job `test`: `cargo test -p arco-api --all-features --test orchestration_parity_gates_m1`)
+
+## Operator surface (implemented)
+
+Rust CLI (`arco`):
+- Trigger with selection + explicit closure flags:
+  - `arco run --asset analytics.a --include-downstream`
+- Rerun from failure:
+  - `arco run --rerun <PARENT_RUN_ID> --from-failure`
+- Subset rerun (roots via `--asset`, optional closure flags):
+  - `arco run --rerun <PARENT_RUN_ID> --asset analytics.b --include-downstream`
+
+Python CLI (`arco-flow`):
+- Trigger:
+  - `arco-flow run raw.events`
+  - `arco-flow run --asset analytics.a --include-downstream`
+- Rerun from failure:
+  - `arco-flow run --rerun <PARENT_RUN_ID> --from-failure`
+- Subset rerun:
+  - `arco-flow run --rerun <PARENT_RUN_ID> --asset analytics.b --include-downstream`
+
+Notes:
+- Both CLIs accept `namespace/name` and normalize to `namespace.name`.
+- API wire values for rerun mode are `fromFailure` and `subset`.
+
+Evidence:
+- Rust CLI rerun wiring: `crates/arco-cli/src/client.rs`
+- Rust CLI UX: `crates/arco-cli/src/commands/run.rs`
+- Rust status lineage: `crates/arco-cli/src/commands/status.rs`
+- Python SDK rerun wiring: `python/arco/src/arco_flow/client.py`
+- Python CLI UX: `python/arco/src/arco_flow/cli/main.py`
+- Python run/rerun implementation: `python/arco/src/arco_flow/cli/commands/run.py`
+- Python status lineage: `python/arco/src/arco_flow/cli/commands/status.py`
+- Python tests: `python/arco/tests/unit/test_client_trigger_run.py`, `python/arco/tests/unit/test_cli_main.py`
+
 ## Risks / Edge Cases
 - Ambiguity around upstream dependency inclusion (must be explicit).
 - Deterministic lineage identifiers.

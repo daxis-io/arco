@@ -35,7 +35,6 @@ class TestAssetDefinitionContract:
         json_str = serialize_to_manifest_json(entry.to_dict())
         data = json.loads(json_str)
 
-        # Required fields per proto/arco/v1/asset.proto
         required_fields = [
             "key",
             "id",
@@ -48,7 +47,7 @@ class TestAssetDefinitionContract:
             "checks",
             "execution",
             "resources",
-            "transformFingerprint",  # camelCase!
+            "transformFingerprint",
         ]
 
         for field in required_fields:
@@ -93,36 +92,26 @@ class TestAssetDefinitionContract:
         entry = AssetEntry.from_definition(definition)
         json_str = serialize_to_manifest_json(entry.to_dict())
 
-        # Verify snake_case is NOT in output
         assert "transform_fingerprint" not in json_str
         assert "file_path" not in json_str
         assert "line_number" not in json_str
 
-        # Verify camelCase IS in output
         assert "transformFingerprint" in json_str
         assert "filePath" in json_str
         assert "lineNumber" in json_str
 
 
 class TestPartitionKeyContract:
-    """Contract tests for PartitionKey serialization."""
+    """Contract tests for PartitionKey canonical encoding."""
 
     def test_canonical_format_matches_spec(self) -> None:
-        """PartitionKey canonical format matches specification.
-
-        Per design docs:
-        - Keys sorted alphabetically
-        - No whitespace
-        - JSON format with type prefixes (s: for strings, i: for integers, etc.)
-        """
+        """PartitionKey canonical string matches ADR-011."""
         from arco_flow.types.partition import PartitionKey
 
         pk = PartitionKey({"date": "2025-01-15", "tenant": "acme"})
         canonical = pk.to_canonical()
 
-        # Must be: sorted keys, no whitespace, proper JSON with type prefixes
-        # String values are prefixed with "s:" for type safety
-        expected = '{"date":"s:2025-01-15","tenant":"s:acme"}'
+        expected = "date=s:MjAyNS0wMS0xNQ,tenant=s:YWNtZQ"
         assert canonical == expected
 
 
@@ -133,34 +122,28 @@ class TestScalarValueContract:
         """ScalarValue kinds match proto ScalarValue oneof cases."""
         from arco_flow.types.scalar import ScalarValue
 
-        # String
         sv_str = ScalarValue.from_value("hello")
         assert sv_str.kind == "string"
 
-        # Int
         sv_int = ScalarValue.from_value(42)
         assert sv_int.kind == "int64"
 
-        # Date (YYYY-MM-DD per proto)
         sv_date = ScalarValue.from_value(date(2025, 1, 15))
         assert sv_date.kind == "date"
         assert sv_date.value == "2025-01-15"
 
-        # Timestamp (ISO 8601 with micros per proto)
         sv_ts = ScalarValue.from_value(datetime(2025, 1, 15, 10, 30, 0, tzinfo=UTC))
         assert sv_ts.kind == "timestamp"
-        assert "2025-01-15T10:30:00" in str(sv_ts.value)
+        assert sv_ts.value == "2025-01-15T10:30:00.000000Z"
 
-        # Bool
         sv_bool = ScalarValue.from_value(True)
         assert sv_bool.kind == "bool"
 
-        # Null
         sv_null = ScalarValue.from_value(None)
         assert sv_null.kind == "null"
 
     def test_float_prohibited(self) -> None:
-        """Float values are prohibited per canonical serialization rules."""
+        """Float values are prohibited per ADR-011."""
         from arco_flow.types.scalar import ScalarValue
 
         with pytest.raises(ValueError, match=r"[Ff]loat"):
@@ -183,7 +166,6 @@ class TestManifestContract:
         json_str = manifest.to_canonical_json()
         data = json.loads(json_str)
 
-        # Required top-level fields
         assert "manifestVersion" in data
         assert "tenantId" in data
         assert "workspaceId" in data
@@ -210,5 +192,5 @@ class TestManifestContract:
 
         assert data["git"]["repository"] == "https://github.com/org/repo"
         assert data["git"]["branch"] == "main"
-        assert data["git"]["commitSha"] == "abc123"  # camelCase
+        assert data["git"]["commitSha"] == "abc123"
         assert data["git"]["dirty"] is True

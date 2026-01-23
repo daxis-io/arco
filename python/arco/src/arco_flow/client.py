@@ -154,16 +154,39 @@ class ArcoFlowApiClient:
         *,
         workspace_id: str,
         selection: list[str],
-        partitions: list[dict[str, str]],
+        partitions: list[dict[str, str]] | None = None,
+        partition_key: str | None = None,
+        include_upstream: bool = False,
+        include_downstream: bool = False,
         run_key: str | None = None,
     ) -> ApiResponse:
         headers = self._build_headers(workspace_id=workspace_id)
+
+        if partitions is None:
+            partitions = []
+
+        if partition_key == "":
+            raise ValueError("partition_key cannot be empty")
+
+        if partition_key and partitions:
+            raise ValueError("use either partition_key or partitions, not both")
+
         payload: dict[str, Any] = {
             "selection": selection,
-            "partitions": partitions,
         }
+        if partition_key:
+            payload["partitionKey"] = partition_key
+        elif partitions:
+            payload["partitions"] = partitions
+
+        if include_upstream:
+            payload["includeUpstream"] = True
+        if include_downstream:
+            payload["includeDownstream"] = True
+
         if run_key:
             payload["runKey"] = run_key
+
         response = self._request_json(
             "POST",
             f"/workspaces/{workspace_id}/runs",
@@ -192,6 +215,46 @@ class ArcoFlowApiClient:
         response = self._request_json(
             "GET",
             f"/workspaces/{workspace_id}/runs/{run_id}",
+            headers=headers,
+        )
+        return ApiResponse(payload=response)
+
+    def rerun_run(
+        self,
+        *,
+        workspace_id: str,
+        run_id: str,
+        mode: str,  # "fromFailure" or "subset"
+        selection: list[str] | None = None,
+        include_upstream: bool = False,
+        include_downstream: bool = False,
+        run_key: str | None = None,
+        labels: dict[str, str] | None = None,
+    ) -> ApiResponse:
+        headers = self._build_headers(workspace_id=workspace_id)
+
+        if selection is None:
+            selection = []
+
+        payload: dict[str, Any] = {
+            "mode": mode,
+            "selection": selection,
+        }
+
+        if include_upstream:
+            payload["includeUpstream"] = True
+        if include_downstream:
+            payload["includeDownstream"] = True
+
+        if run_key:
+            payload["runKey"] = run_key
+        if labels:
+            payload["labels"] = labels
+
+        response = self._request_json(
+            "POST",
+            f"/workspaces/{workspace_id}/runs/{run_id}/rerun",
+            json_body=payload,
             headers=headers,
         )
         return ApiResponse(payload=response)

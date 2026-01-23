@@ -9,6 +9,7 @@
 //! - `GET    /workspaces/{workspace_id}/manifests` - List manifests
 
 use std::collections::HashSet;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -24,11 +25,15 @@ use utoipa::ToSchema;
 
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
+use crate::orchestration_compaction::compact_orchestration_events;
 use crate::paths::{
     MANIFEST_IDEMPOTENCY_PREFIX, MANIFEST_PREFIX, manifest_idempotency_path, manifest_path,
 };
 use crate::server::AppState;
 use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
+use arco_flow::orchestration::compactor::MicroCompactor;
+use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
+use arco_flow::orchestration::ledger::LedgerWriter;
 
 // ============================================================================
 // Request/Response Types
@@ -88,7 +93,7 @@ pub struct GitContext {
 pub struct AssetEntry {
     /// Asset key (namespace + name).
     pub key: AssetKey,
-    /// Asset ID (ULID).
+    /// Asset ID (UUID).
     pub id: String,
     /// Asset description.
     #[serde(default)]
@@ -246,6 +251,14 @@ pub struct ListManifestsResponse {
 }
 
 const MAX_MANIFEST_BYTES: usize = 10 * 1024 * 1024;
+const MANIFEST_LATEST_INDEX_PATH: &str = "manifests/_index.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LatestManifestIndex {
+    latest_manifest_id: String,
+    deployed_at: DateTime<Utc>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -293,9 +306,37 @@ fn validate_manifest(request: &DeployManifestRequest) -> Result<(), ApiError> {
         if asset.id.trim().is_empty() {
             return Err(ApiError::bad_request("asset id is required"));
         }
-        let key = format!("{}/{}", asset.key.namespace, asset.key.name);
-        if !asset_keys.insert(key) {
+
+        let canonical = arco_flow::orchestration::canonicalize_asset_key(&format!(
+            "{}/{}",
+            asset.key.namespace, asset.key.name
+        ))
+        .map_err(ApiError::bad_request)?;
+
+        if !asset_keys.insert(canonical) {
             return Err(ApiError::bad_request("duplicate asset key in manifest"));
+        }
+    }
+
+    for asset in &request.assets {
+        let asset_key = arco_flow::orchestration::canonicalize_asset_key(&format!(
+            "{}/{}",
+            asset.key.namespace, asset.key.name
+        ))
+        .map_err(ApiError::bad_request)?;
+
+        for dependency in &asset.dependencies {
+            let upstream = arco_flow::orchestration::canonicalize_asset_key(&format!(
+                "{}/{}",
+                dependency.upstream_key.namespace, dependency.upstream_key.name
+            ))
+            .map_err(ApiError::bad_request)?;
+
+            if !asset_keys.contains(&upstream) {
+                return Err(ApiError::bad_request(format!(
+                    "asset '{asset_key}' depends on unknown asset '{upstream}'",
+                )));
+            }
         }
     }
 
@@ -307,11 +348,43 @@ fn validate_manifest(request: &DeployManifestRequest) -> Result<(), ApiError> {
         if schedule.cron.trim().is_empty() {
             return Err(ApiError::bad_request("schedule cron is required"));
         }
+
+        let field_count = schedule.cron.split_whitespace().count();
+        if field_count != 5 && field_count != 6 {
+            return Err(ApiError::bad_request(
+                "schedule cron must have 5 fields (min..dow) or 6 fields (sec..dow)",
+            ));
+        }
+        let normalized = if field_count == 5 {
+            format!("0 {}", schedule.cron)
+        } else {
+            schedule.cron.clone()
+        };
+        if cron::Schedule::from_str(&normalized).is_err() {
+            return Err(ApiError::bad_request("invalid schedule cron"));
+        }
+
+        if schedule.timezone.parse::<chrono_tz::Tz>().is_err() {
+            return Err(ApiError::bad_request("invalid schedule timezone"));
+        }
         if schedule.assets.is_empty() {
             return Err(ApiError::bad_request(
                 "schedule must include at least one asset",
             ));
         }
+
+        for asset in &schedule.assets {
+            let canonical = arco_flow::orchestration::canonicalize_asset_key(asset)
+                .map_err(ApiError::bad_request)?;
+
+            if !asset_keys.contains(&canonical) {
+                return Err(ApiError::bad_request(format!(
+                    "schedule '{}' references unknown asset '{canonical}'",
+                    schedule.id
+                )));
+            }
+        }
+
         if !schedule_ids.insert(schedule.id.clone()) {
             return Err(ApiError::bad_request("duplicate schedule id in manifest"));
         }
@@ -377,6 +450,93 @@ async fn load_idempotency_record(
     }
 }
 
+async fn upsert_schedule_definitions(
+    state: &AppState,
+    storage: ScopedStorage,
+    tenant_id: &str,
+    workspace_id: &str,
+    manifest_id: &str,
+    schedules: &[ScheduleEntry],
+) -> Result<(), ApiError> {
+    if schedules.is_empty() {
+        return Ok(());
+    }
+
+    let normalize_asset_selection = |values: &[String]| -> Vec<String> {
+        let mut values = values.to_vec();
+        values.sort();
+        values
+    };
+
+    let compactor = MicroCompactor::new(storage.clone());
+    let (_, fold_state) = compactor
+        .load_state()
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to load orchestration state: {e}")))?;
+
+    let mut events: Vec<OrchestrationEvent> = Vec::new();
+    for schedule in schedules {
+        let schedule_cron_expression = schedule.cron.as_str();
+        let existing = fold_state.schedule_definitions.get(schedule.id.as_str());
+
+        let enabled = existing.is_none_or(|row| row.enabled);
+        let catchup_window_minutes = existing.map_or(0, |row| row.catchup_window_minutes);
+        let max_catchup_ticks = existing.map_or(1, |row| row.max_catchup_ticks);
+
+        let needs_upsert = existing.is_none_or(|row| {
+            row.cron_expression != schedule_cron_expression
+                || row.timezone != schedule.timezone
+                || row.enabled != enabled
+                || row.catchup_window_minutes != catchup_window_minutes
+                || row.max_catchup_ticks != max_catchup_ticks
+                || normalize_asset_selection(&row.asset_selection)
+                    != normalize_asset_selection(&schedule.assets)
+        });
+
+        if !needs_upsert {
+            continue;
+        }
+
+        let mut event = OrchestrationEvent::new(
+            tenant_id,
+            workspace_id,
+            OrchestrationEventData::ScheduleDefinitionUpserted {
+                schedule_id: schedule.id.clone(),
+                cron_expression: schedule.cron.clone(),
+                timezone: schedule.timezone.clone(),
+                catchup_window_minutes,
+                asset_selection: schedule.assets.clone(),
+                max_catchup_ticks,
+                enabled,
+            },
+        );
+
+        if let Some(existing) = existing {
+            while event.event_id <= existing.row_version {
+                event.event_id = Ulid::new().to_string();
+            }
+        }
+
+        event.idempotency_key = format!("sched_def_manifest:{manifest_id}:{}", schedule.id);
+        events.push(event);
+    }
+
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let ledger = LedgerWriter::new(storage.clone());
+    let event_paths: Vec<String> = events.iter().map(LedgerWriter::event_path).collect();
+    ledger
+        .append_all(events)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to append schedule events: {e}")))?;
+
+    compact_orchestration_events(&state.config, storage, event_paths).await?;
+
+    Ok(())
+}
+
 // ============================================================================
 // Route Handlers
 // ============================================================================
@@ -427,6 +587,16 @@ pub(crate) async fn deploy_manifest(
     if let Some(key) = idempotency_key.as_deref() {
         if let Some(existing) = load_idempotency_record(&storage, key).await? {
             if existing.fingerprint == fingerprint {
+                upsert_schedule_definitions(
+                    state.as_ref(),
+                    storage.clone(),
+                    &ctx.tenant,
+                    &workspace_id,
+                    &existing.manifest_id,
+                    &request.schedules,
+                )
+                .await?;
+
                 return Ok((
                     axum::http::StatusCode::OK,
                     Json(DeployManifestResponse {
@@ -520,6 +690,31 @@ pub(crate) async fn deploy_manifest(
             );
         }
     }
+
+    let index = LatestManifestIndex {
+        latest_manifest_id: manifest_id.clone(),
+        deployed_at: now,
+    };
+    let index_json = serde_json::to_string(&index)
+        .map_err(|e| ApiError::internal(format!("failed to serialize manifest index: {e}")))?;
+    storage
+        .put_raw(
+            MANIFEST_LATEST_INDEX_PATH,
+            Bytes::from(index_json),
+            WritePrecondition::None,
+        )
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to store manifest index: {e}")))?;
+
+    upsert_schedule_definitions(
+        state.as_ref(),
+        storage.clone(),
+        &ctx.tenant,
+        &workspace_id,
+        &manifest_id,
+        &request.schedules,
+    )
+    .await?;
 
     tracing::info!(
         manifest_id = %manifest_id,

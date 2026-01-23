@@ -18,7 +18,8 @@
 //! - `POST   /tasks/{task_id}/heartbeat` - Worker heartbeat
 //! - `POST   /tasks/{task_id}/completed` - Worker finished execution
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::extract::Query as AxumQuery;
@@ -36,14 +37,15 @@ use utoipa::{IntoParams, ToSchema};
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
 use crate::orchestration_compaction::compact_orchestration_events;
-use crate::paths::backfill_idempotency_path;
+use crate::paths::{MANIFEST_IDEMPOTENCY_PREFIX, MANIFEST_PREFIX, backfill_idempotency_path};
+use crate::routes::manifests::StoredManifest;
 use crate::server::AppState;
 use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::{
     BackfillChunkRow, BackfillRow, FoldState, MicroCompactor, PartitionStatusRow, RunRow,
-    RunState as FoldRunState, ScheduleStateRow, ScheduleTickRow, SensorEvalRow, SensorStateRow,
-    TaskRow, TaskState as FoldTaskState,
+    RunState as FoldRunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
+    SensorEvalRow, SensorStateRow, TaskRow, TaskState as FoldTaskState,
 };
 use arco_flow::orchestration::controllers::{PubSubMessage, PushSensorHandler};
 use arco_flow::orchestration::events::{
@@ -67,8 +69,67 @@ pub struct TriggerRunRequest {
     /// Asset selection (asset keys to materialize).
     #[serde(default)]
     pub selection: Vec<String>,
-    /// Partition overrides (key=value pairs).
+    /// Include upstream dependencies of the selection.
     #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default)]
+    pub include_downstream: bool,
+    /// Partition overrides (key=value strings). Backward-compatible with older clients.
+    #[serde(default)]
+    pub partitions: Vec<PartitionValue>,
+    /// Canonical partition key string (ADR-011). Preferred; cannot be combined with `partitions`.
+    #[schema(min_length = 1)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_key: Option<String>,
+    /// Idempotency key for deduplication (409 if reused with different payload).
+    /// Reservations created before the fingerprint cutoff remain lenient.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Additional labels for the run.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TriggerRunRequestWithPartitionKey {
+    /// Asset selection (asset keys to materialize).
+    #[serde(default)]
+    pub selection: Vec<String>,
+    /// Include upstream dependencies of the selection.
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default)]
+    pub include_downstream: bool,
+    /// Canonical partition key string (ADR-011).
+    #[schema(min_length = 1)]
+    pub partition_key: String,
+    /// Idempotency key for deduplication (409 if reused with different payload).
+    /// Reservations created before the fingerprint cutoff remain lenient.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Additional labels for the run.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TriggerRunRequestWithPartitions {
+    /// Asset selection (asset keys to materialize).
+    #[serde(default)]
+    pub selection: Vec<String>,
+    /// Include upstream dependencies of the selection.
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default)]
+    pub include_downstream: bool,
+    /// Partition overrides (key=value strings). Backward-compatible with older clients.
     pub partitions: Vec<PartitionValue>,
     /// Idempotency key for deduplication (409 if reused with different payload).
     /// Reservations created before the fingerprint cutoff remain lenient.
@@ -77,6 +138,100 @@ pub struct TriggerRunRequest {
     /// Additional labels for the run.
     #[serde(default)]
     pub labels: HashMap<String, String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TriggerRunRequestUnpartitioned {
+    /// Asset selection (asset keys to materialize).
+    #[serde(default)]
+    pub selection: Vec<String>,
+    /// Include upstream dependencies of the selection.
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default)]
+    pub include_downstream: bool,
+    /// Idempotency key for deduplication (409 if reused with different payload).
+    /// Reservations created before the fingerprint cutoff remain lenient.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Additional labels for the run.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(untagged)]
+pub(crate) enum TriggerRunRequestOpenApi {
+    WithPartitionKey(TriggerRunRequestWithPartitionKey),
+    WithPartitions(TriggerRunRequestWithPartitions),
+    Unpartitioned(TriggerRunRequestUnpartitioned),
+}
+
+/// Rerun mode values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum RerunMode {
+    /// Rerun all tasks that did not succeed in the parent run.
+    FromFailure,
+    /// Rerun a user-chosen subset of tasks from the parent plan.
+    Subset,
+}
+
+/// Rerun kind values exposed in responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RerunKindResponse {
+    /// Rerun tasks that did not succeed.
+    FromFailure,
+    /// Rerun a selected subset.
+    Subset,
+}
+
+/// Request to rerun a prior run.
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RerunRunRequest {
+    /// Rerun mode.
+    pub mode: RerunMode,
+    /// Selection roots for subset reruns.
+    #[serde(default)]
+    pub selection: Vec<String>,
+    /// Include upstream dependencies of the subset.
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the subset.
+    #[serde(default)]
+    pub include_downstream: bool,
+    /// Optional run key override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Additional labels for the rerun.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+/// Response after triggering a rerun.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RerunRunResponse {
+    /// Run ID (ULID).
+    pub run_id: String,
+    /// Plan ID for this run.
+    pub plan_id: String,
+    /// Current run state.
+    pub state: RunStateResponse,
+    /// Whether this is a new run or an existing one (`run_key` deduplication).
+    pub created: bool,
+    /// Run creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Parent run ID.
+    pub parent_run_id: String,
+    /// Rerun kind.
+    pub rerun_kind: RerunKindResponse,
 }
 
 /// Request to backfill a `run_key` reservation fingerprint.
@@ -88,6 +243,12 @@ pub struct RunKeyBackfillRequest {
     /// Asset selection (asset keys to materialize).
     #[serde(default)]
     pub selection: Vec<String>,
+    /// Include upstream dependencies of the selection.
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default)]
+    pub include_downstream: bool,
     /// Partition overrides (key=value pairs).
     #[serde(default)]
     pub partitions: Vec<PartitionValue>,
@@ -184,6 +345,12 @@ pub struct RunResponse {
     /// Run labels.
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Parent run ID (for reruns).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    /// Rerun kind (for reruns).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerun_kind: Option<RerunKindResponse>,
 }
 
 /// Task execution summary.
@@ -303,6 +470,12 @@ pub struct RunListItem {
     pub tasks_succeeded: u32,
     /// Tasks failed.
     pub tasks_failed: u32,
+    /// Parent run ID (for reruns).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    /// Rerun kind (for reruns).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerun_kind: Option<RerunKindResponse>,
 }
 
 /// Request to cancel a run.
@@ -437,6 +610,20 @@ pub struct RunRequestResponse {
 pub struct ScheduleResponse {
     /// Schedule identifier.
     pub schedule_id: String,
+    /// Cron expression for the schedule.
+    pub cron_expression: String,
+    /// IANA timezone used for evaluation.
+    pub timezone: String,
+    /// Maximum time window for catchup.
+    pub catchup_window_minutes: u32,
+    /// Maximum number of ticks to catch up per evaluation.
+    pub max_catchup_ticks: u32,
+    /// Asset selection snapshot stored with the definition.
+    pub asset_selection: Vec<String>,
+    /// Whether the schedule is enabled.
+    pub enabled: bool,
+    /// Current definition version.
+    pub definition_version: String,
     /// Last `scheduled_for` timestamp that was processed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_scheduled_for: Option<DateTime<Utc>>,
@@ -459,6 +646,25 @@ pub struct ListSchedulesResponse {
     pub next_cursor: Option<String>,
 }
 
+/// Request body for creating/updating a schedule definition.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertScheduleRequest {
+    /// Cron expression for the schedule.
+    pub cron_expression: String,
+    /// IANA timezone used for evaluation.
+    pub timezone: String,
+    /// Maximum time window for catchup.
+    pub catchup_window_minutes: u32,
+    /// Maximum number of ticks to catch up per evaluation.
+    pub max_catchup_ticks: u32,
+    /// Asset selection snapshot stored with the definition.
+    #[serde(default)]
+    pub asset_selection: Vec<String>,
+    /// Whether the schedule is enabled.
+    pub enabled: bool,
+}
+
 /// Schedule tick response.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -473,6 +679,12 @@ pub struct ScheduleTickResponse {
     pub asset_selection: Vec<String>,
     /// Tick status.
     pub status: TickStatusResponse,
+    /// Skip reason when status is `SKIPPED`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    /// Error message when status is `FAILED`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
     /// Run key if a run was requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_key: Option<String>,
@@ -926,6 +1138,421 @@ fn ensure_workspace(ctx: &RequestContext, workspace_id: &str) -> Result<(), ApiE
     Ok(())
 }
 
+const MANIFEST_LATEST_INDEX_PATH: &str = "manifests/_index.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LatestManifestIndex {
+    latest_manifest_id: String,
+    deployed_at: DateTime<Utc>,
+}
+
+async fn load_latest_manifest(storage: &ScopedStorage) -> Result<Option<StoredManifest>, ApiError> {
+    match storage.get_raw(MANIFEST_LATEST_INDEX_PATH).await {
+        Ok(bytes) => match serde_json::from_slice::<LatestManifestIndex>(&bytes) {
+            Ok(index) => {
+                let path = crate::paths::manifest_path(&index.latest_manifest_id);
+                match storage.get_raw(&path).await {
+                    Ok(bytes) => match serde_json::from_slice::<StoredManifest>(&bytes) {
+                        Ok(stored) => return Ok(Some(stored)),
+                        Err(err) => {
+                            tracing::warn!(
+                                manifest_id = %index.latest_manifest_id,
+                                error = ?err,
+                                "failed to parse manifest referenced by latest index; falling back to scan"
+                            );
+                        }
+                    },
+                    Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => {
+                        tracing::warn!(
+                            manifest_id = %index.latest_manifest_id,
+                            "latest manifest index referenced missing manifest; falling back to scan"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            manifest_id = %index.latest_manifest_id,
+                            error = ?err,
+                            "failed to read manifest referenced by latest index; falling back to scan"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    "failed to parse latest manifest index; falling back to scan"
+                );
+            }
+        },
+        Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => {}
+        Err(err) => {
+            tracing::warn!(
+                error = ?err,
+                "failed to read latest manifest index; falling back to scan"
+            );
+        }
+    }
+
+    let entries = storage
+        .list_meta(MANIFEST_PREFIX)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to list manifests: {e}")))?;
+
+    let mut latest: Option<StoredManifest> = None;
+
+    for entry in entries {
+        let path = entry.path.as_str();
+        if path.starts_with(MANIFEST_IDEMPOTENCY_PREFIX) || path.ends_with("_index.json") {
+            continue;
+        }
+        if !std::path::Path::new(path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
+            continue;
+        }
+
+        let bytes = match storage.get_raw(path).await {
+            Ok(b) => b,
+            Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => continue,
+            Err(err) => {
+                tracing::warn!(path = %path, error = ?err, "failed to read manifest; skipping");
+                continue;
+            }
+        };
+
+        let stored: StoredManifest = match serde_json::from_slice(&bytes) {
+            Ok(stored) => stored,
+            Err(err) => {
+                tracing::warn!(path = %path, error = ?err, "failed to parse manifest; skipping");
+                continue;
+            }
+        };
+
+        let should_replace = latest
+            .as_ref()
+            .is_none_or(|existing| stored.deployed_at > existing.deployed_at);
+
+        if should_replace {
+            latest = Some(stored);
+        }
+    }
+
+    Ok(latest)
+}
+
+async fn plan_tasks_and_root_assets(
+    storage: &ScopedStorage,
+    request: &TriggerRunRequest,
+) -> Result<(String, DateTime<Utc>, Vec<String>, Vec<TaskDef>), ApiError> {
+    let stored = load_latest_manifest(storage).await?;
+    let Some(stored) = stored else {
+        return Err(ApiError::bad_request(
+            "no manifest deployed for workspace; deploy a manifest before triggering a run",
+        ));
+    };
+
+    let manifest_id = stored.manifest_id.clone();
+    let deployed_at = stored.deployed_at;
+
+    let mut known_assets = HashSet::new();
+    let mut manifest_assets = Vec::with_capacity(stored.assets.len());
+
+    for asset in &stored.assets {
+        let key = arco_flow::orchestration::canonicalize_asset_key(&format!(
+            "{}/{}",
+            asset.key.namespace, asset.key.name
+        ))
+        .map_err(|err| {
+            ApiError::internal(format!(
+                "invalid asset key in manifest {}: {err}",
+                stored.manifest_id
+            ))
+        })?;
+
+        known_assets.insert(key.clone());
+        manifest_assets.push((key, asset.dependencies.as_slice()));
+    }
+
+    let mut graph = arco_flow::orchestration::AssetGraph::new();
+    for (asset_key, deps) in manifest_assets {
+        let mut upstream = Vec::new();
+        for dep in deps {
+            let upstream_key = arco_flow::orchestration::canonicalize_asset_key(&format!(
+                "{}/{}",
+                dep.upstream_key.namespace, dep.upstream_key.name
+            ))
+            .map_err(|err| {
+                ApiError::internal(format!(
+                    "invalid asset dependency key in manifest {}: {err}",
+                    stored.manifest_id
+                ))
+            })?;
+
+            if known_assets.contains(&upstream_key) {
+                upstream.push(upstream_key);
+            } else {
+                tracing::warn!(
+                    asset_key = %asset_key,
+                    upstream_key = %upstream_key,
+                    manifest_id = %stored.manifest_id,
+                    "dropping dependency edge to unknown upstream"
+                );
+            }
+        }
+        graph.insert_asset(asset_key, upstream);
+    }
+
+    let mut roots = BTreeSet::new();
+    let mut unknown_roots = BTreeSet::new();
+    for root in &request.selection {
+        let canonical = arco_flow::orchestration::canonicalize_asset_key(root)
+            .map_err(ApiError::bad_request)?;
+
+        if known_assets.contains(&canonical) {
+            roots.insert(canonical);
+        } else {
+            unknown_roots.insert(canonical);
+        }
+    }
+
+    if !unknown_roots.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "unknown asset keys: {}",
+            unknown_roots.into_iter().collect::<Vec<_>>().join(", ")
+        )));
+    }
+
+    let root_assets: Vec<String> = roots.iter().cloned().collect();
+
+    let partition_key = resolve_partition_key(request)?;
+    let options = arco_flow::orchestration::SelectionOptions {
+        include_upstream: request.include_upstream,
+        include_downstream: request.include_downstream,
+    };
+
+    let tasks = arco_flow::orchestration::build_task_defs_for_selection(
+        &graph,
+        &root_assets,
+        options,
+        partition_key.as_deref(),
+    )
+    .map_err(ApiError::bad_request)?;
+
+    Ok((manifest_id, deployed_at, root_assets, tasks))
+}
+
+type PlanGraph = (
+    HashMap<String, TaskRow>,
+    HashMap<String, Vec<String>>,
+    HashMap<String, Vec<String>>,
+);
+
+fn build_plan_graph_for_run(fold_state: &FoldState, run_id: &str) -> PlanGraph {
+    let mut tasks_by_key = HashMap::new();
+    for row in fold_state.tasks.values().filter(|row| row.run_id == run_id) {
+        tasks_by_key.insert(row.task_key.clone(), row.clone());
+    }
+
+    let mut upstream_by_task: HashMap<String, Vec<String>> = HashMap::new();
+    let mut downstream_by_task: HashMap<String, Vec<String>> = HashMap::new();
+
+    for task_key in tasks_by_key.keys() {
+        upstream_by_task.insert(task_key.clone(), Vec::new());
+        downstream_by_task.insert(task_key.clone(), Vec::new());
+    }
+
+    for edge in fold_state
+        .dep_satisfaction
+        .values()
+        .filter(|edge| edge.run_id == run_id)
+    {
+        if !tasks_by_key.contains_key(&edge.upstream_task_key)
+            || !tasks_by_key.contains_key(&edge.downstream_task_key)
+        {
+            continue;
+        }
+
+        upstream_by_task
+            .entry(edge.downstream_task_key.clone())
+            .or_default()
+            .push(edge.upstream_task_key.clone());
+        downstream_by_task
+            .entry(edge.upstream_task_key.clone())
+            .or_default()
+            .push(edge.downstream_task_key.clone());
+    }
+
+    for value in upstream_by_task.values_mut() {
+        value.sort();
+        value.dedup();
+    }
+    for value in downstream_by_task.values_mut() {
+        value.sort();
+        value.dedup();
+    }
+
+    (tasks_by_key, upstream_by_task, downstream_by_task)
+}
+
+fn close_task_selection(
+    roots: &[String],
+    include_upstream: bool,
+    include_downstream: bool,
+    upstream_by_task: &HashMap<String, Vec<String>>,
+    downstream_by_task: &HashMap<String, Vec<String>>,
+) -> BTreeSet<String> {
+    let mut selected: BTreeSet<String> = roots.iter().cloned().collect();
+
+    if include_upstream {
+        let mut queue: VecDeque<String> = roots.iter().cloned().collect();
+        while let Some(current) = queue.pop_front() {
+            let upstream = upstream_by_task.get(&current).cloned().unwrap_or_default();
+            for upstream_key in upstream {
+                if selected.insert(upstream_key.clone()) {
+                    queue.push_back(upstream_key);
+                }
+            }
+        }
+    }
+
+    if include_downstream {
+        let mut queue: VecDeque<String> = roots.iter().cloned().collect();
+        while let Some(current) = queue.pop_front() {
+            let downstream = downstream_by_task
+                .get(&current)
+                .cloned()
+                .unwrap_or_default();
+            for downstream_key in downstream {
+                if selected.insert(downstream_key.clone()) {
+                    queue.push_back(downstream_key);
+                }
+            }
+        }
+    }
+
+    selected
+}
+
+fn task_defs_for_rerun(
+    tasks_by_key: &HashMap<String, TaskRow>,
+    selected: &BTreeSet<String>,
+    upstream_by_task: &HashMap<String, Vec<String>>,
+) -> Vec<TaskDef> {
+    let mut tasks = Vec::new();
+
+    for task_key in selected {
+        let Some(task_row) = tasks_by_key.get(task_key) else {
+            continue;
+        };
+
+        let mut depends_on: Vec<String> = upstream_by_task
+            .get(task_key)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|upstream| selected.contains(upstream))
+            .collect();
+        depends_on.sort();
+
+        tasks.push(TaskDef {
+            key: task_key.clone(),
+            depends_on,
+            asset_key: task_row.asset_key.clone(),
+            partition_key: task_row.partition_key.clone(),
+            max_attempts: task_row.max_attempts,
+            heartbeat_timeout_sec: task_row.heartbeat_timeout_sec,
+        });
+    }
+
+    tasks.sort_by(|a, b| a.key.cmp(&b.key));
+    tasks
+}
+
+fn compute_rerun_run_key(
+    parent_run_id: &str,
+    rerun_kind: RerunKindResponse,
+    selected_tasks: &BTreeSet<String>,
+    partition_keys: &BTreeSet<String>,
+) -> Result<String, ApiError> {
+    #[derive(Serialize)]
+    struct Payload {
+        parent_run_id: String,
+        rerun_kind: RerunKindResponse,
+        selected_tasks: Vec<String>,
+        partition_keys: Vec<String>,
+    }
+
+    let payload = Payload {
+        parent_run_id: parent_run_id.to_string(),
+        rerun_kind,
+        selected_tasks: selected_tasks.iter().cloned().collect(),
+        partition_keys: partition_keys.iter().cloned().collect(),
+    };
+
+    let json = serde_json::to_vec(&payload).map_err(|e| {
+        ApiError::internal(format!("failed to serialize rerun run_key payload: {e}"))
+    })?;
+    let hash = Sha256::digest(&json);
+    let hex_hash = hex::encode(hash);
+
+    let kind = match rerun_kind {
+        RerunKindResponse::FromFailure => "from_failure",
+        RerunKindResponse::Subset => "subset",
+    };
+
+    Ok(format!("rerun:{parent_run_id}:{kind}:{}", &hex_hash[..16]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_rerun_request_fingerprint(
+    parent_run_id: &str,
+    rerun_kind: RerunKindResponse,
+    roots: &[String],
+    include_upstream: bool,
+    include_downstream: bool,
+    selected_tasks: &BTreeSet<String>,
+    partition_keys: &BTreeSet<String>,
+    labels: &HashMap<String, String>,
+) -> Result<String, ApiError> {
+    #[derive(Serialize)]
+    struct Payload {
+        parent_run_id: String,
+        rerun_kind: RerunKindResponse,
+        roots: Vec<String>,
+        include_upstream: bool,
+        include_downstream: bool,
+        selected_tasks: Vec<String>,
+        partition_keys: Vec<String>,
+        labels: BTreeMap<String, String>,
+    }
+
+    let labels = labels
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let payload = Payload {
+        parent_run_id: parent_run_id.to_string(),
+        rerun_kind,
+        roots: roots.to_vec(),
+        include_upstream,
+        include_downstream,
+        selected_tasks: selected_tasks.iter().cloned().collect(),
+        partition_keys: partition_keys.iter().cloned().collect(),
+        labels,
+    };
+
+    let json = serde_json::to_vec(&payload).map_err(|e| {
+        ApiError::internal(format!(
+            "failed to serialize rerun request fingerprint: {e}"
+        ))
+    })?;
+    let hash = Sha256::digest(&json);
+    Ok(hex::encode(hash))
+}
+
 fn parse_pagination(limit: u32, cursor: Option<&str>) -> Result<(usize, usize), ApiError> {
     if limit == 0 || limit > MAX_LIST_LIMIT {
         return Err(ApiError::bad_request(format!(
@@ -1269,6 +1896,43 @@ fn map_task_state(state: FoldTaskState) -> TaskStateResponse {
     }
 }
 
+const LABEL_PARENT_RUN_ID: &str = "arco.parent_run_id";
+const LABEL_RERUN_KIND: &str = "arco.rerun.kind";
+
+fn rerun_kind_from_label(value: &str) -> Option<RerunKindResponse> {
+    match value {
+        "FROM_FAILURE" => Some(RerunKindResponse::FromFailure),
+        "SUBSET" => Some(RerunKindResponse::Subset),
+        _ => None,
+    }
+}
+
+fn lineage_from_labels(
+    labels: &HashMap<String, String>,
+) -> (Option<String>, Option<RerunKindResponse>) {
+    let parent = labels.get(LABEL_PARENT_RUN_ID).cloned();
+    let kind = labels
+        .get(LABEL_RERUN_KIND)
+        .and_then(|value| rerun_kind_from_label(value));
+    (parent, kind)
+}
+
+fn reject_reserved_lineage_labels(labels: &HashMap<String, String>) -> Result<(), ApiError> {
+    let forbidden = [LABEL_PARENT_RUN_ID, LABEL_RERUN_KIND]
+        .into_iter()
+        .filter(|key| labels.contains_key(*key))
+        .collect::<Vec<_>>();
+
+    if forbidden.is_empty() {
+        return Ok(());
+    }
+
+    Err(ApiError::bad_request(format!(
+        "labels cannot include reserved keys: {}",
+        forbidden.join(", ")
+    )))
+}
+
 fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
     let mut pending = 0;
     let mut queued = 0;
@@ -1297,21 +1961,31 @@ fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
     }
 }
 
-fn build_task_defs(request: &TriggerRunRequest) -> Result<Vec<TaskDef>, ApiError> {
-    let partition_key = build_partition_key(&request.partitions)?;
+fn resolve_partition_key(request: &TriggerRunRequest) -> Result<Option<String>, ApiError> {
+    if request.partition_key.is_some() && !request.partitions.is_empty() {
+        return Err(ApiError::bad_request(
+            "use either partitionKey or partitions, not both",
+        ));
+    }
 
-    Ok(request
-        .selection
-        .iter()
-        .map(|asset_key| TaskDef {
-            key: asset_key.clone(), // task_key = asset_key for simple case
-            depends_on: vec![],
-            asset_key: Some(asset_key.clone()),
-            partition_key: partition_key.clone(),
-            max_attempts: 3,
-            heartbeat_timeout_sec: 300,
-        })
-        .collect())
+    if let Some(raw) = request.partition_key.as_deref() {
+        if raw.is_empty() {
+            return Err(ApiError::bad_request("partitionKey cannot be empty"));
+        }
+
+        let parsed = arco_core::partition::PartitionKey::parse(raw)
+            .map_err(|err| ApiError::bad_request(format!("invalid partitionKey: {err}")))?;
+        let canonical = parsed.canonical_string();
+        if canonical != raw {
+            return Err(ApiError::bad_request(format!(
+                "partitionKey must be canonical: expected '{canonical}'"
+            )));
+        }
+
+        return Ok(Some(raw.to_string()));
+    }
+
+    build_partition_key(&request.partitions)
 }
 
 fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, ApiError> {
@@ -1371,15 +2045,24 @@ fn build_request_fingerprint(request: &TriggerRunRequest) -> Result<String, ApiE
     #[derive(Serialize)]
     struct FingerprintPayload {
         selection: Vec<String>,
-        partitions: Vec<PartitionValue>,
+        include_upstream: bool,
+        include_downstream: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partition_key: Option<String>,
         labels: BTreeMap<String, String>,
     }
 
-    let mut selection = request.selection.clone();
+    let mut selection: Vec<String> = request
+        .selection
+        .iter()
+        .map(|value| {
+            arco_flow::orchestration::canonicalize_asset_key(value).map_err(ApiError::bad_request)
+        })
+        .collect::<Result<_, _>>()?;
     selection.sort();
+    selection.dedup();
 
-    let mut partitions = request.partitions.clone();
-    partitions.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.value.cmp(&b.value)));
+    let partition_key = resolve_partition_key(request)?;
 
     let labels = request
         .labels
@@ -1389,7 +2072,9 @@ fn build_request_fingerprint(request: &TriggerRunRequest) -> Result<String, ApiE
 
     let payload = FingerprintPayload {
         selection,
-        partitions,
+        include_upstream: request.include_upstream,
+        include_downstream: request.include_downstream,
+        partition_key,
         labels,
     };
     let json = serde_json::to_vec(&payload).map_err(|e| {
@@ -1399,6 +2084,146 @@ fn build_request_fingerprint(request: &TriggerRunRequest) -> Result<String, ApiE
     })?;
     let hash = Sha256::digest(&json);
     Ok(hex::encode(hash))
+}
+
+fn build_request_fingerprint_variants(
+    request: &TriggerRunRequest,
+) -> Result<(String, Vec<String>), ApiError> {
+    #[derive(Serialize)]
+    struct LegacyFingerprintPayload {
+        selection: Vec<String>,
+        include_upstream: bool,
+        include_downstream: bool,
+        partitions: Vec<PartitionValue>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partition_key: Option<String>,
+        labels: BTreeMap<String, String>,
+    }
+
+    fn hash_payload<T: Serialize>(payload: &T) -> Result<String, ApiError> {
+        let json = serde_json::to_vec(payload).map_err(|e| {
+            ApiError::internal(format!(
+                "failed to serialize trigger request fingerprint: {e}"
+            ))
+        })?;
+        let hash = Sha256::digest(&json);
+        Ok(hex::encode(hash))
+    }
+
+    let primary = build_request_fingerprint(request)?;
+
+    let mut selection: Vec<String> = request
+        .selection
+        .iter()
+        .map(|value| {
+            arco_flow::orchestration::canonicalize_asset_key(value).map_err(ApiError::bad_request)
+        })
+        .collect::<Result<_, _>>()?;
+    selection.sort();
+    selection.dedup();
+
+    let labels = request
+        .labels
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let resolved_partition_key = resolve_partition_key(request)?;
+
+    let partitions_from_partition_key = match resolved_partition_key.as_deref() {
+        Some(pk) => partitions_from_string_only_partition_key(pk)?,
+        None => None,
+    };
+
+    let mut variants = vec![primary.clone()];
+
+    if let Some(partition_key) = resolved_partition_key.as_ref() {
+        let legacy_partition_key_payload = LegacyFingerprintPayload {
+            selection: selection.clone(),
+            include_upstream: request.include_upstream,
+            include_downstream: request.include_downstream,
+            partitions: Vec::new(),
+            partition_key: Some(partition_key.clone()),
+            labels: labels.clone(),
+        };
+        variants.push(hash_payload(&legacy_partition_key_payload)?);
+    }
+
+    let mut legacy_partitions = if request.partitions.is_empty() {
+        partitions_from_partition_key
+    } else {
+        Some(request.partitions.clone())
+    };
+
+    if let Some(ref mut partitions) = legacy_partitions {
+        partitions.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.value.cmp(&b.value)));
+    }
+
+    if let Some(partitions) = legacy_partitions {
+        let legacy_partitions_payload = LegacyFingerprintPayload {
+            selection,
+            include_upstream: request.include_upstream,
+            include_downstream: request.include_downstream,
+            partitions,
+            partition_key: None,
+            labels,
+        };
+        variants.push(hash_payload(&legacy_partitions_payload)?);
+    }
+
+    variants.sort();
+    variants.dedup();
+
+    Ok((primary, variants))
+}
+
+fn partitions_from_string_only_partition_key(
+    partition_key: &str,
+) -> Result<Option<Vec<PartitionValue>>, ApiError> {
+    let parsed = arco_core::partition::PartitionKey::parse(partition_key).map_err(|err| {
+        ApiError::internal(format!(
+            "failed to parse canonical partitionKey for fingerprint normalization: {err}"
+        ))
+    })?;
+
+    let mut result = Vec::with_capacity(parsed.len());
+    for (key, value) in parsed.iter() {
+        match value {
+            arco_core::partition::ScalarValue::String(s) => result.push(PartitionValue {
+                key: key.clone(),
+                value: s.clone(),
+            }),
+            _ => return Ok(None),
+        }
+    }
+
+    Ok(Some(result))
+}
+
+fn normalize_trigger_run_reservation_result(
+    result: ReservationResult,
+    fingerprint_variants: &[String],
+) -> ReservationResult {
+    match result {
+        ReservationResult::FingerprintMismatch {
+            existing,
+            requested_fingerprint,
+        } => {
+            let is_equivalent = existing
+                .request_fingerprint
+                .as_deref()
+                .is_some_and(|fp| fingerprint_variants.iter().any(|v| v == fp));
+            if is_equivalent {
+                ReservationResult::AlreadyExists(existing)
+            } else {
+                ReservationResult::FingerprintMismatch {
+                    existing,
+                    requested_fingerprint,
+                }
+            }
+        }
+        other => other,
+    }
 }
 
 fn apply_event_metadata(event: &mut OrchestrationEvent, event_id: &str, timestamp: DateTime<Utc>) {
@@ -1433,13 +2258,87 @@ fn map_run_requests(run_requests: &[RunRequest]) -> Vec<RunRequestResponse> {
 // Schedule/Sensor/Backfill/Partition Mapping Helpers
 // ============================================================================
 
-fn map_schedule_state(row: &ScheduleStateRow) -> ScheduleResponse {
+fn map_schedule(def: &ScheduleDefinitionRow, state: Option<&ScheduleStateRow>) -> ScheduleResponse {
     ScheduleResponse {
-        schedule_id: row.schedule_id.clone(),
-        last_scheduled_for: row.last_scheduled_for,
-        last_tick_id: row.last_tick_id.clone(),
-        last_run_key: row.last_run_key.clone(),
+        schedule_id: def.schedule_id.clone(),
+        cron_expression: def.cron_expression.clone(),
+        timezone: def.timezone.clone(),
+        catchup_window_minutes: def.catchup_window_minutes,
+        max_catchup_ticks: def.max_catchup_ticks,
+        asset_selection: def.asset_selection.clone(),
+        enabled: def.enabled,
+        definition_version: def.row_version.clone(),
+        last_scheduled_for: state.and_then(|row| row.last_scheduled_for),
+        last_tick_id: state.and_then(|row| row.last_tick_id.clone()),
+        last_run_key: state.and_then(|row| row.last_run_key.clone()),
     }
+}
+
+fn normalize_asset_selection(values: &[String]) -> Vec<String> {
+    let mut values = values.to_vec();
+    values.sort();
+    values
+}
+
+fn schedule_definition_matches_request(
+    def: &ScheduleDefinitionRow,
+    request: &UpsertScheduleRequest,
+) -> bool {
+    def.cron_expression == request.cron_expression
+        && def.timezone == request.timezone
+        && def.catchup_window_minutes == request.catchup_window_minutes
+        && def.max_catchup_ticks == request.max_catchup_ticks
+        && def.enabled == request.enabled
+        && normalize_asset_selection(&def.asset_selection)
+            == normalize_asset_selection(&request.asset_selection)
+}
+
+fn validate_schedule_upsert(
+    schedule_id: &str,
+    request: &UpsertScheduleRequest,
+) -> Result<(), ApiError> {
+    if schedule_id.is_empty() {
+        return Err(ApiError::bad_request("schedule_id cannot be empty"));
+    }
+
+    if request.asset_selection.is_empty() {
+        return Err(ApiError::bad_request("assetSelection cannot be empty"));
+    }
+
+    for asset in &request.asset_selection {
+        if asset.is_empty() {
+            return Err(ApiError::bad_request(
+                "assetSelection items cannot be empty",
+            ));
+        }
+    }
+
+    if request.max_catchup_ticks == 0 {
+        return Err(ApiError::bad_request("maxCatchupTicks must be >= 1"));
+    }
+
+    let field_count = request.cron_expression.split_whitespace().count();
+    if field_count != 5 && field_count != 6 {
+        return Err(ApiError::bad_request(
+            "cronExpression must have 5 fields (min..dow) or 6 fields (sec..dow)",
+        ));
+    }
+
+    let normalized = if field_count == 5 {
+        format!("0 {}", request.cron_expression)
+    } else {
+        request.cron_expression.clone()
+    };
+
+    if cron::Schedule::from_str(&normalized).is_err() {
+        return Err(ApiError::bad_request("invalid cronExpression"));
+    }
+
+    if request.timezone.parse::<chrono_tz::Tz>().is_err() {
+        return Err(ApiError::bad_request("invalid timezone"));
+    }
+
+    Ok(())
 }
 
 fn map_tick_status(status: &TickStatus) -> TickStatusResponse {
@@ -1451,12 +2350,20 @@ fn map_tick_status(status: &TickStatus) -> TickStatusResponse {
 }
 
 fn map_schedule_tick(row: &ScheduleTickRow) -> ScheduleTickResponse {
+    let (skip_reason, error_message) = match &row.status {
+        TickStatus::Skipped { reason } => (Some(reason.clone()), None),
+        TickStatus::Failed { error } => (None, Some(error.clone())),
+        TickStatus::Triggered => (None, None),
+    };
+
     ScheduleTickResponse {
         tick_id: row.tick_id.clone(),
         schedule_id: row.schedule_id.clone(),
         scheduled_for: row.scheduled_for,
         asset_selection: row.asset_selection.clone(),
         status: map_tick_status(&row.status),
+        skip_reason,
+        error_message,
         run_key: row.run_key.clone(),
         run_id: row.run_id.clone(),
     }
@@ -1653,7 +2560,7 @@ fn filter_ticks_by_status(
     params(
         ("workspace_id" = String, Path, description = "Workspace ID")
     ),
-    request_body = TriggerRunRequest,
+    request_body = TriggerRunRequestOpenApi,
     responses(
         (status = 201, description = "Run created", body = TriggerRunResponse),
         (status = 200, description = "Existing run returned (run_key match)", body = TriggerRunResponse),
@@ -1688,8 +2595,7 @@ pub(crate) async fn trigger_run(
         return Err(ApiError::bad_request("selection cannot be empty"));
     }
 
-    let tasks = build_task_defs(&request)?;
-    let root_assets = request.selection.clone();
+    reject_reserved_lineage_labels(&request.labels)?;
 
     // Generate IDs upfront (needed for reservation)
     let run_id = Ulid::new().to_string();
@@ -1702,11 +2608,133 @@ pub(crate) async fn trigger_run(
     let ledger = LedgerWriter::new(storage.clone());
     let mut run_event_overrides: Option<RunEventOverrides> = None;
 
-    let request_fingerprint = if request.run_key.is_some() {
-        Some(build_request_fingerprint(&request)?)
+    let (request_fingerprint, request_fingerprint_variants) = if request.run_key.is_some() {
+        let (primary, variants) = build_request_fingerprint_variants(&request)?;
+        (Some(primary), variants)
     } else {
-        None
+        (None, Vec::new())
     };
+
+    if let Some(ref run_key) = request.run_key {
+        let fingerprint_policy =
+            FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff);
+
+        let existing = get_reservation(&storage, run_key)
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to read run_key reservation: {e}")))?;
+
+        if let Some(existing) = existing {
+            let fingerprints_match = match (
+                existing.request_fingerprint.as_deref(),
+                request_fingerprint.as_deref(),
+            ) {
+                (Some(existing_fp), Some(_)) => request_fingerprint_variants
+                    .iter()
+                    .any(|fp| fp == existing_fp),
+                (None, None) => true,
+                (None, Some(_)) => match fingerprint_policy.cutoff {
+                    None => true,
+                    Some(cutoff) => existing.created_at < cutoff,
+                },
+                (Some(_), None) => false,
+            };
+
+            if !fingerprints_match {
+                tracing::warn!(
+                    run_key = %existing.run_key,
+                    run_id = %existing.run_id,
+                    existing_fingerprint = ?existing.request_fingerprint,
+                    requested_fingerprint = ?request_fingerprint,
+                    existing_created_at = %existing.created_at,
+                    fingerprint_cutoff = ?fingerprint_policy.cutoff,
+                    "run_key reused with different trigger payload (fingerprint mismatch)"
+                );
+
+                return Err(ApiError::conflict(format!(
+                    "run_key '{}' already reserved with different trigger payload",
+                    existing.run_key
+                )));
+            }
+
+            let mut run_state = RunStateResponse::Pending;
+            let mut run_found = false;
+
+            match load_orchestration_state(&ctx, &state).await {
+                Ok(fold_state) => {
+                    if let Some(run) = fold_state.runs.get(&existing.run_id) {
+                        run_state = map_run_row_state(run);
+                        run_found = true;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        run_key = %existing.run_key,
+                        run_id = %existing.run_id,
+                        error = ?err,
+                        "failed to load orchestration state for run_key lookup"
+                    );
+                }
+            }
+
+            if !run_found {
+                let (manifest_id, deployed_at, root_assets, tasks) =
+                    plan_tasks_and_root_assets(&storage, &request).await?;
+
+                let plan_event_id = existing.plan_event_id.clone().unwrap_or_else(|| {
+                    let new_id = Ulid::new().to_string();
+                    tracing::warn!(
+                        run_key = %existing.run_key,
+                        run_id = %existing.run_id,
+                        "missing plan_event_id in reservation; generating new plan event id"
+                    );
+                    new_id
+                });
+
+                tracing::info!(
+                    manifest_id = %manifest_id,
+                    manifest_deployed_at = %deployed_at,
+                    run_id = %existing.run_id,
+                    "re-emitting run plan from latest manifest"
+                );
+
+                let event_paths = append_run_events(
+                    &ledger,
+                    &ctx.tenant,
+                    &workspace_id,
+                    user_id.clone(),
+                    &existing.run_id,
+                    &existing.plan_id,
+                    Some(existing.run_key.clone()),
+                    request.labels.clone(),
+                    state.config.code_version.clone(),
+                    root_assets,
+                    tasks,
+                    Some(RunEventOverrides {
+                        run_event_id: existing.event_id.clone(),
+                        plan_event_id,
+                        created_at: existing.created_at,
+                    }),
+                )
+                .await?;
+
+                compact_orchestration_events(&state.config, storage.clone(), event_paths).await?;
+            }
+
+            return Ok((
+                StatusCode::OK,
+                Json(TriggerRunResponse {
+                    run_id: existing.run_id,
+                    plan_id: existing.plan_id,
+                    state: run_state,
+                    created: false,
+                    created_at: existing.created_at,
+                }),
+            ));
+        }
+    }
+
+    let (manifest_id, deployed_at, root_assets, tasks) =
+        plan_tasks_and_root_assets(&storage, &request).await?;
 
     // If run_key provided, attempt to reserve it (strong idempotency)
     if let Some(ref run_key) = request.run_key {
@@ -1724,10 +2752,15 @@ pub(crate) async fn trigger_run(
 
         let fingerprint_policy =
             FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff);
-        match reserve_run_key(&storage, &reservation, fingerprint_policy)
+        let reservation_result = reserve_run_key(&storage, &reservation, fingerprint_policy)
             .await
-            .map_err(|e| ApiError::internal(format!("failed to reserve run_key: {e}")))?
-        {
+            .map_err(|e| ApiError::internal(format!("failed to reserve run_key: {e}")))?;
+        let reservation_result = normalize_trigger_run_reservation_result(
+            reservation_result,
+            &request_fingerprint_variants,
+        );
+
+        match reservation_result {
             ReservationResult::Reserved => {
                 // We won the race - proceed to emit events
                 tracing::debug!(run_key = %run_key, "run_key reserved, proceeding with run creation");
@@ -1738,11 +2771,14 @@ pub(crate) async fn trigger_run(
                 });
             }
             ReservationResult::AlreadyExists(existing) => {
-                if let (Some(existing_fp), Some(current_fp)) = (
+                if let (Some(existing_fp), Some(_)) = (
                     existing.request_fingerprint.as_deref(),
                     request_fingerprint.as_deref(),
                 ) {
-                    if existing_fp != current_fp {
+                    if !request_fingerprint_variants
+                        .iter()
+                        .any(|fp| fp == existing_fp)
+                    {
                         tracing::warn!(
                             run_key = %existing.run_key,
                             run_id = %existing.run_id,
@@ -1792,6 +2828,13 @@ pub(crate) async fn trigger_run(
                         );
                         new_id
                     });
+
+                    tracing::info!(
+                        manifest_id = %manifest_id,
+                        manifest_deployed_at = %deployed_at,
+                        run_id = %existing.run_id,
+                        "re-emitting run plan from latest manifest"
+                    );
 
                     let event_paths = append_run_events(
                         &ledger,
@@ -1849,6 +2892,16 @@ pub(crate) async fn trigger_run(
         }
     }
 
+    tracing::info!(
+        manifest_id = %manifest_id,
+        manifest_deployed_at = %deployed_at,
+        root_assets = ?root_assets,
+        include_upstream = request.include_upstream,
+        include_downstream = request.include_downstream,
+        planned_tasks = tasks.len(),
+        "planning run from latest manifest"
+    );
+
     let event_paths = append_run_events(
         &ledger,
         &ctx.tenant,
@@ -1875,6 +2928,289 @@ pub(crate) async fn trigger_run(
             state: RunStateResponse::Pending,
             created: true,
             created_at: now,
+        }),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/runs/{run_id}/rerun",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("run_id" = String, Path, description = "Run ID")
+    ),
+    request_body = RerunRunRequest,
+    responses(
+        (status = 201, description = "Rerun created", body = RerunRunResponse),
+        (status = 200, description = "Existing rerun returned (run_key match)", body = RerunRunResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorBody),
+        (status = 409, description = "Conflict", body = ApiErrorBody),
+        (status = 404, description = "Run not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(
+        ("bearerAuth" = [])
+    )
+)]
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn rerun_run(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, parent_run_id)): Path<(String, String)>,
+    Json(request): Json<RerunRunRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    reject_reserved_lineage_labels(&request.labels)?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let parent_run = fold_state
+        .runs
+        .get(&parent_run_id)
+        .ok_or_else(|| ApiError::not_found(format!("run not found: {parent_run_id}")))?;
+
+    let rerun_kind = match request.mode {
+        RerunMode::FromFailure => RerunKindResponse::FromFailure,
+        RerunMode::Subset => RerunKindResponse::Subset,
+    };
+
+    if rerun_kind == RerunKindResponse::FromFailure && parent_run.state != FoldRunState::Failed {
+        return Err(ApiError::conflict(
+            "rerun-from-failure requires a FAILED parent run".to_string(),
+        ));
+    }
+
+    let (tasks_by_key, upstream_by_task, downstream_by_task) =
+        build_plan_graph_for_run(&fold_state, &parent_run_id);
+
+    if tasks_by_key.is_empty() {
+        return Err(ApiError::conflict(
+            "parent run has no plan; cannot rerun".to_string(),
+        ));
+    }
+
+    let (roots, selected, include_upstream, include_downstream) = match rerun_kind {
+        RerunKindResponse::FromFailure => {
+            let mut selected = BTreeSet::new();
+            for (task_key, task_row) in &tasks_by_key {
+                if task_row.state != FoldTaskState::Succeeded {
+                    selected.insert(task_key.clone());
+                }
+            }
+
+            let roots: Vec<String> = selected.iter().cloned().collect();
+            (roots, selected, false, false)
+        }
+        RerunKindResponse::Subset => {
+            if request.selection.is_empty() {
+                return Err(ApiError::bad_request("selection cannot be empty"));
+            }
+
+            let mut roots = BTreeSet::new();
+            let mut unknown = BTreeSet::new();
+            for value in &request.selection {
+                let canonical = arco_flow::orchestration::canonicalize_asset_key(value)
+                    .map_err(ApiError::bad_request)?;
+
+                if tasks_by_key.contains_key(&canonical) {
+                    roots.insert(canonical);
+                } else {
+                    unknown.insert(canonical);
+                }
+            }
+
+            if !unknown.is_empty() {
+                return Err(ApiError::bad_request(format!(
+                    "unknown task keys: {}",
+                    unknown.into_iter().collect::<Vec<_>>().join(", ")
+                )));
+            }
+
+            let roots_vec: Vec<String> = roots.iter().cloned().collect();
+            let selected = close_task_selection(
+                &roots_vec,
+                request.include_upstream,
+                request.include_downstream,
+                &upstream_by_task,
+                &downstream_by_task,
+            );
+
+            (
+                roots_vec,
+                selected,
+                request.include_upstream,
+                request.include_downstream,
+            )
+        }
+    };
+
+    if selected.is_empty() {
+        return Err(ApiError::bad_request("rerun selection is empty"));
+    }
+
+    let mut partition_keys = BTreeSet::new();
+    for task_key in &selected {
+        let Some(row) = tasks_by_key.get(task_key) else {
+            continue;
+        };
+        if let Some(partition_key) = row.partition_key.as_ref() {
+            partition_keys.insert(partition_key.clone());
+        }
+    }
+
+    let root_assets = roots.clone();
+    let tasks = task_defs_for_rerun(&tasks_by_key, &selected, &upstream_by_task);
+
+    let mut labels = request.labels.clone();
+    labels.insert(LABEL_PARENT_RUN_ID.to_string(), parent_run_id.clone());
+    labels.insert(
+        LABEL_RERUN_KIND.to_string(),
+        match rerun_kind {
+            RerunKindResponse::FromFailure => "FROM_FAILURE".to_string(),
+            RerunKindResponse::Subset => "SUBSET".to_string(),
+        },
+    );
+
+    let run_key = match request.run_key.clone() {
+        Some(value) => value,
+        None => compute_rerun_run_key(&parent_run_id, rerun_kind, &selected, &partition_keys)?,
+    };
+
+    let request_fingerprint = Some(compute_rerun_request_fingerprint(
+        &parent_run_id,
+        rerun_kind,
+        &root_assets,
+        include_upstream,
+        include_downstream,
+        &selected,
+        &partition_keys,
+        &labels,
+    )?);
+
+    let now = Utc::now();
+    let run_id = Ulid::new().to_string();
+    let plan_id = Ulid::new().to_string();
+
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+    let ledger = LedgerWriter::new(storage.clone());
+
+    let fingerprint_policy =
+        FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff);
+
+    let run_event_id = Ulid::new().to_string();
+    let plan_event_id = Ulid::new().to_string();
+
+    let reservation = RunKeyReservation {
+        run_key: run_key.clone(),
+        run_id: run_id.clone(),
+        plan_id: plan_id.clone(),
+        event_id: run_event_id.clone(),
+        plan_event_id: Some(plan_event_id.clone()),
+        request_fingerprint: request_fingerprint.clone(),
+        created_at: now,
+    };
+
+    let run_event_overrides = match reserve_run_key(&storage, &reservation, fingerprint_policy)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to reserve run_key: {e}")))?
+    {
+        ReservationResult::Reserved => Some(RunEventOverrides {
+            run_event_id,
+            plan_event_id,
+            created_at: now,
+        }),
+        ReservationResult::AlreadyExists(existing) => {
+            let mut run_state = RunStateResponse::Pending;
+            let mut run_found = false;
+
+            if let Ok(fold_state) = load_orchestration_state(&ctx, &state).await {
+                if let Some(run) = fold_state.runs.get(&existing.run_id) {
+                    run_state = map_run_row_state(run);
+                    run_found = true;
+                }
+            }
+
+            if !run_found {
+                let user_id = user_id_for_events(&ctx);
+                let plan_event_id = existing
+                    .plan_event_id
+                    .clone()
+                    .unwrap_or_else(|| Ulid::new().to_string());
+
+                let event_paths = append_run_events(
+                    &ledger,
+                    &ctx.tenant,
+                    &workspace_id,
+                    user_id,
+                    &existing.run_id,
+                    &existing.plan_id,
+                    Some(existing.run_key.clone()),
+                    labels.clone(),
+                    parent_run.code_version.clone(),
+                    root_assets.clone(),
+                    tasks.clone(),
+                    Some(RunEventOverrides {
+                        run_event_id: existing.event_id.clone(),
+                        plan_event_id,
+                        created_at: existing.created_at,
+                    }),
+                )
+                .await?;
+
+                compact_orchestration_events(&state.config, storage.clone(), event_paths).await?;
+            }
+
+            return Ok((
+                StatusCode::OK,
+                Json(RerunRunResponse {
+                    run_id: existing.run_id,
+                    plan_id: existing.plan_id,
+                    state: run_state,
+                    created: false,
+                    created_at: existing.created_at,
+                    parent_run_id,
+                    rerun_kind,
+                }),
+            ));
+        }
+        ReservationResult::FingerprintMismatch { existing, .. } => {
+            return Err(ApiError::conflict(format!(
+                "run_key '{}' already reserved with different trigger payload",
+                existing.run_key
+            )));
+        }
+    };
+
+    let user_id = user_id_for_events(&ctx);
+
+    let event_paths = append_run_events(
+        &ledger,
+        &ctx.tenant,
+        &workspace_id,
+        user_id,
+        &run_id,
+        &plan_id,
+        Some(run_key),
+        labels,
+        parent_run.code_version.clone(),
+        root_assets,
+        tasks,
+        run_event_overrides,
+    )
+    .await?;
+
+    compact_orchestration_events(&state.config, storage.clone(), event_paths).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(RerunRunResponse {
+            run_id,
+            plan_id,
+            state: RunStateResponse::Pending,
+            created: true,
+            created_at: now,
+            parent_run_id,
+            rerun_kind,
         }),
     ))
 }
@@ -2038,7 +3374,10 @@ pub(crate) async fn backfill_run_key(
 
     let fingerprint_request = TriggerRunRequest {
         selection: request.selection.clone(),
+        include_upstream: request.include_upstream,
+        include_downstream: request.include_downstream,
         partitions: request.partitions.clone(),
+        partition_key: None,
         run_key: Some(request.run_key.clone()),
         labels: request.labels.clone(),
     };
@@ -2183,6 +3522,8 @@ pub(crate) async fn get_run(
         })
         .collect::<Vec<_>>();
 
+    let (parent_run_id, rerun_kind) = lineage_from_labels(&run.labels);
+
     let response = RunResponse {
         run_id: run.run_id.clone(),
         workspace_id,
@@ -2194,6 +3535,8 @@ pub(crate) async fn get_run(
         tasks: task_summaries,
         task_counts,
         labels: run.labels.clone(),
+        parent_run_id,
+        rerun_kind,
     };
 
     Ok(Json(response))
@@ -2274,14 +3617,19 @@ pub(crate) async fn list_runs(
 
     let items = page
         .iter()
-        .map(|row| RunListItem {
-            run_id: row.run_id.clone(),
-            state: map_run_row_state(row),
-            created_at: row.triggered_at,
-            completed_at: row.completed_at,
-            task_count: row.tasks_total,
-            tasks_succeeded: row.tasks_succeeded,
-            tasks_failed: row.tasks_failed,
+        .map(|row| {
+            let (parent_run_id, rerun_kind) = lineage_from_labels(&row.labels);
+            RunListItem {
+                run_id: row.run_id.clone(),
+                state: map_run_row_state(row),
+                created_at: row.triggered_at,
+                completed_at: row.completed_at,
+                task_count: row.tasks_total,
+                tasks_succeeded: row.tasks_succeeded,
+                tasks_failed: row.tasks_failed,
+                parent_run_id,
+                rerun_kind,
+            }
         })
         .collect::<Vec<_>>();
 
@@ -2555,9 +3903,12 @@ pub(crate) async fn list_schedules(
     let fold_state = load_orchestration_state(&ctx, &state).await?;
 
     let mut schedules: Vec<ScheduleResponse> = fold_state
-        .schedule_state
+        .schedule_definitions
         .values()
-        .map(map_schedule_state)
+        .map(|def| {
+            let state = fold_state.schedule_state.get(def.schedule_id.as_str());
+            map_schedule(def, state)
+        })
         .collect();
     schedules.sort_by(|a, b| a.schedule_id.cmp(&b.schedule_id));
 
@@ -2592,12 +3943,257 @@ pub(crate) async fn get_schedule(
     ensure_workspace(&ctx, &workspace_id)?;
     let fold_state = load_orchestration_state(&ctx, &state).await?;
 
-    let schedule = fold_state
-        .schedule_state
-        .get(&schedule_id)
+    let definition = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
         .ok_or_else(|| ApiError::not_found(format!("schedule not found: {schedule_id}")))?;
 
-    Ok(Json(map_schedule_state(schedule)))
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    Ok(Json(map_schedule(definition, schedule_state)))
+}
+
+pub(crate) async fn upsert_schedule(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, schedule_id)): Path<(String, String)>,
+    Json(request): Json<UpsertScheduleRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    validate_schedule_upsert(&schedule_id, &request)?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let existing = fold_state.schedule_definitions.get(schedule_id.as_str());
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    if let Some(existing) = existing {
+        if schedule_definition_matches_request(existing, &request) {
+            return Ok((StatusCode::OK, Json(map_schedule(existing, schedule_state))));
+        }
+    }
+
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+
+    let ledger = LedgerWriter::new(storage.clone());
+    let existed = existing.is_some();
+
+    let mut event = OrchestrationEvent::new(
+        &ctx.tenant,
+        &workspace_id,
+        OrchestrationEventData::ScheduleDefinitionUpserted {
+            schedule_id: schedule_id.clone(),
+            cron_expression: request.cron_expression,
+            timezone: request.timezone,
+            catchup_window_minutes: request.catchup_window_minutes,
+            asset_selection: request.asset_selection,
+            max_catchup_ticks: request.max_catchup_ticks,
+            enabled: request.enabled,
+        },
+    );
+
+    if let Some(existing) = existing {
+        while event.event_id <= existing.row_version {
+            event.event_id = Ulid::new().to_string();
+        }
+    }
+
+    let request_key = ctx
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| event.event_id.clone());
+    event.idempotency_key = format!("sched_def_api:{schedule_id}:{request_key}");
+
+    let event_path = LedgerWriter::event_path(&event);
+
+    ledger.append(event).await.map_err(|e| {
+        ApiError::internal(format!("failed to append schedule definition event: {e}"))
+    })?;
+
+    compact_orchestration_events(&state.config, storage, vec![event_path]).await?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let definition = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
+        .ok_or_else(|| ApiError::internal("schedule definition missing after upsert"))?;
+
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    let status_code = if existed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+
+    Ok((status_code, Json(map_schedule(definition, schedule_state))))
+}
+
+pub(crate) async fn enable_schedule(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, schedule_id)): Path<(String, String)>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let existing = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
+        .ok_or_else(|| ApiError::not_found(format!("schedule not found: {schedule_id}")))?;
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    if existing.enabled {
+        return Ok((StatusCode::OK, Json(map_schedule(existing, schedule_state))));
+    }
+
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+
+    let ledger = LedgerWriter::new(storage.clone());
+    let mut event = OrchestrationEvent::new(
+        &ctx.tenant,
+        &workspace_id,
+        OrchestrationEventData::ScheduleDefinitionUpserted {
+            schedule_id: schedule_id.clone(),
+            cron_expression: existing.cron_expression.clone(),
+            timezone: existing.timezone.clone(),
+            catchup_window_minutes: existing.catchup_window_minutes,
+            asset_selection: existing.asset_selection.clone(),
+            max_catchup_ticks: existing.max_catchup_ticks,
+            enabled: true,
+        },
+    );
+
+    while event.event_id <= existing.row_version {
+        event.event_id = Ulid::new().to_string();
+    }
+
+    let request_key = ctx
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| event.event_id.clone());
+    event.idempotency_key = format!("sched_enable:{schedule_id}:{request_key}");
+
+    let event_path = LedgerWriter::event_path(&event);
+
+    ledger.append(event).await.map_err(|e| {
+        ApiError::internal(format!("failed to append schedule definition event: {e}"))
+    })?;
+
+    compact_orchestration_events(&state.config, storage, vec![event_path]).await?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let definition = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
+        .ok_or_else(|| ApiError::internal("schedule definition missing after enable"))?;
+
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    Ok((
+        StatusCode::OK,
+        Json(map_schedule(definition, schedule_state)),
+    ))
+}
+
+pub(crate) async fn disable_schedule(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, schedule_id)): Path<(String, String)>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let existing = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
+        .ok_or_else(|| ApiError::not_found(format!("schedule not found: {schedule_id}")))?;
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    if !existing.enabled {
+        return Ok((StatusCode::OK, Json(map_schedule(existing, schedule_state))));
+    }
+
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+
+    let ledger = LedgerWriter::new(storage.clone());
+    let mut event = OrchestrationEvent::new(
+        &ctx.tenant,
+        &workspace_id,
+        OrchestrationEventData::ScheduleDefinitionUpserted {
+            schedule_id: schedule_id.clone(),
+            cron_expression: existing.cron_expression.clone(),
+            timezone: existing.timezone.clone(),
+            catchup_window_minutes: existing.catchup_window_minutes,
+            asset_selection: existing.asset_selection.clone(),
+            max_catchup_ticks: existing.max_catchup_ticks,
+            enabled: false,
+        },
+    );
+
+    while event.event_id <= existing.row_version {
+        event.event_id = Ulid::new().to_string();
+    }
+
+    let request_key = ctx
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| event.event_id.clone());
+    event.idempotency_key = format!("sched_disable:{schedule_id}:{request_key}");
+
+    let event_path = LedgerWriter::event_path(&event);
+
+    ledger.append(event).await.map_err(|e| {
+        ApiError::internal(format!("failed to append schedule definition event: {e}"))
+    })?;
+
+    compact_orchestration_events(&state.config, storage, vec![event_path]).await?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let definition = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
+        .ok_or_else(|| ApiError::internal("schedule definition missing after disable"))?;
+
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    Ok((
+        StatusCode::OK,
+        Json(map_schedule(definition, schedule_state)),
+    ))
+}
+
+pub(crate) async fn get_schedule_tick(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, schedule_id, tick_id)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    if !fold_state
+        .schedule_definitions
+        .contains_key(schedule_id.as_str())
+    {
+        return Err(ApiError::not_found(format!(
+            "schedule not found: {schedule_id}"
+        )));
+    }
+
+    let tick = fold_state
+        .schedule_ticks
+        .get(tick_id.as_str())
+        .ok_or_else(|| ApiError::not_found(format!("tick not found: {tick_id}")))?;
+
+    if tick.schedule_id != schedule_id {
+        return Err(ApiError::not_found(format!("tick not found: {tick_id}")));
+    }
+
+    Ok(Json(map_schedule_tick(tick)))
 }
 
 /// List schedule ticks.
@@ -2637,7 +4233,11 @@ pub(crate) async fn list_schedule_ticks(
         .map(map_schedule_tick)
         .collect();
     filter_ticks_by_status(&mut ticks, query.status);
-    ticks.sort_by(|a, b| b.scheduled_for.cmp(&a.scheduled_for));
+    ticks.sort_by(|a, b| {
+        b.scheduled_for
+            .cmp(&a.scheduled_for)
+            .then_with(|| b.tick_id.cmp(&a.tick_id))
+    });
 
     let (page, next_cursor) = paginate(&ticks, limit, offset);
 
@@ -3169,6 +4769,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/workspaces/:workspace_id/runs", get(list_runs))
         .route("/workspaces/:workspace_id/runs/:run_id", get(get_run))
         .route(
+            "/workspaces/:workspace_id/runs/:run_id/rerun",
+            post(rerun_run),
+        )
+        .route(
             "/workspaces/:workspace_id/runs/run-key/backfill",
             post(backfill_run_key),
         )
@@ -3188,11 +4792,23 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/workspaces/:workspace_id/schedules", get(list_schedules))
         .route(
             "/workspaces/:workspace_id/schedules/:schedule_id",
-            get(get_schedule),
+            get(get_schedule).put(upsert_schedule),
+        )
+        .route(
+            "/workspaces/:workspace_id/schedules/:schedule_id/enable",
+            post(enable_schedule),
+        )
+        .route(
+            "/workspaces/:workspace_id/schedules/:schedule_id/disable",
+            post(disable_schedule),
         )
         .route(
             "/workspaces/:workspace_id/schedules/:schedule_id/ticks",
             get(list_schedule_ticks),
+        )
+        .route(
+            "/workspaces/:workspace_id/schedules/:schedule_id/ticks/:tick_id",
+            get(get_schedule_tick),
         )
         // Sensors
         .route("/workspaces/:workspace_id/sensors", get(list_sensors))
@@ -3232,6 +4848,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes::manifests::{AssetEntry, AssetKey, GitContext};
     use anyhow::{Result, anyhow};
     use arco_core::partition::{PartitionKey, ScalarValue};
     use axum::http::StatusCode;
@@ -3252,6 +4869,138 @@ mod tests {
     }
 
     #[test]
+    fn test_trigger_request_deserialization_partition_key() {
+        let json = r#"{
+            "selection": ["analytics/users"],
+            "partitionKey": "date=s:MjAyNC0wMS0xNQ",
+            "runKey": "daily-etl:2024-01-15"
+        }"#;
+
+        let request: TriggerRunRequest = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(request.selection, vec!["analytics/users"]);
+        assert_eq!(
+            request.partition_key.as_deref(),
+            Some("date=s:MjAyNC0wMS0xNQ")
+        );
+        assert!(request.partitions.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_partition_key_rejects_both_partition_key_and_partitions() {
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![PartitionValue {
+                key: "date".to_string(),
+                value: "2024-01-15".to_string(),
+            }],
+            partition_key: Some("date=s:MjAyNC0wMS0xNQ".to_string()),
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err = resolve_partition_key(&request).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_resolve_partition_key_rejects_noncanonical_partition_key() {
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: Some("tenant=s:YWNtZQ,date=s:MjAyNC0wMS0xNQ".to_string()),
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err = resolve_partition_key(&request).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.message().contains("canonical"));
+    }
+
+    #[test]
+    fn test_resolve_partition_key_accepts_canonical_partition_key() -> Result<()> {
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: Some("date=s:MjAyNC0wMS0xNQ,tenant=s:YWNtZQ".to_string()),
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let resolved = resolve_partition_key(&request).map_err(|err| anyhow!("{err:?}"))?;
+        assert_eq!(
+            resolved.as_deref(),
+            Some("date=s:MjAyNC0wMS0xNQ,tenant=s:YWNtZQ")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_partition_key_rejects_empty_partition_key() {
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: Some("".to_string()),
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err = resolve_partition_key(&request).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_request_fingerprint_equivalent_for_partition_key_and_partitions() -> Result<()> {
+        let partitions = vec![
+            PartitionValue {
+                key: "region".to_string(),
+                value: "us-east-1".to_string(),
+            },
+            PartitionValue {
+                key: "date".to_string(),
+                value: "2024-01-15".to_string(),
+            },
+        ];
+
+        let request_with_partitions = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: partitions.clone(),
+            partition_key: None,
+            run_key: Some("daily-etl:2024-01-15".to_string()),
+            labels: HashMap::new(),
+        };
+
+        let canonical = build_partition_key(&partitions).map_err(|err| anyhow!("{err:?}"))?;
+        let request_with_partition_key = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: canonical,
+            run_key: Some("daily-etl:2024-01-15".to_string()),
+            labels: HashMap::new(),
+        };
+
+        let fingerprint_partitions = build_request_fingerprint(&request_with_partitions)
+            .map_err(|err| anyhow!("{err:?}"))?;
+        let fingerprint_partition_key = build_request_fingerprint(&request_with_partition_key)
+            .map_err(|err| anyhow!("{err:?}"))?;
+
+        assert_eq!(fingerprint_partitions, fingerprint_partition_key);
+        Ok(())
+    }
+
+    #[test]
     fn test_run_response_serialization() {
         let response = RunResponse {
             run_id: "run_123".to_string(),
@@ -3264,6 +5013,8 @@ mod tests {
             tasks: vec![],
             task_counts: TaskCounts::default(),
             labels: HashMap::new(),
+            parent_run_id: None,
+            rerun_kind: None,
         };
 
         let json = serde_json::to_string(&response).expect("serialize");
@@ -3401,6 +5152,8 @@ mod tests {
                 scheduled_for: Utc::now(),
                 asset_selection: vec![],
                 status: TickStatusResponse::Triggered,
+                skip_reason: None,
+                error_message: None,
                 run_key: None,
                 run_id: None,
             },
@@ -3410,6 +5163,8 @@ mod tests {
                 scheduled_for: Utc::now(),
                 asset_selection: vec![],
                 status: TickStatusResponse::Failed,
+                skip_reason: None,
+                error_message: Some("boom".to_string()),
                 run_key: None,
                 run_id: None,
             },
@@ -3428,7 +5183,9 @@ mod tests {
         labels.insert("team".to_string(), "infra".to_string());
 
         let request_a = TriggerRunRequest {
-            selection: vec!["b".to_string(), "a".to_string()],
+            selection: vec!["analytics.b".to_string(), "analytics.a".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![
                 PartitionValue {
                     key: "date".to_string(),
@@ -3439,6 +5196,7 @@ mod tests {
                     value: "us-east-1".to_string(),
                 },
             ],
+            partition_key: None,
             run_key: Some("daily:2024-01-01".to_string()),
             labels: labels.clone(),
         };
@@ -3448,7 +5206,9 @@ mod tests {
         labels_reordered.insert("env".to_string(), "prod".to_string());
 
         let request_b = TriggerRunRequest {
-            selection: vec!["a".to_string(), "b".to_string()],
+            selection: vec!["analytics.a".to_string(), "analytics.b".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![
                 PartitionValue {
                     key: "region".to_string(),
@@ -3459,6 +5219,7 @@ mod tests {
                     value: "2024-01-01".to_string(),
                 },
             ],
+            partition_key: None,
             run_key: Some("daily:2024-01-01".to_string()),
             labels: labels_reordered,
         };
@@ -3473,46 +5234,37 @@ mod tests {
     }
 
     #[test]
-    fn test_build_task_defs_canonical_partition_key() -> Result<()> {
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string()],
-            partitions: vec![
-                PartitionValue {
-                    key: "region".to_string(),
-                    value: "us-east-1".to_string(),
-                },
-                PartitionValue {
-                    key: "date".to_string(),
-                    value: "2024-01-15".to_string(),
-                },
-            ],
-            run_key: None,
-            labels: HashMap::new(),
-        };
+    fn test_build_partition_key_canonical_string() -> Result<()> {
+        let partitions = vec![
+            PartitionValue {
+                key: "region".to_string(),
+                value: "us-east-1".to_string(),
+            },
+            PartitionValue {
+                key: "date".to_string(),
+                value: "2024-01-15".to_string(),
+            },
+        ];
 
-        let tasks = build_task_defs(&request).map_err(|err| anyhow!("{err:?}"))?;
+        let partition_key = build_partition_key(&partitions).map_err(|err| anyhow!("{err:?}"))?;
+
         let mut pk = PartitionKey::new();
         pk.insert("region", ScalarValue::String("us-east-1".to_string()));
         pk.insert("date", ScalarValue::String("2024-01-15".to_string()));
         let expected = pk.canonical_string();
 
-        assert_eq!(tasks[0].partition_key.as_deref(), Some(expected.as_str()));
+        assert_eq!(partition_key.as_deref(), Some(expected.as_str()));
         Ok(())
     }
 
     #[test]
-    fn test_build_task_defs_rejects_invalid_partition_key() {
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string()],
-            partitions: vec![PartitionValue {
-                key: "Date".to_string(),
-                value: "2024-01-15".to_string(),
-            }],
-            run_key: None,
-            labels: HashMap::new(),
-        };
+    fn test_build_partition_key_rejects_invalid_partition_key() {
+        let partitions = vec![PartitionValue {
+            key: "Date".to_string(),
+            value: "2024-01-15".to_string(),
+        }];
 
-        assert!(build_task_defs(&request).is_err());
+        assert!(build_partition_key(&partitions).is_err());
     }
 
     #[tokio::test]
@@ -3531,7 +5283,10 @@ mod tests {
 
         let request = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
+            partition_key: None,
             run_key: Some("daily:2024-01-01".to_string()),
             labels: HashMap::new(),
         };
@@ -3539,15 +5294,72 @@ mod tests {
         let backend = state.storage_backend()?;
         let storage = ctx.scoped_storage(backend)?;
 
+        let manifest_id = Ulid::new().to_string();
+        let stored_manifest = StoredManifest {
+            manifest_id: manifest_id.clone(),
+            tenant_id: ctx.tenant.clone(),
+            workspace_id: ctx.workspace.clone(),
+            manifest_version: "1.0".to_string(),
+            code_version_id: "abc123".to_string(),
+            fingerprint: "fp".to_string(),
+            git: GitContext::default(),
+            assets: vec![AssetEntry {
+                key: AssetKey {
+                    namespace: "analytics".to_string(),
+                    name: "users".to_string(),
+                },
+                id: "01HQXYZ123".to_string(),
+                description: String::new(),
+                owners: vec![],
+                tags: serde_json::Value::Null,
+                partitioning: serde_json::Value::Null,
+                dependencies: vec![],
+                code: serde_json::Value::Null,
+                checks: vec![],
+                execution: serde_json::Value::Null,
+                resources: serde_json::Value::Null,
+                io: serde_json::Value::Null,
+                transform_fingerprint: String::new(),
+            }],
+            schedules: vec![],
+            deployed_at: Utc::now(),
+            deployed_by: "test".to_string(),
+            metadata: serde_json::Value::Null,
+        };
+
+        let manifest_path = crate::paths::manifest_path(&manifest_id);
+        storage
+            .put_raw(
+                &manifest_path,
+                Bytes::from(serde_json::to_vec(&stored_manifest)?),
+                WritePrecondition::None,
+            )
+            .await?;
+        storage
+            .put_raw(
+                MANIFEST_LATEST_INDEX_PATH,
+                Bytes::from(serde_json::to_vec(&LatestManifestIndex {
+                    latest_manifest_id: manifest_id,
+                    deployed_at: stored_manifest.deployed_at,
+                })?),
+                WritePrecondition::None,
+            )
+            .await?;
+
         let reservation = RunKeyReservation {
             run_key: "daily:2024-01-01".to_string(),
             run_id: Ulid::new().to_string(),
             plan_id: Ulid::new().to_string(),
             event_id: Ulid::new().to_string(),
             plan_event_id: Some(Ulid::new().to_string()),
-            request_fingerprint: Some(
-                build_request_fingerprint(&request).map_err(|err| anyhow!("{err:?}"))?,
-            ),
+            request_fingerprint: Some({
+                let (primary, variants) = build_request_fingerprint_variants(&request)
+                    .map_err(|err| anyhow!("{err:?}"))?;
+                variants
+                    .into_iter()
+                    .find(|fp| fp != &primary)
+                    .unwrap_or(primary)
+            }),
             created_at: Utc::now(),
         };
 
@@ -3583,7 +5395,7 @@ mod tests {
                 trigger: TriggerInfo::Manual {
                     user_id: user_id_for_events(&ctx),
                 },
-                root_assets: vec!["analytics/users".to_string()],
+                root_assets: vec!["analytics.users".to_string()],
                 run_key: Some(reservation.run_key.clone()),
                 labels: request.labels.clone(),
                 code_version: None,
@@ -3607,7 +5419,22 @@ mod tests {
             OrchestrationEventData::PlanCreated {
                 run_id: reservation.run_id.clone(),
                 plan_id: reservation.plan_id.clone(),
-                tasks: build_task_defs(&request).map_err(|err| anyhow!("{err:?}"))?,
+                tasks: {
+                    let graph = arco_flow::orchestration::AssetGraph::new();
+                    let partition_key =
+                        resolve_partition_key(&request).map_err(|err| anyhow!("{err:?}"))?;
+                    let options = arco_flow::orchestration::SelectionOptions {
+                        include_upstream: request.include_upstream,
+                        include_downstream: request.include_downstream,
+                    };
+                    arco_flow::orchestration::build_task_defs_for_selection(
+                        &graph,
+                        &request.selection,
+                        options,
+                        partition_key.as_deref(),
+                    )
+                    .map_err(|err| anyhow!("{err}"))?
+                },
             },
         );
         apply_event_metadata(&mut plan_event, &plan_event_id, reservation.created_at);
@@ -3616,6 +5443,92 @@ mod tests {
         let stored_plan: OrchestrationEvent = serde_json::from_slice(&plan_bytes)?;
         assert_eq!(stored_plan.event_id, plan_event_id);
         assert_eq!(stored_plan.event_type, "PlanCreated");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_trigger_run_normalizes_reserve_run_key_fingerprint_mismatch_for_equivalent_variants()
+    -> Result<()> {
+        let mut config = crate::config::Config::default();
+        config.debug = true;
+        let state = Arc::new(AppState::with_memory_storage(config));
+
+        let ctx = RequestContext {
+            tenant: "tenant".to_string(),
+            workspace: "workspace".to_string(),
+            user_id: Some("user@example.com".to_string()),
+            request_id: "req_01".to_string(),
+            idempotency_key: None,
+        };
+
+        let partitions = vec![
+            PartitionValue {
+                key: "region".to_string(),
+                value: "us-east-1".to_string(),
+            },
+            PartitionValue {
+                key: "date".to_string(),
+                value: "2024-01-15".to_string(),
+            },
+        ];
+
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions,
+            partition_key: None,
+            run_key: Some("daily:2024-01-15".to_string()),
+            labels: HashMap::new(),
+        };
+
+        let (primary, variants) =
+            build_request_fingerprint_variants(&request).map_err(|err| anyhow!("{err:?}"))?;
+        let legacy = variants
+            .iter()
+            .find(|fp| *fp != &primary)
+            .cloned()
+            .expect("expected legacy fingerprint variant");
+
+        let backend = state.storage_backend()?;
+        let storage = ctx.scoped_storage(backend)?;
+
+        let run_key = request.run_key.clone().expect("run_key");
+
+        let legacy_reservation = RunKeyReservation {
+            run_key: run_key.clone(),
+            run_id: Ulid::new().to_string(),
+            plan_id: Ulid::new().to_string(),
+            event_id: Ulid::new().to_string(),
+            plan_event_id: Some(Ulid::new().to_string()),
+            request_fingerprint: Some(legacy),
+            created_at: Utc::now(),
+        };
+
+        let reserved =
+            reserve_run_key(&storage, &legacy_reservation, FingerprintPolicy::lenient()).await?;
+        assert!(matches!(reserved, ReservationResult::Reserved));
+
+        let new_reservation = RunKeyReservation {
+            run_key: run_key.clone(),
+            run_id: Ulid::new().to_string(),
+            plan_id: Ulid::new().to_string(),
+            event_id: Ulid::new().to_string(),
+            plan_event_id: Some(Ulid::new().to_string()),
+            request_fingerprint: Some(primary),
+            created_at: Utc::now(),
+        };
+
+        let result =
+            reserve_run_key(&storage, &new_reservation, FingerprintPolicy::lenient()).await?;
+        assert!(matches!(
+            result,
+            ReservationResult::FingerprintMismatch { .. }
+        ));
+
+        let normalized = normalize_trigger_run_reservation_result(result, &variants);
+        assert!(matches!(normalized, ReservationResult::AlreadyExists(_)));
 
         Ok(())
     }
@@ -3636,14 +5549,20 @@ mod tests {
 
         let request_a = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
+            partition_key: None,
             run_key: Some("daily:2024-01-01".to_string()),
             labels: HashMap::new(),
         };
 
         let request_b = TriggerRunRequest {
             selection: vec!["analytics/orders".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
+            partition_key: None,
             run_key: Some("daily:2024-01-01".to_string()),
             labels: HashMap::new(),
         };
@@ -3684,6 +5603,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_trigger_run_falls_back_to_scan_when_index_points_to_missing_manifest()
+    -> Result<()> {
+        let mut config = crate::config::Config::default();
+        config.debug = true;
+        let state = Arc::new(AppState::with_memory_storage(config));
+
+        let ctx = RequestContext {
+            tenant: "tenant".to_string(),
+            workspace: "workspace".to_string(),
+            user_id: Some("user@example.com".to_string()),
+            request_id: "req_01".to_string(),
+            idempotency_key: None,
+        };
+
+        let backend = state.storage_backend()?;
+        let storage = ctx.scoped_storage(backend)?;
+
+        let manifest_id = Ulid::new().to_string();
+        let stored_manifest = StoredManifest {
+            manifest_id: manifest_id.clone(),
+            tenant_id: ctx.tenant.clone(),
+            workspace_id: ctx.workspace.clone(),
+            manifest_version: "1.0".to_string(),
+            code_version_id: "abc123".to_string(),
+            fingerprint: "fp".to_string(),
+            git: GitContext::default(),
+            assets: vec![AssetEntry {
+                key: AssetKey {
+                    namespace: "analytics".to_string(),
+                    name: "orders".to_string(),
+                },
+                id: "01HQXYZ123".to_string(),
+                description: String::new(),
+                owners: vec![],
+                tags: serde_json::Value::Null,
+                partitioning: serde_json::Value::Null,
+                dependencies: vec![],
+                code: serde_json::Value::Null,
+                checks: vec![],
+                execution: serde_json::Value::Null,
+                resources: serde_json::Value::Null,
+                io: serde_json::Value::Null,
+                transform_fingerprint: String::new(),
+            }],
+            schedules: vec![],
+            deployed_at: Utc::now(),
+            deployed_by: "test".to_string(),
+            metadata: serde_json::Value::Null,
+        };
+
+        let manifest_path = crate::paths::manifest_path(&manifest_id);
+        storage
+            .put_raw(
+                &manifest_path,
+                Bytes::from(serde_json::to_vec(&stored_manifest)?),
+                WritePrecondition::None,
+            )
+            .await?;
+
+        storage
+            .put_raw(
+                MANIFEST_LATEST_INDEX_PATH,
+                Bytes::from(serde_json::to_vec(&LatestManifestIndex {
+                    latest_manifest_id: "missing".to_string(),
+                    deployed_at: stored_manifest.deployed_at,
+                })?),
+                WritePrecondition::None,
+            )
+            .await?;
+
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/orders".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: None,
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let response = trigger_run(
+            State(state),
+            ctx.clone(),
+            Path(ctx.workspace.clone()),
+            Json(request),
+        )
+        .await
+        .map_err(|err| anyhow!("{err:?}"))?
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_backfill_run_key_updates_missing_fingerprint() -> Result<()> {
         let cutoff = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let mut config = crate::config::Config::default();
@@ -3702,13 +5716,18 @@ mod tests {
         let request = RunKeyBackfillRequest {
             run_key: "daily:2024-01-01".to_string(),
             selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
             labels: HashMap::new(),
         };
 
         let fingerprint_request = TriggerRunRequest {
             selection: request.selection.clone(),
+            include_upstream: request.include_upstream,
+            include_downstream: request.include_downstream,
             partitions: request.partitions.clone(),
+            partition_key: None,
             run_key: Some(request.run_key.clone()),
             labels: request.labels.clone(),
         };
@@ -3770,7 +5789,10 @@ mod tests {
 
         let request_a = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
+            partition_key: None,
             run_key: Some("daily:2024-01-01".to_string()),
             labels: HashMap::new(),
         };
@@ -3778,6 +5800,8 @@ mod tests {
         let request_b = RunKeyBackfillRequest {
             run_key: "daily:2024-01-01".to_string(),
             selection: vec!["analytics/orders".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
             labels: HashMap::new(),
         };

@@ -449,6 +449,24 @@ pub enum OrchestrationEventData {
     // ========================================================================
     // Automation Events (Layer 2)
     // ========================================================================
+    /// Upserts the schedule definition used for tick evaluation.
+    ScheduleDefinitionUpserted {
+        /// Schedule identifier (ULID).
+        schedule_id: String,
+        /// Cron expression for the schedule.
+        cron_expression: String,
+        /// IANA timezone used for evaluation.
+        timezone: String,
+        /// Maximum time window for catchup.
+        catchup_window_minutes: u32,
+        /// Asset selection snapshot stored with the definition.
+        asset_selection: Vec<String>,
+        /// Maximum number of ticks to catch up per evaluation.
+        max_catchup_ticks: u32,
+        /// Whether the schedule is enabled.
+        enabled: bool,
+    },
+
     /// A schedule tick has been evaluated.
     ScheduleTicked {
         /// Schedule identifier (ULID).
@@ -591,6 +609,7 @@ impl OrchestrationEventData {
             Self::DispatchEnqueued { .. } => "DispatchEnqueued",
             Self::TimerEnqueued { .. } => "TimerEnqueued",
             Self::TimerFired { .. } => "TimerFired",
+            Self::ScheduleDefinitionUpserted { .. } => "ScheduleDefinitionUpserted",
             Self::ScheduleTicked { .. } => "ScheduleTicked",
             Self::SensorEvaluated { .. } => "SensorEvaluated",
             Self::RunRequested { .. } => "RunRequested",
@@ -625,14 +644,12 @@ impl OrchestrationEventData {
                 attempt_id,
                 heartbeat_at,
                 ..
-            } => heartbeat_at.as_ref().map_or_else(
-                || format!("heartbeat:{run_id}:{task_key}:{attempt}:{attempt_id}"),
-                |ts| {
-                    format!(
-                        "heartbeat:{run_id}:{task_key}:{attempt}:{attempt_id}:{}",
-                        ts.timestamp_millis()
-                    )
-                },
+            } => Self::task_heartbeat_idempotency_key(
+                run_id,
+                task_key,
+                *attempt,
+                attempt_id,
+                heartbeat_at.as_ref(),
             ),
             Self::TaskFinished {
                 run_id,
@@ -647,6 +664,24 @@ impl OrchestrationEventData {
             Self::TimerEnqueued { timer_id, .. } => format!("timer_ack:{timer_id}"),
             Self::TimerFired { timer_id, .. } => format!("timer_fired:{timer_id}"),
 
+            Self::ScheduleDefinitionUpserted {
+                schedule_id,
+                cron_expression,
+                timezone,
+                catchup_window_minutes,
+                asset_selection,
+                max_catchup_ticks,
+                enabled,
+            } => Self::schedule_definition_idempotency_key(
+                schedule_id,
+                cron_expression,
+                timezone,
+                *catchup_window_minutes,
+                asset_selection,
+                *max_catchup_ticks,
+                *enabled,
+            ),
+
             Self::ScheduleTicked { tick_id, .. } => format!("sched_tick:{tick_id}"),
 
             Self::SensorEvaluated {
@@ -654,30 +689,23 @@ impl OrchestrationEventData {
                 trigger_source,
                 cursor_before,
                 ..
-            } => match trigger_source {
-                TriggerSource::Push { message_id } => {
-                    format!("sensor_eval:{sensor_id}:msg:{message_id}")
-                }
-                TriggerSource::Poll { poll_epoch } => {
-                    let cursor_hash = cursor_before
-                        .as_ref()
-                        .map_or_else(|| "none".to_string(), |c| sha256_hex(c));
-                    format!("sensor_eval:{sensor_id}:poll:{poll_epoch}:{cursor_hash}")
-                }
-            },
+            } => Self::sensor_evaluated_idempotency_key(
+                sensor_id,
+                trigger_source,
+                cursor_before.as_deref(),
+            ),
 
             Self::RunRequested {
                 run_key,
                 request_fingerprint,
                 ..
-            } => {
-                let fp_hash = sha256_hex(request_fingerprint);
-                format!("runreq:{run_key}:{fp_hash}")
-            }
+            } => Self::run_requested_idempotency_key(run_key, request_fingerprint),
 
             Self::BackfillCreated {
                 client_request_id, ..
-            } => format!("backfill_create:{client_request_id}"),
+            } => {
+                format!("backfill_create:{client_request_id}")
+            }
 
             Self::BackfillChunkPlanned {
                 backfill_id,
@@ -691,17 +719,84 @@ impl OrchestrationEventData {
                 to_state,
                 ..
             } => {
-                let to_state = match to_state {
-                    BackfillState::Pending => "PENDING",
-                    BackfillState::Running => "RUNNING",
-                    BackfillState::Paused => "PAUSED",
-                    BackfillState::Succeeded => "SUCCEEDED",
-                    BackfillState::Failed => "FAILED",
-                    BackfillState::Cancelled => "CANCELLED",
-                };
-                format!("backfill_state:{backfill_id}:{state_version}:{to_state}")
+                Self::backfill_state_changed_idempotency_key(backfill_id, *state_version, *to_state)
             }
         }
+    }
+
+    fn task_heartbeat_idempotency_key(
+        run_id: &str,
+        task_key: &str,
+        attempt: u32,
+        attempt_id: &str,
+        heartbeat_at: Option<&DateTime<Utc>>,
+    ) -> String {
+        heartbeat_at.as_ref().map_or_else(
+            || format!("heartbeat:{run_id}:{task_key}:{attempt}:{attempt_id}"),
+            |ts| {
+                format!(
+                    "heartbeat:{run_id}:{task_key}:{attempt}:{attempt_id}:{}",
+                    ts.timestamp_millis()
+                )
+            },
+        )
+    }
+
+    fn schedule_definition_idempotency_key(
+        schedule_id: &str,
+        cron_expression: &str,
+        timezone: &str,
+        catchup_window_minutes: u32,
+        asset_selection: &[String],
+        max_catchup_ticks: u32,
+        enabled: bool,
+    ) -> String {
+        let mut asset_selection = asset_selection.to_vec();
+        asset_selection.sort();
+
+        let input = format!(
+            "{cron_expression}|{timezone}|{catchup_window_minutes}|{max_catchup_ticks}|{enabled}|{}",
+            asset_selection.join(",")
+        );
+        let fp = sha256_hex(&input);
+        format!("sched_def:{schedule_id}:{fp}")
+    }
+
+    fn sensor_evaluated_idempotency_key(
+        sensor_id: &str,
+        trigger_source: &TriggerSource,
+        cursor_before: Option<&str>,
+    ) -> String {
+        match trigger_source {
+            TriggerSource::Push { message_id } => {
+                format!("sensor_eval:{sensor_id}:msg:{message_id}")
+            }
+            TriggerSource::Poll { poll_epoch } => {
+                let cursor_hash = cursor_before.map_or_else(|| "none".to_string(), sha256_hex);
+                format!("sensor_eval:{sensor_id}:poll:{poll_epoch}:{cursor_hash}")
+            }
+        }
+    }
+
+    fn run_requested_idempotency_key(run_key: &str, request_fingerprint: &str) -> String {
+        let fp_hash = sha256_hex(request_fingerprint);
+        format!("runreq:{run_key}:{fp_hash}")
+    }
+
+    fn backfill_state_changed_idempotency_key(
+        backfill_id: &str,
+        state_version: u32,
+        to_state: BackfillState,
+    ) -> String {
+        let to_state = match to_state {
+            BackfillState::Pending => "PENDING",
+            BackfillState::Running => "RUNNING",
+            BackfillState::Paused => "PAUSED",
+            BackfillState::Succeeded => "SUCCEEDED",
+            BackfillState::Failed => "FAILED",
+            BackfillState::Cancelled => "CANCELLED",
+        };
+        format!("backfill_state:{backfill_id}:{state_version}:{to_state}")
     }
 
     /// Returns the run ID if this event is associated with a run.
@@ -722,7 +817,8 @@ impl OrchestrationEventData {
             | Self::TimerFired { run_id, .. } => run_id.as_deref(),
 
             // Automation events don't have direct run_id (runs are created at fold time)
-            Self::ScheduleTicked { .. }
+            Self::ScheduleDefinitionUpserted { .. }
+            | Self::ScheduleTicked { .. }
             | Self::SensorEvaluated { .. }
             | Self::RunRequested { .. }
             | Self::BackfillCreated { .. }

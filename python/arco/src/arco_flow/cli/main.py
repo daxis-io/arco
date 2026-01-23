@@ -108,7 +108,34 @@ def deploy(
 
 @app.command()
 def run(
-    asset: Annotated[str, typer.Argument(help="Asset key to run (namespace.name).")],
+    asset: Annotated[
+        str | None,
+        typer.Argument(help="Asset key to run (namespace.name)."),
+    ] = None,
+    assets: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--asset",
+            "-a",
+            help="Asset keys to run (repeatable; also used as subset roots with --rerun).",
+        ),
+    ] = None,
+    rerun: Annotated[
+        str | None,
+        typer.Option("--rerun", help="Parent run ID to rerun."),
+    ] = None,
+    from_failure: Annotated[
+        bool,
+        typer.Option("--from-failure", help="Rerun only tasks that did not succeed."),
+    ] = False,
+    include_upstream: Annotated[
+        bool,
+        typer.Option("--include-upstream", help="Include upstream dependencies."),
+    ] = False,
+    include_downstream: Annotated[
+        bool,
+        typer.Option("--include-downstream", help="Include downstream dependents."),
+    ] = False,
     partition: Annotated[
         list[str] | None,
         typer.Option("--partition", "-p", help="Partition value (key=value)."),
@@ -139,6 +166,11 @@ def run(
 
     run_asset(
         asset=asset,
+        assets=assets or [],
+        rerun=rerun,
+        from_failure=from_failure,
+        include_upstream=include_upstream,
+        include_downstream=include_downstream,
         partitions=partition or [],
         wait=wait,
         timeout=timeout,

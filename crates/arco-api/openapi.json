@@ -1985,7 +1985,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/TriggerRunRequest"
+                "$ref": "#/components/schemas/TriggerRunRequestOpenApi"
               }
             }
           },
@@ -2415,6 +2415,101 @@
           },
           "409": {
             "description": "Log already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/workspaces/{workspace_id}/runs/{run_id}/rerun": {
+      "post": {
+        "tags": [
+          "Orchestration"
+        ],
+        "operationId": "rerun_run",
+        "parameters": [
+          {
+            "name": "workspace_id",
+            "in": "path",
+            "description": "Workspace ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "path",
+            "description": "Run ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RerunRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Existing rerun returned (run_key match)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RerunRunResponse"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Rerun created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RerunRunResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Run not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
             "content": {
               "application/json": {
                 "schema": {
@@ -2985,7 +3080,7 @@
           },
           "id": {
             "type": "string",
-            "description": "Asset ID (ULID)."
+            "description": "Asset ID (UUID)."
           },
           "io": {
             "description": "I/O configuration."
@@ -4702,6 +4797,111 @@
           }
         }
       },
+      "RerunKindResponse": {
+        "type": "string",
+        "description": "Rerun kind values exposed in responses.",
+        "enum": [
+          "FROM_FAILURE",
+          "SUBSET"
+        ]
+      },
+      "RerunMode": {
+        "type": "string",
+        "description": "Rerun mode values.",
+        "enum": [
+          "fromFailure",
+          "subset"
+        ]
+      },
+      "RerunRunRequest": {
+        "type": "object",
+        "description": "Request to rerun a prior run.",
+        "required": [
+          "mode"
+        ],
+        "properties": {
+          "includeDownstream": {
+            "type": "boolean",
+            "description": "Include downstream dependents of the subset."
+          },
+          "includeUpstream": {
+            "type": "boolean",
+            "description": "Include upstream dependencies of the subset."
+          },
+          "labels": {
+            "type": "object",
+            "description": "Additional labels for the rerun.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "mode": {
+            "$ref": "#/components/schemas/RerunMode",
+            "description": "Rerun mode."
+          },
+          "runKey": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional run key override."
+          },
+          "selection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Selection roots for subset reruns."
+          }
+        }
+      },
+      "RerunRunResponse": {
+        "type": "object",
+        "description": "Response after triggering a rerun.",
+        "required": [
+          "runId",
+          "planId",
+          "state",
+          "created",
+          "createdAt",
+          "parentRunId",
+          "rerunKind"
+        ],
+        "properties": {
+          "created": {
+            "type": "boolean",
+            "description": "Whether this is a new run or an existing one (`run_key` deduplication)."
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Run creation timestamp."
+          },
+          "parentRunId": {
+            "type": "string",
+            "description": "Parent run ID."
+          },
+          "planId": {
+            "type": "string",
+            "description": "Plan ID for this run."
+          },
+          "rerunKind": {
+            "$ref": "#/components/schemas/RerunKindResponse",
+            "description": "Rerun kind."
+          },
+          "runId": {
+            "type": "string",
+            "description": "Run ID (ULID)."
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunStateResponse",
+            "description": "Current run state."
+          }
+        }
+      },
       "RunKeyBackfillRequest": {
         "type": "object",
         "description": "Request to backfill a `run_key` reservation fingerprint.",
@@ -4709,6 +4909,14 @@
           "runKey"
         ],
         "properties": {
+          "includeDownstream": {
+            "type": "boolean",
+            "description": "Include downstream dependents of the selection."
+          },
+          "includeUpstream": {
+            "type": "boolean",
+            "description": "Include upstream dependencies of the selection."
+          },
           "labels": {
             "type": "object",
             "description": "Additional labels for the run.",
@@ -4797,6 +5005,24 @@
             "type": "string",
             "format": "date-time",
             "description": "Creation timestamp."
+          },
+          "parentRunId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Parent run ID (for reruns)."
+          },
+          "rerunKind": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RerunKindResponse",
+                "description": "Rerun kind (for reruns)."
+              }
+            ]
           },
           "runId": {
             "type": "string",
@@ -4959,9 +5185,27 @@
               "type": "string"
             }
           },
+          "parentRunId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Parent run ID (for reruns)."
+          },
           "planId": {
             "type": "string",
             "description": "Plan ID."
+          },
+          "rerunKind": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RerunKindResponse",
+                "description": "Rerun kind (for reruns)."
+              }
+            ]
           },
           "runId": {
             "type": "string",
@@ -5043,9 +5287,41 @@
         "type": "object",
         "description": "Schedule state response.",
         "required": [
-          "scheduleId"
+          "scheduleId",
+          "cronExpression",
+          "timezone",
+          "catchupWindowMinutes",
+          "maxCatchupTicks",
+          "assetSelection",
+          "enabled",
+          "definitionVersion"
         ],
         "properties": {
+          "assetSelection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Asset selection snapshot stored with the definition."
+          },
+          "catchupWindowMinutes": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Maximum time window for catchup.",
+            "minimum": 0
+          },
+          "cronExpression": {
+            "type": "string",
+            "description": "Cron expression for the schedule."
+          },
+          "definitionVersion": {
+            "type": "string",
+            "description": "Current definition version."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the schedule is enabled."
+          },
           "lastRunKey": {
             "type": [
               "string",
@@ -5068,9 +5344,19 @@
             ],
             "description": "Last tick ID that was processed."
           },
+          "maxCatchupTicks": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Maximum number of ticks to catch up per evaluation.",
+            "minimum": 0
+          },
           "scheduleId": {
             "type": "string",
             "description": "Schedule identifier."
+          },
+          "timezone": {
+            "type": "string",
+            "description": "IANA timezone used for evaluation."
           }
         }
       },
@@ -5091,6 +5377,13 @@
               "type": "string"
             },
             "description": "Asset selection at tick time."
+          },
+          "errorMessage": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Error message when status is `FAILED`."
           },
           "runId": {
             "type": [
@@ -5114,6 +5407,13 @@
             "type": "string",
             "format": "date-time",
             "description": "When this tick was scheduled for."
+          },
+          "skipReason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Skip reason when status is `SKIPPED`."
           },
           "status": {
             "$ref": "#/components/schemas/TickStatusResponse",
@@ -5858,10 +6158,30 @@
           "FAILED"
         ]
       },
-      "TriggerRunRequest": {
+      "TriggerRunRequestOpenApi": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/TriggerRunRequestWithPartitionKey"
+          },
+          {
+            "$ref": "#/components/schemas/TriggerRunRequestWithPartitions"
+          },
+          {
+            "$ref": "#/components/schemas/TriggerRunRequestUnpartitioned"
+          }
+        ]
+      },
+      "TriggerRunRequestUnpartitioned": {
         "type": "object",
-        "description": "Request to trigger a new run.",
         "properties": {
+          "includeDownstream": {
+            "type": "boolean",
+            "description": "Include downstream dependents of the selection."
+          },
+          "includeUpstream": {
+            "type": "boolean",
+            "description": "Include upstream dependencies of the selection."
+          },
           "labels": {
             "type": "object",
             "description": "Additional labels for the run.",
@@ -5871,13 +6191,6 @@
             "propertyNames": {
               "type": "string"
             }
-          },
-          "partitions": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/PartitionValue"
-            },
-            "description": "Partition overrides (key=value pairs)."
           },
           "runKey": {
             "type": [
@@ -5893,7 +6206,102 @@
             },
             "description": "Asset selection (asset keys to materialize)."
           }
-        }
+        },
+        "additionalProperties": false
+      },
+      "TriggerRunRequestWithPartitionKey": {
+        "type": "object",
+        "required": [
+          "partitionKey"
+        ],
+        "properties": {
+          "includeDownstream": {
+            "type": "boolean",
+            "description": "Include downstream dependents of the selection."
+          },
+          "includeUpstream": {
+            "type": "boolean",
+            "description": "Include upstream dependencies of the selection."
+          },
+          "labels": {
+            "type": "object",
+            "description": "Additional labels for the run.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "partitionKey": {
+            "type": "string",
+            "description": "Canonical partition key string (ADR-011).",
+            "minLength": 1
+          },
+          "runKey": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Idempotency key for deduplication (409 if reused with different payload).\nReservations created before the fingerprint cutoff remain lenient."
+          },
+          "selection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Asset selection (asset keys to materialize)."
+          }
+        },
+        "additionalProperties": false
+      },
+      "TriggerRunRequestWithPartitions": {
+        "type": "object",
+        "required": [
+          "partitions"
+        ],
+        "properties": {
+          "includeDownstream": {
+            "type": "boolean",
+            "description": "Include downstream dependents of the selection."
+          },
+          "includeUpstream": {
+            "type": "boolean",
+            "description": "Include upstream dependencies of the selection."
+          },
+          "labels": {
+            "type": "object",
+            "description": "Additional labels for the run.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "partitions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PartitionValue"
+            },
+            "description": "Partition overrides (key=value strings). Backward-compatible with older clients."
+          },
+          "runKey": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Idempotency key for deduplication (409 if reused with different payload).\nReservations created before the fingerprint cutoff remain lenient."
+          },
+          "selection": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Asset selection (asset keys to materialize)."
+          }
+        },
+        "additionalProperties": false
       },
       "TriggerRunResponse": {
         "type": "object",

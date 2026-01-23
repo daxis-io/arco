@@ -120,7 +120,16 @@ def _show_recent_runs(config: ArcoFlowConfig, limit: int) -> None:
 def _render_run_table(run: dict[str, object]) -> Table:
     run_id = run.get("runId", "")
     state = run.get("state", "")
-    table = Table(title=f"Run {run_id} ({state})", show_lines=True)
+    title = f"Run {run_id} ({state})"
+
+    parent_run_id = run.get("parentRunId")
+    rerun_kind = run.get("rerunKind")
+    if parent_run_id:
+        title = f"{title} parent={parent_run_id}"
+    if rerun_kind:
+        title = f"{title} rerun={rerun_kind}"
+
+    table = Table(title=title, show_lines=True)
     table.add_column("Task", style="cyan")
     table.add_column("State")
     table.add_column("Attempt")

@@ -440,6 +440,18 @@ const MAX_LIST_LIMIT: u32 = 200;
 const DEFAULT_LIMIT: u32 = 50;
 const MAX_LOG_BYTES: usize = 2 * 1024 * 1024;
 
+// Input size limits (defense-in-depth; avoid pathological CPU/memory in validation/fingerprinting).
+const MAX_RUN_KEY_LEN: usize = 256;
+const MAX_PARTITION_KEY_LEN: usize = 1024;
+const MAX_SELECTION_ITEMS: usize = 10_000;
+const MAX_SELECTION_ITEM_LEN: usize = 256;
+const MAX_LABELS: usize = 128;
+const MAX_LABEL_KEY_LEN: usize = 128;
+const MAX_LABEL_VALUE_LEN: usize = 2048;
+const MAX_PARTITIONS: usize = 128;
+const MAX_PARTITION_DIM_LEN: usize = 64;
+const MAX_PARTITION_VALUE_LEN: usize = 256;
+
 /// Response for listing runs.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1933,6 +1945,92 @@ fn reject_reserved_lineage_labels(labels: &HashMap<String, String>) -> Result<()
     )))
 }
 
+fn validate_selection_limits(selection: &[String]) -> Result<(), ApiError> {
+    if selection.len() > MAX_SELECTION_ITEMS {
+        return Err(ApiError::bad_request(format!(
+            "selection exceeds max items ({MAX_SELECTION_ITEMS})"
+        )));
+    }
+    for value in selection {
+        if value.len() > MAX_SELECTION_ITEM_LEN {
+            return Err(ApiError::bad_request(format!(
+                "selection item exceeds max length ({MAX_SELECTION_ITEM_LEN})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_labels_limits(labels: &HashMap<String, String>) -> Result<(), ApiError> {
+    if labels.len() > MAX_LABELS {
+        return Err(ApiError::bad_request(format!(
+            "labels exceed max properties ({MAX_LABELS})"
+        )));
+    }
+
+    for (key, value) in labels {
+        if key.len() > MAX_LABEL_KEY_LEN {
+            return Err(ApiError::bad_request(format!(
+                "label key exceeds max length ({MAX_LABEL_KEY_LEN})"
+            )));
+        }
+        if value.len() > MAX_LABEL_VALUE_LEN {
+            return Err(ApiError::bad_request(format!(
+                "label value exceeds max length ({MAX_LABEL_VALUE_LEN})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_partitions_limits(partitions: &[PartitionValue]) -> Result<(), ApiError> {
+    if partitions.len() > MAX_PARTITIONS {
+        return Err(ApiError::bad_request(format!(
+            "partitions exceed max items ({MAX_PARTITIONS})"
+        )));
+    }
+
+    for partition in partitions {
+        if partition.key.len() > MAX_PARTITION_DIM_LEN {
+            return Err(ApiError::bad_request(format!(
+                "partition key exceeds max length ({MAX_PARTITION_DIM_LEN})"
+            )));
+        }
+        if partition.value.len() > MAX_PARTITION_VALUE_LEN {
+            return Err(ApiError::bad_request(format!(
+                "partition value exceeds max length ({MAX_PARTITION_VALUE_LEN})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_trigger_run_request_limits(request: &TriggerRunRequest) -> Result<(), ApiError> {
+    validate_selection_limits(&request.selection)?;
+    validate_labels_limits(&request.labels)?;
+    validate_partitions_limits(&request.partitions)?;
+
+    if let Some(run_key) = request.run_key.as_deref() {
+        if run_key.len() > MAX_RUN_KEY_LEN {
+            return Err(ApiError::bad_request(format!(
+                "runKey exceeds max length ({MAX_RUN_KEY_LEN})"
+            )));
+        }
+    }
+
+    if let Some(partition_key) = request.partition_key.as_deref() {
+        if partition_key.len() > MAX_PARTITION_KEY_LEN {
+            return Err(ApiError::bad_request(format!(
+                "partitionKey exceeds max length ({MAX_PARTITION_KEY_LEN})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
     let mut pending = 0;
     let mut queued = 0;
@@ -1993,6 +2091,12 @@ fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, 
         return Ok(None);
     }
 
+    if partitions.len() > MAX_PARTITIONS {
+        return Err(ApiError::bad_request(format!(
+            "partitions exceed max items ({MAX_PARTITIONS})"
+        )));
+    }
+
     let mut seen = HashSet::new();
     let mut partition_key = arco_core::partition::PartitionKey::new();
 
@@ -2000,6 +2104,11 @@ fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, 
         let key = partition.key.trim();
         if key.is_empty() {
             return Err(ApiError::bad_request("partition key cannot be empty"));
+        }
+        if key.len() > MAX_PARTITION_DIM_LEN {
+            return Err(ApiError::bad_request(format!(
+                "partition key exceeds max length ({MAX_PARTITION_DIM_LEN})"
+            )));
         }
         if !is_valid_partition_key(key) {
             return Err(ApiError::bad_request(format!(
@@ -2012,13 +2121,26 @@ fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, 
             )));
         }
 
+        if partition.value.len() > MAX_PARTITION_VALUE_LEN {
+            return Err(ApiError::bad_request(format!(
+                "partition value exceeds max length ({MAX_PARTITION_VALUE_LEN})"
+            )));
+        }
+
         partition_key.insert(
             key.to_string(),
             arco_core::partition::ScalarValue::String(partition.value.clone()),
         );
     }
 
-    Ok(Some(partition_key.canonical_string()))
+    let canonical = partition_key.canonical_string();
+    if canonical.len() > MAX_PARTITION_KEY_LEN {
+        return Err(ApiError::bad_request(format!(
+            "partitionKey exceeds max length ({MAX_PARTITION_KEY_LEN})"
+        )));
+    }
+
+    Ok(Some(canonical))
 }
 
 fn is_valid_partition_key(key: &str) -> bool {
@@ -2595,6 +2717,8 @@ pub(crate) async fn trigger_run(
         return Err(ApiError::bad_request("selection cannot be empty"));
     }
 
+    validate_trigger_run_request_limits(&request)?;
+
     reject_reserved_lineage_labels(&request.labels)?;
 
     // Generate IDs upfront (needed for reservation)
@@ -2960,6 +3084,17 @@ pub(crate) async fn rerun_run(
     Json(request): Json<RerunRunRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
+
+    validate_labels_limits(&request.labels)?;
+    validate_selection_limits(&request.selection)?;
+    if let Some(run_key) = request.run_key.as_deref() {
+        if run_key.len() > MAX_RUN_KEY_LEN {
+            return Err(ApiError::bad_request(format!(
+                "runKey exceeds max length ({MAX_RUN_KEY_LEN})"
+            )));
+        }
+    }
+
     reject_reserved_lineage_labels(&request.labels)?;
 
     let fold_state = load_orchestration_state(&ctx, &state).await?;
@@ -3381,6 +3516,8 @@ pub(crate) async fn backfill_run_key(
         run_key: Some(request.run_key.clone()),
         labels: request.labels.clone(),
     };
+
+    validate_trigger_run_request_limits(&fingerprint_request)?;
     let request_fingerprint = build_request_fingerprint(&fingerprint_request)?;
 
     let backend = state.storage_backend()?;
@@ -4883,6 +5020,62 @@ mod tests {
             Some("date=s:MjAyNC0wMS0xNQ")
         );
         assert!(request.partitions.is_empty());
+    }
+
+    #[test]
+    fn test_trigger_request_limits_rejects_too_long_partition_key() {
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: Some("x".repeat(MAX_PARTITION_KEY_LEN + 1)),
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err = validate_trigger_run_request_limits(&request).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.message().contains("partitionKey"));
+    }
+
+    #[test]
+    fn test_trigger_request_limits_rejects_too_many_selection_items() {
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string(); MAX_SELECTION_ITEMS + 1],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: None,
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err = validate_trigger_run_request_limits(&request).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.message().contains("selection"));
+    }
+
+    #[test]
+    fn test_build_partition_key_rejects_canonical_string_too_long() {
+        let partitions = vec![
+            PartitionValue {
+                key: "a".to_string(),
+                value: "x".repeat(MAX_PARTITION_VALUE_LEN),
+            },
+            PartitionValue {
+                key: "b".to_string(),
+                value: "x".repeat(MAX_PARTITION_VALUE_LEN),
+            },
+            PartitionValue {
+                key: "c".to_string(),
+                value: "x".repeat(MAX_PARTITION_VALUE_LEN),
+            },
+        ];
+
+        let err = build_partition_key(&partitions).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.message().contains("partitionKey exceeds max length"));
     }
 
     #[test]

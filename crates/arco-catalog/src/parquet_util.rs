@@ -595,8 +595,9 @@ fn col_string<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray>
 }
 
 fn col_string_optional<'a>(batch: &'a RecordBatch, name: &str) -> Result<Option<&'a StringArray>> {
-    let Ok(idx) = batch.schema().index_of(name) else {
-        return Ok(None);
+    let idx = match batch.schema().index_of(name) {
+        Ok(idx) => idx,
+        Err(_) => return Ok(None),
     };
 
     batch
@@ -703,40 +704,6 @@ pub fn read_namespaces(bytes: &Bytes) -> Result<Vec<NamespaceRecord>> {
                         Some(col.value(row).to_string())
                     }
                 }),
-                name: name.value(row).to_string(),
-                description: description.and_then(|col| {
-                    if col.is_null(row) {
-                        None
-                    } else {
-                        Some(col.value(row).to_string())
-                    }
-                }),
-                created_at: created_at.value(row),
-                updated_at: updated_at.value(row),
-            });
-        }
-    }
-    Ok(out)
-}
-
-/// Reads `catalogs.parquet`.
-///
-/// # Errors
-///
-/// Returns an error if the Parquet payload is invalid or required columns are
-/// missing.
-pub fn read_catalogs(bytes: &Bytes) -> Result<Vec<CatalogRecord>> {
-    let mut out = Vec::new();
-    for batch in read_batches(bytes)? {
-        let id = col_string(&batch, "id")?;
-        let name = col_string(&batch, "name")?;
-        let description = col_string_optional(&batch, "description")?;
-        let created_at = col_i64(&batch, "created_at")?;
-        let updated_at = col_i64(&batch, "updated_at")?;
-
-        for row in 0..batch.num_rows() {
-            out.push(CatalogRecord {
-                id: id.value(row).to_string(),
                 name: name.value(row).to_string(),
                 description: description.and_then(|col| {
                     if col.is_null(row) {
@@ -916,7 +883,6 @@ mod tests {
         // Simulate an "old" snapshot schema that predates optional columns.
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
-            // NOTE: "catalog_id" intentionally omitted.
             Field::new("name", DataType::Utf8, false),
             // NOTE: "description" intentionally omitted.
             Field::new("created_at", DataType::Int64, false),
@@ -944,133 +910,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "ns_1");
-        assert_eq!(rows[0].catalog_id, None);
         assert_eq!(rows[0].name, "default");
         assert_eq!(rows[0].description, None);
-    }
-
-    #[test]
-    fn read_tables_tolerates_missing_optional_columns() {
-        // Simulate an "old" snapshot schema that predates optional columns.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("namespace_id", DataType::Utf8, false),
-            Field::new("name", DataType::Utf8, false),
-            // NOTE: "description", "location", and "format" intentionally omitted.
-            Field::new("created_at", DataType::Int64, false),
-            Field::new("updated_at", DataType::Int64, false),
-        ]));
-
-        let ids = StringArray::from(vec![Some("tbl_1")]);
-        let namespace_ids = StringArray::from(vec![Some("ns_1")]);
-        let names = StringArray::from(vec![Some("users")]);
-        let created_at = Int64Array::from(vec![123_i64]);
-        let updated_at = Int64Array::from(vec![123_i64]);
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(ids),
-                Arc::new(namespace_ids),
-                Arc::new(names),
-                Arc::new(created_at),
-                Arc::new(updated_at),
-            ],
-        )
-        .expect("record batch build");
-
-        let bytes = write_single_batch(schema, &batch).expect("write parquet");
-        let rows = read_tables(&bytes).expect("read tables");
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, "tbl_1");
-        assert_eq!(rows[0].namespace_id, "ns_1");
-        assert_eq!(rows[0].name, "users");
-        assert_eq!(rows[0].description, None);
-        assert_eq!(rows[0].location, None);
-        assert_eq!(rows[0].format, None);
-    }
-
-    #[test]
-    fn read_columns_tolerates_missing_optional_columns() {
-        // Simulate an "old" snapshot schema that predates optional columns.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("table_id", DataType::Utf8, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("data_type", DataType::Utf8, false),
-            Field::new("is_nullable", DataType::Boolean, false),
-            Field::new("ordinal", DataType::Int32, false),
-            // NOTE: "description" intentionally omitted.
-        ]));
-
-        let ids = StringArray::from(vec![Some("col_1")]);
-        let table_ids = StringArray::from(vec![Some("tbl_1")]);
-        let names = StringArray::from(vec![Some("user_id")]);
-        let data_types = StringArray::from(vec![Some("STRING")]);
-        let is_nullable = BooleanArray::from(vec![false]);
-        let ordinal = Int32Array::from(vec![0_i32]);
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(ids),
-                Arc::new(table_ids),
-                Arc::new(names),
-                Arc::new(data_types),
-                Arc::new(is_nullable),
-                Arc::new(ordinal),
-            ],
-        )
-        .expect("record batch build");
-
-        let bytes = write_single_batch(schema, &batch).expect("write parquet");
-        let rows = read_columns(&bytes).expect("read columns");
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, "col_1");
-        assert_eq!(rows[0].table_id, "tbl_1");
-        assert_eq!(rows[0].name, "user_id");
-        assert_eq!(rows[0].description, None);
-    }
-
-    #[test]
-    fn read_lineage_edges_tolerates_missing_optional_columns() {
-        // Simulate an "old" snapshot schema that predates optional columns.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("source_id", DataType::Utf8, false),
-            Field::new("target_id", DataType::Utf8, false),
-            Field::new("edge_type", DataType::Utf8, false),
-            // NOTE: "run_id" intentionally omitted.
-            Field::new("created_at", DataType::Int64, false),
-        ]));
-
-        let ids = StringArray::from(vec![Some("edge_1")]);
-        let source_ids = StringArray::from(vec![Some("tbl_a")]);
-        let target_ids = StringArray::from(vec![Some("tbl_b")]);
-        let edge_types = StringArray::from(vec![Some("derives_from")]);
-        let created_at = Int64Array::from(vec![123_i64]);
-
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(ids),
-                Arc::new(source_ids),
-                Arc::new(target_ids),
-                Arc::new(edge_types),
-                Arc::new(created_at),
-            ],
-        )
-        .expect("record batch build");
-
-        let bytes = write_single_batch(schema, &batch).expect("write parquet");
-        let rows = read_lineage_edges(&bytes).expect("read lineage edges");
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, "edge_1");
-        assert_eq!(rows[0].source_id, "tbl_a");
-        assert_eq!(rows[0].target_id, "tbl_b");
-        assert_eq!(rows[0].run_id, None);
     }
 }

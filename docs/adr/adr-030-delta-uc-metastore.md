@@ -83,32 +83,6 @@ Arco supports two Delta table modes:
   per-table coordinator state machine to coordinate commits without relying on
   filesystem atomicity.
 
-#### Catalog-managed Delta framing (Mode B)
-
-Mode B is Arco's implementation of **catalog-managed Delta**: the catalog becomes the
-authority for discovery and commit success, rather than relying solely on object-store
-atomic operations on `_delta_log`.
-
-**Parity target (contract):** Unity Catalog OSS publishes an OpenAPI surface for Delta
-commit coordination under `/delta/preview/commits` (a "commit coordinator" API). Arco
-targets this surface as the compatibility contract for managed-table writes.
-
-#### "Unbackfilled commits" mapping
-
-Unity Catalog's commit coordinator model implies an **"unbackfilled commits" queue**:
-the coordinator can reserve/record commits before the corresponding `_delta_log`
-entries are durably written, and clients later "backfill" those log files.
-
-Arco maps this to a file-native coordinator ledger:
-
-1. **Coordinate (reserve)**: record a pending commit intent as small, strongly
-   consistent control-plane state (Tier-1 semantics; no correctness-critical listing).
-2. **Backfill**: client writes `_delta_log/{version}.json` (and any referenced files)
-   to the table location.
-3. **Acknowledge / reconcile**: coordinator marks the commit as backfilled (and may
-   trigger projection/compaction), enabling repair paths for "reserved version but
-   missing log file" failures.
-
 Mode B uses a staging upload (signed PUT) to avoid large request bodies; Arco is the
 sole writer to the real `_delta_log/{version}.json` file for Mode B tables.
 
@@ -125,3 +99,4 @@ via a Delta manifest CAS) so readers do not need to replay the Delta log.
   - GCS-only, single configured bucket
   - Delta Sharing (official protocol) not implemented; Arco ships a file-manifest API
     first (paged, latest-only in v1)
+

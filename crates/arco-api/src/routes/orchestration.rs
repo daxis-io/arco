@@ -308,7 +308,8 @@ pub struct RunKeyBackfillRequest {
     /// Include downstream dependents of the selection.
     #[serde(default)]
     pub include_downstream: bool,
-    /// Partition overrides (key=value pairs).
+    /// Partition overrides (key=value pairs). Backward-compatible with older clients.
+    /// Cannot be combined with `partitionKey`.
     #[serde(default)]
     pub partitions: Vec<PartitionValue>,
     /// Canonical partition key string (ADR-011). Preferred; cannot be combined with `partitions`.
@@ -1222,6 +1223,160 @@ struct LatestManifestIndex {
     deployed_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PartitioningSpec {
+    is_partitioned: bool,
+    dimensions: Vec<DimensionSpec>,
+}
+
+impl Default for PartitioningSpec {
+    fn default() -> Self {
+        Self {
+            is_partitioned: false,
+            dimensions: Vec::new(),
+        }
+    }
+}
+
+impl PartitioningSpec {
+    fn from_value(value: &serde_json::Value) -> Self {
+        let Some(obj) = value.as_object() else {
+            return Self::default();
+        };
+
+        let dimensions: Vec<DimensionSpec> = obj
+            .get("dimensions")
+            .and_then(|dims| dims.as_array())
+            .map(|dims| dims.iter().filter_map(DimensionSpec::from_value).collect())
+            .unwrap_or_default();
+
+        let is_partitioned_value = obj
+            .get("is_partitioned")
+            .or_else(|| obj.get("isPartitioned"))
+            .and_then(|value| value.as_bool());
+        let mut is_partitioned = is_partitioned_value.unwrap_or(!dimensions.is_empty());
+
+        if is_partitioned_value == Some(false) && !dimensions.is_empty() {
+            let dimension_names = dimensions
+                .iter()
+                .map(|dim| dim.name.clone())
+                .collect::<Vec<_>>();
+            tracing::warn!(
+                dimensions = ?dimension_names,
+                "manifest partitioning marked unpartitioned despite dimensions; treating as partitioned"
+            );
+            is_partitioned = true;
+        }
+
+        Self {
+            is_partitioned,
+            dimensions,
+        }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        if self.is_partitioned != other.is_partitioned {
+            return false;
+        }
+        if !self.is_partitioned {
+            return true;
+        }
+        partitioning_signature(self) == partitioning_signature(other)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DimensionSignature {
+    kind: String,
+    granularity: Option<String>,
+    values: Option<BTreeSet<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DimensionSpec {
+    name: String,
+    kind: String,
+    granularity: Option<String>,
+    values: Option<Vec<String>>,
+}
+
+impl DimensionSpec {
+    fn from_value(value: &serde_json::Value) -> Option<Self> {
+        let obj = value.as_object()?;
+        let name = obj.get("name")?.as_str()?.to_string();
+        let kind = obj.get("kind")?.as_str()?.to_string();
+        let granularity = obj
+            .get("granularity")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let values = obj
+            .get("values")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            });
+
+        Some(Self {
+            name,
+            kind,
+            granularity,
+            values,
+        })
+    }
+
+    fn signature(&self) -> DimensionSignature {
+        let values = self
+            .values
+            .as_ref()
+            .filter(|values| !values.is_empty())
+            .map(|values| values.iter().cloned().collect::<BTreeSet<_>>());
+
+        DimensionSignature {
+            kind: self.kind.clone(),
+            granularity: self.granularity.clone(),
+            values,
+        }
+    }
+}
+
+fn partitioning_signature(spec: &PartitioningSpec) -> BTreeMap<String, DimensionSignature> {
+    spec.dimensions
+        .iter()
+        .map(|dim| (dim.name.clone(), dim.signature()))
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedPartitionKey {
+    canonical: Option<String>,
+    legacy_canonical: Option<String>,
+}
+
+impl ResolvedPartitionKey {
+    fn canonical(&self) -> Option<&str> {
+        self.canonical.as_deref()
+    }
+}
+
+struct ManifestContext {
+    manifest_id: String,
+    deployed_at: DateTime<Utc>,
+    graph: arco_flow::orchestration::AssetGraph,
+    known_assets: HashSet<String>,
+    partitioning_specs: HashMap<String, PartitioningSpec>,
+}
+
+struct RunPlanContext {
+    manifest_id: String,
+    deployed_at: DateTime<Utc>,
+    graph: arco_flow::orchestration::AssetGraph,
+    root_assets: Vec<String>,
+    partitioning_spec: PartitioningSpec,
+}
+
 async fn load_latest_manifest(storage: &ScopedStorage) -> Result<Option<StoredManifest>, ApiError> {
     match storage.get_raw(MANIFEST_LATEST_INDEX_PATH).await {
         Ok(bytes) => match serde_json::from_slice::<LatestManifestIndex>(&bytes) {
@@ -1317,22 +1472,10 @@ async fn load_latest_manifest(storage: &ScopedStorage) -> Result<Option<StoredMa
     Ok(latest)
 }
 
-async fn plan_tasks_and_root_assets(
-    storage: &ScopedStorage,
-    request: &TriggerRunRequest,
-) -> Result<(String, DateTime<Utc>, Vec<String>, Vec<TaskDef>), ApiError> {
-    let stored = load_latest_manifest(storage).await?;
-    let Some(stored) = stored else {
-        return Err(ApiError::bad_request(
-            "no manifest deployed for workspace; deploy a manifest before triggering a run",
-        ));
-    };
-
-    let manifest_id = stored.manifest_id.clone();
-    let deployed_at = stored.deployed_at;
-
+fn build_manifest_context(stored: &StoredManifest) -> Result<ManifestContext, ApiError> {
     let mut known_assets = HashSet::new();
     let mut manifest_assets = Vec::with_capacity(stored.assets.len());
+    let mut partitioning_specs = HashMap::with_capacity(stored.assets.len());
 
     for asset in &stored.assets {
         let key = arco_flow::orchestration::canonicalize_asset_key(&format!(
@@ -1347,7 +1490,8 @@ async fn plan_tasks_and_root_assets(
         })?;
 
         known_assets.insert(key.clone());
-        manifest_assets.push((key, asset.dependencies.as_slice()));
+        manifest_assets.push((key.clone(), asset.dependencies.as_slice()));
+        partitioning_specs.insert(key, PartitioningSpec::from_value(&asset.partitioning));
     }
 
     let mut graph = arco_flow::orchestration::AssetGraph::new();
@@ -1379,8 +1523,22 @@ async fn plan_tasks_and_root_assets(
         graph.insert_asset(asset_key, upstream);
     }
 
+    Ok(ManifestContext {
+        manifest_id: stored.manifest_id.clone(),
+        deployed_at: stored.deployed_at,
+        graph,
+        known_assets,
+        partitioning_specs,
+    })
+}
+
+fn resolve_root_assets(
+    request: &TriggerRunRequest,
+    known_assets: &HashSet<String>,
+) -> Result<Vec<String>, ApiError> {
     let mut roots = BTreeSet::new();
     let mut unknown_roots = BTreeSet::new();
+
     for root in &request.selection {
         let canonical = arco_flow::orchestration::canonicalize_asset_key(root)
             .map_err(ApiError::bad_request)?;
@@ -1399,23 +1557,85 @@ async fn plan_tasks_and_root_assets(
         )));
     }
 
-    let root_assets: Vec<String> = roots.iter().cloned().collect();
+    Ok(roots.into_iter().collect())
+}
 
-    let partition_key = resolve_partition_key(request)?;
+fn derive_run_partitioning_spec(
+    root_assets: &[String],
+    partitioning_specs: &HashMap<String, PartitioningSpec>,
+    has_partition_request: bool,
+) -> Result<PartitioningSpec, ApiError> {
+    let mut base_spec: Option<PartitioningSpec> = None;
+
+    for root in root_assets {
+        let spec = partitioning_specs.get(root).cloned().unwrap_or_default();
+
+        if has_partition_request && !spec.is_partitioned {
+            return Err(ApiError::bad_request(format!(
+                "partition key provided for unpartitioned asset: {root}"
+            )));
+        }
+
+        if let Some(existing) = base_spec.as_ref() {
+            if has_partition_request && !existing.matches(&spec) {
+                return Err(ApiError::bad_request(
+                    "partitioned root assets must share identical partitioning".to_string(),
+                ));
+            }
+        } else {
+            base_spec = Some(spec);
+        }
+    }
+
+    Ok(base_spec.unwrap_or_default())
+}
+
+async fn load_run_plan_context(
+    storage: &ScopedStorage,
+    request: &TriggerRunRequest,
+) -> Result<RunPlanContext, ApiError> {
+    let stored = load_latest_manifest(storage).await?;
+    let Some(stored) = stored else {
+        return Err(ApiError::bad_request(
+            "no manifest deployed for workspace; deploy a manifest before triggering a run",
+        ));
+    };
+
+    let manifest_context = build_manifest_context(&stored)?;
+    let root_assets = resolve_root_assets(request, &manifest_context.known_assets)?;
+    let has_partition_request = request.partition_key.is_some() || !request.partitions.is_empty();
+    let partitioning_spec = derive_run_partitioning_spec(
+        &root_assets,
+        &manifest_context.partitioning_specs,
+        has_partition_request,
+    )?;
+
+    Ok(RunPlanContext {
+        manifest_id: manifest_context.manifest_id,
+        deployed_at: manifest_context.deployed_at,
+        graph: manifest_context.graph,
+        root_assets,
+        partitioning_spec,
+    })
+}
+
+fn build_task_defs_for_request(
+    context: &RunPlanContext,
+    request: &TriggerRunRequest,
+    partition_key: Option<&str>,
+) -> Result<Vec<TaskDef>, ApiError> {
     let options = arco_flow::orchestration::SelectionOptions {
         include_upstream: request.include_upstream,
         include_downstream: request.include_downstream,
     };
 
-    let tasks = arco_flow::orchestration::build_task_defs_for_selection(
-        &graph,
-        &root_assets,
+    arco_flow::orchestration::build_task_defs_for_selection(
+        &context.graph,
+        &context.root_assets,
         options,
-        partition_key.as_deref(),
+        partition_key,
     )
-    .map_err(ApiError::bad_request)?;
-
-    Ok((manifest_id, deployed_at, root_assets, tasks))
+    .map_err(ApiError::bad_request)
 }
 
 type PlanGraph = (
@@ -2094,65 +2314,11 @@ fn validate_trigger_run_request_limits(request: &TriggerRunRequest) -> Result<()
     Ok(())
 }
 
-fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
-    let mut pending = 0;
-    let mut queued = 0;
-    let mut running = 0;
-
-    for task in tasks {
-        match task.state {
-            FoldTaskState::Planned | FoldTaskState::Blocked | FoldTaskState::RetryWait => {
-                pending += 1;
-            }
-            FoldTaskState::Ready | FoldTaskState::Dispatched => queued += 1,
-            FoldTaskState::Running => running += 1,
-            _ => {}
-        }
-    }
-
-    TaskCounts {
-        total: run.tasks_total,
-        pending,
-        queued,
-        running,
-        succeeded: run.tasks_succeeded,
-        failed: run.tasks_failed,
-        skipped: run.tasks_skipped,
-        cancelled: run.tasks_cancelled,
-    }
-}
-
-fn resolve_partition_key(request: &TriggerRunRequest) -> Result<Option<String>, ApiError> {
-    if request.partition_key.is_some() && !request.partitions.is_empty() {
-        return Err(ApiError::bad_request(
-            "use either partitionKey or partitions, not both",
-        ));
-    }
-
-    if let Some(raw) = request.partition_key.as_deref() {
-        if raw.is_empty() {
-            return Err(ApiError::bad_request("partitionKey cannot be empty"));
-        }
-
-        let parsed = arco_core::partition::PartitionKey::parse(raw)
-            .map_err(|err| ApiError::bad_request(format!("invalid partitionKey: {err}")))?;
-        let canonical = parsed.canonical_string();
-        if canonical != raw {
-            return Err(ApiError::bad_request(format!(
-                "partitionKey must be canonical: expected '{canonical}'"
-            )));
-        }
-
-        return Ok(Some(raw.to_string()));
-    }
-
-    build_partition_key(&request.partitions)
-}
-
-fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, ApiError> {
-    let values = parse_partition_values(partitions)?;
-    if values.is_empty() {
-        return Ok(None);
+fn parse_partition_values(
+    partitions: &[PartitionValue],
+) -> Result<BTreeMap<String, String>, ApiError> {
+    if partitions.is_empty() {
+        return Ok(BTreeMap::new());
     }
 
     if partitions.len() > MAX_PARTITIONS {
@@ -2162,7 +2328,7 @@ fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, 
     }
 
     let mut seen = HashSet::new();
-    let mut partition_key = arco_core::partition::PartitionKey::new();
+    let mut values = BTreeMap::new();
 
     for partition in partitions {
         let key = partition.key.trim();
@@ -2191,10 +2357,155 @@ fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, 
             )));
         }
 
-        partition_key.insert(
-            key.to_string(),
-            arco_core::partition::ScalarValue::String(partition.value.clone()),
-        );
+        values.insert(key.to_string(), partition.value.clone());
+    }
+
+    Ok(values)
+}
+
+fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
+    let mut pending = 0;
+    let mut queued = 0;
+    let mut running = 0;
+
+    for task in tasks {
+        match task.state {
+            FoldTaskState::Planned | FoldTaskState::Blocked | FoldTaskState::RetryWait => {
+                pending += 1;
+            }
+            FoldTaskState::Ready | FoldTaskState::Dispatched => queued += 1,
+            FoldTaskState::Running => running += 1,
+            _ => {}
+        }
+    }
+
+    TaskCounts {
+        total: run.tasks_total,
+        pending,
+        queued,
+        running,
+        succeeded: run.tasks_succeeded,
+        failed: run.tasks_failed,
+        skipped: run.tasks_skipped,
+        cancelled: run.tasks_cancelled,
+    }
+}
+
+fn resolve_partition_key(
+    request: &TriggerRunRequest,
+    partitioning: &PartitioningSpec,
+    cutoff: Option<DateTime<Utc>>,
+) -> Result<ResolvedPartitionKey, ApiError> {
+    if request.partition_key.is_some() && !request.partitions.is_empty() {
+        return Err(ApiError::bad_request(
+            "use either partitionKey or partitions, not both",
+        ));
+    }
+
+    let has_partition_request = request.partition_key.is_some() || !request.partitions.is_empty();
+    if has_partition_request && !partitioning.is_partitioned {
+        return Err(ApiError::bad_request(
+            "partition key provided for unpartitioned assets",
+        ));
+    }
+
+    if let Some(raw) = request.partition_key.as_deref() {
+        if raw.is_empty() {
+            return Err(ApiError::bad_request("partitionKey cannot be empty"));
+        }
+
+        let parsed = arco_core::partition::PartitionKey::parse(raw)
+            .map_err(|err| ApiError::bad_request(format!("invalid partitionKey: {err}")))?;
+        let canonical = parsed.canonical_string();
+        if canonical != raw {
+            return Err(ApiError::bad_request(format!(
+                "partitionKey must be canonical: expected '{canonical}'"
+            )));
+        }
+
+        let raw_dimensions = parsed
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<HashMap<_, _>>();
+        let (normalized_key, normalized) =
+            normalize_partition_key(&raw_dimensions, partitioning, cutoff)?;
+        let normalized_canonical = normalized_key.canonical_string();
+
+        // Validate that normalization produced a fully canonical, ADR-011 compliant key.
+        arco_core::partition::PartitionKey::parse(&normalized_canonical)
+            .map_err(|err| ApiError::bad_request(format!("invalid partitionKey: {err}")))?;
+
+        if normalized_canonical.len() > MAX_PARTITION_KEY_LEN {
+            return Err(ApiError::bad_request(format!(
+                "partitionKey exceeds max length ({MAX_PARTITION_KEY_LEN})"
+            )));
+        }
+
+        let legacy_canonical = if normalized && normalized_canonical != raw {
+            Some(raw.to_string())
+        } else {
+            None
+        };
+
+        return Ok(ResolvedPartitionKey {
+            canonical: Some(normalized_canonical),
+            legacy_canonical,
+        });
+    }
+
+    let raw_values = parse_partition_values(&request.partitions)?;
+    if raw_values.is_empty() {
+        return Ok(ResolvedPartitionKey {
+            canonical: None,
+            legacy_canonical: None,
+        });
+    }
+
+    let raw_dimensions = raw_values
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                arco_core::partition::ScalarValue::String(value.clone()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let (normalized_key, normalized) =
+        normalize_partition_key(&raw_dimensions, partitioning, cutoff)?;
+    let normalized_canonical = normalized_key.canonical_string();
+
+    // Validate that normalization produced a fully canonical, ADR-011 compliant key.
+    arco_core::partition::PartitionKey::parse(&normalized_canonical)
+        .map_err(|err| ApiError::bad_request(format!("invalid partitionKey: {err}")))?;
+
+    if normalized_canonical.len() > MAX_PARTITION_KEY_LEN {
+        return Err(ApiError::bad_request(format!(
+            "partitionKey exceeds max length ({MAX_PARTITION_KEY_LEN})"
+        )));
+    }
+
+    let legacy_canonical = if normalized {
+        let legacy = build_partition_key(&request.partitions)?;
+        legacy.filter(|legacy| legacy != &normalized_canonical)
+    } else {
+        None
+    };
+
+    Ok(ResolvedPartitionKey {
+        canonical: Some(normalized_canonical),
+        legacy_canonical,
+    })
+}
+
+fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, ApiError> {
+    let values = parse_partition_values(partitions)?;
+    if values.is_empty() {
+        return Ok(None);
+    }
+
+    let mut partition_key = arco_core::partition::PartitionKey::new();
+    for (key, value) in values {
+        partition_key.insert(key, arco_core::partition::ScalarValue::String(value));
     }
 
     let canonical = partition_key.canonical_string();
@@ -2205,6 +2516,242 @@ fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, 
     }
 
     Ok(Some(canonical))
+}
+
+fn normalize_partition_key(
+    raw_dimensions: &HashMap<String, arco_core::partition::ScalarValue>,
+    partitioning: &PartitioningSpec,
+    cutoff: Option<DateTime<Utc>>,
+) -> Result<(arco_core::partition::PartitionKey, bool), ApiError> {
+    let provided_keys: HashSet<&str> = raw_dimensions.keys().map(String::as_str).collect();
+    let expected_keys: HashSet<&str> = partitioning
+        .dimensions
+        .iter()
+        .map(|dim| dim.name.as_str())
+        .collect();
+
+    if partitioning.is_partitioned {
+        if provided_keys != expected_keys {
+            let expected = partitioning
+                .dimensions
+                .iter()
+                .map(|dim| dim.name.as_str())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let provided = provided_keys
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ApiError::bad_request(format!(
+                "partitionKey dimensions must match manifest dimensions: expected [{expected}], got [{provided}]"
+            )));
+        }
+    }
+
+    let cutoff_active = cutoff.is_some_and(|cutoff| Utc::now() >= cutoff);
+    let mut normalized = arco_core::partition::PartitionKey::new();
+    let mut normalized_time_string = false;
+
+    for dim in &partitioning.dimensions {
+        let Some(value) = raw_dimensions.get(&dim.name) else {
+            continue;
+        };
+
+        let (normalized_value, did_normalize) = match dim.kind.as_str() {
+            "time" => normalize_time_dimension_value(dim, value, cutoff_active)?,
+            "static" => normalize_static_dimension_value(dim, value)?,
+            "tenant" => normalize_tenant_dimension_value(dim, value)?,
+            _ => {
+                return Err(ApiError::bad_request(format!(
+                    "unsupported partition dimension kind '{}' for '{}'",
+                    dim.kind, dim.name
+                )));
+            }
+        };
+
+        if did_normalize {
+            normalized_time_string = true;
+        }
+
+        normalized.insert(dim.name.clone(), normalized_value);
+    }
+
+    Ok((normalized, normalized_time_string))
+}
+
+fn normalize_time_dimension_value(
+    dim: &DimensionSpec,
+    value: &arco_core::partition::ScalarValue,
+    cutoff_active: bool,
+) -> Result<(arco_core::partition::ScalarValue, bool), ApiError> {
+    match value {
+        arco_core::partition::ScalarValue::Date(date) => {
+            enforce_time_granularity(dim, "day")?;
+            Ok((arco_core::partition::ScalarValue::Date(date.clone()), false))
+        }
+        arco_core::partition::ScalarValue::Timestamp(timestamp) => {
+            enforce_time_granularity(dim, "hour")?;
+
+            if dim.granularity.as_deref() == Some("hour") {
+                // Hour-partitioned dimensions must be aligned to the hour.
+                let parsed = DateTime::parse_from_rfc3339(timestamp).map_err(|_| {
+                    ApiError::bad_request(format!(
+                        "time dimension '{}' must use canonical UTC timestamp",
+                        dim.name
+                    ))
+                })?;
+                let utc = parsed.with_timezone(&Utc);
+                if utc.minute() != 0 || utc.second() != 0 || utc.nanosecond() != 0 {
+                    return Err(ApiError::bad_request(format!(
+                        "time dimension '{}' must be aligned to the hour",
+                        dim.name
+                    )));
+                }
+            }
+
+            Ok((
+                arco_core::partition::ScalarValue::Timestamp(timestamp.clone()),
+                false,
+            ))
+        }
+        arco_core::partition::ScalarValue::String(raw) => {
+            if cutoff_active {
+                return Err(ApiError::bad_request(format!(
+                    "time partition values must use d:/t: tags for '{}'",
+                    dim.name
+                )));
+            }
+
+            let normalized = match dim.granularity.as_deref() {
+                Some("day") => {
+                    let parsed = parse_date(raw).ok_or_else(|| {
+                        ApiError::bad_request(format!(
+                            "time dimension '{}' expects YYYY-MM-DD",
+                            dim.name
+                        ))
+                    })?;
+                    arco_core::partition::ScalarValue::Date(parsed)
+                }
+                Some("hour") => {
+                    let parsed = parse_rfc3339_timestamp(raw, true).ok_or_else(|| {
+                        ApiError::bad_request(format!(
+                            "time dimension '{}' expects RFC3339 timestamp",
+                            dim.name
+                        ))
+                    })?;
+                    arco_core::partition::ScalarValue::Timestamp(parsed)
+                }
+                Some(granularity) => {
+                    return Err(ApiError::bad_request(format!(
+                        "unsupported time granularity '{}' for '{}'",
+                        granularity, dim.name
+                    )));
+                }
+                None => {
+                    if let Some(parsed) = parse_date(raw) {
+                        arco_core::partition::ScalarValue::Date(parsed)
+                    } else if let Some(parsed) = parse_rfc3339_timestamp(raw, false) {
+                        arco_core::partition::ScalarValue::Timestamp(parsed)
+                    } else {
+                        return Err(ApiError::bad_request(format!(
+                            "time dimension '{}' expects YYYY-MM-DD or RFC3339 timestamp",
+                            dim.name
+                        )));
+                    }
+                }
+            };
+
+            tracing::warn!(
+                dimension = %dim.name,
+                value = %raw,
+                "normalized time partition string to tagged value"
+            );
+
+            Ok((normalized, true))
+        }
+        _ => Err(ApiError::bad_request(format!(
+            "time dimension '{}' must use d:/t: or s: value",
+            dim.name
+        ))),
+    }
+}
+
+fn normalize_static_dimension_value(
+    dim: &DimensionSpec,
+    value: &arco_core::partition::ScalarValue,
+) -> Result<(arco_core::partition::ScalarValue, bool), ApiError> {
+    let arco_core::partition::ScalarValue::String(raw) = value else {
+        return Err(ApiError::bad_request(format!(
+            "dimension '{}' must use string values",
+            dim.name
+        )));
+    };
+
+    if let Some(values) = dim.values.as_ref().filter(|values| !values.is_empty()) {
+        if !values.contains(raw) {
+            return Err(ApiError::bad_request(format!(
+                "dimension '{}' value '{}' is not allowed",
+                dim.name, raw
+            )));
+        }
+    }
+
+    Ok((
+        arco_core::partition::ScalarValue::String(raw.clone()),
+        false,
+    ))
+}
+
+fn normalize_tenant_dimension_value(
+    dim: &DimensionSpec,
+    value: &arco_core::partition::ScalarValue,
+) -> Result<(arco_core::partition::ScalarValue, bool), ApiError> {
+    let arco_core::partition::ScalarValue::String(raw) = value else {
+        return Err(ApiError::bad_request(format!(
+            "dimension '{}' must use string values",
+            dim.name
+        )));
+    };
+
+    Ok((
+        arco_core::partition::ScalarValue::String(raw.clone()),
+        false,
+    ))
+}
+
+fn enforce_time_granularity(dim: &DimensionSpec, expected: &str) -> Result<(), ApiError> {
+    match dim.granularity.as_deref() {
+        Some(granularity) if granularity == expected => Ok(()),
+        Some(_granularity) => Err(ApiError::bad_request(format!(
+            "time dimension '{}' expects {} granularity",
+            dim.name, expected
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn parse_date(value: &str) -> Option<String> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .ok()
+        .map(|date| date.format("%Y-%m-%d").to_string())
+}
+
+fn parse_rfc3339_timestamp(value: &str, require_hour_boundary: bool) -> Option<String> {
+    let parsed = DateTime::parse_from_rfc3339(value).ok()?;
+    let utc = parsed.with_timezone(&Utc);
+
+    if require_hour_boundary {
+        if utc.minute() != 0 || utc.second() != 0 || utc.nanosecond() != 0 {
+            return None;
+        }
+    }
+
+    Some(utc.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
 }
 
 fn is_valid_partition_key(key: &str) -> bool {
@@ -2251,7 +2798,7 @@ fn build_request_fingerprint(
     selection.sort();
     selection.dedup();
 
-    let partition_key = resolve_partition_key(request)?;
+    let partition_key = resolved_partition_key.canonical.clone();
 
     let labels = request
         .labels
@@ -2277,7 +2824,18 @@ fn build_request_fingerprint(
 
 fn build_request_fingerprint_variants(
     request: &TriggerRunRequest,
+    resolved_partition_key: &ResolvedPartitionKey,
 ) -> Result<(String, Vec<String>), ApiError> {
+    #[derive(Serialize)]
+    struct FingerprintPayload {
+        selection: Vec<String>,
+        include_upstream: bool,
+        include_downstream: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partition_key: Option<String>,
+        labels: BTreeMap<String, String>,
+    }
+
     #[derive(Serialize)]
     struct LegacyFingerprintPayload {
         selection: Vec<String>,
@@ -2299,7 +2857,7 @@ fn build_request_fingerprint_variants(
         Ok(hex::encode(hash))
     }
 
-    let primary = build_request_fingerprint(request)?;
+    let primary = build_request_fingerprint(request, resolved_partition_key)?;
 
     let mut selection: Vec<String> = request
         .selection
@@ -2317,16 +2875,31 @@ fn build_request_fingerprint_variants(
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<BTreeMap<_, _>>();
 
-    let resolved_partition_key = resolve_partition_key(request)?;
-
-    let partitions_from_partition_key = match resolved_partition_key.as_deref() {
-        Some(pk) => partitions_from_string_only_partition_key(pk)?,
-        None => None,
-    };
+    let partition_key = resolved_partition_key.canonical.as_ref();
+    let legacy_partition_key = resolved_partition_key.legacy_canonical.as_ref();
+    let mut partition_key_variants: Vec<String> = Vec::new();
+    if let Some(pk) = partition_key {
+        partition_key_variants.push(pk.clone());
+        partition_key_variants.extend(time_string_partition_key_variants(pk)?);
+    }
+    if let Some(pk) = legacy_partition_key {
+        partition_key_variants.push(pk.clone());
+    }
+    partition_key_variants.sort();
+    partition_key_variants.dedup();
 
     let mut variants = vec![primary.clone()];
 
-    if let Some(partition_key) = resolved_partition_key.as_ref() {
+    for partition_key in &partition_key_variants {
+        let fingerprint_payload = FingerprintPayload {
+            selection: selection.clone(),
+            include_upstream: request.include_upstream,
+            include_downstream: request.include_downstream,
+            partition_key: Some(partition_key.clone()),
+            labels: labels.clone(),
+        };
+        variants.push(hash_payload(&fingerprint_payload)?);
+
         let legacy_partition_key_payload = LegacyFingerprintPayload {
             selection: selection.clone(),
             include_upstream: request.include_upstream,
@@ -2338,17 +2911,29 @@ fn build_request_fingerprint_variants(
         variants.push(hash_payload(&legacy_partition_key_payload)?);
     }
 
-    let mut legacy_partitions = if request.partitions.is_empty() {
-        partitions_from_partition_key
+    if request.partitions.is_empty() {
+        for partition_key in &partition_key_variants {
+            let Some(mut partitions) = partitions_from_string_only_partition_key(partition_key)?
+            else {
+                continue;
+            };
+
+            partitions.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.value.cmp(&b.value)));
+
+            let legacy_partitions_payload = LegacyFingerprintPayload {
+                selection: selection.clone(),
+                include_upstream: request.include_upstream,
+                include_downstream: request.include_downstream,
+                partitions,
+                partition_key: None,
+                labels: labels.clone(),
+            };
+            variants.push(hash_payload(&legacy_partitions_payload)?);
+        }
     } else {
-        Some(request.partitions.clone())
-    };
-
-    if let Some(ref mut partitions) = legacy_partitions {
+        let mut partitions = request.partitions.clone();
         partitions.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.value.cmp(&b.value)));
-    }
 
-    if let Some(partitions) = legacy_partitions {
         let legacy_partitions_payload = LegacyFingerprintPayload {
             selection,
             include_upstream: request.include_upstream,
@@ -2364,6 +2949,68 @@ fn build_request_fingerprint_variants(
     variants.dedup();
 
     Ok((primary, variants))
+}
+
+fn time_string_partition_key_variants(partition_key: &str) -> Result<Vec<String>, ApiError> {
+    let parsed = arco_core::partition::PartitionKey::parse(partition_key).map_err(|err| {
+        ApiError::internal(format!(
+            "failed to parse canonical partitionKey for fingerprint normalization: {err}"
+        ))
+    })?;
+
+    let mut base = arco_core::partition::PartitionKey::new();
+    let mut trimmed_timestamp_keys: Vec<(String, String)> = Vec::new();
+
+    for (key, value) in parsed.iter() {
+        match value {
+            arco_core::partition::ScalarValue::String(s) => {
+                base.insert(
+                    key.clone(),
+                    arco_core::partition::ScalarValue::String(s.clone()),
+                );
+            }
+            arco_core::partition::ScalarValue::Date(date) => {
+                base.insert(
+                    key.clone(),
+                    arco_core::partition::ScalarValue::String(date.clone()),
+                );
+            }
+            arco_core::partition::ScalarValue::Timestamp(timestamp) => {
+                base.insert(
+                    key.clone(),
+                    arco_core::partition::ScalarValue::String(timestamp.clone()),
+                );
+                if let Some(prefix) = timestamp.strip_suffix(".000000Z") {
+                    trimmed_timestamp_keys.push((key.clone(), format!("{prefix}Z")));
+                }
+            }
+            _ => return Ok(Vec::new()),
+        }
+    }
+
+    let mut variants = vec![base];
+    for (key, trimmed) in trimmed_timestamp_keys {
+        let mut next = Vec::with_capacity(variants.len() * 2);
+        for existing in &variants {
+            next.push(existing.clone());
+
+            let mut adjusted = existing.clone();
+            adjusted.insert(
+                key.clone(),
+                arco_core::partition::ScalarValue::String(trimmed.clone()),
+            );
+            next.push(adjusted);
+        }
+        variants = next;
+    }
+
+    let mut rendered: Vec<String> = variants
+        .into_iter()
+        .map(|pk| pk.canonical_string())
+        .collect();
+    rendered.sort();
+    rendered.dedup();
+    Ok(rendered)
 }
 
 fn partitions_from_string_only_partition_key(
@@ -2799,8 +3446,26 @@ pub(crate) async fn trigger_run(
     let ledger = LedgerWriter::new(storage.clone());
     let mut run_event_overrides: Option<RunEventOverrides> = None;
 
+    let has_partition_request = request.partition_key.is_some() || !request.partitions.is_empty();
+    let mut plan_context: Option<RunPlanContext> = None;
+    let partitioning_spec = if has_partition_request {
+        let context = load_run_plan_context(&storage, &request).await?;
+        let spec = context.partitioning_spec.clone();
+        plan_context = Some(context);
+        spec
+    } else {
+        PartitioningSpec::default()
+    };
+
+    let resolved_partition_key = resolve_partition_key(
+        &request,
+        &partitioning_spec,
+        state.config.partition_time_string_cutoff,
+    )?;
+
     let (request_fingerprint, request_fingerprint_variants) = if request.run_key.is_some() {
-        let (primary, variants) = build_request_fingerprint_variants(&request)?;
+        let (primary, variants) =
+            build_request_fingerprint_variants(&request, &resolved_partition_key)?;
         (Some(primary), variants)
     } else {
         (None, Vec::new())
@@ -2868,8 +3533,18 @@ pub(crate) async fn trigger_run(
             }
 
             if !run_found {
-                let (manifest_id, deployed_at, root_assets, tasks) =
-                    plan_tasks_and_root_assets(&storage, &request).await?;
+                if plan_context.is_none() {
+                    plan_context = Some(load_run_plan_context(&storage, &request).await?);
+                }
+                let Some(plan_context_ref) = plan_context.as_ref() else {
+                    return Err(ApiError::internal("internal error: missing plan context"));
+                };
+
+                let tasks = build_task_defs_for_request(
+                    plan_context_ref,
+                    &request,
+                    resolved_partition_key.canonical(),
+                )?;
 
                 let plan_event_id = existing.plan_event_id.clone().unwrap_or_else(|| {
                     let new_id = Ulid::new().to_string();
@@ -2882,8 +3557,8 @@ pub(crate) async fn trigger_run(
                 });
 
                 tracing::info!(
-                    manifest_id = %manifest_id,
-                    manifest_deployed_at = %deployed_at,
+                    manifest_id = %plan_context_ref.manifest_id,
+                    manifest_deployed_at = %plan_context_ref.deployed_at,
                     run_id = %existing.run_id,
                     "re-emitting run plan from latest manifest"
                 );
@@ -2898,7 +3573,7 @@ pub(crate) async fn trigger_run(
                     Some(existing.run_key.clone()),
                     request.labels.clone(),
                     state.config.code_version.clone(),
-                    root_assets,
+                    plan_context_ref.root_assets.clone(),
                     tasks,
                     Some(RunEventOverrides {
                         run_event_id: existing.event_id.clone(),
@@ -2923,9 +3598,6 @@ pub(crate) async fn trigger_run(
             ));
         }
     }
-
-    let (manifest_id, deployed_at, root_assets, tasks) =
-        plan_tasks_and_root_assets(&storage, &request).await?;
 
     // If run_key provided, attempt to reserve it (strong idempotency)
     if let Some(ref run_key) = request.run_key {
@@ -3039,8 +3711,8 @@ pub(crate) async fn trigger_run(
                     });
 
                     tracing::info!(
-                        manifest_id = %manifest_id,
-                        manifest_deployed_at = %deployed_at,
+                        manifest_id = %plan_context_ref.manifest_id,
+                        manifest_deployed_at = %plan_context_ref.deployed_at,
                         run_id = %existing.run_id,
                         "re-emitting run plan from latest manifest"
                     );
@@ -3101,10 +3773,22 @@ pub(crate) async fn trigger_run(
         }
     }
 
+    if plan_context.is_none() {
+        plan_context = Some(load_run_plan_context(&storage, &request).await?);
+    }
+    let Some(plan_context_ref) = plan_context.as_ref() else {
+        return Err(ApiError::internal("internal error: missing plan context"));
+    };
+    let tasks = build_task_defs_for_request(
+        plan_context_ref,
+        &request,
+        resolved_partition_key.canonical(),
+    )?;
+
     tracing::info!(
-        manifest_id = %manifest_id,
-        manifest_deployed_at = %deployed_at,
-        root_assets = ?root_assets,
+        manifest_id = %plan_context_ref.manifest_id,
+        manifest_deployed_at = %plan_context_ref.deployed_at,
+        root_assets = ?plan_context_ref.root_assets,
         include_upstream = request.include_upstream,
         include_downstream = request.include_downstream,
         planned_tasks = tasks.len(),
@@ -3598,13 +4282,12 @@ pub(crate) async fn backfill_run_key(
         include_upstream: request.include_upstream,
         include_downstream: request.include_downstream,
         partitions: request.partitions.clone(),
-        partition_key: None,
+        partition_key: request.partition_key.clone(),
         run_key: Some(request.run_key.clone()),
         labels: request.labels.clone(),
     };
 
     validate_trigger_run_request_limits(&fingerprint_request)?;
-    let request_fingerprint = build_request_fingerprint(&fingerprint_request)?;
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
@@ -5270,6 +5953,7 @@ mod tests {
 
     #[test]
     fn test_resolve_partition_key_rejects_both_partition_key_and_partitions() {
+        let partitioning = partitioning_spec(vec![time_dimension("date", Some("day"))]);
         let request = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
             include_upstream: false,
@@ -5283,12 +5967,16 @@ mod tests {
             labels: HashMap::new(),
         };
 
-        let err = resolve_partition_key(&request).expect_err("expected error");
+        let err = resolve_partition_key(&request, &partitioning, None).expect_err("expected error");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn test_resolve_partition_key_rejects_noncanonical_partition_key() {
+        let partitioning = partitioning_spec(vec![
+            time_dimension("date", Some("day")),
+            tenant_dimension("tenant"),
+        ]);
         let request = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
             include_upstream: false,
@@ -5299,13 +5987,99 @@ mod tests {
             labels: HashMap::new(),
         };
 
-        let err = resolve_partition_key(&request).expect_err("expected error");
+        let err = resolve_partition_key(&request, &partitioning, None).expect_err("expected error");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert!(err.message().contains("canonical"));
     }
 
     #[test]
+    fn test_resolve_partition_key_rejects_missing_dimension() {
+        let partitioning = partitioning_spec(vec![
+            time_dimension("date", Some("day")),
+            static_dimension("region"),
+        ]);
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![PartitionValue {
+                key: "date".to_string(),
+                value: "2024-01-15".to_string(),
+            }],
+            partition_key: None,
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err = resolve_partition_key(&request, &partitioning, None).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.message().contains("expected"));
+        assert!(err.message().contains("got"));
+    }
+
+    #[test]
+    fn test_resolve_partition_key_rejects_extra_dimension() {
+        let partitioning = partitioning_spec(vec![
+            time_dimension("date", Some("day")),
+            static_dimension("region"),
+        ]);
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![
+                PartitionValue {
+                    key: "date".to_string(),
+                    value: "2024-01-15".to_string(),
+                },
+                PartitionValue {
+                    key: "region".to_string(),
+                    value: "us".to_string(),
+                },
+                PartitionValue {
+                    key: "tenant".to_string(),
+                    value: "acme".to_string(),
+                },
+            ],
+            partition_key: None,
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err = resolve_partition_key(&request, &partitioning, None).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_resolve_partition_key_rejects_disallowed_static_value() {
+        let partitioning = partitioning_spec(vec![static_dimension_with_values(
+            "region",
+            vec!["us", "eu"],
+        )]);
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![PartitionValue {
+                key: "region".to_string(),
+                value: "apac".to_string(),
+            }],
+            partition_key: None,
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err = resolve_partition_key(&request, &partitioning, None).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.message().contains("not allowed"));
+    }
+
+    #[test]
     fn test_resolve_partition_key_accepts_canonical_partition_key() -> Result<()> {
+        let partitioning = partitioning_spec(vec![
+            time_dimension("date", Some("day")),
+            tenant_dimension("tenant"),
+        ]);
         let request = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
             include_upstream: false,
@@ -5316,16 +6090,164 @@ mod tests {
             labels: HashMap::new(),
         };
 
-        let resolved = resolve_partition_key(&request).map_err(|err| anyhow!("{err:?}"))?;
+        let resolved = resolve_partition_key(&request, &partitioning, None)
+            .map_err(|err| anyhow!("{err:?}"))?;
         assert_eq!(
-            resolved.as_deref(),
-            Some("date=s:MjAyNC0wMS0xNQ,tenant=s:YWNtZQ")
+            resolved.canonical.as_deref(),
+            Some("date=d:2024-01-15,tenant=s:YWNtZQ")
         );
         Ok(())
     }
 
     #[test]
+    fn test_resolve_partition_key_normalizes_day_time_string() -> Result<()> {
+        let partitioning = partitioning_spec(vec![time_dimension("date", Some("day"))]);
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: Some("date=s:MjAyNC0wMS0xNQ".to_string()),
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let resolved = resolve_partition_key(&request, &partitioning, None)
+            .map_err(|err| anyhow!("{err:?}"))?;
+        assert_eq!(resolved.canonical.as_deref(), Some("date=d:2024-01-15"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_request_fingerprint_variants_include_legacy_time_string_partition_key() -> Result<()> {
+        let partitioning = partitioning_spec(vec![time_dimension("date", Some("day"))]);
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: Some("date=d:2024-01-15".to_string()),
+            run_key: Some("daily:2024-01-15".to_string()),
+            labels: HashMap::new(),
+        };
+
+        let resolved = resolve_partition_key(&request, &partitioning, None)
+            .map_err(|err| anyhow!("{err:?}"))?;
+        let (_primary, variants) = build_request_fingerprint_variants(&request, &resolved)
+            .map_err(|err| anyhow!("{err:?}"))?;
+
+        let encoded = URL_SAFE_NO_PAD.encode("2024-01-15".as_bytes());
+        let legacy_partition_key = format!("date=s:{encoded}");
+        let legacy_fingerprint =
+            hash_trigger_fingerprint_payload(&request, Some(legacy_partition_key))?;
+
+        assert!(
+            variants.contains(&legacy_fingerprint),
+            "expected variants to include legacy time-string fingerprint"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_request_fingerprint_variants_include_legacy_hour_time_string_partition_key()
+    -> Result<()> {
+        let partitioning = partitioning_spec(vec![time_dimension("hour", Some("hour"))]);
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: Some("hour=t:2024-01-15T15:00:00.000000Z".to_string()),
+            run_key: Some("hourly:2024-01-15T15:00:00Z".to_string()),
+            labels: HashMap::new(),
+        };
+
+        let resolved = resolve_partition_key(&request, &partitioning, None)
+            .map_err(|err| anyhow!("{err:?}"))?;
+        let (_primary, variants) = build_request_fingerprint_variants(&request, &resolved)
+            .map_err(|err| anyhow!("{err:?}"))?;
+
+        let encoded = URL_SAFE_NO_PAD.encode("2024-01-15T15:00:00Z".as_bytes());
+        let legacy_partition_key = format!("hour=s:{encoded}");
+        let legacy_fingerprint =
+            hash_trigger_fingerprint_payload(&request, Some(legacy_partition_key))?;
+
+        assert!(
+            variants.contains(&legacy_fingerprint),
+            "expected variants to include legacy hour time-string fingerprint"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_partition_key_normalizes_hour_time_string() -> Result<()> {
+        let partitioning = partitioning_spec(vec![time_dimension("hour", Some("hour"))]);
+        let encoded = URL_SAFE_NO_PAD.encode("2024-01-15T10:00:00-05:00".as_bytes());
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: Some(format!("hour=s:{encoded}")),
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let resolved = resolve_partition_key(&request, &partitioning, None)
+            .map_err(|err| anyhow!("{err:?}"))?;
+        assert_eq!(
+            resolved.canonical.as_deref(),
+            Some("hour=t:2024-01-15T15:00:00.000000Z")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_partition_key_rejects_time_string_after_cutoff() {
+        let partitioning = partitioning_spec(vec![time_dimension("date", Some("day"))]);
+        let cutoff = Some(Utc::now() - Duration::days(1));
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: Some("date=s:MjAyNC0wMS0xNQ".to_string()),
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err =
+            resolve_partition_key(&request, &partitioning, cutoff).expect_err("expected error");
+        assert!(err.message().contains("d:/t:"));
+    }
+
+    #[test]
+    fn test_resolve_partition_key_rejects_partitions_time_string_after_cutoff() {
+        let partitioning = partitioning_spec(vec![time_dimension("date", Some("day"))]);
+        let cutoff = Some(Utc::now() - Duration::days(1));
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![PartitionValue {
+                key: "date".to_string(),
+                value: "2024-01-15".to_string(),
+            }],
+            partition_key: None,
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err =
+            resolve_partition_key(&request, &partitioning, cutoff).expect_err("expected error");
+        assert!(err.message().contains("d:/t:"));
+    }
+
+    #[test]
     fn test_resolve_partition_key_rejects_empty_partition_key() {
+        let partitioning = partitioning_spec(vec![time_dimension("date", Some("day"))]);
         let request = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
             include_upstream: false,
@@ -5336,12 +6258,16 @@ mod tests {
             labels: HashMap::new(),
         };
 
-        let err = resolve_partition_key(&request).expect_err("expected error");
+        let err = resolve_partition_key(&request, &partitioning, None).expect_err("expected error");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn test_request_fingerprint_equivalent_for_partition_key_and_partitions() -> Result<()> {
+        let partitioning = partitioning_spec(vec![
+            time_dimension("date", Some("day")),
+            static_dimension("region"),
+        ]);
         let partitions = vec![
             PartitionValue {
                 key: "region".to_string(),
@@ -5374,10 +6300,18 @@ mod tests {
             labels: HashMap::new(),
         };
 
-        let fingerprint_partitions = build_request_fingerprint(&request_with_partitions)
-            .map_err(|err| anyhow!("{err:?}"))?;
-        let fingerprint_partition_key = build_request_fingerprint(&request_with_partition_key)
-            .map_err(|err| anyhow!("{err:?}"))?;
+        let resolved_partitions =
+            resolve_partition_key(&request_with_partitions, &partitioning, None)
+                .map_err(|err| anyhow!("{err:?}"))?;
+        let resolved_partition_key =
+            resolve_partition_key(&request_with_partition_key, &partitioning, None)
+                .map_err(|err| anyhow!("{err:?}"))?;
+        let fingerprint_partitions =
+            build_request_fingerprint(&request_with_partitions, &resolved_partitions)
+                .map_err(|err| anyhow!("{err:?}"))?;
+        let fingerprint_partition_key =
+            build_request_fingerprint(&request_with_partition_key, &resolved_partition_key)
+                .map_err(|err| anyhow!("{err:?}"))?;
 
         assert_eq!(fingerprint_partitions, fingerprint_partition_key);
         Ok(())
@@ -5658,6 +6592,91 @@ mod tests {
         assert!(build_partition_key(&partitions).is_err());
     }
 
+    #[test]
+    fn test_derive_run_partitioning_spec_rejects_mismatched_root_partitioning() -> Result<()> {
+        let stored_manifest = StoredManifest {
+            manifest_id: Ulid::new().to_string(),
+            tenant_id: "tenant".to_string(),
+            workspace_id: "workspace".to_string(),
+            manifest_version: "1.0".to_string(),
+            code_version_id: "abc123".to_string(),
+            fingerprint: "fp".to_string(),
+            git: GitContext::default(),
+            assets: vec![
+                AssetEntry {
+                    key: AssetKey {
+                        namespace: "analytics".to_string(),
+                        name: "users".to_string(),
+                    },
+                    id: "01HQXYZ123".to_string(),
+                    description: String::new(),
+                    owners: vec![],
+                    tags: serde_json::Value::Null,
+                    partitioning: json!({
+                        "is_partitioned": true,
+                        "dimensions": [{
+                            "name": "date",
+                            "kind": "time",
+                            "granularity": "day"
+                        }]
+                    }),
+                    dependencies: vec![],
+                    code: serde_json::Value::Null,
+                    checks: vec![],
+                    execution: serde_json::Value::Null,
+                    resources: serde_json::Value::Null,
+                    io: serde_json::Value::Null,
+                    transform_fingerprint: String::new(),
+                },
+                AssetEntry {
+                    key: AssetKey {
+                        namespace: "analytics".to_string(),
+                        name: "orders".to_string(),
+                    },
+                    id: "01HQXYZ124".to_string(),
+                    description: String::new(),
+                    owners: vec![],
+                    tags: serde_json::Value::Null,
+                    partitioning: json!({
+                        "is_partitioned": true,
+                        "dimensions": [{
+                            "name": "date",
+                            "kind": "time",
+                            "granularity": "hour"
+                        }]
+                    }),
+                    dependencies: vec![],
+                    code: serde_json::Value::Null,
+                    checks: vec![],
+                    execution: serde_json::Value::Null,
+                    resources: serde_json::Value::Null,
+                    io: serde_json::Value::Null,
+                    transform_fingerprint: String::new(),
+                },
+            ],
+            schedules: vec![],
+            deployed_at: Utc::now(),
+            deployed_by: "test".to_string(),
+            metadata: serde_json::Value::Null,
+        };
+
+        let manifest_context =
+            build_manifest_context(&stored_manifest).map_err(|err| anyhow!("{err:?}"))?;
+        let root_assets = vec![
+            arco_flow::orchestration::canonicalize_asset_key("analytics/users")
+                .map_err(anyhow::Error::msg)?,
+            arco_flow::orchestration::canonicalize_asset_key("analytics/orders")
+                .map_err(anyhow::Error::msg)?,
+        ];
+
+        let err =
+            derive_run_partitioning_spec(&root_assets, &manifest_context.partitioning_specs, true)
+                .expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.message().contains("identical partitioning"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_trigger_run_reemits_when_reservation_exists() -> Result<()> {
         let mut config = crate::config::Config::default();
@@ -5738,6 +6757,9 @@ mod tests {
             )
             .await?;
 
+        let partitioning = PartitioningSpec::default();
+        let resolved_partition_key = resolve_partition_key(&request, &partitioning, None)
+            .map_err(|err| anyhow!("{err:?}"))?;
         let reservation = RunKeyReservation {
             run_key: "daily:2024-01-01".to_string(),
             run_id: Ulid::new().to_string(),
@@ -5745,8 +6767,9 @@ mod tests {
             event_id: Ulid::new().to_string(),
             plan_event_id: Some(Ulid::new().to_string()),
             request_fingerprint: Some({
-                let (primary, variants) = build_request_fingerprint_variants(&request)
-                    .map_err(|err| anyhow!("{err:?}"))?;
+                let (primary, variants) =
+                    build_request_fingerprint_variants(&request, &resolved_partition_key)
+                        .map_err(|err| anyhow!("{err:?}"))?;
                 variants
                     .into_iter()
                     .find(|fp| fp != &primary)
@@ -5813,8 +6836,6 @@ mod tests {
                 plan_id: reservation.plan_id.clone(),
                 tasks: {
                     let graph = arco_flow::orchestration::AssetGraph::new();
-                    let partition_key =
-                        resolve_partition_key(&request).map_err(|err| anyhow!("{err:?}"))?;
                     let options = arco_flow::orchestration::SelectionOptions {
                         include_upstream: request.include_upstream,
                         include_downstream: request.include_downstream,
@@ -5823,7 +6844,7 @@ mod tests {
                         &graph,
                         &request.selection,
                         options,
-                        partition_key.as_deref(),
+                        resolved_partition_key.canonical.as_deref(),
                     )
                     .map_err(|err| anyhow!("{err}"))?
                 },
@@ -5875,8 +6896,15 @@ mod tests {
             labels: HashMap::new(),
         };
 
+        let partitioning = partitioning_spec(vec![
+            time_dimension("date", Some("day")),
+            static_dimension("region"),
+        ]);
+        let resolved_partition_key = resolve_partition_key(&request, &partitioning, None)
+            .map_err(|err| anyhow!("{err:?}"))?;
         let (primary, variants) =
-            build_request_fingerprint_variants(&request).map_err(|err| anyhow!("{err:?}"))?;
+            build_request_fingerprint_variants(&request, &resolved_partition_key)
+                .map_err(|err| anyhow!("{err:?}"))?;
         let legacy = variants
             .iter()
             .find(|fp| *fp != &primary)

@@ -31,20 +31,21 @@ use arco_core::publish::{
 };
 
 use super::fold::{
-    FoldState, merge_dep_satisfaction_rows, merge_dispatch_outbox_rows, merge_idempotency_key_rows,
-    merge_partition_status_rows, merge_run_rows, merge_schedule_definition_rows,
-    merge_schedule_state_rows, merge_schedule_tick_rows, merge_sensor_eval_rows,
-    merge_sensor_state_rows, merge_task_rows, merge_timer_rows,
+    FoldState, merge_backfill_chunk_rows, merge_backfill_rows, merge_dep_satisfaction_rows,
+    merge_dispatch_outbox_rows, merge_idempotency_key_rows, merge_partition_status_rows,
+    merge_run_rows, merge_schedule_definition_rows, merge_schedule_state_rows,
+    merge_schedule_tick_rows, merge_sensor_eval_rows, merge_sensor_state_rows, merge_task_rows,
+    merge_timer_rows,
 };
 use super::manifest::{
     EventRange, L0Delta, OrchestrationManifest, OrchestrationManifestPointer, RowCounts,
     TablePaths, Watermarks, next_manifest_id,
 };
 use super::parquet_util::{
-    read_partition_status, write_dep_satisfaction, write_dispatch_outbox, write_idempotency_keys,
-    write_partition_status, write_run_key_conflicts, write_run_key_index, write_runs,
-    write_schedule_definitions, write_schedule_state, write_schedule_ticks, write_sensor_evals,
-    write_sensor_state, write_tasks, write_timers,
+    read_partition_status, write_backfill_chunks, write_backfills, write_dep_satisfaction,
+    write_dispatch_outbox, write_idempotency_keys, write_partition_status, write_run_key_conflicts,
+    write_run_key_index, write_runs, write_schedule_definitions, write_schedule_state,
+    write_schedule_ticks, write_sensor_evals, write_sensor_state, write_tasks, write_timers,
 };
 
 const SENSOR_EVAL_RETENTION_DAYS: i64 = 30;
@@ -358,6 +359,8 @@ impl MicroCompactor {
                 .unwrap_or(u32::MAX),
             schedule_state: u32::try_from(delta_state.schedule_state.len()).unwrap_or(u32::MAX),
             schedule_ticks: u32::try_from(delta_state.schedule_ticks.len()).unwrap_or(u32::MAX),
+            backfills: u32::try_from(delta_state.backfills.len()).unwrap_or(u32::MAX),
+            backfill_chunks: u32::try_from(delta_state.backfill_chunks.len()).unwrap_or(u32::MAX),
         };
 
         // Create L0 delta entry when changes exist
@@ -614,6 +617,22 @@ impl MicroCompactor {
             }
         }
 
+        if let Some(ref backfills_path) = tables.backfills {
+            let data = self.storage.get_raw(backfills_path).await?;
+            let rows = super::parquet_util::read_backfills(&data)?;
+            for row in rows {
+                state.backfills.insert(row.backfill_id.clone(), row);
+            }
+        }
+
+        if let Some(ref backfill_chunks_path) = tables.backfill_chunks {
+            let data = self.storage.get_raw(backfill_chunks_path).await?;
+            let rows = super::parquet_util::read_backfill_chunks(&data)?;
+            for row in rows {
+                state.backfill_chunks.insert(row.chunk_id.clone(), row);
+            }
+        }
+
         if let Some(ref run_key_index_path) = tables.run_key_index {
             let data = self.storage.get_raw(run_key_index_path).await?;
             let rows = super::parquet_util::read_run_key_index(&data)?;
@@ -776,6 +795,19 @@ impl MicroCompactor {
             &state.schedule_ticks,
             write_schedule_ticks,
             &mut paths.schedule_ticks
+        );
+
+        write_table!(
+            "backfills.parquet",
+            &state.backfills,
+            write_backfills,
+            &mut paths.backfills
+        );
+        write_table!(
+            "backfill_chunks.parquet",
+            &state.backfill_chunks,
+            write_backfill_chunks,
+            &mut paths.backfill_chunks
         );
 
         Ok(paths)
@@ -1080,6 +1112,32 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
             .or_insert(row);
     }
 
+    for (backfill_id, row) in delta.backfills {
+        merged
+            .backfills
+            .entry(backfill_id)
+            .and_modify(|existing| {
+                if let Some(merged_row) = merge_backfill_rows(vec![existing.clone(), row.clone()]) {
+                    *existing = merged_row;
+                }
+            })
+            .or_insert(row);
+    }
+
+    for (chunk_id, row) in delta.backfill_chunks {
+        merged
+            .backfill_chunks
+            .entry(chunk_id)
+            .and_modify(|existing| {
+                if let Some(merged_row) =
+                    merge_backfill_chunk_rows(vec![existing.clone(), row.clone()])
+                {
+                    *existing = merged_row;
+                }
+            })
+            .or_insert(row);
+    }
+
     for (run_key, row) in delta.run_key_index {
         merged
             .run_key_index
@@ -1212,6 +1270,13 @@ fn delta_from_states(base: &FoldState, current: &FoldState) -> FoldState {
         &base.sensor_evals,
         &current.sensor_evals,
     );
+
+    insert_changed(&mut delta.backfills, &base.backfills, &current.backfills);
+    insert_changed(
+        &mut delta.backfill_chunks,
+        &base.backfill_chunks,
+        &current.backfill_chunks,
+    );
     insert_changed(
         &mut delta.run_key_index,
         &base.run_key_index,
@@ -1259,6 +1324,8 @@ fn delta_state_is_empty(state: &FoldState) -> bool {
         && state.dispatch_outbox.is_empty()
         && state.sensor_state.is_empty()
         && state.sensor_evals.is_empty()
+        && state.backfills.is_empty()
+        && state.backfill_chunks.is_empty()
         && state.run_key_index.is_empty()
         && state.run_key_conflicts.is_empty()
         && state.partition_status.is_empty()
@@ -1266,29 +1333,6 @@ fn delta_state_is_empty(state: &FoldState) -> bool {
         && state.schedule_definitions.is_empty()
         && state.schedule_state.is_empty()
         && state.schedule_ticks.is_empty()
-}
-
-fn validate_fencing_against_pointer(
-    fencing: Option<&FencingValidation>,
-    pointer: Option<&OrchestrationManifestPointer>,
-) -> Result<()> {
-    let (Some(fencing), Some(pointer)) = (fencing, pointer) else {
-        return Ok(());
-    };
-
-    if fencing.request_epoch < pointer.epoch {
-        counter!(
-            metric_names::ORCH_COMPACTOR_STALE_FENCE_REJECTS_TOTAL,
-            "reason" => "pointer_epoch_mismatch".to_string()
-        )
-        .increment(1);
-        return Err(Error::StaleFencingToken {
-            expected: pointer.epoch,
-            provided: fencing.request_epoch,
-        });
-    }
-
-    Ok(())
 }
 
 fn retention_reference_time_for_events(events: &[(String, OrchestrationEvent)]) -> DateTime<Utc> {

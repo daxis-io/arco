@@ -272,6 +272,14 @@ pub struct TablePaths {
     /// Path to `schedule_ticks.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule_ticks: Option<String>,
+
+    /// Path to `backfills.parquet` (relative to storage root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backfills: Option<String>,
+
+    /// Path to `backfill_chunks.parquet` (relative to storage root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backfill_chunks: Option<String>,
 }
 
 impl TablePaths {
@@ -320,6 +328,12 @@ impl TablePaths {
         }
         if let Some(ref p) = self.schedule_ticks {
             paths.insert("schedule_ticks", p.as_str());
+        }
+        if let Some(ref p) = self.backfills {
+            paths.insert("backfills", p.as_str());
+        }
+        if let Some(ref p) = self.backfill_chunks {
+            paths.insert("backfill_chunks", p.as_str());
         }
         paths
     }
@@ -405,6 +419,12 @@ pub struct RowCounts {
 
     /// Rows in `schedule_ticks` table.
     pub schedule_ticks: u32,
+
+    /// Rows in `backfills` table.
+    pub backfills: u32,
+
+    /// Rows in `backfill_chunks` table.
+    pub backfill_chunks: u32,
 }
 
 impl RowCounts {
@@ -425,6 +445,8 @@ impl RowCounts {
             + self.schedule_definitions
             + self.schedule_state
             + self.schedule_ticks
+            + self.backfills
+            + self.backfill_chunks
     }
 }
 
@@ -528,6 +550,8 @@ mod tests {
             schedule_definitions: 0,
             schedule_state: 0,
             schedule_ticks: 0,
+            backfills: 0,
+            backfill_chunks: 0,
         };
 
         assert_eq!(counts.total(), 529);

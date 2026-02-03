@@ -95,6 +95,18 @@ class AssetEntry:
                 check_dict["max_age_hours"] = check.max_age_hours
             checks_serialized.append(check_dict)
 
+        dimensions: list[dict[str, Any]] = []
+        for dimension in definition.partitioning.dimensions:
+            dimension_entry: dict[str, Any] = {
+                "name": dimension.name,
+                "kind": dimension.kind.value,
+            }
+            if hasattr(dimension, "granularity"):
+                dimension_entry["granularity"] = getattr(dimension, "granularity")
+            if hasattr(dimension, "values"):
+                dimension_entry["values"] = list(getattr(dimension, "values"))
+            dimensions.append(dimension_entry)
+
         return cls(
             key={
                 "namespace": definition.key.namespace,
@@ -106,13 +118,7 @@ class AssetEntry:
             tags=dict(definition.tags),
             partitioning={
                 "is_partitioned": definition.partitioning.is_partitioned,
-                "dimensions": [
-                    {
-                        "name": d.name,
-                        "kind": d.kind.value,
-                    }
-                    for d in definition.partitioning.dimensions
-                ],
+                "dimensions": dimensions,
             },
             dependencies=[
                 {

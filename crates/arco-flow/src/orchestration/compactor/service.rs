@@ -10,7 +10,7 @@
 //! The compactor is the sole writer of Parquet files (IAM-enforced).
 
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::cmp::Ordering;
 use ulid::Ulid;
 
@@ -21,19 +21,20 @@ use crate::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
 use crate::paths::{orchestration_l0_dir, orchestration_manifest_path};
 
 use super::fold::{
-    FoldState, merge_dep_satisfaction_rows, merge_dispatch_outbox_rows, merge_idempotency_key_rows,
-    merge_partition_status_rows, merge_run_rows, merge_schedule_definition_rows,
-    merge_schedule_state_rows, merge_schedule_tick_rows, merge_sensor_eval_rows,
-    merge_sensor_state_rows, merge_task_rows, merge_timer_rows,
+    FoldState, merge_backfill_chunk_rows, merge_backfill_rows, merge_dep_satisfaction_rows,
+    merge_dispatch_outbox_rows, merge_idempotency_key_rows, merge_partition_status_rows,
+    merge_run_rows, merge_schedule_definition_rows, merge_schedule_state_rows,
+    merge_schedule_tick_rows, merge_sensor_eval_rows, merge_sensor_state_rows, merge_task_rows,
+    merge_timer_rows,
 };
 use super::manifest::{
     EventRange, L0Delta, OrchestrationManifest, RowCounts, TablePaths, Watermarks,
 };
 use super::parquet_util::{
-    read_partition_status, write_dep_satisfaction, write_dispatch_outbox, write_idempotency_keys,
-    write_partition_status, write_run_key_conflicts, write_run_key_index, write_runs,
-    write_schedule_definitions, write_schedule_state, write_schedule_ticks, write_sensor_evals,
-    write_sensor_state, write_tasks, write_timers,
+    read_partition_status, write_backfill_chunks, write_backfills, write_dep_satisfaction,
+    write_dispatch_outbox, write_idempotency_keys, write_partition_status, write_run_key_conflicts,
+    write_run_key_index, write_runs, write_schedule_definitions, write_schedule_state,
+    write_schedule_ticks, write_sensor_evals, write_sensor_state, write_tasks, write_timers,
 };
 
 const SENSOR_EVAL_RETENTION_DAYS: i64 = 30;
@@ -161,8 +162,9 @@ impl MicroCompactor {
             state.fold_event(event);
         }
 
-        prune_sensor_evals(&mut state);
-        prune_idempotency_keys(&mut state);
+        let retention_now = retention_reference_time_for_events(&events);
+        prune_sensor_evals(&mut state, retention_now);
+        prune_idempotency_keys(&mut state, retention_now);
 
         // Compute delta state (rows changed by this batch)
         let delta_state = delta_from_states(&base_state, &state);
@@ -197,6 +199,8 @@ impl MicroCompactor {
                 .unwrap_or(u32::MAX),
             schedule_state: u32::try_from(delta_state.schedule_state.len()).unwrap_or(u32::MAX),
             schedule_ticks: u32::try_from(delta_state.schedule_ticks.len()).unwrap_or(u32::MAX),
+            backfills: u32::try_from(delta_state.backfills.len()).unwrap_or(u32::MAX),
+            backfill_chunks: u32::try_from(delta_state.backfill_chunks.len()).unwrap_or(u32::MAX),
         };
 
         // Create L0 delta entry when changes exist
@@ -290,8 +294,11 @@ impl MicroCompactor {
             state = merge_states(state, delta_state);
         }
 
-        prune_sensor_evals(&mut state);
-        prune_idempotency_keys(&mut state);
+        let retention_now = retention_reference_time_for_state(&state);
+        if let Some(retention_now) = retention_now {
+            prune_sensor_evals(&mut state, retention_now);
+            prune_idempotency_keys(&mut state, retention_now);
+        }
         state.rebuild_dependency_graph();
 
         Ok(state)
@@ -367,6 +374,22 @@ impl MicroCompactor {
             let rows = super::parquet_util::read_sensor_evals(&data)?;
             for row in rows {
                 state.sensor_evals.insert(row.eval_id.clone(), row);
+            }
+        }
+
+        if let Some(ref backfills_path) = tables.backfills {
+            let data = self.storage.get_raw(backfills_path).await?;
+            let rows = super::parquet_util::read_backfills(&data)?;
+            for row in rows {
+                state.backfills.insert(row.backfill_id.clone(), row);
+            }
+        }
+
+        if let Some(ref backfill_chunks_path) = tables.backfill_chunks {
+            let data = self.storage.get_raw(backfill_chunks_path).await?;
+            let rows = super::parquet_util::read_backfill_chunks(&data)?;
+            for row in rows {
+                state.backfill_chunks.insert(row.chunk_id.clone(), row);
             }
         }
 
@@ -532,6 +555,19 @@ impl MicroCompactor {
             &state.schedule_ticks,
             write_schedule_ticks,
             &mut paths.schedule_ticks
+        );
+
+        write_table!(
+            "backfills.parquet",
+            &state.backfills,
+            write_backfills,
+            &mut paths.backfills
+        );
+        write_table!(
+            "backfill_chunks.parquet",
+            &state.backfill_chunks,
+            write_backfill_chunks,
+            &mut paths.backfill_chunks
         );
 
         Ok(paths)
@@ -713,6 +749,32 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
             .or_insert(row);
     }
 
+    for (backfill_id, row) in delta.backfills {
+        merged
+            .backfills
+            .entry(backfill_id)
+            .and_modify(|existing| {
+                if let Some(merged_row) = merge_backfill_rows(vec![existing.clone(), row.clone()]) {
+                    *existing = merged_row;
+                }
+            })
+            .or_insert(row);
+    }
+
+    for (chunk_id, row) in delta.backfill_chunks {
+        merged
+            .backfill_chunks
+            .entry(chunk_id)
+            .and_modify(|existing| {
+                if let Some(merged_row) =
+                    merge_backfill_chunk_rows(vec![existing.clone(), row.clone()])
+                {
+                    *existing = merged_row;
+                }
+            })
+            .or_insert(row);
+    }
+
     for (run_key, row) in delta.run_key_index {
         merged
             .run_key_index
@@ -845,6 +907,13 @@ fn delta_from_states(base: &FoldState, current: &FoldState) -> FoldState {
         &base.sensor_evals,
         &current.sensor_evals,
     );
+
+    insert_changed(&mut delta.backfills, &base.backfills, &current.backfills);
+    insert_changed(
+        &mut delta.backfill_chunks,
+        &base.backfill_chunks,
+        &current.backfill_chunks,
+    );
     insert_changed(
         &mut delta.run_key_index,
         &base.run_key_index,
@@ -892,6 +961,8 @@ fn delta_state_is_empty(state: &FoldState) -> bool {
         && state.dispatch_outbox.is_empty()
         && state.sensor_state.is_empty()
         && state.sensor_evals.is_empty()
+        && state.backfills.is_empty()
+        && state.backfill_chunks.is_empty()
         && state.run_key_index.is_empty()
         && state.run_key_conflicts.is_empty()
         && state.partition_status.is_empty()
@@ -901,15 +972,43 @@ fn delta_state_is_empty(state: &FoldState) -> bool {
         && state.schedule_ticks.is_empty()
 }
 
-fn prune_sensor_evals(state: &mut FoldState) {
-    let cutoff = Utc::now() - chrono::Duration::days(SENSOR_EVAL_RETENTION_DAYS);
+fn retention_reference_time_for_events(events: &[(String, OrchestrationEvent)]) -> DateTime<Utc> {
+    events
+        .iter()
+        .map(|(_, event)| event.timestamp)
+        .max()
+        .unwrap_or_else(Utc::now)
+}
+
+fn retention_reference_time_for_state(state: &FoldState) -> Option<DateTime<Utc>> {
+    let max_sensor_eval = state
+        .sensor_evals
+        .values()
+        .map(|row| row.evaluated_at)
+        .max();
+    let max_idempotency = state
+        .idempotency_keys
+        .values()
+        .map(|row| row.recorded_at)
+        .max();
+
+    match (max_sensor_eval, max_idempotency) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn prune_sensor_evals(state: &mut FoldState, retention_now: DateTime<Utc>) {
+    let cutoff = retention_now - chrono::Duration::days(SENSOR_EVAL_RETENTION_DAYS);
     state
         .sensor_evals
         .retain(|_, row| row.evaluated_at >= cutoff);
 }
 
-fn prune_idempotency_keys(state: &mut FoldState) {
-    let cutoff = Utc::now() - chrono::Duration::days(IDEMPOTENCY_KEY_RETENTION_DAYS);
+fn prune_idempotency_keys(state: &mut FoldState, retention_now: DateTime<Utc>) {
+    let cutoff = retention_now - chrono::Duration::days(IDEMPOTENCY_KEY_RETENTION_DAYS);
     state
         .idempotency_keys
         .retain(|_, row| row.recorded_at >= cutoff);
@@ -959,7 +1058,8 @@ mod tests {
     use super::*;
     use crate::orchestration::compactor::fold::{DispatchOutboxRow, TimerRow};
     use crate::orchestration::events::{
-        OrchestrationEventData, SourceRef, TaskDef, TickStatus, TimerType, TriggerInfo,
+        OrchestrationEventData, PartitionSelector, RunRequest, SensorEvalStatus, SourceRef,
+        TaskDef, TickStatus, TimerType, TriggerInfo, TriggerSource,
     };
     use crate::paths::orchestration_event_path;
     use arco_core::MemoryBackend;
@@ -1211,6 +1311,224 @@ mod tests {
                 .contains_key(&("run_01".to_string(), "transform".to_string()))
         );
         assert_eq!(state.dep_satisfaction.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cold_restart_preserves_layer2_backfills_ticks_and_sensors() -> Result<()> {
+        let (_compactor, storage) = create_test_compactor().await?;
+
+        let now = Utc::now();
+        let scheduled_for = now + chrono::Duration::minutes(5);
+        let schedule_id = "sched-01";
+        let tick_id = format!("{schedule_id}:{}", scheduled_for.timestamp());
+
+        let sensor_id = "sensor-01";
+        let eval_id = "eval-01";
+
+        let backfill_id = "bf-01";
+        let chunk_id = "bf-01:0";
+
+        fn event_with_id(
+            event_id: &str,
+            timestamp: DateTime<Utc>,
+            data: OrchestrationEventData,
+        ) -> OrchestrationEvent {
+            let mut e =
+                OrchestrationEvent::new_with_timestamp("tenant", "workspace", data, timestamp);
+            e.event_id = event_id.to_string();
+            e
+        }
+
+        let schedule_def = event_with_id(
+            "evt_01",
+            now,
+            OrchestrationEventData::ScheduleDefinitionUpserted {
+                schedule_id: schedule_id.to_string(),
+                cron_expression: "* * * * *".to_string(),
+                timezone: "UTC".to_string(),
+                catchup_window_minutes: 60,
+                asset_selection: vec!["asset.a".to_string()],
+                max_catchup_ticks: 10,
+                enabled: true,
+            },
+        );
+
+        let schedule_tick = event_with_id(
+            "evt_02",
+            now,
+            OrchestrationEventData::ScheduleTicked {
+                schedule_id: schedule_id.to_string(),
+                scheduled_for,
+                tick_id: tick_id.clone(),
+                definition_version: "v1".to_string(),
+                asset_selection: vec!["asset.a".to_string()],
+                partition_selection: None,
+                status: TickStatus::Triggered,
+                run_key: Some("sched:1".to_string()),
+                request_fingerprint: Some("fp-sched-1".to_string()),
+            },
+        );
+
+        let schedule_run_requested = event_with_id(
+            "evt_03",
+            now,
+            OrchestrationEventData::RunRequested {
+                run_key: "sched:1".to_string(),
+                request_fingerprint: "fp-sched-1".to_string(),
+                asset_selection: vec!["asset.a".to_string()],
+                partition_selection: None,
+                trigger_source_ref: SourceRef::Schedule {
+                    schedule_id: schedule_id.to_string(),
+                    tick_id: tick_id.clone(),
+                },
+                labels: HashMap::new(),
+            },
+        );
+
+        let sensor_eval = event_with_id(
+            "evt_04",
+            now,
+            OrchestrationEventData::SensorEvaluated {
+                sensor_id: sensor_id.to_string(),
+                eval_id: eval_id.to_string(),
+                cursor_before: None,
+                cursor_after: Some("c1".to_string()),
+                expected_state_version: Some(0),
+                trigger_source: TriggerSource::Poll {
+                    poll_epoch: scheduled_for.timestamp(),
+                },
+                run_requests: vec![RunRequest {
+                    run_key: "sensor:1".to_string(),
+                    request_fingerprint: "fp-sensor-1".to_string(),
+                    asset_selection: vec!["asset.b".to_string()],
+                    partition_selection: None,
+                }],
+                status: SensorEvalStatus::Triggered,
+            },
+        );
+
+        let sensor_run_requested = event_with_id(
+            "evt_05",
+            now,
+            OrchestrationEventData::RunRequested {
+                run_key: "sensor:1".to_string(),
+                request_fingerprint: "fp-sensor-1".to_string(),
+                asset_selection: vec!["asset.b".to_string()],
+                partition_selection: None,
+                trigger_source_ref: SourceRef::Sensor {
+                    sensor_id: sensor_id.to_string(),
+                    eval_id: eval_id.to_string(),
+                },
+                labels: HashMap::new(),
+            },
+        );
+
+        let backfill_created = event_with_id(
+            "evt_06",
+            now,
+            OrchestrationEventData::BackfillCreated {
+                backfill_id: backfill_id.to_string(),
+                client_request_id: "req-01".to_string(),
+                asset_selection: vec!["asset.c".to_string()],
+                partition_selector: PartitionSelector::Explicit {
+                    partition_keys: vec![
+                        "2025-01-01".to_string(),
+                        "2025-01-02".to_string(),
+                        "2025-01-03".to_string(),
+                    ],
+                },
+                total_partitions: 3,
+                chunk_size: 2,
+                max_concurrent_runs: 2,
+                parent_backfill_id: None,
+            },
+        );
+
+        let backfill_chunk_planned = event_with_id(
+            "evt_07",
+            now,
+            OrchestrationEventData::BackfillChunkPlanned {
+                backfill_id: backfill_id.to_string(),
+                chunk_id: chunk_id.to_string(),
+                chunk_index: 0,
+                partition_keys: vec!["2025-01-01".to_string(), "2025-01-02".to_string()],
+                run_key: "backfill:bf-01:0".to_string(),
+                request_fingerprint: "fp-bf-0".to_string(),
+            },
+        );
+
+        let backfill_run_requested = event_with_id(
+            "evt_08",
+            now,
+            OrchestrationEventData::RunRequested {
+                run_key: "backfill:bf-01:0".to_string(),
+                request_fingerprint: "fp-bf-0".to_string(),
+                asset_selection: vec!["asset.c".to_string()],
+                partition_selection: Some(vec!["2025-01-01".to_string(), "2025-01-02".to_string()]),
+                trigger_source_ref: SourceRef::Backfill {
+                    backfill_id: backfill_id.to_string(),
+                    chunk_id: chunk_id.to_string(),
+                },
+                labels: HashMap::new(),
+            },
+        );
+
+        let events = vec![
+            schedule_def,
+            schedule_tick,
+            schedule_run_requested,
+            sensor_eval,
+            sensor_run_requested,
+            backfill_created,
+            backfill_chunk_planned,
+            backfill_run_requested,
+        ];
+
+        let mut paths = Vec::new();
+        for event in &events {
+            let path = orchestration_event_path("2026-01-15", &event.event_id);
+            storage
+                .put_raw(
+                    &path,
+                    Bytes::from(serde_json::to_string(event).expect("serialize")),
+                    WritePrecondition::None,
+                )
+                .await?;
+            paths.push(path);
+        }
+
+        let compactor = MicroCompactor::new(storage.clone());
+        compactor.compact_events(paths).await?;
+
+        // Cold restart: create a fresh compactor instance and reload solely from manifest + Parquet.
+        let reloaded = MicroCompactor::new(storage.clone());
+        let (_manifest, state) = reloaded.load_state().await?;
+
+        assert!(state.schedule_definitions.contains_key(schedule_id));
+        assert!(state.schedule_state.contains_key(schedule_id));
+        let tick = state.schedule_ticks.get(&tick_id).expect("tick");
+
+        assert!(state.sensor_state.contains_key(sensor_id));
+        assert!(state.sensor_evals.contains_key(eval_id));
+
+        assert!(state.backfills.contains_key(backfill_id));
+        let chunk = state.backfill_chunks.get(chunk_id).expect("chunk");
+
+        let sched_run_id = tick.run_id.as_deref().expect("schedule run_id");
+        let sched_index = state
+            .run_key_index
+            .get("sched:1")
+            .expect("schedule run_key_index");
+        assert_eq!(sched_index.run_id.as_str(), sched_run_id);
+
+        let bf_run_id = chunk.run_id.as_deref().expect("backfill chunk run_id");
+        let bf_index = state
+            .run_key_index
+            .get("backfill:bf-01:0")
+            .expect("backfill run_key_index");
+        assert_eq!(bf_index.run_id.as_str(), bf_run_id);
 
         Ok(())
     }

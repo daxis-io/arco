@@ -49,3 +49,7 @@ coverage/
 *.tfstate
 *.tfstate.backup
 *.tfplan
+
+# Local tooling
+/.claude/
+/.worktrees/

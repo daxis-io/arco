@@ -513,6 +513,22 @@ fn col_string<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray>
         })
 }
 
+fn col_string_optional<'a>(batch: &'a RecordBatch, name: &str) -> Result<Option<&'a StringArray>> {
+    let idx = match batch.schema().index_of(name) {
+        Ok(idx) => idx,
+        Err(_) => return Ok(None),
+    };
+
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .map(Some)
+        .ok_or_else(|| CatalogError::InvariantViolation {
+            message: format!("column '{name}' is not StringArray"),
+        })
+}
+
 fn col_i64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
     let idx = batch
         .schema()
@@ -592,7 +608,7 @@ pub fn read_namespaces(bytes: &Bytes) -> Result<Vec<NamespaceRecord>> {
     for batch in read_batches(bytes)? {
         let id = col_string(&batch, "id")?;
         let name = col_string(&batch, "name")?;
-        let description = col_string(&batch, "description")?;
+        let description = col_string_optional(&batch, "description")?;
         let created_at = col_i64(&batch, "created_at")?;
         let updated_at = col_i64(&batch, "updated_at")?;
 
@@ -600,11 +616,13 @@ pub fn read_namespaces(bytes: &Bytes) -> Result<Vec<NamespaceRecord>> {
             out.push(NamespaceRecord {
                 id: id.value(row).to_string(),
                 name: name.value(row).to_string(),
-                description: if description.is_null(row) {
-                    None
-                } else {
-                    Some(description.value(row).to_string())
-                },
+                description: description.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
                 created_at: created_at.value(row),
                 updated_at: updated_at.value(row),
             });
@@ -625,9 +643,9 @@ pub fn read_tables(bytes: &Bytes) -> Result<Vec<TableRecord>> {
         let id = col_string(&batch, "id")?;
         let namespace_id = col_string(&batch, "namespace_id")?;
         let name = col_string(&batch, "name")?;
-        let description = col_string(&batch, "description")?;
-        let location = col_string(&batch, "location")?;
-        let format = col_string(&batch, "format")?;
+        let description = col_string_optional(&batch, "description")?;
+        let location = col_string_optional(&batch, "location")?;
+        let format = col_string_optional(&batch, "format")?;
         let created_at = col_i64(&batch, "created_at")?;
         let updated_at = col_i64(&batch, "updated_at")?;
 
@@ -636,21 +654,27 @@ pub fn read_tables(bytes: &Bytes) -> Result<Vec<TableRecord>> {
                 id: id.value(row).to_string(),
                 namespace_id: namespace_id.value(row).to_string(),
                 name: name.value(row).to_string(),
-                description: if description.is_null(row) {
-                    None
-                } else {
-                    Some(description.value(row).to_string())
-                },
-                location: if location.is_null(row) {
-                    None
-                } else {
-                    Some(location.value(row).to_string())
-                },
-                format: if format.is_null(row) {
-                    None
-                } else {
-                    Some(format.value(row).to_string())
-                },
+                description: description.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                location: location.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                format: format.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
                 created_at: created_at.value(row),
                 updated_at: updated_at.value(row),
             });
@@ -674,7 +698,7 @@ pub fn read_columns(bytes: &Bytes) -> Result<Vec<ColumnRecord>> {
         let data_type = col_string(&batch, "data_type")?;
         let is_nullable = col_bool(&batch, "is_nullable")?;
         let ordinal = col_i32(&batch, "ordinal")?;
-        let description = col_string(&batch, "description")?;
+        let description = col_string_optional(&batch, "description")?;
 
         for row in 0..batch.num_rows() {
             out.push(ColumnRecord {
@@ -684,11 +708,13 @@ pub fn read_columns(bytes: &Bytes) -> Result<Vec<ColumnRecord>> {
                 data_type: data_type.value(row).to_string(),
                 is_nullable: is_nullable.value(row),
                 ordinal: ordinal.value(row),
-                description: if description.is_null(row) {
-                    None
-                } else {
-                    Some(description.value(row).to_string())
-                },
+                description: description.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
             });
         }
     }
@@ -708,7 +734,7 @@ pub fn read_lineage_edges(bytes: &Bytes) -> Result<Vec<LineageEdgeRecord>> {
         let source_id = col_string(&batch, "source_id")?;
         let target_id = col_string(&batch, "target_id")?;
         let edge_type = col_string(&batch, "edge_type")?;
-        let run_id = col_string(&batch, "run_id")?;
+        let run_id = col_string_optional(&batch, "run_id")?;
         let created_at = col_i64(&batch, "created_at")?;
 
         for row in 0..batch.num_rows() {
@@ -717,11 +743,13 @@ pub fn read_lineage_edges(bytes: &Bytes) -> Result<Vec<LineageEdgeRecord>> {
                 source_id: source_id.value(row).to_string(),
                 target_id: target_id.value(row).to_string(),
                 edge_type: edge_type.value(row).to_string(),
-                run_id: if run_id.is_null(row) {
-                    None
-                } else {
-                    Some(run_id.value(row).to_string())
-                },
+                run_id: run_id.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
                 created_at: created_at.value(row),
             });
         }
@@ -755,4 +783,45 @@ pub fn read_search_postings(bytes: &Bytes) -> Result<Vec<SearchPostingRecord>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_namespaces_tolerates_missing_optional_columns() {
+        // Simulate an "old" snapshot schema that predates optional columns.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+            // NOTE: "description" intentionally omitted.
+            Field::new("created_at", DataType::Int64, false),
+            Field::new("updated_at", DataType::Int64, false),
+        ]));
+
+        let ids = StringArray::from(vec![Some("ns_1")]);
+        let names = StringArray::from(vec![Some("default")]);
+        let created_at = Int64Array::from(vec![123_i64]);
+        let updated_at = Int64Array::from(vec![123_i64]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(ids),
+                Arc::new(names),
+                Arc::new(created_at),
+                Arc::new(updated_at),
+            ],
+        )
+        .expect("record batch build");
+
+        let bytes = write_single_batch(schema, &batch).expect("write parquet");
+        let rows = read_namespaces(&bytes).expect("read namespaces");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "ns_1");
+        assert_eq!(rows[0].name, "default");
+        assert_eq!(rows[0].description, None);
+    }
 }

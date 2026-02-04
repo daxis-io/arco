@@ -551,7 +551,7 @@ impl CatalogWriter {
         description: Option<&str>,
         opts: WriteOptions,
     ) -> Result<Catalog> {
-        // Check optimistic locking
+        // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -583,6 +583,18 @@ impl CatalogWriter {
             .await?;
 
         let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
@@ -1306,8 +1318,7 @@ impl CatalogWriter {
                 });
             }
         }
-
-        let state =
+        let mut state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
         let target_catalog = if catalog == "default" {

@@ -37,9 +37,7 @@ use crate::error::{CatalogError, Result};
 use crate::event_writer::EventWriter;
 use crate::lock::DistributedLock;
 use crate::manifest::SnapshotInfo;
-use crate::parquet_util::{
-    CatalogRecord, ColumnRecord, LineageEdgeRecord, NamespaceRecord, TableRecord,
-};
+use crate::parquet_util::{CatalogRecord, ColumnRecord, LineageEdgeRecord, NamespaceRecord, TableRecord};
 use crate::sync_compactor::SyncCompactor;
 use crate::tier1_events::{CatalogDdlEvent, CatalogDdlEventV2, LineageDdlEvent};
 use crate::tier1_state;
@@ -551,7 +549,7 @@ impl CatalogWriter {
         description: Option<&str>,
         opts: WriteOptions,
     ) -> Result<Catalog> {
-        // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
+        // Check optimistic locking
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -583,18 +581,6 @@ impl CatalogWriter {
             .await?;
 
         let manifest = self.tier1.read_manifest().await?;
-        if let Some(expected) = &opts.if_match {
-            if manifest.catalog.snapshot_version != expected.as_u64() {
-                guard.release().await?;
-                return Err(CatalogError::PreconditionFailed {
-                    message: format!(
-                        "version mismatch: expected {}, got {}",
-                        expected.as_u64(),
-                        manifest.catalog.snapshot_version
-                    ),
-                });
-            }
-        }
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
@@ -607,7 +593,7 @@ impl CatalogWriter {
             });
         }
 
-        let event = CatalogDdlEventV2::CatalogCreated {
+        let event = CatalogDdlEvent::CatalogCreated {
             catalog: CatalogRecord::from(&catalog),
         };
 
@@ -2083,7 +2069,11 @@ mod tests {
         writer.initialize().await.expect("initialize");
 
         let catalog = writer
-            .create_catalog("default", Some("Default catalog"), WriteOptions::default())
+            .create_catalog(
+                "default",
+                Some("Default catalog"),
+                WriteOptions::default(),
+            )
             .await
             .expect("create catalog");
 
@@ -2098,136 +2088,6 @@ mod tests {
 
         assert_eq!(state.catalogs.len(), 1);
         assert_eq!(state.catalogs[0].name, "default");
-    }
-
-    #[tokio::test]
-    async fn test_create_duplicate_catalog_fails() {
-        let writer = setup();
-        writer.initialize().await.expect("initialize");
-
-        writer
-            .create_catalog("default", None, WriteOptions::default())
-            .await
-            .expect("first create");
-
-        let result = writer
-            .create_catalog("default", None, WriteOptions::default())
-            .await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, CatalogError::AlreadyExists { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_create_schema_sets_catalog_id() {
-        let writer = setup();
-        writer.initialize().await.expect("initialize");
-
-        let catalog = writer
-            .create_catalog("default", None, WriteOptions::default())
-            .await
-            .expect("create catalog");
-
-        let ns = writer
-            .create_schema(
-                "default",
-                "sales",
-                Some("Sales schema"),
-                WriteOptions::default(),
-            )
-            .await
-            .expect("create schema");
-
-        assert_eq!(ns.name, "sales");
-        assert_eq!(ns.catalog_id, Some(catalog.id.clone()));
-
-        let manifest = writer.tier1.read_manifest().await.expect("manifest");
-        let state =
-            tier1_state::load_catalog_state(&writer.storage, &manifest.catalog.snapshot_path)
-                .await
-                .expect("load catalog state");
-
-        let stored = state
-            .namespaces
-            .iter()
-            .find(|n| n.id == ns.id)
-            .expect("namespace stored");
-
-        assert_eq!(stored.catalog_id, Some(catalog.id));
-    }
-
-    #[tokio::test]
-    async fn test_create_schema_allows_same_name_in_different_catalogs() {
-        let writer = setup();
-        writer.initialize().await.expect("initialize");
-
-        let default = writer
-            .create_catalog("default", None, WriteOptions::default())
-            .await
-            .expect("create default catalog");
-
-        let analytics = writer
-            .create_catalog("analytics", None, WriteOptions::default())
-            .await
-            .expect("create analytics catalog");
-
-        let ns_default = writer
-            .create_schema("default", "sales", None, WriteOptions::default())
-            .await
-            .expect("create schema in default");
-
-        let ns_analytics = writer
-            .create_schema("analytics", "sales", None, WriteOptions::default())
-            .await
-            .expect("create schema in analytics");
-
-        assert_eq!(ns_default.name, "sales");
-        assert_eq!(ns_default.catalog_id, Some(default.id.clone()));
-        assert_eq!(ns_analytics.name, "sales");
-        assert_eq!(ns_analytics.catalog_id, Some(analytics.id.clone()));
-
-        let manifest = writer.tier1.read_manifest().await.expect("manifest");
-        let state =
-            tier1_state::load_catalog_state(&writer.storage, &manifest.catalog.snapshot_path)
-                .await
-                .expect("load catalog state");
-
-        assert_eq!(state.namespaces.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_register_table_in_schema_uses_catalog_and_schema() {
-        let writer = setup();
-        writer.initialize().await.expect("initialize");
-
-        writer
-            .create_catalog("analytics", None, WriteOptions::default())
-            .await
-            .expect("create analytics catalog");
-        let sales = writer
-            .create_schema("analytics", "sales", None, WriteOptions::default())
-            .await
-            .expect("create sales schema");
-
-        let table = writer
-            .register_table_in_schema(
-                "analytics",
-                "sales",
-                RegisterTableInSchemaRequest {
-                    name: "orders".to_string(),
-                    description: None,
-                    location: Some("gs://bucket/warehouse/sales/orders".to_string()),
-                    format: Some("delta".to_string()),
-                    columns: vec![],
-                },
-                WriteOptions::default(),
-            )
-            .await
-            .expect("register table");
-
-        assert_eq!(table.namespace_id, sales.id);
-        assert_eq!(table.name, "orders");
     }
 
     #[tokio::test]

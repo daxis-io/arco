@@ -994,22 +994,6 @@ fn apply_catalog_event_v1(
     event: CatalogDdlEvent,
 ) -> Result<(), Tier1CompactionError> {
     match event {
-        CatalogDdlEvent::CatalogCreated { catalog } => {
-            if let Some(existing) = state.catalogs.iter().find(|c| c.id == catalog.id) {
-                if existing == &catalog {
-                    return Ok(());
-                }
-                return Err(Tier1CompactionError::ProcessingError {
-                    message: format!("catalog id collision for {}", catalog.id),
-                });
-            }
-            if state.catalogs.iter().any(|c| c.name == catalog.name) {
-                return Err(Tier1CompactionError::ProcessingError {
-                    message: format!("catalog '{}' already exists", catalog.name),
-                });
-            }
-            state.catalogs.push(catalog);
-        }
         CatalogDdlEvent::NamespaceCreated { namespace } => {
             if let Some(existing) = state.namespaces.iter().find(|ns| ns.id == namespace.id) {
                 if existing == &namespace {

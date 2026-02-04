@@ -565,6 +565,40 @@ fn contract_catalogs_roundtrip_preserves_schema() {
 }
 
 #[test]
+fn contract_catalogs_roundtrip_preserves_schema() {
+    use arco_catalog::parquet_util::{CatalogRecord, read_catalogs, write_catalogs};
+
+    let records = vec![
+        CatalogRecord {
+            id: "cat_001".into(),
+            name: "default".into(),
+            description: Some("Default catalog".into()),
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+        },
+        CatalogRecord {
+            id: "cat_002".into(),
+            name: "analytics".into(),
+            description: None,
+            created_at: 1_700_000_001_000,
+            updated_at: 1_700_000_001_000,
+        },
+    ];
+
+    let result = write_catalogs(&records).expect("write should succeed");
+    let read_back = read_catalogs(&result).expect("read should succeed");
+
+    assert_eq!(read_back.len(), 2);
+    let first = read_back.first().expect("first catalog record");
+    let second = read_back.get(1).expect("second catalog record");
+    assert_eq!(first.id, "cat_001");
+    assert_eq!(first.name, "default");
+    assert_eq!(first.description, Some("Default catalog".into()));
+    assert_eq!(second.id, "cat_002");
+    assert_eq!(second.description, None);
+}
+
+#[test]
 fn contract_tables_roundtrip_preserves_schema() {
     use arco_catalog::parquet_util::{TableRecord, read_tables, write_tables};
 

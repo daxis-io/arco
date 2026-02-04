@@ -37,7 +37,9 @@ use crate::error::{CatalogError, Result};
 use crate::event_writer::EventWriter;
 use crate::lock::DistributedLock;
 use crate::manifest::SnapshotInfo;
-use crate::parquet_util::{CatalogRecord, ColumnRecord, LineageEdgeRecord, NamespaceRecord, TableRecord};
+use crate::parquet_util::{
+    CatalogRecord, ColumnRecord, LineageEdgeRecord, NamespaceRecord, TableRecord,
+};
 use crate::sync_compactor::SyncCompactor;
 use crate::tier1_events::{CatalogDdlEvent, CatalogDdlEventV2, LineageDdlEvent};
 use crate::tier1_state;
@@ -593,7 +595,7 @@ impl CatalogWriter {
             });
         }
 
-        let event = CatalogDdlEvent::CatalogCreated {
+        let event = CatalogDdlEventV2::CatalogCreated {
             catalog: CatalogRecord::from(&catalog),
         };
 
@@ -2069,11 +2071,7 @@ mod tests {
         writer.initialize().await.expect("initialize");
 
         let catalog = writer
-            .create_catalog(
-                "default",
-                Some("Default catalog"),
-                WriteOptions::default(),
-            )
+            .create_catalog("default", Some("Default catalog"), WriteOptions::default())
             .await
             .expect("create catalog");
 

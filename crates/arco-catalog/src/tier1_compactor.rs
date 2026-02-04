@@ -727,7 +727,16 @@ fn apply_catalog_event_v1(
                     message: format!("namespace id collision for {}", namespace.id),
                 });
             }
-            if state.namespaces.iter().any(|ns| ns.name == namespace.name) {
+            let default_catalog_id = state
+                .catalogs
+                .iter()
+                .find(|c| c.name == "default")
+                .map(|c| c.id.as_str());
+            let new_catalog_id = namespace.catalog_id.as_deref().or(default_catalog_id);
+            if state.namespaces.iter().any(|ns| {
+                ns.name == namespace.name
+                    && ns.catalog_id.as_deref().or(default_catalog_id) == new_catalog_id
+            }) {
                 return Err(Tier1CompactionError::ProcessingError {
                     message: format!("namespace '{}' already exists", namespace.name),
                 });
@@ -1290,6 +1299,7 @@ mod tests {
             catalogs: Vec::new(),
             namespaces: vec![NamespaceRecord {
                 id: "ns-1".to_string(),
+                catalog_id: None,
                 name: "sales".to_string(),
                 description: Some("Sales".to_string()),
                 created_at: now,

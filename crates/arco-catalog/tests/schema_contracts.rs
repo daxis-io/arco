@@ -350,7 +350,7 @@ fn contract_catalogs_required_fields() {
 #[test]
 fn contract_namespaces_required_fields() {
     let schema = arco_catalog::parquet_util::namespace_schema();
-    let required_fields = ["id", "name", "created_at", "updated_at"];
+    let required_fields = ["id", "catalog_id", "name", "created_at", "updated_at"];
 
     for field_name in required_fields {
         assert!(
@@ -364,6 +364,13 @@ fn contract_namespaces_required_fields() {
     assert!(
         !id_field.is_nullable(),
         "Namespace 'id' field should not be nullable"
+    );
+
+    // catalog_id is nullable for backward compatibility with older snapshots.
+    let catalog_id_field = schema.field_with_name("catalog_id").unwrap();
+    assert!(
+        catalog_id_field.is_nullable(),
+        "Namespace 'catalog_id' field should be nullable"
     );
 
     let name_field = schema.field_with_name("name").unwrap();
@@ -492,6 +499,7 @@ fn contract_namespaces_roundtrip_preserves_schema() {
     let records = vec![
         NamespaceRecord {
             id: "ns_001".into(),
+            catalog_id: None,
             name: "default".into(),
             description: Some("Default namespace".into()),
             created_at: 1_700_000_000_000,
@@ -499,6 +507,7 @@ fn contract_namespaces_roundtrip_preserves_schema() {
         },
         NamespaceRecord {
             id: "ns_002".into(),
+            catalog_id: Some("cat_001".into()),
             name: "analytics".into(),
             description: None,
             created_at: 1_700_000_001_000,
@@ -513,9 +522,11 @@ fn contract_namespaces_roundtrip_preserves_schema() {
     let first = read_back.first().expect("first namespace record");
     let second = read_back.get(1).expect("second namespace record");
     assert_eq!(first.id, "ns_001");
+    assert_eq!(first.catalog_id, None);
     assert_eq!(first.name, "default");
     assert_eq!(first.description, Some("Default namespace".into()));
     assert_eq!(second.id, "ns_002");
+    assert_eq!(second.catalog_id, Some("cat_001".into()));
     assert_eq!(second.description, None);
 }
 
@@ -645,6 +656,7 @@ fn contract_namespaces_parquet_write_is_deterministic() {
     let records = vec![
         NamespaceRecord {
             id: "ns_001".into(),
+            catalog_id: None,
             name: "default".into(),
             description: Some("Default namespace".into()),
             created_at: 1_700_000_000_000,
@@ -652,6 +664,7 @@ fn contract_namespaces_parquet_write_is_deterministic() {
         },
         NamespaceRecord {
             id: "ns_002".into(),
+            catalog_id: Some("cat_001".into()),
             name: "analytics".into(),
             description: None,
             created_at: 1_700_000_001_000,

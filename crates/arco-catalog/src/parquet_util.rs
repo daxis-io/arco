@@ -30,6 +30,8 @@ use crate::error::{CatalogError, Result};
 pub struct NamespaceRecord {
     /// Namespace ID (UUID v7).
     pub id: String,
+    /// Parent catalog ID (UUID v7). Null implies legacy/default catalog.
+    pub catalog_id: Option<String>,
     /// Namespace name.
     pub name: String,
     /// Optional description.
@@ -132,6 +134,7 @@ pub struct SearchPostingRecord {
 fn namespaces_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
+        Field::new("catalog_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
         Field::new("description", DataType::Utf8, true),
         Field::new("created_at", DataType::Int64, false),
@@ -274,6 +277,11 @@ pub fn write_namespaces(rows: &[NamespaceRecord]) -> Result<Bytes> {
     let schema = namespaces_schema();
 
     let ids = StringArray::from(rows.iter().map(|r| Some(r.id.as_str())).collect::<Vec<_>>());
+    let catalog_ids = StringArray::from(
+        rows.iter()
+            .map(|r| r.catalog_id.as_deref())
+            .collect::<Vec<_>>(),
+    );
     let names = StringArray::from(
         rows.iter()
             .map(|r| Some(r.name.as_str()))
@@ -291,6 +299,7 @@ pub fn write_namespaces(rows: &[NamespaceRecord]) -> Result<Bytes> {
         schema.clone(),
         vec![
             Arc::new(ids),
+            Arc::new(catalog_ids),
             Arc::new(names),
             Arc::new(descriptions),
             Arc::new(created_at),
@@ -679,6 +688,7 @@ pub fn read_namespaces(bytes: &Bytes) -> Result<Vec<NamespaceRecord>> {
     let mut out = Vec::new();
     for batch in read_batches(bytes)? {
         let id = col_string(&batch, "id")?;
+        let catalog_id = col_string_optional(&batch, "catalog_id")?;
         let name = col_string(&batch, "name")?;
         let description = col_string_optional(&batch, "description")?;
         let created_at = col_i64(&batch, "created_at")?;
@@ -687,6 +697,13 @@ pub fn read_namespaces(bytes: &Bytes) -> Result<Vec<NamespaceRecord>> {
         for row in 0..batch.num_rows() {
             out.push(NamespaceRecord {
                 id: id.value(row).to_string(),
+                catalog_id: catalog_id.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
                 name: name.value(row).to_string(),
                 description: description.and_then(|col| {
                     if col.is_null(row) {
@@ -900,6 +917,7 @@ mod tests {
         // Simulate an "old" snapshot schema that predates optional columns.
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
+            // NOTE: "catalog_id" intentionally omitted.
             Field::new("name", DataType::Utf8, false),
             // NOTE: "description" intentionally omitted.
             Field::new("created_at", DataType::Int64, false),
@@ -927,6 +945,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "ns_1");
+        assert_eq!(rows[0].catalog_id, None);
         assert_eq!(rows[0].name, "default");
         assert_eq!(rows[0].description, None);
     }

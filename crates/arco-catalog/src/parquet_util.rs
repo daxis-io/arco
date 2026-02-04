@@ -152,16 +152,6 @@ fn catalogs_schema() -> Arc<Schema> {
     ]))
 }
 
-fn catalogs_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("name", DataType::Utf8, false),
-        Field::new("description", DataType::Utf8, true),
-        Field::new("created_at", DataType::Int64, false),
-        Field::new("updated_at", DataType::Int64, false),
-    ]))
-}
-
 fn tables_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -310,46 +300,6 @@ pub fn write_namespaces(rows: &[NamespaceRecord]) -> Result<Bytes> {
         vec![
             Arc::new(ids),
             Arc::new(catalog_ids),
-            Arc::new(names),
-            Arc::new(descriptions),
-            Arc::new(created_at),
-            Arc::new(updated_at),
-        ],
-    )
-    .map_err(|e| CatalogError::Parquet {
-        message: format!("record batch build failed: {e}"),
-    })?;
-
-    write_single_batch(schema, &batch)
-}
-
-/// Writes `catalogs.parquet`.
-///
-/// # Errors
-///
-/// Returns an error if the record batch cannot be built or the Parquet write
-/// fails.
-pub fn write_catalogs(rows: &[CatalogRecord]) -> Result<Bytes> {
-    let schema = catalogs_schema();
-
-    let ids = StringArray::from(rows.iter().map(|r| Some(r.id.as_str())).collect::<Vec<_>>());
-    let names = StringArray::from(
-        rows.iter()
-            .map(|r| Some(r.name.as_str()))
-            .collect::<Vec<_>>(),
-    );
-    let descriptions = StringArray::from(
-        rows.iter()
-            .map(|r| r.description.as_deref())
-            .collect::<Vec<_>>(),
-    );
-    let created_at = Int64Array::from(rows.iter().map(|r| r.created_at).collect::<Vec<_>>());
-    let updated_at = Int64Array::from(rows.iter().map(|r| r.updated_at).collect::<Vec<_>>());
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(ids),
             Arc::new(names),
             Arc::new(descriptions),
             Arc::new(created_at),
@@ -967,6 +917,7 @@ mod tests {
         // Simulate an "old" snapshot schema that predates optional columns.
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
+            // NOTE: "catalog_id" intentionally omitted.
             Field::new("name", DataType::Utf8, false),
             // NOTE: "description" intentionally omitted.
             Field::new("created_at", DataType::Int64, false),
@@ -994,6 +945,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "ns_1");
+        assert_eq!(rows[0].catalog_id, None);
         assert_eq!(rows[0].name, "default");
         assert_eq!(rows[0].description, None);
     }

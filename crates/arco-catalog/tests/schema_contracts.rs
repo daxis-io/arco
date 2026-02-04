@@ -154,6 +154,11 @@ fn current_namespaces_schema() -> GoldenSchema {
     )
 }
 
+/// Get current catalogs schema from code.
+fn current_catalogs_schema() -> GoldenSchema {
+    schema_to_golden("catalogs", &arco_catalog::parquet_util::catalog_schema())
+}
+
 /// Get current tables schema from code.
 fn current_tables_schema() -> GoldenSchema {
     schema_to_golden("tables", &arco_catalog::parquet_util::table_schema())
@@ -183,6 +188,7 @@ fn generate_golden_schemas() {
     let golden_dir = Path::new(manifest_dir).join("tests").join("golden_schemas");
 
     let schemas = [
+        ("catalogs", current_catalogs_schema()),
         ("namespaces", current_namespaces_schema()),
         ("tables", current_tables_schema()),
         ("columns", current_columns_schema()),
@@ -208,6 +214,19 @@ fn contract_namespaces_parquet_schema_backward_compatible() {
     if let Err(msg) = is_backward_compatible(&golden, &current) {
         panic!(
             "Namespaces schema is NOT backward compatible with golden:\n{msg}\n\
+             See docs/adr/adr-006-schema-evolution.md for migration guidance."
+        );
+    }
+}
+
+#[test]
+fn contract_catalogs_parquet_schema_backward_compatible() {
+    let golden = load_golden_schema("catalogs");
+    let current = current_catalogs_schema();
+
+    if let Err(msg) = is_backward_compatible(&golden, &current) {
+        panic!(
+            "Catalogs schema is NOT backward compatible with golden:\n{msg}\n\
              See docs/adr/adr-006-schema-evolution.md for migration guidance."
         );
     }
@@ -259,7 +278,13 @@ fn contract_lineage_edges_parquet_schema_backward_compatible() {
 #[test]
 fn golden_schemas_are_valid_and_parseable() {
     // This test fails fast if any golden file is missing or malformed
-    let schemas = ["namespaces", "tables", "columns", "lineage_edges"];
+    let schemas = [
+        "catalogs",
+        "namespaces",
+        "tables",
+        "columns",
+        "lineage_edges",
+    ];
 
     for name in schemas {
         let schema = load_golden_schema(name);
@@ -274,6 +299,7 @@ fn golden_schemas_are_valid_and_parseable() {
 fn current_schemas_match_golden_field_count() {
     // This is a sanity check - field count should match or current has more (new nullable fields)
     let test_cases = [
+        ("catalogs", current_catalogs_schema()),
         ("namespaces", current_namespaces_schema()),
         ("tables", current_tables_schema()),
         ("columns", current_columns_schema()),
@@ -294,6 +320,32 @@ fn current_schemas_match_golden_field_count() {
 // ============================================================================
 // Required Fields Tests
 // ============================================================================
+
+#[test]
+fn contract_catalogs_required_fields() {
+    let schema = arco_catalog::parquet_util::catalog_schema();
+    let required_fields = ["id", "name", "created_at", "updated_at"];
+
+    for field_name in required_fields {
+        assert!(
+            schema.field_with_name(field_name).is_ok(),
+            "Catalogs schema missing required field: {field_name}"
+        );
+    }
+
+    // id and name should be non-nullable
+    let id_field = schema.field_with_name("id").unwrap();
+    assert!(
+        !id_field.is_nullable(),
+        "Catalog 'id' field should not be nullable"
+    );
+
+    let name_field = schema.field_with_name("name").unwrap();
+    assert!(
+        !name_field.is_nullable(),
+        "Catalog 'name' field should not be nullable"
+    );
+}
 
 #[test]
 fn contract_namespaces_required_fields() {
@@ -376,6 +428,7 @@ fn contract_timestamp_fields_use_milliseconds() {
     // All timestamp fields should use Int64 (milliseconds since epoch) for portability
     // across different query engines (DuckDB, Datafusion, etc.)
     let test_cases = [
+        ("catalogs", arco_catalog::parquet_util::catalog_schema()),
         ("namespaces", arco_catalog::parquet_util::namespace_schema()),
         ("tables", arco_catalog::parquet_util::table_schema()),
         (
@@ -404,6 +457,7 @@ fn contract_timestamp_fields_use_milliseconds() {
 fn contract_id_fields_are_strings() {
     // All ID fields should be strings (UUIDs/ULIDs stored as text)
     let test_cases = [
+        ("catalogs", arco_catalog::parquet_util::catalog_schema()),
         ("namespaces", arco_catalog::parquet_util::namespace_schema()),
         ("tables", arco_catalog::parquet_util::table_schema()),
         ("columns", arco_catalog::parquet_util::column_schema()),
@@ -462,6 +516,40 @@ fn contract_namespaces_roundtrip_preserves_schema() {
     assert_eq!(first.name, "default");
     assert_eq!(first.description, Some("Default namespace".into()));
     assert_eq!(second.id, "ns_002");
+    assert_eq!(second.description, None);
+}
+
+#[test]
+fn contract_catalogs_roundtrip_preserves_schema() {
+    use arco_catalog::parquet_util::{CatalogRecord, read_catalogs, write_catalogs};
+
+    let records = vec![
+        CatalogRecord {
+            id: "cat_001".into(),
+            name: "default".into(),
+            description: Some("Default catalog".into()),
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+        },
+        CatalogRecord {
+            id: "cat_002".into(),
+            name: "analytics".into(),
+            description: None,
+            created_at: 1_700_000_001_000,
+            updated_at: 1_700_000_001_000,
+        },
+    ];
+
+    let result = write_catalogs(&records).expect("write should succeed");
+    let read_back = read_catalogs(&result).expect("read should succeed");
+
+    assert_eq!(read_back.len(), 2);
+    let first = read_back.first().expect("first catalog record");
+    let second = read_back.get(1).expect("second catalog record");
+    assert_eq!(first.id, "cat_001");
+    assert_eq!(first.name, "default");
+    assert_eq!(first.description, Some("Default catalog".into()));
+    assert_eq!(second.id, "cat_002");
     assert_eq!(second.description, None);
 }
 
@@ -573,6 +661,33 @@ fn contract_namespaces_parquet_write_is_deterministic() {
 
     let bytes_one = write_namespaces(&records).expect("write one");
     let bytes_two = write_namespaces(&records).expect("write two");
+
+    assert_eq!(bytes_one, bytes_two);
+}
+
+#[test]
+fn contract_catalogs_parquet_write_is_deterministic() {
+    use arco_catalog::parquet_util::{CatalogRecord, write_catalogs};
+
+    let records = vec![
+        CatalogRecord {
+            id: "cat_001".into(),
+            name: "default".into(),
+            description: Some("Default catalog".into()),
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+        },
+        CatalogRecord {
+            id: "cat_002".into(),
+            name: "analytics".into(),
+            description: None,
+            created_at: 1_700_000_001_000,
+            updated_at: 1_700_000_001_000,
+        },
+    ];
+
+    let bytes_one = write_catalogs(&records).expect("write one");
+    let bytes_two = write_catalogs(&records).expect("write two");
 
     assert_eq!(bytes_one, bytes_two);
 }

@@ -1,6 +1,7 @@
 //! Parquet encoding/decoding helpers for Tier-1 catalog snapshots.
 //!
 //! This module defines the canonical Parquet schemas for Tier-1 snapshot files:
+//! - `catalogs.parquet`
 //! - `namespaces.parquet`
 //! - `tables.parquet`
 //! - `columns.parquet`
@@ -30,6 +31,21 @@ pub struct NamespaceRecord {
     /// Namespace ID (UUID v7).
     pub id: String,
     /// Namespace name.
+    pub name: String,
+    /// Optional description.
+    pub description: Option<String>,
+    /// Creation timestamp (ms since epoch).
+    pub created_at: i64,
+    /// Update timestamp (ms since epoch).
+    pub updated_at: i64,
+}
+
+/// Record stored in `catalogs.parquet`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogRecord {
+    /// Catalog ID (UUID v7).
+    pub id: String,
+    /// Catalog name.
     pub name: String,
     /// Optional description.
     pub description: Option<String>,
@@ -123,6 +139,16 @@ fn namespaces_schema() -> Arc<Schema> {
     ]))
 }
 
+fn catalogs_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("description", DataType::Utf8, true),
+        Field::new("created_at", DataType::Int64, false),
+        Field::new("updated_at", DataType::Int64, false),
+    ]))
+}
+
 fn tables_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -178,6 +204,12 @@ fn search_postings_schema() -> Arc<Schema> {
 #[must_use]
 pub fn namespace_schema() -> Schema {
     (*namespaces_schema()).clone()
+}
+
+/// Returns the catalog schema for golden file comparison.
+#[must_use]
+pub fn catalog_schema() -> Schema {
+    (*catalogs_schema()).clone()
 }
 
 /// Returns the table schema for golden file comparison.
@@ -240,6 +272,46 @@ fn write_single_batch(schema: Arc<Schema>, batch: &RecordBatch) -> Result<Bytes>
 /// fails.
 pub fn write_namespaces(rows: &[NamespaceRecord]) -> Result<Bytes> {
     let schema = namespaces_schema();
+
+    let ids = StringArray::from(rows.iter().map(|r| Some(r.id.as_str())).collect::<Vec<_>>());
+    let names = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.name.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let descriptions = StringArray::from(
+        rows.iter()
+            .map(|r| r.description.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let created_at = Int64Array::from(rows.iter().map(|r| r.created_at).collect::<Vec<_>>());
+    let updated_at = Int64Array::from(rows.iter().map(|r| r.updated_at).collect::<Vec<_>>());
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(ids),
+            Arc::new(names),
+            Arc::new(descriptions),
+            Arc::new(created_at),
+            Arc::new(updated_at),
+        ],
+    )
+    .map_err(|e| CatalogError::Parquet {
+        message: format!("record batch build failed: {e}"),
+    })?;
+
+    write_single_batch(schema, &batch)
+}
+
+/// Writes `catalogs.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if the record batch cannot be built or the Parquet write
+/// fails.
+pub fn write_catalogs(rows: &[CatalogRecord]) -> Result<Bytes> {
+    let schema = catalogs_schema();
 
     let ids = StringArray::from(rows.iter().map(|r| Some(r.id.as_str())).collect::<Vec<_>>());
     let names = StringArray::from(
@@ -614,6 +686,40 @@ pub fn read_namespaces(bytes: &Bytes) -> Result<Vec<NamespaceRecord>> {
 
         for row in 0..batch.num_rows() {
             out.push(NamespaceRecord {
+                id: id.value(row).to_string(),
+                name: name.value(row).to_string(),
+                description: description.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                created_at: created_at.value(row),
+                updated_at: updated_at.value(row),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Reads `catalogs.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if the Parquet payload is invalid or required columns are
+/// missing.
+pub fn read_catalogs(bytes: &Bytes) -> Result<Vec<CatalogRecord>> {
+    let mut out = Vec::new();
+    for batch in read_batches(bytes)? {
+        let id = col_string(&batch, "id")?;
+        let name = col_string(&batch, "name")?;
+        let description = col_string_optional(&batch, "description")?;
+        let created_at = col_i64(&batch, "created_at")?;
+        let updated_at = col_i64(&batch, "updated_at")?;
+
+        for row in 0..batch.num_rows() {
+            out.push(CatalogRecord {
                 id: id.value(row).to_string(),
                 name: name.value(row).to_string(),
                 description: description.and_then(|col| {

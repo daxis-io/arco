@@ -2089,6 +2089,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_duplicate_catalog_fails() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_catalog("default", None, WriteOptions::default())
+            .await
+            .expect("first create");
+
+        let result = writer
+            .create_catalog("default", None, WriteOptions::default())
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, CatalogError::AlreadyExists { .. }));
+    }
+
+    #[tokio::test]
     async fn test_initialize_creates_manifests() {
         let writer = setup();
         writer.initialize().await.expect("initialize");

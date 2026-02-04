@@ -2119,6 +2119,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_schema_sets_catalog_id() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        let catalog = writer
+            .create_catalog("default", None, WriteOptions::default())
+            .await
+            .expect("create catalog");
+
+        let ns = writer
+            .create_schema(
+                "default",
+                "sales",
+                Some("Sales schema"),
+                WriteOptions::default(),
+            )
+            .await
+            .expect("create schema");
+
+        assert_eq!(ns.name, "sales");
+        assert_eq!(ns.catalog_id, Some(catalog.id.clone()));
+
+        let manifest = writer.tier1.read_manifest().await.expect("manifest");
+        let state =
+            tier1_state::load_catalog_state(&writer.storage, &manifest.catalog.snapshot_path)
+                .await
+                .expect("load catalog state");
+
+        let stored = state
+            .namespaces
+            .iter()
+            .find(|n| n.id == ns.id)
+            .expect("namespace stored");
+
+        assert_eq!(stored.catalog_id, Some(catalog.id));
+    }
+
+    #[tokio::test]
+    async fn test_create_schema_allows_same_name_in_different_catalogs() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        let default = writer
+            .create_catalog("default", None, WriteOptions::default())
+            .await
+            .expect("create default catalog");
+
+        let analytics = writer
+            .create_catalog("analytics", None, WriteOptions::default())
+            .await
+            .expect("create analytics catalog");
+
+        let ns_default = writer
+            .create_schema("default", "sales", None, WriteOptions::default())
+            .await
+            .expect("create schema in default");
+
+        let ns_analytics = writer
+            .create_schema("analytics", "sales", None, WriteOptions::default())
+            .await
+            .expect("create schema in analytics");
+
+        assert_eq!(ns_default.name, "sales");
+        assert_eq!(ns_default.catalog_id, Some(default.id.clone()));
+        assert_eq!(ns_analytics.name, "sales");
+        assert_eq!(ns_analytics.catalog_id, Some(analytics.id.clone()));
+
+        let manifest = writer.tier1.read_manifest().await.expect("manifest");
+        let state =
+            tier1_state::load_catalog_state(&writer.storage, &manifest.catalog.snapshot_path)
+                .await
+                .expect("load catalog state");
+
+        assert_eq!(state.namespaces.len(), 2);
+    }
+
+    #[tokio::test]
     async fn test_initialize_creates_manifests() {
         let writer = setup();
         writer.initialize().await.expect("initialize");

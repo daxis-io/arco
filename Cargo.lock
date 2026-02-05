@@ -193,6 +193,7 @@ dependencies = [
  "arco-iceberg",
  "arco-proto",
  "arco-test-utils",
+ "arco-uc",
  "arrow 54.3.1",
  "arrow-json",
  "async-trait",
@@ -454,6 +455,27 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "arco-uc"
+version = "0.1.0"
+dependencies = [
+ "arco-core",
+ "axum 0.7.9",
+ "gcp_auth",
+ "http",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tower",
+ "tower-http",
+ "tracing",
+ "ulid",
+ "utoipa",
 ]
 
 [[package]]

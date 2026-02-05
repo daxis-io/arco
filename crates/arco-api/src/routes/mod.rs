@@ -1,6 +1,7 @@
 //! HTTP route handlers.
 
 pub mod browser;
+pub mod catalogs;
 pub mod delta;
 pub mod lineage;
 pub mod manifests;

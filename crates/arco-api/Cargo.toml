@@ -72,7 +72,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 
 # Auth
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 
 # OpenAPI
 utoipa = { version = "5.4.0", features = ["axum_extras", "chrono"] }

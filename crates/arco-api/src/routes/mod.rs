@@ -1,6 +1,7 @@
 //! HTTP route handlers.
 
 pub mod browser;
+pub mod catalogs;
 pub mod delta;
 pub mod lineage;
 pub mod manifests;
@@ -19,6 +20,7 @@ use crate::server::AppState;
 /// `/api/v1` routes (authenticated).
 pub fn api_v1_routes() -> Router<Arc<AppState>> {
     Router::new()
+        .merge(catalogs::routes())
         .merge(namespaces::routes())
         .merge(tables::routes())
         .merge(lineage::routes())

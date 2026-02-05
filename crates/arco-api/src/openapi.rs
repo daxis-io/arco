@@ -17,6 +17,14 @@ use utoipa::{Modify, OpenApi};
         description = "Arco catalog REST API (M4/M5)"
     ),
     paths(
+        crate::routes::catalogs::create_catalog,
+        crate::routes::catalogs::list_catalogs,
+        crate::routes::catalogs::get_catalog,
+        crate::routes::catalogs::create_schema,
+        crate::routes::catalogs::list_schemas,
+        crate::routes::catalogs::register_table_in_schema,
+        crate::routes::catalogs::list_tables_in_schema,
+        crate::routes::catalogs::get_table_in_schema,
         crate::routes::namespaces::create_namespace,
         crate::routes::namespaces::list_namespaces,
         crate::routes::namespaces::get_namespace,
@@ -63,6 +71,15 @@ use utoipa::{Modify, OpenApi};
     components(
         schemas(
             crate::error::ApiErrorBody,
+            crate::routes::catalogs::CreateCatalogRequest,
+            crate::routes::catalogs::CatalogResponse,
+            crate::routes::catalogs::ListCatalogsResponse,
+            crate::routes::catalogs::CreateSchemaRequest,
+            crate::routes::catalogs::SchemaResponse,
+            crate::routes::catalogs::ListSchemasResponse,
+            crate::routes::catalogs::RegisterSchemaTableRequest,
+            crate::routes::catalogs::SchemaTableResponse,
+            crate::routes::catalogs::ListSchemaTablesResponse,
             crate::routes::namespaces::CreateNamespaceRequest,
             crate::routes::namespaces::NamespaceResponse,
             crate::routes::namespaces::ListNamespacesResponse,
@@ -165,6 +182,8 @@ use utoipa::{Modify, OpenApi};
         )
     ),
     tags(
+        (name = "catalogs", description = "Catalog operations"),
+        (name = "schemas", description = "Schema operations"),
         (name = "namespaces", description = "Namespace operations"),
         (name = "tables", description = "Table operations"),
         (name = "lineage", description = "Lineage operations"),

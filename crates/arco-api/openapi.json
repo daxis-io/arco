@@ -101,6 +101,638 @@
         ]
       }
     },
+    "/api/v1/catalogs": {
+      "get": {
+        "tags": [
+          "catalogs"
+        ],
+        "summary": "List catalogs.",
+        "description": "GET /api/v1/catalogs",
+        "operationId": "list_catalogs",
+        "responses": {
+          "200": {
+            "description": "Catalogs listed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListCatalogsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "catalogs"
+        ],
+        "summary": "Create a catalog.",
+        "description": "POST /api/v1/catalogs",
+        "operationId": "create_catalog",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCatalogRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Catalog created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/catalogs/{catalog}/schemas": {
+      "get": {
+        "tags": [
+          "schemas"
+        ],
+        "summary": "List schemas in a catalog.",
+        "description": "GET /api/v1/catalogs/{catalog}/schemas",
+        "operationId": "list_schemas",
+        "parameters": [
+          {
+            "name": "catalog",
+            "in": "path",
+            "description": "Catalog name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Schemas listed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSchemasResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "schemas"
+        ],
+        "summary": "Create a schema in a catalog.",
+        "description": "POST /api/v1/catalogs/{catalog}/schemas",
+        "operationId": "create_schema",
+        "parameters": [
+          {
+            "name": "catalog",
+            "in": "path",
+            "description": "Catalog name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSchemaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Schema created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchemaResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/catalogs/{catalog}/schemas/{schema}/tables": {
+      "get": {
+        "tags": [
+          "tables"
+        ],
+        "summary": "List tables in a schema.",
+        "description": "GET /api/v1/catalogs/{catalog}/schemas/{schema}/tables",
+        "operationId": "list_tables_in_schema",
+        "parameters": [
+          {
+            "name": "catalog",
+            "in": "path",
+            "description": "Catalog name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "schema",
+            "in": "path",
+            "description": "Schema name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Tables listed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSchemaTablesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "tables"
+        ],
+        "summary": "Register a table in a schema.",
+        "description": "POST /api/v1/catalogs/{catalog}/schemas/{schema}/tables",
+        "operationId": "register_table_in_schema",
+        "parameters": [
+          {
+            "name": "catalog",
+            "in": "path",
+            "description": "Catalog name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "schema",
+            "in": "path",
+            "description": "Schema name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterSchemaTableRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Table registered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchemaTableResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/catalogs/{catalog}/schemas/{schema}/tables/{name}": {
+      "get": {
+        "tags": [
+          "tables"
+        ],
+        "summary": "Get a table by name in a schema.",
+        "description": "GET /api/v1/catalogs/{catalog}/schemas/{schema}/tables/{name}",
+        "operationId": "get_table_in_schema",
+        "parameters": [
+          {
+            "name": "catalog",
+            "in": "path",
+            "description": "Catalog name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "schema",
+            "in": "path",
+            "description": "Schema name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Table name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Table found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchemaTableResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/catalogs/{name}": {
+      "get": {
+        "tags": [
+          "catalogs"
+        ],
+        "summary": "Get a catalog by name.",
+        "description": "GET /api/v1/catalogs/{name}",
+        "operationId": "get_catalog",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Catalog name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Catalog found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/api/v1/delta/tables/{table_id}/commits": {
       "post": {
         "tags": [
@@ -3584,6 +4216,41 @@
           }
         }
       },
+      "CatalogResponse": {
+        "type": "object",
+        "description": "Catalog response.",
+        "required": [
+          "id",
+          "name",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "Creation timestamp (ISO 8601)."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description."
+          },
+          "id": {
+            "type": "string",
+            "description": "Catalog ID."
+          },
+          "name": {
+            "type": "string",
+            "description": "Catalog name."
+          },
+          "updated_at": {
+            "type": "string",
+            "description": "Last update timestamp (ISO 8601)."
+          }
+        }
+      },
       "ChunkCounts": {
         "type": "object",
         "description": "Chunk counts by state.",
@@ -3816,6 +4483,26 @@
           }
         }
       },
+      "CreateCatalogRequest": {
+        "type": "object",
+        "description": "Request to create a catalog.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description."
+          },
+          "name": {
+            "type": "string",
+            "description": "Catalog name (unique within workspace)."
+          }
+        }
+      },
       "CreateNamespaceRequest": {
         "type": "object",
         "description": "Request to create a namespace.",
@@ -3833,6 +4520,26 @@
           "name": {
             "type": "string",
             "description": "Namespace name (must be unique within workspace)."
+          }
+        }
+      },
+      "CreateSchemaRequest": {
+        "type": "object",
+        "description": "Request to create a schema in a catalog.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description."
+          },
+          "name": {
+            "type": "string",
+            "description": "Schema name (unique within catalog)."
           }
         }
       },
@@ -4230,6 +4937,22 @@
           }
         }
       },
+      "ListCatalogsResponse": {
+        "type": "object",
+        "description": "List catalogs response.",
+        "required": [
+          "catalogs"
+        ],
+        "properties": {
+          "catalogs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogResponse"
+            },
+            "description": "List of catalogs."
+          }
+        }
+      },
       "ListChunksQuery": {
         "type": "object",
         "description": "Query parameters for listing backfill chunks.",
@@ -4442,6 +5165,38 @@
               "$ref": "#/components/schemas/ScheduleResponse"
             },
             "description": "List of schedules."
+          }
+        }
+      },
+      "ListSchemaTablesResponse": {
+        "type": "object",
+        "description": "List tables response.",
+        "required": [
+          "tables"
+        ],
+        "properties": {
+          "tables": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SchemaTableResponse"
+            },
+            "description": "List of tables."
+          }
+        }
+      },
+      "ListSchemasResponse": {
+        "type": "object",
+        "description": "List schemas response.",
+        "required": [
+          "schemas"
+        ],
+        "properties": {
+          "schemas": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SchemaResponse"
+            },
+            "description": "List of schemas."
           }
         }
       },
@@ -5000,6 +5755,48 @@
           "sql": {
             "type": "string",
             "description": "SQL query to execute (read-only)."
+          }
+        }
+      },
+      "RegisterSchemaTableRequest": {
+        "type": "object",
+        "description": "Request to register a table in a schema.",
+        "required": [
+          "name",
+          "columns"
+        ],
+        "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ColumnDefinition"
+            },
+            "description": "Column definitions."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description."
+          },
+          "format": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Table format (e.g., \"delta\", \"iceberg\", \"parquet\")."
+          },
+          "location": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Storage location (URI)."
+          },
+          "name": {
+            "type": "string",
+            "description": "Table name (must be unique within schema)."
           }
         }
       },
@@ -5656,6 +6453,105 @@
           "tickId": {
             "type": "string",
             "description": "Unique tick ID."
+          }
+        }
+      },
+      "SchemaResponse": {
+        "type": "object",
+        "description": "Schema response.",
+        "required": [
+          "id",
+          "catalog",
+          "name",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "catalog": {
+            "type": "string",
+            "description": "Parent catalog name."
+          },
+          "created_at": {
+            "type": "string",
+            "description": "Creation timestamp (ISO 8601)."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description."
+          },
+          "id": {
+            "type": "string",
+            "description": "Schema ID."
+          },
+          "name": {
+            "type": "string",
+            "description": "Schema name."
+          },
+          "updated_at": {
+            "type": "string",
+            "description": "Last update timestamp (ISO 8601)."
+          }
+        }
+      },
+      "SchemaTableResponse": {
+        "type": "object",
+        "description": "Table response (catalog + schema qualified).",
+        "required": [
+          "id",
+          "catalog",
+          "schema",
+          "name",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "catalog": {
+            "type": "string",
+            "description": "Catalog name."
+          },
+          "created_at": {
+            "type": "string",
+            "description": "Creation timestamp (ISO 8601)."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description."
+          },
+          "format": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Table format."
+          },
+          "id": {
+            "type": "string",
+            "description": "Table ID."
+          },
+          "location": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Storage location."
+          },
+          "name": {
+            "type": "string",
+            "description": "Table name."
+          },
+          "schema": {
+            "type": "string",
+            "description": "Schema name."
+          },
+          "updated_at": {
+            "type": "string",
+            "description": "Last update timestamp (ISO 8601)."
           }
         }
       },
@@ -6658,6 +7554,14 @@
     }
   },
   "tags": [
+    {
+      "name": "catalogs",
+      "description": "Catalog operations"
+    },
+    {
+      "name": "schemas",
+      "description": "Schema operations"
+    },
     {
       "name": "namespaces",
       "description": "Namespace operations"

@@ -348,8 +348,6 @@ async fn unity_catalog_auth_middleware(
     let uc_ctx = UnityCatalogRequestContext {
         tenant: ctx.tenant.clone(),
         workspace: ctx.workspace.clone(),
-        user_id: ctx.user_id.clone(),
-        groups: ctx.groups.clone(),
         request_id: ctx.request_id.clone(),
         idempotency_key: ctx.idempotency_key.clone(),
     };
@@ -416,7 +414,6 @@ fn api_error_to_unity_catalog_response(
         StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
             UnityCatalogError::Conflict { message }
         }
-        StatusCode::TOO_MANY_REQUESTS => UnityCatalogError::TooManyRequests { message },
         StatusCode::NOT_IMPLEMENTED => UnityCatalogError::NotImplemented { message },
         StatusCode::SERVICE_UNAVAILABLE => UnityCatalogError::ServiceUnavailable { message },
         _ => UnityCatalogError::Internal { message },
@@ -597,8 +594,7 @@ impl Server {
 
         // Mount Unity Catalog facade if enabled
         if state.config.unity_catalog.enabled {
-            let uc_state = UnityCatalogState::new(Arc::clone(&state.storage))
-                .with_audit_emitter(Arc::new(state.audit().clone()));
+            let uc_state = UnityCatalogState::new(Arc::clone(&state.storage));
 
             let uc_service = ServiceBuilder::new()
                 .layer(middleware::from_fn_with_state(

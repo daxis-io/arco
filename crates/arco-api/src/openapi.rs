@@ -38,7 +38,6 @@ use utoipa::{Modify, OpenApi};
         crate::routes::lineage::get_lineage,
         crate::routes::browser::mint_urls,
         crate::routes::query::query,
-        crate::routes::query_data::query_data,
         crate::routes::delta::stage_commit_payload,
         crate::routes::delta::commit_staged,
         crate::routes::orchestration::trigger_run,

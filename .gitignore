@@ -9,6 +9,10 @@
 *.swo
 *~
 
+# Codex / agents
+.claude/
+.worktrees/
+
 # OS
 .DS_Store
 Thumbs.db

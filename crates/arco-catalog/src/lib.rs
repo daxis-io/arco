@@ -120,7 +120,7 @@ pub use tier1_writer::Tier1Writer;
 pub use write_options::{IdempotencyKey, SnapshotVersion, WriteOptions};
 pub use writer::{
     Catalog, CatalogWriter, Column, ColumnDefinition, EventSource, LineageEdge, Namespace,
-    RegisterTableRequest, Table, TablePatch,
+    RegisterTableInSchemaRequest, RegisterTableRequest, Table, TablePatch,
 };
 
 /// Creates a publish permit issuer for sync compaction.

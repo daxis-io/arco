@@ -595,9 +595,8 @@ fn col_string<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray>
 }
 
 fn col_string_optional<'a>(batch: &'a RecordBatch, name: &str) -> Result<Option<&'a StringArray>> {
-    let idx = match batch.schema().index_of(name) {
-        Ok(idx) => idx,
-        Err(_) => return Ok(None),
+    let Ok(idx) = batch.schema().index_of(name) else {
+        return Ok(None);
     };
 
     batch

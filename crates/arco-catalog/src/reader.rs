@@ -511,6 +511,11 @@ impl CatalogReader {
                         CatalogPaths::snapshot_file(
                             CatalogDomain::Catalog,
                             version,
+                            "catalogs.parquet",
+                        ),
+                        CatalogPaths::snapshot_file(
+                            CatalogDomain::Catalog,
+                            version,
                             "namespaces.parquet",
                         ),
                         CatalogPaths::snapshot_file(

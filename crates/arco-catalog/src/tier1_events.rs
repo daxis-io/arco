@@ -77,7 +77,7 @@ impl CatalogEventPayload for CatalogDdlEvent {
 /// Catalog domain DDL events (schema v2).
 ///
 /// New variants MUST be introduced as new versions to preserve rolling upgrades:
-/// deploy the Tier1Compactor that can read v2 before writers emit v2 events.
+/// deploy the `Tier1Compactor` that can read v2 before writers emit v2 events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CatalogDdlEventV2 {

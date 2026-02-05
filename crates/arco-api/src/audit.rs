@@ -130,6 +130,7 @@ mod tests {
             tenant: "test-tenant".to_string(),
             workspace: "test-workspace".to_string(),
             user_id: Some("alice@example.com".to_string()),
+            groups: vec![],
             request_id: "req-123".to_string(),
             idempotency_key: None,
         }
@@ -224,6 +225,7 @@ mod tests {
             tenant: "test".to_string(),
             workspace: "test".to_string(),
             user_id: None,
+            groups: vec![],
             request_id: "req".to_string(),
             idempotency_key: None,
         };

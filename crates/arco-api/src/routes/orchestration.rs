@@ -5462,14 +5462,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_trigger_run_reemits_when_reservation_exists() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..crate::config::Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
             tenant: "tenant".to_string(),
             workspace: "workspace".to_string(),
             user_id: Some("user@example.com".to_string()),
+            groups: vec![],
             request_id: "req_01".to_string(),
             idempotency_key: None,
         };
@@ -5643,14 +5646,17 @@ mod tests {
     #[tokio::test]
     async fn test_trigger_run_normalizes_reserve_run_key_fingerprint_mismatch_for_equivalent_variants()
     -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..crate::config::Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
             tenant: "tenant".to_string(),
             workspace: "workspace".to_string(),
             user_id: Some("user@example.com".to_string()),
+            groups: vec![],
             request_id: "req_01".to_string(),
             idempotency_key: None,
         };
@@ -5728,14 +5734,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_trigger_run_conflicts_on_fingerprint_mismatch() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..crate::config::Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
             tenant: "tenant".to_string(),
             workspace: "workspace".to_string(),
             user_id: Some("user@example.com".to_string()),
+            groups: vec![],
             request_id: "req_01".to_string(),
             idempotency_key: None,
         };
@@ -5798,14 +5807,17 @@ mod tests {
     #[tokio::test]
     async fn test_trigger_run_falls_back_to_scan_when_index_points_to_missing_manifest()
     -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..crate::config::Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
             tenant: "tenant".to_string(),
             workspace: "workspace".to_string(),
             user_id: Some("user@example.com".to_string()),
+            groups: vec![],
             request_id: "req_01".to_string(),
             idempotency_key: None,
         };
@@ -5893,15 +5905,18 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_run_key_updates_missing_fingerprint() -> Result<()> {
         let cutoff = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let mut config = crate::config::Config::default();
-        config.debug = true;
-        config.run_key_fingerprint_cutoff = Some(cutoff);
+        let config = crate::config::Config {
+            debug: true,
+            run_key_fingerprint_cutoff: Some(cutoff),
+            ..crate::config::Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
             tenant: "tenant".to_string(),
             workspace: "workspace".to_string(),
             user_id: Some("user@example.com".to_string()),
+            groups: vec![],
             request_id: "req_01".to_string(),
             idempotency_key: None,
         };
@@ -5968,14 +5983,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_run_key_conflicts_on_mismatch() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..crate::config::Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
             tenant: "tenant".to_string(),
             workspace: "workspace".to_string(),
             user_id: Some("user@example.com".to_string()),
+            groups: vec![],
             request_id: "req_01".to_string(),
             idempotency_key: None,
         };

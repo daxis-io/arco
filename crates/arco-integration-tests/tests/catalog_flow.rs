@@ -1,5 +1,7 @@
 //! Integration tests between arco-catalog and arco-flow.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use arco_core::prelude::*;
 
 #[test]

@@ -1,13 +1,17 @@
 //! HTTP route handlers.
 
 pub mod browser;
+pub mod catalogs;
+pub mod delta;
 pub mod lineage;
 pub mod manifests;
 pub mod namespaces;
 pub mod orchestration;
 pub mod query;
+pub mod query_data;
 pub mod tables;
 pub mod tasks;
+pub mod uc;
 
 use std::sync::Arc;
 
@@ -20,9 +24,12 @@ pub fn api_v1_routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(namespaces::routes())
         .merge(tables::routes())
+        .merge(catalogs::routes())
+        .merge(delta::routes())
         .merge(lineage::routes())
         .merge(browser::routes())
         .merge(query::routes())
+        .merge(query_data::routes())
         .merge(orchestration::routes())
         .merge(manifests::routes())
 }

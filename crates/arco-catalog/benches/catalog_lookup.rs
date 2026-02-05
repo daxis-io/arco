@@ -11,6 +11,7 @@
 //! - Full catalog scan (100 tables): < 50ms P95
 
 #![allow(missing_docs)]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
 
@@ -38,6 +39,7 @@ async fn setup_catalog(
     let namespaces: Vec<parquet_util::NamespaceRecord> = (0..num_namespaces)
         .map(|i| parquet_util::NamespaceRecord {
             id: format!("ns-{i:04}"),
+            catalog_id: None,
             name: format!("namespace_{i}"),
             description: Some(format!("Namespace {i} for benchmarking")),
             created_at: now_ms,
@@ -69,7 +71,7 @@ async fn setup_catalog(
                 table_id: tbl.id.clone(),
                 name: format!("column_{c}"),
                 data_type: "STRING".to_string(),
-                ordinal: c as i32,
+                ordinal: c,
                 is_nullable: c > 0,
                 description: Some(format!("Column {c} description")),
             })
@@ -86,7 +88,7 @@ async fn setup_catalog(
         "namespaces.parquet",
     );
     storage
-        .put_raw(&ns_path, ns_bytes.into(), WritePrecondition::None)
+        .put_raw(&ns_path, ns_bytes, WritePrecondition::None)
         .await
         .expect("put namespaces");
 
@@ -94,7 +96,7 @@ async fn setup_catalog(
     let tables_path =
         CatalogPaths::snapshot_file(CatalogDomain::Catalog, snapshot_version, "tables.parquet");
     storage
-        .put_raw(&tables_path, tables_bytes.into(), WritePrecondition::None)
+        .put_raw(&tables_path, tables_bytes, WritePrecondition::None)
         .await
         .expect("put tables");
 
@@ -102,7 +104,7 @@ async fn setup_catalog(
     let columns_path =
         CatalogPaths::snapshot_file(CatalogDomain::Catalog, snapshot_version, "columns.parquet");
     storage
-        .put_raw(&columns_path, columns_bytes.into(), WritePrecondition::None)
+        .put_raw(&columns_path, columns_bytes, WritePrecondition::None)
         .await
         .expect("put columns");
 
@@ -111,7 +113,7 @@ async fn setup_catalog(
     let edges_path =
         CatalogPaths::snapshot_file(CatalogDomain::Lineage, snapshot_version, "edges.parquet");
     storage
-        .put_raw(&edges_path, edges_bytes.into(), WritePrecondition::None)
+        .put_raw(&edges_path, edges_bytes, WritePrecondition::None)
         .await
         .expect("put edges");
 

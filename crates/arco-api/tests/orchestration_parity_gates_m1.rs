@@ -745,9 +745,11 @@ async fn parity_m1_rejects_unknown_assets() -> Result<()> {
 }
 
 fn test_state_and_router() -> Result<(Arc<AppState>, axum::Router)> {
-    let mut config = Config::default();
-    config.debug = true;
-    config.posture = Posture::Dev;
+    let config = Config {
+        debug: true,
+        posture: Posture::Dev,
+        ..Config::default()
+    };
 
     let state = Arc::new(AppState::with_memory_storage(config));
     let auth_layer = middleware::from_fn_with_state(state.clone(), auth_middleware);
@@ -764,6 +766,7 @@ fn test_ctx() -> RequestContext {
         tenant: "test-tenant".to_string(),
         workspace: "test-workspace".to_string(),
         user_id: Some("user@example.com".to_string()),
+        groups: vec![],
         request_id: "req_test".to_string(),
         idempotency_key: None,
     }

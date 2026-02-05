@@ -3,6 +3,9 @@
 //! This module provides idempotency support for catalog DDL operations:
 //! - `create_namespace`: Creates a namespace with idempotent retry semantics
 //! - `register_table`: Registers a table with idempotent retry semantics
+//! - `create_catalog`: Creates a catalog with idempotent retry semantics
+//! - `create_schema`: Creates a schema within a catalog with idempotent retry semantics
+//! - `register_table_in_schema`: Registers a table within a schema with idempotent retry semantics
 //!
 //! ## Protocol
 //!
@@ -20,7 +23,7 @@
 //! ```
 //!
 //! Where:
-//! - `operation`: One of `create_namespace`, `register_table`
+//! - `operation`: One of `create_namespace`, `register_table`, `create_catalog`, `create_schema`, `register_table_in_schema`
 //! - `key_hash_prefix`: First 2 characters of `SHA256(idempotency_key)`
 //! - `key_hash`: Full `SHA256(idempotency_key)`
 
@@ -81,6 +84,12 @@ pub enum CatalogOperation {
     CreateNamespace,
     /// Register a table in the catalog.
     RegisterTable,
+    /// Create a catalog.
+    CreateCatalog,
+    /// Create a schema within a catalog.
+    CreateSchema,
+    /// Register a table within a schema.
+    RegisterTableInSchema,
 }
 
 impl CatalogOperation {
@@ -90,6 +99,9 @@ impl CatalogOperation {
         match self {
             Self::CreateNamespace => "create_namespace",
             Self::RegisterTable => "register_table",
+            Self::CreateCatalog => "create_catalog",
+            Self::CreateSchema => "create_schema",
+            Self::RegisterTableInSchema => "register_table_in_schema",
         }
     }
 }
@@ -1025,16 +1037,15 @@ mod tests {
         )
         .await
         .expect("check");
-        match result {
-            IdempotencyCheck::Replay {
-                entity_id,
-                entity_name,
-            } => {
-                assert_eq!(entity_id, "ns_001");
-                assert_eq!(entity_name, "my-namespace");
-            }
-            _ => panic!("expected Replay, got {result:?}"),
-        }
+        let IdempotencyCheck::Replay {
+            entity_id,
+            entity_name,
+        } = result
+        else {
+            panic!("expected Replay, got {result:?}");
+        };
+        assert_eq!(entity_id, "ns_001");
+        assert_eq!(entity_name, "my-namespace");
     }
 
     #[tokio::test]
@@ -1182,7 +1193,9 @@ mod tests {
                 assert_eq!(entity_id, "ns_001");
                 assert_eq!(entity_name, "my-namespace");
             }
-            _ => panic!("expected Replay after concurrent finalization, got {result:?}"),
+            _ => {
+                panic!("expected Replay after concurrent finalization, got {result:?}");
+            }
         }
     }
 
@@ -1192,7 +1205,7 @@ mod tests {
 
         let fresh_start = Utc::now();
         let retry = calculate_retry_after(fresh_start, stale_timeout);
-        assert!(retry >= 1 && retry <= 300, "fresh marker retry={retry}");
+        assert!((1..=300).contains(&retry), "fresh marker retry={retry}");
 
         let old_start = Utc::now() - chrono::Duration::minutes(10);
         let retry = calculate_retry_after(old_start, stale_timeout);

@@ -206,6 +206,7 @@ async fn register_snapshot_tables(
         storage,
         CatalogDomain::Catalog,
         &[
+            ("catalogs.parquet", "catalogs"),
             ("namespaces.parquet", "namespaces"),
             ("tables.parquet", "tables"),
             ("columns.parquet", "columns"),

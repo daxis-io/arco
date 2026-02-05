@@ -71,6 +71,8 @@ enum Commands {
         bucket: Option<String>,
     },
     ParityMatrixCheck,
+    /// Generate endpoint inventory from vendored Unity Catalog OSS OpenAPI fixture
+    UcOpenapiInventory,
 }
 
 fn main() -> Result<()> {
@@ -83,6 +85,7 @@ fn main() -> Result<()> {
         Commands::Doctor => run_doctor(),
         Commands::AdrCheck => run_adr_check(),
         Commands::ParityMatrixCheck => run_parity_matrix_check(),
+        Commands::UcOpenapiInventory => run_uc_openapi_inventory(),
         Commands::VerifyIntegrity {
             verbose,
             dry_run,
@@ -92,6 +95,187 @@ fn main() -> Result<()> {
             bucket,
         } => run_verify_integrity(verbose, dry_run, lock_strict, tenant, workspace, bucket),
     }
+}
+
+fn run_uc_openapi_inventory() -> Result<()> {
+    let spec_path = Path::new("crates/arco-uc/tests/fixtures/unitycatalog-openapi.yaml");
+    let output_path = Path::new("docs/plans/2026-02-04-unity-catalog-openapi-inventory.md");
+
+    let yaml = std::fs::read_to_string(spec_path)
+        .with_context(|| format!("read UC OpenAPI fixture at {}", spec_path.display()))?;
+    if yaml.contains("PLACEHOLDER") || yaml.contains("REPLACE_ME") {
+        anyhow::bail!(
+            "UC OpenAPI fixture is a placeholder; replace {} with a pinned upstream api/all.yaml and record the commit hash in the header",
+            spec_path.display()
+        );
+    }
+
+    let spec_yaml: serde_yaml::Value =
+        serde_yaml::from_str(&yaml).context("parse UC OpenAPI fixture YAML")?;
+    let spec: serde_json::Value =
+        serde_json::to_value(spec_yaml).context("convert UC OpenAPI spec to JSON")?;
+
+    let title = spec
+        .get("info")
+        .and_then(|info| info.get("title"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Unity Catalog OSS OpenAPI");
+    let version = spec
+        .get("info")
+        .and_then(|info| info.get("version"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    let servers = spec
+        .get("servers")
+        .and_then(serde_json::Value::as_array)
+        .map(|servers| {
+            servers
+                .iter()
+                .filter_map(|server| server.get("url").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let spec_paths = spec
+        .get("paths")
+        .and_then(serde_json::Value::as_object)
+        .context("UC OpenAPI spec missing `paths` object")?;
+
+    let mut by_tag: HashMap<String, Vec<(String, String, Option<String>, Option<String>)>> =
+        HashMap::new();
+
+    for (path, path_item) in spec_paths {
+        let Some(path_item) = path_item.as_object() else {
+            continue;
+        };
+
+        for (method, operation) in path_item {
+            if !is_http_method(method) {
+                continue;
+            }
+            let Some(operation) = operation.as_object() else {
+                continue;
+            };
+
+            let tags = operation
+                .get("tags")
+                .and_then(serde_json::Value::as_array)
+                .map(|tags| {
+                    tags.iter()
+                        .filter_map(|tag| tag.as_str())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let operation_id = operation
+                .get("operationId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let summary = operation
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+
+            let tags = if tags.is_empty() {
+                vec!["Untagged".to_string()]
+            } else {
+                tags
+            };
+
+            for tag in tags {
+                by_tag.entry(tag).or_default().push((
+                    method.to_uppercase(),
+                    path.to_string(),
+                    operation_id.clone(),
+                    summary.clone(),
+                ));
+            }
+        }
+    }
+
+    for entries in by_tag.values_mut() {
+        entries.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    }
+
+    let mut tags: Vec<_> = by_tag.keys().cloned().collect();
+    tags.sort();
+
+    let manual_block = read_manual_block(output_path)?;
+
+    let mut md = String::new();
+    md.push_str("# Unity Catalog OSS OpenAPI Endpoint Inventory (Pinned)\n\n");
+    md.push_str(&format!("**Generated:** {}  \n", Utc::now().date_naive()));
+    md.push_str(&format!("**Spec fixture:** `{}`  \n", spec_path.display()));
+    md.push_str(&format!("**Spec title:** {title}  \n"));
+    md.push_str(&format!("**Spec version:** {version}  \n"));
+    if !servers.is_empty() {
+        md.push_str("**Servers:**\n");
+        for server in &servers {
+            md.push_str(&format!("- `{server}`\n"));
+        }
+        md.push('\n');
+    }
+
+    md.push_str("<!-- BEGIN GENERATED -->\n\n");
+    for tag in tags {
+        md.push_str(&format!("## {tag}\n\n"));
+        let Some(entries) = by_tag.get(&tag) else {
+            continue;
+        };
+        for (method, path, operation_id, summary) in entries {
+            md.push_str(&format!("- `{method} {path}`"));
+            if let Some(operation_id) = operation_id {
+                md.push_str(&format!(" _(operationId: `{operation_id}`)_"));
+            }
+            if let Some(summary) = summary {
+                md.push_str(&format!(" — {summary}"));
+            }
+            md.push('\n');
+        }
+        md.push('\n');
+    }
+    md.push_str("<!-- END GENERATED -->\n\n");
+
+    md.push_str("## Manual annotations\n\n");
+    md.push_str("<!-- BEGIN MANUAL -->\n");
+    md.push_str(manual_block.trim());
+    md.push('\n');
+    md.push_str("<!-- END MANUAL -->\n");
+
+    std::fs::write(output_path, md)
+        .with_context(|| format!("write inventory markdown to {}", output_path.display()))?;
+
+    println!(
+        "Wrote UC OpenAPI endpoint inventory to {}",
+        output_path.display()
+    );
+    Ok(())
+}
+
+fn is_http_method(key: &str) -> bool {
+    matches!(
+        key,
+        "get" | "post" | "put" | "delete" | "patch" | "head" | "options" | "trace"
+    )
+}
+
+fn read_manual_block(path: &Path) -> Result<String> {
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("read existing inventory file at {}", path.display()))?;
+    let Some(start) = contents.find("<!-- BEGIN MANUAL -->") else {
+        return Ok(String::new());
+    };
+    let Some(end) = contents.find("<!-- END MANUAL -->") else {
+        return Ok(String::new());
+    };
+    Ok(contents[start + "<!-- BEGIN MANUAL -->".len()..end]
+        .trim()
+        .to_string())
 }
 
 fn run_ci() -> Result<()> {

@@ -48,6 +48,7 @@
 #![deny(missing_docs)]
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
+#![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
 pub(crate) mod audit;
 pub mod compactor_client;

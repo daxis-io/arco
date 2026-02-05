@@ -1276,7 +1276,6 @@ impl CatalogWriter {
     /// - Schema doesn't exist within the catalog
     /// - Table name already exists in schema
     /// - Lock acquisition or storage operations fail
-    #[allow(clippy::too_many_lines)]
     pub async fn register_table_in_schema(
         &self,
         catalog: &str,
@@ -1318,7 +1317,8 @@ impl CatalogWriter {
                 });
             }
         }
-        let mut state =
+
+        let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
         let target_catalog = if catalog == "default" {
@@ -2386,6 +2386,40 @@ mod tests {
             .expect("register table");
 
         assert_eq!(table.namespace_id, default_sales.id);
+    }
+
+    #[tokio::test]
+    async fn test_register_table_in_schema_uses_catalog_and_schema() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_catalog("analytics", None, WriteOptions::default())
+            .await
+            .expect("create analytics catalog");
+        let sales = writer
+            .create_schema("analytics", "sales", None, WriteOptions::default())
+            .await
+            .expect("create sales schema");
+
+        let table = writer
+            .register_table_in_schema(
+                "analytics",
+                "sales",
+                RegisterTableInSchemaRequest {
+                    name: "orders".to_string(),
+                    description: None,
+                    location: Some("gs://bucket/warehouse/sales/orders".to_string()),
+                    format: Some("delta".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+
+        assert_eq!(table.namespace_id, sales.id);
+        assert_eq!(table.name, "orders");
     }
 
     #[tokio::test]

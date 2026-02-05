@@ -8,7 +8,6 @@
 //! - Table references must be fully qualified as `<catalog>.<schema>.<table>` (CTE names excluded).
 //! - Currently only Parquet single-file locations are supported.
 
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -265,27 +264,25 @@ async fn register_referenced_tables(
     let mut schema_tables: HashMap<(String, String), Vec<Table>> = HashMap::new();
 
     for table_ref in referenced_tables {
-        let catalog_provider = match catalog_providers.entry(table_ref.catalog.clone()) {
-            Entry::Occupied(entry) => entry.get().clone(),
-            Entry::Vacant(entry) => {
-                let provider = Arc::new(MemoryCatalogProvider::new());
-                session.register_catalog(&table_ref.catalog, provider.clone());
-                entry.insert(provider.clone());
-                provider
-            }
+        let catalog_provider = if let Some(provider) = catalog_providers.get(&table_ref.catalog) {
+            provider.clone()
+        } else {
+            let provider = Arc::new(MemoryCatalogProvider::new());
+            session.register_catalog(&table_ref.catalog, provider.clone());
+            catalog_providers.insert(table_ref.catalog.clone(), provider.clone());
+            provider
         };
 
         let schema_key = (table_ref.catalog.clone(), table_ref.schema.clone());
-        let schema_provider = match schema_providers.entry(schema_key.clone()) {
-            Entry::Occupied(entry) => entry.get().clone(),
-            Entry::Vacant(entry) => {
-                let provider = Arc::new(MemorySchemaProvider::new());
-                catalog_provider
-                    .register_schema(&table_ref.schema, provider.clone())
-                    .map_err(|err| map_datafusion_error(&err))?;
-                entry.insert(provider.clone());
-                provider
-            }
+        let schema_provider = if let Some(provider) = schema_providers.get(&schema_key) {
+            provider.clone()
+        } else {
+            let provider = Arc::new(MemorySchemaProvider::new());
+            catalog_provider
+                .register_schema(&table_ref.schema, provider.clone())
+                .map_err(|err| map_datafusion_error(&err))?;
+            schema_providers.insert(schema_key.clone(), provider.clone());
+            provider
         };
 
         if !schema_tables.contains_key(&schema_key) {

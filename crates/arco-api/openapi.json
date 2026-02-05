@@ -7649,6 +7649,18 @@
       "description": "Table operations"
     },
     {
+      "name": "catalogs",
+      "description": "Catalog operations"
+    },
+    {
+      "name": "schemas",
+      "description": "Schema operations"
+    },
+    {
+      "name": "delta",
+      "description": "Delta commit coordination"
+    },
+    {
       "name": "lineage",
       "description": "Lineage operations"
     },

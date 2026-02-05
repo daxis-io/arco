@@ -188,7 +188,6 @@ pub fn routes() -> Router<Arc<AppState>> {
         ("bearerAuth" = [])
     )
 )]
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn create_catalog(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
@@ -438,7 +437,7 @@ pub(crate) async fn get_catalog(
     path = "/api/v1/catalogs/{catalog}/schemas",
     tag = "schemas",
     params(
-        ("catalog" = String, Path, description = "Catalog name"),
+        ("catalog" = String, Path, description = "Catalog name")
     ),
     request_body = CreateSchemaRequest,
     responses(
@@ -453,7 +452,6 @@ pub(crate) async fn get_catalog(
         ("bearerAuth" = [])
     )
 )]
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn create_schema(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
@@ -682,7 +680,6 @@ pub(crate) async fn list_schemas(
         ("bearerAuth" = [])
     )
 )]
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn register_table_in_schema(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
@@ -786,6 +783,17 @@ pub(crate) async fn register_table_in_schema(
         options
     };
 
+    let columns = req
+        .columns
+        .into_iter()
+        .map(|c| arco_catalog::ColumnDefinition {
+            name: c.name,
+            data_type: c.data_type,
+            is_nullable: c.nullable,
+            description: c.description,
+        })
+        .collect();
+
     let create_result = writer
         .register_table_in_schema(
             &catalog,
@@ -795,16 +803,7 @@ pub(crate) async fn register_table_in_schema(
                 description: req.description,
                 location: req.location,
                 format: req.format,
-                columns: req
-                    .columns
-                    .into_iter()
-                    .map(|col| arco_catalog::ColumnDefinition {
-                        name: col.name,
-                        data_type: col.data_type,
-                        is_nullable: col.nullable,
-                        description: col.description,
-                    })
-                    .collect(),
+                columns,
             },
             options,
         )

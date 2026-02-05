@@ -34,13 +34,12 @@ bytes = { workspace = true }
 ulid = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
-arrow = { workspace = true }
-parquet = { workspace = true }

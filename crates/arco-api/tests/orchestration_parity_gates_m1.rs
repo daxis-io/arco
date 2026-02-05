@@ -745,9 +745,11 @@ async fn parity_m1_rejects_unknown_assets() -> Result<()> {
 }
 
 fn test_state_and_router() -> Result<(Arc<AppState>, axum::Router)> {
-    let mut config = Config::default();
-    config.debug = true;
-    config.posture = Posture::Dev;
+    let config = Config {
+        debug: true,
+        posture: Posture::Dev,
+        ..Config::default()
+    };
 
     let state = Arc::new(AppState::with_memory_storage(config));
     let auth_layer = middleware::from_fn_with_state(state.clone(), auth_middleware);

@@ -294,6 +294,21 @@ pub struct RegisterTableRequest {
     pub columns: Vec<ColumnDefinition>,
 }
 
+/// Request to register a new table under a UC-like catalog + schema.
+#[derive(Debug, Clone)]
+pub struct RegisterTableInSchemaRequest {
+    /// Table name (must be unique within schema).
+    pub name: String,
+    /// Optional description.
+    pub description: Option<String>,
+    /// Storage location.
+    pub location: Option<String>,
+    /// File format (e.g., "parquet", "iceberg", "delta").
+    pub format: Option<String>,
+    /// Column definitions.
+    pub columns: Vec<ColumnDefinition>,
+}
+
 /// Column definition for table registration.
 #[derive(Debug, Clone)]
 pub struct ColumnDefinition {
@@ -1252,6 +1267,177 @@ impl CatalogWriter {
         result.map(|_| table)
     }
 
+    /// Registers a new table under a UC-like catalog + schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Catalog doesn't exist (unless `catalog == "default"`, which is auto-created)
+    /// - Schema doesn't exist within the catalog
+    /// - Table name already exists in schema
+    /// - Lock acquisition or storage operations fail
+    #[allow(clippy::too_many_lines)]
+    pub async fn register_table_in_schema(
+        &self,
+        catalog: &str,
+        schema: &str,
+        req: RegisterTableInSchemaRequest,
+        opts: WriteOptions,
+    ) -> Result<Table> {
+        // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
+        if let Some(expected) = &opts.if_match {
+            let manifest = self.tier1.read_manifest().await?;
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+
+        let compactor = self.sync_compactor()?;
+
+        let guard = self
+            .tier1
+            .acquire_lock(self.lock_ttl, self.lock_max_retries)
+            .await?;
+
+        let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+
+        let target_catalog = if catalog == "default" {
+            match self
+                .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+                .await
+            {
+                Ok(catalog) => catalog,
+                Err(err) => {
+                    guard.release().await?;
+                    return Err(err);
+                }
+            }
+        } else {
+            let Some(catalog_record) = state.catalogs.iter().find(|c| c.name == catalog) else {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "catalog".into(),
+                    name: catalog.to_string(),
+                });
+            };
+
+            catalog_record.clone()
+        };
+
+        let target_catalog_id = target_catalog.id.as_str();
+        let default_catalog_id = state
+            .catalogs
+            .iter()
+            .find(|c| c.name == "default")
+            .map(|c| c.id.as_str());
+
+        // Find schema within the requested catalog, treating legacy `NULL` catalog_id as `default`.
+        let ns = state
+            .namespaces
+            .iter()
+            .find(|ns| {
+                ns.name == schema
+                    && ns.catalog_id.as_deref().or(default_catalog_id) == Some(target_catalog_id)
+            })
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "schema".into(),
+                name: format!("{catalog}.{schema}"),
+            })?;
+        let namespace_id = ns.id.clone();
+
+        // Check for duplicate table
+        if state
+            .tables
+            .iter()
+            .any(|t| t.namespace_id == namespace_id && t.name == req.name)
+        {
+            guard.release().await?;
+            return Err(CatalogError::AlreadyExists {
+                entity: "table".into(),
+                name: format!("{catalog}.{schema}.{}", req.name),
+            });
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let table_id = Uuid::now_v7().to_string();
+
+        let table = Table {
+            id: table_id.clone(),
+            namespace_id: namespace_id.clone(),
+            name: req.name.clone(),
+            description: req.description.clone(),
+            location: req.location.clone(),
+            format: req.format.clone(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let columns: Vec<ColumnRecord> = req
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(ordinal, col_def)| ColumnRecord {
+                id: Uuid::now_v7().to_string(),
+                table_id: table_id.clone(),
+                name: col_def.name.clone(),
+                data_type: col_def.data_type.clone(),
+                is_nullable: col_def.is_nullable,
+                ordinal: ordinal as i32,
+                description: col_def.description.clone(),
+            })
+            .collect();
+
+        let event = CatalogDdlEvent::TableRegistered {
+            table: TableRecord::from(&table),
+            columns,
+        };
+
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
+            .await?;
+
+        let request = SyncCompactRequest {
+            domain: CatalogDomain::Catalog.as_str().to_string(),
+            event_paths: vec![CatalogPaths::ledger_event(
+                CatalogDomain::Catalog,
+                &event_id.to_string(),
+            )],
+            fencing_token: guard.fencing_token().sequence(),
+            request_id: opts.request_id.clone(),
+        };
+
+        let result = compactor.sync_compact(request).await;
+        guard.release().await?;
+        result.map(|_| table)
+    }
+
     /// Updates a table.
     ///
     /// # Errors
@@ -2008,6 +2194,40 @@ mod tests {
                 .expect("load catalog state");
 
         assert_eq!(state.namespaces.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_register_table_in_schema_uses_catalog_and_schema() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_catalog("analytics", None, WriteOptions::default())
+            .await
+            .expect("create analytics catalog");
+        let sales = writer
+            .create_schema("analytics", "sales", None, WriteOptions::default())
+            .await
+            .expect("create sales schema");
+
+        let table = writer
+            .register_table_in_schema(
+                "analytics",
+                "sales",
+                RegisterTableInSchemaRequest {
+                    name: "orders".to_string(),
+                    description: None,
+                    location: Some("gs://bucket/warehouse/sales/orders".to_string()),
+                    format: Some("delta".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+
+        assert_eq!(table.namespace_id, sales.id);
+        assert_eq!(table.name, "orders");
     }
 
     #[tokio::test]

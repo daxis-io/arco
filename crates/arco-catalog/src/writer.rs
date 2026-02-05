@@ -1110,6 +1110,7 @@ impl CatalogWriter {
     /// - Namespace doesn't exist
     /// - Table name already exists in namespace
     /// - Lock acquisition or storage operations fail
+    #[allow(clippy::too_many_lines)]
     pub async fn register_table(
         &self,
         req: RegisterTableRequest,
@@ -1259,6 +1260,7 @@ impl CatalogWriter {
     /// - Table doesn't exist
     /// - `opts.if_match` doesn't match current version
     /// - Lock acquisition or storage operations fail
+    #[allow(clippy::too_many_lines)]
     pub async fn update_table(
         &self,
         namespace: &str,

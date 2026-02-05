@@ -22,8 +22,10 @@ default = []
 iam-smoke = []
 
 [dependencies]
+arco-api = { path = "../arco-api" }
 arco-core = { path = "../arco-core" }
 arco-catalog = { path = "../arco-catalog" }
+arco-delta = { path = "../arco-delta" }
 arco-flow = { path = "../arco-flow" }
 arco-iceberg = { path = "../arco-iceberg" }
 
@@ -31,7 +33,12 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 bytes = { workspace = true }
 ulid = { workspace = true }
 axum = { workspace = true }
+tower = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

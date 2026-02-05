@@ -101,6 +101,201 @@
         ]
       }
     },
+    "/api/v1/delta/tables/{table_id}/commits": {
+      "post": {
+        "tags": [
+          "delta"
+        ],
+        "summary": "Commit a staged Delta payload.",
+        "description": "POST `/api/v1/delta/tables/{table_id}/commits`",
+        "operationId": "commit_staged",
+        "parameters": [
+          {
+            "name": "table_id",
+            "in": "path",
+            "description": "Table ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Idempotency key (UUIDv7)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommitRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Commit succeeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommitResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/delta/tables/{table_id}/commits/stage": {
+      "post": {
+        "tags": [
+          "delta"
+        ],
+        "summary": "Stage a Delta commit payload.",
+        "description": "POST `/api/v1/delta/tables/{table_id}/commits/stage`",
+        "operationId": "stage_commit_payload",
+        "parameters": [
+          {
+            "name": "table_id",
+            "in": "path",
+            "description": "Table ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StageCommitRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Payload staged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StageCommitResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/api/v1/lineage/edges": {
       "post": {
         "tags": [
@@ -3513,6 +3708,45 @@
           }
         }
       },
+      "CommitRequest": {
+        "type": "object",
+        "required": [
+          "read_version",
+          "staged_path",
+          "staged_version"
+        ],
+        "properties": {
+          "read_version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Optimistic concurrency token: the version the client read."
+          },
+          "staged_path": {
+            "type": "string",
+            "description": "Path returned by the stage endpoint."
+          },
+          "staged_version": {
+            "type": "string",
+            "description": "Version returned by the stage endpoint."
+          }
+        }
+      },
+      "CommitResponse": {
+        "type": "object",
+        "required": [
+          "version",
+          "delta_log_path"
+        ],
+        "properties": {
+          "delta_log_path": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "CreateBackfillRequest": {
         "type": "object",
         "description": "Request to create a backfill.",
@@ -5612,6 +5846,33 @@
           }
         }
       },
+      "StageCommitRequest": {
+        "type": "object",
+        "required": [
+          "payload"
+        ],
+        "properties": {
+          "payload": {
+            "type": "string",
+            "description": "Delta commit payload to store (JSON lines)."
+          }
+        }
+      },
+      "StageCommitResponse": {
+        "type": "object",
+        "required": [
+          "staged_path",
+          "staged_version"
+        ],
+        "properties": {
+          "staged_path": {
+            "type": "string"
+          },
+          "staged_version": {
+            "type": "string"
+          }
+        }
+      },
       "StoredManifest": {
         "type": "object",
         "description": "Stored manifest metadata (what gets persisted).",
@@ -6416,6 +6677,10 @@
     {
       "name": "query",
       "description": "SQL query execution"
+    },
+    {
+      "name": "delta",
+      "description": "Delta commit coordination (Mode B)"
     },
     {
       "name": "Orchestration",

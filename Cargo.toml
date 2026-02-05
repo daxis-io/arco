@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/arco-core",
     "crates/arco-catalog",
+    "crates/arco-delta",
     "crates/arco-flow",
     "crates/arco-api",
     "crates/arco-proto",

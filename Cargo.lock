@@ -330,6 +330,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "arco-delta"
+version = "0.1.0"
+dependencies = [
+ "arco-core",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "hex",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "ulid",
+ "uuid",
+]
+
+[[package]]
 name = "arco-flow"
 version = "0.1.0"
 dependencies = [

@@ -97,9 +97,6 @@ fn main() -> Result<()> {
     }
 }
 
-type UcEndpointEntry = (String, String, Option<String>, Option<String>);
-type UcEndpointsByTag = HashMap<String, Vec<UcEndpointEntry>>;
-
 fn run_uc_openapi_inventory() -> Result<()> {
     let spec_path = Path::new("crates/arco-uc/tests/fixtures/unitycatalog-openapi.yaml");
     let output_path = Path::new("docs/plans/2026-02-04-unity-catalog-openapi-inventory.md");
@@ -146,7 +143,8 @@ fn run_uc_openapi_inventory() -> Result<()> {
         .and_then(serde_json::Value::as_object)
         .context("UC OpenAPI spec missing `paths` object")?;
 
-    let mut by_tag: UcEndpointsByTag = HashMap::new();
+    let mut by_tag: HashMap<String, Vec<(String, String, Option<String>, Option<String>)>> =
+        HashMap::new();
 
     for (path, path_item) in spec_paths {
         let Some(path_item) = path_item.as_object() else {

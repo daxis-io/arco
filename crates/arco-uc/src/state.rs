@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arco_core::audit::AuditEmitter;
 use arco_core::storage::StorageBackend;
 
 /// Server-side configuration for the Unity Catalog facade.
@@ -22,8 +21,6 @@ pub struct UnityCatalogState {
     pub storage: Arc<dyn StorageBackend>,
     /// Server-side configuration.
     pub config: UnityCatalogConfig,
-    /// Optional audit event emitter.
-    pub audit_emitter: Option<Arc<AuditEmitter>>,
 }
 
 impl UnityCatalogState {
@@ -33,24 +30,12 @@ impl UnityCatalogState {
         Self {
             storage,
             config: UnityCatalogConfig::default(),
-            audit_emitter: None,
         }
     }
 
     /// Creates Unity Catalog state with explicit configuration.
     #[must_use]
     pub fn with_config(storage: Arc<dyn StorageBackend>, config: UnityCatalogConfig) -> Self {
-        Self {
-            storage,
-            config,
-            audit_emitter: None,
-        }
-    }
-
-    /// Attaches an audit emitter used for security decision logging.
-    #[must_use]
-    pub fn with_audit_emitter(mut self, audit_emitter: Arc<AuditEmitter>) -> Self {
-        self.audit_emitter = Some(audit_emitter);
-        self
+        Self { storage, config }
     }
 }

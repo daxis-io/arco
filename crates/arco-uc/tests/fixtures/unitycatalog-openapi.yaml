@@ -1,0 +1,15 @@
+# Unity Catalog OSS OpenAPI (PINNED COPY) — PLACEHOLDER
+#
+# Upstream commit: REPLACE_ME
+# Retrieved: 2026-02-04
+# Source: https://raw.githubusercontent.com/unitycatalog/unitycatalog/<commit>/api/all.yaml
+#
+# NOTE:
+# - Network access is blocked in this environment, so this file must be provided out-of-band.
+# - Replace the entire contents of this file with the pinned upstream `api/all.yaml` (verbatim).
+# - Keep the header above and record the real upstream commit hash.
+openapi: 3.0.0
+info:
+  title: Unity Catalog OSS API (placeholder)
+  version: 0.0.0
+paths: {}

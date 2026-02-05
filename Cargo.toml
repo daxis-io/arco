@@ -9,6 +9,7 @@ members = [
     "crates/arco-compactor",
     "crates/arco-cli",
     "crates/arco-iceberg",
+    "crates/arco-uc",
     "crates/arco-test-utils",
     "crates/arco-integration-tests",
     "tools/xtask",

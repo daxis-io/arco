@@ -18,15 +18,22 @@ workspace = true
 [features]
 default = []
 full = ["gcp", "aws", "azure"]
-gcp = ["arco-core/gcp", "arco-catalog/gcp", "arco-flow/gcp", "arco-iceberg/gcp"]
-aws = ["arco-core/aws", "arco-catalog/aws", "arco-flow/aws"]
-azure = ["arco-core/azure", "arco-catalog/azure", "arco-flow/azure"]
+gcp = [
+    "arco-core/gcp",
+    "arco-catalog/gcp",
+    "arco-flow/gcp",
+    "arco-iceberg/gcp",
+    "arco-uc/gcp",
+]
+aws = ["arco-core/aws", "arco-catalog/aws", "arco-flow/aws", "arco-uc/aws"]
+azure = ["arco-core/azure", "arco-catalog/azure", "arco-flow/azure", "arco-uc/azure"]
 
 [dependencies]
 arco-core = { path = "../arco-core" }
 arco-catalog = { path = "../arco-catalog" }
 arco-flow = { path = "../arco-flow" }
 arco-iceberg = { path = "../arco-iceberg" }
+arco-uc = { path = "../arco-uc" }
 arco-proto = { path = "../arco-proto" }
 
 # Async runtime

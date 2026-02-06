@@ -43,3 +43,5 @@ Each ADR follows this structure:
 | [027](adr-027-datafusion-query-endpoint.md) | DataFusion query endpoint | Accepted |
 | [028](adr-028-gcp-oidc-authentication.md) | GCP OIDC authentication | Accepted |
 | [029](adr-029-iceberg-multi-table-transactions.md) | Iceberg multi-table transactions (ICE-7) | Accepted |
+| [030](adr-030-delta-uc-metastore.md) | Delta Lake + UC-Like Metastore/Catalog (Arco-Native) | Proposed |
+| [031](adr-031-unity-catalog-api-facade.md) | Unity Catalog OSS API Facade (UC Parity) | Proposed |

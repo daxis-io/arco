@@ -40,22 +40,34 @@ pub async fn load_catalog_state(
 
     let catalogs = match storage.get_raw(&catalogs_path).await {
         Ok(bytes) => parquet_util::read_catalogs(&bytes)?,
-        Err(_) => Vec::new(),
+        Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+            Vec::new()
+        }
+        Err(e) => return Err(e.into()),
     };
 
     let namespaces = match storage.get_raw(&ns_path).await {
         Ok(bytes) => parquet_util::read_namespaces(&bytes)?,
-        Err(_) => Vec::new(),
+        Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+            Vec::new()
+        }
+        Err(e) => return Err(e.into()),
     };
 
     let tables = match storage.get_raw(&tables_path).await {
         Ok(bytes) => parquet_util::read_tables(&bytes)?,
-        Err(_) => Vec::new(),
+        Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+            Vec::new()
+        }
+        Err(e) => return Err(e.into()),
     };
 
     let columns = match storage.get_raw(&columns_path).await {
         Ok(bytes) => parquet_util::read_columns(&bytes)?,
-        Err(_) => Vec::new(),
+        Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+            Vec::new()
+        }
+        Err(e) => return Err(e.into()),
     };
 
     Ok(CatalogState {
@@ -90,7 +102,10 @@ pub async fn load_lineage_state(storage: &ScopedStorage, edges_path: &str) -> Re
         CatalogPaths::snapshot_file(CatalogDomain::Lineage, version, "lineage_edges.parquet");
     let edges = match storage.get_raw(&path).await {
         Ok(bytes) => parquet_util::read_lineage_edges(&bytes)?,
-        Err(_) => Vec::new(),
+        Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+            Vec::new()
+        }
+        Err(e) => return Err(e.into()),
     };
 
     Ok(LineageState { edges })

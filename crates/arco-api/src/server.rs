@@ -26,6 +26,9 @@ use arco_iceberg::{
     CredentialProvider, IcebergError, IcebergState, SharedCompactorFactory, Tier1CompactorFactory,
     iceberg_router,
 };
+use arco_uc::context::UnityCatalogRequestContext;
+use arco_uc::error::UnityCatalogError;
+use arco_uc::{UnityCatalogState, unity_catalog_router};
 
 use crate::compactor_client::CompactorClient;
 use crate::config::{Config, CorsConfig};
@@ -308,6 +311,55 @@ fn iceberg_public_path(path: &str) -> bool {
     path.ends_with("/v1/config") || path.ends_with("/openapi.json")
 }
 
+/// Auth middleware for Unity Catalog facade requests.
+///
+/// Allows `/openapi.json` without auth; all other endpoints require valid auth and
+/// inject a [`UnityCatalogRequestContext`] based on the existing `RequestContext`.
+async fn unity_catalog_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if unity_catalog_public_path(req.uri().path()) {
+        return next.run(req).await;
+    }
+
+    let (mut parts, body) = req.into_parts();
+    let resource = parts.uri.path().to_string();
+    let request_id = crate::context::request_id_from_headers(&parts.headers)
+        .unwrap_or_else(|| ulid::Ulid::new().to_string());
+
+    let ctx = match RequestContext::from_request_parts(&mut parts, &state).await {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            let reason = if err.code() == "MISSING_AUTH" {
+                crate::audit::REASON_MISSING_TOKEN
+            } else {
+                crate::audit::REASON_INVALID_TOKEN
+            };
+            let audit_request_id = err.request_id().unwrap_or(&request_id);
+            crate::audit::emit_auth_deny(&state, audit_request_id, &resource, reason);
+            return api_error_to_unity_catalog_response(&err, Some(&request_id));
+        }
+    };
+
+    crate::audit::emit_auth_allow(&state, &ctx, &resource);
+
+    let uc_ctx = UnityCatalogRequestContext {
+        tenant: ctx.tenant.clone(),
+        workspace: ctx.workspace.clone(),
+        request_id: ctx.request_id.clone(),
+        idempotency_key: ctx.idempotency_key.clone(),
+    };
+    parts.extensions.insert(uc_ctx);
+
+    next.run(Request::from_parts(parts, body)).await
+}
+
+fn unity_catalog_public_path(path: &str) -> bool {
+    path.ends_with("/openapi.json")
+}
+
 fn api_error_to_iceberg_response(err: &ApiError) -> Response {
     let status = err.status();
     let message = err.message().to_string();
@@ -336,6 +388,38 @@ fn api_error_to_iceberg_response(err: &ApiError) -> Response {
     };
 
     let mut response = iceberg_error.into_response();
+    if let Some(request_id) = request_id {
+        if let Ok(value) = HeaderValue::from_str(&request_id) {
+            response
+                .headers_mut()
+                .insert(header::HeaderName::from_static("x-request-id"), value);
+        }
+    }
+    response
+}
+
+fn api_error_to_unity_catalog_response(
+    err: &ApiError,
+    request_id_fallback: Option<&str>,
+) -> Response {
+    let status = err.status();
+    let message = err.message().to_string();
+    let request_id = err.request_id().or(request_id_fallback).map(str::to_string);
+
+    let uc_error = match status {
+        StatusCode::BAD_REQUEST => UnityCatalogError::BadRequest { message },
+        StatusCode::UNAUTHORIZED => UnityCatalogError::Unauthorized { message },
+        StatusCode::FORBIDDEN => UnityCatalogError::Forbidden { message },
+        StatusCode::NOT_FOUND => UnityCatalogError::NotFound { message },
+        StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
+            UnityCatalogError::Conflict { message }
+        }
+        StatusCode::NOT_IMPLEMENTED => UnityCatalogError::NotImplemented { message },
+        StatusCode::SERVICE_UNAVAILABLE => UnityCatalogError::ServiceUnavailable { message },
+        _ => UnityCatalogError::Internal { message },
+    };
+
+    let mut response = uc_error.into_response();
     if let Some(request_id) = request_id {
         if let Ok(value) = HeaderValue::from_str(&request_id) {
             response
@@ -506,6 +590,22 @@ impl Server {
 
             tracing::info!("Iceberg REST Catalog enabled at /iceberg/v1/*");
             router = router.nest_service("/iceberg", iceberg_service);
+        }
+
+        // Mount Unity Catalog facade if enabled
+        if state.config.unity_catalog.enabled {
+            let uc_state = UnityCatalogState::new(Arc::clone(&state.storage));
+
+            let uc_service = ServiceBuilder::new()
+                .layer(middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    unity_catalog_auth_middleware,
+                ))
+                .service(unity_catalog_router(uc_state).into_service::<Body>());
+
+            let mount_prefix = state.config.unity_catalog.mount_prefix.clone();
+            tracing::info!("Unity Catalog facade enabled at {mount_prefix}/*");
+            router = router.nest_service(mount_prefix.as_str(), uc_service);
         }
 
         router

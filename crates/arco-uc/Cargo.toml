@@ -1,0 +1,56 @@
+[package]
+name = "arco-uc"
+description = "Unity Catalog OSS API facade for Arco: OpenAPI-parity UC compatibility surface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+full = ["gcp", "aws", "azure"]
+gcp = ["arco-core/gcp", "dep:gcp_auth"]
+aws = ["arco-core/aws"]
+azure = ["arco-core/azure"]
+
+[dependencies]
+arco-core = { path = "../arco-core" }
+
+# HTTP
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+http = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# IDs
+ulid = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# OpenAPI
+utoipa = { version = "5.4.0", features = ["axum_extras"] }
+
+# Logging/tracing
+tracing = { workspace = true }
+
+# Credential vending (GCS OAuth2) - optional, enabled by `gcp` feature
+gcp_auth = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-test = { workspace = true }
+serde_yaml = { workspace = true }

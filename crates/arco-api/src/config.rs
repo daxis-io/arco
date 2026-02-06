@@ -107,6 +107,10 @@ pub struct Config {
     #[serde(default)]
     pub iceberg: IcebergApiConfig,
 
+    /// Unity Catalog OSS parity facade configuration.
+    #[serde(default)]
+    pub unity_catalog: UnityCatalogApiConfig,
+
     /// Audit configuration for security event logging.
     #[serde(default)]
     pub audit: AuditConfig,
@@ -226,6 +230,7 @@ impl Default for Config {
             partition_time_string_cutoff: None,
             code_version: None,
             iceberg: IcebergApiConfig::default(),
+            unity_catalog: UnityCatalogApiConfig::default(),
             audit: AuditConfig::default(),
             idempotency_stale_timeout_secs: default_idempotency_stale_timeout_secs(),
         }
@@ -307,6 +312,32 @@ impl IcebergApiConfig {
     }
 }
 
+/// Configuration for the Unity Catalog OSS parity facade.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnityCatalogApiConfig {
+    /// Enable Unity Catalog facade endpoints.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Mount prefix for UC endpoints (must start with `/`).
+    #[serde(default = "default_unity_catalog_mount_prefix")]
+    pub mount_prefix: String,
+}
+
+fn default_unity_catalog_mount_prefix() -> String {
+    // Matches the Unity Catalog OSS OpenAPI `servers.url` base path.
+    "/api/2.1/unity-catalog".to_string()
+}
+
+impl Default for UnityCatalogApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mount_prefix: default_unity_catalog_mount_prefix(),
+        }
+    }
+}
+
 /// Storage configuration for the API server.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StorageConfig {
@@ -338,6 +369,7 @@ impl Config {
     /// - `ARCO_JWT_TENANT_CLAIM`
     /// - `ARCO_JWT_WORKSPACE_CLAIM`
     /// - `ARCO_JWT_USER_CLAIM`
+    /// - `ARCO_JWT_GROUPS_CLAIM`
     /// - `ARCO_STORAGE_BUCKET`
     /// - `ARCO_COMPACTOR_URL`
     /// - `ARCO_ORCH_COMPACTOR_URL`
@@ -353,6 +385,8 @@ impl Config {
     /// - `ARCO_ICEBERG_ALLOW_MULTI_TABLE_TRANSACTIONS`
     /// - `ARCO_ICEBERG_CONCURRENCY_LIMIT`
     /// - `ARCO_ICEBERG_ENABLE_CREDENTIAL_VENDING`
+    /// - `ARCO_UNITY_CATALOG_ENABLED`
+    /// - `ARCO_UNITY_CATALOG_MOUNT_PREFIX`
     /// - `ARCO_AUDIT_ACTOR_HMAC_KEY`
     /// - `ARCO_IDEMPOTENCY_STALE_TIMEOUT_SECS` (10-3600, default: 300)
     ///
@@ -420,6 +454,9 @@ impl Config {
         if let Some(claim) = env_string("ARCO_JWT_USER_CLAIM") {
             config.jwt.user_claim = claim;
         }
+        if let Some(claim) = env_string("ARCO_JWT_GROUPS_CLAIM") {
+            config.jwt.groups_claim = claim;
+        }
 
         if let Some(bucket) = env_string("ARCO_STORAGE_BUCKET") {
             config.storage.bucket = Some(bucket);
@@ -470,6 +507,14 @@ impl Config {
             config.iceberg.enable_credential_vending = enable;
         }
 
+        // Unity Catalog facade configuration
+        if let Some(enabled) = env_bool("ARCO_UNITY_CATALOG_ENABLED")? {
+            config.unity_catalog.enabled = enabled;
+        }
+        if let Some(prefix) = env_string("ARCO_UNITY_CATALOG_MOUNT_PREFIX") {
+            config.unity_catalog.mount_prefix = prefix;
+        }
+
         if let Some(key) = env_string("ARCO_AUDIT_ACTOR_HMAC_KEY") {
             config.audit.actor_hmac_key = Some(key);
         }
@@ -486,6 +531,25 @@ impl Config {
                 )));
             }
             config.idempotency_stale_timeout_secs = secs;
+        }
+
+        if !config.unity_catalog.mount_prefix.starts_with('/') {
+            return Err(Error::InvalidInput(
+                "ARCO_UNITY_CATALOG_MOUNT_PREFIX must start with '/'".to_string(),
+            ));
+        }
+        if config.unity_catalog.mount_prefix == "/" {
+            return Err(Error::InvalidInput(
+                "ARCO_UNITY_CATALOG_MOUNT_PREFIX cannot be '/' (would shadow /health, /ready, and other core endpoints)"
+                    .to_string(),
+            ));
+        }
+        if config.unity_catalog.mount_prefix.ends_with('/') {
+            config.unity_catalog.mount_prefix = config
+                .unity_catalog
+                .mount_prefix
+                .trim_end_matches('/')
+                .to_string();
         }
 
         Ok(config)
@@ -655,6 +719,12 @@ pub struct JwtConfig {
     /// Claim name that contains the user identifier.
     #[serde(default = "default_user_claim")]
     pub user_claim: String,
+
+    /// Claim name that contains group memberships.
+    ///
+    /// When absent, the request principal has no groups.
+    #[serde(default = "default_groups_claim")]
+    pub groups_claim: String,
 }
 
 impl Default for JwtConfig {
@@ -667,6 +737,7 @@ impl Default for JwtConfig {
             tenant_claim: default_tenant_claim(),
             workspace_claim: default_workspace_claim(),
             user_claim: default_user_claim(),
+            groups_claim: default_groups_claim(),
         }
     }
 }
@@ -681,6 +752,10 @@ fn default_workspace_claim() -> String {
 
 fn default_user_claim() -> String {
     "sub".to_string()
+}
+
+fn default_groups_claim() -> String {
+    "groups".to_string()
 }
 
 fn normalize_pem(pem: &str) -> String {

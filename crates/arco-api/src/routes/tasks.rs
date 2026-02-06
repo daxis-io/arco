@@ -660,6 +660,7 @@ pub async fn task_auth_middleware(
         tenant,
         workspace,
         user_id: None,
+        groups: vec![],
         request_id: request_id.clone(),
         idempotency_key,
     };

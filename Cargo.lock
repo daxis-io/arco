@@ -189,10 +189,12 @@ dependencies = [
  "anyhow",
  "arco-catalog",
  "arco-core",
+ "arco-delta",
  "arco-flow",
  "arco-iceberg",
  "arco-proto",
  "arco-test-utils",
+ "arco-uc",
  "arrow 54.3.1",
  "arrow-json",
  "async-trait",
@@ -227,6 +229,7 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "utoipa",
+ "uuid",
 ]
 
 [[package]]
@@ -329,6 +332,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "arco-delta"
+version = "0.1.0"
+dependencies = [
+ "arco-core",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "hex",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "ulid",
+ "uuid",
+]
+
+[[package]]
 name = "arco-flow"
 version = "0.1.0"
 dependencies = [
@@ -403,16 +425,25 @@ dependencies = [
 name = "arco-integration-tests"
 version = "0.1.0"
 dependencies = [
+ "arco-api",
  "arco-catalog",
  "arco-core",
+ "arco-delta",
  "arco-flow",
  "arco-iceberg",
+ "arrow 54.3.1",
  "axum 0.7.9",
  "bytes",
+ "chrono",
+ "hex",
  "iceberg",
  "iceberg-catalog-rest",
+ "parquet 54.3.1",
+ "serde",
  "serde_json",
+ "sha2",
  "tokio",
+ "tower",
  "ulid",
  "uuid",
 ]
@@ -454,6 +485,27 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "arco-uc"
+version = "0.1.0"
+dependencies = [
+ "arco-core",
+ "axum 0.7.9",
+ "gcp_auth",
+ "http",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tower",
+ "tower-http",
+ "tracing",
+ "ulid",
+ "utoipa",
 ]
 
 [[package]]

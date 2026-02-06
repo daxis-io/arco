@@ -362,6 +362,7 @@ impl Config {
     /// - `ARCO_JWT_TENANT_CLAIM`
     /// - `ARCO_JWT_WORKSPACE_CLAIM`
     /// - `ARCO_JWT_USER_CLAIM`
+    /// - `ARCO_JWT_GROUPS_CLAIM`
     /// - `ARCO_STORAGE_BUCKET`
     /// - `ARCO_COMPACTOR_URL`
     /// - `ARCO_ORCH_COMPACTOR_URL`
@@ -444,6 +445,9 @@ impl Config {
         }
         if let Some(claim) = env_string("ARCO_JWT_USER_CLAIM") {
             config.jwt.user_claim = claim;
+        }
+        if let Some(claim) = env_string("ARCO_JWT_GROUPS_CLAIM") {
+            config.jwt.groups_claim = claim;
         }
 
         if let Some(bucket) = env_string("ARCO_STORAGE_BUCKET") {
@@ -704,6 +708,12 @@ pub struct JwtConfig {
     /// Claim name that contains the user identifier.
     #[serde(default = "default_user_claim")]
     pub user_claim: String,
+
+    /// Claim name that contains group memberships.
+    ///
+    /// When absent, the request principal has no groups.
+    #[serde(default = "default_groups_claim")]
+    pub groups_claim: String,
 }
 
 impl Default for JwtConfig {
@@ -716,6 +726,7 @@ impl Default for JwtConfig {
             tenant_claim: default_tenant_claim(),
             workspace_claim: default_workspace_claim(),
             user_claim: default_user_claim(),
+            groups_claim: default_groups_claim(),
         }
     }
 }
@@ -730,6 +741,10 @@ fn default_workspace_claim() -> String {
 
 fn default_user_claim() -> String {
     "sub".to_string()
+}
+
+fn default_groups_claim() -> String {
+    "groups".to_string()
 }
 
 fn normalize_pem(pem: &str) -> String {

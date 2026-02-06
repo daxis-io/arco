@@ -5470,6 +5470,7 @@ mod tests {
             tenant: "tenant".to_string(),
             workspace: "workspace".to_string(),
             user_id: Some("user@example.com".to_string()),
+            groups: vec![],
             request_id: "req_01".to_string(),
             idempotency_key: None,
         };
@@ -5651,6 +5652,7 @@ mod tests {
             tenant: "tenant".to_string(),
             workspace: "workspace".to_string(),
             user_id: Some("user@example.com".to_string()),
+            groups: vec![],
             request_id: "req_01".to_string(),
             idempotency_key: None,
         };
@@ -5736,6 +5738,7 @@ mod tests {
             tenant: "tenant".to_string(),
             workspace: "workspace".to_string(),
             user_id: Some("user@example.com".to_string()),
+            groups: vec![],
             request_id: "req_01".to_string(),
             idempotency_key: None,
         };
@@ -5806,6 +5809,7 @@ mod tests {
             tenant: "tenant".to_string(),
             workspace: "workspace".to_string(),
             user_id: Some("user@example.com".to_string()),
+            groups: vec![],
             request_id: "req_01".to_string(),
             idempotency_key: None,
         };
@@ -5902,6 +5906,7 @@ mod tests {
             tenant: "tenant".to_string(),
             workspace: "workspace".to_string(),
             user_id: Some("user@example.com".to_string()),
+            groups: vec![],
             request_id: "req_01".to_string(),
             idempotency_key: None,
         };
@@ -5976,6 +5981,7 @@ mod tests {
             tenant: "tenant".to_string(),
             workspace: "workspace".to_string(),
             user_id: Some("user@example.com".to_string()),
+            groups: vec![],
             request_id: "req_01".to_string(),
             idempotency_key: None,
         };

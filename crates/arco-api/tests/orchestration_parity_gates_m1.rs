@@ -764,6 +764,7 @@ fn test_ctx() -> RequestContext {
         tenant: "test-tenant".to_string(),
         workspace: "test-workspace".to_string(),
         user_id: Some("user@example.com".to_string()),
+        groups: vec![],
         request_id: "req_test".to_string(),
         idempotency_key: None,
     }

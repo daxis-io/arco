@@ -5,12 +5,15 @@
 //! apply changes, then write a new snapshot.
 
 use crate::parquet_util::{
-    ColumnRecord, LineageEdgeRecord, NamespaceRecord, SearchPostingRecord, TableRecord,
+    CatalogRecord, ColumnRecord, LineageEdgeRecord, NamespaceRecord, SearchPostingRecord,
+    TableRecord,
 };
 
 /// In-memory state for the catalog domain (namespaces, tables, columns).
 #[derive(Debug, Clone, Default)]
 pub struct CatalogState {
+    /// Catalog records.
+    pub catalogs: Vec<CatalogRecord>,
     /// Namespace records.
     pub namespaces: Vec<NamespaceRecord>,
     /// Table records.

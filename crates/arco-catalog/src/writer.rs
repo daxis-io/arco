@@ -37,9 +37,11 @@ use crate::error::{CatalogError, Result};
 use crate::event_writer::EventWriter;
 use crate::lock::DistributedLock;
 use crate::manifest::SnapshotInfo;
-use crate::parquet_util::{ColumnRecord, LineageEdgeRecord, NamespaceRecord, TableRecord};
+use crate::parquet_util::{
+    CatalogRecord, ColumnRecord, LineageEdgeRecord, NamespaceRecord, TableRecord,
+};
 use crate::sync_compactor::SyncCompactor;
-use crate::tier1_events::{CatalogDdlEvent, LineageDdlEvent};
+use crate::tier1_events::{CatalogDdlEvent, CatalogDdlEventV2, LineageDdlEvent};
 use crate::tier1_state;
 use crate::tier1_writer::Tier1Writer;
 use crate::write_options::WriteOptions;
@@ -57,6 +59,8 @@ const DEFAULT_LOCK_MAX_RETRIES: u32 = 10;
 pub struct Namespace {
     /// Unique namespace ID (UUID v7).
     pub id: String,
+    /// Parent catalog ID (UUID v7). Null implies legacy/default catalog.
+    pub catalog_id: Option<String>,
     /// Namespace name (unique within workspace).
     pub name: String,
     /// Optional description.
@@ -67,10 +71,50 @@ pub struct Namespace {
     pub updated_at: i64,
 }
 
+/// A catalog in the metastore.
+#[derive(Debug, Clone)]
+pub struct Catalog {
+    /// Unique catalog ID (UUID v7).
+    pub id: String,
+    /// Catalog name (unique within workspace).
+    pub name: String,
+    /// Optional description.
+    pub description: Option<String>,
+    /// Creation timestamp (milliseconds since epoch).
+    pub created_at: i64,
+    /// Last update timestamp (milliseconds since epoch).
+    pub updated_at: i64,
+}
+
+impl From<CatalogRecord> for Catalog {
+    fn from(r: CatalogRecord) -> Self {
+        Self {
+            id: r.id,
+            name: r.name,
+            description: r.description,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+impl From<&Catalog> for CatalogRecord {
+    fn from(catalog: &Catalog) -> Self {
+        Self {
+            id: catalog.id.clone(),
+            name: catalog.name.clone(),
+            description: catalog.description.clone(),
+            created_at: catalog.created_at,
+            updated_at: catalog.updated_at,
+        }
+    }
+}
+
 impl From<NamespaceRecord> for Namespace {
     fn from(r: NamespaceRecord) -> Self {
         Self {
             id: r.id,
+            catalog_id: r.catalog_id,
             name: r.name,
             description: r.description,
             created_at: r.created_at,
@@ -83,6 +127,7 @@ impl From<&Namespace> for NamespaceRecord {
     fn from(ns: &Namespace) -> Self {
         Self {
             id: ns.id.clone(),
+            catalog_id: ns.catalog_id.clone(),
             name: ns.name.clone(),
             description: ns.description.clone(),
             created_at: ns.created_at,
@@ -403,6 +448,55 @@ impl CatalogWriter {
             })
     }
 
+    async fn ensure_default_catalog_locked(
+        &self,
+        guard: &crate::lock::LockGuard<dyn StorageBackend>,
+        state: &crate::state::CatalogState,
+        compactor: &Arc<dyn SyncCompactor>,
+        opts: &WriteOptions,
+    ) -> Result<CatalogRecord> {
+        if let Some(existing) = state.catalogs.iter().find(|c| c.name == "default") {
+            return Ok(existing.clone());
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let default = Catalog {
+            id: Uuid::now_v7().to_string(),
+            name: "default".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let event = CatalogDdlEventV2::CatalogCreated {
+            catalog: CatalogRecord::from(&default),
+        };
+
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
+            .await?;
+
+        let request = SyncCompactRequest {
+            domain: CatalogDomain::Catalog.as_str().to_string(),
+            event_paths: vec![CatalogPaths::ledger_event(
+                CatalogDomain::Catalog,
+                &event_id.to_string(),
+            )],
+            fencing_token: guard.fencing_token().sequence(),
+            request_id: opts.request_id.clone(),
+        };
+
+        compactor.sync_compact(request).await?;
+
+        Ok(CatalogRecord::from(&default))
+    }
+
     // ========================================================================
     // Initialization
     // ========================================================================
@@ -425,8 +519,233 @@ impl CatalogWriter {
     }
 
     // ========================================================================
+    // Catalogs (Tier 1 - catalog domain)
+    // ========================================================================
+
+    /// Creates a new catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - A catalog with this name already exists
+    /// - Lock acquisition fails
+    /// - Storage operations fail
+    pub async fn create_catalog(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        opts: WriteOptions,
+    ) -> Result<Catalog> {
+        // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
+        if let Some(expected) = &opts.if_match {
+            let manifest = self.tier1.read_manifest().await?;
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let catalog = Catalog {
+            id: Uuid::now_v7().to_string(),
+            name: name.to_string(),
+            description: description.map(String::from),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let compactor = self.sync_compactor()?;
+
+        // Acquire lock and append ledger event.
+        let guard = self
+            .tier1
+            .acquire_lock(self.lock_ttl, self.lock_max_retries)
+            .await?;
+
+        let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+
+        // Check for duplicate
+        if state.catalogs.iter().any(|c| c.name == name) {
+            guard.release().await?;
+            return Err(CatalogError::AlreadyExists {
+                entity: "catalog".into(),
+                name: name.to_string(),
+            });
+        }
+
+        let event = CatalogDdlEventV2::CatalogCreated {
+            catalog: CatalogRecord::from(&catalog),
+        };
+
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
+            .await?;
+
+        let request = SyncCompactRequest {
+            domain: CatalogDomain::Catalog.as_str().to_string(),
+            event_paths: vec![CatalogPaths::ledger_event(
+                CatalogDomain::Catalog,
+                &event_id.to_string(),
+            )],
+            fencing_token: guard.fencing_token().sequence(),
+            request_id: opts.request_id.clone(),
+        };
+
+        let result = compactor.sync_compact(request).await;
+        guard.release().await?;
+        result?;
+
+        Ok(catalog)
+    }
+
+    // ========================================================================
     // Namespaces (Tier 1 - catalog domain)
     // ========================================================================
+
+    /// Creates a new schema within a catalog.
+    ///
+    /// In the UC-like model, "schemas" are the same underlying entity as legacy
+    /// namespaces, but scoped to a catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The catalog doesn't exist
+    /// - A schema with this name already exists
+    /// - Lock acquisition fails
+    /// - Storage operations fail
+    pub async fn create_schema(
+        &self,
+        catalog: &str,
+        schema: &str,
+        description: Option<&str>,
+        opts: WriteOptions,
+    ) -> Result<Namespace> {
+        // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
+        if let Some(expected) = &opts.if_match {
+            let manifest = self.tier1.read_manifest().await?;
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+
+        let compactor = self.sync_compactor()?;
+
+        let guard = self
+            .tier1
+            .acquire_lock(self.lock_ttl, self.lock_max_retries)
+            .await?;
+
+        let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+
+        let Some(catalog_record) = state.catalogs.iter().find(|c| c.name == catalog) else {
+            guard.release().await?;
+            return Err(CatalogError::NotFound {
+                entity: "catalog".into(),
+                name: catalog.to_string(),
+            });
+        };
+
+        // Check for duplicate within the catalog (UC semantics).
+        let default_catalog_id = state
+            .catalogs
+            .iter()
+            .find(|c| c.name == "default")
+            .map(|c| c.id.as_str());
+        let catalog_id = catalog_record.id.as_str();
+        if state.namespaces.iter().any(|ns| {
+            ns.name == schema && ns.catalog_id.as_deref().or(default_catalog_id) == Some(catalog_id)
+        }) {
+            guard.release().await?;
+            return Err(CatalogError::AlreadyExists {
+                entity: "namespace".into(),
+                name: schema.to_string(),
+            });
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let namespace = Namespace {
+            id: Uuid::now_v7().to_string(),
+            catalog_id: Some(catalog_record.id.clone()),
+            name: schema.to_string(),
+            description: description.map(String::from),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let event = CatalogDdlEvent::NamespaceCreated {
+            namespace: NamespaceRecord::from(&namespace),
+        };
+
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
+            .await?;
+
+        let request = SyncCompactRequest {
+            domain: CatalogDomain::Catalog.as_str().to_string(),
+            event_paths: vec![CatalogPaths::ledger_event(
+                CatalogDomain::Catalog,
+                &event_id.to_string(),
+            )],
+            fencing_token: guard.fencing_token().sequence(),
+            request_id: opts.request_id.clone(),
+        };
+
+        let result = compactor.sync_compact(request).await;
+        guard.release().await?;
+        result.map(|_| namespace)
+    }
 
     /// Creates a new namespace.
     ///
@@ -448,7 +767,7 @@ impl CatalogWriter {
         description: Option<&str>,
         opts: WriteOptions,
     ) -> Result<Namespace> {
-        // Check optimistic locking
+        // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -462,15 +781,6 @@ impl CatalogWriter {
             }
         }
 
-        let now = Utc::now().timestamp_millis();
-        let namespace = Namespace {
-            id: Uuid::now_v7().to_string(),
-            name: name.to_string(),
-            description: description.map(String::from),
-            created_at: now,
-            updated_at: now,
-        };
-
         let compactor = self.sync_compactor()?;
 
         // Acquire lock and append ledger event
@@ -480,17 +790,55 @@ impl CatalogWriter {
             .await?;
 
         let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
+        let default_catalog = match self
+            .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                guard.release().await?;
+                return Err(err);
+            }
+        };
+
+        let default_catalog_id = default_catalog.id.as_str();
+
         // Check for duplicate
-        if state.namespaces.iter().any(|ns| ns.name == name) {
+        if state.namespaces.iter().any(|ns| {
+            ns.name == name
+                && ns.catalog_id.as_deref().unwrap_or(default_catalog_id) == default_catalog_id
+        }) {
             guard.release().await?;
             return Err(CatalogError::AlreadyExists {
                 entity: "namespace".into(),
                 name: name.to_string(),
             });
         }
+
+        let now = Utc::now().timestamp_millis();
+        let namespace = Namespace {
+            id: Uuid::now_v7().to_string(),
+            catalog_id: Some(default_catalog.id),
+            name: name.to_string(),
+            description: description.map(String::from),
+            created_at: now,
+            updated_at: now,
+        };
 
         let event = CatalogDdlEvent::NamespaceCreated {
             namespace: NamespaceRecord::from(&namespace),
@@ -532,6 +880,7 @@ impl CatalogWriter {
         description: Option<&str>,
         opts: WriteOptions,
     ) -> Result<Namespace> {
+        // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -553,13 +902,41 @@ impl CatalogWriter {
             .await?;
 
         let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+
+        let default_catalog = match self
+            .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                guard.release().await?;
+                return Err(err);
+            }
+        };
+
+        let default_catalog_id = default_catalog.id.as_str();
 
         let existing = state
             .namespaces
             .iter()
-            .find(|ns| ns.name == name)
+            .find(|ns| {
+                ns.name == name
+                    && ns.catalog_id.as_deref().unwrap_or(default_catalog_id) == default_catalog_id
+            })
             .ok_or_else(|| CatalogError::NotFound {
                 entity: "namespace".into(),
                 name: name.to_string(),
@@ -568,6 +945,7 @@ impl CatalogWriter {
         let now = Utc::now().timestamp_millis();
         let namespace = Namespace {
             id: existing.id.clone(),
+            catalog_id: Some(default_catalog.id),
             name: existing.name.clone(),
             description: description.map(String::from),
             created_at: existing.created_at,
@@ -617,7 +995,7 @@ impl CatalogWriter {
     /// - Namespace contains tables (must be empty)
     /// - Lock acquisition or storage operations fail
     pub async fn delete_namespace(&self, name: &str, opts: WriteOptions) -> Result<()> {
-        // Check optimistic locking
+        // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -639,14 +1017,42 @@ impl CatalogWriter {
             .await?;
 
         let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
-        // Find namespace
+        let default_catalog = match self
+            .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                guard.release().await?;
+                return Err(err);
+            }
+        };
+
+        let default_catalog_id = default_catalog.id.as_str();
+
+        // Find namespace in the default catalog (legacy route semantics).
         let ns_idx = state
             .namespaces
             .iter()
-            .position(|ns| ns.name == name)
+            .position(|ns| {
+                ns.name == name
+                    && ns.catalog_id.as_deref().unwrap_or(default_catalog_id) == default_catalog_id
+            })
             .ok_or_else(|| CatalogError::NotFound {
                 entity: "namespace".into(),
                 name: name.to_string(),
@@ -704,12 +1110,13 @@ impl CatalogWriter {
     /// - Namespace doesn't exist
     /// - Table name already exists in namespace
     /// - Lock acquisition or storage operations fail
+    #[allow(clippy::too_many_lines)]
     pub async fn register_table(
         &self,
         req: RegisterTableRequest,
         opts: WriteOptions,
     ) -> Result<Table> {
-        // Check optimistic locking
+        // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -731,14 +1138,42 @@ impl CatalogWriter {
             .await?;
 
         let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
-        // Find namespace
+        let default_catalog = match self
+            .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                guard.release().await?;
+                return Err(err);
+            }
+        };
+
+        let default_catalog_id = default_catalog.id.as_str();
+
+        // Find namespace in the default catalog (legacy route semantics).
         let ns = state
             .namespaces
             .iter()
-            .find(|ns| ns.name == req.namespace)
+            .find(|ns| {
+                ns.name == req.namespace
+                    && ns.catalog_id.as_deref().unwrap_or(default_catalog_id) == default_catalog_id
+            })
             .ok_or_else(|| CatalogError::NotFound {
                 entity: "namespace".into(),
                 name: req.namespace.clone(),
@@ -825,6 +1260,7 @@ impl CatalogWriter {
     /// - Table doesn't exist
     /// - `opts.if_match` doesn't match current version
     /// - Lock acquisition or storage operations fail
+    #[allow(clippy::too_many_lines)]
     pub async fn update_table(
         &self,
         namespace: &str,
@@ -832,7 +1268,7 @@ impl CatalogWriter {
         patch: TablePatch,
         opts: WriteOptions,
     ) -> Result<Table> {
-        // Check optimistic locking
+        // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -854,14 +1290,42 @@ impl CatalogWriter {
             .await?;
 
         let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
         let mut state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
-        // Find namespace
+        let default_catalog = match self
+            .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                guard.release().await?;
+                return Err(err);
+            }
+        };
+
+        let default_catalog_id = default_catalog.id.as_str();
+
+        // Find namespace in the default catalog (legacy route semantics).
         let ns = state
             .namespaces
             .iter()
-            .find(|ns| ns.name == namespace)
+            .find(|ns| {
+                ns.name == namespace
+                    && ns.catalog_id.as_deref().unwrap_or(default_catalog_id) == default_catalog_id
+            })
             .ok_or_else(|| CatalogError::NotFound {
                 entity: "namespace".into(),
                 name: namespace.to_string(),
@@ -931,7 +1395,7 @@ impl CatalogWriter {
     /// - Table doesn't exist
     /// - Lock acquisition or storage operations fail
     pub async fn drop_table(&self, namespace: &str, name: &str, opts: WriteOptions) -> Result<()> {
-        // Check optimistic locking
+        // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -953,14 +1417,42 @@ impl CatalogWriter {
             .await?;
 
         let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
-        // Find namespace
+        let default_catalog = match self
+            .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                guard.release().await?;
+                return Err(err);
+            }
+        };
+
+        let default_catalog_id = default_catalog.id.as_str();
+
+        // Find namespace in the default catalog (legacy route semantics).
         let ns = state
             .namespaces
             .iter()
-            .find(|ns| ns.name == namespace)
+            .find(|ns| {
+                ns.name == namespace
+                    && ns.catalog_id.as_deref().unwrap_or(default_catalog_id) == default_catalog_id
+            })
             .ok_or_else(|| CatalogError::NotFound {
                 entity: "namespace".into(),
                 name: namespace.to_string(),
@@ -1046,18 +1538,54 @@ impl CatalogWriter {
             });
         }
 
-        // No-op if names are the same
+        // No-op if names are the same.
         if source_name == dest_name {
-            // Still need to find and return the table
+            let compactor = self.sync_compactor()?;
+
+            let guard = self
+                .tier1
+                .acquire_lock(self.lock_ttl, self.lock_max_retries)
+                .await?;
+
             let manifest = self.tier1.read_manifest().await?;
+            if let Some(expected) = &opts.if_match {
+                if manifest.catalog.snapshot_version != expected.as_u64() {
+                    guard.release().await?;
+                    return Err(CatalogError::PreconditionFailed {
+                        message: format!(
+                            "version mismatch: expected {}, got {}",
+                            expected.as_u64(),
+                            manifest.catalog.snapshot_version
+                        ),
+                    });
+                }
+            }
+
             let state =
                 tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path)
                     .await?;
 
+            let default_catalog = match self
+                .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+                .await
+            {
+                Ok(catalog) => catalog,
+                Err(err) => {
+                    guard.release().await?;
+                    return Err(err);
+                }
+            };
+
+            let default_catalog_id = default_catalog.id.as_str();
+
             let ns = state
                 .namespaces
                 .iter()
-                .find(|ns| ns.name == source_namespace)
+                .find(|ns| {
+                    ns.name == source_namespace
+                        && ns.catalog_id.as_deref().unwrap_or(default_catalog_id)
+                            == default_catalog_id
+                })
                 .ok_or_else(|| CatalogError::NotFound {
                     entity: "namespace".into(),
                     name: source_namespace.to_string(),
@@ -1072,10 +1600,12 @@ impl CatalogWriter {
                     name: format!("{}.{}", source_namespace, source_name),
                 })?;
 
-            return Ok(Table::from(table.clone()));
+            let out = Table::from(table.clone());
+            guard.release().await?;
+            return Ok(out);
         }
 
-        // Check optimistic locking
+        // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -1097,14 +1627,42 @@ impl CatalogWriter {
             .await?;
 
         let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
-        // Find namespace
+        let default_catalog = match self
+            .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                guard.release().await?;
+                return Err(err);
+            }
+        };
+
+        let default_catalog_id = default_catalog.id.as_str();
+
+        // Find namespace in the default catalog (legacy route semantics).
         let ns = state
             .namespaces
             .iter()
-            .find(|ns| ns.name == source_namespace)
+            .find(|ns| {
+                ns.name == source_namespace
+                    && ns.catalog_id.as_deref().unwrap_or(default_catalog_id) == default_catalog_id
+            })
             .ok_or_else(|| CatalogError::NotFound {
                 entity: "namespace".into(),
                 name: source_namespace.to_string(),
@@ -1334,6 +1892,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_catalog() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        let catalog = writer
+            .create_catalog("default", Some("Default catalog"), WriteOptions::default())
+            .await
+            .expect("create catalog");
+
+        assert_eq!(catalog.name, "default");
+        assert_eq!(catalog.description, Some("Default catalog".to_string()));
+
+        let manifest = writer.tier1.read_manifest().await.expect("manifest");
+        let state =
+            tier1_state::load_catalog_state(&writer.storage, &manifest.catalog.snapshot_path)
+                .await
+                .expect("load catalog state");
+
+        assert_eq!(state.catalogs.len(), 1);
+        assert_eq!(state.catalogs[0].name, "default");
+    }
+
+    #[tokio::test]
+    async fn test_create_duplicate_catalog_fails() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_catalog("default", None, WriteOptions::default())
+            .await
+            .expect("first create");
+
+        let result = writer
+            .create_catalog("default", None, WriteOptions::default())
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, CatalogError::AlreadyExists { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_create_schema_sets_catalog_id() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        let catalog = writer
+            .create_catalog("default", None, WriteOptions::default())
+            .await
+            .expect("create catalog");
+
+        let ns = writer
+            .create_schema(
+                "default",
+                "sales",
+                Some("Sales schema"),
+                WriteOptions::default(),
+            )
+            .await
+            .expect("create schema");
+
+        assert_eq!(ns.name, "sales");
+        assert_eq!(ns.catalog_id, Some(catalog.id.clone()));
+
+        let manifest = writer.tier1.read_manifest().await.expect("manifest");
+        let state =
+            tier1_state::load_catalog_state(&writer.storage, &manifest.catalog.snapshot_path)
+                .await
+                .expect("load catalog state");
+
+        let stored = state
+            .namespaces
+            .iter()
+            .find(|n| n.id == ns.id)
+            .expect("namespace stored");
+
+        assert_eq!(stored.catalog_id, Some(catalog.id));
+    }
+
+    #[tokio::test]
+    async fn test_create_schema_allows_same_name_in_different_catalogs() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        let default = writer
+            .create_catalog("default", None, WriteOptions::default())
+            .await
+            .expect("create default catalog");
+
+        let analytics = writer
+            .create_catalog("analytics", None, WriteOptions::default())
+            .await
+            .expect("create analytics catalog");
+
+        let ns_default = writer
+            .create_schema("default", "sales", None, WriteOptions::default())
+            .await
+            .expect("create schema in default");
+
+        let ns_analytics = writer
+            .create_schema("analytics", "sales", None, WriteOptions::default())
+            .await
+            .expect("create schema in analytics");
+
+        assert_eq!(ns_default.name, "sales");
+        assert_eq!(ns_default.catalog_id, Some(default.id.clone()));
+        assert_eq!(ns_analytics.name, "sales");
+        assert_eq!(ns_analytics.catalog_id, Some(analytics.id.clone()));
+
+        let manifest = writer.tier1.read_manifest().await.expect("manifest");
+        let state =
+            tier1_state::load_catalog_state(&writer.storage, &manifest.catalog.snapshot_path)
+                .await
+                .expect("load catalog state");
+
+        assert_eq!(state.namespaces.len(), 2);
+    }
+
+    #[tokio::test]
     async fn test_initialize_creates_manifests() {
         let writer = setup();
         writer.initialize().await.expect("initialize");
@@ -1359,6 +2036,49 @@ mod tests {
         assert_eq!(ns.name, "default");
         assert_eq!(ns.description, Some("Default namespace".to_string()));
         assert!(!ns.id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_namespace_creates_default_catalog_once() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        let ns_one = writer
+            .create_namespace("sales", None, WriteOptions::default())
+            .await
+            .expect("create namespace one");
+
+        let ns_two = writer
+            .create_namespace("analytics", None, WriteOptions::default())
+            .await
+            .expect("create namespace two");
+
+        let manifest = writer.tier1.read_manifest().await.expect("manifest");
+        let state =
+            tier1_state::load_catalog_state(&writer.storage, &manifest.catalog.snapshot_path)
+                .await
+                .expect("load catalog state");
+
+        assert_eq!(state.catalogs.len(), 1);
+        assert_eq!(state.catalogs[0].name, "default");
+        let default_id = state.catalogs[0].id.clone();
+
+        assert_eq!(ns_one.catalog_id, Some(default_id.clone()));
+        assert_eq!(ns_two.catalog_id, Some(default_id.clone()));
+
+        let stored_one = state
+            .namespaces
+            .iter()
+            .find(|n| n.id == ns_one.id)
+            .expect("namespace one stored");
+        let stored_two = state
+            .namespaces
+            .iter()
+            .find(|n| n.id == ns_two.id)
+            .expect("namespace two stored");
+
+        assert_eq!(stored_one.catalog_id, Some(default_id.clone()));
+        assert_eq!(stored_two.catalog_id, Some(default_id));
     }
 
     #[tokio::test]
@@ -1442,6 +2162,45 @@ mod tests {
 
         assert_eq!(table.name, "users");
         assert!(!table.id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_register_table_resolves_namespace_in_default_catalog() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        // Create a non-default catalog/schema pair with the same schema name.
+        writer
+            .create_catalog("analytics", None, WriteOptions::default())
+            .await
+            .expect("create analytics catalog");
+        writer
+            .create_schema("analytics", "sales", None, WriteOptions::default())
+            .await
+            .expect("create sales schema in analytics");
+
+        // Create the default schema with the same name via legacy API.
+        let default_sales = writer
+            .create_namespace("sales", None, WriteOptions::default())
+            .await
+            .expect("create sales namespace in default");
+
+        let table = writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "sales".to_string(),
+                    name: "orders".to_string(),
+                    description: None,
+                    location: None,
+                    format: None,
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+
+        assert_eq!(table.namespace_id, default_sales.id);
     }
 
     #[tokio::test]

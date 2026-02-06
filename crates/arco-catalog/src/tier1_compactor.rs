@@ -23,7 +23,7 @@ use crate::manifest::{
 };
 use crate::parquet_util::SearchPostingRecord;
 use crate::sync_compact_permit_issuer;
-use crate::tier1_events::{CatalogDdlEvent, LineageDdlEvent};
+use crate::tier1_events::{CatalogDdlEvent, CatalogDdlEventV2, LineageDdlEvent};
 use crate::tier1_snapshot;
 use crate::tier1_state;
 
@@ -610,10 +610,16 @@ fn validate_event_paths(
     Ok(filtered)
 }
 
+#[derive(Debug)]
+enum ParsedCatalogDdlEvent {
+    V1(CatalogDdlEvent),
+    V2(CatalogDdlEventV2),
+}
+
 async fn read_catalog_event(
     storage: &ScopedStorage,
     path: &str,
-) -> Result<CatalogDdlEvent, Tier1CompactionError> {
+) -> Result<ParsedCatalogDdlEvent, Tier1CompactionError> {
     let data = storage
         .get_raw(path)
         .await
@@ -622,12 +628,10 @@ async fn read_catalog_event(
             message: e.to_string(),
         })?;
 
-    let envelope: CatalogEvent<CatalogDdlEvent> =
+    let envelope: CatalogEvent<serde_json::Value> =
         serde_json::from_slice(&data).map_err(map_processing_error)?;
 
-    if envelope.event_type != CatalogDdlEvent::EVENT_TYPE
-        || envelope.event_version != CatalogDdlEvent::EVENT_VERSION
-    {
+    if envelope.event_type != CatalogDdlEvent::EVENT_TYPE {
         return Err(Tier1CompactionError::ProcessingError {
             message: format!(
                 "unexpected catalog event type {} v{}",
@@ -642,7 +646,24 @@ async fn read_catalog_event(
             message: format!("invalid catalog event envelope: {e}"),
         })?;
 
-    Ok(envelope.payload)
+    match envelope.event_version {
+        CatalogDdlEvent::EVENT_VERSION => {
+            let payload: CatalogDdlEvent =
+                serde_json::from_value(envelope.payload).map_err(map_processing_error)?;
+            Ok(ParsedCatalogDdlEvent::V1(payload))
+        }
+        CatalogDdlEventV2::EVENT_VERSION => {
+            let payload: CatalogDdlEventV2 =
+                serde_json::from_value(envelope.payload).map_err(map_processing_error)?;
+            Ok(ParsedCatalogDdlEvent::V2(payload))
+        }
+        other => Err(Tier1CompactionError::ProcessingError {
+            message: format!(
+                "unexpected catalog event type {} v{other}",
+                envelope.event_type
+            ),
+        }),
+    }
 }
 
 async fn read_lineage_event(
@@ -683,6 +704,17 @@ async fn read_lineage_event(
 #[allow(clippy::too_many_lines, clippy::indexing_slicing)]
 fn apply_catalog_event(
     state: &mut crate::state::CatalogState,
+    event: ParsedCatalogDdlEvent,
+) -> Result<(), Tier1CompactionError> {
+    match event {
+        ParsedCatalogDdlEvent::V1(event) => apply_catalog_event_v1(state, event),
+        ParsedCatalogDdlEvent::V2(event) => apply_catalog_event_v2(state, event),
+    }
+}
+
+#[allow(clippy::too_many_lines, clippy::indexing_slicing)]
+fn apply_catalog_event_v1(
+    state: &mut crate::state::CatalogState,
     event: CatalogDdlEvent,
 ) -> Result<(), Tier1CompactionError> {
     match event {
@@ -695,7 +727,16 @@ fn apply_catalog_event(
                     message: format!("namespace id collision for {}", namespace.id),
                 });
             }
-            if state.namespaces.iter().any(|ns| ns.name == namespace.name) {
+            let default_catalog_id = state
+                .catalogs
+                .iter()
+                .find(|c| c.name == "default")
+                .map(|c| c.id.as_str());
+            let new_catalog_id = namespace.catalog_id.as_deref().or(default_catalog_id);
+            if state.namespaces.iter().any(|ns| {
+                ns.name == namespace.name
+                    && ns.catalog_id.as_deref().or(default_catalog_id) == new_catalog_id
+            }) {
                 return Err(Tier1CompactionError::ProcessingError {
                     message: format!("namespace '{}' already exists", namespace.name),
                 });
@@ -890,6 +931,32 @@ fn apply_catalog_event(
 
             state.tables[table_idx].name.clone_from(&new_name);
             state.tables[table_idx].updated_at = updated_at;
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_catalog_event_v2(
+    state: &mut crate::state::CatalogState,
+    event: CatalogDdlEventV2,
+) -> Result<(), Tier1CompactionError> {
+    match event {
+        CatalogDdlEventV2::CatalogCreated { catalog } => {
+            if let Some(existing) = state.catalogs.iter().find(|c| c.id == catalog.id) {
+                if existing == &catalog {
+                    return Ok(());
+                }
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog id collision for {}", catalog.id),
+                });
+            }
+            if state.catalogs.iter().any(|c| c.name == catalog.name) {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog '{}' already exists", catalog.name),
+                });
+            }
+            state.catalogs.push(catalog);
         }
     }
 
@@ -1229,8 +1296,10 @@ mod tests {
 
         let now = Utc::now().timestamp_millis();
         let state = crate::state::CatalogState {
+            catalogs: Vec::new(),
             namespaces: vec![NamespaceRecord {
                 id: "ns-1".to_string(),
+                catalog_id: None,
                 name: "sales".to_string(),
                 description: Some("Sales".to_string()),
                 created_at: now,

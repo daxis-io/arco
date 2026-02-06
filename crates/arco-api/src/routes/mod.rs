@@ -1,6 +1,7 @@
 //! HTTP route handlers.
 
 pub mod browser;
+pub mod catalogs;
 pub mod delta;
 pub mod lineage;
 pub mod manifests;
@@ -26,6 +27,7 @@ pub fn api_v1_routes() -> Router<Arc<AppState>> {
         .merge(lineage::routes())
         .merge(browser::routes())
         .merge(query::routes())
+        .merge(query_data::routes())
         .merge(delta::routes())
         .merge(orchestration::routes())
         .merge(manifests::routes())

@@ -1536,6 +1536,7 @@ pub fn write_schedule_ticks(rows: &[ScheduleTickRow]) -> Result<Bytes> {
 ///
 /// # Errors
 /// Returns an error if Parquet serialization fails.
+#[allow(clippy::too_many_lines)]
 pub fn write_backfills(rows: &[BackfillRow]) -> Result<Bytes> {
     let schema = backfills_schema();
 

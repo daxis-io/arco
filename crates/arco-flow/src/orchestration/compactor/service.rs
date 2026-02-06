@@ -305,6 +305,7 @@ impl MicroCompactor {
     }
 
     /// Loads state from a snapshot.
+    #[allow(clippy::too_many_lines)]
     async fn load_snapshot_state(
         &self,
         _snapshot_id: &str,

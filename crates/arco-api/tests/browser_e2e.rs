@@ -581,7 +581,7 @@ mod signed_url_security {
         use arco_catalog::CatalogReader;
         use arco_core::{CatalogDomain, ScopedStorage};
 
-        let (router, inner, _) = test_router_with_storage().await?;
+        let (router, inner) = test_router_with_storage().await?;
 
         // Initialize catalog first.
         let create_ns = CreateNamespaceRequest {
@@ -619,7 +619,7 @@ mod signed_url_security {
         use arco_catalog::CatalogReader;
         use arco_core::{CatalogDomain, ScopedStorage};
 
-        let (router, inner, _) = test_router_with_storage().await?;
+        let (router, inner) = test_router_with_storage().await?;
 
         // Initialize catalog.
         let create_ns = CreateNamespaceRequest {

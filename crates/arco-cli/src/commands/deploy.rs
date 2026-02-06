@@ -33,8 +33,12 @@ pub async fn execute(args: DeployArgs, config: &Config) -> Result<()> {
         .context("Workspace ID is required. Set ARCO_WORKSPACE_ID or use --workspace-id")?;
 
     // Read manifest file
-    let manifest_content = std::fs::read_to_string(&args.manifest_file)
-        .with_context(|| format!("Failed to read manifest file: {:?}", args.manifest_file))?;
+    let manifest_content = std::fs::read_to_string(&args.manifest_file).with_context(|| {
+        format!(
+            "Failed to read manifest file: {}",
+            args.manifest_file.display()
+        )
+    })?;
 
     // Parse manifest
     let mut request: DeployManifestRequest =

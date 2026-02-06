@@ -1,9 +1,12 @@
 """Tests for ID types."""
+
 from __future__ import annotations
+
+import uuid
 
 import pytest
 
-from servo.types.ids import AssetId, RunId, TaskId
+from arco_flow.types.ids import AssetId, RunId, TaskId
 
 
 class TestAssetId:
@@ -14,28 +17,24 @@ class TestAssetId:
         ids = {AssetId.generate() for _ in range(100)}
         assert len(ids) == 100
 
-    def test_format_is_ulid(self) -> None:
-        """IDs should be valid ULID format (26 alphanumeric chars)."""
+    def test_format_is_uuid(self) -> None:
+        """IDs should be valid UUID format (canonical hyphenated string)."""
         asset_id = AssetId.generate()
-        assert len(asset_id) == 26
-        assert asset_id.isalnum()
-        assert asset_id.isupper()
+        parsed = uuid.UUID(asset_id)
+        assert parsed.version == 7
+        assert str(parsed) == asset_id
+        assert len(asset_id) == 36
 
     def test_validation_rejects_invalid(self) -> None:
         """Invalid IDs should be rejected."""
-        with pytest.raises(ValueError, match="Invalid ULID"):
+        with pytest.raises(ValueError, match="Invalid UUID"):
             AssetId.validate("not-valid")
 
-    def test_validation_rejects_invalid_base32(self) -> None:
-        """IDs must use ULID Crockford base32 alphabet."""
-        with pytest.raises(ValueError, match="Invalid ULID"):
-            AssetId.validate("01ARZ3NDEKTSV4RRFFQ69G5FAU")  # U is invalid in ULIDs
-
     def test_validation_normalizes_case(self) -> None:
-        """IDs should be normalized to uppercase."""
-        lower = "01arz3ndektsv4rrffq69g5fav"
-        validated = AssetId.validate(lower)
-        assert validated.isupper()
+        """IDs should be normalized to canonical lowercase."""
+        upper = "01930A0B-1234-7ABC-9DEF-0123456789AB"
+        validated = AssetId.validate(upper)
+        assert validated == upper.lower()
 
 
 class TestRunId:

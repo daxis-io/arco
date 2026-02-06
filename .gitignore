@@ -9,6 +9,10 @@
 *.swo
 *~
 
+# Codex / agents
+.claude/
+.worktrees/
+
 # OS
 .DS_Store
 Thumbs.db
@@ -49,8 +53,3 @@ coverage/
 *.tfstate
 *.tfstate.backup
 *.tfplan
-
-# Claude/AI config and planning
-.claude/
-docs/plans/
-.worktrees/

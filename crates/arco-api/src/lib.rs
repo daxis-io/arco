@@ -49,6 +49,7 @@
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 
+pub(crate) mod audit;
 pub mod compactor_client;
 pub mod config;
 pub mod context;
@@ -56,6 +57,7 @@ pub mod error;
 pub mod metrics;
 pub mod openapi;
 pub(crate) mod orchestration_compaction;
+pub(crate) mod paths;
 pub mod rate_limit;
 pub(crate) mod redaction;
 pub mod routes;

@@ -46,6 +46,28 @@ pub struct GetNamespaceResponse {
     pub properties: HashMap<String, String>,
 }
 
+/// Request body for `POST /v1/{prefix}/namespaces`.
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+pub struct CreateNamespaceRequest {
+    /// The namespace identifier as a list of strings.
+    pub namespace: NamespaceIdent,
+
+    /// Properties to set on the namespace.
+    #[serde(default)]
+    pub properties: HashMap<String, String>,
+}
+
+/// Response from `POST /v1/{prefix}/namespaces`.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CreateNamespaceResponse {
+    /// The created namespace identifier.
+    pub namespace: NamespaceIdent,
+
+    /// Properties of the namespace.
+    #[serde(default)]
+    pub properties: HashMap<String, String>,
+}
+
 impl GetNamespaceResponse {
     /// Creates a response for a namespace with the given name and properties.
     #[must_use]
@@ -64,6 +86,32 @@ impl GetNamespaceResponse {
             properties: HashMap::new(),
         }
     }
+}
+
+/// Request body for `POST /v1/{prefix}/namespaces/{namespace}/properties`.
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+pub struct UpdateNamespacePropertiesRequest {
+    /// Properties to remove (keys only).
+    #[serde(default)]
+    pub removals: Vec<String>,
+
+    /// Properties to add or update.
+    #[serde(default)]
+    pub updates: HashMap<String, String>,
+}
+
+/// Response from `POST /v1/{prefix}/namespaces/{namespace}/properties`.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UpdateNamespacePropertiesResponse {
+    /// List of property keys that were updated.
+    pub updated: Vec<String>,
+
+    /// List of property keys that were removed.
+    pub removed: Vec<String>,
+
+    /// List of property keys that were requested for removal but did not exist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing: Option<Vec<String>>,
 }
 
 #[cfg(test)]

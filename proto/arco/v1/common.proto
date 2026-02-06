@@ -21,7 +21,7 @@ message WorkspaceId {
 }
 
 message AssetId {
-  // ULID-based asset identifier
+  // UUID-based asset identifier (generated as UUIDv7 in canonical implementation)
   string value = 1;
 }
 
@@ -77,11 +77,11 @@ enum NullValue {
 // Asset identifier (namespace + name)
 message AssetKey {
   // Namespace, e.g., "raw", "staging", "mart"
-  // Pattern: ^[a-z][a-z0-9_]*$
+  // Pattern: `^[a-z][a-z0-9_]*$`
   string namespace = 1;
 
   // Asset name within namespace
-  // Pattern: ^[a-z][a-z0-9_]*$
+  // Pattern: `^[a-z][a-z0-9_]*$`
   string name = 2;
 }
 

@@ -1,0 +1,10 @@
+Command: cargo test --manifest-path /Users/ethanurbanski/arco/Cargo.toml -p arco-api --test openapi_contract --all-features
+
+   Compiling arco-api v0.1.0 (/Users/ethanurbanski/arco/crates/arco-api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.21s
+     Running tests/openapi_contract.rs (arco/target/debug/deps/openapi_contract-ca5603c4f283088b)
+
+running 1 test
+test contract_openapi_matches_implementation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s

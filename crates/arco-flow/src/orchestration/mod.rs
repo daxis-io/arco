@@ -1,4 +1,4 @@
-//! Event-driven orchestration for Servo.
+//! Event-driven orchestration for Arco Flow.
 //!
 //! This module implements the orchestration domain following the unified platform
 //! pattern (ADR-020). It provides:
@@ -40,6 +40,7 @@ pub mod events;
 pub mod ids;
 pub mod ledger;
 pub mod run_key;
+pub mod selection;
 
 pub use callbacks::{
     CallbackError, CallbackResult, ErrorCategory, HeartbeatRequest, HeartbeatResponse,
@@ -50,4 +51,8 @@ pub use ledger::{LedgerWriter, OrchestrationLedgerWriter};
 pub use run_key::{
     FingerprintPolicy, ReservationResult, RunKeyReservation, get_reservation, reservation_path,
     reserve_run_key,
+};
+pub use selection::{
+    AssetGraph, SelectionOptions, build_task_defs_for_selection, canonicalize_asset_key,
+    compute_selection_fingerprint,
 };

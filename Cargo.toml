@@ -62,7 +62,7 @@ missing_panics_doc = "allow"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.49", features = ["full"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -111,6 +111,7 @@ petgraph = "0.7"
 # Data formats
 parquet = { version = "54", features = ["async"] }
 arrow = { version = "54", features = ["chrono-tz"] }
+arrow-json = { version = "54" }
 bytes = "1"
 iceberg = "0.6"
 iceberg-catalog-rest = "0.6"
@@ -124,7 +125,7 @@ tonic = "0.14"
 prost = "0.13"
 prost-types = "0.13"
 http = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 
 # GCP authentication
 gcp_auth = "0.12"

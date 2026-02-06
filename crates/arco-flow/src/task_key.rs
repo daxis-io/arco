@@ -10,21 +10,16 @@ use std::cmp::Ordering;
 use crate::plan::AssetKey;
 
 /// The type of operation a task performs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskOperation {
     /// Produce asset data (default).
+    #[default]
     Materialize,
     /// Run data quality checks.
     Check,
     /// Historical data backfill chunk.
     Backfill,
-}
-
-impl Default for TaskOperation {
-    fn default() -> Self {
-        Self::Materialize
-    }
 }
 
 impl std::fmt::Display for TaskOperation {

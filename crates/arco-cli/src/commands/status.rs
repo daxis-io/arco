@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::Args;
-use colored::Colorize;
+use owo_colors::OwoColorize;
 
 use crate::client::ApiClient;
 use crate::{Config, OutputFormat};
@@ -134,6 +134,12 @@ async fn show_run(
             println!("Run: {}", run.run_id);
             println!("State: {state_str}");
             println!("Plan ID: {}", run.plan_id);
+            if let Some(parent_run_id) = &run.parent_run_id {
+                println!("Parent Run: {parent_run_id}");
+            }
+            if let Some(rerun_kind) = &run.rerun_kind {
+                println!("Rerun Kind: {rerun_kind}");
+            }
             println!("Created: {}", run.created_at);
             if let Some(started) = run.started_at {
                 println!("Started: {started}");

@@ -364,7 +364,6 @@ impl Tier1Writer {
                     // Another writer updated the manifest between read and write.
                     // Retry from fresh state.
                     crate::metrics::record_cas_retry("catalog_manifest");
-                    continue;
                 }
             }
         }

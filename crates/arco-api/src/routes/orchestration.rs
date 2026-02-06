@@ -18,13 +18,14 @@
 //! - `POST   /tasks/{task_id}/heartbeat` - Worker heartbeat
 //! - `POST   /tasks/{task_id}/completed` - Worker finished execution
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::extract::Query as AxumQuery;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
@@ -36,17 +37,20 @@ use utoipa::{IntoParams, ToSchema};
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
 use crate::orchestration_compaction::compact_orchestration_events;
+use crate::paths::{MANIFEST_IDEMPOTENCY_PREFIX, MANIFEST_PREFIX, backfill_idempotency_path};
+use crate::routes::manifests::StoredManifest;
 use crate::server::AppState;
-use arco_core::{WritePrecondition, WriteResult};
+use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::{
-    FoldState, MicroCompactor, RunRow, RunState as FoldRunState, TaskRow,
-    TaskState as FoldTaskState,
+    BackfillChunkRow, BackfillRow, FoldState, MicroCompactor, PartitionStatusRow, RunRow,
+    RunState as FoldRunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
+    SensorEvalRow, SensorStateRow, TaskRow, TaskState as FoldTaskState,
 };
 use arco_flow::orchestration::controllers::{PubSubMessage, PushSensorHandler};
 use arco_flow::orchestration::events::{
-    OrchestrationEvent, OrchestrationEventData, RunRequest, SensorEvalStatus, SensorStatus,
-    TaskDef, TriggerInfo,
+    BackfillState, ChunkState, OrchestrationEvent, OrchestrationEventData, PartitionSelector,
+    RunRequest, SensorEvalStatus, SensorStatus, TaskDef, TickStatus, TriggerInfo,
 };
 use arco_flow::orchestration::run_key::{
     FingerprintPolicy, ReservationResult, RunKeyReservation, get_reservation, reservation_path,
@@ -65,8 +69,67 @@ pub struct TriggerRunRequest {
     /// Asset selection (asset keys to materialize).
     #[serde(default)]
     pub selection: Vec<String>,
-    /// Partition overrides (key=value pairs).
+    /// Include upstream dependencies of the selection.
     #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default)]
+    pub include_downstream: bool,
+    /// Partition overrides (key=value strings). Backward-compatible with older clients.
+    #[serde(default)]
+    pub partitions: Vec<PartitionValue>,
+    /// Canonical partition key string (ADR-011). Preferred; cannot be combined with `partitions`.
+    #[schema(min_length = 1)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_key: Option<String>,
+    /// Idempotency key for deduplication (409 if reused with different payload).
+    /// Reservations created before the fingerprint cutoff remain lenient.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Additional labels for the run.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TriggerRunRequestWithPartitionKey {
+    /// Asset selection (asset keys to materialize).
+    #[serde(default)]
+    pub selection: Vec<String>,
+    /// Include upstream dependencies of the selection.
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default)]
+    pub include_downstream: bool,
+    /// Canonical partition key string (ADR-011).
+    #[schema(min_length = 1)]
+    pub partition_key: String,
+    /// Idempotency key for deduplication (409 if reused with different payload).
+    /// Reservations created before the fingerprint cutoff remain lenient.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Additional labels for the run.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TriggerRunRequestWithPartitions {
+    /// Asset selection (asset keys to materialize).
+    #[serde(default)]
+    pub selection: Vec<String>,
+    /// Include upstream dependencies of the selection.
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default)]
+    pub include_downstream: bool,
+    /// Partition overrides (key=value strings). Backward-compatible with older clients.
     pub partitions: Vec<PartitionValue>,
     /// Idempotency key for deduplication (409 if reused with different payload).
     /// Reservations created before the fingerprint cutoff remain lenient.
@@ -75,6 +138,100 @@ pub struct TriggerRunRequest {
     /// Additional labels for the run.
     #[serde(default)]
     pub labels: HashMap<String, String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TriggerRunRequestUnpartitioned {
+    /// Asset selection (asset keys to materialize).
+    #[serde(default)]
+    pub selection: Vec<String>,
+    /// Include upstream dependencies of the selection.
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default)]
+    pub include_downstream: bool,
+    /// Idempotency key for deduplication (409 if reused with different payload).
+    /// Reservations created before the fingerprint cutoff remain lenient.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Additional labels for the run.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(untagged)]
+pub(crate) enum TriggerRunRequestOpenApi {
+    WithPartitionKey(TriggerRunRequestWithPartitionKey),
+    WithPartitions(TriggerRunRequestWithPartitions),
+    Unpartitioned(TriggerRunRequestUnpartitioned),
+}
+
+/// Rerun mode values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum RerunMode {
+    /// Rerun all tasks that did not succeed in the parent run.
+    FromFailure,
+    /// Rerun a user-chosen subset of tasks from the parent plan.
+    Subset,
+}
+
+/// Rerun kind values exposed in responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RerunKindResponse {
+    /// Rerun tasks that did not succeed.
+    FromFailure,
+    /// Rerun a selected subset.
+    Subset,
+}
+
+/// Request to rerun a prior run.
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RerunRunRequest {
+    /// Rerun mode.
+    pub mode: RerunMode,
+    /// Selection roots for subset reruns.
+    #[serde(default)]
+    pub selection: Vec<String>,
+    /// Include upstream dependencies of the subset.
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the subset.
+    #[serde(default)]
+    pub include_downstream: bool,
+    /// Optional run key override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Additional labels for the rerun.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+/// Response after triggering a rerun.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RerunRunResponse {
+    /// Run ID (ULID).
+    pub run_id: String,
+    /// Plan ID for this run.
+    pub plan_id: String,
+    /// Current run state.
+    pub state: RunStateResponse,
+    /// Whether this is a new run or an existing one (`run_key` deduplication).
+    pub created: bool,
+    /// Run creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Parent run ID.
+    pub parent_run_id: String,
+    /// Rerun kind.
+    pub rerun_kind: RerunKindResponse,
 }
 
 /// Request to backfill a `run_key` reservation fingerprint.
@@ -86,6 +243,12 @@ pub struct RunKeyBackfillRequest {
     /// Asset selection (asset keys to materialize).
     #[serde(default)]
     pub selection: Vec<String>,
+    /// Include upstream dependencies of the selection.
+    #[serde(default)]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default)]
+    pub include_downstream: bool,
     /// Partition overrides (key=value pairs).
     #[serde(default)]
     pub partitions: Vec<PartitionValue>,
@@ -182,6 +345,12 @@ pub struct RunResponse {
     /// Run labels.
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Parent run ID (for reruns).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    /// Rerun kind (for reruns).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerun_kind: Option<RerunKindResponse>,
 }
 
 /// Task execution summary.
@@ -268,7 +437,20 @@ fn default_limit() -> u32 {
 }
 
 const MAX_LIST_LIMIT: u32 = 200;
+const DEFAULT_LIMIT: u32 = 50;
 const MAX_LOG_BYTES: usize = 2 * 1024 * 1024;
+
+// Input size limits (defense-in-depth; avoid pathological CPU/memory in validation/fingerprinting).
+const MAX_RUN_KEY_LEN: usize = 256;
+const MAX_PARTITION_KEY_LEN: usize = 1024;
+const MAX_SELECTION_ITEMS: usize = 10_000;
+const MAX_SELECTION_ITEM_LEN: usize = 256;
+const MAX_LABELS: usize = 128;
+const MAX_LABEL_KEY_LEN: usize = 128;
+const MAX_LABEL_VALUE_LEN: usize = 2048;
+const MAX_PARTITIONS: usize = 128;
+const MAX_PARTITION_DIM_LEN: usize = 64;
+const MAX_PARTITION_VALUE_LEN: usize = 256;
 
 /// Response for listing runs.
 #[derive(Debug, Serialize, ToSchema)]
@@ -300,6 +482,12 @@ pub struct RunListItem {
     pub tasks_succeeded: u32,
     /// Tasks failed.
     pub tasks_failed: u32,
+    /// Parent run ID (for reruns).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
+    /// Rerun kind (for reruns).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerun_kind: Option<RerunKindResponse>,
 }
 
 /// Request to cancel a run.
@@ -393,7 +581,7 @@ pub struct ManualSensorEvaluateResponse {
 }
 
 /// Sensor evaluation status (API response).
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SensorEvalStatusResponse {
     /// Sensor triggered one or more runs.
@@ -425,6 +613,533 @@ pub struct RunRequestResponse {
 }
 
 // ============================================================================
+// Schedule API Types
+// ============================================================================
+
+/// Schedule state response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleResponse {
+    /// Schedule identifier.
+    pub schedule_id: String,
+    /// Cron expression for the schedule.
+    pub cron_expression: String,
+    /// IANA timezone used for evaluation.
+    pub timezone: String,
+    /// Maximum time window for catchup.
+    pub catchup_window_minutes: u32,
+    /// Maximum number of ticks to catch up per evaluation.
+    pub max_catchup_ticks: u32,
+    /// Asset selection snapshot stored with the definition.
+    pub asset_selection: Vec<String>,
+    /// Whether the schedule is enabled.
+    pub enabled: bool,
+    /// Current definition version.
+    pub definition_version: String,
+    /// Last `scheduled_for` timestamp that was processed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_scheduled_for: Option<DateTime<Utc>>,
+    /// Last tick ID that was processed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tick_id: Option<String>,
+    /// Last run key generated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_key: Option<String>,
+}
+
+/// Response for listing schedules.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSchedulesResponse {
+    /// List of schedules.
+    pub schedules: Vec<ScheduleResponse>,
+    /// Next page cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Request body for creating/updating a schedule definition.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertScheduleRequest {
+    /// Cron expression for the schedule.
+    pub cron_expression: String,
+    /// IANA timezone used for evaluation.
+    pub timezone: String,
+    /// Maximum time window for catchup.
+    pub catchup_window_minutes: u32,
+    /// Maximum number of ticks to catch up per evaluation.
+    pub max_catchup_ticks: u32,
+    /// Asset selection snapshot stored with the definition.
+    #[serde(default)]
+    pub asset_selection: Vec<String>,
+    /// Whether the schedule is enabled.
+    pub enabled: bool,
+}
+
+/// Schedule tick response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleTickResponse {
+    /// Unique tick ID.
+    pub tick_id: String,
+    /// Schedule identifier.
+    pub schedule_id: String,
+    /// When this tick was scheduled for.
+    pub scheduled_for: DateTime<Utc>,
+    /// Asset selection at tick time.
+    pub asset_selection: Vec<String>,
+    /// Tick status.
+    pub status: TickStatusResponse,
+    /// Skip reason when status is `SKIPPED`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    /// Error message when status is `FAILED`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// Run key if a run was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Run ID if resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+/// Tick status values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TickStatusResponse {
+    /// Tick triggered a run.
+    Triggered,
+    /// Tick was skipped.
+    Skipped,
+    /// Tick failed to evaluate.
+    Failed,
+}
+
+/// Response for listing schedule ticks.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListScheduleTicksResponse {
+    /// List of ticks.
+    pub ticks: Vec<ScheduleTickResponse>,
+    /// Next page cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Query parameters for listing schedule ticks.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct ListTicksQuery {
+    /// Maximum ticks to return.
+    pub limit: Option<u32>,
+    /// Cursor for pagination.
+    pub cursor: Option<String>,
+    /// Filter by tick status.
+    pub status: Option<TickStatusResponse>,
+}
+
+// ============================================================================
+// Sensor API Types
+// ============================================================================
+
+/// Sensor state response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SensorResponse {
+    /// Sensor identifier.
+    pub sensor_id: String,
+    /// Current cursor value (poll sensors).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Last successful evaluation time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_evaluation_at: Option<DateTime<Utc>>,
+    /// Sensor status.
+    pub status: SensorStatusResponse,
+    /// State version (for CAS).
+    pub state_version: u32,
+}
+
+/// Sensor status values.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SensorStatusResponse {
+    /// Sensor is active.
+    Active,
+    /// Sensor is paused.
+    Paused,
+    /// Sensor is in error state.
+    Error,
+}
+
+/// Response for listing sensors.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSensorsResponse {
+    /// List of sensors.
+    pub sensors: Vec<SensorResponse>,
+    /// Next page cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Sensor evaluation history response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SensorEvalResponse {
+    /// Evaluation identifier.
+    pub eval_id: String,
+    /// Sensor identifier.
+    pub sensor_id: String,
+    /// Cursor before evaluation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_before: Option<String>,
+    /// Cursor after evaluation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_after: Option<String>,
+    /// Evaluation timestamp.
+    pub evaluated_at: DateTime<Utc>,
+    /// Evaluation status.
+    pub status: SensorEvalStatusResponse,
+    /// Number of run requests generated.
+    pub run_requests_count: u32,
+}
+
+/// Response for listing sensor evaluations.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSensorEvalsResponse {
+    /// List of evaluations.
+    pub evals: Vec<SensorEvalResponse>,
+    /// Next page cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+// ============================================================================
+// Backfill API Types
+// ============================================================================
+
+const DEFAULT_BACKFILL_CHUNK_SIZE: u32 = 10;
+const DEFAULT_BACKFILL_MAX_CONCURRENT_RUNS: u32 = 2;
+
+/// Request to create a backfill.
+#[derive(Debug, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateBackfillRequest {
+    /// Assets to backfill.
+    #[serde(default)]
+    pub asset_selection: Vec<String>,
+    /// Partition selector.
+    pub partition_selector: PartitionSelectorRequest,
+    /// Client request ID for idempotency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_request_id: Option<String>,
+    /// Number of partitions per chunk (0 uses default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_size: Option<u32>,
+    /// Maximum concurrent chunk runs (0 uses default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_runs: Option<u32>,
+}
+
+/// Response after creating a backfill.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateBackfillResponse {
+    /// Backfill identifier.
+    pub backfill_id: String,
+    /// Event ID that was accepted.
+    pub accepted_event_id: String,
+    /// Time the event was accepted.
+    pub accepted_at: DateTime<Utc>,
+}
+
+/// Partition selector request.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PartitionSelectorRequest {
+    /// Range of partitions.
+    Range {
+        /// Start partition (inclusive).
+        start: String,
+        /// End partition (inclusive).
+        end: String,
+    },
+    /// Explicit list of partitions.
+    Explicit {
+        /// Partition keys.
+        partitions: Vec<String>,
+    },
+    /// Filter-based selection.
+    Filter {
+        /// Filter expressions.
+        filters: HashMap<String, String>,
+    },
+}
+
+/// Error response for unsupported partition selectors.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UnprocessableEntityResponse {
+    /// Error category.
+    pub error: String,
+    /// Human-readable error message.
+    pub message: String,
+    /// Stable error code.
+    pub code: String,
+}
+
+/// Backfill response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackfillResponse {
+    /// Backfill identifier.
+    pub backfill_id: String,
+    /// Assets to backfill.
+    pub asset_selection: Vec<String>,
+    /// Partition selector.
+    pub partition_selector: PartitionSelectorResponse,
+    /// Number of partitions per chunk.
+    pub chunk_size: u32,
+    /// Maximum concurrent chunk runs.
+    pub max_concurrent_runs: u32,
+    /// Current state.
+    pub state: BackfillStateResponse,
+    /// State version (for CAS).
+    pub state_version: u32,
+    /// When the backfill was created.
+    pub created_at: DateTime<Utc>,
+    /// Chunk counts by state.
+    pub chunk_counts: ChunkCounts,
+}
+
+/// Partition selector response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PartitionSelectorResponse {
+    /// Range of partitions.
+    Range {
+        /// Start partition (inclusive).
+        start: String,
+        /// End partition (inclusive).
+        end: String,
+    },
+    /// Explicit list of partitions.
+    Explicit {
+        /// Partition keys.
+        partitions: Vec<String>,
+    },
+    /// Filter-based selection.
+    Filter {
+        /// Filter expressions.
+        filters: HashMap<String, String>,
+    },
+}
+
+/// Backfill state values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BackfillStateResponse {
+    /// Backfill created but not yet started.
+    Pending,
+    /// Backfill is actively processing chunks.
+    Running,
+    /// Backfill is paused.
+    Paused,
+    /// All chunks completed successfully.
+    Succeeded,
+    /// At least one chunk failed after retries.
+    Failed,
+    /// Backfill was cancelled.
+    Cancelled,
+}
+
+/// Chunk counts by state.
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkCounts {
+    /// Total chunks.
+    pub total: u32,
+    /// Pending chunks.
+    pub pending: u32,
+    /// Running chunks.
+    pub running: u32,
+    /// Succeeded chunks.
+    pub succeeded: u32,
+    /// Failed chunks.
+    pub failed: u32,
+}
+
+/// Response for listing backfills.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListBackfillsResponse {
+    /// List of backfills.
+    pub backfills: Vec<BackfillResponse>,
+    /// Next page cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Backfill chunk response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackfillChunkResponse {
+    /// Chunk identifier.
+    pub chunk_id: String,
+    /// Backfill identifier.
+    pub backfill_id: String,
+    /// Zero-indexed chunk number.
+    pub chunk_index: u32,
+    /// Partition keys in this chunk.
+    pub partition_keys: Vec<String>,
+    /// Run key for this chunk.
+    pub run_key: String,
+    /// Run ID if resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Chunk state.
+    pub state: ChunkStateResponse,
+}
+
+/// Chunk state values.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ChunkStateResponse {
+    /// Chunk is pending.
+    Pending,
+    /// Chunk has been planned.
+    Planned,
+    /// Chunk run is in progress.
+    Running,
+    /// Chunk completed successfully.
+    Succeeded,
+    /// Chunk failed.
+    Failed,
+}
+
+/// Response for listing backfill chunks.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListBackfillChunksResponse {
+    /// List of chunks.
+    pub chunks: Vec<BackfillChunkResponse>,
+    /// Next page cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+// ============================================================================
+// Partition Status API Types
+// ============================================================================
+
+/// Partition status response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PartitionStatusApiResponse {
+    /// Asset key.
+    pub asset_key: String,
+    /// Partition key.
+    pub partition_key: String,
+    /// Run that last materialized (success only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_materialization_run_id: Option<String>,
+    /// Timestamp of last successful materialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_materialization_at: Option<DateTime<Utc>>,
+    /// Whether this partition is stale.
+    pub is_stale: bool,
+    /// Why the partition is stale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+    /// Dimension key-values for the partition.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub partition_values: HashMap<String, String>,
+}
+
+/// Response for listing partitions.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPartitionsResponse {
+    /// List of partitions.
+    pub partitions: Vec<PartitionStatusApiResponse>,
+    /// Next page cursor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Asset partition summary response.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetPartitionSummaryResponse {
+    /// Asset key.
+    pub asset_key: String,
+    /// Total partition count.
+    pub total_partitions: u32,
+    /// Materialized partition count.
+    pub materialized_partitions: u32,
+    /// Stale partition count.
+    pub stale_partitions: u32,
+    /// Missing partition count.
+    pub missing_partitions: u32,
+}
+
+// ============================================================================
+// Query Parameter Types
+// ============================================================================
+
+/// Common list query parameters.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct ListQuery {
+    /// Maximum items to return.
+    pub limit: Option<u32>,
+    /// Cursor for pagination.
+    pub cursor: Option<String>,
+}
+
+/// Query parameters for listing backfills.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct ListBackfillsQuery {
+    /// Maximum backfills to return.
+    pub limit: Option<u32>,
+    /// Cursor for pagination.
+    pub cursor: Option<String>,
+    /// Filter by state.
+    pub state: Option<BackfillStateResponse>,
+}
+
+/// Query parameters for listing backfill chunks.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct ListChunksQuery {
+    /// Maximum chunks to return.
+    pub limit: Option<u32>,
+    /// Cursor for pagination.
+    pub cursor: Option<String>,
+    /// Filter by state.
+    pub state: Option<ChunkStateResponse>,
+}
+
+/// Query parameters for listing partitions.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPartitionsQuery {
+    /// Maximum partitions to return.
+    pub limit: Option<u32>,
+    /// Cursor for pagination.
+    pub cursor: Option<String>,
+    /// Filter by asset key.
+    pub asset_key: Option<String>,
+    /// Filter to stale partitions only.
+    pub stale_only: Option<bool>,
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -433,6 +1148,639 @@ fn ensure_workspace(ctx: &RequestContext, workspace_id: &str) -> Result<(), ApiE
         return Err(ApiError::not_found("workspace not found"));
     }
     Ok(())
+}
+
+const MANIFEST_LATEST_INDEX_PATH: &str = "manifests/_index.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LatestManifestIndex {
+    latest_manifest_id: String,
+    deployed_at: DateTime<Utc>,
+}
+
+async fn load_latest_manifest(storage: &ScopedStorage) -> Result<Option<StoredManifest>, ApiError> {
+    match storage.get_raw(MANIFEST_LATEST_INDEX_PATH).await {
+        Ok(bytes) => match serde_json::from_slice::<LatestManifestIndex>(&bytes) {
+            Ok(index) => {
+                let path = crate::paths::manifest_path(&index.latest_manifest_id);
+                match storage.get_raw(&path).await {
+                    Ok(bytes) => match serde_json::from_slice::<StoredManifest>(&bytes) {
+                        Ok(stored) => return Ok(Some(stored)),
+                        Err(err) => {
+                            tracing::warn!(
+                                manifest_id = %index.latest_manifest_id,
+                                error = ?err,
+                                "failed to parse manifest referenced by latest index; falling back to scan"
+                            );
+                        }
+                    },
+                    Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => {
+                        tracing::warn!(
+                            manifest_id = %index.latest_manifest_id,
+                            "latest manifest index referenced missing manifest; falling back to scan"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            manifest_id = %index.latest_manifest_id,
+                            error = ?err,
+                            "failed to read manifest referenced by latest index; falling back to scan"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    "failed to parse latest manifest index; falling back to scan"
+                );
+            }
+        },
+        Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => {}
+        Err(err) => {
+            tracing::warn!(
+                error = ?err,
+                "failed to read latest manifest index; falling back to scan"
+            );
+        }
+    }
+
+    let entries = storage
+        .list_meta(MANIFEST_PREFIX)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to list manifests: {e}")))?;
+
+    let mut latest: Option<StoredManifest> = None;
+
+    for entry in entries {
+        let path = entry.path.as_str();
+        if path.starts_with(MANIFEST_IDEMPOTENCY_PREFIX) || path.ends_with("_index.json") {
+            continue;
+        }
+        if !std::path::Path::new(path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
+            continue;
+        }
+
+        let bytes = match storage.get_raw(path).await {
+            Ok(b) => b,
+            Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => continue,
+            Err(err) => {
+                tracing::warn!(path = %path, error = ?err, "failed to read manifest; skipping");
+                continue;
+            }
+        };
+
+        let stored: StoredManifest = match serde_json::from_slice(&bytes) {
+            Ok(stored) => stored,
+            Err(err) => {
+                tracing::warn!(path = %path, error = ?err, "failed to parse manifest; skipping");
+                continue;
+            }
+        };
+
+        let should_replace = latest
+            .as_ref()
+            .is_none_or(|existing| stored.deployed_at > existing.deployed_at);
+
+        if should_replace {
+            latest = Some(stored);
+        }
+    }
+
+    Ok(latest)
+}
+
+async fn plan_tasks_and_root_assets(
+    storage: &ScopedStorage,
+    request: &TriggerRunRequest,
+) -> Result<(String, DateTime<Utc>, Vec<String>, Vec<TaskDef>), ApiError> {
+    let stored = load_latest_manifest(storage).await?;
+    let Some(stored) = stored else {
+        return Err(ApiError::bad_request(
+            "no manifest deployed for workspace; deploy a manifest before triggering a run",
+        ));
+    };
+
+    let manifest_id = stored.manifest_id.clone();
+    let deployed_at = stored.deployed_at;
+
+    let mut known_assets = HashSet::new();
+    let mut manifest_assets = Vec::with_capacity(stored.assets.len());
+
+    for asset in &stored.assets {
+        let key = arco_flow::orchestration::canonicalize_asset_key(&format!(
+            "{}/{}",
+            asset.key.namespace, asset.key.name
+        ))
+        .map_err(|err| {
+            ApiError::internal(format!(
+                "invalid asset key in manifest {}: {err}",
+                stored.manifest_id
+            ))
+        })?;
+
+        known_assets.insert(key.clone());
+        manifest_assets.push((key, asset.dependencies.as_slice()));
+    }
+
+    let mut graph = arco_flow::orchestration::AssetGraph::new();
+    for (asset_key, deps) in manifest_assets {
+        let mut upstream = Vec::new();
+        for dep in deps {
+            let upstream_key = arco_flow::orchestration::canonicalize_asset_key(&format!(
+                "{}/{}",
+                dep.upstream_key.namespace, dep.upstream_key.name
+            ))
+            .map_err(|err| {
+                ApiError::internal(format!(
+                    "invalid asset dependency key in manifest {}: {err}",
+                    stored.manifest_id
+                ))
+            })?;
+
+            if known_assets.contains(&upstream_key) {
+                upstream.push(upstream_key);
+            } else {
+                tracing::warn!(
+                    asset_key = %asset_key,
+                    upstream_key = %upstream_key,
+                    manifest_id = %stored.manifest_id,
+                    "dropping dependency edge to unknown upstream"
+                );
+            }
+        }
+        graph.insert_asset(asset_key, upstream);
+    }
+
+    let mut roots = BTreeSet::new();
+    let mut unknown_roots = BTreeSet::new();
+    for root in &request.selection {
+        let canonical = arco_flow::orchestration::canonicalize_asset_key(root)
+            .map_err(ApiError::bad_request)?;
+
+        if known_assets.contains(&canonical) {
+            roots.insert(canonical);
+        } else {
+            unknown_roots.insert(canonical);
+        }
+    }
+
+    if !unknown_roots.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "unknown asset keys: {}",
+            unknown_roots.into_iter().collect::<Vec<_>>().join(", ")
+        )));
+    }
+
+    let root_assets: Vec<String> = roots.iter().cloned().collect();
+
+    let partition_key = resolve_partition_key(request)?;
+    let options = arco_flow::orchestration::SelectionOptions {
+        include_upstream: request.include_upstream,
+        include_downstream: request.include_downstream,
+    };
+
+    let tasks = arco_flow::orchestration::build_task_defs_for_selection(
+        &graph,
+        &root_assets,
+        options,
+        partition_key.as_deref(),
+    )
+    .map_err(ApiError::bad_request)?;
+
+    Ok((manifest_id, deployed_at, root_assets, tasks))
+}
+
+type PlanGraph = (
+    HashMap<String, TaskRow>,
+    HashMap<String, Vec<String>>,
+    HashMap<String, Vec<String>>,
+);
+
+fn build_plan_graph_for_run(fold_state: &FoldState, run_id: &str) -> PlanGraph {
+    let mut tasks_by_key = HashMap::new();
+    for row in fold_state.tasks.values().filter(|row| row.run_id == run_id) {
+        tasks_by_key.insert(row.task_key.clone(), row.clone());
+    }
+
+    let mut upstream_by_task: HashMap<String, Vec<String>> = HashMap::new();
+    let mut downstream_by_task: HashMap<String, Vec<String>> = HashMap::new();
+
+    for task_key in tasks_by_key.keys() {
+        upstream_by_task.insert(task_key.clone(), Vec::new());
+        downstream_by_task.insert(task_key.clone(), Vec::new());
+    }
+
+    for edge in fold_state
+        .dep_satisfaction
+        .values()
+        .filter(|edge| edge.run_id == run_id)
+    {
+        if !tasks_by_key.contains_key(&edge.upstream_task_key)
+            || !tasks_by_key.contains_key(&edge.downstream_task_key)
+        {
+            continue;
+        }
+
+        upstream_by_task
+            .entry(edge.downstream_task_key.clone())
+            .or_default()
+            .push(edge.upstream_task_key.clone());
+        downstream_by_task
+            .entry(edge.upstream_task_key.clone())
+            .or_default()
+            .push(edge.downstream_task_key.clone());
+    }
+
+    for value in upstream_by_task.values_mut() {
+        value.sort();
+        value.dedup();
+    }
+    for value in downstream_by_task.values_mut() {
+        value.sort();
+        value.dedup();
+    }
+
+    (tasks_by_key, upstream_by_task, downstream_by_task)
+}
+
+fn close_task_selection(
+    roots: &[String],
+    include_upstream: bool,
+    include_downstream: bool,
+    upstream_by_task: &HashMap<String, Vec<String>>,
+    downstream_by_task: &HashMap<String, Vec<String>>,
+) -> BTreeSet<String> {
+    let mut selected: BTreeSet<String> = roots.iter().cloned().collect();
+
+    if include_upstream {
+        let mut queue: VecDeque<String> = roots.iter().cloned().collect();
+        while let Some(current) = queue.pop_front() {
+            let upstream = upstream_by_task.get(&current).cloned().unwrap_or_default();
+            for upstream_key in upstream {
+                if selected.insert(upstream_key.clone()) {
+                    queue.push_back(upstream_key);
+                }
+            }
+        }
+    }
+
+    if include_downstream {
+        let mut queue: VecDeque<String> = roots.iter().cloned().collect();
+        while let Some(current) = queue.pop_front() {
+            let downstream = downstream_by_task
+                .get(&current)
+                .cloned()
+                .unwrap_or_default();
+            for downstream_key in downstream {
+                if selected.insert(downstream_key.clone()) {
+                    queue.push_back(downstream_key);
+                }
+            }
+        }
+    }
+
+    selected
+}
+
+fn task_defs_for_rerun(
+    tasks_by_key: &HashMap<String, TaskRow>,
+    selected: &BTreeSet<String>,
+    upstream_by_task: &HashMap<String, Vec<String>>,
+) -> Vec<TaskDef> {
+    let mut tasks = Vec::new();
+
+    for task_key in selected {
+        let Some(task_row) = tasks_by_key.get(task_key) else {
+            continue;
+        };
+
+        let mut depends_on: Vec<String> = upstream_by_task
+            .get(task_key)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|upstream| selected.contains(upstream))
+            .collect();
+        depends_on.sort();
+
+        tasks.push(TaskDef {
+            key: task_key.clone(),
+            depends_on,
+            asset_key: task_row.asset_key.clone(),
+            partition_key: task_row.partition_key.clone(),
+            max_attempts: task_row.max_attempts,
+            heartbeat_timeout_sec: task_row.heartbeat_timeout_sec,
+        });
+    }
+
+    tasks.sort_by(|a, b| a.key.cmp(&b.key));
+    tasks
+}
+
+fn compute_rerun_run_key(
+    parent_run_id: &str,
+    rerun_kind: RerunKindResponse,
+    selected_tasks: &BTreeSet<String>,
+    partition_keys: &BTreeSet<String>,
+) -> Result<String, ApiError> {
+    #[derive(Serialize)]
+    struct Payload {
+        parent_run_id: String,
+        rerun_kind: RerunKindResponse,
+        selected_tasks: Vec<String>,
+        partition_keys: Vec<String>,
+    }
+
+    let payload = Payload {
+        parent_run_id: parent_run_id.to_string(),
+        rerun_kind,
+        selected_tasks: selected_tasks.iter().cloned().collect(),
+        partition_keys: partition_keys.iter().cloned().collect(),
+    };
+
+    let json = serde_json::to_vec(&payload).map_err(|e| {
+        ApiError::internal(format!("failed to serialize rerun run_key payload: {e}"))
+    })?;
+    let hash = Sha256::digest(&json);
+    let hex_hash = hex::encode(hash);
+
+    let kind = match rerun_kind {
+        RerunKindResponse::FromFailure => "from_failure",
+        RerunKindResponse::Subset => "subset",
+    };
+
+    Ok(format!("rerun:{parent_run_id}:{kind}:{}", &hex_hash[..16]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_rerun_request_fingerprint(
+    parent_run_id: &str,
+    rerun_kind: RerunKindResponse,
+    roots: &[String],
+    include_upstream: bool,
+    include_downstream: bool,
+    selected_tasks: &BTreeSet<String>,
+    partition_keys: &BTreeSet<String>,
+    labels: &HashMap<String, String>,
+) -> Result<String, ApiError> {
+    #[derive(Serialize)]
+    struct Payload {
+        parent_run_id: String,
+        rerun_kind: RerunKindResponse,
+        roots: Vec<String>,
+        include_upstream: bool,
+        include_downstream: bool,
+        selected_tasks: Vec<String>,
+        partition_keys: Vec<String>,
+        labels: BTreeMap<String, String>,
+    }
+
+    let labels = labels
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let payload = Payload {
+        parent_run_id: parent_run_id.to_string(),
+        rerun_kind,
+        roots: roots.to_vec(),
+        include_upstream,
+        include_downstream,
+        selected_tasks: selected_tasks.iter().cloned().collect(),
+        partition_keys: partition_keys.iter().cloned().collect(),
+        labels,
+    };
+
+    let json = serde_json::to_vec(&payload).map_err(|e| {
+        ApiError::internal(format!(
+            "failed to serialize rerun request fingerprint: {e}"
+        ))
+    })?;
+    let hash = Sha256::digest(&json);
+    Ok(hex::encode(hash))
+}
+
+fn parse_pagination(limit: u32, cursor: Option<&str>) -> Result<(usize, usize), ApiError> {
+    if limit == 0 || limit > MAX_LIST_LIMIT {
+        return Err(ApiError::bad_request(format!(
+            "limit must be between 1 and {MAX_LIST_LIMIT}"
+        )));
+    }
+
+    let offset = cursor
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| ApiError::bad_request("invalid cursor"))
+        })
+        .transpose()?
+        .unwrap_or(0);
+
+    Ok((limit as usize, offset))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BackfillIdempotencyRecord {
+    idempotency_key: String,
+    backfill_id: String,
+    accepted_event_id: String,
+    accepted_at: DateTime<Utc>,
+    fingerprint: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackfillFingerprintPayload {
+    asset_selection: Vec<String>,
+    partitions: Vec<String>,
+    chunk_size: u32,
+    max_concurrent_runs: u32,
+}
+
+struct BackfillCreateInput {
+    asset_selection: Vec<String>,
+    partition_selector: PartitionSelector,
+    partition_keys: Vec<String>,
+    chunk_size: u32,
+    max_concurrent_runs: u32,
+}
+
+fn compute_backfill_fingerprint(
+    asset_selection: &[String],
+    partitions: &[String],
+    chunk_size: u32,
+    max_concurrent_runs: u32,
+) -> Result<String, ApiError> {
+    let payload = BackfillFingerprintPayload {
+        asset_selection: asset_selection.to_vec(),
+        partitions: partitions.to_vec(),
+        chunk_size,
+        max_concurrent_runs,
+    };
+    let json = serde_json::to_vec(&payload).map_err(|e| {
+        ApiError::internal(format!("failed to serialize backfill fingerprint: {e}"))
+    })?;
+    let hash = Sha256::digest(&json);
+    Ok(hex::encode(hash))
+}
+
+async fn load_backfill_idempotency_record(
+    storage: &ScopedStorage,
+    idempotency_key: &str,
+) -> Result<Option<BackfillIdempotencyRecord>, ApiError> {
+    let path = backfill_idempotency_path(idempotency_key);
+    match storage.get_raw(&path).await {
+        Ok(bytes) => {
+            let record: BackfillIdempotencyRecord =
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    ApiError::internal(format!("failed to parse backfill idempotency record: {e}"))
+                })?;
+            Ok(Some(record))
+        }
+        Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => Ok(None),
+        Err(err) => Err(ApiError::internal(format!(
+            "failed to read backfill idempotency record: {err}"
+        ))),
+    }
+}
+
+async fn store_backfill_idempotency_record(
+    storage: &ScopedStorage,
+    record: &BackfillIdempotencyRecord,
+) -> Result<(), ApiError> {
+    let record_json = serde_json::to_string(record).map_err(|e| {
+        ApiError::internal(format!(
+            "failed to serialize backfill idempotency record: {e}"
+        ))
+    })?;
+    let record_path = backfill_idempotency_path(&record.idempotency_key);
+    let result = storage
+        .put_raw(
+            &record_path,
+            Bytes::from(record_json),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!("failed to store backfill idempotency record: {e}"))
+        })?;
+
+    if matches!(result, WriteResult::PreconditionFailed { .. }) {
+        tracing::warn!(
+            idempotency_key = %record.idempotency_key,
+            backfill_id = %record.backfill_id,
+            "backfill idempotency record already exists after write"
+        );
+    }
+
+    Ok(())
+}
+
+fn explicit_partition_selector(
+    partitions: Vec<String>,
+) -> Result<(PartitionSelector, Vec<String>), ApiError> {
+    if partitions.is_empty() {
+        return Err(ApiError::bad_request("partition selector cannot be empty"));
+    }
+    if partitions.iter().any(String::is_empty) {
+        return Err(ApiError::bad_request("partition key cannot be empty"));
+    }
+
+    Ok((
+        PartitionSelector::Explicit {
+            partition_keys: partitions.clone(),
+        },
+        partitions,
+    ))
+}
+
+fn unsupported_partition_selector_response() -> UnprocessableEntityResponse {
+    UnprocessableEntityResponse {
+        error: "unprocessable_entity".to_string(),
+        code: "PARTITION_SELECTOR_NOT_SUPPORTED".to_string(),
+        message: "Only explicit partition lists are supported. Range and filter selectors require a PartitionResolver (not yet implemented).".to_string(),
+    }
+}
+
+async fn resolve_backfill_idempotency(
+    storage: &ScopedStorage,
+    idempotency_key: &str,
+    fingerprint: &str,
+) -> Result<Option<CreateBackfillResponse>, ApiError> {
+    if let Some(existing) = load_backfill_idempotency_record(storage, idempotency_key).await? {
+        if existing.fingerprint == fingerprint {
+            return Ok(Some(CreateBackfillResponse {
+                backfill_id: existing.backfill_id,
+                accepted_event_id: existing.accepted_event_id,
+                accepted_at: existing.accepted_at,
+            }));
+        }
+
+        return Err(ApiError::conflict(
+            "idempotency key already used for a different backfill",
+        ));
+    }
+
+    Ok(None)
+}
+
+async fn append_backfill_created_event(
+    state: &AppState,
+    ctx: &RequestContext,
+    workspace_id: &str,
+    input: BackfillCreateInput,
+    idempotency_key: &str,
+    storage: &ScopedStorage,
+    fingerprint: String,
+) -> Result<CreateBackfillResponse, ApiError> {
+    let backfill_id = Ulid::new().to_string();
+    let total_partitions = u32::try_from(input.partition_keys.len()).unwrap_or(u32::MAX);
+    let event = OrchestrationEvent::new(
+        &ctx.tenant,
+        workspace_id,
+        OrchestrationEventData::BackfillCreated {
+            backfill_id: backfill_id.clone(),
+            client_request_id: idempotency_key.to_string(),
+            asset_selection: input.asset_selection,
+            partition_selector: input.partition_selector,
+            total_partitions,
+            chunk_size: input.chunk_size,
+            max_concurrent_runs: input.max_concurrent_runs,
+            parent_backfill_id: None,
+        },
+    );
+
+    let accepted_event_id = event.event_id.clone();
+    let accepted_at = event.timestamp;
+
+    let ledger = LedgerWriter::new(storage.clone());
+    let event_path = LedgerWriter::event_path(&event);
+    ledger
+        .append(event)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to write BackfillCreated event: {e}")))?;
+
+    compact_orchestration_events(&state.config, storage.clone(), vec![event_path]).await?;
+
+    let record = BackfillIdempotencyRecord {
+        idempotency_key: idempotency_key.to_string(),
+        backfill_id: backfill_id.clone(),
+        accepted_event_id: accepted_event_id.clone(),
+        accepted_at,
+        fingerprint,
+    };
+    store_backfill_idempotency_record(storage, &record).await?;
+
+    Ok(CreateBackfillResponse {
+        backfill_id,
+        accepted_event_id,
+        accepted_at,
+    })
 }
 
 fn user_id_for_events(ctx: &RequestContext) -> String {
@@ -560,6 +1908,129 @@ fn map_task_state(state: FoldTaskState) -> TaskStateResponse {
     }
 }
 
+const LABEL_PARENT_RUN_ID: &str = "arco.parent_run_id";
+const LABEL_RERUN_KIND: &str = "arco.rerun.kind";
+
+fn rerun_kind_from_label(value: &str) -> Option<RerunKindResponse> {
+    match value {
+        "FROM_FAILURE" => Some(RerunKindResponse::FromFailure),
+        "SUBSET" => Some(RerunKindResponse::Subset),
+        _ => None,
+    }
+}
+
+fn lineage_from_labels(
+    labels: &HashMap<String, String>,
+) -> (Option<String>, Option<RerunKindResponse>) {
+    let parent = labels.get(LABEL_PARENT_RUN_ID).cloned();
+    let kind = labels
+        .get(LABEL_RERUN_KIND)
+        .and_then(|value| rerun_kind_from_label(value));
+    (parent, kind)
+}
+
+fn reject_reserved_lineage_labels(labels: &HashMap<String, String>) -> Result<(), ApiError> {
+    let forbidden = [LABEL_PARENT_RUN_ID, LABEL_RERUN_KIND]
+        .into_iter()
+        .filter(|key| labels.contains_key(*key))
+        .collect::<Vec<_>>();
+
+    if forbidden.is_empty() {
+        return Ok(());
+    }
+
+    Err(ApiError::bad_request(format!(
+        "labels cannot include reserved keys: {}",
+        forbidden.join(", ")
+    )))
+}
+
+fn validate_selection_limits(selection: &[String]) -> Result<(), ApiError> {
+    if selection.len() > MAX_SELECTION_ITEMS {
+        return Err(ApiError::bad_request(format!(
+            "selection exceeds max items ({MAX_SELECTION_ITEMS})"
+        )));
+    }
+    for value in selection {
+        if value.len() > MAX_SELECTION_ITEM_LEN {
+            return Err(ApiError::bad_request(format!(
+                "selection item exceeds max length ({MAX_SELECTION_ITEM_LEN})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_labels_limits(labels: &HashMap<String, String>) -> Result<(), ApiError> {
+    if labels.len() > MAX_LABELS {
+        return Err(ApiError::bad_request(format!(
+            "labels exceed max properties ({MAX_LABELS})"
+        )));
+    }
+
+    for (key, value) in labels {
+        if key.len() > MAX_LABEL_KEY_LEN {
+            return Err(ApiError::bad_request(format!(
+                "label key exceeds max length ({MAX_LABEL_KEY_LEN})"
+            )));
+        }
+        if value.len() > MAX_LABEL_VALUE_LEN {
+            return Err(ApiError::bad_request(format!(
+                "label value exceeds max length ({MAX_LABEL_VALUE_LEN})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_partitions_limits(partitions: &[PartitionValue]) -> Result<(), ApiError> {
+    if partitions.len() > MAX_PARTITIONS {
+        return Err(ApiError::bad_request(format!(
+            "partitions exceed max items ({MAX_PARTITIONS})"
+        )));
+    }
+
+    for partition in partitions {
+        if partition.key.len() > MAX_PARTITION_DIM_LEN {
+            return Err(ApiError::bad_request(format!(
+                "partition key exceeds max length ({MAX_PARTITION_DIM_LEN})"
+            )));
+        }
+        if partition.value.len() > MAX_PARTITION_VALUE_LEN {
+            return Err(ApiError::bad_request(format!(
+                "partition value exceeds max length ({MAX_PARTITION_VALUE_LEN})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_trigger_run_request_limits(request: &TriggerRunRequest) -> Result<(), ApiError> {
+    validate_selection_limits(&request.selection)?;
+    validate_labels_limits(&request.labels)?;
+    validate_partitions_limits(&request.partitions)?;
+
+    if let Some(run_key) = request.run_key.as_deref() {
+        if run_key.len() > MAX_RUN_KEY_LEN {
+            return Err(ApiError::bad_request(format!(
+                "runKey exceeds max length ({MAX_RUN_KEY_LEN})"
+            )));
+        }
+    }
+
+    if let Some(partition_key) = request.partition_key.as_deref() {
+        if partition_key.len() > MAX_PARTITION_KEY_LEN {
+            return Err(ApiError::bad_request(format!(
+                "partitionKey exceeds max length ({MAX_PARTITION_KEY_LEN})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
     let mut pending = 0;
     let mut queued = 0;
@@ -568,7 +2039,7 @@ fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
     for task in tasks {
         match task.state {
             FoldTaskState::Planned | FoldTaskState::Blocked | FoldTaskState::RetryWait => {
-                pending += 1
+                pending += 1;
             }
             FoldTaskState::Ready | FoldTaskState::Dispatched => queued += 1,
             FoldTaskState::Running => running += 1,
@@ -588,26 +2059,42 @@ fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
     }
 }
 
-fn build_task_defs(request: &TriggerRunRequest) -> Result<Vec<TaskDef>, ApiError> {
-    let partition_key = build_partition_key(&request.partitions)?;
+fn resolve_partition_key(request: &TriggerRunRequest) -> Result<Option<String>, ApiError> {
+    if request.partition_key.is_some() && !request.partitions.is_empty() {
+        return Err(ApiError::bad_request(
+            "use either partitionKey or partitions, not both",
+        ));
+    }
 
-    Ok(request
-        .selection
-        .iter()
-        .map(|asset_key| TaskDef {
-            key: asset_key.clone(), // task_key = asset_key for simple case
-            depends_on: vec![],
-            asset_key: Some(asset_key.clone()),
-            partition_key: partition_key.clone(),
-            max_attempts: 3,
-            heartbeat_timeout_sec: 300,
-        })
-        .collect())
+    if let Some(raw) = request.partition_key.as_deref() {
+        if raw.is_empty() {
+            return Err(ApiError::bad_request("partitionKey cannot be empty"));
+        }
+
+        let parsed = arco_core::partition::PartitionKey::parse(raw)
+            .map_err(|err| ApiError::bad_request(format!("invalid partitionKey: {err}")))?;
+        let canonical = parsed.canonical_string();
+        if canonical != raw {
+            return Err(ApiError::bad_request(format!(
+                "partitionKey must be canonical: expected '{canonical}'"
+            )));
+        }
+
+        return Ok(Some(raw.to_string()));
+    }
+
+    build_partition_key(&request.partitions)
 }
 
 fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, ApiError> {
     if partitions.is_empty() {
         return Ok(None);
+    }
+
+    if partitions.len() > MAX_PARTITIONS {
+        return Err(ApiError::bad_request(format!(
+            "partitions exceed max items ({MAX_PARTITIONS})"
+        )));
     }
 
     let mut seen = HashSet::new();
@@ -617,6 +2104,11 @@ fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, 
         let key = partition.key.trim();
         if key.is_empty() {
             return Err(ApiError::bad_request("partition key cannot be empty"));
+        }
+        if key.len() > MAX_PARTITION_DIM_LEN {
+            return Err(ApiError::bad_request(format!(
+                "partition key exceeds max length ({MAX_PARTITION_DIM_LEN})"
+            )));
         }
         if !is_valid_partition_key(key) {
             return Err(ApiError::bad_request(format!(
@@ -629,13 +2121,26 @@ fn build_partition_key(partitions: &[PartitionValue]) -> Result<Option<String>, 
             )));
         }
 
+        if partition.value.len() > MAX_PARTITION_VALUE_LEN {
+            return Err(ApiError::bad_request(format!(
+                "partition value exceeds max length ({MAX_PARTITION_VALUE_LEN})"
+            )));
+        }
+
         partition_key.insert(
             key.to_string(),
             arco_core::partition::ScalarValue::String(partition.value.clone()),
         );
     }
 
-    Ok(Some(partition_key.canonical_string()))
+    let canonical = partition_key.canonical_string();
+    if canonical.len() > MAX_PARTITION_KEY_LEN {
+        return Err(ApiError::bad_request(format!(
+            "partitionKey exceeds max length ({MAX_PARTITION_KEY_LEN})"
+        )));
+    }
+
+    Ok(Some(canonical))
 }
 
 fn is_valid_partition_key(key: &str) -> bool {
@@ -662,15 +2167,24 @@ fn build_request_fingerprint(request: &TriggerRunRequest) -> Result<String, ApiE
     #[derive(Serialize)]
     struct FingerprintPayload {
         selection: Vec<String>,
-        partitions: Vec<PartitionValue>,
+        include_upstream: bool,
+        include_downstream: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partition_key: Option<String>,
         labels: BTreeMap<String, String>,
     }
 
-    let mut selection = request.selection.clone();
+    let mut selection: Vec<String> = request
+        .selection
+        .iter()
+        .map(|value| {
+            arco_flow::orchestration::canonicalize_asset_key(value).map_err(ApiError::bad_request)
+        })
+        .collect::<Result<_, _>>()?;
     selection.sort();
+    selection.dedup();
 
-    let mut partitions = request.partitions.clone();
-    partitions.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.value.cmp(&b.value)));
+    let partition_key = resolve_partition_key(request)?;
 
     let labels = request
         .labels
@@ -680,7 +2194,9 @@ fn build_request_fingerprint(request: &TriggerRunRequest) -> Result<String, ApiE
 
     let payload = FingerprintPayload {
         selection,
-        partitions,
+        include_upstream: request.include_upstream,
+        include_downstream: request.include_downstream,
+        partition_key,
         labels,
     };
     let json = serde_json::to_vec(&payload).map_err(|e| {
@@ -690,6 +2206,146 @@ fn build_request_fingerprint(request: &TriggerRunRequest) -> Result<String, ApiE
     })?;
     let hash = Sha256::digest(&json);
     Ok(hex::encode(hash))
+}
+
+fn build_request_fingerprint_variants(
+    request: &TriggerRunRequest,
+) -> Result<(String, Vec<String>), ApiError> {
+    #[derive(Serialize)]
+    struct LegacyFingerprintPayload {
+        selection: Vec<String>,
+        include_upstream: bool,
+        include_downstream: bool,
+        partitions: Vec<PartitionValue>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partition_key: Option<String>,
+        labels: BTreeMap<String, String>,
+    }
+
+    fn hash_payload<T: Serialize>(payload: &T) -> Result<String, ApiError> {
+        let json = serde_json::to_vec(payload).map_err(|e| {
+            ApiError::internal(format!(
+                "failed to serialize trigger request fingerprint: {e}"
+            ))
+        })?;
+        let hash = Sha256::digest(&json);
+        Ok(hex::encode(hash))
+    }
+
+    let primary = build_request_fingerprint(request)?;
+
+    let mut selection: Vec<String> = request
+        .selection
+        .iter()
+        .map(|value| {
+            arco_flow::orchestration::canonicalize_asset_key(value).map_err(ApiError::bad_request)
+        })
+        .collect::<Result<_, _>>()?;
+    selection.sort();
+    selection.dedup();
+
+    let labels = request
+        .labels
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    let resolved_partition_key = resolve_partition_key(request)?;
+
+    let partitions_from_partition_key = match resolved_partition_key.as_deref() {
+        Some(pk) => partitions_from_string_only_partition_key(pk)?,
+        None => None,
+    };
+
+    let mut variants = vec![primary.clone()];
+
+    if let Some(partition_key) = resolved_partition_key.as_ref() {
+        let legacy_partition_key_payload = LegacyFingerprintPayload {
+            selection: selection.clone(),
+            include_upstream: request.include_upstream,
+            include_downstream: request.include_downstream,
+            partitions: Vec::new(),
+            partition_key: Some(partition_key.clone()),
+            labels: labels.clone(),
+        };
+        variants.push(hash_payload(&legacy_partition_key_payload)?);
+    }
+
+    let mut legacy_partitions = if request.partitions.is_empty() {
+        partitions_from_partition_key
+    } else {
+        Some(request.partitions.clone())
+    };
+
+    if let Some(ref mut partitions) = legacy_partitions {
+        partitions.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.value.cmp(&b.value)));
+    }
+
+    if let Some(partitions) = legacy_partitions {
+        let legacy_partitions_payload = LegacyFingerprintPayload {
+            selection,
+            include_upstream: request.include_upstream,
+            include_downstream: request.include_downstream,
+            partitions,
+            partition_key: None,
+            labels,
+        };
+        variants.push(hash_payload(&legacy_partitions_payload)?);
+    }
+
+    variants.sort();
+    variants.dedup();
+
+    Ok((primary, variants))
+}
+
+fn partitions_from_string_only_partition_key(
+    partition_key: &str,
+) -> Result<Option<Vec<PartitionValue>>, ApiError> {
+    let parsed = arco_core::partition::PartitionKey::parse(partition_key).map_err(|err| {
+        ApiError::internal(format!(
+            "failed to parse canonical partitionKey for fingerprint normalization: {err}"
+        ))
+    })?;
+
+    let mut result = Vec::with_capacity(parsed.len());
+    for (key, value) in parsed.iter() {
+        match value {
+            arco_core::partition::ScalarValue::String(s) => result.push(PartitionValue {
+                key: key.clone(),
+                value: s.clone(),
+            }),
+            _ => return Ok(None),
+        }
+    }
+
+    Ok(Some(result))
+}
+
+fn normalize_trigger_run_reservation_result(
+    result: ReservationResult,
+    fingerprint_variants: &[String],
+) -> ReservationResult {
+    match result {
+        ReservationResult::FingerprintMismatch {
+            existing,
+            requested_fingerprint,
+        } => {
+            let is_equivalent = existing
+                .request_fingerprint
+                .as_deref()
+                .is_some_and(|fp| fingerprint_variants.iter().any(|v| v == fp));
+            if is_equivalent {
+                ReservationResult::AlreadyExists(existing)
+            } else {
+                ReservationResult::FingerprintMismatch {
+                    existing,
+                    requested_fingerprint,
+                }
+            }
+        }
+        other => other,
+    }
 }
 
 fn apply_event_metadata(event: &mut OrchestrationEvent, event_id: &str, timestamp: DateTime<Utc>) {
@@ -721,6 +2377,299 @@ fn map_run_requests(run_requests: &[RunRequest]) -> Vec<RunRequestResponse> {
 }
 
 // ============================================================================
+// Schedule/Sensor/Backfill/Partition Mapping Helpers
+// ============================================================================
+
+fn map_schedule(def: &ScheduleDefinitionRow, state: Option<&ScheduleStateRow>) -> ScheduleResponse {
+    ScheduleResponse {
+        schedule_id: def.schedule_id.clone(),
+        cron_expression: def.cron_expression.clone(),
+        timezone: def.timezone.clone(),
+        catchup_window_minutes: def.catchup_window_minutes,
+        max_catchup_ticks: def.max_catchup_ticks,
+        asset_selection: def.asset_selection.clone(),
+        enabled: def.enabled,
+        definition_version: def.row_version.clone(),
+        last_scheduled_for: state.and_then(|row| row.last_scheduled_for),
+        last_tick_id: state.and_then(|row| row.last_tick_id.clone()),
+        last_run_key: state.and_then(|row| row.last_run_key.clone()),
+    }
+}
+
+fn normalize_asset_selection(values: &[String]) -> Vec<String> {
+    let mut values = values.to_vec();
+    values.sort();
+    values
+}
+
+fn schedule_definition_matches_request(
+    def: &ScheduleDefinitionRow,
+    request: &UpsertScheduleRequest,
+) -> bool {
+    def.cron_expression == request.cron_expression
+        && def.timezone == request.timezone
+        && def.catchup_window_minutes == request.catchup_window_minutes
+        && def.max_catchup_ticks == request.max_catchup_ticks
+        && def.enabled == request.enabled
+        && normalize_asset_selection(&def.asset_selection)
+            == normalize_asset_selection(&request.asset_selection)
+}
+
+fn validate_schedule_upsert(
+    schedule_id: &str,
+    request: &UpsertScheduleRequest,
+) -> Result<(), ApiError> {
+    if schedule_id.is_empty() {
+        return Err(ApiError::bad_request("schedule_id cannot be empty"));
+    }
+
+    if request.asset_selection.is_empty() {
+        return Err(ApiError::bad_request("assetSelection cannot be empty"));
+    }
+
+    for asset in &request.asset_selection {
+        if asset.is_empty() {
+            return Err(ApiError::bad_request(
+                "assetSelection items cannot be empty",
+            ));
+        }
+    }
+
+    if request.max_catchup_ticks == 0 {
+        return Err(ApiError::bad_request("maxCatchupTicks must be >= 1"));
+    }
+
+    let field_count = request.cron_expression.split_whitespace().count();
+    if field_count != 5 && field_count != 6 {
+        return Err(ApiError::bad_request(
+            "cronExpression must have 5 fields (min..dow) or 6 fields (sec..dow)",
+        ));
+    }
+
+    let normalized = if field_count == 5 {
+        format!("0 {}", request.cron_expression)
+    } else {
+        request.cron_expression.clone()
+    };
+
+    if cron::Schedule::from_str(&normalized).is_err() {
+        return Err(ApiError::bad_request("invalid cronExpression"));
+    }
+
+    if request.timezone.parse::<chrono_tz::Tz>().is_err() {
+        return Err(ApiError::bad_request("invalid timezone"));
+    }
+
+    Ok(())
+}
+
+fn map_tick_status(status: &TickStatus) -> TickStatusResponse {
+    match status {
+        TickStatus::Triggered => TickStatusResponse::Triggered,
+        TickStatus::Skipped { .. } => TickStatusResponse::Skipped,
+        TickStatus::Failed { .. } => TickStatusResponse::Failed,
+    }
+}
+
+fn map_schedule_tick(row: &ScheduleTickRow) -> ScheduleTickResponse {
+    let (skip_reason, error_message) = match &row.status {
+        TickStatus::Skipped { reason } => (Some(reason.clone()), None),
+        TickStatus::Failed { error } => (None, Some(error.clone())),
+        TickStatus::Triggered => (None, None),
+    };
+
+    ScheduleTickResponse {
+        tick_id: row.tick_id.clone(),
+        schedule_id: row.schedule_id.clone(),
+        scheduled_for: row.scheduled_for,
+        asset_selection: row.asset_selection.clone(),
+        status: map_tick_status(&row.status),
+        skip_reason,
+        error_message,
+        run_key: row.run_key.clone(),
+        run_id: row.run_id.clone(),
+    }
+}
+
+fn map_sensor_status(status: SensorStatus) -> SensorStatusResponse {
+    match status {
+        SensorStatus::Active => SensorStatusResponse::Active,
+        SensorStatus::Paused => SensorStatusResponse::Paused,
+        SensorStatus::Error => SensorStatusResponse::Error,
+    }
+}
+
+fn map_sensor_state(row: &SensorStateRow) -> SensorResponse {
+    SensorResponse {
+        sensor_id: row.sensor_id.clone(),
+        cursor: row.cursor.clone(),
+        last_evaluation_at: row.last_evaluation_at,
+        status: map_sensor_status(row.status),
+        state_version: row.state_version,
+    }
+}
+
+fn map_sensor_eval(row: &SensorEvalRow) -> SensorEvalResponse {
+    SensorEvalResponse {
+        eval_id: row.eval_id.clone(),
+        sensor_id: row.sensor_id.clone(),
+        cursor_before: row.cursor_before.clone(),
+        cursor_after: row.cursor_after.clone(),
+        evaluated_at: row.evaluated_at,
+        status: map_sensor_eval_status(&row.status),
+        run_requests_count: u32::try_from(row.run_requests.len()).unwrap_or(u32::MAX),
+    }
+}
+
+fn map_backfill_state(state: BackfillState) -> BackfillStateResponse {
+    match state {
+        BackfillState::Pending => BackfillStateResponse::Pending,
+        BackfillState::Running => BackfillStateResponse::Running,
+        BackfillState::Paused => BackfillStateResponse::Paused,
+        BackfillState::Succeeded => BackfillStateResponse::Succeeded,
+        BackfillState::Failed => BackfillStateResponse::Failed,
+        BackfillState::Cancelled => BackfillStateResponse::Cancelled,
+    }
+}
+
+fn map_partition_selector(selector: &PartitionSelector) -> PartitionSelectorResponse {
+    match selector {
+        PartitionSelector::Range { start, end } => PartitionSelectorResponse::Range {
+            start: start.clone(),
+            end: end.clone(),
+        },
+        PartitionSelector::Explicit { partition_keys } => PartitionSelectorResponse::Explicit {
+            partitions: partition_keys.clone(),
+        },
+        PartitionSelector::Filter { filters } => PartitionSelectorResponse::Filter {
+            filters: filters.clone(),
+        },
+    }
+}
+
+fn build_chunk_counts(chunks: &[&BackfillChunkRow]) -> ChunkCounts {
+    let mut counts = ChunkCounts {
+        total: u32::try_from(chunks.len()).unwrap_or(u32::MAX),
+        ..Default::default()
+    };
+
+    for chunk in chunks {
+        match chunk.state {
+            ChunkState::Pending | ChunkState::Planned => counts.pending += 1,
+            ChunkState::Running => counts.running += 1,
+            ChunkState::Succeeded => counts.succeeded += 1,
+            ChunkState::Failed => counts.failed += 1,
+        }
+    }
+
+    counts
+}
+
+fn build_chunk_counts_index<'a, I>(chunks: I) -> HashMap<String, ChunkCounts>
+where
+    I: IntoIterator<Item = &'a BackfillChunkRow>,
+{
+    let mut counts = HashMap::new();
+
+    for chunk in chunks {
+        let entry = counts
+            .entry(chunk.backfill_id.clone())
+            .or_insert_with(ChunkCounts::default);
+
+        entry.total = entry.total.saturating_add(1);
+
+        match chunk.state {
+            ChunkState::Pending | ChunkState::Planned => {
+                entry.pending = entry.pending.saturating_add(1);
+            }
+            ChunkState::Running => {
+                entry.running = entry.running.saturating_add(1);
+            }
+            ChunkState::Succeeded => {
+                entry.succeeded = entry.succeeded.saturating_add(1);
+            }
+            ChunkState::Failed => {
+                entry.failed = entry.failed.saturating_add(1);
+            }
+        }
+    }
+
+    counts
+}
+
+fn map_backfill_with_counts(row: &BackfillRow, counts: ChunkCounts) -> BackfillResponse {
+    BackfillResponse {
+        backfill_id: row.backfill_id.clone(),
+        asset_selection: row.asset_selection.clone(),
+        partition_selector: map_partition_selector(&row.partition_selector),
+        chunk_size: row.chunk_size,
+        max_concurrent_runs: row.max_concurrent_runs,
+        state: map_backfill_state(row.state),
+        state_version: row.state_version,
+        created_at: row.created_at,
+        chunk_counts: counts,
+    }
+}
+
+fn map_backfill(row: &BackfillRow, chunks: &[&BackfillChunkRow]) -> BackfillResponse {
+    map_backfill_with_counts(row, build_chunk_counts(chunks))
+}
+
+fn map_chunk_state(state: ChunkState) -> ChunkStateResponse {
+    match state {
+        ChunkState::Pending => ChunkStateResponse::Pending,
+        ChunkState::Planned => ChunkStateResponse::Planned,
+        ChunkState::Running => ChunkStateResponse::Running,
+        ChunkState::Succeeded => ChunkStateResponse::Succeeded,
+        ChunkState::Failed => ChunkStateResponse::Failed,
+    }
+}
+
+fn map_backfill_chunk(row: &BackfillChunkRow) -> BackfillChunkResponse {
+    BackfillChunkResponse {
+        chunk_id: row.chunk_id.clone(),
+        backfill_id: row.backfill_id.clone(),
+        chunk_index: row.chunk_index,
+        partition_keys: row.partition_keys.clone(),
+        run_key: row.run_key.clone(),
+        run_id: row.run_id.clone(),
+        state: map_chunk_state(row.state),
+    }
+}
+
+fn map_partition_status(row: &PartitionStatusRow) -> PartitionStatusApiResponse {
+    PartitionStatusApiResponse {
+        asset_key: row.asset_key.clone(),
+        partition_key: row.partition_key.clone(),
+        last_materialization_run_id: row.last_materialization_run_id.clone(),
+        last_materialization_at: row.last_materialization_at,
+        is_stale: row.stale_since.is_some(),
+        stale_reason: row.stale_reason_code.clone(),
+        partition_values: row.partition_values.clone(),
+    }
+}
+
+fn paginate<T: Clone>(items: &[T], limit: usize, offset: usize) -> (Vec<T>, Option<String>) {
+    let end = (offset + limit).min(items.len());
+    let page = items.get(offset..end).unwrap_or_default().to_vec();
+    let next_cursor = if end < items.len() {
+        Some(end.to_string())
+    } else {
+        None
+    };
+    (page, next_cursor)
+}
+
+fn filter_ticks_by_status(
+    ticks: &mut Vec<ScheduleTickResponse>,
+    status: Option<TickStatusResponse>,
+) {
+    if let Some(filter) = status {
+        ticks.retain(|tick| tick.status == filter);
+    }
+}
+
+// ============================================================================
 // Route Handlers
 // ============================================================================
 
@@ -733,7 +2682,7 @@ fn map_run_requests(run_requests: &[RunRequest]) -> Vec<RunRequestResponse> {
     params(
         ("workspace_id" = String, Path, description = "Workspace ID")
     ),
-    request_body = TriggerRunRequest,
+    request_body = TriggerRunRequestOpenApi,
     responses(
         (status = 201, description = "Run created", body = TriggerRunResponse),
         (status = 200, description = "Existing run returned (run_key match)", body = TriggerRunResponse),
@@ -768,8 +2717,9 @@ pub(crate) async fn trigger_run(
         return Err(ApiError::bad_request("selection cannot be empty"));
     }
 
-    let tasks = build_task_defs(&request)?;
-    let root_assets = request.selection.clone();
+    validate_trigger_run_request_limits(&request)?;
+
+    reject_reserved_lineage_labels(&request.labels)?;
 
     // Generate IDs upfront (needed for reservation)
     let run_id = Ulid::new().to_string();
@@ -782,11 +2732,133 @@ pub(crate) async fn trigger_run(
     let ledger = LedgerWriter::new(storage.clone());
     let mut run_event_overrides: Option<RunEventOverrides> = None;
 
-    let request_fingerprint = if request.run_key.is_some() {
-        Some(build_request_fingerprint(&request)?)
+    let (request_fingerprint, request_fingerprint_variants) = if request.run_key.is_some() {
+        let (primary, variants) = build_request_fingerprint_variants(&request)?;
+        (Some(primary), variants)
     } else {
-        None
+        (None, Vec::new())
     };
+
+    if let Some(ref run_key) = request.run_key {
+        let fingerprint_policy =
+            FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff);
+
+        let existing = get_reservation(&storage, run_key)
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to read run_key reservation: {e}")))?;
+
+        if let Some(existing) = existing {
+            let fingerprints_match = match (
+                existing.request_fingerprint.as_deref(),
+                request_fingerprint.as_deref(),
+            ) {
+                (Some(existing_fp), Some(_)) => request_fingerprint_variants
+                    .iter()
+                    .any(|fp| fp == existing_fp),
+                (None, None) => true,
+                (None, Some(_)) => match fingerprint_policy.cutoff {
+                    None => true,
+                    Some(cutoff) => existing.created_at < cutoff,
+                },
+                (Some(_), None) => false,
+            };
+
+            if !fingerprints_match {
+                tracing::warn!(
+                    run_key = %existing.run_key,
+                    run_id = %existing.run_id,
+                    existing_fingerprint = ?existing.request_fingerprint,
+                    requested_fingerprint = ?request_fingerprint,
+                    existing_created_at = %existing.created_at,
+                    fingerprint_cutoff = ?fingerprint_policy.cutoff,
+                    "run_key reused with different trigger payload (fingerprint mismatch)"
+                );
+
+                return Err(ApiError::conflict(format!(
+                    "run_key '{}' already reserved with different trigger payload",
+                    existing.run_key
+                )));
+            }
+
+            let mut run_state = RunStateResponse::Pending;
+            let mut run_found = false;
+
+            match load_orchestration_state(&ctx, &state).await {
+                Ok(fold_state) => {
+                    if let Some(run) = fold_state.runs.get(&existing.run_id) {
+                        run_state = map_run_row_state(run);
+                        run_found = true;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        run_key = %existing.run_key,
+                        run_id = %existing.run_id,
+                        error = ?err,
+                        "failed to load orchestration state for run_key lookup"
+                    );
+                }
+            }
+
+            if !run_found {
+                let (manifest_id, deployed_at, root_assets, tasks) =
+                    plan_tasks_and_root_assets(&storage, &request).await?;
+
+                let plan_event_id = existing.plan_event_id.clone().unwrap_or_else(|| {
+                    let new_id = Ulid::new().to_string();
+                    tracing::warn!(
+                        run_key = %existing.run_key,
+                        run_id = %existing.run_id,
+                        "missing plan_event_id in reservation; generating new plan event id"
+                    );
+                    new_id
+                });
+
+                tracing::info!(
+                    manifest_id = %manifest_id,
+                    manifest_deployed_at = %deployed_at,
+                    run_id = %existing.run_id,
+                    "re-emitting run plan from latest manifest"
+                );
+
+                let event_paths = append_run_events(
+                    &ledger,
+                    &ctx.tenant,
+                    &workspace_id,
+                    user_id.clone(),
+                    &existing.run_id,
+                    &existing.plan_id,
+                    Some(existing.run_key.clone()),
+                    request.labels.clone(),
+                    state.config.code_version.clone(),
+                    root_assets,
+                    tasks,
+                    Some(RunEventOverrides {
+                        run_event_id: existing.event_id.clone(),
+                        plan_event_id,
+                        created_at: existing.created_at,
+                    }),
+                )
+                .await?;
+
+                compact_orchestration_events(&state.config, storage.clone(), event_paths).await?;
+            }
+
+            return Ok((
+                StatusCode::OK,
+                Json(TriggerRunResponse {
+                    run_id: existing.run_id,
+                    plan_id: existing.plan_id,
+                    state: run_state,
+                    created: false,
+                    created_at: existing.created_at,
+                }),
+            ));
+        }
+    }
+
+    let (manifest_id, deployed_at, root_assets, tasks) =
+        plan_tasks_and_root_assets(&storage, &request).await?;
 
     // If run_key provided, attempt to reserve it (strong idempotency)
     if let Some(ref run_key) = request.run_key {
@@ -804,10 +2876,15 @@ pub(crate) async fn trigger_run(
 
         let fingerprint_policy =
             FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff);
-        match reserve_run_key(&storage, &reservation, fingerprint_policy)
+        let reservation_result = reserve_run_key(&storage, &reservation, fingerprint_policy)
             .await
-            .map_err(|e| ApiError::internal(format!("failed to reserve run_key: {e}")))?
-        {
+            .map_err(|e| ApiError::internal(format!("failed to reserve run_key: {e}")))?;
+        let reservation_result = normalize_trigger_run_reservation_result(
+            reservation_result,
+            &request_fingerprint_variants,
+        );
+
+        match reservation_result {
             ReservationResult::Reserved => {
                 // We won the race - proceed to emit events
                 tracing::debug!(run_key = %run_key, "run_key reserved, proceeding with run creation");
@@ -818,11 +2895,14 @@ pub(crate) async fn trigger_run(
                 });
             }
             ReservationResult::AlreadyExists(existing) => {
-                if let (Some(existing_fp), Some(current_fp)) = (
+                if let (Some(existing_fp), Some(_)) = (
                     existing.request_fingerprint.as_deref(),
                     request_fingerprint.as_deref(),
                 ) {
-                    if existing_fp != current_fp {
+                    if !request_fingerprint_variants
+                        .iter()
+                        .any(|fp| fp == existing_fp)
+                    {
                         tracing::warn!(
                             run_key = %existing.run_key,
                             run_id = %existing.run_id,
@@ -872,6 +2952,13 @@ pub(crate) async fn trigger_run(
                         );
                         new_id
                     });
+
+                    tracing::info!(
+                        manifest_id = %manifest_id,
+                        manifest_deployed_at = %deployed_at,
+                        run_id = %existing.run_id,
+                        "re-emitting run plan from latest manifest"
+                    );
 
                     let event_paths = append_run_events(
                         &ledger,
@@ -929,6 +3016,16 @@ pub(crate) async fn trigger_run(
         }
     }
 
+    tracing::info!(
+        manifest_id = %manifest_id,
+        manifest_deployed_at = %deployed_at,
+        root_assets = ?root_assets,
+        include_upstream = request.include_upstream,
+        include_downstream = request.include_downstream,
+        planned_tasks = tasks.len(),
+        "planning run from latest manifest"
+    );
+
     let event_paths = append_run_events(
         &ledger,
         &ctx.tenant,
@@ -955,6 +3052,300 @@ pub(crate) async fn trigger_run(
             state: RunStateResponse::Pending,
             created: true,
             created_at: now,
+        }),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/runs/{run_id}/rerun",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("run_id" = String, Path, description = "Run ID")
+    ),
+    request_body = RerunRunRequest,
+    responses(
+        (status = 201, description = "Rerun created", body = RerunRunResponse),
+        (status = 200, description = "Existing rerun returned (run_key match)", body = RerunRunResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorBody),
+        (status = 409, description = "Conflict", body = ApiErrorBody),
+        (status = 404, description = "Run not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(
+        ("bearerAuth" = [])
+    )
+)]
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn rerun_run(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, parent_run_id)): Path<(String, String)>,
+    Json(request): Json<RerunRunRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+
+    validate_labels_limits(&request.labels)?;
+    validate_selection_limits(&request.selection)?;
+    if let Some(run_key) = request.run_key.as_deref() {
+        if run_key.len() > MAX_RUN_KEY_LEN {
+            return Err(ApiError::bad_request(format!(
+                "runKey exceeds max length ({MAX_RUN_KEY_LEN})"
+            )));
+        }
+    }
+
+    reject_reserved_lineage_labels(&request.labels)?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let parent_run = fold_state
+        .runs
+        .get(&parent_run_id)
+        .ok_or_else(|| ApiError::not_found(format!("run not found: {parent_run_id}")))?;
+
+    let rerun_kind = match request.mode {
+        RerunMode::FromFailure => RerunKindResponse::FromFailure,
+        RerunMode::Subset => RerunKindResponse::Subset,
+    };
+
+    if rerun_kind == RerunKindResponse::FromFailure && parent_run.state != FoldRunState::Failed {
+        return Err(ApiError::conflict(
+            "rerun-from-failure requires a FAILED parent run".to_string(),
+        ));
+    }
+
+    let (tasks_by_key, upstream_by_task, downstream_by_task) =
+        build_plan_graph_for_run(&fold_state, &parent_run_id);
+
+    if tasks_by_key.is_empty() {
+        return Err(ApiError::conflict(
+            "parent run has no plan; cannot rerun".to_string(),
+        ));
+    }
+
+    let (roots, selected, include_upstream, include_downstream) = match rerun_kind {
+        RerunKindResponse::FromFailure => {
+            let mut selected = BTreeSet::new();
+            for (task_key, task_row) in &tasks_by_key {
+                if task_row.state != FoldTaskState::Succeeded {
+                    selected.insert(task_key.clone());
+                }
+            }
+
+            let roots: Vec<String> = selected.iter().cloned().collect();
+            (roots, selected, false, false)
+        }
+        RerunKindResponse::Subset => {
+            if request.selection.is_empty() {
+                return Err(ApiError::bad_request("selection cannot be empty"));
+            }
+
+            let mut roots = BTreeSet::new();
+            let mut unknown = BTreeSet::new();
+            for value in &request.selection {
+                let canonical = arco_flow::orchestration::canonicalize_asset_key(value)
+                    .map_err(ApiError::bad_request)?;
+
+                if tasks_by_key.contains_key(&canonical) {
+                    roots.insert(canonical);
+                } else {
+                    unknown.insert(canonical);
+                }
+            }
+
+            if !unknown.is_empty() {
+                return Err(ApiError::bad_request(format!(
+                    "unknown task keys: {}",
+                    unknown.into_iter().collect::<Vec<_>>().join(", ")
+                )));
+            }
+
+            let roots_vec: Vec<String> = roots.iter().cloned().collect();
+            let selected = close_task_selection(
+                &roots_vec,
+                request.include_upstream,
+                request.include_downstream,
+                &upstream_by_task,
+                &downstream_by_task,
+            );
+
+            (
+                roots_vec,
+                selected,
+                request.include_upstream,
+                request.include_downstream,
+            )
+        }
+    };
+
+    if selected.is_empty() {
+        return Err(ApiError::bad_request("rerun selection is empty"));
+    }
+
+    let mut partition_keys = BTreeSet::new();
+    for task_key in &selected {
+        let Some(row) = tasks_by_key.get(task_key) else {
+            continue;
+        };
+        if let Some(partition_key) = row.partition_key.as_ref() {
+            partition_keys.insert(partition_key.clone());
+        }
+    }
+
+    let root_assets = roots.clone();
+    let tasks = task_defs_for_rerun(&tasks_by_key, &selected, &upstream_by_task);
+
+    let mut labels = request.labels.clone();
+    labels.insert(LABEL_PARENT_RUN_ID.to_string(), parent_run_id.clone());
+    labels.insert(
+        LABEL_RERUN_KIND.to_string(),
+        match rerun_kind {
+            RerunKindResponse::FromFailure => "FROM_FAILURE".to_string(),
+            RerunKindResponse::Subset => "SUBSET".to_string(),
+        },
+    );
+
+    let run_key = match request.run_key.clone() {
+        Some(value) => value,
+        None => compute_rerun_run_key(&parent_run_id, rerun_kind, &selected, &partition_keys)?,
+    };
+
+    let request_fingerprint = Some(compute_rerun_request_fingerprint(
+        &parent_run_id,
+        rerun_kind,
+        &root_assets,
+        include_upstream,
+        include_downstream,
+        &selected,
+        &partition_keys,
+        &labels,
+    )?);
+
+    let now = Utc::now();
+    let run_id = Ulid::new().to_string();
+    let plan_id = Ulid::new().to_string();
+
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+    let ledger = LedgerWriter::new(storage.clone());
+
+    let fingerprint_policy =
+        FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff);
+
+    let run_event_id = Ulid::new().to_string();
+    let plan_event_id = Ulid::new().to_string();
+
+    let reservation = RunKeyReservation {
+        run_key: run_key.clone(),
+        run_id: run_id.clone(),
+        plan_id: plan_id.clone(),
+        event_id: run_event_id.clone(),
+        plan_event_id: Some(plan_event_id.clone()),
+        request_fingerprint: request_fingerprint.clone(),
+        created_at: now,
+    };
+
+    let run_event_overrides = match reserve_run_key(&storage, &reservation, fingerprint_policy)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to reserve run_key: {e}")))?
+    {
+        ReservationResult::Reserved => Some(RunEventOverrides {
+            run_event_id,
+            plan_event_id,
+            created_at: now,
+        }),
+        ReservationResult::AlreadyExists(existing) => {
+            let mut run_state = RunStateResponse::Pending;
+            let mut run_found = false;
+
+            if let Ok(fold_state) = load_orchestration_state(&ctx, &state).await {
+                if let Some(run) = fold_state.runs.get(&existing.run_id) {
+                    run_state = map_run_row_state(run);
+                    run_found = true;
+                }
+            }
+
+            if !run_found {
+                let user_id = user_id_for_events(&ctx);
+                let plan_event_id = existing
+                    .plan_event_id
+                    .clone()
+                    .unwrap_or_else(|| Ulid::new().to_string());
+
+                let event_paths = append_run_events(
+                    &ledger,
+                    &ctx.tenant,
+                    &workspace_id,
+                    user_id,
+                    &existing.run_id,
+                    &existing.plan_id,
+                    Some(existing.run_key.clone()),
+                    labels.clone(),
+                    parent_run.code_version.clone(),
+                    root_assets.clone(),
+                    tasks.clone(),
+                    Some(RunEventOverrides {
+                        run_event_id: existing.event_id.clone(),
+                        plan_event_id,
+                        created_at: existing.created_at,
+                    }),
+                )
+                .await?;
+
+                compact_orchestration_events(&state.config, storage.clone(), event_paths).await?;
+            }
+
+            return Ok((
+                StatusCode::OK,
+                Json(RerunRunResponse {
+                    run_id: existing.run_id,
+                    plan_id: existing.plan_id,
+                    state: run_state,
+                    created: false,
+                    created_at: existing.created_at,
+                    parent_run_id,
+                    rerun_kind,
+                }),
+            ));
+        }
+        ReservationResult::FingerprintMismatch { existing, .. } => {
+            return Err(ApiError::conflict(format!(
+                "run_key '{}' already reserved with different trigger payload",
+                existing.run_key
+            )));
+        }
+    };
+
+    let user_id = user_id_for_events(&ctx);
+
+    let event_paths = append_run_events(
+        &ledger,
+        &ctx.tenant,
+        &workspace_id,
+        user_id,
+        &run_id,
+        &plan_id,
+        Some(run_key),
+        labels,
+        parent_run.code_version.clone(),
+        root_assets,
+        tasks,
+        run_event_overrides,
+    )
+    .await?;
+
+    compact_orchestration_events(&state.config, storage.clone(), event_paths).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(RerunRunResponse {
+            run_id,
+            plan_id,
+            state: RunStateResponse::Pending,
+            created: true,
+            created_at: now,
+            parent_run_id,
+            rerun_kind,
         }),
     ))
 }
@@ -1082,7 +3473,7 @@ pub(crate) async fn manual_evaluate_sensor(
     ))
 }
 
-/// Backfill missing run_key fingerprints.
+/// Backfill missing `run_key` fingerprints.
 ///
 /// Allows updating legacy reservations that were created before fingerprints
 /// were introduced, enabling strict payload validation moving forward.
@@ -1118,10 +3509,15 @@ pub(crate) async fn backfill_run_key(
 
     let fingerprint_request = TriggerRunRequest {
         selection: request.selection.clone(),
+        include_upstream: request.include_upstream,
+        include_downstream: request.include_downstream,
         partitions: request.partitions.clone(),
+        partition_key: None,
         run_key: Some(request.run_key.clone()),
         labels: request.labels.clone(),
     };
+
+    validate_trigger_run_request_limits(&fingerprint_request)?;
     let request_fingerprint = build_request_fingerprint(&fingerprint_request)?;
 
     let backend = state.storage_backend()?;
@@ -1263,6 +3659,8 @@ pub(crate) async fn get_run(
         })
         .collect::<Vec<_>>();
 
+    let (parent_run_id, rerun_kind) = lineage_from_labels(&run.labels);
+
     let response = RunResponse {
         run_id: run.run_id.clone(),
         workspace_id,
@@ -1274,6 +3672,8 @@ pub(crate) async fn get_run(
         tasks: task_summaries,
         task_counts,
         labels: run.labels.clone(),
+        parent_run_id,
+        rerun_kind,
     };
 
     Ok(Json(response))
@@ -1354,14 +3754,19 @@ pub(crate) async fn list_runs(
 
     let items = page
         .iter()
-        .map(|row| RunListItem {
-            run_id: row.run_id.clone(),
-            state: map_run_row_state(row),
-            created_at: row.triggered_at,
-            completed_at: row.completed_at,
-            task_count: row.tasks_total,
-            tasks_succeeded: row.tasks_succeeded,
-            tasks_failed: row.tasks_failed,
+        .map(|row| {
+            let (parent_run_id, rerun_kind) = lineage_from_labels(&row.labels);
+            RunListItem {
+                run_id: row.run_id.clone(),
+                state: map_run_row_state(row),
+                created_at: row.triggered_at,
+                completed_at: row.completed_at,
+                task_count: row.tasks_total,
+                tasks_succeeded: row.tasks_succeeded,
+                tasks_failed: row.tasks_failed,
+                parent_run_id,
+                rerun_kind,
+            }
         })
         .collect::<Vec<_>>();
 
@@ -1590,7 +3995,9 @@ pub(crate) async fn get_run_logs(
             .await
             .map_err(|e| ApiError::internal(format!("failed to read log: {e}")))?;
         let chunk = String::from_utf8_lossy(&bytes);
-        output.push_str(&format!("--- {} ---\n", path.as_str()));
+        output.push_str("--- ");
+        output.push_str(path.as_str());
+        output.push_str(" ---\n");
         output.push_str(&chunk);
         if !chunk.ends_with('\n') {
             output.push('\n');
@@ -1601,18 +4008,906 @@ pub(crate) async fn get_run_logs(
 }
 
 // ============================================================================
+// Schedule Routes
+// ============================================================================
+
+/// List schedules.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/schedules",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("limit" = Option<u32>, Query, description = "Maximum schedules to return"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+    ),
+    responses(
+        (status = 200, description = "List of schedules", body = ListSchedulesResponse),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn list_schedules(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path(workspace_id): Path<String>,
+    AxumQuery(query): AxumQuery<ListQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let (limit, offset) = parse_pagination(
+        query.limit.unwrap_or(DEFAULT_LIMIT),
+        query.cursor.as_deref(),
+    )?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let mut schedules: Vec<ScheduleResponse> = fold_state
+        .schedule_definitions
+        .values()
+        .map(|def| {
+            let state = fold_state.schedule_state.get(def.schedule_id.as_str());
+            map_schedule(def, state)
+        })
+        .collect();
+    schedules.sort_by(|a, b| a.schedule_id.cmp(&b.schedule_id));
+
+    let (page, next_cursor) = paginate(&schedules, limit, offset);
+
+    Ok(Json(ListSchedulesResponse {
+        schedules: page,
+        next_cursor,
+    }))
+}
+
+/// Get schedule by ID.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/schedules/{schedule_id}",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("schedule_id" = String, Path, description = "Schedule ID")
+    ),
+    responses(
+        (status = 200, description = "Schedule details", body = ScheduleResponse),
+        (status = 404, description = "Schedule not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn get_schedule(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, schedule_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let definition = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
+        .ok_or_else(|| ApiError::not_found(format!("schedule not found: {schedule_id}")))?;
+
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    Ok(Json(map_schedule(definition, schedule_state)))
+}
+
+pub(crate) async fn upsert_schedule(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, schedule_id)): Path<(String, String)>,
+    Json(request): Json<UpsertScheduleRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    validate_schedule_upsert(&schedule_id, &request)?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let existing = fold_state.schedule_definitions.get(schedule_id.as_str());
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    if let Some(existing) = existing {
+        if schedule_definition_matches_request(existing, &request) {
+            return Ok((StatusCode::OK, Json(map_schedule(existing, schedule_state))));
+        }
+    }
+
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+
+    let ledger = LedgerWriter::new(storage.clone());
+    let existed = existing.is_some();
+
+    let mut event = OrchestrationEvent::new(
+        &ctx.tenant,
+        &workspace_id,
+        OrchestrationEventData::ScheduleDefinitionUpserted {
+            schedule_id: schedule_id.clone(),
+            cron_expression: request.cron_expression,
+            timezone: request.timezone,
+            catchup_window_minutes: request.catchup_window_minutes,
+            asset_selection: request.asset_selection,
+            max_catchup_ticks: request.max_catchup_ticks,
+            enabled: request.enabled,
+        },
+    );
+
+    if let Some(existing) = existing {
+        while event.event_id <= existing.row_version {
+            event.event_id = Ulid::new().to_string();
+        }
+    }
+
+    let request_key = ctx
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| event.event_id.clone());
+    event.idempotency_key = format!("sched_def_api:{schedule_id}:{request_key}");
+
+    let event_path = LedgerWriter::event_path(&event);
+
+    ledger.append(event).await.map_err(|e| {
+        ApiError::internal(format!("failed to append schedule definition event: {e}"))
+    })?;
+
+    compact_orchestration_events(&state.config, storage, vec![event_path]).await?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let definition = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
+        .ok_or_else(|| ApiError::internal("schedule definition missing after upsert"))?;
+
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    let status_code = if existed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+
+    Ok((status_code, Json(map_schedule(definition, schedule_state))))
+}
+
+pub(crate) async fn enable_schedule(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, schedule_id)): Path<(String, String)>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let existing = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
+        .ok_or_else(|| ApiError::not_found(format!("schedule not found: {schedule_id}")))?;
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    if existing.enabled {
+        return Ok((StatusCode::OK, Json(map_schedule(existing, schedule_state))));
+    }
+
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+
+    let ledger = LedgerWriter::new(storage.clone());
+    let mut event = OrchestrationEvent::new(
+        &ctx.tenant,
+        &workspace_id,
+        OrchestrationEventData::ScheduleDefinitionUpserted {
+            schedule_id: schedule_id.clone(),
+            cron_expression: existing.cron_expression.clone(),
+            timezone: existing.timezone.clone(),
+            catchup_window_minutes: existing.catchup_window_minutes,
+            asset_selection: existing.asset_selection.clone(),
+            max_catchup_ticks: existing.max_catchup_ticks,
+            enabled: true,
+        },
+    );
+
+    while event.event_id <= existing.row_version {
+        event.event_id = Ulid::new().to_string();
+    }
+
+    let request_key = ctx
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| event.event_id.clone());
+    event.idempotency_key = format!("sched_enable:{schedule_id}:{request_key}");
+
+    let event_path = LedgerWriter::event_path(&event);
+
+    ledger.append(event).await.map_err(|e| {
+        ApiError::internal(format!("failed to append schedule definition event: {e}"))
+    })?;
+
+    compact_orchestration_events(&state.config, storage, vec![event_path]).await?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let definition = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
+        .ok_or_else(|| ApiError::internal("schedule definition missing after enable"))?;
+
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    Ok((
+        StatusCode::OK,
+        Json(map_schedule(definition, schedule_state)),
+    ))
+}
+
+pub(crate) async fn disable_schedule(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, schedule_id)): Path<(String, String)>,
+    Json(_): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let existing = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
+        .ok_or_else(|| ApiError::not_found(format!("schedule not found: {schedule_id}")))?;
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    if !existing.enabled {
+        return Ok((StatusCode::OK, Json(map_schedule(existing, schedule_state))));
+    }
+
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+
+    let ledger = LedgerWriter::new(storage.clone());
+    let mut event = OrchestrationEvent::new(
+        &ctx.tenant,
+        &workspace_id,
+        OrchestrationEventData::ScheduleDefinitionUpserted {
+            schedule_id: schedule_id.clone(),
+            cron_expression: existing.cron_expression.clone(),
+            timezone: existing.timezone.clone(),
+            catchup_window_minutes: existing.catchup_window_minutes,
+            asset_selection: existing.asset_selection.clone(),
+            max_catchup_ticks: existing.max_catchup_ticks,
+            enabled: false,
+        },
+    );
+
+    while event.event_id <= existing.row_version {
+        event.event_id = Ulid::new().to_string();
+    }
+
+    let request_key = ctx
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| event.event_id.clone());
+    event.idempotency_key = format!("sched_disable:{schedule_id}:{request_key}");
+
+    let event_path = LedgerWriter::event_path(&event);
+
+    ledger.append(event).await.map_err(|e| {
+        ApiError::internal(format!("failed to append schedule definition event: {e}"))
+    })?;
+
+    compact_orchestration_events(&state.config, storage, vec![event_path]).await?;
+
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let definition = fold_state
+        .schedule_definitions
+        .get(schedule_id.as_str())
+        .ok_or_else(|| ApiError::internal("schedule definition missing after disable"))?;
+
+    let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+
+    Ok((
+        StatusCode::OK,
+        Json(map_schedule(definition, schedule_state)),
+    ))
+}
+
+pub(crate) async fn get_schedule_tick(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, schedule_id, tick_id)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    if !fold_state
+        .schedule_definitions
+        .contains_key(schedule_id.as_str())
+    {
+        return Err(ApiError::not_found(format!(
+            "schedule not found: {schedule_id}"
+        )));
+    }
+
+    let tick = fold_state
+        .schedule_ticks
+        .get(tick_id.as_str())
+        .ok_or_else(|| ApiError::not_found(format!("tick not found: {tick_id}")))?;
+
+    if tick.schedule_id != schedule_id {
+        return Err(ApiError::not_found(format!("tick not found: {tick_id}")));
+    }
+
+    Ok(Json(map_schedule_tick(tick)))
+}
+
+/// List schedule ticks.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/schedules/{schedule_id}/ticks",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("schedule_id" = String, Path, description = "Schedule ID"),
+        ("limit" = Option<u32>, Query, description = "Maximum ticks to return"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("status" = Option<TickStatusResponse>, Query, description = "Filter by status"),
+    ),
+    responses(
+        (status = 200, description = "List of ticks", body = ListScheduleTicksResponse),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn list_schedule_ticks(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, schedule_id)): Path<(String, String)>,
+    AxumQuery(query): AxumQuery<ListTicksQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let (limit, offset) = parse_pagination(
+        query.limit.unwrap_or(DEFAULT_LIMIT),
+        query.cursor.as_deref(),
+    )?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let mut ticks: Vec<ScheduleTickResponse> = fold_state
+        .schedule_ticks
+        .values()
+        .filter(|t| t.schedule_id == schedule_id)
+        .map(map_schedule_tick)
+        .collect();
+    filter_ticks_by_status(&mut ticks, query.status);
+    ticks.sort_by(|a, b| {
+        b.scheduled_for
+            .cmp(&a.scheduled_for)
+            .then_with(|| b.tick_id.cmp(&a.tick_id))
+    });
+
+    let (page, next_cursor) = paginate(&ticks, limit, offset);
+
+    Ok(Json(ListScheduleTicksResponse {
+        ticks: page,
+        next_cursor,
+    }))
+}
+
+// ============================================================================
+// Sensor Routes
+// ============================================================================
+
+/// List sensors.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/sensors",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("limit" = Option<u32>, Query, description = "Maximum sensors to return"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+    ),
+    responses(
+        (status = 200, description = "List of sensors", body = ListSensorsResponse),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn list_sensors(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path(workspace_id): Path<String>,
+    AxumQuery(query): AxumQuery<ListQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let (limit, offset) = parse_pagination(
+        query.limit.unwrap_or(DEFAULT_LIMIT),
+        query.cursor.as_deref(),
+    )?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let mut sensors: Vec<SensorResponse> = fold_state
+        .sensor_state
+        .values()
+        .map(map_sensor_state)
+        .collect();
+    sensors.sort_by(|a, b| a.sensor_id.cmp(&b.sensor_id));
+
+    let (page, next_cursor) = paginate(&sensors, limit, offset);
+
+    Ok(Json(ListSensorsResponse {
+        sensors: page,
+        next_cursor,
+    }))
+}
+
+/// Get sensor by ID.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/sensors/{sensor_id}",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("sensor_id" = String, Path, description = "Sensor ID")
+    ),
+    responses(
+        (status = 200, description = "Sensor details", body = SensorResponse),
+        (status = 404, description = "Sensor not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn get_sensor(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, sensor_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let sensor = fold_state
+        .sensor_state
+        .get(&sensor_id)
+        .ok_or_else(|| ApiError::not_found(format!("sensor not found: {sensor_id}")))?;
+
+    Ok(Json(map_sensor_state(sensor)))
+}
+
+/// List sensor evaluations.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/sensors/{sensor_id}/evals",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("sensor_id" = String, Path, description = "Sensor ID"),
+        ("limit" = Option<u32>, Query, description = "Maximum evaluations to return"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+    ),
+    responses(
+        (status = 200, description = "List of evaluations", body = ListSensorEvalsResponse),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn list_sensor_evals(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, sensor_id)): Path<(String, String)>,
+    AxumQuery(query): AxumQuery<ListQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let (limit, offset) = parse_pagination(
+        query.limit.unwrap_or(DEFAULT_LIMIT),
+        query.cursor.as_deref(),
+    )?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let mut evals: Vec<SensorEvalResponse> = fold_state
+        .sensor_evals
+        .values()
+        .filter(|e| e.sensor_id == sensor_id)
+        .map(map_sensor_eval)
+        .collect();
+    evals.sort_by(|a, b| b.evaluated_at.cmp(&a.evaluated_at));
+
+    let (page, next_cursor) = paginate(&evals, limit, offset);
+
+    Ok(Json(ListSensorEvalsResponse {
+        evals: page,
+        next_cursor,
+    }))
+}
+
+// ============================================================================
+// Backfill Routes
+// ============================================================================
+
+/// Create a new backfill.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/backfills",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID")
+    ),
+    request_body = CreateBackfillRequest,
+    responses(
+        (status = 202, description = "Backfill accepted", body = CreateBackfillResponse),
+        (status = 200, description = "Existing backfill returned", body = CreateBackfillResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorBody),
+        (status = 409, description = "Idempotency conflict", body = ApiErrorBody),
+        (status = 422, description = "Partition selector not supported", body = UnprocessableEntityResponse),
+        (status = 404, description = "Workspace not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn create_backfill(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path(workspace_id): Path<String>,
+    Json(request): Json<CreateBackfillRequest>,
+) -> Result<Response, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+
+    let CreateBackfillRequest {
+        asset_selection,
+        partition_selector,
+        client_request_id,
+        chunk_size,
+        max_concurrent_runs,
+    } = request;
+
+    if asset_selection.is_empty() {
+        return Err(ApiError::bad_request("assetSelection cannot be empty"));
+    }
+
+    if asset_selection.len() > 1 {
+        return Err(ApiError::bad_request(
+            "multi-asset backfills are not supported yet",
+        ));
+    }
+
+    let idempotency_key = client_request_id
+        .or_else(|| ctx.idempotency_key.clone())
+        .ok_or_else(|| ApiError::bad_request("clientRequestId or Idempotency-Key is required"))?;
+
+    let (partition_selector, partition_keys) = match partition_selector {
+        PartitionSelectorRequest::Explicit { partitions } => {
+            explicit_partition_selector(partitions)?
+        }
+        PartitionSelectorRequest::Range { .. } | PartitionSelectorRequest::Filter { .. } => {
+            let response = unsupported_partition_selector_response();
+            return Ok((StatusCode::UNPROCESSABLE_ENTITY, Json(response)).into_response());
+        }
+    };
+
+    let chunk_size = match chunk_size {
+        Some(0) | None => DEFAULT_BACKFILL_CHUNK_SIZE,
+        Some(value) => value,
+    };
+    let max_concurrent_runs = match max_concurrent_runs {
+        Some(0) | None => DEFAULT_BACKFILL_MAX_CONCURRENT_RUNS,
+        Some(value) => value,
+    };
+    let input = BackfillCreateInput {
+        asset_selection,
+        partition_selector,
+        partition_keys,
+        chunk_size,
+        max_concurrent_runs,
+    };
+
+    let fingerprint = compute_backfill_fingerprint(
+        &input.asset_selection,
+        &input.partition_keys,
+        input.chunk_size,
+        input.max_concurrent_runs,
+    )?;
+
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+
+    if let Some(existing) =
+        resolve_backfill_idempotency(&storage, &idempotency_key, &fingerprint).await?
+    {
+        return Ok((StatusCode::OK, Json(existing)).into_response());
+    }
+
+    let response = append_backfill_created_event(
+        state.as_ref(),
+        &ctx,
+        &workspace_id,
+        input,
+        &idempotency_key,
+        &storage,
+        fingerprint,
+    )
+    .await?;
+
+    Ok((StatusCode::ACCEPTED, Json(response)).into_response())
+}
+
+/// List backfills.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/backfills",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("limit" = Option<u32>, Query, description = "Maximum backfills to return"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("state" = Option<BackfillStateResponse>, Query, description = "Filter by state"),
+    ),
+    responses(
+        (status = 200, description = "List of backfills", body = ListBackfillsResponse),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn list_backfills(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path(workspace_id): Path<String>,
+    AxumQuery(query): AxumQuery<ListBackfillsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let (limit, offset) = parse_pagination(
+        query.limit.unwrap_or(DEFAULT_LIMIT),
+        query.cursor.as_deref(),
+    )?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let counts_by_backfill = build_chunk_counts_index(fold_state.backfill_chunks.values());
+    let mut backfills: Vec<BackfillResponse> = fold_state
+        .backfills
+        .values()
+        .map(|b| {
+            let counts = counts_by_backfill
+                .get(&b.backfill_id)
+                .cloned()
+                .unwrap_or_default();
+            map_backfill_with_counts(b, counts)
+        })
+        .collect();
+
+    if let Some(state_filter) = query.state {
+        backfills.retain(|b| b.state == state_filter);
+    }
+
+    backfills.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    let (page, next_cursor) = paginate(&backfills, limit, offset);
+
+    Ok(Json(ListBackfillsResponse {
+        backfills: page,
+        next_cursor,
+    }))
+}
+
+/// Get backfill by ID.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/backfills/{backfill_id}",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("backfill_id" = String, Path, description = "Backfill ID")
+    ),
+    responses(
+        (status = 200, description = "Backfill details", body = BackfillResponse),
+        (status = 404, description = "Backfill not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn get_backfill(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, backfill_id)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let backfill = fold_state
+        .backfills
+        .get(&backfill_id)
+        .ok_or_else(|| ApiError::not_found(format!("backfill not found: {backfill_id}")))?;
+
+    let chunks: Vec<&BackfillChunkRow> = fold_state
+        .backfill_chunks
+        .values()
+        .filter(|c| c.backfill_id == backfill_id)
+        .collect();
+
+    Ok(Json(map_backfill(backfill, &chunks)))
+}
+
+/// List backfill chunks.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/backfills/{backfill_id}/chunks",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("backfill_id" = String, Path, description = "Backfill ID"),
+        ("limit" = Option<u32>, Query, description = "Maximum chunks to return"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("state" = Option<ChunkStateResponse>, Query, description = "Filter by state"),
+    ),
+    responses(
+        (status = 200, description = "List of chunks", body = ListBackfillChunksResponse),
+        (status = 404, description = "Backfill not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn list_backfill_chunks(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, backfill_id)): Path<(String, String)>,
+    AxumQuery(query): AxumQuery<ListChunksQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let (limit, offset) = parse_pagination(
+        query.limit.unwrap_or(DEFAULT_LIMIT),
+        query.cursor.as_deref(),
+    )?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    // Verify backfill exists
+    if !fold_state.backfills.contains_key(&backfill_id) {
+        return Err(ApiError::not_found(format!(
+            "backfill not found: {backfill_id}"
+        )));
+    }
+
+    let mut chunks: Vec<BackfillChunkResponse> = fold_state
+        .backfill_chunks
+        .values()
+        .filter(|c| c.backfill_id == backfill_id)
+        .map(map_backfill_chunk)
+        .collect();
+
+    if let Some(state_filter) = query.state {
+        chunks.retain(|c| c.state as u8 == state_filter as u8);
+    }
+
+    chunks.sort_by(|a, b| a.chunk_index.cmp(&b.chunk_index));
+
+    let (page, next_cursor) = paginate(&chunks, limit, offset);
+
+    Ok(Json(ListBackfillChunksResponse {
+        chunks: page,
+        next_cursor,
+    }))
+}
+
+// ============================================================================
+// Partition Routes
+// ============================================================================
+
+/// List partitions.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/partitions",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("limit" = Option<u32>, Query, description = "Maximum partitions to return"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("assetKey" = Option<String>, Query, description = "Filter by asset key"),
+        ("staleOnly" = Option<bool>, Query, description = "Filter to stale partitions only"),
+    ),
+    responses(
+        (status = 200, description = "List of partitions", body = ListPartitionsResponse),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn list_partitions(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path(workspace_id): Path<String>,
+    AxumQuery(query): AxumQuery<ListPartitionsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let (limit, offset) = parse_pagination(
+        query.limit.unwrap_or(DEFAULT_LIMIT),
+        query.cursor.as_deref(),
+    )?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let mut partitions: Vec<PartitionStatusApiResponse> = fold_state
+        .partition_status
+        .values()
+        .filter(|p| {
+            if let Some(ref asset_key) = query.asset_key {
+                if &p.asset_key != asset_key {
+                    return false;
+                }
+            }
+            if query.stale_only.unwrap_or(false) && p.stale_since.is_none() {
+                return false;
+            }
+            true
+        })
+        .map(map_partition_status)
+        .collect();
+
+    partitions.sort_by(|a, b| {
+        a.asset_key
+            .cmp(&b.asset_key)
+            .then_with(|| a.partition_key.cmp(&b.partition_key))
+    });
+
+    let (page, next_cursor) = paginate(&partitions, limit, offset);
+
+    Ok(Json(ListPartitionsResponse {
+        partitions: page,
+        next_cursor,
+    }))
+}
+
+/// Get partition summary for an asset.
+#[utoipa::path(
+    get,
+    path = "/api/v1/workspaces/{workspace_id}/assets/{asset_key}/partitions/summary",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("asset_key" = String, Path, description = "Asset key (URL-encoded)")
+    ),
+    responses(
+        (status = 200, description = "Partition summary", body = AssetPartitionSummaryResponse),
+        (status = 404, description = "Asset not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn get_asset_partition_summary(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    Path((workspace_id, asset_key)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_workspace(&ctx, &workspace_id)?;
+    let fold_state = load_orchestration_state(&ctx, &state).await?;
+
+    let partitions: Vec<&PartitionStatusRow> = fold_state
+        .partition_status
+        .values()
+        .filter(|p| p.asset_key == asset_key)
+        .collect();
+
+    if partitions.is_empty() {
+        return Err(ApiError::not_found(format!(
+            "no partitions found for asset: {asset_key}"
+        )));
+    }
+
+    let total = u32::try_from(partitions.len()).unwrap_or(u32::MAX);
+    let materialized = u32::try_from(
+        partitions
+            .iter()
+            .filter(|p| p.last_materialization_run_id.is_some())
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    let stale_count = u32::try_from(
+        partitions
+            .iter()
+            .filter(|p| p.stale_since.is_some())
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    let missing = total.saturating_sub(materialized);
+
+    Ok(Json(AssetPartitionSummaryResponse {
+        asset_key,
+        total_partitions: total,
+        materialized_partitions: materialized,
+        stale_partitions: stale_count,
+        missing_partitions: missing,
+    }))
+}
+
+// ============================================================================
 // Router
 // ============================================================================
 
 /// Creates the orchestration routes.
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        // Runs
         .route("/workspaces/:workspace_id/runs", post(trigger_run))
         .route("/workspaces/:workspace_id/runs", get(list_runs))
         .route("/workspaces/:workspace_id/runs/:run_id", get(get_run))
         .route(
-            "/workspaces/:workspace_id/sensors/:sensor_id/evaluate",
-            post(manual_evaluate_sensor),
+            "/workspaces/:workspace_id/runs/:run_id/rerun",
+            post(rerun_run),
         )
         .route(
             "/workspaces/:workspace_id/runs/run-key/backfill",
@@ -1630,11 +4925,67 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/workspaces/:workspace_id/runs/:run_id/logs",
             get(get_run_logs),
         )
+        // Schedules
+        .route("/workspaces/:workspace_id/schedules", get(list_schedules))
+        .route(
+            "/workspaces/:workspace_id/schedules/:schedule_id",
+            get(get_schedule).put(upsert_schedule),
+        )
+        .route(
+            "/workspaces/:workspace_id/schedules/:schedule_id/enable",
+            post(enable_schedule),
+        )
+        .route(
+            "/workspaces/:workspace_id/schedules/:schedule_id/disable",
+            post(disable_schedule),
+        )
+        .route(
+            "/workspaces/:workspace_id/schedules/:schedule_id/ticks",
+            get(list_schedule_ticks),
+        )
+        .route(
+            "/workspaces/:workspace_id/schedules/:schedule_id/ticks/:tick_id",
+            get(get_schedule_tick),
+        )
+        // Sensors
+        .route("/workspaces/:workspace_id/sensors", get(list_sensors))
+        .route(
+            "/workspaces/:workspace_id/sensors/:sensor_id",
+            get(get_sensor),
+        )
+        .route(
+            "/workspaces/:workspace_id/sensors/:sensor_id/evaluate",
+            post(manual_evaluate_sensor),
+        )
+        .route(
+            "/workspaces/:workspace_id/sensors/:sensor_id/evals",
+            get(list_sensor_evals),
+        )
+        // Backfills
+        .route(
+            "/workspaces/:workspace_id/backfills",
+            post(create_backfill).get(list_backfills),
+        )
+        .route(
+            "/workspaces/:workspace_id/backfills/:backfill_id",
+            get(get_backfill),
+        )
+        .route(
+            "/workspaces/:workspace_id/backfills/:backfill_id/chunks",
+            get(list_backfill_chunks),
+        )
+        // Partitions
+        .route("/workspaces/:workspace_id/partitions", get(list_partitions))
+        .route(
+            "/workspaces/:workspace_id/assets/:asset_key/partitions/summary",
+            get(get_asset_partition_summary),
+        )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes::manifests::{AssetEntry, AssetKey, GitContext};
     use anyhow::{Result, anyhow};
     use arco_core::partition::{PartitionKey, ScalarValue};
     use axum::http::StatusCode;
@@ -1655,6 +5006,194 @@ mod tests {
     }
 
     #[test]
+    fn test_trigger_request_deserialization_partition_key() {
+        let json = r#"{
+            "selection": ["analytics/users"],
+            "partitionKey": "date=s:MjAyNC0wMS0xNQ",
+            "runKey": "daily-etl:2024-01-15"
+        }"#;
+
+        let request: TriggerRunRequest = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(request.selection, vec!["analytics/users"]);
+        assert_eq!(
+            request.partition_key.as_deref(),
+            Some("date=s:MjAyNC0wMS0xNQ")
+        );
+        assert!(request.partitions.is_empty());
+    }
+
+    #[test]
+    fn test_trigger_request_limits_rejects_too_long_partition_key() {
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: Some("x".repeat(MAX_PARTITION_KEY_LEN + 1)),
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err = validate_trigger_run_request_limits(&request).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.message().contains("partitionKey"));
+    }
+
+    #[test]
+    fn test_trigger_request_limits_rejects_too_many_selection_items() {
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string(); MAX_SELECTION_ITEMS + 1],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: None,
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err = validate_trigger_run_request_limits(&request).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.message().contains("selection"));
+    }
+
+    #[test]
+    fn test_build_partition_key_rejects_canonical_string_too_long() {
+        let partitions = vec![
+            PartitionValue {
+                key: "a".to_string(),
+                value: "x".repeat(MAX_PARTITION_VALUE_LEN),
+            },
+            PartitionValue {
+                key: "b".to_string(),
+                value: "x".repeat(MAX_PARTITION_VALUE_LEN),
+            },
+            PartitionValue {
+                key: "c".to_string(),
+                value: "x".repeat(MAX_PARTITION_VALUE_LEN),
+            },
+        ];
+
+        let err = build_partition_key(&partitions).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.message().contains("partitionKey exceeds max length"));
+    }
+
+    #[test]
+    fn test_resolve_partition_key_rejects_both_partition_key_and_partitions() {
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![PartitionValue {
+                key: "date".to_string(),
+                value: "2024-01-15".to_string(),
+            }],
+            partition_key: Some("date=s:MjAyNC0wMS0xNQ".to_string()),
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err = resolve_partition_key(&request).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_resolve_partition_key_rejects_noncanonical_partition_key() {
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: Some("tenant=s:YWNtZQ,date=s:MjAyNC0wMS0xNQ".to_string()),
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err = resolve_partition_key(&request).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.message().contains("canonical"));
+    }
+
+    #[test]
+    fn test_resolve_partition_key_accepts_canonical_partition_key() -> Result<()> {
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: Some("date=s:MjAyNC0wMS0xNQ,tenant=s:YWNtZQ".to_string()),
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let resolved = resolve_partition_key(&request).map_err(|err| anyhow!("{err:?}"))?;
+        assert_eq!(
+            resolved.as_deref(),
+            Some("date=s:MjAyNC0wMS0xNQ,tenant=s:YWNtZQ")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolve_partition_key_rejects_empty_partition_key() {
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: Some("".to_string()),
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let err = resolve_partition_key(&request).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_request_fingerprint_equivalent_for_partition_key_and_partitions() -> Result<()> {
+        let partitions = vec![
+            PartitionValue {
+                key: "region".to_string(),
+                value: "us-east-1".to_string(),
+            },
+            PartitionValue {
+                key: "date".to_string(),
+                value: "2024-01-15".to_string(),
+            },
+        ];
+
+        let request_with_partitions = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: partitions.clone(),
+            partition_key: None,
+            run_key: Some("daily-etl:2024-01-15".to_string()),
+            labels: HashMap::new(),
+        };
+
+        let canonical = build_partition_key(&partitions).map_err(|err| anyhow!("{err:?}"))?;
+        let request_with_partition_key = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: canonical,
+            run_key: Some("daily-etl:2024-01-15".to_string()),
+            labels: HashMap::new(),
+        };
+
+        let fingerprint_partitions = build_request_fingerprint(&request_with_partitions)
+            .map_err(|err| anyhow!("{err:?}"))?;
+        let fingerprint_partition_key = build_request_fingerprint(&request_with_partition_key)
+            .map_err(|err| anyhow!("{err:?}"))?;
+
+        assert_eq!(fingerprint_partitions, fingerprint_partition_key);
+        Ok(())
+    }
+
+    #[test]
     fn test_run_response_serialization() {
         let response = RunResponse {
             run_id: "run_123".to_string(),
@@ -1667,11 +5206,167 @@ mod tests {
             tasks: vec![],
             task_counts: TaskCounts::default(),
             labels: HashMap::new(),
+            parent_run_id: None,
+            rerun_kind: None,
         };
 
         let json = serde_json::to_string(&response).expect("serialize");
         assert!(json.contains("\"runId\":\"run_123\""));
         assert!(json.contains("\"state\":\"RUNNING\""));
+    }
+
+    #[test]
+    fn test_parse_pagination_rejects_zero_limit() {
+        let err = parse_pagination(0, None).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.message(),
+            format!("limit must be between 1 and {MAX_LIST_LIMIT}")
+        );
+    }
+
+    #[test]
+    fn test_parse_pagination_rejects_invalid_cursor() {
+        let err = parse_pagination(1, Some("abc")).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.message(), "invalid cursor");
+    }
+
+    #[test]
+    fn test_parse_pagination_parses_cursor() {
+        let (limit, offset) = parse_pagination(5, Some("10")).expect("parse");
+        assert_eq!(limit, 5);
+        assert_eq!(offset, 10);
+    }
+
+    #[test]
+    fn test_partition_selector_filter_maps_to_response() {
+        let mut filters = HashMap::new();
+        filters.insert("region".to_string(), "us-*".to_string());
+
+        let selector = PartitionSelector::Filter {
+            filters: filters.clone(),
+        };
+        let response = map_partition_selector(&selector);
+        let json = serde_json::to_value(&response).expect("serialize");
+
+        assert_eq!(json["type"], "filter");
+        assert_eq!(json["filters"]["region"], "us-*");
+    }
+
+    #[test]
+    fn test_build_chunk_counts_index_groups_by_backfill() {
+        let rows = vec![
+            BackfillChunkRow {
+                tenant_id: "tenant".to_string(),
+                workspace_id: "workspace".to_string(),
+                chunk_id: "bf_a:0".to_string(),
+                backfill_id: "bf_a".to_string(),
+                chunk_index: 0,
+                partition_keys: vec!["2025-01-01".to_string()],
+                run_key: "rk_a0".to_string(),
+                run_id: None,
+                state: ChunkState::Pending,
+                row_version: "01HQ1".to_string(),
+            },
+            BackfillChunkRow {
+                tenant_id: "tenant".to_string(),
+                workspace_id: "workspace".to_string(),
+                chunk_id: "bf_a:1".to_string(),
+                backfill_id: "bf_a".to_string(),
+                chunk_index: 1,
+                partition_keys: vec!["2025-01-02".to_string()],
+                run_key: "rk_a1".to_string(),
+                run_id: None,
+                state: ChunkState::Planned,
+                row_version: "01HQ2".to_string(),
+            },
+            BackfillChunkRow {
+                tenant_id: "tenant".to_string(),
+                workspace_id: "workspace".to_string(),
+                chunk_id: "bf_a:2".to_string(),
+                backfill_id: "bf_a".to_string(),
+                chunk_index: 2,
+                partition_keys: vec!["2025-01-03".to_string()],
+                run_key: "rk_a2".to_string(),
+                run_id: None,
+                state: ChunkState::Running,
+                row_version: "01HQ3".to_string(),
+            },
+            BackfillChunkRow {
+                tenant_id: "tenant".to_string(),
+                workspace_id: "workspace".to_string(),
+                chunk_id: "bf_b:0".to_string(),
+                backfill_id: "bf_b".to_string(),
+                chunk_index: 0,
+                partition_keys: vec!["2025-01-01".to_string()],
+                run_key: "rk_b0".to_string(),
+                run_id: None,
+                state: ChunkState::Succeeded,
+                row_version: "01HQ4".to_string(),
+            },
+            BackfillChunkRow {
+                tenant_id: "tenant".to_string(),
+                workspace_id: "workspace".to_string(),
+                chunk_id: "bf_b:1".to_string(),
+                backfill_id: "bf_b".to_string(),
+                chunk_index: 1,
+                partition_keys: vec!["2025-01-02".to_string()],
+                run_key: "rk_b1".to_string(),
+                run_id: None,
+                state: ChunkState::Failed,
+                row_version: "01HQ5".to_string(),
+            },
+        ];
+
+        let counts = build_chunk_counts_index(rows.iter());
+
+        let a = counts.get("bf_a").expect("bf_a");
+        assert_eq!(a.total, 3);
+        assert_eq!(a.pending, 2);
+        assert_eq!(a.running, 1);
+        assert_eq!(a.succeeded, 0);
+        assert_eq!(a.failed, 0);
+
+        let b = counts.get("bf_b").expect("bf_b");
+        assert_eq!(b.total, 2);
+        assert_eq!(b.pending, 0);
+        assert_eq!(b.running, 0);
+        assert_eq!(b.succeeded, 1);
+        assert_eq!(b.failed, 1);
+    }
+
+    #[test]
+    fn test_filter_ticks_by_status() {
+        let mut ticks = vec![
+            ScheduleTickResponse {
+                tick_id: "tick_1".to_string(),
+                schedule_id: "sched".to_string(),
+                scheduled_for: Utc::now(),
+                asset_selection: vec![],
+                status: TickStatusResponse::Triggered,
+                skip_reason: None,
+                error_message: None,
+                run_key: None,
+                run_id: None,
+            },
+            ScheduleTickResponse {
+                tick_id: "tick_2".to_string(),
+                schedule_id: "sched".to_string(),
+                scheduled_for: Utc::now(),
+                asset_selection: vec![],
+                status: TickStatusResponse::Failed,
+                skip_reason: None,
+                error_message: Some("boom".to_string()),
+                run_key: None,
+                run_id: None,
+            },
+        ];
+
+        filter_ticks_by_status(&mut ticks, Some(TickStatusResponse::Failed));
+
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].status, TickStatusResponse::Failed);
     }
 
     #[test]
@@ -1681,7 +5376,9 @@ mod tests {
         labels.insert("team".to_string(), "infra".to_string());
 
         let request_a = TriggerRunRequest {
-            selection: vec!["b".to_string(), "a".to_string()],
+            selection: vec!["analytics.b".to_string(), "analytics.a".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![
                 PartitionValue {
                     key: "date".to_string(),
@@ -1692,6 +5389,7 @@ mod tests {
                     value: "us-east-1".to_string(),
                 },
             ],
+            partition_key: None,
             run_key: Some("daily:2024-01-01".to_string()),
             labels: labels.clone(),
         };
@@ -1701,7 +5399,9 @@ mod tests {
         labels_reordered.insert("env".to_string(), "prod".to_string());
 
         let request_b = TriggerRunRequest {
-            selection: vec!["a".to_string(), "b".to_string()],
+            selection: vec!["analytics.a".to_string(), "analytics.b".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![
                 PartitionValue {
                     key: "region".to_string(),
@@ -1712,6 +5412,7 @@ mod tests {
                     value: "2024-01-01".to_string(),
                 },
             ],
+            partition_key: None,
             run_key: Some("daily:2024-01-01".to_string()),
             labels: labels_reordered,
         };
@@ -1726,46 +5427,37 @@ mod tests {
     }
 
     #[test]
-    fn test_build_task_defs_canonical_partition_key() -> Result<()> {
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string()],
-            partitions: vec![
-                PartitionValue {
-                    key: "region".to_string(),
-                    value: "us-east-1".to_string(),
-                },
-                PartitionValue {
-                    key: "date".to_string(),
-                    value: "2024-01-15".to_string(),
-                },
-            ],
-            run_key: None,
-            labels: HashMap::new(),
-        };
+    fn test_build_partition_key_canonical_string() -> Result<()> {
+        let partitions = vec![
+            PartitionValue {
+                key: "region".to_string(),
+                value: "us-east-1".to_string(),
+            },
+            PartitionValue {
+                key: "date".to_string(),
+                value: "2024-01-15".to_string(),
+            },
+        ];
 
-        let tasks = build_task_defs(&request).map_err(|err| anyhow!("{err:?}"))?;
+        let partition_key = build_partition_key(&partitions).map_err(|err| anyhow!("{err:?}"))?;
+
         let mut pk = PartitionKey::new();
         pk.insert("region", ScalarValue::String("us-east-1".to_string()));
         pk.insert("date", ScalarValue::String("2024-01-15".to_string()));
         let expected = pk.canonical_string();
 
-        assert_eq!(tasks[0].partition_key.as_deref(), Some(expected.as_str()));
+        assert_eq!(partition_key.as_deref(), Some(expected.as_str()));
         Ok(())
     }
 
     #[test]
-    fn test_build_task_defs_rejects_invalid_partition_key() {
-        let request = TriggerRunRequest {
-            selection: vec!["analytics/users".to_string()],
-            partitions: vec![PartitionValue {
-                key: "Date".to_string(),
-                value: "2024-01-15".to_string(),
-            }],
-            run_key: None,
-            labels: HashMap::new(),
-        };
+    fn test_build_partition_key_rejects_invalid_partition_key() {
+        let partitions = vec![PartitionValue {
+            key: "Date".to_string(),
+            value: "2024-01-15".to_string(),
+        }];
 
-        assert!(build_task_defs(&request).is_err());
+        assert!(build_partition_key(&partitions).is_err());
     }
 
     #[tokio::test]
@@ -1784,7 +5476,10 @@ mod tests {
 
         let request = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
+            partition_key: None,
             run_key: Some("daily:2024-01-01".to_string()),
             labels: HashMap::new(),
         };
@@ -1792,15 +5487,72 @@ mod tests {
         let backend = state.storage_backend()?;
         let storage = ctx.scoped_storage(backend)?;
 
+        let manifest_id = Ulid::new().to_string();
+        let stored_manifest = StoredManifest {
+            manifest_id: manifest_id.clone(),
+            tenant_id: ctx.tenant.clone(),
+            workspace_id: ctx.workspace.clone(),
+            manifest_version: "1.0".to_string(),
+            code_version_id: "abc123".to_string(),
+            fingerprint: "fp".to_string(),
+            git: GitContext::default(),
+            assets: vec![AssetEntry {
+                key: AssetKey {
+                    namespace: "analytics".to_string(),
+                    name: "users".to_string(),
+                },
+                id: "01HQXYZ123".to_string(),
+                description: String::new(),
+                owners: vec![],
+                tags: serde_json::Value::Null,
+                partitioning: serde_json::Value::Null,
+                dependencies: vec![],
+                code: serde_json::Value::Null,
+                checks: vec![],
+                execution: serde_json::Value::Null,
+                resources: serde_json::Value::Null,
+                io: serde_json::Value::Null,
+                transform_fingerprint: String::new(),
+            }],
+            schedules: vec![],
+            deployed_at: Utc::now(),
+            deployed_by: "test".to_string(),
+            metadata: serde_json::Value::Null,
+        };
+
+        let manifest_path = crate::paths::manifest_path(&manifest_id);
+        storage
+            .put_raw(
+                &manifest_path,
+                Bytes::from(serde_json::to_vec(&stored_manifest)?),
+                WritePrecondition::None,
+            )
+            .await?;
+        storage
+            .put_raw(
+                MANIFEST_LATEST_INDEX_PATH,
+                Bytes::from(serde_json::to_vec(&LatestManifestIndex {
+                    latest_manifest_id: manifest_id,
+                    deployed_at: stored_manifest.deployed_at,
+                })?),
+                WritePrecondition::None,
+            )
+            .await?;
+
         let reservation = RunKeyReservation {
             run_key: "daily:2024-01-01".to_string(),
             run_id: Ulid::new().to_string(),
             plan_id: Ulid::new().to_string(),
             event_id: Ulid::new().to_string(),
             plan_event_id: Some(Ulid::new().to_string()),
-            request_fingerprint: Some(
-                build_request_fingerprint(&request).map_err(|err| anyhow!("{err:?}"))?,
-            ),
+            request_fingerprint: Some({
+                let (primary, variants) = build_request_fingerprint_variants(&request)
+                    .map_err(|err| anyhow!("{err:?}"))?;
+                variants
+                    .into_iter()
+                    .find(|fp| fp != &primary)
+                    .unwrap_or(primary)
+            }),
             created_at: Utc::now(),
         };
 
@@ -1836,7 +5588,7 @@ mod tests {
                 trigger: TriggerInfo::Manual {
                     user_id: user_id_for_events(&ctx),
                 },
-                root_assets: vec!["analytics/users".to_string()],
+                root_assets: vec!["analytics.users".to_string()],
                 run_key: Some(reservation.run_key.clone()),
                 labels: request.labels.clone(),
                 code_version: None,
@@ -1860,7 +5612,22 @@ mod tests {
             OrchestrationEventData::PlanCreated {
                 run_id: reservation.run_id.clone(),
                 plan_id: reservation.plan_id.clone(),
-                tasks: build_task_defs(&request).map_err(|err| anyhow!("{err:?}"))?,
+                tasks: {
+                    let graph = arco_flow::orchestration::AssetGraph::new();
+                    let partition_key =
+                        resolve_partition_key(&request).map_err(|err| anyhow!("{err:?}"))?;
+                    let options = arco_flow::orchestration::SelectionOptions {
+                        include_upstream: request.include_upstream,
+                        include_downstream: request.include_downstream,
+                    };
+                    arco_flow::orchestration::build_task_defs_for_selection(
+                        &graph,
+                        &request.selection,
+                        options,
+                        partition_key.as_deref(),
+                    )
+                    .map_err(|err| anyhow!("{err}"))?
+                },
             },
         );
         apply_event_metadata(&mut plan_event, &plan_event_id, reservation.created_at);
@@ -1869,6 +5636,92 @@ mod tests {
         let stored_plan: OrchestrationEvent = serde_json::from_slice(&plan_bytes)?;
         assert_eq!(stored_plan.event_id, plan_event_id);
         assert_eq!(stored_plan.event_type, "PlanCreated");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_trigger_run_normalizes_reserve_run_key_fingerprint_mismatch_for_equivalent_variants()
+    -> Result<()> {
+        let mut config = crate::config::Config::default();
+        config.debug = true;
+        let state = Arc::new(AppState::with_memory_storage(config));
+
+        let ctx = RequestContext {
+            tenant: "tenant".to_string(),
+            workspace: "workspace".to_string(),
+            user_id: Some("user@example.com".to_string()),
+            request_id: "req_01".to_string(),
+            idempotency_key: None,
+        };
+
+        let partitions = vec![
+            PartitionValue {
+                key: "region".to_string(),
+                value: "us-east-1".to_string(),
+            },
+            PartitionValue {
+                key: "date".to_string(),
+                value: "2024-01-15".to_string(),
+            },
+        ];
+
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions,
+            partition_key: None,
+            run_key: Some("daily:2024-01-15".to_string()),
+            labels: HashMap::new(),
+        };
+
+        let (primary, variants) =
+            build_request_fingerprint_variants(&request).map_err(|err| anyhow!("{err:?}"))?;
+        let legacy = variants
+            .iter()
+            .find(|fp| *fp != &primary)
+            .cloned()
+            .expect("expected legacy fingerprint variant");
+
+        let backend = state.storage_backend()?;
+        let storage = ctx.scoped_storage(backend)?;
+
+        let run_key = request.run_key.clone().expect("run_key");
+
+        let legacy_reservation = RunKeyReservation {
+            run_key: run_key.clone(),
+            run_id: Ulid::new().to_string(),
+            plan_id: Ulid::new().to_string(),
+            event_id: Ulid::new().to_string(),
+            plan_event_id: Some(Ulid::new().to_string()),
+            request_fingerprint: Some(legacy),
+            created_at: Utc::now(),
+        };
+
+        let reserved =
+            reserve_run_key(&storage, &legacy_reservation, FingerprintPolicy::lenient()).await?;
+        assert!(matches!(reserved, ReservationResult::Reserved));
+
+        let new_reservation = RunKeyReservation {
+            run_key: run_key.clone(),
+            run_id: Ulid::new().to_string(),
+            plan_id: Ulid::new().to_string(),
+            event_id: Ulid::new().to_string(),
+            plan_event_id: Some(Ulid::new().to_string()),
+            request_fingerprint: Some(primary),
+            created_at: Utc::now(),
+        };
+
+        let result =
+            reserve_run_key(&storage, &new_reservation, FingerprintPolicy::lenient()).await?;
+        assert!(matches!(
+            result,
+            ReservationResult::FingerprintMismatch { .. }
+        ));
+
+        let normalized = normalize_trigger_run_reservation_result(result, &variants);
+        assert!(matches!(normalized, ReservationResult::AlreadyExists(_)));
 
         Ok(())
     }
@@ -1889,14 +5742,20 @@ mod tests {
 
         let request_a = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
+            partition_key: None,
             run_key: Some("daily:2024-01-01".to_string()),
             labels: HashMap::new(),
         };
 
         let request_b = TriggerRunRequest {
             selection: vec!["analytics/orders".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
+            partition_key: None,
             run_key: Some("daily:2024-01-01".to_string()),
             labels: HashMap::new(),
         };
@@ -1937,6 +5796,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_trigger_run_falls_back_to_scan_when_index_points_to_missing_manifest()
+    -> Result<()> {
+        let mut config = crate::config::Config::default();
+        config.debug = true;
+        let state = Arc::new(AppState::with_memory_storage(config));
+
+        let ctx = RequestContext {
+            tenant: "tenant".to_string(),
+            workspace: "workspace".to_string(),
+            user_id: Some("user@example.com".to_string()),
+            request_id: "req_01".to_string(),
+            idempotency_key: None,
+        };
+
+        let backend = state.storage_backend()?;
+        let storage = ctx.scoped_storage(backend)?;
+
+        let manifest_id = Ulid::new().to_string();
+        let stored_manifest = StoredManifest {
+            manifest_id: manifest_id.clone(),
+            tenant_id: ctx.tenant.clone(),
+            workspace_id: ctx.workspace.clone(),
+            manifest_version: "1.0".to_string(),
+            code_version_id: "abc123".to_string(),
+            fingerprint: "fp".to_string(),
+            git: GitContext::default(),
+            assets: vec![AssetEntry {
+                key: AssetKey {
+                    namespace: "analytics".to_string(),
+                    name: "orders".to_string(),
+                },
+                id: "01HQXYZ123".to_string(),
+                description: String::new(),
+                owners: vec![],
+                tags: serde_json::Value::Null,
+                partitioning: serde_json::Value::Null,
+                dependencies: vec![],
+                code: serde_json::Value::Null,
+                checks: vec![],
+                execution: serde_json::Value::Null,
+                resources: serde_json::Value::Null,
+                io: serde_json::Value::Null,
+                transform_fingerprint: String::new(),
+            }],
+            schedules: vec![],
+            deployed_at: Utc::now(),
+            deployed_by: "test".to_string(),
+            metadata: serde_json::Value::Null,
+        };
+
+        let manifest_path = crate::paths::manifest_path(&manifest_id);
+        storage
+            .put_raw(
+                &manifest_path,
+                Bytes::from(serde_json::to_vec(&stored_manifest)?),
+                WritePrecondition::None,
+            )
+            .await?;
+
+        storage
+            .put_raw(
+                MANIFEST_LATEST_INDEX_PATH,
+                Bytes::from(serde_json::to_vec(&LatestManifestIndex {
+                    latest_manifest_id: "missing".to_string(),
+                    deployed_at: stored_manifest.deployed_at,
+                })?),
+                WritePrecondition::None,
+            )
+            .await?;
+
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/orders".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: None,
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let response = trigger_run(
+            State(state),
+            ctx.clone(),
+            Path(ctx.workspace.clone()),
+            Json(request),
+        )
+        .await
+        .map_err(|err| anyhow!("{err:?}"))?
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_backfill_run_key_updates_missing_fingerprint() -> Result<()> {
         let cutoff = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let mut config = crate::config::Config::default();
@@ -1955,13 +5909,18 @@ mod tests {
         let request = RunKeyBackfillRequest {
             run_key: "daily:2024-01-01".to_string(),
             selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
             labels: HashMap::new(),
         };
 
         let fingerprint_request = TriggerRunRequest {
             selection: request.selection.clone(),
+            include_upstream: request.include_upstream,
+            include_downstream: request.include_downstream,
             partitions: request.partitions.clone(),
+            partition_key: None,
             run_key: Some(request.run_key.clone()),
             labels: request.labels.clone(),
         };
@@ -2023,7 +5982,10 @@ mod tests {
 
         let request_a = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
+            partition_key: None,
             run_key: Some("daily:2024-01-01".to_string()),
             labels: HashMap::new(),
         };
@@ -2031,6 +5993,8 @@ mod tests {
         let request_b = RunKeyBackfillRequest {
             run_key: "daily:2024-01-01".to_string(),
             selection: vec!["analytics/orders".to_string()],
+            include_upstream: false,
+            include_downstream: false,
             partitions: vec![],
             labels: HashMap::new(),
         };

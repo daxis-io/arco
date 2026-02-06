@@ -7,6 +7,7 @@
 
 use arco_core::{AssetId, TaskId};
 use arco_flow::plan::{AssetKey, PlanBuilder, ResourceRequirements, TaskSpec};
+use arco_flow::task_key::TaskOperation;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 fn plan_generation_benchmark(c: &mut Criterion) {
@@ -26,6 +27,7 @@ fn plan_generation_benchmark(c: &mut Criterion) {
                         task_id,
                         asset_id: AssetId::generate(),
                         asset_key: AssetKey::new("benchmark", format!("task_{i}")),
+                        operation: TaskOperation::Materialize,
                         partition_key: None,
                         upstream_task_ids,
                         stage: 0,

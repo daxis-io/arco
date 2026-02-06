@@ -45,8 +45,6 @@ use serde::{Deserialize, Serialize};
 
 use super::{EnqueueOptions, EnqueueResult, TaskEnvelope, TaskQueue};
 use crate::error::{Error, Result};
-#[cfg(feature = "gcp")]
-use crate::orchestration::ids::cloud_task_id;
 
 /// Configuration for Cloud Tasks dispatcher.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,10 +175,14 @@ mod gcp_impl {
     use super::{
         CloudTasksConfig, EnqueueOptions, EnqueueResult, Error, Result, TaskEnvelope, TaskQueue,
     };
+    use crate::dispatch::enqueue_result_for_status;
+    use crate::orchestration::ids::cloud_task_id;
     use base64::Engine;
     use gcp_auth::TokenProvider;
+    use serde::{Deserialize, Serialize};
     use std::collections::HashSet;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Mutex;
 
     /// Google Cloud Tasks dispatcher.
@@ -441,10 +443,8 @@ mod gcp_impl {
                 retry_config: self.retry_config_payload(),
             };
 
-            let api_url = format!(
-                "https://cloudtasks.googleapis.com/v2/{}?updateMask=retryConfig",
-                queue_path
-            );
+            let api_url =
+                format!("https://cloudtasks.googleapis.com/v2/{queue_path}?updateMask=retryConfig");
 
             let response = self
                 .client
@@ -474,8 +474,7 @@ mod gcp_impl {
                     )))
                 } else {
                     Err(Error::configuration(format!(
-                        "Cloud Tasks queue update error: {} - {}",
-                        status, error_body
+                        "Cloud Tasks queue update error: {status} - {error_body}"
                     )))
                 }
             }
@@ -495,8 +494,10 @@ mod gcp_impl {
 
             self.apply_retry_config(queue_path).await?;
 
-            let mut configured = self.configured_queues.lock().await;
-            configured.insert(queue_path.to_string());
+            self.configured_queues
+                .lock()
+                .await
+                .insert(queue_path.to_string());
             Ok(())
         }
 
@@ -518,7 +519,7 @@ mod gcp_impl {
             audience: Option<&str>,
         ) -> Result<EnqueueResult> {
             let queue_path = self.queue_path_for_routing(options.routing_key.as_deref());
-            let task_name = format!("{}/tasks/{}", queue_path, task_id);
+            let task_name = format!("{queue_path}/tasks/{task_id}");
 
             self.ensure_queue_retry_config(&queue_path).await?;
 
@@ -554,7 +555,7 @@ mod gcp_impl {
             };
 
             let access_token = self.get_access_token().await?;
-            let api_url = format!("https://cloudtasks.googleapis.com/v2/{}/tasks", queue_path);
+            let api_url = format!("https://cloudtasks.googleapis.com/v2/{queue_path}/tasks");
 
             let response = self
                 .client
@@ -577,7 +578,7 @@ mod gcp_impl {
                 });
             }
 
-            if let Some(result) = super::enqueue_result_for_status(status.as_u16(), &task_name) {
+            if let Some(result) = enqueue_result_for_status(status.as_u16(), &task_name) {
                 return Ok(result);
             }
 
@@ -595,8 +596,7 @@ mod gcp_impl {
             }
 
             Err(Error::dispatch(format!(
-                "Cloud Tasks API error: {} - {}",
-                status, error_body
+                "Cloud Tasks API error: {status} - {error_body}"
             )))
         }
     }
@@ -612,7 +612,7 @@ mod gcp_impl {
             let idempotency_key = envelope.idempotency_key();
             let task_id = Self::task_id_from_key(&idempotency_key);
             let queue_path = self.queue_path_for_routing(options.routing_key.as_deref());
-            let task_name = format!("{}/tasks/{}", queue_path, task_id);
+            let task_name = format!("{queue_path}/tasks/{task_id}");
 
             self.ensure_queue_retry_config(&queue_path).await?;
 
@@ -659,7 +659,7 @@ mod gcp_impl {
             let access_token = self.get_access_token().await?;
 
             // Make the API call
-            let api_url = format!("https://cloudtasks.googleapis.com/v2/{}/tasks", queue_path);
+            let api_url = format!("https://cloudtasks.googleapis.com/v2/{queue_path}/tasks");
 
             let response = self
                 .client
@@ -681,9 +681,7 @@ mod gcp_impl {
                 Ok(EnqueueResult::Enqueued {
                     message_id: success.name,
                 })
-            } else if let Some(result) =
-                super::enqueue_result_for_status(status.as_u16(), &task_name)
-            {
+            } else if let Some(result) = enqueue_result_for_status(status.as_u16(), &task_name) {
                 Ok(result)
             } else {
                 // Other error
@@ -702,8 +700,7 @@ mod gcp_impl {
                     )))
                 } else {
                     Err(Error::dispatch(format!(
-                        "Cloud Tasks API error: {} - {}",
-                        status, error_body
+                        "Cloud Tasks API error: {status} - {error_body}"
                     )))
                 }
             }
@@ -917,6 +914,8 @@ mod tests {
 
     #[cfg(feature = "gcp")]
     mod gcp_tests {
+        use std::time::Duration;
+
         use super::CloudTasksDispatcher;
 
         #[test]

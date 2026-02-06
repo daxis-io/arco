@@ -628,7 +628,7 @@ fn rand_jitter() -> u64 {
 
 /// Path constants for lock files.
 ///
-/// These align with [`ScopedStorage`](arco_core::ScopedStorage) path helpers.
+/// These align with [`ScopedStorage`](crate::ScopedStorage) path helpers.
 pub mod paths {
     /// Lock file for the catalog domain (Tier 1) operations.
     pub const CATALOG_LOCK: &str = "locks/catalog.lock.json";

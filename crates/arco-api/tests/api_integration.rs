@@ -7,10 +7,12 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use tower::ServiceExt;
 
-use arco_api::config::{Config, CorsConfig};
+use arco_api::config::{Config, CorsConfig, Posture};
 use arco_api::server::{Server, ServerBuilder};
 
 const TEST_JWT_SECRET: &str = "test-jwt-secret";
+const TEST_JWT_ISSUER: &str = "https://issuer.test";
+const TEST_JWT_AUDIENCE: &str = "arco-api";
 
 fn test_router() -> axum::Router {
     ServerBuilder::new().debug(true).build().test_router()
@@ -19,8 +21,27 @@ fn test_router() -> axum::Router {
 fn test_router_prod() -> axum::Router {
     let config = Config {
         debug: false,
+        posture: Posture::Private,
         jwt: arco_api::config::JwtConfig {
             hs256_secret: Some(TEST_JWT_SECRET.to_string()),
+            issuer: Some(TEST_JWT_ISSUER.to_string()),
+            audience: Some(TEST_JWT_AUDIENCE.to_string()),
+            ..arco_api::config::JwtConfig::default()
+        },
+        ..Config::default()
+    };
+
+    Server::new(config).test_router()
+}
+
+fn test_router_public() -> axum::Router {
+    let config = Config {
+        debug: false,
+        posture: Posture::Public,
+        jwt: arco_api::config::JwtConfig {
+            hs256_secret: Some(TEST_JWT_SECRET.to_string()),
+            issuer: Some(TEST_JWT_ISSUER.to_string()),
+            audience: Some(TEST_JWT_AUDIENCE.to_string()),
             ..arco_api::config::JwtConfig::default()
         },
         ..Config::default()
@@ -81,6 +102,22 @@ async fn test_server_uses_provided_storage_backend() -> Result<()> {
         !objects.is_empty(),
         "expected writes to go to the provided backend"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_public_posture_blocks_metrics() -> Result<()> {
+    let router = test_router_public();
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/metrics")
+        .body(Body::empty())
+        .context("build request")?;
+
+    let response = router.oneshot(request).await.map_err(|err| match err {})?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     Ok(())
 }
@@ -739,11 +776,13 @@ mod orchestration {
     use arco_core::storage::{MemoryBackend, StorageBackend};
     use arco_flow::orchestration::LedgerWriter;
     use arco_flow::orchestration::compactor::MicroCompactor;
+    use arco_flow::orchestration::controllers::ReadyDispatchController;
     use arco_flow::orchestration::controllers::{
         PollSensorResult, PubSubMessage, SensorEvaluationError, SensorEvaluator,
     };
-    use arco_flow::orchestration::controllers::ReadyDispatchController;
-    use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData, RunRequest};
+    use arco_flow::orchestration::events::{
+        OrchestrationEvent, OrchestrationEventData, RunRequest,
+    };
 
     #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -831,7 +870,7 @@ mod orchestration {
     }
 
     #[tokio::test]
-    async fn test_servo_deploy_run_callbacks_and_logs() -> Result<()> {
+    async fn test_arco_flow_deploy_run_callbacks_and_logs() -> Result<()> {
         let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let router = ServerBuilder::new()
             .debug(true)
@@ -859,7 +898,7 @@ mod orchestration {
             router.clone(),
             "/api/v1/workspaces/test-workspace/manifests",
             manifest,
-            &[("Idempotency-Key", "idem-servo-001")],
+            &[("Idempotency-Key", "idem-arco-flow-001")],
         )
         .await?;
         assert_eq!(status, StatusCode::CREATED);
@@ -1090,6 +1129,8 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
             tenant: &'a str,
             workspace: &'a str,
             sub: &'a str,
+            iss: &'a str,
+            aud: &'a str,
             exp: u64,
         }
 
@@ -1104,6 +1145,8 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
             tenant,
             workspace,
             sub: TEST_USER_ID,
+            iss: TEST_JWT_ISSUER,
+            aud: TEST_JWT_AUDIENCE,
             exp,
         };
 
@@ -1123,6 +1166,8 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
         struct Claims<'a> {
             tenant: &'a str,
             workspace: &'a str,
+            iss: &'a str,
+            aud: &'a str,
             exp: u64,
         }
 
@@ -1136,6 +1181,80 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
         let claims = Claims {
             tenant,
             workspace,
+            iss: TEST_JWT_ISSUER,
+            aud: TEST_JWT_AUDIENCE,
+            exp,
+        };
+
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        )
+        .context("encode JWT")
+    }
+
+    fn make_test_jwt_missing_issuer(tenant: &str, workspace: &str) -> Result<String> {
+        use serde::Serialize;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        #[derive(Debug, Serialize)]
+        struct Claims<'a> {
+            tenant: &'a str,
+            workspace: &'a str,
+            sub: &'a str,
+            aud: &'a str,
+            exp: u64,
+        }
+
+        let exp = SystemTime::now()
+            .checked_add(Duration::from_secs(60 * 60))
+            .context("compute JWT expiry")?
+            .duration_since(UNIX_EPOCH)
+            .context("system time before unix epoch")?
+            .as_secs();
+
+        let claims = Claims {
+            tenant,
+            workspace,
+            sub: TEST_USER_ID,
+            aud: TEST_JWT_AUDIENCE,
+            exp,
+        };
+
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        )
+        .context("encode JWT")
+    }
+
+    fn make_test_jwt_missing_audience(tenant: &str, workspace: &str) -> Result<String> {
+        use serde::Serialize;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        #[derive(Debug, Serialize)]
+        struct Claims<'a> {
+            tenant: &'a str,
+            workspace: &'a str,
+            sub: &'a str,
+            iss: &'a str,
+            exp: u64,
+        }
+
+        let exp = SystemTime::now()
+            .checked_add(Duration::from_secs(60 * 60))
+            .context("compute JWT expiry")?
+            .duration_since(UNIX_EPOCH)
+            .context("system time before unix epoch")?
+            .as_secs();
+
+        let claims = Claims {
+            tenant,
+            workspace,
+            sub: TEST_USER_ID,
+            iss: TEST_JWT_ISSUER,
             exp,
         };
 
@@ -1156,6 +1275,8 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
             tenant: &'a str,
             workspace: &'a str,
             sub: &'a str,
+            iss: &'a str,
+            aud: &'a str,
             exp: u64,
         }
 
@@ -1170,6 +1291,8 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
             tenant,
             workspace,
             sub: TEST_USER_ID,
+            iss: TEST_JWT_ISSUER,
+            aud: TEST_JWT_AUDIENCE,
             exp,
         };
 
@@ -1268,6 +1391,64 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
     }
 
     #[tokio::test]
+    async fn test_production_mode_rejects_missing_issuer_claim() -> Result<()> {
+        #[derive(Debug, Deserialize)]
+        struct ErrorBody {
+            code: String,
+        }
+
+        let router = test_router_prod();
+        let jwt = make_test_jwt_missing_issuer("test-tenant", "test-workspace")?;
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/namespaces")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(Body::empty())
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .context("read response body")?;
+        let error: ErrorBody = serde_json::from_slice(&body).context("parse JSON body")?;
+        assert_eq!(error.code, "INVALID_TOKEN");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_production_mode_rejects_missing_audience_claim() -> Result<()> {
+        #[derive(Debug, Deserialize)]
+        struct ErrorBody {
+            code: String,
+        }
+
+        let router = test_router_prod();
+        let jwt = make_test_jwt_missing_audience("test-tenant", "test-workspace")?;
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/namespaces")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(Body::empty())
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .context("read response body")?;
+        let error: ErrorBody = serde_json::from_slice(&body).context("parse JSON body")?;
+        assert_eq!(error.code, "INVALID_TOKEN");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_production_mode_accepts_bearer_jwt() -> Result<()> {
         let router = test_router_prod();
 
@@ -1294,8 +1475,11 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
     async fn test_production_mode_accepts_rs256_jwt() -> Result<()> {
         let config = Config {
             debug: false,
+            posture: Posture::Private,
             jwt: arco_api::config::JwtConfig {
                 rs256_public_key_pem: Some(TEST_RSA_PUBLIC_KEY_PEM.to_string()),
+                issuer: Some(TEST_JWT_ISSUER.to_string()),
+                audience: Some(TEST_JWT_AUDIENCE.to_string()),
                 ..arco_api::config::JwtConfig::default()
             },
             ..Config::default()
@@ -1333,7 +1517,7 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
             .uri("/api/v1/namespaces")
             .header("X-Tenant-Id", "test-tenant")
             .header("X-Workspace-Id", "test-workspace")
-            .header("Idempotency-Key", "unique-key-123")
+            .header("Idempotency-Key", "01924a7c-8d9f-7000-8000-000000000001")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body))
             .context("build request")?;
@@ -1458,6 +1642,386 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
                 .headers()
                 .contains_key("access-control-allow-origin")
         );
+
+        Ok(())
+    }
+}
+
+mod query {
+    use super::*;
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    async fn seed_catalog(router: axum::Router) -> Result<axum::Router> {
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/namespaces",
+            serde_json::json!({
+                "name": "analytics",
+                "description": "Analytics namespace"
+            }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/namespaces/analytics/tables",
+            serde_json::json!({
+                "name": "events",
+                "description": "Event stream",
+                "columns": [
+                    {"name": "event_id", "data_type": "STRING", "nullable": false},
+                    {"name": "event_type", "data_type": "STRING", "nullable": false}
+                ]
+            }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        Ok(router)
+    }
+
+    #[tokio::test]
+    async fn test_query_returns_arrow_stream() -> Result<()> {
+        let router = seed_catalog(test_router()).await?;
+
+        let request = helpers::make_request_with_headers(
+            Method::POST,
+            "/api/v1/query",
+            Some(serde_json::json!({
+                "sql": "SELECT name FROM catalog.namespaces"
+            })),
+            &[("Accept", "application/vnd.apache.arrow.stream")],
+        )?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(content_type, Some("application/vnd.apache.arrow.stream"));
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .context("read response body")?;
+        let cursor = Cursor::new(body.to_vec());
+        let mut reader = StreamReader::try_new(cursor, None).context("open arrow stream reader")?;
+        let mut rows = 0;
+        while let Some(batch) = reader.next() {
+            let batch = batch.context("read arrow batch")?;
+            rows += batch.num_rows();
+        }
+        assert!(rows >= 1, "expected at least one namespace row");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_query_returns_json_format() -> Result<()> {
+        let router = seed_catalog(test_router()).await?;
+
+        let request = helpers::make_request(
+            Method::POST,
+            "/api/v1/query?format=json",
+            Some(serde_json::json!({
+                "sql": "SELECT name FROM catalog.namespaces"
+            })),
+        )?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(content_type, Some("application/json"));
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .context("read response body")?;
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&body).context("parse JSON response")?;
+        assert!(
+            rows.iter()
+                .any(|row| row.get("name") == Some(&"analytics".into()))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_query_rejects_non_select() -> Result<()> {
+        let router = test_router();
+
+        let request = helpers::make_request(
+            Method::POST,
+            "/api/v1/query",
+            Some(serde_json::json!({
+                "sql": "DELETE FROM catalog.namespaces"
+            })),
+        )?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_audit_emits_auth_allow_on_success() -> Result<()> {
+        use arco_core::audit::{AuditAction, AuditEmitter, TestAuditSink};
+
+        let sink = std::sync::Arc::new(TestAuditSink::new());
+        let emitter = std::sync::Arc::new(AuditEmitter::with_test_sink(sink.clone()));
+
+        let router = ServerBuilder::new()
+            .debug(true)
+            .audit_emitter(emitter)
+            .build()
+            .test_router();
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/namespaces")
+            .header("X-Tenant-Id", "test-tenant")
+            .header("X-Workspace-Id", "test-workspace")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"name": "audit-test-ns", "description": "test"}"#,
+            ))
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let events = sink.events();
+        let auth_allows = events
+            .iter()
+            .filter(|e| e.action == AuditAction::AuthAllow)
+            .count();
+        assert!(auth_allows >= 1, "expected at least one AuthAllow event");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_audit_emits_auth_deny_on_missing_auth() -> Result<()> {
+        use arco_core::audit::{AuditAction, AuditEmitter, TestAuditSink};
+
+        let sink = std::sync::Arc::new(TestAuditSink::new());
+        let emitter = std::sync::Arc::new(AuditEmitter::with_test_sink(sink.clone()));
+
+        let config = Config {
+            debug: false,
+            posture: Posture::Private,
+            jwt: arco_api::config::JwtConfig {
+                hs256_secret: Some(TEST_JWT_SECRET.to_string()),
+                issuer: Some(TEST_JWT_ISSUER.to_string()),
+                audience: Some(TEST_JWT_AUDIENCE.to_string()),
+                ..arco_api::config::JwtConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let router = ServerBuilder::new()
+            .config(config)
+            .storage_backend(std::sync::Arc::new(arco_core::storage::MemoryBackend::new()))
+            .audit_emitter(emitter)
+            .build()
+            .test_router();
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/namespaces")
+            .body(Body::empty())
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let events = sink.events();
+        let auth_denies = events
+            .iter()
+            .filter(|e| e.action == AuditAction::AuthDeny)
+            .count();
+        assert!(auth_denies >= 1, "expected at least one AuthDeny event");
+
+        let deny_event = events
+            .iter()
+            .find(|e| e.action == AuditAction::AuthDeny)
+            .expect("should have AuthDeny event");
+        assert_eq!(deny_event.decision_reason, "missing_token");
+
+        Ok(())
+    }
+}
+
+mod idempotency {
+    use super::*;
+    use serde::Deserialize;
+    use std::sync::Arc;
+
+    use arco_core::storage::MemoryBackend;
+
+    #[derive(Debug, Deserialize)]
+    struct NamespaceResponse {
+        id: String,
+        name: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct TableResponse {
+        id: String,
+        #[allow(dead_code)]
+        name: String,
+    }
+
+    fn router_with_shared_storage() -> (axum::Router, Arc<MemoryBackend>) {
+        let backend = Arc::new(MemoryBackend::new());
+        let router = ServerBuilder::new()
+            .debug(true)
+            .storage_backend(backend.clone())
+            .build()
+            .test_router();
+        (router, backend)
+    }
+
+    #[tokio::test]
+    async fn test_create_namespace_idempotent_replay() -> Result<()> {
+        let (router, _) = router_with_shared_storage();
+        let idempotency_key = "01924a7c-8d9f-7000-8000-000000000001";
+
+        let body = serde_json::json!({
+            "name": "idempotent-ns",
+            "description": "Test namespace"
+        });
+
+        let (status1, ns1): (_, NamespaceResponse) = helpers::post_json_with_headers(
+            router.clone(),
+            "/api/v1/namespaces",
+            body.clone(),
+            &[("Idempotency-Key", idempotency_key)],
+        )
+        .await?;
+        assert_eq!(status1, StatusCode::CREATED);
+
+        let (status2, ns2): (_, NamespaceResponse) = helpers::post_json_with_headers(
+            router.clone(),
+            "/api/v1/namespaces",
+            body,
+            &[("Idempotency-Key", idempotency_key)],
+        )
+        .await?;
+        assert_eq!(status2, StatusCode::CREATED);
+        assert_eq!(ns1.id, ns2.id);
+        assert_eq!(ns1.name, ns2.name);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_namespace_conflict_on_different_payload() -> Result<()> {
+        let (router, _) = router_with_shared_storage();
+        let idempotency_key = "01924a7c-8d9f-7000-8000-000000000002";
+
+        let (status1, _): (_, NamespaceResponse) = helpers::post_json_with_headers(
+            router.clone(),
+            "/api/v1/namespaces",
+            serde_json::json!({
+                "name": "ns-v1",
+                "description": "First version"
+            }),
+            &[("Idempotency-Key", idempotency_key)],
+        )
+        .await?;
+        assert_eq!(status1, StatusCode::CREATED);
+
+        let request = helpers::make_request_with_headers(
+            Method::POST,
+            "/api/v1/namespaces",
+            Some(serde_json::json!({
+                "name": "ns-v2",
+                "description": "Different version"
+            })),
+            &[("Idempotency-Key", idempotency_key)],
+        )?;
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_register_table_idempotent_replay() -> Result<()> {
+        let (router, _) = router_with_shared_storage();
+
+        let (_, _): (_, NamespaceResponse) = helpers::post_json(
+            router.clone(),
+            "/api/v1/namespaces",
+            serde_json::json!({ "name": "test-ns" }),
+        )
+        .await?;
+
+        let idempotency_key = "01924a7c-8d9f-7000-8000-000000000003";
+        let table_body = serde_json::json!({
+            "name": "test-table",
+            "columns": [
+                {"name": "id", "data_type": "INTEGER", "nullable": false}
+            ]
+        });
+
+        let (status1, t1): (_, TableResponse) = helpers::post_json_with_headers(
+            router.clone(),
+            "/api/v1/namespaces/test-ns/tables",
+            table_body.clone(),
+            &[("Idempotency-Key", idempotency_key)],
+        )
+        .await?;
+        assert_eq!(status1, StatusCode::CREATED);
+
+        let (status2, t2): (_, TableResponse) = helpers::post_json_with_headers(
+            router.clone(),
+            "/api/v1/namespaces/test-ns/tables",
+            table_body,
+            &[("Idempotency-Key", idempotency_key)],
+        )
+        .await?;
+        assert_eq!(status2, StatusCode::CREATED);
+        assert_eq!(t1.id, t2.id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_invalid_idempotency_key_rejected() -> Result<()> {
+        let router = test_router();
+
+        let request = helpers::make_request_with_headers(
+            Method::POST,
+            "/api/v1/namespaces",
+            Some(serde_json::json!({ "name": "test-ns" })),
+            &[("Idempotency-Key", "not-a-valid-uuid")],
+        )?;
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_uuidv4_idempotency_key_rejected() -> Result<()> {
+        let router = test_router();
+
+        let request = helpers::make_request_with_headers(
+            Method::POST,
+            "/api/v1/namespaces",
+            Some(serde_json::json!({ "name": "test-ns" })),
+            &[("Idempotency-Key", "550e8400-e29b-41d4-a716-446655440000")],
+        )?;
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         Ok(())
     }

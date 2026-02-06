@@ -18,19 +18,22 @@ use arco_core::{ScopedStorage, WritePrecondition, WriteResult};
 
 use crate::error::{Error, Result};
 use crate::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
+use crate::paths::{orchestration_l0_dir, orchestration_manifest_path};
 
 use super::fold::{
-    FoldState, merge_dep_satisfaction_rows, merge_dispatch_outbox_rows,
-    merge_idempotency_key_rows, merge_partition_status_rows, merge_run_rows,
-    merge_sensor_eval_rows, merge_sensor_state_rows, merge_task_rows, merge_timer_rows,
+    FoldState, merge_dep_satisfaction_rows, merge_dispatch_outbox_rows, merge_idempotency_key_rows,
+    merge_partition_status_rows, merge_run_rows, merge_schedule_definition_rows,
+    merge_schedule_state_rows, merge_schedule_tick_rows, merge_sensor_eval_rows,
+    merge_sensor_state_rows, merge_task_rows, merge_timer_rows,
 };
 use super::manifest::{
     EventRange, L0Delta, OrchestrationManifest, RowCounts, TablePaths, Watermarks,
 };
 use super::parquet_util::{
     read_partition_status, write_dep_satisfaction, write_dispatch_outbox, write_idempotency_keys,
-    write_partition_status, write_runs, write_sensor_evals, write_sensor_state, write_tasks,
-    write_timers,
+    write_partition_status, write_run_key_conflicts, write_run_key_index, write_runs,
+    write_schedule_definitions, write_schedule_state, write_schedule_ticks, write_sensor_evals,
+    write_sensor_state, write_tasks, write_timers,
 };
 
 const SENSOR_EVAL_RETENTION_DAYS: i64 = 30;
@@ -87,7 +90,7 @@ impl MicroCompactor {
     pub async fn load_state(&self) -> Result<(OrchestrationManifest, FoldState)> {
         let (manifest, _) = self.read_manifest_with_version().await?;
         let mut state = self.load_current_state(&manifest).await?;
-        state.tenant_secret = self.tenant_secret.clone();
+        state.tenant_secret.clone_from(&self.tenant_secret);
         Ok((manifest, state))
     }
 
@@ -124,7 +127,7 @@ impl MicroCompactor {
 
         // Load current fold state from base + L0 deltas
         let mut state = self.load_current_state(&manifest).await?;
-        state.tenant_secret = self.tenant_secret.clone();
+        state.tenant_secret.clone_from(&self.tenant_secret);
         let base_state = state.clone();
 
         // Process events
@@ -185,8 +188,15 @@ impl MicroCompactor {
             dispatch_outbox: u32::try_from(delta_state.dispatch_outbox.len()).unwrap_or(u32::MAX),
             sensor_state: u32::try_from(delta_state.sensor_state.len()).unwrap_or(u32::MAX),
             sensor_evals: u32::try_from(delta_state.sensor_evals.len()).unwrap_or(u32::MAX),
+            run_key_index: u32::try_from(delta_state.run_key_index.len()).unwrap_or(u32::MAX),
+            run_key_conflicts: u32::try_from(delta_state.run_key_conflicts.len())
+                .unwrap_or(u32::MAX),
             partition_status: u32::try_from(delta_state.partition_status.len()).unwrap_or(u32::MAX),
             idempotency_keys: u32::try_from(delta_state.idempotency_keys.len()).unwrap_or(u32::MAX),
+            schedule_definitions: u32::try_from(delta_state.schedule_definitions.len())
+                .unwrap_or(u32::MAX),
+            schedule_state: u32::try_from(delta_state.schedule_state.len()).unwrap_or(u32::MAX),
+            schedule_ticks: u32::try_from(delta_state.schedule_ticks.len()).unwrap_or(u32::MAX),
         };
 
         // Create L0 delta entry when changes exist
@@ -198,9 +208,7 @@ impl MicroCompactor {
             .last()
             .map(|e| e.1.event_id.clone())
             .unwrap_or_default();
-        let mut manifest_changed = false;
-
-        if let Some(delta_id) = delta_id.clone() {
+        let delta_changed = if let Some(delta_id) = delta_id.clone() {
             let delta = L0Delta {
                 delta_id,
                 created_at: Utc::now(),
@@ -216,12 +224,13 @@ impl MicroCompactor {
             // Update manifest
             manifest.l0_deltas.push(delta);
             manifest.l0_count += 1;
-            manifest_changed = true;
-        }
+            true
+        } else {
+            false
+        };
 
-        if update_watermarks(&mut manifest, &events, &last_event) {
-            manifest_changed = true;
-        }
+        let watermark_changed = update_watermarks(&mut manifest, &events, &last_event);
+        let manifest_changed = delta_changed || watermark_changed;
 
         let manifest_revision = if manifest_changed {
             let new_revision = Ulid::new().to_string();
@@ -243,7 +252,7 @@ impl MicroCompactor {
 
     /// Reads the current manifest and version for CAS publishing.
     async fn read_manifest_with_version(&self) -> Result<(OrchestrationManifest, Option<String>)> {
-        let manifest_path = "state/orchestration/manifest.json";
+        let manifest_path = orchestration_manifest_path();
 
         match self.storage.head_raw(manifest_path).await? {
             Some(meta) => {
@@ -266,14 +275,12 @@ impl MicroCompactor {
 
     /// Loads current fold state from base snapshot + L0 deltas.
     async fn load_current_state(&self, manifest: &OrchestrationManifest) -> Result<FoldState> {
-        let mut state = FoldState::new();
-
-        // Load base snapshot if exists
-        if let Some(ref snapshot_id) = manifest.base_snapshot.snapshot_id {
-            state = self
-                .load_snapshot_state(snapshot_id, &manifest.base_snapshot.tables)
-                .await?;
-        }
+        let mut state = if let Some(ref snapshot_id) = manifest.base_snapshot.snapshot_id {
+            self.load_snapshot_state(snapshot_id, &manifest.base_snapshot.tables)
+                .await?
+        } else {
+            FoldState::new()
+        };
 
         // Apply L0 deltas in order
         for delta in &manifest.l0_deltas {
@@ -363,6 +370,23 @@ impl MicroCompactor {
             }
         }
 
+        if let Some(ref run_key_index_path) = tables.run_key_index {
+            let data = self.storage.get_raw(run_key_index_path).await?;
+            let rows = super::parquet_util::read_run_key_index(&data)?;
+            for row in rows {
+                state.run_key_index.insert(row.run_key.clone(), row);
+            }
+        }
+
+        if let Some(ref run_key_conflicts_path) = tables.run_key_conflicts {
+            let data = self.storage.get_raw(run_key_conflicts_path).await?;
+            let rows = super::parquet_util::read_run_key_conflicts(&data)?;
+            for row in rows {
+                let conflict_id = format!("conflict:{}:{}", row.run_key, row.conflicting_event_id);
+                state.run_key_conflicts.insert(conflict_id, row);
+            }
+        }
+
         if let Some(ref partition_status_path) = tables.partition_status {
             let data = self.storage.get_raw(partition_status_path).await?;
             let rows = read_partition_status(&data)?;
@@ -382,7 +406,39 @@ impl MicroCompactor {
             }
         }
 
+        self.load_schedule_tables(&mut state, tables).await?;
+
         Ok(state)
+    }
+
+    async fn load_schedule_tables(&self, state: &mut FoldState, tables: &TablePaths) -> Result<()> {
+        if let Some(ref schedule_definitions_path) = tables.schedule_definitions {
+            let data = self.storage.get_raw(schedule_definitions_path).await?;
+            let rows = super::parquet_util::read_schedule_definitions(&data)?;
+            for row in rows {
+                state
+                    .schedule_definitions
+                    .insert(row.schedule_id.clone(), row);
+            }
+        }
+
+        if let Some(ref schedule_state_path) = tables.schedule_state {
+            let data = self.storage.get_raw(schedule_state_path).await?;
+            let rows = super::parquet_util::read_schedule_state(&data)?;
+            for row in rows {
+                state.schedule_state.insert(row.schedule_id.clone(), row);
+            }
+        }
+
+        if let Some(ref schedule_ticks_path) = tables.schedule_ticks {
+            let data = self.storage.get_raw(schedule_ticks_path).await?;
+            let rows = super::parquet_util::read_schedule_ticks(&data)?;
+            for row in rows {
+                state.schedule_ticks.insert(row.tick_id.clone(), row);
+            }
+        }
+
+        Ok(())
     }
 
     /// Loads state from an L0 delta.
@@ -394,84 +450,118 @@ impl MicroCompactor {
     /// Writes fold state to L0 delta Parquet files.
     async fn write_delta_parquet(&self, delta_id: &str, state: &FoldState) -> Result<TablePaths> {
         let mut paths = TablePaths::default();
-        let base_path = format!("state/orchestration/l0/{delta_id}");
+        let base_path = orchestration_l0_dir(delta_id);
 
-        // Write runs
-        if !state.runs.is_empty() {
-            let rows: Vec<_> = state.runs.values().cloned().collect();
-            let bytes = write_runs(&rows)?;
-            let path = format!("{base_path}/runs.parquet");
-            self.write_parquet_file(&path, bytes).await?;
-            paths.runs = Some(path);
+        macro_rules! write_table {
+            ($file:literal, $rows:expr, $encode:expr, $out:expr) => {
+                self.write_map_table_if_nonempty(&base_path, $file, $rows, $encode, $out)
+                    .await?;
+            };
         }
 
-        // Write tasks
-        if !state.tasks.is_empty() {
-            let rows: Vec<_> = state.tasks.values().cloned().collect();
-            let bytes = write_tasks(&rows)?;
-            let path = format!("{base_path}/tasks.parquet");
-            self.write_parquet_file(&path, bytes).await?;
-            paths.tasks = Some(path);
-        }
-
-        // Write dep_satisfaction
-        if !state.dep_satisfaction.is_empty() {
-            let rows: Vec<_> = state.dep_satisfaction.values().cloned().collect();
-            let bytes = write_dep_satisfaction(&rows)?;
-            let path = format!("{base_path}/dep_satisfaction.parquet");
-            self.write_parquet_file(&path, bytes).await?;
-            paths.dep_satisfaction = Some(path);
-        }
-
-        if !state.timers.is_empty() {
-            let rows: Vec<_> = state.timers.values().cloned().collect();
-            let bytes = write_timers(&rows)?;
-            let path = format!("{base_path}/timers.parquet");
-            self.write_parquet_file(&path, bytes).await?;
-            paths.timers = Some(path);
-        }
-
-        if !state.dispatch_outbox.is_empty() {
-            let rows: Vec<_> = state.dispatch_outbox.values().cloned().collect();
-            let bytes = write_dispatch_outbox(&rows)?;
-            let path = format!("{base_path}/dispatch_outbox.parquet");
-            self.write_parquet_file(&path, bytes).await?;
-            paths.dispatch_outbox = Some(path);
-        }
-
-        if !state.sensor_state.is_empty() {
-            let rows: Vec<_> = state.sensor_state.values().cloned().collect();
-            let bytes = write_sensor_state(&rows)?;
-            let path = format!("{base_path}/sensor_state.parquet");
-            self.write_parquet_file(&path, bytes).await?;
-            paths.sensor_state = Some(path);
-        }
-
-        if !state.sensor_evals.is_empty() {
-            let rows: Vec<_> = state.sensor_evals.values().cloned().collect();
-            let bytes = write_sensor_evals(&rows)?;
-            let path = format!("{base_path}/sensor_evals.parquet");
-            self.write_parquet_file(&path, bytes).await?;
-            paths.sensor_evals = Some(path);
-        }
-
-        if !state.partition_status.is_empty() {
-            let rows: Vec<_> = state.partition_status.values().cloned().collect();
-            let bytes = write_partition_status(&rows)?;
-            let path = format!("{base_path}/partition_status.parquet");
-            self.write_parquet_file(&path, bytes).await?;
-            paths.partition_status = Some(path);
-        }
-
-        if !state.idempotency_keys.is_empty() {
-            let rows: Vec<_> = state.idempotency_keys.values().cloned().collect();
-            let bytes = write_idempotency_keys(&rows)?;
-            let path = format!("{base_path}/idempotency_keys.parquet");
-            self.write_parquet_file(&path, bytes).await?;
-            paths.idempotency_keys = Some(path);
-        }
+        write_table!("runs.parquet", &state.runs, write_runs, &mut paths.runs);
+        write_table!("tasks.parquet", &state.tasks, write_tasks, &mut paths.tasks);
+        write_table!(
+            "dep_satisfaction.parquet",
+            &state.dep_satisfaction,
+            write_dep_satisfaction,
+            &mut paths.dep_satisfaction
+        );
+        write_table!(
+            "timers.parquet",
+            &state.timers,
+            write_timers,
+            &mut paths.timers
+        );
+        write_table!(
+            "dispatch_outbox.parquet",
+            &state.dispatch_outbox,
+            write_dispatch_outbox,
+            &mut paths.dispatch_outbox
+        );
+        write_table!(
+            "sensor_state.parquet",
+            &state.sensor_state,
+            write_sensor_state,
+            &mut paths.sensor_state
+        );
+        write_table!(
+            "sensor_evals.parquet",
+            &state.sensor_evals,
+            write_sensor_evals,
+            &mut paths.sensor_evals
+        );
+        write_table!(
+            "run_key_index.parquet",
+            &state.run_key_index,
+            write_run_key_index,
+            &mut paths.run_key_index
+        );
+        write_table!(
+            "run_key_conflicts.parquet",
+            &state.run_key_conflicts,
+            write_run_key_conflicts,
+            &mut paths.run_key_conflicts
+        );
+        write_table!(
+            "partition_status.parquet",
+            &state.partition_status,
+            write_partition_status,
+            &mut paths.partition_status
+        );
+        write_table!(
+            "idempotency_keys.parquet",
+            &state.idempotency_keys,
+            write_idempotency_keys,
+            &mut paths.idempotency_keys
+        );
+        write_table!(
+            "schedule_definitions.parquet",
+            &state.schedule_definitions,
+            write_schedule_definitions,
+            &mut paths.schedule_definitions
+        );
+        write_table!(
+            "schedule_state.parquet",
+            &state.schedule_state,
+            write_schedule_state,
+            &mut paths.schedule_state
+        );
+        write_table!(
+            "schedule_ticks.parquet",
+            &state.schedule_ticks,
+            write_schedule_ticks,
+            &mut paths.schedule_ticks
+        );
 
         Ok(paths)
+    }
+
+    async fn write_map_table_if_nonempty<K, R>(
+        &self,
+        base_path: &str,
+        file: &str,
+        rows: &std::collections::HashMap<K, R>,
+        encode: fn(&[R]) -> Result<Bytes>,
+        out: &mut Option<String>,
+    ) -> Result<()>
+    where
+        K: std::hash::Hash + Eq + Sync,
+        R: Clone + Sync,
+    {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let bytes = {
+            let values: Vec<R> = rows.values().cloned().collect();
+            encode(&values)?
+        };
+
+        let path = format!("{base_path}/{file}");
+        self.write_parquet_file(&path, bytes).await?;
+        *out = Some(path);
+        Ok(())
     }
 
     /// Writes a Parquet file to storage.
@@ -496,7 +586,7 @@ impl MicroCompactor {
         manifest: &OrchestrationManifest,
         current_version: Option<&str>,
     ) -> Result<()> {
-        let manifest_path = "state/orchestration/manifest.json";
+        let manifest_path = orchestration_manifest_path();
         let json = serde_json::to_string_pretty(manifest).map_err(|e| Error::Serialization {
             message: format!("failed to serialize manifest: {e}"),
         })?;
@@ -623,6 +713,22 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
             .or_insert(row);
     }
 
+    for (run_key, row) in delta.run_key_index {
+        merged
+            .run_key_index
+            .entry(run_key)
+            .and_modify(|existing| {
+                if row.row_version > existing.row_version {
+                    *existing = row.clone();
+                }
+            })
+            .or_insert(row);
+    }
+
+    for (conflict_id, row) in delta.run_key_conflicts {
+        merged.run_key_conflicts.entry(conflict_id).or_insert(row);
+    }
+
     // Merge partition status
     for (key, row) in delta.partition_status {
         merged
@@ -653,69 +759,127 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
             .or_insert(row);
     }
 
+    for (schedule_id, row) in delta.schedule_definitions {
+        merged
+            .schedule_definitions
+            .entry(schedule_id)
+            .and_modify(|existing| {
+                if let Some(merged_row) =
+                    merge_schedule_definition_rows(vec![existing.clone(), row.clone()])
+                {
+                    *existing = merged_row;
+                }
+            })
+            .or_insert(row);
+    }
+
+    for (schedule_id, row) in delta.schedule_state {
+        merged
+            .schedule_state
+            .entry(schedule_id)
+            .and_modify(|existing| {
+                if let Some(merged_row) =
+                    merge_schedule_state_rows(vec![existing.clone(), row.clone()])
+                {
+                    *existing = merged_row;
+                }
+            })
+            .or_insert(row);
+    }
+
+    for (tick_id, row) in delta.schedule_ticks {
+        merged
+            .schedule_ticks
+            .entry(tick_id)
+            .and_modify(|existing| {
+                if let Some(merged_row) =
+                    merge_schedule_tick_rows(vec![existing.clone(), row.clone()])
+                {
+                    *existing = merged_row;
+                }
+            })
+            .or_insert(row);
+    }
+
     merged
+}
+
+fn insert_changed<K, V>(
+    delta: &mut std::collections::HashMap<K, V>,
+    base: &std::collections::HashMap<K, V>,
+    current: &std::collections::HashMap<K, V>,
+) where
+    K: std::hash::Hash + Eq + Clone,
+    V: PartialEq + Clone,
+{
+    for (key, row) in current {
+        if base.get(key) != Some(row) {
+            delta.insert(key.clone(), row.clone());
+        }
+    }
 }
 
 fn delta_from_states(base: &FoldState, current: &FoldState) -> FoldState {
     let mut delta = FoldState::new();
 
-    for (run_id, row) in &current.runs {
-        if base.runs.get(run_id) != Some(row) {
-            delta.runs.insert(run_id.clone(), row.clone());
-        }
-    }
-
-    for (key, row) in &current.tasks {
-        if base.tasks.get(key) != Some(row) {
-            delta.tasks.insert(key.clone(), row.clone());
-        }
-    }
-
-    for (key, row) in &current.dep_satisfaction {
-        if base.dep_satisfaction.get(key) != Some(row) {
-            delta.dep_satisfaction.insert(key.clone(), row.clone());
-        }
-    }
-
-    for (timer_id, row) in &current.timers {
-        if base.timers.get(timer_id) != Some(row) {
-            delta.timers.insert(timer_id.clone(), row.clone());
-        }
-    }
-
-    for (dispatch_id, row) in &current.dispatch_outbox {
-        if base.dispatch_outbox.get(dispatch_id) != Some(row) {
-            delta
-                .dispatch_outbox
-                .insert(dispatch_id.clone(), row.clone());
-        }
-    }
-
-    for (sensor_id, row) in &current.sensor_state {
-        if base.sensor_state.get(sensor_id) != Some(row) {
-            delta.sensor_state.insert(sensor_id.clone(), row.clone());
-        }
-    }
-
-    for (eval_id, row) in &current.sensor_evals {
-        if base.sensor_evals.get(eval_id) != Some(row) {
-            delta.sensor_evals.insert(eval_id.clone(), row.clone());
-        }
-    }
-
-    for (key, row) in &current.partition_status {
-        if base.partition_status.get(key) != Some(row) {
-            delta.partition_status.insert(key.clone(), row.clone());
-        }
-    }
-
-    for (idempotency_key, row) in &current.idempotency_keys {
-        if base.idempotency_keys.get(idempotency_key) != Some(row) {
-            delta
-                .idempotency_keys
-                .insert(idempotency_key.clone(), row.clone());
-        }
-    }
+    insert_changed(&mut delta.runs, &base.runs, &current.runs);
+    insert_changed(&mut delta.tasks, &base.tasks, &current.tasks);
+    insert_changed(
+        &mut delta.dep_satisfaction,
+        &base.dep_satisfaction,
+        &current.dep_satisfaction,
+    );
+    insert_changed(&mut delta.timers, &base.timers, &current.timers);
+    insert_changed(
+        &mut delta.dispatch_outbox,
+        &base.dispatch_outbox,
+        &current.dispatch_outbox,
+    );
+    insert_changed(
+        &mut delta.sensor_state,
+        &base.sensor_state,
+        &current.sensor_state,
+    );
+    insert_changed(
+        &mut delta.sensor_evals,
+        &base.sensor_evals,
+        &current.sensor_evals,
+    );
+    insert_changed(
+        &mut delta.run_key_index,
+        &base.run_key_index,
+        &current.run_key_index,
+    );
+    insert_changed(
+        &mut delta.run_key_conflicts,
+        &base.run_key_conflicts,
+        &current.run_key_conflicts,
+    );
+    insert_changed(
+        &mut delta.partition_status,
+        &base.partition_status,
+        &current.partition_status,
+    );
+    insert_changed(
+        &mut delta.idempotency_keys,
+        &base.idempotency_keys,
+        &current.idempotency_keys,
+    );
+    insert_changed(
+        &mut delta.schedule_definitions,
+        &base.schedule_definitions,
+        &current.schedule_definitions,
+    );
+    insert_changed(
+        &mut delta.schedule_state,
+        &base.schedule_state,
+        &current.schedule_state,
+    );
+    insert_changed(
+        &mut delta.schedule_ticks,
+        &base.schedule_ticks,
+        &current.schedule_ticks,
+    );
 
     delta
 }
@@ -728,8 +892,13 @@ fn delta_state_is_empty(state: &FoldState) -> bool {
         && state.dispatch_outbox.is_empty()
         && state.sensor_state.is_empty()
         && state.sensor_evals.is_empty()
+        && state.run_key_index.is_empty()
+        && state.run_key_conflicts.is_empty()
         && state.partition_status.is_empty()
         && state.idempotency_keys.is_empty()
+        && state.schedule_definitions.is_empty()
+        && state.schedule_state.is_empty()
+        && state.schedule_ticks.is_empty()
 }
 
 fn prune_sensor_evals(state: &mut FoldState) {
@@ -792,6 +961,7 @@ mod tests {
     use crate::orchestration::events::{
         OrchestrationEventData, SourceRef, TaskDef, TickStatus, TimerType, TriggerInfo,
     };
+    use crate::paths::orchestration_event_path;
     use arco_core::MemoryBackend;
     use chrono::DateTime;
     use std::collections::HashMap;
@@ -957,8 +1127,8 @@ mod tests {
         let event1 = make_run_triggered_event();
         let event2 = make_plan_created_event();
 
-        let path1 = format!("ledger/orchestration/2025-01-15/{}.json", event1.event_id);
-        let path2 = format!("ledger/orchestration/2025-01-15/{}.json", event2.event_id);
+        let path1 = orchestration_event_path("2025-01-15", &event1.event_id);
+        let path2 = orchestration_event_path("2025-01-15", &event2.event_id);
 
         storage
             .put_raw(
@@ -983,7 +1153,7 @@ mod tests {
         assert!(result.delta_id.is_some());
 
         // Verify manifest was updated
-        let manifest_data = storage.get_raw("state/orchestration/manifest.json").await?;
+        let manifest_data = storage.get_raw(orchestration_manifest_path()).await?;
         let manifest: OrchestrationManifest =
             serde_json::from_slice(&manifest_data).expect("parse");
 
@@ -1002,8 +1172,8 @@ mod tests {
         let event1 = make_run_triggered_event();
         let event2 = make_plan_created_event();
 
-        let path1 = format!("ledger/orchestration/2025-01-15/{}.json", event1.event_id);
-        let path2 = format!("ledger/orchestration/2025-01-15/{}.json", event2.event_id);
+        let path1 = orchestration_event_path("2025-01-15", &event1.event_id);
+        let path2 = orchestration_event_path("2025-01-15", &event2.event_id);
 
         storage
             .put_raw(
@@ -1054,8 +1224,8 @@ mod tests {
 
         let event1_id = event1.event_id.clone();
         let event2_id = event2.event_id.clone();
-        let path1 = format!("ledger/orchestration/2025-01-15/{}.json", event1_id);
-        let path2 = format!("ledger/orchestration/2025-01-15/{}.json", event2_id);
+        let path1 = orchestration_event_path("2025-01-15", &event1_id);
+        let path2 = orchestration_event_path("2025-01-15", &event2_id);
 
         storage
             .put_raw(
@@ -1076,7 +1246,7 @@ mod tests {
             .compact_events(vec![path2.clone(), path1.clone()])
             .await?;
 
-        let manifest_data = storage.get_raw("state/orchestration/manifest.json").await?;
+        let manifest_data = storage.get_raw(orchestration_manifest_path()).await?;
         let manifest: OrchestrationManifest =
             serde_json::from_slice(&manifest_data).expect("parse");
 
@@ -1105,8 +1275,8 @@ mod tests {
         let event1 = make_run_triggered_event();
         let event2 = make_plan_created_event();
 
-        let path1 = format!("ledger/orchestration/2025-01-15/{}.json", event1.event_id);
-        let path2 = format!("ledger/orchestration/2025-01-15/{}.json", event2.event_id);
+        let path1 = orchestration_event_path("2025-01-15", &event1.event_id);
+        let path2 = orchestration_event_path("2025-01-15", &event2.event_id);
 
         storage
             .put_raw(
@@ -1127,7 +1297,7 @@ mod tests {
 
         let attempt_id = Ulid::new().to_string();
         let event3 = make_task_started_event(&attempt_id);
-        let path3 = format!("ledger/orchestration/2025-01-15/{}.json", event3.event_id);
+        let path3 = orchestration_event_path("2025-01-15", &event3.event_id);
         storage
             .put_raw(
                 &path3,
@@ -1138,7 +1308,7 @@ mod tests {
 
         compactor.compact_events(vec![path3]).await?;
 
-        let manifest_data = storage.get_raw("state/orchestration/manifest.json").await?;
+        let manifest_data = storage.get_raw(orchestration_manifest_path()).await?;
         let manifest: OrchestrationManifest =
             serde_json::from_slice(&manifest_data).expect("parse");
 
@@ -1166,7 +1336,7 @@ mod tests {
         // DispatchEnqueued arrives first (newer ULID)
         let mut enqueued = make_dispatch_enqueued_event(&dispatch_id);
         enqueued.event_id = "01B".to_string();
-        let path1 = format!("ledger/orchestration/2025-01-15/{}.json", enqueued.event_id);
+        let path1 = orchestration_event_path("2025-01-15", &enqueued.event_id);
         storage
             .put_raw(
                 &path1,
@@ -1179,10 +1349,7 @@ mod tests {
         // DispatchRequested arrives later but with older ULID
         let mut requested = make_dispatch_requested_event("run_01", "extract", 1, "01HQ123ATT");
         requested.event_id = "01A".to_string();
-        let path2 = format!(
-            "ledger/orchestration/2025-01-15/{}.json",
-            requested.event_id
-        );
+        let path2 = orchestration_event_path("2025-01-15", &requested.event_id);
         storage
             .put_raw(
                 &path2,
@@ -1213,7 +1380,7 @@ mod tests {
         // TimerEnqueued arrives first (newer ULID)
         let mut enqueued = make_timer_enqueued_event(&timer_id);
         enqueued.event_id = "01B".to_string();
-        let path1 = format!("ledger/orchestration/2025-01-15/{}.json", enqueued.event_id);
+        let path1 = orchestration_event_path("2025-01-15", &enqueued.event_id);
         storage
             .put_raw(
                 &path1,
@@ -1227,10 +1394,7 @@ mod tests {
         let canonical_fire_at = DateTime::from_timestamp(fire_epoch + 30, 0).unwrap();
         let mut requested = make_timer_requested_event(&timer_id, canonical_fire_at);
         requested.event_id = "01A".to_string();
-        let path2 = format!(
-            "ledger/orchestration/2025-01-15/{}.json",
-            requested.event_id
-        );
+        let path2 = orchestration_event_path("2025-01-15", &requested.event_id);
         storage
             .put_raw(
                 &path2,
@@ -1258,7 +1422,7 @@ mod tests {
         let manifest = OrchestrationManifest::new("01HQXYZ123REV");
         storage
             .put_raw(
-                "state/orchestration/manifest.json",
+                orchestration_manifest_path(),
                 Bytes::from(serde_json::to_string(&manifest).expect("serialize")),
                 WritePrecondition::None,
             )
@@ -1270,7 +1434,7 @@ mod tests {
         let bumped = OrchestrationManifest::new("01HQXYZ124REV");
         storage
             .put_raw(
-                "state/orchestration/manifest.json",
+                orchestration_manifest_path(),
                 Bytes::from(serde_json::to_string(&bumped).expect("serialize")),
                 WritePrecondition::None,
             )

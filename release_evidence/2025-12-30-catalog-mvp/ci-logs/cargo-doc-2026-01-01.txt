@@ -1,0 +1,18 @@
+    Checking arco-core v0.1.0 (/Users/ethanurbanski/arco/crates/arco-core)
+ Documenting arco-cli v0.1.0 (/Users/ethanurbanski/arco/crates/arco-cli)
+    Checking arco-cli v0.1.0 (/Users/ethanurbanski/arco/crates/arco-cli)
+ Documenting arco-core v0.1.0 (/Users/ethanurbanski/arco/crates/arco-core)
+    Checking arco-catalog v0.1.0 (/Users/ethanurbanski/arco/crates/arco-catalog)
+    Checking arco-flow v0.1.0 (/Users/ethanurbanski/arco/crates/arco-flow)
+ Documenting arco-flow v0.1.0 (/Users/ethanurbanski/arco/crates/arco-flow)
+ Documenting arco-catalog v0.1.0 (/Users/ethanurbanski/arco/crates/arco-catalog)
+    Checking arco-iceberg v0.1.0 (/Users/ethanurbanski/arco/crates/arco-iceberg)
+ Documenting arco-compactor v0.1.0 (/Users/ethanurbanski/arco/crates/arco-compactor)
+ Documenting xtask v0.1.0 (/Users/ethanurbanski/arco/tools/xtask)
+ Documenting arco-iceberg v0.1.0 (/Users/ethanurbanski/arco/crates/arco-iceberg)
+ Documenting arco-test-utils v0.1.0 (/Users/ethanurbanski/arco/crates/arco-test-utils)
+ Documenting arco-api v0.1.0 (/Users/ethanurbanski/arco/crates/arco-api)
+    Checking arco-api v0.1.0 (/Users/ethanurbanski/arco/crates/arco-api)
+ Documenting arco-integration-tests v0.1.0 (/Users/ethanurbanski/arco/crates/arco-integration-tests)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.16s
+   Generated /Users/ethanurbanski/arco/target/doc/arco_api/index.html and 15 other files

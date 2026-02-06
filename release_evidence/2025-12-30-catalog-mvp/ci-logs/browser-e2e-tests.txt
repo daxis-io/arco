@@ -1,0 +1,24 @@
+Command: cargo test --manifest-path /Users/ethanurbanski/arco/Cargo.toml -p arco-api --test browser_e2e --all-features
+
+   Compiling arco-api v0.1.0 (/Users/ethanurbanski/arco/crates/arco-api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.72s
+     Running tests/browser_e2e.rs (arco/target/debug/deps/browser_e2e-a4b5b630b0d81905)
+
+running 15 tests
+test signed_url_security::test_missing_tenant_header_rejected ... ok
+test signed_url_security::test_missing_workspace_header_rejected ... ok
+test cors::test_cors_preflight ... ok
+test signed_url_security::test_unknown_domain_rejected ... ok
+test e2e_browser_read::test_browser_read_empty_catalog ... ok
+test signed_url_security::test_path_traversal_various_patterns ... ok
+test signed_url_security::test_path_traversal_rejected ... ok
+test cors::test_cors_headers_on_response ... ok
+test signed_url_security::test_manifest_paths_not_mintable ... ok
+test signed_url_security::test_cross_tenant_paths_not_mintable ... ok
+test signed_url_security::test_non_allowlist_path_rejected ... ok
+test signed_url_security::test_ttl_bounded_to_maximum ... ok
+test signed_url_security::test_ttl_default_applied ... ok
+test e2e_browser_read::test_browser_read_different_domains ... ok
+test e2e_browser_read::test_browser_read_full_lifecycle ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s

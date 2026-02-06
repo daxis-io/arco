@@ -1,16 +1,17 @@
 """Tests for introspection utilities."""
+
 from __future__ import annotations
 
 import pytest
 
-from servo._internal.introspection import (
+from arco_flow._internal.introspection import (
     compute_transform_fingerprint,
     extract_code_location,
     extract_dependencies,
     infer_asset_key,
     validate_asset_function,
 )
-from servo.types import AssetIn
+from arco_flow.types import AssetIn
 
 
 class TestExtractCodeLocation:
@@ -18,6 +19,7 @@ class TestExtractCodeLocation:
 
     def test_extracts_module_and_function(self) -> None:
         """Should extract module and function name."""
+
         def my_func() -> None:
             pass
 
@@ -28,6 +30,7 @@ class TestExtractCodeLocation:
 
     def test_extracts_file_and_line(self) -> None:
         """Should extract file path and line number."""
+
         def my_func() -> None:
             pass
 
@@ -43,6 +46,7 @@ class TestExtractDependencies:
 
     def test_extracts_asset_in_hints(self) -> None:
         """Should extract AssetIn type hints."""
+
         def my_asset(ctx: object, raw: AssetIn["raw.events"]) -> None:  # noqa: UP037
             pass
 
@@ -54,6 +58,7 @@ class TestExtractDependencies:
 
     def test_multiple_dependencies(self) -> None:
         """Should extract multiple dependencies."""
+
         def my_asset(
             ctx: object,
             events: AssetIn["raw.events"],  # noqa: UP037
@@ -66,6 +71,7 @@ class TestExtractDependencies:
 
     def test_skips_ctx_parameter(self) -> None:
         """Should skip the ctx parameter."""
+
         def my_asset(ctx: object) -> None:
             pass
 
@@ -74,6 +80,7 @@ class TestExtractDependencies:
 
     def test_skips_non_asset_params(self) -> None:
         """Should skip non-AssetIn parameters."""
+
         def my_asset(
             ctx: object,
             raw: AssetIn["raw.events"],  # noqa: UP037
@@ -87,6 +94,7 @@ class TestExtractDependencies:
 
     def test_fallback_parses_string_annotations(self) -> None:
         """Fallback path should parse AssetIn[...] when get_type_hints fails."""
+
         # The "NotAType" annotation will cause get_type_hints() to fail,
         # triggering the AST-based fallback path for all annotations
         def my_asset(ctx: object, raw: AssetIn["raw.events"], bad: NotAType) -> None:  # type: ignore[name-defined]  # noqa: UP037
@@ -104,6 +112,7 @@ class TestComputeTransformFingerprint:
 
     def test_deterministic(self) -> None:
         """Same function should produce same fingerprint."""
+
         def my_func() -> None:
             return None
 
@@ -113,6 +122,7 @@ class TestComputeTransformFingerprint:
 
     def test_different_for_different_code(self) -> None:
         """Different functions should produce different fingerprints."""
+
         def func_a() -> None:
             return None
 
@@ -129,6 +139,7 @@ class TestInferAssetKey:
 
     def test_uses_function_name(self) -> None:
         """Should use function name as asset name."""
+
         def user_events() -> None:
             pass
 
@@ -138,6 +149,7 @@ class TestInferAssetKey:
 
     def test_infers_namespace_from_module(self) -> None:
         """Should infer namespace from module path."""
+
         def events() -> None:
             pass
 
@@ -151,6 +163,7 @@ class TestValidateAssetFunction:
 
     def test_requires_ctx_parameter(self) -> None:
         """Function must have ctx as first parameter."""
+
         def bad_func() -> None:
             pass
 
@@ -159,6 +172,7 @@ class TestValidateAssetFunction:
 
     def test_ctx_must_be_first(self) -> None:
         """ctx must be the first parameter."""
+
         def bad_func(other: int, ctx: object) -> None:
             pass
 
@@ -167,6 +181,7 @@ class TestValidateAssetFunction:
 
     def test_valid_function_passes(self) -> None:
         """Valid function should pass validation."""
+
         def good_func(ctx: object) -> None:
             pass
 

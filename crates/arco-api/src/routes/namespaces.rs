@@ -24,6 +24,10 @@ use crate::error::ApiError;
 use crate::error::ApiErrorBody;
 use crate::server::AppState;
 use arco_catalog::Tier1Compactor;
+use arco_catalog::idempotency::{
+    CatalogOperation, IdempotencyCheck, IdempotencyStore, IdempotencyStoreImpl,
+    calculate_retry_after, canonical_request_hash, check_idempotency,
+};
 
 /// Request to create a namespace.
 #[derive(Debug, Deserialize, ToSchema)]
@@ -86,6 +90,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         ("bearerAuth" = [])
     )
 )]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn create_namespace(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
@@ -98,20 +103,75 @@ pub(crate) async fn create_namespace(
         "Creating namespace"
     );
 
-    // Get storage backend from state
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
 
-    // Create catalog writer and ensure initialized
+    let request_json = serde_json::json!({
+        "name": req.name,
+        "description": req.description
+    });
+    let request_hash = canonical_request_hash(&request_json)
+        .map_err(|e| ApiError::internal(format!("Failed to compute request hash: {e}")))?;
+
+    let storage_arc = Arc::new(storage.clone());
+    let idempotency_store = IdempotencyStoreImpl::new(storage_arc);
+    let idempotency_check = check_idempotency(
+        &idempotency_store,
+        ctx.idempotency_key.as_deref(),
+        CatalogOperation::CreateNamespace,
+        &request_hash,
+        state.config.idempotency_stale_timeout(),
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    let (marker, marker_version) = match idempotency_check {
+        IdempotencyCheck::NoKey => (None, None),
+        IdempotencyCheck::Proceed { marker, version } => (Some(marker), Some(version)),
+        IdempotencyCheck::Replay {
+            entity_id,
+            entity_name,
+        } => {
+            let reader = arco_catalog::CatalogReader::new(storage);
+            let ns = reader
+                .get_namespace(&entity_name)
+                .await
+                .map_err(ApiError::from)?
+                .ok_or_else(|| ApiError::internal("Cached namespace not found"))?;
+            let response = NamespaceResponse {
+                id: entity_id,
+                name: ns.name,
+                description: ns.description,
+                created_at: format_timestamp(ns.created_at),
+                updated_at: format_timestamp(ns.updated_at),
+            };
+            return Ok((StatusCode::CREATED, Json(response)));
+        }
+        IdempotencyCheck::Conflict => {
+            return Err(ApiError::conflict(
+                "Idempotency-Key already used with different request body",
+            ));
+        }
+        IdempotencyCheck::PreviousFailed {
+            http_status,
+            message,
+        } => {
+            return Err(ApiError::from_status_and_message(http_status, message));
+        }
+        IdempotencyCheck::InProgress { started_at } => {
+            let retry_after =
+                calculate_retry_after(started_at, state.config.idempotency_stale_timeout());
+            return Err(ApiError::conflict_in_progress(retry_after));
+        }
+    };
+
     let compactor = state
         .sync_compactor()
         .unwrap_or_else(|| Arc::new(Tier1Compactor::new(storage.clone())));
     let writer = arco_catalog::CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
 
-    // Initialize if not already (idempotent)
     writer.initialize().await.map_err(ApiError::from)?;
 
-    // Create the namespace
     let options = arco_catalog::write_options::WriteOptions::default()
         .with_actor(format!("api:{}", ctx.tenant))
         .with_request_id(&ctx.request_id);
@@ -122,12 +182,46 @@ pub(crate) async fn create_namespace(
         options
     };
 
-    writer
+    let create_result = writer
         .create_namespace(&req.name, req.description.as_deref(), options)
-        .await
-        .map_err(ApiError::from)?;
+        .await;
 
-    // Read back the namespace to return it
+    if let (Some(marker), Some(version)) = (&marker, &marker_version) {
+        match &create_result {
+            Ok(ns) => {
+                let finalized = marker
+                    .clone()
+                    .finalize_committed(ns.id.clone(), ns.name.clone());
+                if let Err(e) = idempotency_store.finalize(&finalized, version).await {
+                    tracing::warn!(
+                        idempotency_key = %marker.idempotency_key,
+                        operation = ?marker.operation,
+                        error = %e,
+                        "Failed to finalize idempotency marker as committed"
+                    );
+                }
+            }
+            Err(e) => {
+                if let Some(status) = e.http_status_code() {
+                    if (400..500).contains(&status) {
+                        let finalized = marker.clone().finalize_failed(status, e.to_string());
+                        if let Err(fin_err) = idempotency_store.finalize(&finalized, version).await
+                        {
+                            tracing::warn!(
+                                idempotency_key = %marker.idempotency_key,
+                                operation = ?marker.operation,
+                                error = %fin_err,
+                                "Failed to finalize idempotency marker as failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    create_result.map_err(ApiError::from)?;
+
     let reader = arco_catalog::CatalogReader::new(storage);
     let ns = reader
         .get_namespace(&req.name)

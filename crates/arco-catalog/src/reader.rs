@@ -461,7 +461,11 @@ impl CatalogReader {
             }
             CatalogDomain::Search => Ok(SnapshotFreshness {
                 version: SnapshotVersion::new(manifest.search.snapshot_version),
-                published_at: manifest.search.updated_at,
+                published_at: manifest
+                    .search
+                    .snapshot
+                    .as_ref()
+                    .map_or(manifest.search.updated_at, |s| s.published_at),
                 tail: None,
             }),
         }
@@ -504,6 +508,11 @@ impl CatalogReader {
                     // Legacy fallback: derive known paths from version.
                     let version = manifest.catalog.snapshot_version;
                     vec![
+                        CatalogPaths::snapshot_file(
+                            CatalogDomain::Catalog,
+                            version,
+                            "catalogs.parquet",
+                        ),
                         CatalogPaths::snapshot_file(
                             CatalogDomain::Catalog,
                             version,
@@ -550,8 +559,22 @@ impl CatalogReader {
                     .unwrap_or_default()
             }
             CatalogDomain::Search => {
-                // Search domain paths would be defined here when search snapshots are implemented
-                Vec::new()
+                if let Some(snapshot) = &manifest.search.snapshot {
+                    snapshot
+                        .files
+                        .iter()
+                        .map(|f| join_snapshot_path(&snapshot.path, &f.path))
+                        .collect()
+                } else if manifest.search.snapshot_version == 0 {
+                    Vec::new()
+                } else {
+                    let version = manifest.search.snapshot_version;
+                    vec![CatalogPaths::snapshot_file(
+                        CatalogDomain::Search,
+                        version,
+                        "token_postings.parquet",
+                    )]
+                }
             }
         };
 
@@ -651,10 +674,7 @@ impl CatalogReader {
                 // Tier-2 snapshots do not yet persist SnapshotInfo metadata.
                 Ok(None)
             }
-            CatalogDomain::Search => {
-                // Search snapshots are not yet implemented.
-                Ok(None)
-            }
+            CatalogDomain::Search => Ok(manifest.search.snapshot),
         }
     }
 }
@@ -666,7 +686,10 @@ impl CatalogReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arco_core::storage::MemoryBackend;
+    use crate::manifest::SnapshotFile;
+    use crate::tier1_writer::Tier1Writer;
+    use arco_core::storage::{MemoryBackend, WritePrecondition};
+    use bytes::Bytes;
     use std::sync::Arc;
 
     fn setup() -> CatalogReader {
@@ -702,6 +725,66 @@ mod tests {
         let reader = setup();
         let result = reader.get_mintable_paths(CatalogDomain::Catalog).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_search_mintable_paths_from_snapshot() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage =
+            ScopedStorage::new(backend, "test-tenant", "test-workspace").expect("storage");
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await.expect("init");
+
+        let root_bytes = storage
+            .get_raw(CatalogPaths::ROOT_MANIFEST)
+            .await
+            .expect("root manifest");
+        let mut root: RootManifest = serde_json::from_slice(&root_bytes).expect("root parse");
+        root.normalize_paths();
+
+        let snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Search, 1);
+        let mut snapshot = SnapshotInfo::new(1, snapshot_path.clone());
+        snapshot.add_file(SnapshotFile {
+            path: "token_postings.parquet".to_string(),
+            checksum_sha256: "00".repeat(32),
+            byte_size: 1,
+            row_count: 0,
+            position_range: None,
+        });
+
+        let search_bytes = storage
+            .get_raw(&root.search_manifest_path)
+            .await
+            .expect("search manifest");
+        let mut search: SearchManifest = serde_json::from_slice(&search_bytes).expect("parse");
+        search.snapshot_version = 1;
+        search.base_path = snapshot_path;
+        search.snapshot = Some(snapshot);
+        search.updated_at = Utc::now();
+
+        let search_payload = serde_json::to_vec(&search).expect("serialize");
+        storage
+            .put_raw(
+                &root.search_manifest_path,
+                Bytes::from(search_payload),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write search manifest");
+
+        let reader = CatalogReader::new(storage);
+        let paths = reader
+            .get_mintable_paths(CatalogDomain::Search)
+            .await
+            .expect("paths");
+        assert_eq!(
+            paths,
+            vec![CatalogPaths::snapshot_file(
+                CatalogDomain::Search,
+                1,
+                "token_postings.parquet"
+            )]
+        );
     }
 
     #[tokio::test]

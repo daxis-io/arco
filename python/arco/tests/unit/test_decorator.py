@@ -1,10 +1,11 @@
 """Tests for @asset decorator."""
+
 from __future__ import annotations
 
 import pytest
 
-from servo._internal.registry import get_registry
-from servo.types import AssetIn, AssetKey, DailyPartition, not_null, row_count
+from arco_flow._internal.registry import get_registry
+from arco_flow.types import AssetIn, AssetKey, DailyPartition, not_null, row_count
 
 
 class TestAssetDecorator:
@@ -12,8 +13,8 @@ class TestAssetDecorator:
 
     def test_registers_function(self) -> None:
         """Basic @asset decorator registers the function."""
-        from servo.asset import asset
-        from servo.context import AssetContext
+        from arco_flow.asset import asset
+        from arco_flow.context import AssetContext
 
         get_registry().clear()
 
@@ -30,8 +31,8 @@ class TestAssetDecorator:
 
     def test_explicit_name(self) -> None:
         """Asset name can be explicitly specified."""
-        from servo.asset import asset
-        from servo.context import AssetContext
+        from arco_flow.asset import asset
+        from arco_flow.context import AssetContext
 
         get_registry().clear()
 
@@ -46,8 +47,8 @@ class TestAssetDecorator:
 
     def test_with_metadata(self) -> None:
         """Decorator accepts owners and tags."""
-        from servo.asset import asset
-        from servo.context import AssetContext
+        from arco_flow.asset import asset
+        from arco_flow.context import AssetContext
 
         get_registry().clear()
 
@@ -66,8 +67,8 @@ class TestAssetDecorator:
 
     def test_preserves_function(self) -> None:
         """Decorated function remains callable."""
-        from servo.asset import asset
-        from servo.context import AssetContext
+        from arco_flow.asset import asset
+        from arco_flow.context import AssetContext
 
         get_registry().clear()
 
@@ -82,8 +83,8 @@ class TestAssetDecorator:
 
     def test_infers_dependencies(self) -> None:
         """Dependencies inferred from AssetIn type hints."""
-        from servo.asset import asset
-        from servo.context import AssetContext
+        from arco_flow.asset import asset
+        from arco_flow.context import AssetContext
 
         get_registry().clear()
 
@@ -100,8 +101,8 @@ class TestAssetDecorator:
 
     def test_with_partitions(self) -> None:
         """Decorator accepts partition configuration."""
-        from servo.asset import asset
-        from servo.context import AssetContext
+        from arco_flow.asset import asset
+        from arco_flow.context import AssetContext
 
         get_registry().clear()
 
@@ -116,8 +117,8 @@ class TestAssetDecorator:
 
     def test_with_checks(self) -> None:
         """Decorator accepts quality checks."""
-        from servo.asset import asset
-        from servo.context import AssetContext
+        from arco_flow.asset import asset
+        from arco_flow.context import AssetContext
 
         get_registry().clear()
 
@@ -137,9 +138,10 @@ class TestAssetDecorator:
 
     def test_validates_signature(self) -> None:
         """Decorator validates function signature."""
-        from servo.asset import asset
+        from arco_flow.asset import asset
 
         with pytest.raises(TypeError, match="ctx"):
+
             @asset(namespace="raw")
             def bad_asset() -> None:  # Missing ctx parameter
                 pass

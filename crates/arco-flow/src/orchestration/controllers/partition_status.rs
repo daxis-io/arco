@@ -324,13 +324,8 @@ mod tests {
         );
 
         let policy = FreshnessPolicy::default();
-        let result = compute_staleness_with_upstreams(
-            &downstream,
-            &[upstream],
-            &policy,
-            Some("v1"),
-            now,
-        );
+        let result =
+            compute_staleness_with_upstreams(&downstream, &[upstream], &policy, Some("v1"), now);
 
         assert!(result.is_stale);
         assert_eq!(result.reason, Some(StalenessReason::UpstreamChanged));
@@ -350,16 +345,14 @@ mod tests {
         let upstream = make_partition("analytics.daily", "2025-01-15", None, Some("v1"));
 
         let policy = FreshnessPolicy::default();
-        let result = compute_staleness_with_upstreams(
-            &downstream,
-            &[upstream],
-            &policy,
-            Some("v1"),
-            now,
-        );
+        let result =
+            compute_staleness_with_upstreams(&downstream, &[upstream], &policy, Some("v1"), now);
 
         assert!(result.is_stale);
-        assert_eq!(result.reason, Some(StalenessReason::UpstreamNeverMaterialized));
+        assert_eq!(
+            result.reason,
+            Some(StalenessReason::UpstreamNeverMaterialized)
+        );
     }
 
     #[test]
@@ -381,13 +374,8 @@ mod tests {
         );
 
         let policy = FreshnessPolicy::default();
-        let result = compute_staleness_with_upstreams(
-            &downstream,
-            &[upstream],
-            &policy,
-            Some("v1"),
-            now,
-        );
+        let result =
+            compute_staleness_with_upstreams(&downstream, &[upstream], &policy, Some("v1"), now);
 
         assert!(!result.is_stale);
         assert!(result.reason.is_none());
@@ -414,13 +402,8 @@ mod tests {
         let policy = FreshnessPolicy {
             maximum_lag_minutes: 60 * 24, // 24 hours
         };
-        let result = compute_staleness_with_upstreams(
-            &downstream,
-            &[upstream],
-            &policy,
-            Some("v1"),
-            now,
-        );
+        let result =
+            compute_staleness_with_upstreams(&downstream, &[upstream], &policy, Some("v1"), now);
 
         assert!(result.is_stale);
         assert_eq!(result.reason, Some(StalenessReason::FreshnessPolicy));

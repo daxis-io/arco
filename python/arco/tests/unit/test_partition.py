@@ -1,19 +1,20 @@
 """Tests for partition types."""
+
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from servo.types.partition import DailyPartition, PartitionKey, PartitionStrategy
-from servo.types.scalar import ScalarValue
+from arco_flow.types.partition import DailyPartition, PartitionKey, PartitionStrategy
+from arco_flow.types.scalar import ScalarValue
 
 
 class TestScalarValue:
     """Tests for ScalarValue."""
 
     def test_string_value(self) -> None:
-        """String scalars serialize correctly."""
+        """String scalars preserve raw value."""
         sv = ScalarValue.from_value("hello")
         assert sv.kind == "string"
         assert sv.value == "hello"
@@ -42,12 +43,12 @@ class TestScalarValue:
             ScalarValue.from_value(3.14)
 
     def test_timestamp_value_normalized_to_utc(self) -> None:
-        """Datetime scalars are normalized to UTC."""
+        """Datetime scalars are normalized to UTC with microseconds."""
         sv = ScalarValue.from_value(
             datetime(2025, 1, 15, 1, 2, 3, 456000, tzinfo=timezone(timedelta(hours=2)))
         )
         assert sv.kind == "timestamp"
-        assert sv.value == "2025-01-14T23:02:03.456Z"
+        assert sv.value == "2025-01-14T23:02:03.456000Z"
 
 
 class TestPartitionKey:
@@ -59,16 +60,15 @@ class TestPartitionKey:
         pk2 = PartitionKey({"date": "2025-01-15", "tenant": "acme"})
 
         assert pk1.to_canonical() == pk2.to_canonical()
-        # Type-tagged format: strings get "s:" prefix
-        assert pk1.to_canonical() == '{"date":"s:2025-01-15","tenant":"s:acme"}'
+        assert pk1.to_canonical() == "date=s:MjAyNS0wMS0xNQ,tenant=s:YWNtZQ"
 
     def test_fingerprint_stable(self) -> None:
-        """Fingerprint is stable SHA-256 of canonical form."""
+        """Fingerprint is stable SHA-256 of canonical string."""
         pk = PartitionKey({"date": "2025-01-15"})
         fp = pk.fingerprint()
 
-        assert len(fp) == 64  # SHA-256 hex
-        assert pk.fingerprint() == fp  # Deterministic
+        assert len(fp) == 64
+        assert pk.fingerprint() == fp
 
     def test_rejects_float_in_dict(self) -> None:
         """Float values rejected even when passed via dict."""
@@ -77,39 +77,43 @@ class TestPartitionKey:
 
     def test_from_dict_mixed_types(self) -> None:
         """PartitionKey accepts dict with mixed value types."""
-        pk = PartitionKey({
-            "date": date(2025, 1, 15),
-            "region": "us-east-1",
-            "version": 42,
-        })
+        pk = PartitionKey(
+            {
+                "date": date(2025, 1, 15),
+                "region": "us-east-1",
+                "version": 42,
+            }
+        )
 
         assert len(pk.dimensions) == 3
 
     def test_to_proto_dict_returns_string_values(self) -> None:
-        """to_proto_dict() returns dict with all string values (proto compliance)."""
-        pk = PartitionKey({
-            "date": date(2025, 1, 15),
-            "region": "us-east-1",
-            "version": 42,
-        })
+        """to_proto_dict() returns dict with all string values."""
+        pk = PartitionKey(
+            {
+                "date": date(2025, 1, 15),
+                "region": "us-east-1",
+                "version": 42,
+            }
+        )
 
         proto_dict = pk.to_proto_dict()
 
-        # All values must be strings
         assert all(isinstance(v, str) for v in proto_dict.values())
-        # Values are type-tagged
         assert proto_dict["date"] == "d:2025-01-15"
-        assert proto_dict["region"] == "s:us-east-1"
+        assert proto_dict["region"] == "s:dXMtZWFzdC0x"
         assert proto_dict["version"] == "i:42"
 
     def test_from_proto_dict_roundtrip(self) -> None:
         """Can roundtrip through proto dict format."""
-        original = PartitionKey({
-            "date": date(2025, 1, 15),
-            "region": "us-east-1",
-            "version": 42,
-            "active": True,
-        })
+        original = PartitionKey(
+            {
+                "date": date(2025, 1, 15),
+                "region": "us-east-1",
+                "version": 42,
+                "active": True,
+            }
+        )
 
         proto_dict = original.to_proto_dict()
         restored = PartitionKey.from_proto_dict(proto_dict)

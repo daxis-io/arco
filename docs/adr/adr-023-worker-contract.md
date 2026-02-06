@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-Servo orchestration dispatches tasks to workers via Cloud Tasks (ADR-017) and expects
+Arco Flow orchestration dispatches tasks to workers via Cloud Tasks (ADR-017) and expects
 workers to report results back. The dispatch payload (`TaskEnvelope`) is well-defined
 in `crates/arco-flow/src/dispatch/mod.rs`, but the **worker callback contract** is not
 specified:

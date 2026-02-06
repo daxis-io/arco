@@ -41,20 +41,24 @@
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
 
+pub mod audit;
 pub mod commit;
 pub mod context;
+pub mod coordinator;
+pub mod credentials;
 pub mod error;
 pub mod events;
 pub mod gc;
 pub mod idempotency;
 pub mod metrics;
 pub mod openapi;
-pub mod pointer;
 pub(crate) mod paths;
+pub mod pointer;
 pub mod reconciler;
 pub mod router;
 pub mod schema_projection;
 pub mod state;
+pub mod transactions;
 pub mod types;
 
 // Route handlers (exposed for OpenAPI generation)
@@ -67,7 +71,10 @@ pub mod prelude {
 
     // Pointer and idempotency
     pub use crate::idempotency::{IdempotencyMarker, IdempotencyStatus};
-    pub use crate::pointer::{IcebergTablePointer, PointerStore};
+    pub use crate::pointer::{
+        EffectivePointer, IcebergTablePointer, PendingPointerUpdate, PointerStore,
+        resolve_effective_metadata_location,
+    };
 
     // Router and state
     pub use crate::router::iceberg_router;
@@ -78,7 +85,7 @@ pub mod prelude {
 
     // Reconciler
     pub use crate::reconciler::{
-        IcebergReconciler, ReconciliationReport, Reconciler, TableReconciliationResult,
+        IcebergReconciler, Reconciler, ReconciliationReport, TableReconciliationResult,
     };
 
     // GC
@@ -90,6 +97,11 @@ pub mod prelude {
     // Schema projection
     pub use crate::schema_projection::{ColumnRecord, IcebergTypeMapper, SchemaProjector};
 
+    // Transactions
+    pub use crate::transactions::{
+        TransactionRecord, TransactionStatus, TransactionStore, TransactionTableEntry,
+    };
+
     // All types
     pub use crate::types::*;
 }
@@ -97,12 +109,18 @@ pub mod prelude {
 // Re-export key types at crate root
 pub use error::{IcebergError, IcebergResult};
 pub use openapi::{IcebergApiDoc, openapi, openapi_json};
-pub use pointer::IcebergTablePointer;
+pub use pointer::{
+    EffectivePointer, IcebergTablePointer, PendingPointerUpdate,
+    resolve_effective_metadata_location,
+};
 pub use router::iceberg_router;
-pub use state::{CredentialProvider, IcebergConfig, IcebergState};
+pub use state::{
+    CredentialProvider, IcebergConfig, IcebergState, SharedCompactorFactory, SyncCompactorFactory,
+    Tier1CompactorFactory,
+};
 
 // Re-export reconciler types
-pub use reconciler::{IcebergReconciler, ReconciliationReport, Reconciler};
+pub use reconciler::{IcebergReconciler, Reconciler, ReconciliationReport};
 
 // Re-export GC types
 pub use gc::{
@@ -112,3 +130,13 @@ pub use gc::{
 
 // Re-export schema projection types
 pub use schema_projection::{ColumnRecord, IcebergTypeMapper, SchemaProjector};
+
+// Re-export transaction types
+pub use transactions::{
+    TransactionRecord, TransactionStatus, TransactionStore, TransactionStoreImpl,
+    TransactionTableEntry,
+};
+
+// Re-export credential types
+#[cfg(feature = "gcp")]
+pub use credentials::{GcsCredentialConfig, GcsCredentialProvider};

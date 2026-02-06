@@ -88,6 +88,38 @@ impl ApiClient {
         }
     }
 
+    /// Reruns a previous run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn rerun_run(
+        &self,
+        workspace_id: &str,
+        run_id: &str,
+        request: RerunRunRequest,
+    ) -> Result<RerunRunResponse> {
+        let url = format!(
+            "{}/api/v1/workspaces/{workspace_id}/runs/{run_id}/rerun",
+            self.base_url
+        );
+
+        let mut req = self.client.post(&url).json(&request);
+        if let Some(token) = &self.token {
+            req = req.bearer_auth(token);
+        }
+
+        let response = req.send().await.context("Failed to send request")?;
+
+        if response.status().is_success() {
+            response.json().await.context("Failed to parse response")
+        } else {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("API error ({status}): {body}")
+        }
+    }
+
     /// Lists runs.
     ///
     /// # Errors
@@ -186,6 +218,11 @@ impl ApiClient {
 // API Types
 // ============================================================================
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Request to trigger a new run.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -193,6 +230,12 @@ pub struct TriggerRunRequest {
     /// Asset selection (asset keys to materialize).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub selection: Vec<String>,
+    /// Include upstream dependencies of the selection.
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the selection.
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub include_downstream: bool,
     /// Partition overrides (key=value pairs).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub partitions: Vec<PartitionValue>,
@@ -218,6 +261,79 @@ pub struct TriggerRunResponse {
     pub created: bool,
     /// Run creation timestamp.
     pub created_at: DateTime<Utc>,
+}
+
+/// Rerun mode values.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RerunMode {
+    /// Rerun all tasks that did not succeed in the parent run.
+    FromFailure,
+    /// Rerun a user-chosen subset of tasks from the parent plan.
+    Subset,
+}
+
+/// Rerun kind values exposed in responses.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RerunKind {
+    /// Rerun tasks that did not succeed.
+    FromFailure,
+    /// Rerun a selected subset.
+    Subset,
+}
+
+impl std::fmt::Display for RerunKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::FromFailure => "FROM_FAILURE",
+            Self::Subset => "SUBSET",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// Request to rerun a prior run.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RerunRunRequest {
+    /// Rerun mode.
+    pub mode: RerunMode,
+    /// Selection roots for subset reruns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selection: Vec<String>,
+    /// Include upstream dependencies of the subset.
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub include_upstream: bool,
+    /// Include downstream dependents of the subset.
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub include_downstream: bool,
+    /// Optional run key override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Additional labels for the rerun.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub labels: std::collections::HashMap<String, String>,
+}
+
+/// Response after triggering a rerun.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RerunRunResponse {
+    /// Run ID (ULID).
+    pub run_id: String,
+    /// Plan ID for this run.
+    pub plan_id: String,
+    /// Current run state.
+    pub state: RunState,
+    /// Whether this is a new run or an existing one (`run_key` deduplication).
+    pub created: bool,
+    /// Run creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Parent run ID.
+    pub parent_run_id: String,
+    /// Rerun kind.
+    pub rerun_kind: RerunKind,
 }
 
 /// Run state values.
@@ -274,6 +390,13 @@ pub struct RunResponse {
     pub tasks: Vec<TaskSummary>,
     /// Task counts by state.
     pub task_counts: TaskCounts,
+    /// Run labels.
+    #[serde(default)]
+    pub labels: std::collections::HashMap<String, String>,
+    /// Parent run ID if this is a rerun.
+    pub parent_run_id: Option<String>,
+    /// Rerun kind if this is a rerun.
+    pub rerun_kind: Option<RerunKind>,
 }
 
 /// Task summary.

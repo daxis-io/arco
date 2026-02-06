@@ -10,13 +10,20 @@ receivers:
           metrics_path: /metrics
           static_configs:
             - targets: ["arco-compactor:8081"]
+          authorization:
+            type: Bearer
+            credentials: ${env:ARCO_METRICS_SECRET:-}
+  otlp:
+    protocols:
+      grpc:
+      http:
 
 exporters:
   googlecloud:
-    project: ${GCP_PROJECT_ID}
+    project: ${env:GCP_PROJECT_ID}
 
 service:
   pipelines:
     metrics:
-      receivers: [prometheus]
+      receivers: [prometheus, otlp]
       exporters: [googlecloud]

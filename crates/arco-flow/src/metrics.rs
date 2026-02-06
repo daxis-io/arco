@@ -11,12 +11,11 @@
 //!
 //! | Metric | Type | Labels | Description |
 //! |--------|------|--------|-------------|
-//! | `arco_flow_tasks_total` | Counter | state, tenant | Total task state transitions |
+//! | `arco_flow_tasks_total` | Counter | `from_state`, `to_state` | Total task state transitions |
 //! | `arco_flow_task_duration_seconds` | Histogram | operation, state | Task execution duration |
 //! | `arco_flow_scheduler_tick_duration_seconds` | Histogram | - | Scheduler tick processing time |
-//! | `arco_flow_active_runs` | Gauge | tenant | Currently active runs per tenant |
+//! | `arco_flow_active_runs` | Gauge | - | Currently active runs |
 //! | `arco_flow_dispatch_queue_depth` | Gauge | queue | Tasks waiting in dispatch queue |
-//! | `arco_flow_quota_usage_ratio` | Gauge | tenant | Current quota utilization (0.0-1.0) |
 //! | `arco_flow_schedule_ticks_total` | Counter | status | Schedule tick outcomes |
 //! | `arco_flow_run_requests_total` | Counter | source | Run requests by trigger source |
 //!
@@ -28,13 +27,13 @@
 //! let metrics = FlowMetrics::new();
 //!
 //! // Record task state transition
-//! metrics.record_task_transition("acme", "ready", "running");
+//! metrics.record_task_transition("ready", "running");
 //!
 //! // Record task execution time
 //! metrics.observe_task_duration("materialize", "succeeded", 45.2);
 //!
 //! // Update active runs gauge
-//! metrics.set_active_runs("acme", 5);
+//! metrics.set_active_runs(5);
 //! ```
 //!
 //! ## Integration
@@ -62,12 +61,10 @@ pub mod names {
     pub const TASK_DURATION_SECONDS: &str = "arco_flow_task_duration_seconds";
     /// Histogram: Scheduler tick processing time in seconds.
     pub const SCHEDULER_TICK_DURATION_SECONDS: &str = "arco_flow_scheduler_tick_duration_seconds";
-    /// Gauge: Currently active runs per tenant.
+    /// Gauge: Total currently active runs.
     pub const ACTIVE_RUNS: &str = "arco_flow_active_runs";
     /// Gauge: Tasks waiting in dispatch queue.
     pub const DISPATCH_QUEUE_DEPTH: &str = "arco_flow_dispatch_queue_depth";
-    /// Gauge: Current quota utilization ratio (0.0-1.0).
-    pub const QUOTA_USAGE_RATIO: &str = "arco_flow_quota_usage_ratio";
     /// Counter: Total dispatch operations.
     pub const DISPATCHES_TOTAL: &str = "arco_flow_dispatches_total";
     /// Counter: Total retry operations.
@@ -92,8 +89,6 @@ pub mod names {
 
 /// Label keys used across metrics.
 pub mod labels {
-    /// Tenant identifier.
-    pub const TENANT: &str = "tenant";
     /// Task state (ready, running, succeeded, failed, etc.).
     pub const STATE: &str = "state";
     /// Previous task state (for transitions).
@@ -139,10 +134,9 @@ impl FlowMetrics {
     /// Records a task state transition.
     ///
     /// Increments the `arco_flow_tasks_total` counter with transition labels.
-    pub fn record_task_transition(&self, tenant: &str, from_state: &str, to_state: &str) {
+    pub fn record_task_transition(&self, from_state: &str, to_state: &str) {
         counter!(
             names::TASKS_TOTAL,
-            labels::TENANT => tenant.to_string(),
             labels::FROM_STATE => from_state.to_string(),
             labels::TO_STATE => to_state.to_string(),
         )
@@ -168,16 +162,12 @@ impl FlowMetrics {
         histogram!(names::SCHEDULER_TICK_DURATION_SECONDS).record(duration.as_secs_f64());
     }
 
-    /// Sets the number of active runs for a tenant.
+    /// Sets the total number of active runs.
     ///
     /// Updates the `arco_flow_active_runs` gauge.
     #[allow(clippy::cast_precision_loss)] // Gauge values are typically small
-    pub fn set_active_runs(&self, tenant: &str, count: usize) {
-        gauge!(
-            names::ACTIVE_RUNS,
-            labels::TENANT => tenant.to_string(),
-        )
-        .set(count as f64);
+    pub fn set_active_runs(&self, count: usize) {
+        gauge!(names::ACTIVE_RUNS).set(count as f64);
     }
 
     /// Sets the dispatch queue depth.
@@ -192,25 +182,12 @@ impl FlowMetrics {
         .set(depth as f64);
     }
 
-    /// Sets the quota usage ratio for a tenant.
-    ///
-    /// Updates the `arco_flow_quota_usage_ratio` gauge.
-    /// Value should be between 0.0 (no usage) and 1.0 (at capacity).
-    pub fn set_quota_usage(&self, tenant: &str, ratio: f64) {
-        gauge!(
-            names::QUOTA_USAGE_RATIO,
-            labels::TENANT => tenant.to_string(),
-        )
-        .set(ratio);
-    }
-
     /// Records a dispatch operation.
     ///
     /// Increments the `arco_flow_dispatches_total` counter.
-    pub fn record_dispatch(&self, tenant: &str, result: &str) {
+    pub fn record_dispatch(&self, result: &str) {
         counter!(
             names::DISPATCHES_TOTAL,
-            labels::TENANT => tenant.to_string(),
             labels::RESULT => result.to_string(),
         )
         .increment(1);
@@ -219,10 +196,9 @@ impl FlowMetrics {
     /// Records a retry operation.
     ///
     /// Increments the `arco_flow_retries_total` counter.
-    pub fn record_retry(&self, tenant: &str, attempt: u32) {
+    pub fn record_retry(&self, attempt: u32) {
         counter!(
             names::RETRIES_TOTAL,
-            labels::TENANT => tenant.to_string(),
             "attempt" => attempt.to_string(),
         )
         .increment(1);
@@ -326,8 +302,8 @@ mod tests {
         let metrics = FlowMetrics::new();
 
         // These calls should not panic even without a metrics recorder installed
-        metrics.record_task_transition("test-tenant", "ready", "running");
-        metrics.record_task_transition("test-tenant", "running", "succeeded");
+        metrics.record_task_transition("ready", "running");
+        metrics.record_task_transition("running", "succeeded");
     }
 
     #[test]
@@ -342,9 +318,8 @@ mod tests {
     fn flow_metrics_can_set_gauges() {
         let metrics = FlowMetrics::new();
 
-        metrics.set_active_runs("test-tenant", 5);
+        metrics.set_active_runs(5);
         metrics.set_queue_depth("default", 10);
-        metrics.set_quota_usage("test-tenant", 0.75);
     }
 
     #[test]

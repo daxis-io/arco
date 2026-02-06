@@ -18,10 +18,11 @@ use serde::{Deserialize, Serialize};
 use arco_core::AssetId;
 
 /// Format of the underlying data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum AssetFormat {
     /// Apache Parquet format.
+    #[default]
     Parquet,
     /// Delta Lake format.
     Delta,
@@ -47,12 +48,6 @@ impl AssetFormat {
             Self::Json => "json",
             Self::Avro => "avro",
         }
-    }
-}
-
-impl Default for AssetFormat {
-    fn default() -> Self {
-        Self::Parquet
     }
 }
 

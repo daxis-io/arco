@@ -918,11 +918,7 @@ impl IdempotencyKeyRow {
     /// Returns the primary key tuple.
     #[must_use]
     pub fn primary_key(&self) -> (&str, &str, &str) {
-        (
-            &self.tenant_id,
-            &self.workspace_id,
-            &self.idempotency_key,
-        )
+        (&self.tenant_id, &self.workspace_id, &self.idempotency_key)
     }
 }
 
@@ -955,6 +951,9 @@ pub struct FoldState {
     // ========================================================================
     // Layer 2: Schedule/Sensor Automation
     // ========================================================================
+    /// Schedule definition rows keyed by `schedule_id`.
+    pub schedule_definitions: HashMap<String, ScheduleDefinitionRow>,
+
     /// Schedule state rows keyed by `schedule_id`.
     pub schedule_state: HashMap<String, ScheduleStateRow>,
 
@@ -1000,7 +999,7 @@ pub struct FoldState {
     // ========================================================================
     // Configuration
     // ========================================================================
-    /// Tenant secret for HMAC-based run_id generation.
+    /// Tenant secret for HMAC-based `run_id` generation.
     /// Default is empty (for testing); should be set in production.
     pub tenant_secret: Vec<u8>,
 }
@@ -1230,6 +1229,30 @@ impl FoldState {
             }
 
             // Layer 2 automation events
+            OrchestrationEventData::ScheduleDefinitionUpserted {
+                schedule_id,
+                cron_expression,
+                timezone,
+                catchup_window_minutes,
+                asset_selection,
+                max_catchup_ticks,
+                enabled,
+            } => {
+                self.fold_schedule_definition_upserted(
+                    &event.tenant_id,
+                    &event.workspace_id,
+                    schedule_id,
+                    cron_expression,
+                    timezone,
+                    *catchup_window_minutes,
+                    asset_selection,
+                    *max_catchup_ticks,
+                    *enabled,
+                    event.timestamp,
+                    &event.event_id,
+                );
+            }
+
             OrchestrationEventData::ScheduleTicked {
                 schedule_id,
                 scheduled_for,
@@ -1293,7 +1316,7 @@ impl FoldState {
                 trigger_source_ref,
                 labels,
             } => {
-                if !self.should_drop_run_requested(trigger_source_ref) {
+                if !self.should_drop_run_requested_for_stale_sensor_eval(trigger_source_ref) {
                     self.fold_run_requested(
                         &event.tenant_id,
                         &event.workspace_id,
@@ -1605,6 +1628,7 @@ impl FoldState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     fn fold_task_finished(
         &mut self,
         run_id: &str,
@@ -2035,6 +2059,50 @@ impl FoldState {
     // Layer 2: Schedule Fold Logic
     // ========================================================================
 
+    #[allow(clippy::too_many_arguments)]
+    fn fold_schedule_definition_upserted(
+        &mut self,
+        tenant_id: &str,
+        workspace_id: &str,
+        schedule_id: &str,
+        cron_expression: &str,
+        timezone: &str,
+        catchup_window_minutes: u32,
+        asset_selection: &[String],
+        max_catchup_ticks: u32,
+        enabled: bool,
+        timestamp: DateTime<Utc>,
+        event_id: &str,
+    ) {
+        let created_at = self
+            .schedule_definitions
+            .get(schedule_id)
+            .map_or(timestamp, |row| row.created_at);
+
+        if let Some(existing) = self.schedule_definitions.get(schedule_id) {
+            if event_id <= existing.row_version.as_str() {
+                return;
+            }
+        }
+
+        self.schedule_definitions.insert(
+            schedule_id.to_string(),
+            ScheduleDefinitionRow {
+                tenant_id: tenant_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                schedule_id: schedule_id.to_string(),
+                cron_expression: cron_expression.to_string(),
+                timezone: timezone.to_string(),
+                catchup_window_minutes,
+                asset_selection: asset_selection.to_vec(),
+                max_catchup_ticks,
+                enabled,
+                created_at,
+                row_version: event_id.to_string(),
+            },
+        );
+    }
+
     /// Folds a `ScheduleTicked` event into state.
     ///
     /// Updates:
@@ -2090,6 +2158,10 @@ impl FoldState {
             }
         }
 
+        let run_id = run_key.as_deref().map(|run_key| {
+            run_id_from_run_key(tenant_id, workspace_id, run_key, &self.tenant_secret)
+        });
+
         self.schedule_ticks.insert(
             tick_id.to_string(),
             ScheduleTickRow {
@@ -2103,7 +2175,7 @@ impl FoldState {
                 partition_selection,
                 status,
                 run_key,
-                run_id: None, // Filled by fold_run_requested correlation
+                run_id,
                 request_fingerprint,
                 row_version: event_id.to_string(),
             },
@@ -2212,11 +2284,6 @@ impl FoldState {
         // Increment state_version for CAS (poll sensors)
         state.state_version += 1;
 
-        // Update status if evaluation errored
-        if matches!(status, SensorEvalStatus::Error { .. }) {
-            state.status = SensorStatus::Error;
-        }
-
         // NOTE: Per P0-1, fold does NOT emit RunRequested events.
         // The controller already emitted SensorEvaluated + RunRequested(s) atomically.
         // fold_run_requested handles each RunRequested event separately.
@@ -2238,13 +2305,12 @@ impl FoldState {
     /// Fold a `RunRequested` event.
     ///
     /// Implements L2-INV-4 (idempotent) and L2-INV-5 (conflict detection):
-    /// - Same run_key + fingerprint = idempotent (no-op)
-    /// - Same run_key + different fingerprint = conflict recorded
-    /// - New run_key = creates run_key_index entry
+    /// - Same `run_key` + fingerprint = idempotent (no-op)
+    /// - Same `run_key` + different fingerprint = conflict recorded
+    /// - New `run_key` = creates `run_key_index` entry
     ///
-    /// Note: This creates the run_key_index entry for deduplication and conflict
-    /// detection. The actual RunRow is created by fold_run_triggered when the
-    /// run is actually triggered (with a plan_id).
+    /// Creates the `run_key_index` entry used for deduplication and conflict detection.
+    /// The `RunRow` is created by `fold_run_triggered` when the run is triggered (with a `plan_id`).
     #[allow(clippy::too_many_arguments)]
     fn fold_run_requested(
         &mut self,
@@ -2266,7 +2332,7 @@ impl FoldState {
                 // Conflict: same run_key but different fingerprint
                 let conflict_id = format!("conflict:{run_key}:{event_id}");
                 self.run_key_conflicts.insert(
-                    conflict_id.clone(),
+                    conflict_id,
                     RunKeyConflictRow {
                         tenant_id: tenant_id.to_string(),
                         workspace_id: workspace_id.to_string(),
@@ -2283,12 +2349,7 @@ impl FoldState {
         }
 
         // Generate deterministic run_id using HMAC
-        let run_id = run_id_from_run_key(
-            tenant_id,
-            workspace_id,
-            run_key,
-            &self.tenant_secret,
-        );
+        let run_id = run_id_from_run_key(tenant_id, workspace_id, run_key, &self.tenant_secret);
 
         // Create run_key_index entry (the actual RunRow is created by RunTriggered)
         self.run_key_index.insert(
@@ -2308,7 +2369,7 @@ impl FoldState {
         self.correlate_run_to_source(run_key, &run_id, trigger_source_ref);
     }
 
-    /// Correlates a run_id back to its trigger source.
+    /// Correlates a `run_id` back to its trigger source.
     fn correlate_run_to_source(&mut self, _run_key: &str, run_id: &str, source: &SourceRef) {
         match source {
             SourceRef::Schedule { tick_id, .. } => {
@@ -2606,13 +2667,21 @@ impl FoldState {
             });
     }
 
-    fn should_drop_run_requested(&self, trigger_source_ref: &SourceRef) -> bool {
-        if let SourceRef::Sensor { eval_id, .. } = trigger_source_ref {
-            if let Some(eval) = self.sensor_evals.get(eval_id) {
-                return matches!(eval.status, SensorEvalStatus::SkippedStaleCursor);
+    fn should_drop_run_requested_for_stale_sensor_eval(
+        &self,
+        trigger_source_ref: &SourceRef,
+    ) -> bool {
+        match trigger_source_ref {
+            SourceRef::Sensor { eval_id, .. } => {
+                let eval = self.sensor_evals.get(eval_id);
+                debug_assert!(
+                    eval.is_some(),
+                    "expected SensorEvaluated to be folded before RunRequested for sensor sources"
+                );
+                eval.is_some_and(|e| matches!(e.status, SensorEvalStatus::SkippedStaleCursor))
             }
+            _ => false,
         }
-        false
     }
 
     fn satisfy_downstream_edges(
@@ -2883,9 +2952,39 @@ pub fn merge_idempotency_key_rows(rows: Vec<IdempotencyKeyRow>) -> Option<Idempo
 
 /// Merges partition status rows from base snapshot and L0 deltas.
 #[must_use]
-pub fn merge_partition_status_rows(
-    rows: Vec<PartitionStatusRow>,
-) -> Option<PartitionStatusRow> {
+pub fn merge_partition_status_rows(rows: Vec<PartitionStatusRow>) -> Option<PartitionStatusRow> {
+    rows.into_iter()
+        .reduce(|best, row| match row.row_version.cmp(&best.row_version) {
+            std::cmp::Ordering::Less => best,
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => row,
+        })
+}
+
+/// Merges schedule definition rows from base snapshot and L0 deltas.
+#[must_use]
+pub fn merge_schedule_definition_rows(
+    rows: Vec<ScheduleDefinitionRow>,
+) -> Option<ScheduleDefinitionRow> {
+    rows.into_iter()
+        .reduce(|best, row| match row.row_version.cmp(&best.row_version) {
+            std::cmp::Ordering::Less => best,
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => row,
+        })
+}
+
+/// Merges schedule state rows from base snapshot and L0 deltas.
+#[must_use]
+pub fn merge_schedule_state_rows(rows: Vec<ScheduleStateRow>) -> Option<ScheduleStateRow> {
+    rows.into_iter()
+        .reduce(|best, row| match row.row_version.cmp(&best.row_version) {
+            std::cmp::Ordering::Less => best,
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => row,
+        })
+}
+
+/// Merges schedule tick rows from base snapshot and L0 deltas.
+#[must_use]
+pub fn merge_schedule_tick_rows(rows: Vec<ScheduleTickRow>) -> Option<ScheduleTickRow> {
     rows.into_iter()
         .reduce(|best, row| match row.row_version.cmp(&best.row_version) {
             std::cmp::Ordering::Less => best,
@@ -4675,7 +4774,10 @@ mod tests {
         let event = backfill_created_event("bf_001");
         state.fold_event(&event);
 
-        let backfill = state.backfills.get("bf_001").expect("backfill should exist");
+        let backfill = state
+            .backfills
+            .get("bf_001")
+            .expect("backfill should exist");
         assert_eq!(backfill.state, BackfillState::Running);
         assert_eq!(backfill.state_version, 1);
         assert_eq!(backfill.total_partitions, 3);
@@ -4697,7 +4799,10 @@ mod tests {
         assert_eq!(chunk.state, ChunkState::Planned);
         assert_eq!(chunk.run_key, "backfill:bf_002:chunk:0");
 
-        let backfill = state.backfills.get("bf_002").expect("backfill should exist");
+        let backfill = state
+            .backfills
+            .get("bf_002")
+            .expect("backfill should exist");
         assert_eq!(backfill.planned_chunks, 1);
     }
 
@@ -4714,7 +4819,10 @@ mod tests {
         );
         state.fold_event(&event);
 
-        let backfill = state.backfills.get("bf_003").expect("backfill should exist");
+        let backfill = state
+            .backfills
+            .get("bf_003")
+            .expect("backfill should exist");
         assert_eq!(backfill.state, BackfillState::Paused);
         assert_eq!(backfill.state_version, 2);
     }
@@ -4732,7 +4840,10 @@ mod tests {
         );
         state.fold_event(&event);
 
-        let backfill = state.backfills.get("bf_004").expect("backfill should exist");
+        let backfill = state
+            .backfills
+            .get("bf_004")
+            .expect("backfill should exist");
         assert_eq!(backfill.state, BackfillState::Running);
         assert_eq!(backfill.state_version, 1);
     }
@@ -4921,7 +5032,7 @@ mod tests {
         };
 
         assert!(
-            state.should_drop_run_requested(&source_ref),
+            state.should_drop_run_requested_for_stale_sensor_eval(&source_ref),
             "RunRequested should be dropped when eval is stale"
         );
     }
@@ -5016,12 +5127,10 @@ mod tests {
         );
     }
 
-    /// Error status should update sensor status to Error.
     #[test]
-    fn test_fold_sensor_evaluated_error_updates_status() {
+    fn test_fold_sensor_evaluated_error_does_not_update_status() {
         let mut state = FoldState::new();
 
-        // Create error event
         let event = OrchestrationEvent::new(
             "tenant-abc",
             "workspace-prod",
@@ -5044,11 +5153,7 @@ mod tests {
         state.fold_event(&event);
 
         let sensor_state = state.sensor_state.get("01HQ123ERRORSENSOR").unwrap();
-        assert_eq!(
-            sensor_state.status,
-            SensorStatus::Error,
-            "Sensor status should be Error after error eval"
-        );
+        assert_eq!(sensor_state.status, SensorStatus::Active);
 
         let eval_id = match &event.data {
             OrchestrationEventData::SensorEvaluated { eval_id, .. } => eval_id,
@@ -5144,7 +5249,10 @@ mod tests {
 
         // Verify partition status updated
         let key = ("analytics.daily".to_string(), "2025-01-15".to_string());
-        let status = state.partition_status.get(&key).expect("partition status should exist");
+        let status = state
+            .partition_status
+            .get(&key)
+            .expect("partition status should exist");
 
         assert_eq!(status.asset_key, "analytics.daily");
         assert_eq!(status.partition_key, "2025-01-15");
@@ -5185,7 +5293,10 @@ mod tests {
 
         // Verify partition status
         let key = ("analytics.daily".to_string(), "2025-01-15".to_string());
-        let status = state.partition_status.get(&key).expect("partition status should exist");
+        let status = state
+            .partition_status
+            .get(&key)
+            .expect("partition status should exist");
 
         // Per P0-5: last_materialization_* should NOT be set on failure
         assert!(

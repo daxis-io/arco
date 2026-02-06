@@ -371,7 +371,7 @@ impl ScheduleController {
         error: &str,
         now: DateTime<Utc>,
     ) -> OrchestrationEvent {
-        let tick_id = format!("{}:error:{}", def.schedule_id, now.timestamp());
+        let tick_id = format!("{}:{}", def.schedule_id, now.timestamp());
 
         OrchestrationEvent::new_with_timestamp(
             &def.tenant_id,
@@ -451,8 +451,14 @@ fn compute_request_fingerprint(
     asset_selection: &[String],
     partition_selection: Option<&[String]>,
 ) -> String {
-    let mut input = asset_selection.join(",");
+    let mut assets = asset_selection.to_vec();
+    assets.sort();
+
+    let mut input = assets.join(",");
     if let Some(partitions) = partition_selection {
+        let mut partitions = partitions.to_vec();
+        partitions.sort();
+
         input.push_str(";partitions:");
         input.push_str(&partitions.join(","));
     }
@@ -836,9 +842,16 @@ mod tests {
         let fp2 = compute_request_fingerprint(&assets, None);
         assert_eq!(fp1, fp2, "Fingerprint should be deterministic");
 
-        let fp3 = compute_request_fingerprint(&assets, Some(&["p1".to_string()]));
-        assert_ne!(
+        let reversed_assets = vec!["b".to_string(), "a".to_string()];
+        let fp3 = compute_request_fingerprint(&reversed_assets, None);
+        assert_eq!(
             fp1, fp3,
+            "Fingerprint should be order-insensitive for asset selection"
+        );
+
+        let fp4 = compute_request_fingerprint(&assets, Some(&["p1".to_string()]));
+        assert_ne!(
+            fp1, fp4,
             "Different partitions should produce different fingerprint"
         );
     }

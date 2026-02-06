@@ -105,21 +105,16 @@ pub enum SourceRef {
 }
 
 /// Sensor status for state tracking.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SensorStatus {
     /// Sensor is active and evaluating.
+    #[default]
     Active,
     /// Sensor is paused.
     Paused,
     /// Sensor is in error state.
     Error,
-}
-
-impl Default for SensorStatus {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 /// Computes a full SHA-256 hex digest for idempotency keys.

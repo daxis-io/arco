@@ -7,7 +7,7 @@
 # - API error rate > 1% for 5 min
 # - Compaction lag > 10 min
 # - CAS retry rate > 10/min
-# - Rate limit hits > 100/min per tenant
+# - Rate limit hits > 100/min per endpoint
 
 groups:
   - name: arco.api
@@ -46,18 +46,18 @@ groups:
           runbook_url: "https://docs.arco.dev/runbooks/slow-requests"
 
       # Rate Limit Hits Alert
-      # Fires when any tenant exceeds 100 rate limit hits per minute
+      # Fires when any endpoint exceeds 100 rate limit hits per minute
       - alert: ArcoRateLimitHitsHigh
         expr: |
-          sum by (tenant) (increase(rate_limit_hits_total[1m])) > 100
+          sum by (endpoint) (increase(rate_limit_hits_total[1m])) > 100
         for: 1m
         labels:
           severity: warning
           service: arco-api
         annotations:
-          summary: "Rate limit hits > 100/min for tenant {{ $labels.tenant }}"
+          summary: "Rate limit hits > 100/min for endpoint {{ $labels.endpoint }}"
           description: |
-            Tenant {{ $labels.tenant }} is hitting rate limits frequently.
+            Endpoint {{ $labels.endpoint }} is hitting rate limits frequently.
             Rate: {{ $value | printf "%.0f" }} hits/min
           runbook_url: "https://docs.arco.dev/runbooks/rate-limiting"
 

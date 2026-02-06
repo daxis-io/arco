@@ -31,12 +31,12 @@ ignore = [
 
 [lint.per-file-ignores]
 "tests/**/*.py" = ["D", "ANN", "S101", "PLR2004", "PLC0415", "F821", "TC001"]
-"src/servo/cli/*.py" = ["PLR0913"]
-"src/servo/_internal/*.py" = ["PLR2004"]
+"src/arco_flow/cli/*.py" = ["PLR0913"]
+"src/arco_flow/_internal/*.py" = ["PLR2004"]
 
 [lint.pydocstyle]
 convention = "google"
 
 [lint.isort]
-known-first-party = ["servo"]
+known-first-party = ["arco_flow"]
 required-imports = ["from __future__ import annotations"]

@@ -1,4 +1,6 @@
-//! HTTP client for the compactor sync-compaction endpoint.
+//! HTTP client for invoking the sync-compact endpoint.
+
+use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::StatusCode;
@@ -7,7 +9,9 @@ use arco_catalog::SyncCompactor;
 use arco_catalog::error::CatalogError;
 use arco_core::sync_compact::{SyncCompactRequest, SyncCompactResponse};
 
-/// Sync-compaction HTTP client.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// HTTP client for invoking the compactor service.
 #[derive(Clone)]
 pub struct CompactorClient {
     base_url: String,
@@ -15,12 +19,16 @@ pub struct CompactorClient {
 }
 
 impl CompactorClient {
-    /// Creates a new compactor client.
+    /// Creates a new client targeting the given base URL.
     #[must_use]
     pub fn new(base_url: impl Into<String>) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             base_url: base_url.into(),
-            client: reqwest::Client::new(),
+            client,
         }
     }
 

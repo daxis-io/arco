@@ -1,0 +1,140 @@
+    Checking arco-core v0.1.0 (/Users/ethanurbanski/arco/crates/arco-core)
+   Compiling arco-proto v0.1.0 (/Users/ethanurbanski/arco/crates/arco-proto)
+    Checking arco-catalog v0.1.0 (/Users/ethanurbanski/arco/crates/arco-catalog)
+    Checking arco-flow v0.1.0 (/Users/ethanurbanski/arco/crates/arco-flow)
+error: this `continue` expression is redundant
+   --> crates/arco-catalog/src/tier1_compactor.rs:315:21
+    |
+315 |                     continue;
+    |                     ^^^^^^^^
+    |
+    = help: consider dropping the `continue` expression
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_continue
+    = note: `-D clippy::needless-continue` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::needless_continue)]`
+
+error: this `continue` expression is redundant
+   --> crates/arco-catalog/src/tier1_compactor.rs:434:21
+    |
+434 |                     continue;
+    |                     ^^^^^^^^
+    |
+    = help: consider dropping the `continue` expression
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_continue
+
+error: this `continue` expression is redundant
+   --> crates/arco-catalog/src/tier1_compactor.rs:565:21
+    |
+565 |                     continue;
+    |                     ^^^^^^^^
+    |
+    = help: consider dropping the `continue` expression
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#needless_continue
+
+error: docs for function returning `Result` missing `# Errors` section
+   --> crates/arco-catalog/src/manifest.rs:683:5
+    |
+683 | /     pub fn validate_succession(
+684 | |         &self,
+685 | |         previous: &Self,
+686 | |         previous_raw_hash: &str,
+687 | |     ) -> Result<(), String> {
+    | |___________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#missing_errors_doc
+    = note: `-D clippy::missing-errors-doc` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::missing_errors_doc)]`
+
+error: docs for function returning `Result` missing `# Errors` section
+   --> crates/arco-catalog/src/parquet_util.rs:430:1
+    |
+430 | pub fn write_search_postings(rows: &[SearchPostingRecord]) -> Result<Bytes> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#missing_errors_doc
+
+error: docs for function returning `Result` missing `# Errors` section
+   --> crates/arco-catalog/src/parquet_util.rs:715:1
+    |
+715 | pub fn read_search_postings(bytes: &Bytes) -> Result<Vec<SearchPostingRecord>> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#missing_errors_doc
+
+error: this function has too many lines (107/100)
+   --> crates/arco-catalog/src/reconciler.rs:297:5
+    |
+297 | /     async fn load_expected_paths(
+298 | |         &self,
+299 | |         domain: CatalogDomain,
+300 | |     ) -> Result<Option<(u64, Vec<String>, String)>> {
+    | |___________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_lines
+    = note: `-D clippy::too-many-lines` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::too_many_lines)]`
+
+error: assigning the result of `Clone::clone()` may be inefficient
+   --> crates/arco-catalog/src/tier1_compactor.rs:272:13
+    |
+272 |             manifest.watermark_event_id = last_event_id.clone();
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use `clone_from()`: `manifest.watermark_event_id.clone_from(&last_event_id)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#assigning_clones
+    = note: `-D clippy::assigning-clones` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::assigning_clones)]`
+
+error: assigning the result of `Clone::clone()` may be inefficient
+   --> crates/arco-catalog/src/tier1_compactor.rs:389:13
+    |
+389 |             manifest.watermark_event_id = last_event_id.clone();
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use `clone_from()`: `manifest.watermark_event_id.clone_from(&last_event_id)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#assigning_clones
+
+error: this function has too many lines (110/100)
+   --> crates/arco-catalog/src/tier1_compactor.rs:444:5
+    |
+444 | /     async fn sync_compact_search(
+445 | |         &self,
+446 | |         event_paths: Vec<String>,
+447 | |         lock: &DistributedLock<dyn StorageBackend>,
+448 | |         issuer: &arco_core::publish::PermitIssuer,
+449 | |         fencing_token: u64,
+450 | |     ) -> Result<Tier1CompactionResult, Tier1CompactionError> {
+    | |____________________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#too_many_lines
+
+error: assigning the result of `Clone::clone()` may be inefficient
+   --> crates/arco-catalog/src/tier1_compactor.rs:516:13
+    |
+516 |             manifest.watermark_event_id = last_event_id.clone();
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use `clone_from()`: `manifest.watermark_event_id.clone_from(&last_event_id)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#assigning_clones
+
+error: docs for function returning `Result` missing `# Errors` section
+  --> crates/arco-catalog/src/tier1_snapshot.rs:95:1
+   |
+95 | / pub async fn write_search_snapshot<S: StatePutStore + ?Sized>(
+96 | |     storage: &S,
+97 | |     version: u64,
+98 | |     state: &SearchState,
+99 | | ) -> Result<SnapshotInfo> {
+   | |_________________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#missing_errors_doc
+
+error: wildcard matches only a single variant and will also match any future added variants
+    --> crates/arco-catalog/src/writer.rs:1059:13
+     |
+1059 |             _ => Ok(None),
+     |             ^ help: try: `CatalogDomain::Executions`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.91.0/index.html#match_wildcard_for_single_variants
+     = note: `-D clippy::match-wildcard-for-single-variants` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::match_wildcard_for_single_variants)]`
+
+error: could not compile `arco-catalog` (lib) due to 13 previous errors
+warning: build failed, waiting for other jobs to finish...

@@ -76,6 +76,13 @@ pub enum CatalogError {
         /// Description of the invariant violation.
         message: String,
     },
+
+    /// The requested operation is not supported.
+    #[error("unsupported operation: {message}")]
+    UnsupportedOperation {
+        /// Description of why the operation is not supported.
+        message: String,
+    },
 }
 
 impl CatalogError {
@@ -84,6 +91,22 @@ impl CatalogError {
     pub fn storage(message: impl fmt::Display) -> Self {
         Self::Storage {
             message: message.to_string(),
+        }
+    }
+
+    /// Returns the HTTP status code for this error, or None for 5xx errors.
+    #[must_use]
+    pub const fn http_status_code(&self) -> Option<u16> {
+        match self {
+            Self::Validation { .. } => Some(400),
+            Self::AlreadyExists { .. } | Self::CasFailed { .. } => Some(409),
+            Self::NotFound { .. } => Some(404),
+            Self::PreconditionFailed { .. } => Some(412),
+            Self::UnsupportedOperation { .. } => Some(406),
+            Self::Storage { .. }
+            | Self::Serialization { .. }
+            | Self::Parquet { .. }
+            | Self::InvariantViolation { .. } => None,
         }
     }
 }

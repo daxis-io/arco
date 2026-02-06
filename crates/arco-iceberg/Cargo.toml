@@ -18,7 +18,7 @@ workspace = true
 [features]
 default = []
 full = ["gcp", "aws", "azure"]
-gcp = ["arco-core/gcp"]
+gcp = ["arco-core/gcp", "dep:gcp_auth"]
 aws = ["arco-core/aws"]
 azure = ["arco-core/azure"]
 
@@ -64,6 +64,9 @@ utoipa = { version = "5.4.0", features = ["axum_extras", "chrono", "uuid"] }
 tracing = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+
+# Credential vending (GCS OAuth2) - optional, enabled by `gcp` feature
+gcp_auth = { workspace = true, optional = true }
 
 [dev-dependencies]
 arco-test-utils = { path = "../arco-test-utils" }

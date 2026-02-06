@@ -25,8 +25,12 @@ use crate::idempotency::{
     FinalizeResult, IdempotencyMarker, IdempotencyStatus, IdempotencyStore, IdempotencyStoreImpl,
 };
 use crate::metrics;
-use crate::paths::resolve_metadata_path;
-use crate::pointer::PointerStore;
+use crate::paths::{
+    ICEBERG_IDEMPOTENCY_PREFIX, iceberg_committed_receipt_prefix, iceberg_idempotency_table_prefix,
+    iceberg_pending_receipt_prefix, resolve_metadata_path,
+};
+use crate::pointer::{PointerStore, resolve_effective_metadata_location};
+use crate::transactions::TransactionStoreImpl;
 use crate::types::{ObjectVersion, TableMetadata};
 
 /// Default grace period added to marker lifetime before deletion.
@@ -181,7 +185,11 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
 
     /// Creates a new garbage collector with custom configuration.
     #[must_use]
-    pub fn with_config(storage: Arc<S>, pointer_store: Arc<P>, config: IdempotencyGcConfig) -> Self {
+    pub fn with_config(
+        storage: Arc<S>,
+        pointer_store: Arc<P>,
+        config: IdempotencyGcConfig,
+    ) -> Self {
         let idempotency_store = IdempotencyStoreImpl::new(Arc::clone(&storage));
         Self {
             storage,
@@ -220,7 +228,7 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
     ///
     /// Returns error if storage listing or marker reading fails.
     pub async fn list_markers(&self, table_uuid: &Uuid) -> IcebergResult<Vec<MarkerListEntry>> {
-        let prefix = format!("_catalog/iceberg_idempotency/{table_uuid}/");
+        let prefix = iceberg_idempotency_table_prefix(table_uuid);
         let result = self.list_markers_with_prefix(&prefix).await?;
         if result.stats.read_errors > 0
             || result.stats.parse_errors > 0
@@ -243,8 +251,8 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
     ///
     /// Returns error if storage listing fails.
     pub async fn list_all_markers(&self) -> IcebergResult<AllMarkersResult> {
-        let prefix = "_catalog/iceberg_idempotency/";
-        let list_result = self.list_markers_with_prefix(prefix).await?;
+        let prefix = format!("{ICEBERG_IDEMPOTENCY_PREFIX}/");
+        let list_result = self.list_markers_with_prefix(&prefix).await?;
         let entries = list_result.entries;
 
         let mut by_table = std::collections::HashMap::new();
@@ -345,8 +353,8 @@ struct MarkerListResult {
 }
 
 fn table_uuid_from_marker_path(path: &str) -> Option<Uuid> {
-    let prefix = "_catalog/iceberg_idempotency/";
-    let rest = path.strip_prefix(prefix)?;
+    let prefix = format!("{ICEBERG_IDEMPOTENCY_PREFIX}/");
+    let rest = path.strip_prefix(&prefix)?;
     let table_part = rest.split('/').next()?;
     Uuid::parse_str(table_part).ok()
 }
@@ -443,7 +451,10 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
         match marker.status {
             IdempotencyStatus::Committed | IdempotencyStatus::Failed => {
                 // Eligible after lifetime + grace period from finalization time
-                let finalized_at = marker.committed_at.or(marker.failed_at).unwrap_or(marker.started_at);
+                let finalized_at = marker
+                    .committed_at
+                    .or(marker.failed_at)
+                    .unwrap_or(marker.started_at);
                 finalized_at + self.config.marker_lifetime + self.config.grace_period < now
             }
             IdempotencyStatus::InProgress => {
@@ -456,12 +467,12 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
     /// Determines the action to take for an in-progress marker.
     ///
     /// Per design doc Section 9.2:
-    /// - If `pointer.metadata_location != marker.metadata_location`, safe to delete
+    /// - If effective metadata location != `marker.metadata_location`, safe to delete
     /// - Otherwise, mark as Failed before deleting
     ///
     /// # Errors
     ///
-    /// Returns error if pointer loading fails.
+    /// Returns error if pointer loading or effective resolution fails.
     pub async fn check_in_progress_action(
         &self,
         marker: &IdempotencyMarker,
@@ -469,17 +480,20 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
         let pointer = self.pointer_store.load(&marker.table_uuid).await?;
 
         match pointer {
-            None => {
-                // Pointer not found - table may have been deleted
-                Ok(InProgressAction::PointerNotFound)
-            }
+            None => Ok(InProgressAction::PointerNotFound),
             Some((pointer, _version)) => {
-                if pointer.current_metadata_location == marker.metadata_location {
-                    // Pointer still points to this marker's metadata
-                    // The commit may have succeeded but finalization failed
+                pointer
+                    .validate_version()
+                    .map_err(|e| IcebergError::Internal {
+                        message: format!("Unsupported pointer version: {e}"),
+                    })?;
+
+                let tx_store = TransactionStoreImpl::new(Arc::clone(&self.storage));
+                let effective = resolve_effective_metadata_location(&pointer, &tx_store).await?;
+
+                if effective.metadata_location == marker.metadata_location {
                     Ok(InProgressAction::MarkFailedThenDelete)
                 } else {
-                    // Pointer has moved past this marker
                     Ok(InProgressAction::SafeToDelete)
                 }
             }
@@ -489,11 +503,7 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
     /// Cleans up a single marker.
     ///
     /// Returns the action taken (deleted, skipped, or failed).
-    async fn clean_marker(
-        &self,
-        entry: &MarkerListEntry,
-        now: DateTime<Utc>,
-    ) -> CleanupOutcome {
+    async fn clean_marker(&self, entry: &MarkerListEntry, now: DateTime<Utc>) -> CleanupOutcome {
         if !self.is_eligible_for_gc(&entry.marker, now) {
             return CleanupOutcome::skipped();
         }
@@ -799,13 +809,13 @@ impl<S: StorageBackend> OrphanMetadataCleaner<S> {
         metadata_prefix: &str,
         allowlist: &HashSet<String>,
     ) -> IcebergResult<OrphanScanResult> {
-        let objects = self
-            .storage
-            .list(metadata_prefix)
-            .await
-            .map_err(|e| IcebergError::Internal {
-                message: format!("Failed to list metadata files: {e}"),
-            })?;
+        let objects =
+            self.storage
+                .list(metadata_prefix)
+                .await
+                .map_err(|e| IcebergError::Internal {
+                    message: format!("Failed to list metadata files: {e}"),
+                })?;
 
         let mut orphans = Vec::new();
         let mut files_scanned = 0;
@@ -1062,15 +1072,23 @@ impl<S: StorageBackend, P: PointerStore> MetadataGcPlanner<S, P> {
             });
         };
 
-        let current_path =
-            resolve_metadata_path(&pointer.current_metadata_location, tenant, workspace)?;
-        let metadata_bytes = self
-            .storage
-            .get(&current_path)
-            .await
+        pointer
+            .validate_version()
             .map_err(|e| IcebergError::Internal {
-                message: format!("Failed to read metadata file: {e}"),
+                message: format!("Unsupported pointer version: {e}"),
             })?;
+
+        let tx_store = TransactionStoreImpl::new(Arc::clone(&self.storage));
+        let effective = resolve_effective_metadata_location(&pointer, &tx_store).await?;
+
+        let current_path = resolve_metadata_path(&effective.metadata_location, tenant, workspace)?;
+        let metadata_bytes =
+            self.storage
+                .get(&current_path)
+                .await
+                .map_err(|e| IcebergError::Internal {
+                    message: format!("Failed to read metadata file: {e}"),
+                })?;
 
         let metadata: TableMetadata =
             serde_json::from_slice(&metadata_bytes).map_err(|e| IcebergError::Internal {
@@ -1082,6 +1100,18 @@ impl<S: StorageBackend, P: PointerStore> MetadataGcPlanner<S, P> {
 
         let mut allowlist = HashSet::new();
         allowlist.insert(current_path);
+
+        let stable_path =
+            resolve_metadata_path(&pointer.current_metadata_location, tenant, workspace)?;
+        allowlist.insert(stable_path);
+
+        if let Some(ref pending) = pointer.pending {
+            if let Ok(pending_path) =
+                resolve_metadata_path(&pending.metadata_location, tenant, workspace)
+            {
+                allowlist.insert(pending_path);
+            }
+        }
 
         if let Some(previous) = pointer.previous_metadata_location.as_deref() {
             match resolve_metadata_path(previous, tenant, workspace) {
@@ -1100,7 +1130,9 @@ impl<S: StorageBackend, P: PointerStore> MetadataGcPlanner<S, P> {
         log_entries.sort_by_key(|entry| entry.timestamp_ms);
 
         let entries_to_keep = if policy.delete_after_commit {
-            let start = log_entries.len().saturating_sub(policy.previous_versions_max);
+            let start = log_entries
+                .len()
+                .saturating_sub(policy.previous_versions_max);
             // start is always <= log_entries.len() due to saturating_sub
             log_entries.get(start..).unwrap_or(&[])
         } else {
@@ -1122,7 +1154,7 @@ impl<S: StorageBackend, P: PointerStore> MetadataGcPlanner<S, P> {
 
         Ok(MetadataGcPlan {
             table_uuid: *table_uuid,
-            current_metadata_location: pointer.current_metadata_location,
+            current_metadata_location: effective.metadata_location,
             metadata_prefix,
             allowlist,
             policy,
@@ -1283,9 +1315,13 @@ impl<S: StorageBackend> EventReceiptGarbageCollector<S> {
     /// # Errors
     ///
     /// Returns error if storage listing or deletion fails.
-    pub async fn clean_pending_receipts(&self, date: chrono::NaiveDate) -> IcebergResult<ReceiptCleanupResult> {
-        let prefix = format!("events/{}/iceberg/pending/", date.format("%Y-%m-%d"));
-        self.clean_receipts_in_prefix(&prefix, self.config.pending_retention).await
+    pub async fn clean_pending_receipts(
+        &self,
+        date: chrono::NaiveDate,
+    ) -> IcebergResult<ReceiptCleanupResult> {
+        let prefix = iceberg_pending_receipt_prefix(date);
+        self.clean_receipts_in_prefix(&prefix, self.config.pending_retention)
+            .await
     }
 
     /// Cleans committed receipts older than the retention period.
@@ -1295,9 +1331,13 @@ impl<S: StorageBackend> EventReceiptGarbageCollector<S> {
     /// # Errors
     ///
     /// Returns error if storage listing or deletion fails.
-    pub async fn clean_committed_receipts(&self, date: chrono::NaiveDate) -> IcebergResult<ReceiptCleanupResult> {
-        let prefix = format!("events/{}/iceberg/committed/", date.format("%Y-%m-%d"));
-        self.clean_receipts_in_prefix(&prefix, self.config.committed_retention).await
+    pub async fn clean_committed_receipts(
+        &self,
+        date: chrono::NaiveDate,
+    ) -> IcebergResult<ReceiptCleanupResult> {
+        let prefix = iceberg_committed_receipt_prefix(date);
+        self.clean_receipts_in_prefix(&prefix, self.config.committed_retention)
+            .await
     }
 
     /// Cleans all eligible receipts for a specific date.
@@ -1309,7 +1349,10 @@ impl<S: StorageBackend> EventReceiptGarbageCollector<S> {
     /// Returns error if receipt cleaning fails.
     #[allow(clippy::cast_possible_truncation)]
     #[tracing::instrument(skip(self), fields(date = %date))]
-    pub async fn clean_receipts_for_date(&self, date: chrono::NaiveDate) -> IcebergResult<EventReceiptGcResult> {
+    pub async fn clean_receipts_for_date(
+        &self,
+        date: chrono::NaiveDate,
+    ) -> IcebergResult<EventReceiptGcResult> {
         let start = Instant::now();
 
         let pending_result = self.clean_pending_receipts(date).await?;
@@ -1620,8 +1663,14 @@ mod tests {
 
         assert_eq!(result.total_count, 5);
         assert_eq!(result.by_table.len(), 2);
-        assert_eq!(result.by_table.get(&table1).map(|v| v.len()).unwrap_or(0), 2);
-        assert_eq!(result.by_table.get(&table2).map(|v| v.len()).unwrap_or(0), 3);
+        assert_eq!(
+            result.by_table.get(&table1).map(|v| v.len()).unwrap_or(0),
+            2
+        );
+        assert_eq!(
+            result.by_table.get(&table2).map(|v| v.len()).unwrap_or(0),
+            3
+        );
     }
 
     #[tokio::test]
@@ -1655,7 +1704,10 @@ mod tests {
         // Create a non-JSON file in the same directory
         storage
             .put(
-                &format!("_catalog/iceberg_idempotency/{table_uuid}/ab/some_file.txt"),
+                &format!(
+                    "{}ab/some_file.txt",
+                    iceberg_idempotency_table_prefix(&table_uuid)
+                ),
                 Bytes::from("not a marker"),
                 arco_core::storage::WritePrecondition::None,
             )
@@ -1703,7 +1755,10 @@ mod tests {
         // Create an invalid JSON file
         storage
             .put(
-                &format!("_catalog/iceberg_idempotency/{table_uuid}/ba/invalid.json"),
+                &format!(
+                    "{}ba/invalid.json",
+                    iceberg_idempotency_table_prefix(&table_uuid)
+                ),
                 Bytes::from("not valid json"),
                 arco_core::storage::WritePrecondition::None,
             )
@@ -1765,16 +1820,13 @@ mod tests {
 
     #[test]
     fn test_idempotency_gc_config_parses_lifetime() {
-        let config = IdempotencyGcConfig::default()
-            .with_idempotency_key_lifetime(Some("PT2H"));
+        let config = IdempotencyGcConfig::default().with_idempotency_key_lifetime(Some("PT2H"));
         assert_eq!(config.marker_lifetime, Duration::hours(2));
 
-        let config = IdempotencyGcConfig::default()
-            .with_idempotency_key_lifetime(Some("P1DT1H"));
+        let config = IdempotencyGcConfig::default().with_idempotency_key_lifetime(Some("P1DT1H"));
         assert_eq!(config.marker_lifetime, Duration::hours(25));
 
-        let config = IdempotencyGcConfig::default()
-            .with_idempotency_key_lifetime(Some("P1M"));
+        let config = IdempotencyGcConfig::default().with_idempotency_key_lifetime(Some("P1M"));
         assert_eq!(config.marker_lifetime, Duration::hours(24));
     }
 
@@ -2407,16 +2459,20 @@ mod tests {
         assert_eq!(result.orphans_skipped, 0);
 
         // Verify orphan is deleted but valid file remains
-        assert!(storage
-            .head("metadata/v1.metadata.json")
-            .await
-            .expect("head")
-            .is_some());
-        assert!(storage
-            .head("metadata/orphan.metadata.json")
-            .await
-            .expect("head")
-            .is_none());
+        assert!(
+            storage
+                .head("metadata/v1.metadata.json")
+                .await
+                .expect("head")
+                .is_some()
+        );
+        assert!(
+            storage
+                .head("metadata/orphan.metadata.json")
+                .await
+                .expect("head")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2450,11 +2506,13 @@ mod tests {
         assert_eq!(result.orphans_skipped, 1);
 
         // Orphan should still exist
-        assert!(storage
-            .head("metadata/orphan.metadata.json")
-            .await
-            .expect("head")
-            .is_some());
+        assert!(
+            storage
+                .head("metadata/orphan.metadata.json")
+                .await
+                .expect("head")
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -2506,19 +2564,23 @@ mod tests {
 
         // Valid files remain
         for i in 1..=3 {
-            assert!(storage
-                .head(&format!("metadata/v{i}.metadata.json"))
-                .await
-                .expect("head")
-                .is_some());
+            assert!(
+                storage
+                    .head(&format!("metadata/v{i}.metadata.json"))
+                    .await
+                    .expect("head")
+                    .is_some()
+            );
         }
         // Orphans are deleted
         for i in 1..=2 {
-            assert!(storage
-                .head(&format!("metadata/orphan{i}.metadata.json"))
-                .await
-                .expect("head")
-                .is_none());
+            assert!(
+                storage
+                    .head(&format!("metadata/orphan{i}.metadata.json"))
+                    .await
+                    .expect("head")
+                    .is_none()
+            );
         }
     }
 
@@ -2602,10 +2664,8 @@ mod tests {
             .await
             .expect("put metadata");
 
-        let pointer = crate::pointer::IcebergTablePointer::new(
-            table_uuid,
-            current_location.to_string(),
-        );
+        let pointer =
+            crate::pointer::IcebergTablePointer::new(table_uuid, current_location.to_string());
         pointer_store
             .create(&table_uuid, &pointer)
             .await
@@ -2618,12 +2678,15 @@ mod tests {
             .expect("plan");
 
         assert!(plan.allowlist.contains(current_location));
-        assert!(plan
-            .allowlist
-            .contains("warehouse/table/metadata/v2.metadata.json"));
-        assert!(!plan
-            .allowlist
-            .contains("warehouse/table/metadata/v1.metadata.json"));
+        assert!(
+            plan.allowlist
+                .contains("warehouse/table/metadata/v2.metadata.json")
+        );
+        assert!(
+            !plan
+                .allowlist
+                .contains("warehouse/table/metadata/v1.metadata.json")
+        );
         assert_eq!(plan.metadata_prefix, "warehouse/table/metadata/");
     }
 
@@ -2648,10 +2711,8 @@ mod tests {
             .await
             .expect("put metadata");
 
-        let pointer = crate::pointer::IcebergTablePointer::new(
-            table_uuid,
-            current_location.to_string(),
-        );
+        let pointer =
+            crate::pointer::IcebergTablePointer::new(table_uuid, current_location.to_string());
         pointer_store
             .create(&table_uuid, &pointer)
             .await
@@ -2708,10 +2769,8 @@ mod tests {
             .await
             .expect("put orphan");
 
-        let pointer = crate::pointer::IcebergTablePointer::new(
-            table_uuid,
-            current_location.to_string(),
-        );
+        let pointer =
+            crate::pointer::IcebergTablePointer::new(table_uuid, current_location.to_string());
         pointer_store
             .create(&table_uuid, &pointer)
             .await
@@ -2728,16 +2787,20 @@ mod tests {
 
         let orphan_result = result.orphan_result.expect("orphan result");
         assert_eq!(orphan_result.orphans_deleted, 1);
-        assert!(storage
-            .head("warehouse/table/metadata/orphan.metadata.json")
-            .await
-            .expect("head")
-            .is_none());
-        assert!(storage
-            .head(current_location)
-            .await
-            .expect("head")
-            .is_some());
+        assert!(
+            storage
+                .head("warehouse/table/metadata/orphan.metadata.json")
+                .await
+                .expect("head")
+                .is_none()
+        );
+        assert!(
+            storage
+                .head(current_location)
+                .await
+                .expect("head")
+                .is_some()
+        );
     }
 
     // ========================================================================
@@ -2768,10 +2831,12 @@ mod tests {
     async fn test_clean_pending_receipts_skips_recent() {
         let storage = Arc::new(MemoryBackend::new());
 
-        // Create a pending receipt (will have recent timestamp)
+        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
+        let pending_path = format!("{}abc123.json", iceberg_pending_receipt_prefix(date));
+
         storage
             .put(
-                "events/2025-01-15/iceberg/pending/abc123.json",
+                &pending_path,
                 Bytes::from("{}"),
                 arco_core::storage::WritePrecondition::None,
             )
@@ -2779,65 +2844,55 @@ mod tests {
             .expect("put");
 
         let gc = EventReceiptGarbageCollector::new(Arc::clone(&storage));
-        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
         let result = gc.clean_pending_receipts(date).await.expect("clean");
 
-        // Should skip (too recent)
         assert_eq!(result.deleted, 0);
         assert_eq!(result.skipped, 1);
         assert_eq!(result.files_scanned, 1);
 
-        // File should still exist
-        assert!(storage
-            .head("events/2025-01-15/iceberg/pending/abc123.json")
-            .await
-            .expect("head")
-            .is_some());
+        assert!(storage.head(&pending_path).await.expect("head").is_some());
     }
 
     #[tokio::test]
     async fn test_clean_pending_receipts_deletes_old() {
         let storage = Arc::new(MemoryBackend::new());
 
-        // Create a pending receipt
+        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
+        let pending_path = format!("{}abc123.json", iceberg_pending_receipt_prefix(date));
+
         storage
             .put(
-                "events/2025-01-15/iceberg/pending/abc123.json",
+                &pending_path,
                 Bytes::from("{}"),
                 arco_core::storage::WritePrecondition::None,
             )
             .await
             .expect("put");
 
-        // Use zero retention for testing
         let config = EventReceiptGcConfig {
             pending_retention: Duration::zero(),
             committed_retention: Duration::zero(),
         };
         let gc = EventReceiptGarbageCollector::with_config(Arc::clone(&storage), config);
 
-        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
         let result = gc.clean_pending_receipts(date).await.expect("clean");
 
         assert_eq!(result.deleted, 1);
         assert_eq!(result.skipped, 0);
 
-        // File should be deleted
-        assert!(storage
-            .head("events/2025-01-15/iceberg/pending/abc123.json")
-            .await
-            .expect("head")
-            .is_none());
+        assert!(storage.head(&pending_path).await.expect("head").is_none());
     }
 
     #[tokio::test]
     async fn test_clean_committed_receipts_respects_90_day_retention() {
         let storage = Arc::new(MemoryBackend::new());
 
-        // Create committed receipts
+        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
+        let committed_path = format!("{}abc123.json", iceberg_committed_receipt_prefix(date));
+
         storage
             .put(
-                "events/2025-01-15/iceberg/committed/abc123.json",
+                &committed_path,
                 Bytes::from("{}"),
                 arco_core::storage::WritePrecondition::None,
             )
@@ -2845,7 +2900,6 @@ mod tests {
             .expect("put");
 
         let gc = EventReceiptGarbageCollector::new(Arc::clone(&storage));
-        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
         let result = gc.clean_committed_receipts(date).await.expect("clean");
 
         // Should skip (too recent, less than 90 days)
@@ -2857,10 +2911,13 @@ mod tests {
     async fn test_clean_receipts_for_date_combines_results() {
         let storage = Arc::new(MemoryBackend::new());
 
-        // Create pending and committed receipts
+        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
+        let pending_path = format!("{}pending1.json", iceberg_pending_receipt_prefix(date));
+        let committed_path = format!("{}committed1.json", iceberg_committed_receipt_prefix(date));
+
         storage
             .put(
-                "events/2025-01-15/iceberg/pending/pending1.json",
+                &pending_path,
                 Bytes::from("{}"),
                 arco_core::storage::WritePrecondition::None,
             )
@@ -2868,21 +2925,19 @@ mod tests {
             .expect("put");
         storage
             .put(
-                "events/2025-01-15/iceberg/committed/committed1.json",
+                &committed_path,
                 Bytes::from("{}"),
                 arco_core::storage::WritePrecondition::None,
             )
             .await
             .expect("put");
 
-        // Zero retention deletes both
         let config = EventReceiptGcConfig {
             pending_retention: Duration::zero(),
             committed_retention: Duration::zero(),
         };
         let gc = EventReceiptGarbageCollector::with_config(Arc::clone(&storage), config);
 
-        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
         let result = gc.clean_receipts_for_date(date).await.expect("clean");
 
         assert_eq!(result.pending_deleted, 1);
@@ -2894,11 +2949,12 @@ mod tests {
     async fn test_clean_receipts_for_date_range() {
         let storage = Arc::new(MemoryBackend::new());
 
-        // Create receipts for multiple days
         for day in 15..=17 {
+            let date = chrono::NaiveDate::from_ymd_opt(2025, 1, day).expect("valid date");
+            let path = format!("{}receipt.json", iceberg_pending_receipt_prefix(date));
             storage
                 .put(
-                    &format!("events/2025-01-{day:02}/iceberg/pending/receipt.json"),
+                    &path,
                     Bytes::from("{}"),
                     arco_core::storage::WritePrecondition::None,
                 )
@@ -2914,7 +2970,10 @@ mod tests {
 
         let start = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
         let end = chrono::NaiveDate::from_ymd_opt(2025, 1, 17).expect("valid date");
-        let result = gc.clean_receipts_for_date_range(start, end).await.expect("clean");
+        let result = gc
+            .clean_receipts_for_date_range(start, end)
+            .await
+            .expect("clean");
 
         assert_eq!(result.pending_deleted, 3);
         assert_eq!(result.files_scanned, 3);
@@ -2924,10 +2983,12 @@ mod tests {
     async fn test_event_receipt_gc_ignores_non_json() {
         let storage = Arc::new(MemoryBackend::new());
 
-        // Create non-JSON file
+        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
+        let path = format!("{}readme.txt", iceberg_pending_receipt_prefix(date));
+
         storage
             .put(
-                "events/2025-01-15/iceberg/pending/readme.txt",
+                &path,
                 Bytes::from("text"),
                 arco_core::storage::WritePrecondition::None,
             )
@@ -2940,19 +3001,12 @@ mod tests {
         };
         let gc = EventReceiptGarbageCollector::with_config(Arc::clone(&storage), config);
 
-        let date = chrono::NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
         let result = gc.clean_pending_receipts(date).await.expect("clean");
 
-        // Should scan but not delete (not a JSON file)
         assert_eq!(result.deleted, 0);
         assert_eq!(result.skipped, 0);
         assert_eq!(result.files_scanned, 1);
 
-        // File should still exist
-        assert!(storage
-            .head("events/2025-01-15/iceberg/pending/readme.txt")
-            .await
-            .expect("head")
-            .is_some());
+        assert!(storage.head(&path).await.expect("head").is_some());
     }
 }

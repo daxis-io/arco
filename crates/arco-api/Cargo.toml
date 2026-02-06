@@ -18,7 +18,7 @@ workspace = true
 [features]
 default = []
 full = ["gcp", "aws", "azure"]
-gcp = ["arco-core/gcp", "arco-catalog/gcp", "arco-flow/gcp"]
+gcp = ["arco-core/gcp", "arco-catalog/gcp", "arco-flow/gcp", "arco-iceberg/gcp"]
 aws = ["arco-core/aws", "arco-catalog/aws", "arco-flow/aws"]
 azure = ["arco-core/azure", "arco-catalog/azure", "arco-flow/azure"]
 
@@ -48,6 +48,10 @@ tonic = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
+arrow = { workspace = true }
+arrow-json = { workspace = true }
+parquet = { workspace = true }
+datafusion = "46"
 
 # IDs
 ulid = { workspace = true }
@@ -55,17 +59,20 @@ ulid = { workspace = true }
 # Hashing/encoding
 base64 = { workspace = true }
 hex = { workspace = true }
+hmac = { workspace = true }
 sha2 = { workspace = true }
 
 # Time
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
+cron = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 
 # Auth
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 
 # OpenAPI
 utoipa = { version = "5.4.0", features = ["axum_extras", "chrono"] }
@@ -80,6 +87,6 @@ metrics-exporter-prometheus = { workspace = true }
 
 [dev-dependencies]
 arco-test-utils = { path = "../arco-test-utils" }
-duckdb = { version = "1.4.3", features = ["parquet"] }
+duckdb = { version = "1.4.4", features = ["parquet"] }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }

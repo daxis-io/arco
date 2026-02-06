@@ -1,4 +1,5 @@
 """Tests for manifest model."""
+
 from __future__ import annotations
 
 import json
@@ -9,7 +10,7 @@ class TestGitContext:
 
     def test_default_values(self) -> None:
         """Default values are empty strings and False."""
-        from servo.manifest.model import GitContext
+        from arco_flow.manifest.model import GitContext
 
         git = GitContext()
         assert git.repository == ""
@@ -19,7 +20,7 @@ class TestGitContext:
 
     def test_with_values(self) -> None:
         """Can create with actual values."""
-        from servo.manifest.model import GitContext
+        from arco_flow.manifest.model import GitContext
 
         git = GitContext(
             repository="https://github.com/arco/arco",
@@ -36,7 +37,7 @@ class TestAssetManifest:
 
     def test_default_values(self) -> None:
         """Default values are sensible."""
-        from servo.manifest.model import AssetManifest
+        from arco_flow.manifest.model import AssetManifest
 
         manifest = AssetManifest()
         assert manifest.manifest_version == "1.0"
@@ -45,7 +46,7 @@ class TestAssetManifest:
 
     def test_with_values(self) -> None:
         """Can create with actual values."""
-        from servo.manifest.model import AssetManifest, GitContext
+        from arco_flow.manifest.model import AssetManifest, GitContext
 
         manifest = AssetManifest(
             tenant_id="acme",
@@ -57,7 +58,7 @@ class TestAssetManifest:
 
     def test_to_canonical_json_uses_camel_case(self) -> None:
         """Canonical JSON uses camelCase keys."""
-        from servo.manifest.model import AssetManifest
+        from arco_flow.manifest.model import AssetManifest
 
         manifest = AssetManifest(
             tenant_id="test",
@@ -73,7 +74,7 @@ class TestAssetManifest:
 
     def test_to_canonical_json_is_deterministic(self) -> None:
         """Canonical JSON output is deterministic."""
-        from servo.manifest.model import AssetManifest, GitContext
+        from arco_flow.manifest.model import AssetManifest, GitContext
 
         manifest = AssetManifest(
             tenant_id="test",
@@ -86,7 +87,7 @@ class TestAssetManifest:
 
     def test_to_dict_converts_nested(self) -> None:
         """to_dict converts nested objects."""
-        from servo.manifest.model import AssetManifest, GitContext
+        from arco_flow.manifest.model import AssetManifest, GitContext
 
         manifest = AssetManifest(
             tenant_id="test",
@@ -99,7 +100,7 @@ class TestAssetManifest:
 
     def test_fingerprint_is_stable(self) -> None:
         """Fingerprint is stable for same content."""
-        from servo.manifest.model import AssetManifest
+        from arco_flow.manifest.model import AssetManifest
 
         manifest = AssetManifest(tenant_id="test")
         fp1 = manifest.fingerprint()
@@ -114,8 +115,8 @@ class TestAssetEntry:
 
     def test_from_definition(self) -> None:
         """Can create AssetEntry from AssetDefinition."""
-        from servo.manifest.model import AssetEntry
-        from servo.types import AssetDefinition, AssetId, AssetKey, CodeLocation
+        from arco_flow.manifest.model import AssetEntry
+        from arco_flow.types import AssetDefinition, AssetId, AssetKey, CodeLocation
 
         definition = AssetDefinition(
             key=AssetKey("raw", "events"),

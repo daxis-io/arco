@@ -158,7 +158,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn idempotency_key_is_deterministic() {
+    fn idempotency_key_is_deterministic() -> std::result::Result<(), Box<dyn std::error::Error>> {
         #[derive(Serialize)]
         struct Payload {
             b: u32,
@@ -166,11 +166,10 @@ mod tests {
         }
 
         let payload = Payload { b: 2, a: 1 };
-        let key1 =
-            CatalogEvent::<()>::generate_idempotency_key("test.event", 1, &payload).expect("key");
-        let key2 =
-            CatalogEvent::<()>::generate_idempotency_key("test.event", 1, &payload).expect("key");
+        let key1 = CatalogEvent::<()>::generate_idempotency_key("test.event", 1, &payload)?;
+        let key2 = CatalogEvent::<()>::generate_idempotency_key("test.event", 1, &payload)?;
         assert_eq!(key1, key2);
         assert!(key1.starts_with("auto:"));
+        Ok(())
     }
 }

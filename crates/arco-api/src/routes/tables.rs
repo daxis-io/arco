@@ -25,6 +25,10 @@ use crate::error::ApiError;
 use crate::error::ApiErrorBody;
 use crate::server::AppState;
 use arco_catalog::Tier1Compactor;
+use arco_catalog::idempotency::{
+    CatalogOperation, IdempotencyCheck, IdempotencyStore, IdempotencyStoreImpl,
+    calculate_retry_after, canonical_request_hash, check_idempotency,
+};
 
 /// Request to register a table.
 #[derive(Debug, Deserialize, ToSchema)]
@@ -143,6 +147,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         ("bearerAuth" = [])
     )
 )]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn register_table(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
@@ -159,12 +164,102 @@ pub(crate) async fn register_table(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
+
+    let columns_json: Vec<serde_json::Value> = req
+        .columns
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name,
+                "data_type": c.data_type,
+                "nullable": c.nullable,
+                "description": c.description
+            })
+        })
+        .collect();
+
+    let request_json = serde_json::json!({
+        "namespace": namespace,
+        "name": req.name,
+        "description": req.description,
+        "columns": columns_json
+    });
+    let request_hash = canonical_request_hash(&request_json)
+        .map_err(|e| ApiError::internal(format!("Failed to compute request hash: {e}")))?;
+
+    let storage_arc = Arc::new(storage.clone());
+    let idempotency_store = IdempotencyStoreImpl::new(storage_arc);
+    let idempotency_check = check_idempotency(
+        &idempotency_store,
+        ctx.idempotency_key.as_deref(),
+        CatalogOperation::RegisterTable,
+        &request_hash,
+        state.config.idempotency_stale_timeout(),
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    let (marker, marker_version) = match idempotency_check {
+        IdempotencyCheck::NoKey => (None, None),
+        IdempotencyCheck::Proceed { marker, version } => (Some(marker), Some(version)),
+        IdempotencyCheck::Replay {
+            entity_id,
+            entity_name,
+        } => {
+            let reader = arco_catalog::CatalogReader::new(storage);
+            let table = reader
+                .get_table(&namespace, &entity_name)
+                .await
+                .map_err(ApiError::from)?
+                .ok_or_else(|| ApiError::internal("Cached table not found"))?;
+            let cols = reader
+                .get_columns(&entity_id)
+                .await
+                .map_err(ApiError::from)?;
+            let response = TableResponse {
+                id: entity_id,
+                namespace,
+                name: table.name,
+                description: table.description,
+                columns: cols
+                    .into_iter()
+                    .map(|c| ColumnResponse {
+                        id: c.id,
+                        name: c.name,
+                        data_type: c.data_type,
+                        nullable: c.is_nullable,
+                        position: c.ordinal,
+                        description: c.description,
+                    })
+                    .collect(),
+                created_at: format_timestamp(table.created_at),
+                updated_at: format_timestamp(table.updated_at),
+            };
+            return Ok((StatusCode::CREATED, Json(response)));
+        }
+        IdempotencyCheck::Conflict => {
+            return Err(ApiError::conflict(
+                "Idempotency-Key already used with different request body",
+            ));
+        }
+        IdempotencyCheck::PreviousFailed {
+            http_status,
+            message,
+        } => {
+            return Err(ApiError::from_status_and_message(http_status, message));
+        }
+        IdempotencyCheck::InProgress { started_at } => {
+            let retry_after =
+                calculate_retry_after(started_at, state.config.idempotency_stale_timeout());
+            return Err(ApiError::conflict_in_progress(retry_after));
+        }
+    };
+
     let compactor = state
         .sync_compactor()
         .unwrap_or_else(|| Arc::new(Tier1Compactor::new(storage.clone())));
     let writer = arco_catalog::CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
 
-    // Ensure initialized
     writer.initialize().await.map_err(ApiError::from)?;
 
     let options = arco_catalog::write_options::WriteOptions::default()
@@ -177,7 +272,6 @@ pub(crate) async fn register_table(
         options
     };
 
-    // Convert columns
     let columns: Vec<arco_catalog::ColumnDefinition> = req
         .columns
         .iter()
@@ -189,7 +283,7 @@ pub(crate) async fn register_table(
         })
         .collect();
 
-    let table = writer
+    let register_result = writer
         .register_table(
             arco_catalog::RegisterTableRequest {
                 namespace: namespace.clone(),
@@ -201,12 +295,45 @@ pub(crate) async fn register_table(
             },
             options,
         )
-        .await
-        .map_err(ApiError::from)?;
+        .await;
 
-    // Read columns back from the published snapshot.
+    if let (Some(marker), Some(version)) = (&marker, &marker_version) {
+        match &register_result {
+            Ok(table) => {
+                let finalized = marker
+                    .clone()
+                    .finalize_committed(table.id.clone(), table.name.clone());
+                if let Err(e) = idempotency_store.finalize(&finalized, version).await {
+                    tracing::warn!(
+                        idempotency_key = %marker.idempotency_key,
+                        operation = ?marker.operation,
+                        error = %e,
+                        "Failed to finalize idempotency marker as committed"
+                    );
+                }
+            }
+            Err(e) => {
+                if let Some(status) = e.http_status_code() {
+                    if (400..500).contains(&status) {
+                        let finalized = marker.clone().finalize_failed(status, e.to_string());
+                        if let Err(fin_err) = idempotency_store.finalize(&finalized, version).await
+                        {
+                            tracing::warn!(
+                                idempotency_key = %marker.idempotency_key,
+                                operation = ?marker.operation,
+                                error = %fin_err,
+                                "Failed to finalize idempotency marker as failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let table = register_result.map_err(ApiError::from)?;
+
     let reader = arco_catalog::CatalogReader::new(storage);
-
     let cols = reader
         .get_columns(&table.id)
         .await

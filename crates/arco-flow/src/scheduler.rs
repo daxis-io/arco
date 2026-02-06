@@ -141,8 +141,8 @@ impl DispatchReport {
     }
 }
 
-fn record_transition(metrics: &FlowMetrics, tenant: &str, from: TaskState, to: TaskState) {
-    metrics.record_task_transition(tenant, from.as_label(), to.as_label());
+fn record_transition(metrics: &FlowMetrics, from: TaskState, to: TaskState) {
+    metrics.record_task_transition(from.as_label(), to.as_label());
 }
 
 /// Scheduler for executing plans.
@@ -285,8 +285,6 @@ impl Scheduler {
 
         if ready_specs.is_empty() {
             self.record_queue_depth(queue, &metrics).await;
-            self.record_quota_usage(quota, &run.tenant_id, &metrics)
-                .await;
             return Ok(report);
         }
 
@@ -314,14 +312,14 @@ impl Scheduler {
             let task_id = selection.task.task_id;
             let Some(spec) = spec_by_id.get(&task_id) else {
                 report.errors += 1;
-                metrics.record_dispatch(&run.tenant_id, "error");
+                metrics.record_dispatch("error");
                 continue;
             };
 
             let decision = quota.try_dispatch(&run.tenant_id, 1).await?;
             if matches!(decision, QuotaDecision::Denied { .. }) {
                 report.quota_denied += 1;
-                metrics.record_dispatch(&run.tenant_id, "quota_denied");
+                metrics.record_dispatch("quota_denied");
                 continue;
             }
 
@@ -334,7 +332,7 @@ impl Scheduler {
                 Ok(result) => result,
                 Err(err) => {
                     report.errors += 1;
-                    metrics.record_dispatch(&run.tenant_id, "failure");
+                    metrics.record_dispatch("failure");
                     let _ = quota.record_completion(&run.tenant_id, 1).await;
                     return Err(err);
                 }
@@ -343,17 +341,17 @@ impl Scheduler {
             match enqueue_result {
                 EnqueueResult::QueueFull => {
                     report.queue_full += 1;
-                    metrics.record_dispatch(&run.tenant_id, "failure");
+                    metrics.record_dispatch("failure");
                     let _ = quota.record_completion(&run.tenant_id, 1).await;
                     continue;
                 }
                 EnqueueResult::Enqueued { .. } => {
                     report.enqueued += 1;
-                    metrics.record_dispatch(&run.tenant_id, "success");
+                    metrics.record_dispatch("success");
                 }
                 EnqueueResult::Deduplicated { .. } => {
                     report.deduplicated += 1;
-                    metrics.record_dispatch(&run.tenant_id, "deduplicated");
+                    metrics.record_dispatch("deduplicated");
                 }
             }
 
@@ -376,8 +374,6 @@ impl Scheduler {
         }
 
         self.record_queue_depth(queue, &metrics).await;
-        self.record_quota_usage(quota, &run.tenant_id, &metrics)
-            .await;
 
         Ok(report)
     }
@@ -446,7 +442,7 @@ impl Scheduler {
                     if exec.state == TaskState::Pending {
                         let from_state = exec.state;
                         let _ = exec.skip();
-                        record_transition(&metrics, &run.tenant_id, from_state, TaskState::Skipped);
+                        record_transition(&metrics, from_state, TaskState::Skipped);
                         skipped_in_order.push(task.task_id);
                     }
                 }
@@ -471,7 +467,6 @@ impl Scheduler {
         outbox: &mut impl EventSink,
     ) -> Result<()> {
         let metrics = FlowMetrics::new();
-        let tenant_id = run.tenant_id.clone();
         let is_ready = run.ready_tasks(&self.plan).contains(task_id);
 
         let attempt = {
@@ -491,12 +486,12 @@ impl Scheduler {
             if exec.state == TaskState::Pending {
                 let from_state = exec.state;
                 exec.transition_to(TaskState::Ready)?;
-                record_transition(&metrics, &tenant_id, from_state, TaskState::Ready);
+                record_transition(&metrics, from_state, TaskState::Ready);
             }
 
             let from_state = exec.state;
             exec.transition_to(TaskState::Queued)?;
-            record_transition(&metrics, &tenant_id, from_state, TaskState::Queued);
+            record_transition(&metrics, from_state, TaskState::Queued);
             exec.attempt
         };
 
@@ -526,7 +521,6 @@ impl Scheduler {
         outbox: &mut impl EventSink,
     ) -> Result<()> {
         let metrics = FlowMetrics::new();
-        let tenant_id = run.tenant_id.clone();
         let attempt = {
             let exec = run
                 .get_task_mut(task_id)
@@ -534,7 +528,7 @@ impl Scheduler {
 
             let from_state = exec.state;
             exec.transition_to(TaskState::Dispatched)?;
-            record_transition(&metrics, &tenant_id, from_state, TaskState::Dispatched);
+            record_transition(&metrics, from_state, TaskState::Dispatched);
             exec.worker_id = Some(worker_id.to_string());
             exec.attempt
         };
@@ -558,7 +552,7 @@ impl Scheduler {
                 .ok_or(Error::TaskNotFound { task_id: *task_id })?;
             let from_state = exec.state;
             exec.transition_to(TaskState::Running)?;
-            record_transition(&metrics, &tenant_id, from_state, TaskState::Running);
+            record_transition(&metrics, from_state, TaskState::Running);
         }
 
         emit_sequenced(
@@ -668,7 +662,7 @@ impl Scheduler {
                 let from_state = exec.state;
                 cancelled.push((exec.task_id, exec.attempt));
                 let _ = exec.cancel();
-                record_transition(&metrics, &run.tenant_id, from_state, TaskState::Cancelled);
+                record_transition(&metrics, from_state, TaskState::Cancelled);
             }
         }
 
@@ -737,7 +731,7 @@ impl Scheduler {
             TaskResult::Cancelled => {
                 self.record_task_cancelled(run, task_id, outbox)?;
             }
-        };
+        }
 
         self.process_task_completion(run, task_id, outbox)
     }
@@ -770,7 +764,7 @@ impl Scheduler {
             )
         };
 
-        record_transition(&metrics, &run.tenant_id, from_state, TaskState::Succeeded);
+        record_transition(&metrics, from_state, TaskState::Succeeded);
         self.record_task_duration(&metrics, task_id, TaskState::Succeeded, duration_ms);
 
         emit_sequenced(
@@ -844,7 +838,7 @@ impl Scheduler {
             }
         };
 
-        record_transition(&metrics, &run.tenant_id, from_state, TaskState::Failed);
+        record_transition(&metrics, from_state, TaskState::Failed);
         self.record_task_duration(&metrics, task_id, TaskState::Failed, duration_ms);
 
         emit_sequenced(
@@ -874,13 +868,8 @@ impl Scheduler {
         );
 
         if let (Some(retry_at), Some(backoff)) = (retry_at, backoff) {
-            record_transition(
-                &metrics,
-                &run.tenant_id,
-                TaskState::Failed,
-                TaskState::RetryWait,
-            );
-            metrics.record_retry(&run.tenant_id, attempt);
+            record_transition(&metrics, TaskState::Failed, TaskState::RetryWait);
+            metrics.record_retry(attempt);
             emit_sequenced(
                 run,
                 outbox,
@@ -916,7 +905,7 @@ impl Scheduler {
             (attempt, from_state, exec.metrics.duration_ms)
         };
 
-        record_transition(&metrics, &run.tenant_id, from_state, TaskState::Cancelled);
+        record_transition(&metrics, from_state, TaskState::Cancelled);
         self.record_task_duration(&metrics, task_id, TaskState::Cancelled, duration_ms);
 
         emit_sequenced(
@@ -1007,7 +996,7 @@ impl Scheduler {
                 exec.transition_to(TaskState::Ready)?;
                 let new_attempt = exec.attempt;
 
-                record_transition(&metrics, &run.tenant_id, from_state, TaskState::Ready);
+                record_transition(&metrics, from_state, TaskState::Ready);
                 (previous_attempt, new_attempt)
             };
 
@@ -1190,31 +1179,6 @@ impl Scheduler {
         if let Ok(depth) = queue.queue_depth().await {
             metrics.set_queue_depth(queue.queue_name(), depth);
         }
-    }
-
-    async fn record_quota_usage<M: QuotaManager>(
-        &self,
-        quota: &M,
-        tenant_id: &str,
-        metrics: &FlowMetrics,
-    ) {
-        let Ok(Some(quota_config)) = quota.get_quota(tenant_id).await else {
-            return;
-        };
-
-        let Ok(active) = quota.active_tasks(tenant_id).await else {
-            return;
-        };
-
-        let limit = quota_config.max_concurrent_tasks;
-        if limit == 0 {
-            metrics.set_quota_usage(tenant_id, 0.0);
-            return;
-        }
-
-        #[allow(clippy::cast_precision_loss)]
-        let ratio = active as f64 / limit as f64;
-        metrics.set_quota_usage(tenant_id, ratio);
     }
 }
 

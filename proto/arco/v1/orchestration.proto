@@ -62,16 +62,16 @@ message TaskSpec {
   ResourceRequirements resources = 7;
 
   // Operation performed by this task (materialize/check/backfill).
-  // If unset/unspecified, defaults to MATERIALIZE.
+  // If unset/unspecified, defaults to TASK_OPERATION_MATERIALIZE.
   TaskOperation operation = 8;
 }
 
 // The semantic operation a task performs.
 enum TaskOperation {
   TASK_OPERATION_UNSPECIFIED = 0;
-  MATERIALIZE = 1;
-  CHECK = 2;
-  BACKFILL = 3;
+  TASK_OPERATION_MATERIALIZE = 1;
+  TASK_OPERATION_CHECK = 2;
+  TASK_OPERATION_BACKFILL = 3;
 }
 
 // Semantic identity for a task (asset + partition + operation).

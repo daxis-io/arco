@@ -60,7 +60,7 @@ use crate::storage_keys::{CommitKey, LedgerKey, LockKey, ManifestKey, StateKey};
 /// # Access
 ///
 /// - **Who**: API, Compactor
-/// - **Operations**: get, get_range
+/// - **Operations**: `get`, `get_range`
 ///
 /// This is the most basic storage capability. All components that need to
 /// read data get this trait.
@@ -86,7 +86,7 @@ pub trait ReadStore: Send + Sync + 'static {
 /// # Access
 ///
 /// - **Who**: API, Compactor
-/// - **Operations**: put with DoesNotExist precondition
+/// - **Operations**: put with `DoesNotExist` precondition
 /// - **Prefix**: `ledger/`
 ///
 /// # Invariant
@@ -112,7 +112,7 @@ pub trait LedgerPutStore: Send + Sync + 'static {
 /// # Access
 ///
 /// - **Who**: Compactor only
-/// - **Operations**: put with DoesNotExist precondition
+/// - **Operations**: put with `DoesNotExist` precondition
 /// - **Prefixes**: `state/`, `snapshots/`
 ///
 /// # Invariant
@@ -137,7 +137,7 @@ pub trait StatePutStore: Send + Sync + 'static {
 /// # Access
 ///
 /// - **Who**: Compactor only
-/// - **Operations**: put with MatchesVersion precondition
+/// - **Operations**: put with `MatchesVersion` precondition
 /// - **Prefix**: `manifests/`
 ///
 /// # Invariant
@@ -188,7 +188,7 @@ pub trait LockPutStore: Send + Sync + 'static {
 /// # Access
 ///
 /// - **Who**: API only
-/// - **Operations**: put with DoesNotExist precondition
+/// - **Operations**: put with `DoesNotExist` precondition
 /// - **Prefix**: `commits/`
 #[async_trait]
 pub trait CommitPutStore: Send + Sync + 'static {
@@ -248,7 +248,7 @@ pub trait MetaStore: Send + Sync + 'static {
 /// # Access
 ///
 /// - **Who**: API only
-/// - **Operations**: signed_url
+/// - **Operations**: `signed_url`
 #[async_trait]
 pub trait SignedUrlStore: Send + Sync + 'static {
     /// Generates a signed URL for direct access.

@@ -19,6 +19,7 @@ use arco_core::{ScopedStorage, WritePrecondition, WriteResult};
 
 use super::events::OrchestrationEvent;
 use crate::error::{Error, Result};
+use crate::paths::orchestration_event_path;
 
 /// Trait for writing orchestration events to the ledger.
 ///
@@ -79,7 +80,7 @@ impl LedgerWriter {
             },
         );
 
-        let path = format!("ledger/orchestration/{}/{}.json", date, event.event_id);
+        let path = orchestration_event_path(&date, &event.event_id);
         tracing::Span::current().record("path", tracing::field::display(&path));
 
         let json = serde_json::to_string(&event).map_err(|e| Error::Serialization {
@@ -141,7 +142,7 @@ impl LedgerWriter {
                     .to_string()
             },
         );
-        format!("ledger/orchestration/{}/{}.json", date, event.event_id)
+        orchestration_event_path(&date, &event.event_id)
     }
 }
 

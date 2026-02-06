@@ -1,0 +1,44 @@
+name: Release SBOM
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.85
+      - name: Install cargo-sbom
+        uses: taiki-e/install-action@887bc4e03483810873d617344dd5189cd82e7b8b # v2
+        with:
+          tool: cargo-sbom@0.10.0
+      - name: Generate SBOM (SPDX JSON)
+        run: cargo sbom --output-format spdx_json_2_3 > arco.spdx.json
+      - name: Generate SBOM (CycloneDX JSON)
+        run: cargo sbom --output-format cyclone_dx_json_1_6 > arco.cyclonedx.json
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: sbom
+          path: |
+            arco.spdx.json
+            arco.cyclonedx.json
+      - name: Attach SBOMs to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+        with:
+          files: |
+            arco.spdx.json
+            arco.cyclonedx.json

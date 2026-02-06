@@ -4,6 +4,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::fs;
 use std::sync::Arc;
 
 use arrow::array::Array;
@@ -11,6 +12,7 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
@@ -1240,6 +1242,44 @@ async fn invariant6_listing_dependency_documented() {
         uses_listing,
         "MVP: compactor uses listing over ledger prefix (Invariant 6 relaxation documented)"
     );
+}
+
+#[tokio::test]
+async fn datafusion_reads_parquet_bytes() {
+    let records = vec![
+        MaterializationRecord {
+            materialization_id: "mat_001".into(),
+            asset_id: "asset_001".into(),
+            row_count: 10,
+            byte_size: 100,
+        },
+        MaterializationRecord {
+            materialization_id: "mat_002".into(),
+            asset_id: "asset_002".into(),
+            row_count: 20,
+            byte_size: 200,
+        },
+    ];
+
+    let bytes = parquet_bytes(&records);
+    let file = tempfile::Builder::new()
+        .suffix(".parquet")
+        .tempfile()
+        .expect("tempfile");
+    fs::write(file.path(), bytes).expect("write parquet");
+
+    let ctx = SessionContext::new();
+    let df = ctx
+        .read_parquet(
+            file.path().to_str().expect("path"),
+            ParquetReadOptions::default(),
+        )
+        .await
+        .expect("read parquet");
+    let batches = df.collect().await.expect("collect");
+    let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+
+    assert_eq!(rows, records.len());
 }
 
 // NOTE: CAS conflict handling is covered by `tier2_concurrent_compactor_race`,

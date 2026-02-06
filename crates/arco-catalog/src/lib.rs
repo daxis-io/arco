@@ -75,6 +75,7 @@ pub mod compactor;
 pub mod error;
 pub mod event_writer;
 pub mod gc;
+pub mod idempotency;
 pub mod lock;
 pub mod manifest;
 pub mod metrics;
@@ -97,6 +98,11 @@ pub use asset::{Asset, AssetFormat, AssetKey, AssetKeyError, CreateAssetRequest}
 pub use compactor::{CompactionResult, Compactor, MaterializationRecord};
 pub use error::{CatalogError, Result};
 pub use event_writer::EventWriter;
+pub use idempotency::{
+    CatalogIdempotencyMarker, CatalogOperation, ClaimResult, DEFAULT_STALE_TIMEOUT, FinalizeResult,
+    IdempotencyCheck, IdempotencyStatus, IdempotencyStoreImpl, ObjectVersion, TakeoverResult,
+    canonical_request_hash, check_idempotency, validate_uuidv7,
+};
 pub use lock::{DistributedLock, LockGuard, LockInfo};
 pub use manifest::{
     CatalogDomainManifest, CatalogManifest, CommitRecord, CompactionMetadata, CoreManifest,
@@ -112,7 +118,7 @@ pub use tier1_events::{CatalogDdlEvent, LineageDdlEvent};
 pub use tier1_writer::Tier1Writer;
 pub use write_options::{IdempotencyKey, SnapshotVersion, WriteOptions};
 pub use writer::{
-    CatalogWriter, Column, ColumnDefinition, EventSource, LineageEdge, Namespace,
+    Catalog, CatalogWriter, Column, ColumnDefinition, EventSource, LineageEdge, Namespace,
     RegisterTableRequest, Table, TablePatch,
 };
 

@@ -50,6 +50,15 @@ struct RecordWithSequence {
     sequence_position: Option<u64>,
 }
 
+struct CompactionWork {
+    root: RootManifest,
+    manifest: ExecutionsManifest,
+    current_version: String,
+    events_to_process: Vec<String>,
+    late_events: Vec<String>,
+    new_watermark_event_id: Option<String>,
+}
+
 /// Policy for handling unknown or unsupported event envelopes during compaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnknownEventPolicy {
@@ -66,6 +75,8 @@ pub enum LateEventPolicy {
     Skip,
     /// Skip late events, but log a warning (recommended default until sequencing exists).
     Log,
+    /// Process late events (anti-entropy replays, missed notifications).
+    Process,
     /// Copy late events into quarantine and continue.
     Quarantine,
 }
@@ -196,6 +207,46 @@ impl Compactor {
         })
     }
 
+    /// Compacts a domain using explicit event paths (no listing).
+    #[allow(clippy::too_many_lines, clippy::missing_errors_doc)]
+    pub async fn compact_domain_explicit(
+        &self,
+        domain: CatalogDomain,
+        event_paths: Vec<String>,
+    ) -> Result<CompactionResult> {
+        if domain != CatalogDomain::Executions {
+            return Err(CatalogError::InvariantViolation {
+                message: format!("compaction not implemented for domain: {domain}"),
+            });
+        }
+
+        let event_paths = validate_event_paths(domain, event_paths)?;
+
+        for attempt in 1..=self.cas_max_retries {
+            match self
+                .compact_domain_explicit_once(domain, &event_paths)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(CatalogError::CasFailed { .. }) if attempt < self.cas_max_retries => {
+                    let backoff = cas_backoff(self.cas_backoff_base, self.cas_backoff_max, attempt);
+                    let backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX);
+                    tracing::info!(attempt, backoff_ms, "compactor lost CAS race, retrying");
+                    crate::metrics::record_cas_retry("compaction_manifest");
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(CatalogError::CasFailed {
+            message: format!(
+                "manifest update lost CAS race after {} retries",
+                self.cas_max_retries
+            ),
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn compact_domain_once(&self, domain: CatalogDomain) -> Result<CompactionResult> {
         // 1. Read current manifest + its version for CAS
@@ -245,6 +296,97 @@ impl Compactor {
             }
         }
 
+        let last_event_id = events_to_process
+            .last()
+            .and_then(|p| p.rsplit('/').next())
+            .map(str::to_string);
+
+        let work = CompactionWork {
+            root,
+            manifest,
+            current_version,
+            events_to_process,
+            late_events,
+            new_watermark_event_id: last_event_id,
+        };
+
+        self.compact_domain_with_events(domain, work).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn compact_domain_explicit_once(
+        &self,
+        domain: CatalogDomain,
+        event_paths: &[String],
+    ) -> Result<CompactionResult> {
+        let (root, manifest, current_version) = self.read_manifest_with_version().await?;
+        let watermark_event_id = manifest.watermark_event_id.clone();
+
+        let mut events_to_process: Vec<String> = Vec::new();
+        let mut late_events: Vec<String> = Vec::new();
+
+        for path in event_paths {
+            let filename = path.rsplit('/').next().unwrap_or("");
+            let is_after_watermark = watermark_event_id
+                .as_deref()
+                .is_none_or(|watermark| filename > watermark);
+
+            if is_after_watermark {
+                events_to_process.push(path.clone());
+                continue;
+            }
+
+            late_events.push(path.clone());
+            if matches!(self.late_event_policy, LateEventPolicy::Process) {
+                events_to_process.push(path.clone());
+            }
+        }
+
+        events_to_process.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
+        let last_event_id = events_to_process
+            .last()
+            .and_then(|p| p.rsplit('/').next())
+            .map(str::to_string);
+
+        let new_watermark_event_id = match (&watermark_event_id, &last_event_id) {
+            (Some(current), Some(candidate)) => Some(if candidate > current {
+                candidate.clone()
+            } else {
+                current.clone()
+            }),
+            (Some(current), None) => Some(current.clone()),
+            (None, Some(candidate)) => Some(candidate.clone()),
+            (None, None) => None,
+        };
+
+        let work = CompactionWork {
+            root,
+            manifest,
+            current_version,
+            events_to_process,
+            late_events,
+            new_watermark_event_id,
+        };
+
+        self.compact_domain_with_events(domain, work).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn compact_domain_with_events(
+        &self,
+        domain: CatalogDomain,
+        work: CompactionWork,
+    ) -> Result<CompactionResult> {
+        let CompactionWork {
+            root,
+            manifest,
+            current_version,
+            events_to_process,
+            late_events,
+            new_watermark_event_id,
+        } = work;
+
         self.handle_late_events(domain, &late_events).await?;
 
         if events_to_process.is_empty() {
@@ -266,15 +408,17 @@ impl Compactor {
             return Ok(CompactionResult {
                 events_processed: 0,
                 parquet_files_written: 0,
-                new_watermark: watermark_event_id.unwrap_or_default(),
+                new_watermark: manifest.watermark_event_id.unwrap_or_default(),
             });
         }
 
-        // CRITICAL: Store exact filename (including .json) as watermark.
-        let last_event_id = events_to_process
+        let snapshot_id = events_to_process
             .last()
             .and_then(|p| p.rsplit('/').next())
-            .unwrap_or("")
+            .unwrap_or("");
+        let snapshot_id = snapshot_id
+            .strip_suffix(".json")
+            .unwrap_or(snapshot_id)
             .to_string();
 
         // 4. Read, parse, and dedupe events by idempotency_key; upsert by primary key.
@@ -473,10 +617,7 @@ impl Compactor {
             records.sort_by(|a, b| a.materialization_id.cmp(&b.materialization_id));
 
             let snapshot_version = manifest.snapshot_version + 1;
-            let snapshot_id = last_event_id
-                .strip_suffix(".json")
-                .unwrap_or(&last_event_id);
-            let path = CatalogPaths::state_snapshot(domain, snapshot_version, snapshot_id);
+            let path = CatalogPaths::state_snapshot(domain, snapshot_version, &snapshot_id);
 
             let wrote_new = self.write_parquet(&path, &records).await?;
             (usize::from(wrote_new), Some(path), snapshot_version)
@@ -486,8 +627,12 @@ impl Compactor {
 
         let now = Utc::now();
         let mut new_manifest = manifest.clone();
+        let new_watermark_event_id =
+            new_watermark_event_id.or_else(|| manifest.watermark_event_id.clone());
         new_manifest.watermark_version = manifest.watermark_version + 1;
-        new_manifest.watermark_event_id = Some(last_event_id.clone());
+        new_manifest
+            .watermark_event_id
+            .clone_from(&new_watermark_event_id);
         new_manifest.snapshot_path = new_snapshot_path;
         new_manifest.snapshot_version = new_snapshot_version;
         new_manifest.last_compaction_at = Some(now);
@@ -514,7 +659,7 @@ impl Compactor {
         Ok(CompactionResult {
             events_processed: events_to_process.len(),
             parquet_files_written,
-            new_watermark: last_event_id,
+            new_watermark: new_watermark_event_id.unwrap_or_default(),
         })
     }
 
@@ -563,6 +708,14 @@ impl Compactor {
                     late_events = paths.len(),
                     metric = "arco_compactor_late_events_total",
                     "late events detected (arrived at or before watermark); skipping per policy"
+                );
+                Ok(())
+            }
+            LateEventPolicy::Process => {
+                tracing::warn!(
+                    late_events = paths.len(),
+                    metric = "arco_compactor_late_events_total",
+                    "late events detected (arrived at or before watermark); processing per policy"
                 );
                 Ok(())
             }
@@ -828,6 +981,33 @@ impl Compactor {
     }
 }
 
+fn validate_event_paths(domain: CatalogDomain, event_paths: Vec<String>) -> Result<Vec<String>> {
+    let prefix = format!("ledger/{}/", domain.as_str());
+    let mut unique = HashSet::new();
+    let mut filtered = Vec::new();
+
+    for path in event_paths {
+        if !path.starts_with(&prefix) {
+            return Err(CatalogError::Validation {
+                message: format!("event path '{path}' is outside {prefix}"),
+            });
+        }
+        if !std::path::Path::new(&path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
+            return Err(CatalogError::Validation {
+                message: format!("event path '{path}' must end with .json"),
+            });
+        }
+        if unique.insert(path.clone()) {
+            filtered.push(path);
+        }
+    }
+
+    Ok(filtered)
+}
+
 /// Record structure for materialization events (matches `EventWriter` format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaterializationRecord {
@@ -913,6 +1093,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parquet_write_is_deterministic() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage =
+            ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
+
+        let compactor = Compactor::new(storage.clone());
+        let records = vec![
+            MaterializationRecord {
+                materialization_id: "mat_001".to_string(),
+                asset_id: "asset_001".to_string(),
+                row_count: 10,
+                byte_size: 100,
+            },
+            MaterializationRecord {
+                materialization_id: "mat_002".to_string(),
+                asset_id: "asset_002".to_string(),
+                row_count: 20,
+                byte_size: 200,
+            },
+        ];
+
+        let path_one =
+            CatalogPaths::state_snapshot(CatalogDomain::Executions, 1, "deterministic_a");
+        let path_two =
+            CatalogPaths::state_snapshot(CatalogDomain::Executions, 1, "deterministic_b");
+
+        let wrote_one = compactor
+            .write_parquet(&path_one, &records)
+            .await
+            .expect("write one");
+        let wrote_two = compactor
+            .write_parquet(&path_two, &records)
+            .await
+            .expect("write two");
+
+        assert!(wrote_one);
+        assert!(wrote_two);
+
+        let bytes_one = storage.get_raw(&path_one).await.expect("read one");
+        let bytes_two = storage.get_raw(&path_two).await.expect("read two");
+
+        assert_eq!(bytes_one, bytes_two);
+    }
+
+    #[tokio::test]
     async fn second_compaction_only_processes_new_events() {
         let backend = Arc::new(MemoryBackend::new());
         let storage =
@@ -942,6 +1167,9 @@ mod tests {
             .await
             .expect("compact1");
         assert_eq!(result1.events_processed, 3);
+
+        // Ensure new events have distinct ULID timestamps (ULID uses millisecond precision)
+        tokio::time::sleep(Duration::from_millis(2)).await;
 
         // Write 2 more events and compact again
         for i in 3..5 {

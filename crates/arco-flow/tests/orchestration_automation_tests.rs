@@ -275,7 +275,7 @@ fn test_backfill_state_changed_uses_state_version() {
     assert!(
         event
             .idempotency_key
-            .contains("backfill_state:bf_01HQ123:3")
+            .contains("backfill_state:bf_01HQ123:3:PAUSED")
     );
 }
 

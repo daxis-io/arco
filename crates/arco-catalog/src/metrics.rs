@@ -30,6 +30,16 @@ pub const GC_ERRORS: &str = "arco_gc_errors_total";
 pub const CAS_RETRY: &str = "cas_retry_total";
 
 // ============================================================================
+// Idempotency Metrics
+// ============================================================================
+
+/// Idempotency check result counter.
+pub const IDEMPOTENCY_CHECK: &str = "arco_idempotency_check_total";
+
+/// Idempotency marker takeover counter.
+pub const IDEMPOTENCY_TAKEOVER: &str = "arco_idempotency_takeover_total";
+
+// ============================================================================
 // Storage Inventory Metrics
 // ============================================================================
 
@@ -73,6 +83,11 @@ pub fn register_metrics() {
     );
     describe_gauge!(STORAGE_OBJECTS_TOTAL, "Total objects in storage by prefix");
     describe_gauge!(STORAGE_BYTES_TOTAL, "Total bytes in storage by prefix");
+    describe_counter!(IDEMPOTENCY_CHECK, "Total idempotency checks by result");
+    describe_counter!(
+        IDEMPOTENCY_TAKEOVER,
+        "Total idempotency marker takeover attempts by result"
+    );
 }
 
 // ============================================================================
@@ -144,4 +159,28 @@ pub fn record_storage_inventory(prefix: &str, objects: u64, bytes: u64) {
     )
     .set(objects as f64);
     gauge!(STORAGE_BYTES_TOTAL, "prefix" => prefix.to_string()).set(bytes as f64);
+}
+
+// ============================================================================
+// Idempotency Metric Recording
+// ============================================================================
+
+/// Records an idempotency check result.
+pub fn record_idempotency_check(operation: &str, result: &str) {
+    counter!(
+        IDEMPOTENCY_CHECK,
+        "operation" => operation.to_string(),
+        "result" => result.to_string()
+    )
+    .increment(1);
+}
+
+/// Records an idempotency marker takeover attempt.
+pub fn record_idempotency_takeover(operation: &str, result: &str) {
+    counter!(
+        IDEMPOTENCY_TAKEOVER,
+        "operation" => operation.to_string(),
+        "result" => result.to_string()
+    )
+    .increment(1);
 }

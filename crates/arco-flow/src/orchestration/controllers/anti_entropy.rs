@@ -294,6 +294,7 @@ impl AntiEntropySweeper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::orchestration_event_path;
 
     fn make_task_row(task_key: &str, state: TaskState, ready_at: Option<DateTime<Utc>>) -> TaskRow {
         TaskRow {
@@ -340,7 +341,7 @@ mod tests {
     fn fresh_watermarks(now: DateTime<Utc>) -> Watermarks {
         Watermarks {
             events_processed_through: Some("01HQ123EVT".to_string()),
-            last_processed_file: Some("ledger/orchestration/01HQ123.json".to_string()),
+            last_processed_file: Some(orchestration_event_path("2025-01-15", "01HQ123")),
             last_processed_at: now - Duration::seconds(5),
         }
     }
@@ -348,7 +349,7 @@ mod tests {
     fn stale_watermarks(now: DateTime<Utc>) -> Watermarks {
         Watermarks {
             events_processed_through: Some("01HQ123EVT".to_string()),
-            last_processed_file: Some("ledger/orchestration/01HQ123.json".to_string()),
+            last_processed_file: Some(orchestration_event_path("2025-01-15", "01HQ123")),
             last_processed_at: now - Duration::seconds(60),
         }
     }

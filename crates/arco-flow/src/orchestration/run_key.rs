@@ -26,6 +26,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 
 use arco_core::{ScopedStorage, WritePrecondition, WriteResult};
 
@@ -166,8 +167,30 @@ pub async fn reserve_run_key(
             Ok(ReservationResult::Reserved)
         }
         WriteResult::PreconditionFailed { .. } => {
-            // Read existing reservation
-            let existing = get_reservation(storage, &reservation.run_key).await?;
+            // Read existing reservation.
+            //
+            // Some object stores can exhibit a brief read-after-write lag in rare cases.
+            // If the write precondition fails (meaning *some* object exists) but the
+            // subsequent read returns NotFound, treat it as a retryable race and
+            // retry the read a handful of times with tight backoff.
+            let mut existing = get_reservation(storage, &reservation.run_key).await?;
+            if existing.is_none() {
+                // Total worst-case sleep ~= 155ms
+                const READ_RETRIES_MS: [u64; 5] = [5, 10, 20, 40, 80];
+                for (attempt, delay_ms) in READ_RETRIES_MS.into_iter().enumerate() {
+                    tracing::debug!(
+                        run_key = %reservation.run_key,
+                        attempt = attempt + 1,
+                        delay_ms,
+                        "run_key reservation not yet visible after precondition failure; retrying read"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    existing = get_reservation(storage, &reservation.run_key).await?;
+                    if existing.is_some() {
+                        break;
+                    }
+                }
+            }
             match existing {
                 Some(existing) => {
                     // Validate fingerprint consistency with optional cutoff for legacy reservations.
@@ -206,7 +229,7 @@ pub async fn reserve_run_key(
                 }
                 None => {
                     // Extremely unlikely: precondition failed but read returned None.
-                    // Could be eventual consistency or deletion race. Retry at caller.
+                    // Could be a deeper storage inconsistency or deletion race.
                     Err(Error::storage(format!(
                         "run_key reservation race: precondition failed but reservation not found: {}",
                         reservation.run_key
@@ -263,9 +286,15 @@ pub async fn get_reservation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arco_core::MemoryBackend;
-    use chrono::Duration;
+    use arco_core::{
+        Error as CoreError, MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition,
+    };
+    use async_trait::async_trait;
+    use chrono::Duration as ChronoDuration;
+    use std::ops::Range;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     fn make_reservation(run_key: &str) -> RunKeyReservation {
         RunKeyReservation {
@@ -351,6 +380,120 @@ mod tests {
                 panic!("expected AlreadyExists, got FingerprintMismatch");
             }
         }
+
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    struct FlakyReadBackend {
+        inner: Arc<MemoryBackend>,
+        flaky_suffix: String,
+        remaining_misses: AtomicUsize,
+    }
+
+    impl FlakyReadBackend {
+        fn new(inner: Arc<MemoryBackend>, flaky_suffix: String, misses: usize) -> Self {
+            Self {
+                inner,
+                flaky_suffix,
+                remaining_misses: AtomicUsize::new(misses),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for FlakyReadBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            if path.ends_with(&self.flaky_suffix) {
+                let mut current = self.remaining_misses.load(Ordering::Relaxed);
+                while current > 0 {
+                    match self.remaining_misses.compare_exchange_weak(
+                        current,
+                        current - 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => return Err(CoreError::NotFound(path.to_string())),
+                        Err(next) => current = next,
+                    }
+                }
+            }
+            self.inner.get(path).await
+        }
+
+        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reserve_run_key_precondition_failed_read_retry() -> Result<()> {
+        let inner = Arc::new(MemoryBackend::new());
+        let backend: Arc<dyn StorageBackend> = Arc::new(FlakyReadBackend::new(
+            inner,
+            reservation_path("test-run-key"),
+            2,
+        ));
+        let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+
+        let reservation1 = make_reservation("test-run-key");
+        let result1 =
+            reserve_run_key(&storage, &reservation1, FingerprintPolicy::lenient()).await?;
+        assert!(matches!(result1, ReservationResult::Reserved));
+
+        let reservation2 = make_reservation("test-run-key");
+        let result2 =
+            reserve_run_key(&storage, &reservation2, FingerprintPolicy::lenient()).await?;
+        assert!(matches!(result2, ReservationResult::AlreadyExists(_)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reserve_run_key_precondition_failed_read_retry_is_bounded() -> Result<()> {
+        let inner = Arc::new(MemoryBackend::new());
+        let backend: Arc<dyn StorageBackend> = Arc::new(FlakyReadBackend::new(
+            inner,
+            reservation_path("test-run-key"),
+            100,
+        ));
+        let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+
+        let reservation1 = make_reservation("test-run-key");
+        let result1 =
+            reserve_run_key(&storage, &reservation1, FingerprintPolicy::lenient()).await?;
+        assert!(matches!(result1, ReservationResult::Reserved));
+
+        let reservation2 = make_reservation("test-run-key");
+        let err = reserve_run_key(&storage, &reservation2, FingerprintPolicy::lenient())
+            .await
+            .expect_err("expected error");
+        assert!(err.to_string().contains("precondition failed"));
 
         Ok(())
     }
@@ -499,7 +642,7 @@ mod tests {
         // First reservation with no fingerprint (simulates old reservation)
         let mut reservation1 = make_reservation("test-run-key");
         reservation1.request_fingerprint = None;
-        reservation1.created_at = cutoff - Duration::hours(1);
+        reservation1.created_at = cutoff - ChronoDuration::hours(1);
         let result1 = reserve_run_key(&storage, &reservation1, policy).await?;
         assert!(matches!(result1, ReservationResult::Reserved));
 
@@ -526,7 +669,7 @@ mod tests {
         // First reservation with no fingerprint created AFTER cutoff
         let mut reservation1 = make_reservation("test-run-key");
         reservation1.request_fingerprint = None;
-        reservation1.created_at = cutoff + Duration::hours(1);
+        reservation1.created_at = cutoff + ChronoDuration::hours(1);
         let result1 = reserve_run_key(&storage, &reservation1, policy).await?;
         assert!(matches!(result1, ReservationResult::Reserved));
 

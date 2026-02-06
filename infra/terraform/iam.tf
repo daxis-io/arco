@@ -118,6 +118,15 @@ resource "google_cloud_run_v2_service_iam_member" "invoker_compactor" {
   member   = "serviceAccount:${google_service_account.invoker.email}"
 }
 
+resource "google_cloud_run_v2_service_iam_member" "compactor_antientropy_invoker" {
+  count    = var.environment != "" ? 1 : 0
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.compactor.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.compactor_antientropy.email}"
+}
+
 # ============================================================================
 # Public Access (optional - for API when public)
 # ============================================================================

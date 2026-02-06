@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use uuid::Uuid;
 
+use crate::paths::{iceberg_committed_receipt_path, iceberg_pending_receipt_path};
 use crate::pointer::UpdateSource;
 use crate::types::CommitKey;
 
@@ -40,11 +41,7 @@ impl PendingReceipt {
     /// Path: `events/YYYY-MM-DD/iceberg/pending/{commit_key}.json`
     #[must_use]
     pub fn storage_path(date: NaiveDate, commit_key: &CommitKey) -> String {
-        format!(
-            "events/{}/iceberg/pending/{}.json",
-            date.format("%Y-%m-%d"),
-            commit_key
-        )
+        iceberg_pending_receipt_path(date, commit_key)
     }
 }
 
@@ -77,24 +74,21 @@ impl CommittedReceipt {
     /// Path: `events/YYYY-MM-DD/iceberg/committed/{commit_key}.json`
     #[must_use]
     pub fn storage_path(date: NaiveDate, commit_key: &CommitKey) -> String {
-        format!(
-            "events/{}/iceberg/committed/{}.json",
-            date.format("%Y-%m-%d"),
-            commit_key
-        )
+        iceberg_committed_receipt_path(date, commit_key)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::{iceberg_committed_receipt_prefix, iceberg_pending_receipt_prefix};
 
     #[test]
     fn test_pending_receipt_path() {
         let date = NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
         let commit_key = CommitKey::from_metadata_location("test/metadata.json");
         let path = PendingReceipt::storage_path(date, &commit_key);
-        assert!(path.starts_with("events/2025-01-15/iceberg/pending/"));
+        assert!(path.starts_with(&iceberg_pending_receipt_prefix(date)));
         assert!(path.ends_with(".json"));
     }
 
@@ -103,7 +97,7 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2025, 1, 15).expect("valid date");
         let commit_key = CommitKey::from_metadata_location("test/metadata.json");
         let path = CommittedReceipt::storage_path(date, &commit_key);
-        assert!(path.starts_with("events/2025-01-15/iceberg/committed/"));
+        assert!(path.starts_with(&iceberg_committed_receipt_prefix(date)));
         assert!(path.ends_with(".json"));
     }
 

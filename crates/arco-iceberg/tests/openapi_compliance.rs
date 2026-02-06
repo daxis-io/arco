@@ -68,16 +68,31 @@ fn test_openapi_paths_align_with_official_spec() {
     let endpoints = [
         ("/v1/config", "get"),
         ("/v1/{prefix}/namespaces", "get"),
+        ("/v1/{prefix}/namespaces", "post"),
         ("/v1/{prefix}/namespaces/{namespace}", "get"),
         ("/v1/{prefix}/namespaces/{namespace}", "head"),
+        ("/v1/{prefix}/namespaces/{namespace}", "delete"),
+        ("/v1/{prefix}/namespaces/{namespace}/properties", "post"),
         ("/v1/{prefix}/namespaces/{namespace}/tables", "get"),
+        ("/v1/{prefix}/namespaces/{namespace}/tables", "post"),
         ("/v1/{prefix}/namespaces/{namespace}/tables/{table}", "get"),
         ("/v1/{prefix}/namespaces/{namespace}/tables/{table}", "head"),
+        (
+            "/v1/{prefix}/namespaces/{namespace}/tables/{table}",
+            "delete",
+        ),
         ("/v1/{prefix}/namespaces/{namespace}/tables/{table}", "post"),
+        ("/v1/{prefix}/namespaces/{namespace}/register", "post"),
         (
             "/v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials",
             "get",
         ),
+        ("/v1/{prefix}/tables/rename", "post"),
+        (
+            "/v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics",
+            "post",
+        ),
+        ("/v1/{prefix}/transactions/commit", "post"),
     ];
 
     for (path, method) in endpoints {
@@ -117,7 +132,9 @@ fn test_openapi_paths_align_with_official_spec() {
         assert!(
             spec_responses.is_subset(&ours_responses),
             "response mismatch for {method} {path}: missing {:?}",
-            spec_responses.difference(&ours_responses).collect::<Vec<_>>()
+            spec_responses
+                .difference(&ours_responses)
+                .collect::<Vec<_>>()
         );
     }
 }

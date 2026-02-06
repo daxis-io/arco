@@ -31,6 +31,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
+use arco_catalog::Compactor;
+use arco_catalog::Tier1Compactor;
+use arco_catalog::compactor::LateEventPolicy;
+use arco_core::CatalogDomain;
+use arco_core::lock::DistributedLock;
+use arco_core::scoped_storage::ScopedStorage;
+
+use crate::metrics;
+
+const TIER1_LOCK_TTL: Duration = Duration::from_secs(30);
+const TIER1_LOCK_MAX_RETRIES: u32 = 3;
+
 /// Configuration for the notification consumer.
 #[derive(Debug, Clone)]
 pub struct NotificationConsumerConfig {
@@ -40,7 +52,7 @@ pub struct NotificationConsumerConfig {
     /// Maximum time to wait for batch accumulation.
     pub batch_timeout: Duration,
 
-    /// Domains to process (e.g., `["catalog", "lineage", "executions"]`).
+    /// Domains to process (e.g., `["executions", "search"]`).
     pub domains: Vec<String>,
 }
 
@@ -49,12 +61,7 @@ impl Default for NotificationConsumerConfig {
         Self {
             max_batch_size: 100,
             batch_timeout: Duration::from_secs(5),
-            domains: vec![
-                "catalog".to_string(),
-                "lineage".to_string(),
-                "executions".to_string(),
-                "search".to_string(),
-            ],
+            domains: vec!["executions".to_string(), "search".to_string()],
         }
     }
 }
@@ -145,7 +152,7 @@ impl EventNotification {
         tenant_id: impl Into<String>,
         workspace_id: impl Into<String>,
     ) -> Result<Self, NotificationParseError> {
-        let path = path.into();
+        let path: String = path.into();
 
         // Split into parts for validation
         let parts: Vec<&str> = path.split('/').collect();
@@ -319,10 +326,9 @@ pub struct DomainProcessingResult {
 /// // Flush accumulated batch
 /// let result = consumer.flush().await?;
 /// ```
-pub struct NotificationConsumer<S: Send + Sync> {
+pub struct NotificationConsumer {
     /// Storage backend for reading events and writing state.
-    #[allow(dead_code)]
-    storage: S,
+    storage: ScopedStorage,
 
     /// Configuration.
     config: NotificationConsumerConfig,
@@ -331,9 +337,9 @@ pub struct NotificationConsumer<S: Send + Sync> {
     current_batch: EventBatch,
 }
 
-impl<S: Send + Sync> NotificationConsumer<S> {
+impl NotificationConsumer {
     /// Creates a new notification consumer.
-    pub fn new(storage: S, config: NotificationConsumerConfig) -> Self {
+    pub fn new(storage: ScopedStorage, config: NotificationConsumerConfig) -> Self {
         Self {
             storage,
             config,
@@ -346,10 +352,27 @@ impl<S: Send + Sync> NotificationConsumer<S> {
         &self.config
     }
 
+    /// Returns true if the domain is configured for processing.
+    pub fn accepts_domain(&self, domain: &str) -> bool {
+        self.config
+            .domains
+            .iter()
+            .any(|configured| configured.eq_ignore_ascii_case(domain))
+    }
+
     /// Adds an event notification to the current batch.
     ///
     /// Returns `true` if the batch should be flushed (size or time limit reached).
     pub fn add_event(&mut self, event: EventNotification) -> bool {
+        if !self
+            .config
+            .domains
+            .iter()
+            .any(|domain| domain.eq_ignore_ascii_case(&event.domain))
+        {
+            return false;
+        }
+
         self.current_batch.add(event);
 
         // Check if we should flush
@@ -409,16 +432,90 @@ impl<S: Send + Sync> NotificationConsumer<S> {
             "processing domain events (no listing)"
         );
 
-        // TODO: Implement actual event processing:
-        // 1. Load events from explicit paths using storage.get()
-        // 2. Read current manifest
-        // 3. Fold events into new snapshot
-        // 4. Write Parquet files
-        // 5. CAS manifest with fencing token
+        let catalog_domain = parse_domain(domain)?;
+        let timer = metrics::CompactionTimer::start(domain);
 
-        Err(NotificationConsumerError::NotImplemented {
-            domain: domain.to_string(),
-            message: "notification consumer not yet implemented - Phase 2".to_string(),
+        let result = match catalog_domain {
+            CatalogDomain::Executions => {
+                let compactor = Compactor::new(self.storage.clone())
+                    .with_late_event_policy(LateEventPolicy::Process);
+                let result = compactor
+                    .compact_domain_explicit(catalog_domain, event_paths.to_vec())
+                    .await
+                    .map_err(|e| {
+                        metrics::record_compaction_error(domain);
+                        NotificationConsumerError::ProcessingError {
+                            domain: domain.to_string(),
+                            message: e.to_string(),
+                        }
+                    })?;
+
+                DomainProcessingResult {
+                    domain: domain.to_string(),
+                    events_processed: result.events_processed,
+                    snapshot_version: None,
+                    error: None,
+                }
+            }
+            CatalogDomain::Search | CatalogDomain::Catalog | CatalogDomain::Lineage => {
+                self.process_tier1_domain_events(catalog_domain, event_paths)
+                    .await?
+            }
+        };
+
+        timer.finish(result.events_processed as u64);
+
+        Ok(result)
+    }
+
+    async fn process_tier1_domain_events(
+        &self,
+        domain: CatalogDomain,
+        event_paths: &[String],
+    ) -> Result<DomainProcessingResult, NotificationConsumerError> {
+        let lock_path = self.storage.lock(domain);
+        let lock = DistributedLock::new(self.storage.backend().clone(), lock_path);
+        let guard = lock
+            .acquire(TIER1_LOCK_TTL, TIER1_LOCK_MAX_RETRIES)
+            .await
+            .map_err(|e| {
+                metrics::record_compaction_error(domain.as_str());
+                NotificationConsumerError::ProcessingError {
+                    domain: domain.as_str().to_string(),
+                    message: format!("failed to acquire lock: {e}"),
+                }
+            })?;
+
+        let compactor = Tier1Compactor::new(self.storage.clone());
+        let result = compactor
+            .sync_compact(
+                domain.as_str(),
+                event_paths.to_vec(),
+                guard.fencing_token().sequence(),
+            )
+            .await;
+
+        guard.release().await.map_err(|e| {
+            metrics::record_compaction_error(domain.as_str());
+            NotificationConsumerError::ProcessingError {
+                domain: domain.as_str().to_string(),
+                message: format!("failed to release lock: {e}"),
+            }
+        })?;
+
+        let result = result.map_err(|e| {
+            metrics::record_compaction_error(domain.as_str());
+            NotificationConsumerError::ProcessingError {
+                domain: domain.as_str().to_string(),
+                message: e.to_string(),
+            }
+        })?;
+
+        Ok(DomainProcessingResult {
+            domain: domain.as_str().to_string(),
+            events_processed: result.events_processed,
+            snapshot_version: Some(result.snapshot_version),
+            error: None,
         })
     }
 
@@ -544,9 +641,33 @@ impl std::fmt::Display for NotificationConsumerError {
 
 impl std::error::Error for NotificationConsumerError {}
 
+fn parse_domain(domain: &str) -> Result<CatalogDomain, NotificationConsumerError> {
+    let normalized = domain.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "catalog" => Ok(CatalogDomain::Catalog),
+        "lineage" => Ok(CatalogDomain::Lineage),
+        "executions" => Ok(CatalogDomain::Executions),
+        "search" => Ok(CatalogDomain::Search),
+        _ => Err(NotificationConsumerError::ProcessingError {
+            domain: domain.to_string(),
+            message: "unsupported domain".to_string(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arco_catalog::{EventWriter, MaterializationRecord, Tier1Writer};
+    use arco_core::scoped_storage::ScopedStorage;
+    use arco_core::storage::MemoryBackend;
+    use arco_core::{CatalogDomain, CatalogPaths};
+    use std::sync::Arc;
+
+    fn test_storage() -> ScopedStorage {
+        let backend = Arc::new(MemoryBackend::new());
+        ScopedStorage::new(backend, "acme", "prod").expect("valid storage")
+    }
 
     #[test]
     fn test_event_notification_from_path() {
@@ -641,43 +762,94 @@ mod tests {
             max_batch_size: 2,
             ..Default::default()
         };
-        let mut consumer = NotificationConsumer::new((), config);
+        let storage = test_storage();
+        let mut consumer = NotificationConsumer::new(storage, config);
 
         // First event doesn't trigger flush
         let should_flush = consumer.add_event(
-            EventNotification::from_path("ledger/catalog/evt1.json", "acme", "prod")
+            EventNotification::from_path("ledger/executions/evt1.json", "acme", "prod")
                 .expect("parse"),
         );
         assert!(!should_flush);
 
         // Second event triggers flush (max_batch_size = 2)
         let should_flush = consumer.add_event(
-            EventNotification::from_path("ledger/catalog/evt2.json", "acme", "prod")
+            EventNotification::from_path("ledger/executions/evt2.json", "acme", "prod")
                 .expect("parse"),
         );
         assert!(should_flush);
     }
 
-    #[tokio::test]
-    async fn test_consumer_flush() {
-        let mut consumer = NotificationConsumer::new((), NotificationConsumerConfig::default());
+    #[test]
+    fn test_consumer_rejects_unconfigured_domain() {
+        let config = NotificationConsumerConfig {
+            domains: vec!["executions".to_string()],
+            ..Default::default()
+        };
+        let storage = test_storage();
+        let mut consumer = NotificationConsumer::new(storage, config);
 
-        consumer.add_event(
+        let should_flush = consumer.add_event(
             EventNotification::from_path("ledger/catalog/evt1.json", "acme", "prod")
                 .expect("parse"),
         );
-        consumer.add_event(
-            EventNotification::from_path("ledger/lineage/evt2.json", "acme", "prod")
-                .expect("parse"),
+
+        assert!(!should_flush);
+        assert_eq!(consumer.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_default_config_domains() {
+        let config = NotificationConsumerConfig::default();
+        assert_eq!(
+            config.domains,
+            vec!["executions".to_string(), "search".to_string()]
         );
+    }
 
-        let result = consumer.flush().await.expect("flush");
+    #[tokio::test]
+    async fn test_consumer_flush() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = test_storage();
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await?;
 
-        // Both domains were processed
-        assert_eq!(result.domains_updated, 2);
-        assert!(result.domain_results.contains_key("catalog"));
-        assert!(result.domain_results.contains_key("lineage"));
-        assert_eq!(result.events_processed, 0);
+        let event_writer = EventWriter::new(storage.clone());
+        let record_one = MaterializationRecord {
+            materialization_id: "mat_001".to_string(),
+            asset_id: "asset_001".to_string(),
+            row_count: 10,
+            byte_size: 100,
+        };
+        let record_two = MaterializationRecord {
+            materialization_id: "mat_002".to_string(),
+            asset_id: "asset_002".to_string(),
+            row_count: 20,
+            byte_size: 200,
+        };
+
+        let event_id_one = event_writer
+            .append(CatalogDomain::Executions, &record_one)
+            .await?;
+        let event_id_two = event_writer
+            .append(CatalogDomain::Executions, &record_two)
+            .await?;
+
+        let path_one =
+            CatalogPaths::ledger_event(CatalogDomain::Executions, &event_id_one.to_string());
+        let path_two =
+            CatalogPaths::ledger_event(CatalogDomain::Executions, &event_id_two.to_string());
+
+        let mut consumer =
+            NotificationConsumer::new(storage, NotificationConsumerConfig::default());
+        consumer.add_event(EventNotification::from_path(path_one, "acme", "prod")?);
+        consumer.add_event(EventNotification::from_path(path_two, "acme", "prod")?);
+
+        let result = consumer.flush().await?;
+
+        assert_eq!(result.domains_updated, 1);
+        assert!(result.domain_results.contains_key("executions"));
+        assert_eq!(result.events_processed, 2);
+        Ok(())
     }
 
     #[test]
@@ -695,7 +867,8 @@ mod tests {
         // 1. API design (no list method)
         // 2. IAM (compactor-fastpath-sa has no list permission)
 
-        let consumer = NotificationConsumer::new((), NotificationConsumerConfig::default());
+        let storage = test_storage();
+        let consumer = NotificationConsumer::new(storage, NotificationConsumerConfig::default());
 
         // Verify there's no way to list
         // (This is a compile-time guarantee via trait bounds)

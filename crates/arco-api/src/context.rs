@@ -18,8 +18,8 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde_json::Value;
-use ulid::Ulid;
 use tracing::warn;
+use ulid::Ulid;
 
 use arco_core::ScopedStorage;
 use arco_core::storage::StorageBackend;
@@ -77,7 +77,9 @@ impl FromRequestParts<Arc<AppState>> for RequestContext {
             request_id_from_headers(headers).unwrap_or_else(|| Ulid::new().to_string());
         let idempotency_key = header_string(headers, "Idempotency-Key");
 
-        let (tenant, workspace, user_id) = if state.config.debug {
+        let debug_allowed = state.config.debug && state.config.posture.is_dev();
+
+        let (tenant, workspace, user_id) = if debug_allowed {
             let tenant = header_string(headers, "X-Tenant-Id").ok_or_else(|| {
                 ApiError::unauthorized("missing X-Tenant-Id header (debug mode)")
                     .with_request_id(request_id.clone())
@@ -134,6 +136,13 @@ fn extract_from_jwt(
         return Err(ApiError::invalid_token().with_request_id(request_id.to_string()));
     };
 
+    if state.config.jwt.issuer.is_some() {
+        require_issuer_claim(obj, request_id)?;
+    }
+    if state.config.jwt.audience.is_some() {
+        require_audience_claim(obj, request_id)?;
+    }
+
     let tenant = extract_required_claim(obj, &state.config.jwt.tenant_claim, request_id)?;
     let workspace = extract_required_claim(obj, &state.config.jwt.workspace_claim, request_id)?;
     let user_id = extract_required_claim(obj, &state.config.jwt.user_claim, request_id)?;
@@ -159,17 +168,17 @@ fn normalize_scope_id(raw: &str, field: &str, request_id: &str) -> Result<String
     }
 
     if normalized.contains('/') || normalized.contains('\\') {
-        return Err(ApiError::bad_request(format!(
-            "{field} cannot contain path separators"
-        ))
-        .with_request_id(request_id.to_string()));
+        return Err(
+            ApiError::bad_request(format!("{field} cannot contain path separators"))
+                .with_request_id(request_id.to_string()),
+        );
     }
 
     if normalized.contains('\n') || normalized.contains('\r') || normalized.contains('\0') {
-        return Err(ApiError::bad_request(format!(
-            "{field} cannot contain control characters"
-        ))
-        .with_request_id(request_id.to_string()));
+        return Err(
+            ApiError::bad_request(format!("{field} cannot contain control characters"))
+                .with_request_id(request_id.to_string()),
+        );
     }
 
     if !normalized
@@ -214,7 +223,7 @@ fn jwt_decoding_key(
     }
 }
 
-fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
     header_string(headers, "X-Request-Id").or_else(|| header_string(headers, "X-Request-ID"))
 }
 
@@ -232,6 +241,38 @@ fn extract_required_claim(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .ok_or_else(|| ApiError::invalid_token().with_request_id(request_id.to_string()))
+}
+
+fn require_issuer_claim(
+    obj: &serde_json::Map<String, Value>,
+    request_id: &str,
+) -> Result<(), ApiError> {
+    let issuer = obj
+        .get("iss")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    if issuer.is_none() {
+        return Err(ApiError::invalid_token().with_request_id(request_id.to_string()));
+    }
+    Ok(())
+}
+
+fn require_audience_claim(
+    obj: &serde_json::Map<String, Value>,
+    request_id: &str,
+) -> Result<(), ApiError> {
+    let has_audience = match obj.get("aud") {
+        Some(Value::String(value)) => !value.is_empty(),
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|value| !value.is_empty()),
+        _ => false,
+    };
+    if !has_audience {
+        return Err(ApiError::invalid_token().with_request_id(request_id.to_string()));
+    }
+    Ok(())
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -259,11 +300,25 @@ pub async fn auth_middleware(
     next: Next,
 ) -> Response {
     let (mut parts, body) = req.into_parts();
+    let resource = parts.uri.path().to_string();
+    let request_id =
+        request_id_from_headers(&parts.headers).unwrap_or_else(|| Ulid::new().to_string());
 
     let ctx = match RequestContext::from_request_parts(&mut parts, &state).await {
         Ok(ctx) => ctx,
-        Err(err) => return err.into_response(),
+        Err(err) => {
+            let reason = if err.code() == "MISSING_AUTH" {
+                crate::audit::REASON_MISSING_TOKEN
+            } else {
+                crate::audit::REASON_INVALID_TOKEN
+            };
+            let audit_request_id = err.request_id().unwrap_or(&request_id);
+            crate::audit::emit_auth_deny(&state, audit_request_id, &resource, reason);
+            return err.into_response();
+        }
     };
+
+    crate::audit::emit_auth_allow(&state, &ctx, &resource);
 
     let mut req = Request::from_parts(parts, body);
     let request_id = ctx.request_id.clone();
@@ -276,4 +331,59 @@ pub async fn auth_middleware(
             .insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{Request as AxumRequest, StatusCode};
+
+    use crate::config::{Config, Posture};
+    use crate::server::AppState;
+
+    #[tokio::test]
+    async fn test_request_context_accepts_debug_headers_in_dev() {
+        let mut config = Config::default();
+        config.debug = true;
+        config.posture = Posture::Dev;
+        let state = Arc::new(AppState::with_memory_storage(config));
+
+        let request = AxumRequest::builder()
+            .uri("/")
+            .header("X-Tenant-Id", "tenant-1")
+            .header("X-Workspace-Id", "workspace-1")
+            .header("X-User-Id", "user-1")
+            .body(Body::empty())
+            .expect("request");
+        let (mut parts, _body) = request.into_parts();
+
+        let ctx = RequestContext::from_request_parts(&mut parts, &state)
+            .await
+            .expect("request context");
+        assert_eq!(ctx.tenant, "tenant-1");
+        assert_eq!(ctx.workspace, "workspace-1");
+        assert_eq!(ctx.user_id.as_deref(), Some("user-1"));
+    }
+
+    #[tokio::test]
+    async fn test_request_context_requires_jwt_outside_dev() {
+        let mut config = Config::default();
+        config.debug = true;
+        config.posture = Posture::Private;
+        let state = Arc::new(AppState::with_memory_storage(config));
+
+        let request = AxumRequest::builder()
+            .uri("/")
+            .header("X-Tenant-Id", "tenant-1")
+            .header("X-Workspace-Id", "workspace-1")
+            .body(Body::empty())
+            .expect("request");
+        let (mut parts, _body) = request.into_parts();
+
+        let err = RequestContext::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(err.message(), "Authorization header required");
+    }
 }

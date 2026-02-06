@@ -28,7 +28,7 @@ terraform {
   required_providers {
     google = {
       source  = "hashicorp/google"
-      version = "~> 5.0"
+      version = "~> 7.15"
     }
   }
 
@@ -56,6 +56,11 @@ resource "google_storage_bucket" "catalog" {
 
   # Uniform access control (recommended for security)
   uniform_bucket_level_access = true
+
+  # SECURITY: Prevent any public access to bucket data.
+  # This is a critical defense-in-depth control that ensures bucket data
+  # cannot be accidentally exposed even if ACLs are misconfigured.
+  public_access_prevention = "enforced"
 
   # Enable versioning for data protection
   versioning {

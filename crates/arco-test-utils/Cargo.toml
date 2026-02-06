@@ -30,3 +30,4 @@ tempfile = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 proptest = { workspace = true }
+datafusion = "46"

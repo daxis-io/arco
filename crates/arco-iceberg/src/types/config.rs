@@ -5,9 +5,7 @@ use std::collections::HashMap;
 
 use crate::state::IcebergConfig;
 
-// Phase B: commit_table is supported; other write endpoints are not yet implemented.
 const COMMIT_ENDPOINT_SUPPORTED: bool = true;
-const WRITE_ENDPOINTS_SUPPORTED: bool = false;
 
 /// Response from the `/v1/config` endpoint.
 ///
@@ -52,6 +50,7 @@ impl ConfigResponse {
             "GET /v1/{prefix}/namespaces/{namespace}/tables".to_string(),
             "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string(),
             "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string(),
+            "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics".to_string(),
         ];
 
         if credentials_enabled {
@@ -64,14 +63,25 @@ impl ConfigResponse {
             endpoints.push("POST /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string());
         }
 
-        if config.allow_write && WRITE_ENDPOINTS_SUPPORTED {
+        if config.allow_namespace_crud {
             endpoints.extend([
                 "POST /v1/{prefix}/namespaces".to_string(),
                 "DELETE /v1/{prefix}/namespaces/{namespace}".to_string(),
+                "POST /v1/{prefix}/namespaces/{namespace}/properties".to_string(),
+            ]);
+        }
+
+        if config.allow_table_crud {
+            endpoints.extend([
                 "POST /v1/{prefix}/namespaces/{namespace}/tables".to_string(),
                 "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string(),
+                "POST /v1/{prefix}/namespaces/{namespace}/register".to_string(),
                 "POST /v1/{prefix}/tables/rename".to_string(),
             ]);
+        }
+
+        if config.allow_write && config.allow_multi_table_transactions {
+            endpoints.push("POST /v1/{prefix}/transactions/commit".to_string());
         }
 
         Self {
@@ -143,21 +153,124 @@ mod tests {
     }
 
     #[test]
-    fn test_allow_write_does_not_advertise_without_support() {
+    fn test_allow_write_does_not_advertise_namespace_crud() {
         let mut config = IcebergConfig::default();
         config.allow_write = true;
         let config = ConfigResponse::from_config(&config, false);
         let endpoints = config.endpoints.expect("endpoints should be present");
 
-        // Only commit_table is advertised; other write endpoints stay hidden.
         assert!(
             endpoints
                 .contains(&"POST /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string())
         );
         assert!(!endpoints.contains(&"POST /v1/{prefix}/namespaces".to_string()));
+    }
+
+    #[test]
+    fn test_namespace_crud_advertises_endpoints() {
+        let mut config = IcebergConfig::default();
+        config.allow_namespace_crud = true;
+        let config = ConfigResponse::from_config(&config, false);
+        let endpoints = config.endpoints.expect("endpoints should be present");
+
+        assert!(endpoints.contains(&"POST /v1/{prefix}/namespaces".to_string()));
+        assert!(endpoints.contains(&"DELETE /v1/{prefix}/namespaces/{namespace}".to_string()));
+        assert!(
+            endpoints.contains(&"POST /v1/{prefix}/namespaces/{namespace}/properties".to_string())
+        );
+    }
+
+    #[test]
+    fn test_table_crud_advertises_endpoints() {
+        let mut config = IcebergConfig::default();
+        config.allow_table_crud = true;
+        let config = ConfigResponse::from_config(&config, false);
+        let endpoints = config.endpoints.expect("endpoints should be present");
+
+        assert!(endpoints.contains(&"POST /v1/{prefix}/namespaces/{namespace}/tables".to_string()));
+        assert!(
+            endpoints
+                .contains(&"DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string())
+        );
+        assert!(
+            endpoints.contains(&"POST /v1/{prefix}/namespaces/{namespace}/register".to_string())
+        );
+    }
+
+    #[test]
+    fn test_table_crud_not_advertised_by_default() {
+        let config = ConfigResponse::from_config(&IcebergConfig::default(), false);
+        let endpoints = config.endpoints.expect("endpoints should be present");
+
         assert!(
             !endpoints.contains(&"POST /v1/{prefix}/namespaces/{namespace}/tables".to_string())
         );
+        assert!(
+            !endpoints
+                .contains(&"DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_metrics_endpoint_always_advertised() {
+        let config = ConfigResponse::from_config(&IcebergConfig::default(), false);
+        let endpoints = config.endpoints.expect("endpoints should be present");
+
+        assert!(endpoints.contains(
+            &"POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics".to_string()
+        ));
+    }
+
+    #[test]
+    fn test_rename_endpoint_advertised_with_table_crud() {
+        let mut config = IcebergConfig::default();
+        config.allow_table_crud = true;
+        let response = ConfigResponse::from_config(&config, false);
+        let endpoints = response.endpoints.expect("endpoints should be present");
+
+        assert!(endpoints.contains(&"POST /v1/{prefix}/tables/rename".to_string()));
+    }
+
+    #[test]
+    fn test_rename_endpoint_not_advertised_without_table_crud() {
+        let config = ConfigResponse::from_config(&IcebergConfig::default(), false);
+        let endpoints = config.endpoints.expect("endpoints should be present");
+
+        assert!(!endpoints.contains(&"POST /v1/{prefix}/tables/rename".to_string()));
+    }
+
+    #[test]
+    fn test_transactions_commit_not_advertised_by_default() {
+        let config = IcebergConfig::default();
+        let response = ConfigResponse::from_config(&config, false);
+        let endpoints = response.endpoints.expect("endpoints should be present");
+
+        assert!(!endpoints.contains(&"POST /v1/{prefix}/transactions/commit".to_string()));
+    }
+
+    #[test]
+    fn test_transactions_commit_not_advertised_without_write() {
+        let mut config = IcebergConfig::default();
+        config.allow_multi_table_transactions = true;
+        config.allow_write = false;
+        let response = ConfigResponse::from_config(&config, false);
+        let endpoints = response.endpoints.expect("endpoints should be present");
+
+        assert!(
+            !endpoints.contains(&"POST /v1/{prefix}/transactions/commit".to_string()),
+            "transactions/commit requires allow_write=true"
+        );
+    }
+
+    #[test]
+    fn test_transactions_commit_advertised_when_both_flags_enabled() {
+        let mut config = IcebergConfig::default();
+        config.allow_write = true;
+        config.allow_multi_table_transactions = true;
+        let response = ConfigResponse::from_config(&config, false);
+        let endpoints = response.endpoints.expect("endpoints should be present");
+
+        assert!(endpoints.contains(&"POST /v1/{prefix}/transactions/commit".to_string()));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 """Tests for asset registry."""
+
 from __future__ import annotations
 
 import pytest
@@ -9,7 +10,7 @@ class TestAssetRegistry:
 
     def test_singleton(self) -> None:
         """Registry is a singleton."""
-        from servo._internal.registry import get_registry
+        from arco_flow._internal.registry import get_registry
 
         reg1 = get_registry()
         reg2 = get_registry()
@@ -17,8 +18,8 @@ class TestAssetRegistry:
 
     def test_register_and_get(self) -> None:
         """Assets can be registered and retrieved."""
-        from servo._internal.registry import get_registry
-        from servo.types import AssetDefinition, AssetId, AssetKey, CodeLocation
+        from arco_flow._internal.registry import get_registry
+        from arco_flow.types import AssetDefinition, AssetId, AssetKey, CodeLocation
 
         reg = get_registry()
         reg.clear()
@@ -46,9 +47,9 @@ class TestAssetRegistry:
 
     def test_get_by_function_supports_decorated_wrapper(self) -> None:
         """get_by_function should work for the decorated function object."""
-        from servo._internal.registry import get_registry
-        from servo.asset import asset
-        from servo.context import AssetContext
+        from arco_flow._internal.registry import get_registry
+        from arco_flow.asset import asset
+        from arco_flow.context import AssetContext
 
         reg = get_registry()
         reg.clear()
@@ -66,8 +67,8 @@ class TestAssetRegistry:
 
     def test_rejects_duplicate(self) -> None:
         """Duplicate asset keys are rejected with helpful error."""
-        from servo._internal.registry import get_registry
-        from servo.types import AssetDefinition, AssetId, AssetKey, CodeLocation
+        from arco_flow._internal.registry import get_registry
+        from arco_flow.types import AssetDefinition, AssetId, AssetKey, CodeLocation
 
         reg = get_registry()
         reg.clear()
@@ -98,8 +99,8 @@ class TestAssetRegistry:
 
     def test_list_all_sorted(self) -> None:
         """All registered assets are returned sorted by key."""
-        from servo._internal.registry import get_registry
-        from servo.types import AssetDefinition, AssetId, AssetKey, CodeLocation
+        from arco_flow._internal.registry import get_registry
+        from arco_flow.types import AssetDefinition, AssetId, AssetKey, CodeLocation
 
         reg = get_registry()
         reg.clear()
@@ -125,8 +126,8 @@ class TestAssetRegistry:
 
     def test_clear(self) -> None:
         """Clear removes all registered assets."""
-        from servo._internal.registry import get_registry
-        from servo.types import AssetDefinition, AssetId, AssetKey, CodeLocation
+        from arco_flow._internal.registry import get_registry
+        from arco_flow.types import AssetDefinition, AssetId, AssetKey, CodeLocation
 
         reg = get_registry()
         reg.clear()

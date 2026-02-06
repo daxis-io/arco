@@ -1,0 +1,20 @@
+Gate 2 Evidence: Runbooks for storage integrity / manifest verification
+
+Primary runbook:
+- docs/runbooks/storage-integrity-verification.md:5-11 (validates root manifest, domain manifests, commit chain, snapshot checksums, lock freshness)
+- docs/runbooks/storage-integrity-verification.md:43-55 (repo-only checks via cargo xtask verify-integrity)
+- docs/runbooks/storage-integrity-verification.md:58-73 (full storage checks with bucket/tenant/workspace)
+- docs/runbooks/storage-integrity-verification.md:125-173 (failure handling for missing root manifest, commit chain break, snapshot checksum mismatch)
+
+Supplemental operational runbook:
+- docs/runbooks/gc-failure.md:7 (orphaned snapshots) 
+- docs/runbooks/gc-failure.md:56-65 (root manifest readability + manifest JSON validation)
+- docs/runbooks/gc-failure.md:100-103 (snapshot version checks vs manifest snapshotPath)
+
+Monitoring/alerts:
+- docs/runbooks/metrics-catalog.md:182-207 (manifest integrity metrics + snapshot artifact verification metrics)
+
+Architecture references (integrity semantics):
+- docs/adr/adr-005-storage-layout.md:21-75 (layout + atomic update rule)
+- docs/adr/adr-003-manifest-domains.md:19-43 (root manifest entrypoint + domain manifest model)
+- docs/adr/adr-018-tier1-write-path.md:26-119 (sole writer + sync compaction invariants)

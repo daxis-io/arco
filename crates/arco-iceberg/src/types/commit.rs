@@ -325,7 +325,10 @@ impl CommitTableRequestBuilder {
 
     /// Adds multiple update requirements.
     #[must_use]
-    pub fn requirements(mut self, requirements: impl IntoIterator<Item = UpdateRequirement>) -> Self {
+    pub fn requirements(
+        mut self,
+        requirements: impl IntoIterator<Item = UpdateRequirement>,
+    ) -> Self {
         self.requirements.extend(requirements);
         self
     }
@@ -364,6 +367,27 @@ pub struct CommitTableResponse {
 
     /// Full table metadata (inline JSON).
     pub metadata: serde_json::Value,
+}
+
+/// Request body for `POST /v1/{prefix}/transactions/commit`.
+///
+/// Commits changes to multiple tables atomically.
+///
+/// # Arco Implementation
+///
+/// Multi-table atomic transactions are supported when `allow_multi_table_transactions`
+/// is enabled. When disabled (default), requests with more than one table change
+/// return 406 Not Acceptable.
+///
+/// The endpoint is advertised in `/v1/config` only when both `allow_write` and
+/// `allow_multi_table_transactions` are enabled.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct CommitTransactionRequest {
+    /// Table changes to commit atomically.
+    ///
+    /// Each entry must include an `identifier` field.
+    #[serde(rename = "table-changes")]
+    pub table_changes: Vec<CommitTableRequest>,
 }
 
 #[cfg(test)]

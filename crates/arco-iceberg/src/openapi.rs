@@ -3,9 +3,12 @@
 //! The generated spec can be used to validate compliance with the
 //! Apache Iceberg REST Catalog specification.
 
+#![allow(clippy::needless_for_each)]
+
 use utoipa::OpenApi;
 
 /// `OpenAPI` documentation for the Iceberg REST Catalog API.
+#[allow(clippy::needless_for_each)]
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -20,19 +23,32 @@ use utoipa::OpenApi;
     paths(
         crate::routes::config::get_config,
         crate::routes::namespaces::list_namespaces,
+        crate::routes::namespaces::create_namespace,
         crate::routes::namespaces::get_namespace,
         crate::routes::namespaces::head_namespace,
+        crate::routes::namespaces::delete_namespace,
+        crate::routes::namespaces::update_namespace_properties,
         crate::routes::tables::list_tables,
+        crate::routes::tables::create_table,
         crate::routes::tables::load_table,
         crate::routes::tables::head_table,
+        crate::routes::tables::drop_table,
+        crate::routes::tables::register_table,
         crate::routes::tables::get_credentials,
         crate::routes::tables::commit_table,
+        crate::routes::tables::report_metrics,
+        crate::routes::catalog::rename_table,
+        crate::routes::catalog::commit_transaction,
     ),
     components(
         schemas(
             crate::types::ConfigResponse,
             crate::types::ListNamespacesResponse,
+            crate::types::CreateNamespaceRequest,
+            crate::types::CreateNamespaceResponse,
             crate::types::GetNamespaceResponse,
+            crate::types::UpdateNamespacePropertiesRequest,
+            crate::types::UpdateNamespacePropertiesResponse,
             crate::types::NamespaceIdent,
             crate::types::ListTablesResponse,
             crate::types::LoadTableResponse,
@@ -56,6 +72,11 @@ use utoipa::OpenApi;
             crate::types::TableUuid,
             crate::types::TableCredentialsResponse,
             crate::types::StorageCredential,
+            crate::types::CreateTableRequest,
+            crate::types::RegisterTableRequest,
+            crate::types::RenameTableRequest,
+            crate::types::CommitTransactionRequest,
+            crate::types::ReportMetricsRequest,
             crate::error::IcebergErrorResponse,
         )
     ),
@@ -63,6 +84,7 @@ use utoipa::OpenApi;
         (name = "Configuration", description = "Catalog configuration endpoint"),
         (name = "Namespaces", description = "Namespace management operations"),
         (name = "Tables", description = "Table management and loading operations"),
+        (name = "Catalog", description = "Catalog-level operations (rename, transactions)"),
     ),
 )]
 pub struct IcebergApiDoc;

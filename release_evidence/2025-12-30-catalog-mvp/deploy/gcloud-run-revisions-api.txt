@@ -1,0 +1,4 @@
+Command: gcloud run revisions list --project dataverse-dev-471815 --region us-central1 --service arco-api-dev
+
+Error: Reauthentication failed. gcloud cannot prompt during non-interactive execution.
+Action: run `gcloud auth login` or set an authenticated account.

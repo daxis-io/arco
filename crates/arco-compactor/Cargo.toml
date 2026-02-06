@@ -34,10 +34,12 @@ tokio = { workspace = true }
 
 # HTTP
 axum = { workspace = true }
+reqwest = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+bytes = { workspace = true }
 
 # Time
 chrono = { workspace = true }
@@ -61,3 +63,5 @@ clap = { version = "4", features = ["derive", "env"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tower = { workspace = true }
+

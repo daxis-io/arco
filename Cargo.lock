@@ -441,6 +441,7 @@ dependencies = [
  "hex",
  "iceberg",
  "iceberg-catalog-rest",
+ "parquet 54.3.1",
  "serde",
  "serde_json",
  "sha2",

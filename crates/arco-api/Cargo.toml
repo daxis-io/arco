@@ -81,7 +81,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 
 # Auth
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 
 # OpenAPI
 utoipa = { version = "5.4.0", features = ["axum_extras", "chrono"] }
@@ -96,6 +96,6 @@ metrics-exporter-prometheus = { workspace = true }
 
 [dev-dependencies]
 arco-test-utils = { path = "../arco-test-utils" }
-duckdb = { version = "1.4.3", features = ["parquet"] }
+duckdb = { version = "1.4.4", features = ["parquet"] }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }

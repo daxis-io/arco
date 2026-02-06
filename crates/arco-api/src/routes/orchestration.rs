@@ -1164,19 +1164,10 @@ struct LatestManifestIndex {
     deployed_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct PartitioningSpec {
     is_partitioned: bool,
     dimensions: Vec<DimensionSpec>,
-}
-
-impl Default for PartitioningSpec {
-    fn default() -> Self {
-        Self {
-            is_partitioned: false,
-            dimensions: Vec::new(),
-        }
-    }
 }
 
 impl PartitioningSpec {
@@ -1194,10 +1185,8 @@ impl PartitioningSpec {
         let is_partitioned_value = obj
             .get("is_partitioned")
             .or_else(|| obj.get("isPartitioned"))
-            .and_then(|value| value.as_bool());
-        let mut is_partitioned = is_partitioned_value.unwrap_or(!dimensions.is_empty());
-
-        if is_partitioned_value == Some(false) && !dimensions.is_empty() {
+            .and_then(serde_json::Value::as_bool);
+        let is_partitioned = if is_partitioned_value == Some(false) && !dimensions.is_empty() {
             let dimension_names = dimensions
                 .iter()
                 .map(|dim| dim.name.clone())
@@ -1206,8 +1195,10 @@ impl PartitioningSpec {
                 dimensions = ?dimension_names,
                 "manifest partitioning marked unpartitioned despite dimensions; treating as partitioned"
             );
-            is_partitioned = true;
-        }
+            true
+        } else {
+            is_partitioned_value.unwrap_or(!dimensions.is_empty())
+        };
 
         Self {
             is_partitioned,
@@ -2471,27 +2462,25 @@ fn normalize_partition_key(
         .map(|dim| dim.name.as_str())
         .collect();
 
-    if partitioning.is_partitioned {
-        if provided_keys != expected_keys {
-            let expected = partitioning
-                .dimensions
-                .iter()
-                .map(|dim| dim.name.as_str())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>()
-                .join(", ");
-            let provided = provided_keys
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(ApiError::bad_request(format!(
-                "partitionKey dimensions must match manifest dimensions: expected [{expected}], got [{provided}]"
-            )));
-        }
+    if partitioning.is_partitioned && provided_keys != expected_keys {
+        let expected = partitioning
+            .dimensions
+            .iter()
+            .map(|dim| dim.name.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let provided = provided_keys
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ApiError::bad_request(format!(
+            "partitionKey dimensions must match manifest dimensions: expected [{expected}], got [{provided}]"
+        )));
     }
 
     let cutoff_active = cutoff.is_some_and(|cutoff| Utc::now() >= cutoff);
@@ -2686,10 +2675,8 @@ fn parse_rfc3339_timestamp(value: &str, require_hour_boundary: bool) -> Option<S
     let parsed = DateTime::parse_from_rfc3339(value).ok()?;
     let utc = parsed.with_timezone(&Utc);
 
-    if require_hour_boundary {
-        if utc.minute() != 0 || utc.second() != 0 || utc.nanosecond() != 0 {
-            return None;
-        }
+    if require_hour_boundary && (utc.minute() != 0 || utc.second() != 0 || utc.nanosecond() != 0) {
+        return None;
     }
 
     Some(utc.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
@@ -2763,6 +2750,7 @@ fn build_request_fingerprint(
     Ok(hex::encode(hash))
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_request_fingerprint_variants(
     request: &TriggerRunRequest,
     resolved_partition_key: &ResolvedPartitionKey,
@@ -4205,6 +4193,7 @@ pub(crate) async fn manual_evaluate_sensor(
         ("bearerAuth" = [])
     )
 )]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn backfill_run_key(
     State(state): State<Arc<AppState>>,
     ctx: RequestContext,

@@ -6,6 +6,7 @@
 //! - `GET /v1/{prefix}/namespaces/{namespace}/tables/{table}` - Load table
 //! - `POST /v1/{prefix}/namespaces/{namespace}/tables/{table}` - Commit table updates
 //! - `GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials` - Get credentials
+//! - `POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics` - Report metrics (ICE-8)
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,33 +20,59 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use tracing::instrument;
 
-use arco_catalog::CatalogReader;
+use arco_catalog::write_options::WriteOptions;
+use arco_catalog::{CatalogReader, CatalogWriter};
 
+use crate::audit::{
+    REASON_COMMIT_CACHED_FAILURE, REASON_COMMIT_CAS_CONFLICT, REASON_COMMIT_IN_PROGRESS,
+    REASON_COMMIT_INTERNAL_ERROR, REASON_COMMIT_REQUIREMENTS_FAILED,
+    REASON_CRED_VEND_ACCESS_DENIED, REASON_CRED_VEND_DISABLED, REASON_CRED_VEND_PROVIDER_ERROR,
+    REASON_CRED_VEND_UNSUPPORTED_DELEGATION, emit_cred_vend_allow, emit_cred_vend_deny,
+    emit_iceberg_commit, emit_iceberg_commit_deny,
+};
 use crate::commit::{CommitError, CommitService};
 use crate::context::IcebergRequestContext;
 use crate::error::{IcebergError, IcebergResult};
 use crate::idempotency::{IdempotencyMarker, canonical_request_hash};
 use crate::paths::resolve_metadata_path;
-use crate::pointer::IcebergTablePointer;
-use crate::pointer::UpdateSource;
-use crate::routes::utils::{ensure_prefix, join_namespace, paginate, parse_namespace};
+use crate::pointer::{IcebergTablePointer, UpdateSource, resolve_effective_metadata_location};
+use crate::routes::utils::{
+    ensure_prefix, is_iceberg_table, join_namespace, paginate, parse_namespace,
+};
 use crate::state::{CredentialRequest, IcebergState, TableInfo};
+use crate::transactions::TransactionStoreImpl;
 use crate::types::{
-    AccessDelegation, CommitTableRequest, CommitTableResponse, ListTablesQuery, ListTablesResponse,
-    LoadTableResponse, TableCredentialsResponse, TableIdent, TableMetadata,
+    AccessDelegation, CommitTableRequest, CommitTableResponse, CreateTableRequest,
+    CredentialsQuery, DropTableQuery, ListTablesQuery, ListTablesResponse, LoadTableQuery,
+    LoadTableResponse, RegisterTableRequest, ReportMetricsRequest, SnapshotsFilter,
+    TableCredentialsResponse, TableIdent, TableMetadata,
 };
 
 /// Creates table routes.
 pub fn routes() -> Router<IcebergState> {
     Router::new()
-        .route("/namespaces/:namespace/tables", get(list_tables))
+        .route(
+            "/namespaces/:namespace/tables",
+            get(list_tables).post(create_table),
+        )
         .route(
             "/namespaces/:namespace/tables/:table",
-            get(load_table).head(head_table).post(commit_table),
+            get(load_table)
+                .head(head_table)
+                .post(commit_table)
+                .delete(drop_table),
         )
         .route(
             "/namespaces/:namespace/tables/:table/credentials",
             get(get_credentials),
+        )
+        .route(
+            "/namespaces/:namespace/tables/:table/metrics",
+            axum::routing::post(report_metrics),
+        )
+        .route(
+            "/namespaces/:namespace/register",
+            axum::routing::post(register_table),
         )
 }
 
@@ -116,6 +143,240 @@ async fn list_tables(
     }))
 }
 
+/// Create table.
+#[utoipa::path(
+    post,
+    path = "/v1/{prefix}/namespaces/{namespace}/tables",
+    params(
+        ("prefix" = String, Path, description = "Catalog prefix"),
+        ("namespace" = String, Path, description = "Namespace name"),
+        ("X-Iceberg-Access-Delegation" = Option<String>, Header, description = "Credential vending hint"),
+        ("Idempotency-Key" = Option<String>, Header, description = "Idempotency key")
+    ),
+    request_body = CreateTableRequest,
+    responses(
+        (status = 200, description = "Table created", body = LoadTableResponse),
+        (status = 400, description = "Bad request", body = crate::error::IcebergErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::error::IcebergErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::error::IcebergErrorResponse),
+        (status = 404, description = "Namespace not found", body = crate::error::IcebergErrorResponse),
+        (status = 406, description = "Unsupported operation", body = crate::error::IcebergErrorResponse),
+        (status = 409, description = "Table already exists", body = crate::error::IcebergErrorResponse),
+        (status = 419, description = "Authentication timeout", body = crate::error::IcebergErrorResponse),
+        (status = 503, description = "Service unavailable", body = crate::error::IcebergErrorResponse),
+        (status = 500, description = "Internal error", body = crate::error::IcebergErrorResponse),
+    ),
+    tag = "Tables"
+)]
+#[instrument(skip_all, fields(request_id = %ctx.request_id, tenant = %ctx.tenant, workspace = %ctx.workspace, prefix = %path.prefix, namespace = %path.namespace))]
+#[allow(clippy::too_many_lines)]
+async fn create_table(
+    Extension(ctx): Extension<IcebergRequestContext>,
+    State(state): State<IcebergState>,
+    Path(path): Path<NamespaceTablesPath>,
+    headers: HeaderMap,
+    Json(req): Json<CreateTableRequest>,
+) -> IcebergResult<Response> {
+    ensure_prefix(&path.prefix, &state.config)?;
+    ensure_table_crud_enabled(&state.config)?;
+
+    if req.stage_create {
+        return Err(IcebergError::unsupported_operation(
+            "Staged table creation is not supported",
+        ));
+    }
+
+    let separator = state.config.namespace_separator_decoded();
+    let namespace_ident = parse_namespace(&path.namespace, &separator)?;
+    let namespace_name = join_namespace(&namespace_ident, &separator)?;
+
+    let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
+    let compactor = state.create_compactor(&storage)?;
+    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
+
+    writer.initialize().await.map_err(IcebergError::from)?;
+
+    let mut options = WriteOptions::default()
+        .with_actor(format!("iceberg-api:{}", ctx.tenant))
+        .with_request_id(&ctx.request_id);
+
+    if let Some(ref key) = ctx.idempotency_key {
+        options = options.with_idempotency_key(key);
+    }
+
+    let default_relative_location = format!("warehouse/{}/{}", namespace_name, req.name);
+    let default_scoped_location = format!(
+        "tenant={}/workspace={}/{}",
+        ctx.tenant, ctx.workspace, default_relative_location
+    );
+
+    let (table_location, storage_relative_location) = match &req.location {
+        Some(loc) => {
+            let resolved =
+                resolve_metadata_path(loc, &ctx.tenant, &ctx.workspace).map_err(|e| {
+                    IcebergError::BadRequest {
+                        message: format!("Invalid table location '{loc}': {e}"),
+                        error_type: "BadRequestException",
+                    }
+                })?;
+            (loc.clone(), resolved)
+        }
+        None => (default_scoped_location, default_relative_location),
+    };
+
+    let delegation_header = headers.get("X-Iceberg-Access-Delegation");
+    if delegation_header.is_some() && state.credential_provider.is_none() {
+        return Err(IcebergError::BadRequest {
+            message: "Credential vending is not enabled".to_string(),
+            error_type: "BadRequestException",
+        });
+    }
+
+    let table = writer
+        .register_table(
+            arco_catalog::RegisterTableRequest {
+                namespace: namespace_name.clone(),
+                name: req.name.clone(),
+                description: None,
+                location: Some(table_location.clone()),
+                format: Some("iceberg".to_string()),
+                columns: vec![],
+            },
+            options,
+        )
+        .await
+        .map_err(IcebergError::from)?;
+
+    let table_uuid = uuid::Uuid::parse_str(&table.id).map_err(|_| IcebergError::Internal {
+        message: format!("Invalid table UUID from catalog: {}", table.id),
+    })?;
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let metadata = TableMetadata {
+        format_version: 2,
+        table_uuid: crate::types::TableUuid::new(table_uuid),
+        location: table_location.clone(),
+        last_sequence_number: 0,
+        last_updated_ms: now_ms,
+        last_column_id: req.schema.fields.iter().map(|f| f.id).max().unwrap_or(0),
+        current_schema_id: req.schema.schema_id,
+        schemas: vec![req.schema],
+        current_snapshot_id: None,
+        snapshots: vec![],
+        snapshot_log: vec![],
+        metadata_log: vec![],
+        properties: req.properties,
+        default_spec_id: req.partition_spec.as_ref().map_or(0, |s| s.spec_id),
+        partition_specs: req.partition_spec.map(|s| vec![s]).unwrap_or_default(),
+        last_partition_id: 0,
+        refs: HashMap::new(),
+        default_sort_order_id: req.write_order.as_ref().map_or(0, |s| s.order_id),
+        sort_orders: req.write_order.map(|s| vec![s]).unwrap_or_default(),
+    };
+
+    let metadata_bytes = serde_json::to_vec(&metadata).map_err(|e| IcebergError::Internal {
+        message: format!("Failed to serialize metadata: {e}"),
+    })?;
+    let metadata_storage_path =
+        format!("{storage_relative_location}/metadata/00000-{table_uuid}.metadata.json");
+    let metadata_location = format!("{table_location}/metadata/00000-{table_uuid}.metadata.json");
+
+    if let Err(e) = storage
+        .put_raw(
+            &metadata_storage_path,
+            bytes::Bytes::from(metadata_bytes),
+            arco_core::storage::WritePrecondition::None,
+        )
+        .await
+    {
+        if let Err(rollback_err) = writer
+            .drop_table(&namespace_name, &req.name, WriteOptions::default())
+            .await
+        {
+            tracing::warn!(error = %rollback_err, "Failed to rollback catalog entry after metadata write failure");
+        }
+        return Err(IcebergError::Internal {
+            message: format!("Failed to write metadata: {e}"),
+        });
+    }
+
+    let pointer = IcebergTablePointer::new(table_uuid, metadata_location.clone());
+    let pointer_path = IcebergTablePointer::storage_path(&table_uuid);
+    let pointer_bytes = serde_json::to_vec(&pointer).map_err(|e| IcebergError::Internal {
+        message: format!("Failed to serialize pointer: {e}"),
+    })?;
+
+    let pointer_write_result = match storage
+        .put_raw(
+            &pointer_path,
+            bytes::Bytes::from(pointer_bytes),
+            arco_core::storage::WritePrecondition::DoesNotExist,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            if let Err(rollback_err) = storage.delete(&metadata_storage_path).await {
+                tracing::warn!(error = %rollback_err, path = %metadata_storage_path, "Failed to rollback metadata file after pointer write failure");
+            }
+            if let Err(rollback_err) = writer
+                .drop_table(&namespace_name, &req.name, WriteOptions::default())
+                .await
+            {
+                tracing::warn!(error = %rollback_err, "Failed to rollback catalog entry after pointer write failure");
+            }
+            return Err(IcebergError::Internal {
+                message: format!("Failed to write pointer: {e}"),
+            });
+        }
+    };
+
+    let pointer_version = match pointer_write_result {
+        arco_core::storage::WriteResult::Success { version } => version,
+        arco_core::storage::WriteResult::PreconditionFailed { .. } => {
+            if let Err(rollback_err) = storage.delete(&metadata_storage_path).await {
+                tracing::warn!(error = %rollback_err, path = %metadata_storage_path, "Failed to rollback metadata file after pointer conflict");
+            }
+            if let Err(rollback_err) = writer
+                .drop_table(&namespace_name, &req.name, WriteOptions::default())
+                .await
+            {
+                tracing::warn!(error = %rollback_err, "Failed to rollback catalog entry after pointer conflict");
+            }
+            return Err(IcebergError::Conflict {
+                message: "Table pointer already exists".to_string(),
+                error_type: "AlreadyExistsException",
+            });
+        }
+    };
+
+    let storage_credentials = maybe_vended_credentials(
+        &state,
+        &ctx,
+        headers.get("X-Iceberg-Access-Delegation"),
+        None,
+        TableInfo {
+            ident: TableIdent::new(namespace_ident, req.name),
+            table_id: table.id,
+            location: Some(table_location),
+        },
+    )
+    .await?;
+
+    let response = LoadTableResponse {
+        metadata_location,
+        metadata,
+        config: HashMap::new(),
+        storage_credentials,
+    };
+
+    let mut resp = Json(response).into_response();
+    if let Ok(value) = HeaderValue::from_str(&pointer_version) {
+        resp.headers_mut().insert("ETag", value);
+    }
+    Ok(resp)
+}
+
 /// Load table.
 #[utoipa::path(
     get,
@@ -125,7 +386,7 @@ async fn list_tables(
         ("namespace" = String, Path, description = "Namespace name"),
         ("table" = String, Path, description = "Table name"),
         ("If-None-Match" = Option<String>, Header, description = "ETag for conditional table load"),
-        ("snapshots" = Option<String>, Query, description = "Snapshots to return (all or refs)"),
+        LoadTableQuery,
         ("X-Iceberg-Access-Delegation" = Option<String>, Header, description = "Credential vending hint")
     ),
     responses(
@@ -147,6 +408,7 @@ async fn load_table(
     Extension(ctx): Extension<IcebergRequestContext>,
     State(state): State<IcebergState>,
     Path(path): Path<TablePath>,
+    Query(query): Query<LoadTableQuery>,
     headers: HeaderMap,
 ) -> IcebergResult<Response> {
     ensure_prefix(&path.prefix, &state.config)?;
@@ -218,11 +480,11 @@ async fn load_table(
             message: err.to_string(),
         })?;
 
-    let metadata_path = resolve_metadata_path(
-        &pointer.current_metadata_location,
-        &ctx.tenant,
-        &ctx.workspace,
-    )?;
+    let tx_store = TransactionStoreImpl::new(Arc::new(storage.clone()));
+    let effective = resolve_effective_metadata_location(&pointer, &tx_store).await?;
+
+    let metadata_path =
+        resolve_metadata_path(&effective.metadata_location, &ctx.tenant, &ctx.workspace)?;
     let metadata_bytes =
         storage
             .get_raw(&metadata_path)
@@ -231,13 +493,22 @@ async fn load_table(
                 message: err.to_string(),
             })?;
 
-    let metadata: TableMetadata =
+    let mut metadata: TableMetadata =
         serde_json::from_slice(&metadata_bytes).map_err(|err| IcebergError::Internal {
             message: format!("Failed to parse table metadata: {err}"),
         })?;
 
+    if query.snapshots == Some(SnapshotsFilter::Refs) {
+        let referenced_ids: std::collections::HashSet<i64> =
+            metadata.refs.values().map(|r| r.snapshot_id).collect();
+        metadata
+            .snapshots
+            .retain(|s| referenced_ids.contains(&s.snapshot_id));
+    }
+
     let storage_credentials = maybe_vended_credentials(
         &state,
+        &ctx,
         headers.get("X-Iceberg-Access-Delegation"),
         None,
         TableInfo {
@@ -249,7 +520,10 @@ async fn load_table(
     .await?;
 
     let mut config = HashMap::new();
-    if storage_credentials.is_some() && state.credentials_enabled() {
+    let has_credentials = storage_credentials
+        .as_ref()
+        .is_some_and(|creds| !creds.is_empty());
+    if has_credentials && state.credentials_enabled() {
         config.insert(
             "client.refresh-credentials-endpoint".to_string(),
             format!(
@@ -260,7 +534,7 @@ async fn load_table(
     }
 
     let response = LoadTableResponse {
-        metadata_location: pointer.current_metadata_location,
+        metadata_location: effective.metadata_location,
         metadata,
         config,
         storage_credentials,
@@ -281,7 +555,6 @@ async fn load_table(
         ("prefix" = String, Path, description = "Catalog prefix"),
         ("namespace" = String, Path, description = "Namespace name"),
         ("table" = String, Path, description = "Table name"),
-        ("planId" = Option<String>, Query, description = "Plan ID used for server-side scan planning")
     ),
     responses(
         (status = 204, description = "Table exists"),
@@ -356,6 +629,7 @@ async fn head_table(
     ),
     tag = "Tables"
 )]
+#[allow(clippy::too_many_lines)]
 #[instrument(skip_all, fields(request_id = %ctx.request_id, tenant = %ctx.tenant, workspace = %ctx.workspace, prefix = %path.prefix, namespace = %path.namespace, table = %path.table))]
 async fn commit_table(
     Extension(ctx): Extension<IcebergRequestContext>,
@@ -444,7 +718,7 @@ async fn commit_table(
 
     let commit_service = CommitService::new(Arc::new(storage));
 
-    match commit_service
+    let result = commit_service
         .commit_table(
             table_uuid,
             &namespace_name,
@@ -456,19 +730,170 @@ async fn commit_table(
             &ctx.tenant,
             &ctx.workspace,
         )
-        .await
-    {
-        Ok(response) => Ok(Json::<CommitTableResponse>(response).into_response()),
-        Err(CommitError::Iceberg(err)) => Err(err),
+        .await;
+
+    match result {
+        Ok(response) => {
+            if let Some(emitter) = state.audit() {
+                let seq = response
+                    .metadata
+                    .get("last-sequence-number")
+                    .and_then(serde_json::Value::as_i64);
+                emit_iceberg_commit(
+                    emitter,
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    &ctx.request_id,
+                    &namespace_name,
+                    &path.table,
+                    seq,
+                );
+            }
+            Ok(Json::<CommitTableResponse>(response).into_response())
+        }
+        Err(CommitError::Iceberg(err)) => {
+            if let Some(emitter) = state.audit() {
+                let reason = match &err {
+                    IcebergError::Conflict { .. } => REASON_COMMIT_CAS_CONFLICT,
+                    IcebergError::BadRequest { .. } => REASON_COMMIT_REQUIREMENTS_FAILED,
+                    _ => REASON_COMMIT_INTERNAL_ERROR,
+                };
+                emit_iceberg_commit_deny(
+                    emitter,
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    &ctx.request_id,
+                    &namespace_name,
+                    &path.table,
+                    reason,
+                );
+            }
+            Err(err)
+        }
         Err(CommitError::CachedFailure { status, payload }) => {
+            if let Some(emitter) = state.audit() {
+                let reason = match status {
+                    409 => REASON_COMMIT_CAS_CONFLICT,
+                    400 => REASON_COMMIT_REQUIREMENTS_FAILED,
+                    _ => REASON_COMMIT_CACHED_FAILURE,
+                };
+                emit_iceberg_commit_deny(
+                    emitter,
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    &ctx.request_id,
+                    &namespace_name,
+                    &path.table,
+                    reason,
+                );
+            }
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT);
             Ok((status, Json(payload)).into_response())
         }
-        Err(CommitError::RetryAfter { seconds }) => Err(IcebergError::ServiceUnavailable {
-            message: "Commit already in progress".to_string(),
-            retry_after_seconds: Some(seconds),
-        }),
+        Err(CommitError::RetryAfter { seconds }) => {
+            if let Some(emitter) = state.audit() {
+                emit_iceberg_commit_deny(
+                    emitter,
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    &ctx.request_id,
+                    &namespace_name,
+                    &path.table,
+                    REASON_COMMIT_IN_PROGRESS,
+                );
+            }
+            Err(IcebergError::ServiceUnavailable {
+                message: "Commit already in progress".to_string(),
+                retry_after_seconds: Some(seconds),
+            })
+        }
     }
+}
+
+/// Drop table.
+#[utoipa::path(
+    delete,
+    path = "/v1/{prefix}/namespaces/{namespace}/tables/{table}",
+    params(
+        ("prefix" = String, Path, description = "Catalog prefix"),
+        ("namespace" = String, Path, description = "Namespace name"),
+        ("table" = String, Path, description = "Table name"),
+        DropTableQuery,
+        ("Idempotency-Key" = Option<String>, Header, description = "Idempotency key")
+    ),
+    responses(
+        (status = 204, description = "Table dropped"),
+        (status = 400, description = "Bad request", body = crate::error::IcebergErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::error::IcebergErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::error::IcebergErrorResponse),
+        (status = 404, description = "Table not found", body = crate::error::IcebergErrorResponse),
+        (status = 406, description = "Unsupported operation", body = crate::error::IcebergErrorResponse),
+        (status = 419, description = "Authentication timeout", body = crate::error::IcebergErrorResponse),
+        (status = 503, description = "Service unavailable", body = crate::error::IcebergErrorResponse),
+        (status = 500, description = "Internal error", body = crate::error::IcebergErrorResponse),
+    ),
+    tag = "Tables"
+)]
+#[instrument(skip_all, fields(request_id = %ctx.request_id, tenant = %ctx.tenant, workspace = %ctx.workspace, prefix = %path.prefix, namespace = %path.namespace, table = %path.table, purge_requested = %query.purge_requested))]
+async fn drop_table(
+    Extension(ctx): Extension<IcebergRequestContext>,
+    State(state): State<IcebergState>,
+    Path(path): Path<TablePath>,
+    Query(query): Query<DropTableQuery>,
+) -> IcebergResult<Response> {
+    ensure_prefix(&path.prefix, &state.config)?;
+    ensure_table_crud_enabled(&state.config)?;
+
+    if query.purge_requested {
+        return Err(IcebergError::unsupported_operation(
+            "Data purge is not supported. Use purgeRequested=false to drop the table without purging data files.",
+        ));
+    }
+
+    let separator = state.config.namespace_separator_decoded();
+    let namespace_ident = parse_namespace(&path.namespace, &separator)?;
+    let namespace_name = join_namespace(&namespace_ident, &separator)?;
+
+    let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
+
+    let reader = CatalogReader::new(storage.clone());
+    let table = reader
+        .get_table(&namespace_name, &path.table)
+        .await
+        .map_err(IcebergError::from)?
+        .filter(|table| is_iceberg_table(table.format.as_deref()))
+        .ok_or_else(|| IcebergError::table_not_found(&namespace_name, &path.table))?;
+
+    let compactor = state.create_compactor(&storage)?;
+    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
+
+    let mut options = WriteOptions::default()
+        .with_actor(format!("iceberg-api:{}", ctx.tenant))
+        .with_request_id(&ctx.request_id);
+
+    if let Some(ref key) = ctx.idempotency_key {
+        options = options.with_idempotency_key(key);
+    }
+
+    writer
+        .drop_table(&namespace_name, &path.table, options)
+        .await
+        .map_err(IcebergError::from)?;
+
+    let table_uuid = uuid::Uuid::parse_str(&table.id).ok();
+    if let Some(uuid) = table_uuid {
+        let pointer_path = IcebergTablePointer::storage_path(&uuid);
+        if let Err(e) = storage.delete(&pointer_path).await {
+            tracing::warn!(error = %e, path = %pointer_path, table_uuid = %uuid, "Failed to delete pointer file during table drop");
+        }
+    }
+
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(axum::body::Body::empty())
+        .map_err(|e| IcebergError::Internal {
+            message: format!("Failed to build response: {e}"),
+        })
 }
 
 /// Get credentials for a table.
@@ -479,7 +904,7 @@ async fn commit_table(
         ("prefix" = String, Path, description = "Catalog prefix"),
         ("namespace" = String, Path, description = "Namespace name"),
         ("table" = String, Path, description = "Table name"),
-        ("planId" = Option<String>, Query, description = "Plan ID used for server-side scan planning")
+        ("planId" = Option<String>, Query, description = "Plan ID for server-side scan planning (not yet implemented; parameter accepted but ignored)")
     ),
     responses(
         (status = 200, description = "Credentials returned", body = TableCredentialsResponse),
@@ -493,13 +918,27 @@ async fn commit_table(
     ),
     tag = "Tables"
 )]
-#[instrument(skip_all, fields(request_id = %ctx.request_id, tenant = %ctx.tenant, workspace = %ctx.workspace, prefix = %path.prefix, namespace = %path.namespace, table = %path.table))]
+#[instrument(skip_all, fields(request_id = %ctx.request_id, tenant = %ctx.tenant, workspace = %ctx.workspace, prefix = %path.prefix, namespace = %path.namespace, table = %path.table, plan_id))]
 async fn get_credentials(
     Extension(ctx): Extension<IcebergRequestContext>,
     State(state): State<IcebergState>,
     Path(path): Path<TablePath>,
+    Query(query): Query<CredentialsQuery>,
     headers: HeaderMap,
 ) -> IcebergResult<Json<TableCredentialsResponse>> {
+    if let Some(ref plan_id) = query.plan_id {
+        // UTF-8 safe truncation: find a valid char boundary at or before byte 256
+        let bounded = if plan_id.len() > 256 {
+            let mut end = 256;
+            while end > 0 && !plan_id.is_char_boundary(end) {
+                end -= 1;
+            }
+            &plan_id[..end]
+        } else {
+            plan_id.as_str()
+        };
+        tracing::Span::current().record("plan_id", bounded);
+    }
     ensure_prefix(&path.prefix, &state.config)?;
     let separator = state.config.namespace_separator_decoded();
     let namespace_ident = parse_namespace(&path.namespace, &separator)?;
@@ -517,6 +956,7 @@ async fn get_credentials(
 
     let credentials = maybe_vended_credentials(
         &state,
+        &ctx,
         headers.get("X-Iceberg-Access-Delegation"),
         Some(AccessDelegation::VendedCredentials),
         TableInfo {
@@ -536,8 +976,292 @@ async fn get_credentials(
     }))
 }
 
-fn is_iceberg_table(format: Option<&str>) -> bool {
-    format.is_some_and(|value| value.eq_ignore_ascii_case("iceberg"))
+#[utoipa::path(
+    post,
+    path = "/v1/{prefix}/namespaces/{namespace}/tables/{table}/metrics",
+    params(
+        ("prefix" = String, Path, description = "Catalog prefix"),
+        ("namespace" = String, Path, description = "Namespace name"),
+        ("table" = String, Path, description = "Table name"),
+    ),
+    request_body = ReportMetricsRequest,
+    responses(
+        (status = 204, description = "Metrics reported"),
+        (status = 400, description = "Bad request", body = crate::error::IcebergErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::error::IcebergErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::error::IcebergErrorResponse),
+        (status = 404, description = "Table not found", body = crate::error::IcebergErrorResponse),
+        (status = 419, description = "Authentication timeout", body = crate::error::IcebergErrorResponse),
+        (status = 503, description = "Service unavailable", body = crate::error::IcebergErrorResponse),
+        (status = 500, description = "Internal error", body = crate::error::IcebergErrorResponse),
+    ),
+    tag = "Tables"
+)]
+#[instrument(skip_all, fields(request_id = %ctx.request_id, tenant = %ctx.tenant, workspace = %ctx.workspace, prefix = %path.prefix, namespace = %path.namespace, table = %path.table))]
+async fn report_metrics(
+    Extension(ctx): Extension<IcebergRequestContext>,
+    State(state): State<IcebergState>,
+    Path(path): Path<TablePath>,
+    Json(req): Json<ReportMetricsRequest>,
+) -> IcebergResult<Response> {
+    ensure_prefix(&path.prefix, &state.config)?;
+
+    if req.report_type != "scan-report" && req.report_type != "commit-report" {
+        return Err(IcebergError::BadRequest {
+            message: format!(
+                "Invalid report-type '{}'; expected 'scan-report' or 'commit-report'",
+                req.report_type
+            ),
+            error_type: "BadRequestException",
+        });
+    }
+
+    let separator = state.config.namespace_separator_decoded();
+    let namespace_ident = parse_namespace(&path.namespace, &separator)?;
+    let namespace_name = join_namespace(&namespace_ident, &separator)?;
+
+    let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
+    let reader = CatalogReader::new(storage);
+
+    reader
+        .get_table(&namespace_name, &path.table)
+        .await
+        .map_err(IcebergError::from)?
+        .filter(|table| is_iceberg_table(table.format.as_deref()))
+        .ok_or_else(|| IcebergError::table_not_found(&namespace_name, &path.table))?;
+
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(axum::body::Body::empty())
+        .map_err(|e| IcebergError::Internal {
+            message: format!("Failed to build response: {e}"),
+        })
+}
+
+/// Register an existing Iceberg table with the catalog.
+///
+/// This endpoint creates a new metadata file with the catalog-assigned UUID,
+/// leaving the original metadata file unchanged (immutable). The response
+/// returns the new metadata location that clients should use for subsequent
+/// operations.
+#[utoipa::path(
+    post,
+    path = "/v1/{prefix}/namespaces/{namespace}/register",
+    params(
+        ("prefix" = String, Path, description = "Catalog prefix"),
+        ("namespace" = String, Path, description = "Namespace name"),
+        ("Idempotency-Key" = Option<String>, Header, description = "Idempotency key")
+    ),
+    request_body = RegisterTableRequest,
+    responses(
+        (status = 200, description = "Table registered. The metadata-location in the response points to a new metadata file with the catalog-assigned UUID.", body = LoadTableResponse),
+        (status = 400, description = "Bad request", body = crate::error::IcebergErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::error::IcebergErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::error::IcebergErrorResponse),
+        (status = 404, description = "Namespace not found", body = crate::error::IcebergErrorResponse),
+        (status = 406, description = "Unsupported operation", body = crate::error::IcebergErrorResponse),
+        (status = 409, description = "Table already exists", body = crate::error::IcebergErrorResponse),
+        (status = 419, description = "Authentication timeout", body = crate::error::IcebergErrorResponse),
+        (status = 503, description = "Service unavailable", body = crate::error::IcebergErrorResponse),
+        (status = 500, description = "Internal error", body = crate::error::IcebergErrorResponse),
+    ),
+    tag = "Tables"
+)]
+#[instrument(skip_all, fields(request_id = %ctx.request_id, tenant = %ctx.tenant, workspace = %ctx.workspace, prefix = %path.prefix, namespace = %path.namespace))]
+#[allow(clippy::too_many_lines)]
+async fn register_table(
+    Extension(ctx): Extension<IcebergRequestContext>,
+    State(state): State<IcebergState>,
+    Path(path): Path<NamespaceTablesPath>,
+    Json(req): Json<RegisterTableRequest>,
+) -> IcebergResult<Response> {
+    ensure_prefix(&path.prefix, &state.config)?;
+    ensure_table_crud_enabled(&state.config)?;
+
+    let separator = state.config.namespace_separator_decoded();
+    let namespace_ident = parse_namespace(&path.namespace, &separator)?;
+    let namespace_name = join_namespace(&namespace_ident, &separator)?;
+
+    let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
+
+    let metadata_path = resolve_metadata_path(&req.metadata_location, &ctx.tenant, &ctx.workspace)?;
+    let metadata_bytes =
+        storage
+            .get_raw(&metadata_path)
+            .await
+            .map_err(|e| IcebergError::BadRequest {
+                message: format!("Cannot read metadata at {}: {e}", req.metadata_location),
+                error_type: "BadRequestException",
+            })?;
+
+    let mut metadata: TableMetadata =
+        serde_json::from_slice(&metadata_bytes).map_err(|e| IcebergError::BadRequest {
+            message: format!("Invalid metadata file: {e}"),
+            error_type: "BadRequestException",
+        })?;
+
+    let reader = CatalogReader::new(storage.clone());
+    let existing = reader
+        .get_table(&namespace_name, &req.name)
+        .await
+        .map_err(IcebergError::from)?;
+
+    if existing.is_some() && !req.overwrite {
+        return Err(IcebergError::Conflict {
+            message: format!("Table already exists: {}.{}", namespace_name, req.name),
+            error_type: "AlreadyExistsException",
+        });
+    }
+
+    let storage_relative_location =
+        resolve_metadata_path(&metadata.location, &ctx.tenant, &ctx.workspace).map_err(|e| {
+            IcebergError::BadRequest {
+                message: format!(
+                    "Invalid table location '{}' in metadata file: {e}",
+                    metadata.location
+                ),
+                error_type: "BadRequestException",
+            }
+        })?;
+
+    let compactor = state.create_compactor(&storage)?;
+    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
+
+    writer.initialize().await.map_err(IcebergError::from)?;
+
+    let mut options = WriteOptions::default()
+        .with_actor(format!("iceberg-api:{}", ctx.tenant))
+        .with_request_id(&ctx.request_id);
+
+    if let Some(ref key) = ctx.idempotency_key {
+        options = options.with_idempotency_key(key);
+    }
+
+    if existing.is_some() && req.overwrite {
+        writer
+            .drop_table(&namespace_name, &req.name, options.clone())
+            .await
+            .map_err(IcebergError::from)?;
+    }
+
+    let table = writer
+        .register_table(
+            arco_catalog::RegisterTableRequest {
+                namespace: namespace_name.clone(),
+                name: req.name.clone(),
+                description: None,
+                location: Some(metadata.location.clone()),
+                format: Some("iceberg".to_string()),
+                columns: vec![],
+            },
+            options,
+        )
+        .await
+        .map_err(IcebergError::from)?;
+
+    let table_uuid = uuid::Uuid::parse_str(&table.id).map_err(|_| IcebergError::Internal {
+        message: format!("Invalid table UUID: {}", table.id),
+    })?;
+
+    metadata.table_uuid = crate::types::TableUuid::new(table_uuid);
+    let new_metadata_storage_path =
+        format!("{storage_relative_location}/metadata/arco-registered-{table_uuid}.metadata.json");
+    let new_metadata_location = format!(
+        "{}/metadata/arco-registered-{table_uuid}.metadata.json",
+        metadata.location
+    );
+
+    let updated_metadata_bytes =
+        serde_json::to_vec(&metadata).map_err(|e| IcebergError::Internal {
+            message: format!("Failed to serialize updated metadata: {e}"),
+        })?;
+
+    if let Err(e) = storage
+        .put_raw(
+            &new_metadata_storage_path,
+            bytes::Bytes::from(updated_metadata_bytes),
+            arco_core::storage::WritePrecondition::None,
+        )
+        .await
+    {
+        if let Err(rollback_err) = writer
+            .drop_table(&namespace_name, &req.name, WriteOptions::default())
+            .await
+        {
+            tracing::warn!(error = %rollback_err, "Failed to rollback catalog entry after metadata write failure in register");
+        }
+        return Err(IcebergError::Internal {
+            message: format!("Failed to write metadata file: {e}"),
+        });
+    }
+
+    let pointer = IcebergTablePointer::new(table_uuid, new_metadata_location.clone());
+    let pointer_path = IcebergTablePointer::storage_path(&table_uuid);
+    let pointer_bytes = serde_json::to_vec(&pointer).map_err(|e| IcebergError::Internal {
+        message: format!("Failed to serialize pointer: {e}"),
+    })?;
+
+    let pointer_write_result = match storage
+        .put_raw(
+            &pointer_path,
+            bytes::Bytes::from(pointer_bytes),
+            arco_core::storage::WritePrecondition::DoesNotExist,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            if let Err(rollback_err) = storage.delete(&new_metadata_storage_path).await {
+                tracing::warn!(error = %rollback_err, path = %new_metadata_storage_path, "Failed to rollback metadata file after pointer write failure in register");
+            }
+            if let Err(rollback_err) = writer
+                .drop_table(&namespace_name, &req.name, WriteOptions::default())
+                .await
+            {
+                tracing::warn!(error = %rollback_err, "Failed to rollback catalog entry after pointer write failure in register");
+            }
+            return Err(IcebergError::Internal {
+                message: format!("Failed to write pointer: {e}"),
+            });
+        }
+    };
+
+    if matches!(
+        pointer_write_result,
+        arco_core::storage::WriteResult::PreconditionFailed { .. }
+    ) {
+        if let Err(rollback_err) = storage.delete(&new_metadata_storage_path).await {
+            tracing::warn!(error = %rollback_err, path = %new_metadata_storage_path, "Failed to rollback metadata file after pointer conflict in register");
+        }
+        if let Err(rollback_err) = writer
+            .drop_table(&namespace_name, &req.name, WriteOptions::default())
+            .await
+        {
+            tracing::warn!(error = %rollback_err, "Failed to rollback catalog entry after pointer conflict in register");
+        }
+        return Err(IcebergError::Conflict {
+            message: "Table pointer already exists".to_string(),
+            error_type: "AlreadyExistsException",
+        });
+    }
+
+    let response = LoadTableResponse {
+        metadata_location: new_metadata_location,
+        metadata,
+        config: HashMap::new(),
+        storage_credentials: None,
+    };
+
+    Ok(Json(response).into_response())
+}
+
+fn ensure_table_crud_enabled(config: &crate::state::IcebergConfig) -> IcebergResult<()> {
+    if !config.allow_table_crud {
+        return Err(IcebergError::unsupported_operation(
+            "Table mutations are not enabled",
+        ));
+    }
+    Ok(())
 }
 
 fn etag_matches(if_none_match: &str, version: &str) -> bool {
@@ -556,6 +1280,7 @@ fn normalize_etag(value: &str) -> &str {
 
 async fn maybe_vended_credentials(
     state: &IcebergState,
+    ctx: &IcebergRequestContext,
     delegation_header: Option<&HeaderValue>,
     default_delegation: Option<AccessDelegation>,
     table: TableInfo,
@@ -569,23 +1294,55 @@ async fn maybe_vended_credentials(
         return Ok(None);
     };
     if !delegation.is_supported() {
+        if let Some(emitter) = state.audit() {
+            emit_cred_vend_deny(
+                emitter,
+                ctx,
+                &table,
+                REASON_CRED_VEND_UNSUPPORTED_DELEGATION,
+            );
+        }
         return Err(IcebergError::BadRequest {
             message: format!("Unsupported access delegation: {delegation:?}"),
             error_type: "BadRequestException",
         });
     }
 
-    let provider = state
-        .credential_provider
-        .as_ref()
-        .ok_or_else(|| IcebergError::BadRequest {
+    let Some(provider) = state.credential_provider.as_ref() else {
+        if let Some(emitter) = state.audit() {
+            emit_cred_vend_deny(emitter, ctx, &table, REASON_CRED_VEND_DISABLED);
+        }
+        return Err(IcebergError::BadRequest {
             message: "Credential vending is not enabled".to_string(),
             error_type: "BadRequestException",
-        })?;
+        });
+    };
 
-    let credentials = provider
-        .vended_credentials(CredentialRequest { table, delegation })
-        .await?;
+    let credentials = match provider
+        .vended_credentials(CredentialRequest {
+            table: table.clone(),
+            delegation,
+        })
+        .await
+    {
+        Ok(creds) => creds,
+        Err(err) => {
+            if let Some(emitter) = state.audit() {
+                let reason = match &err {
+                    IcebergError::Forbidden { .. } | IcebergError::Unauthorized { .. } => {
+                        REASON_CRED_VEND_ACCESS_DENIED
+                    }
+                    _ => REASON_CRED_VEND_PROVIDER_ERROR,
+                };
+                emit_cred_vend_deny(emitter, ctx, &table, reason);
+            }
+            return Err(err);
+        }
+    };
+
+    if let Some(emitter) = state.audit() {
+        emit_cred_vend_allow(emitter, ctx, &table);
+    }
 
     Ok(Some(credentials))
 }
@@ -594,17 +1351,86 @@ async fn maybe_vended_credentials(
 mod tests {
     use super::*;
     use crate::state::IcebergConfig;
-    use arco_catalog::error::CatalogError;
     use arco_catalog::CatalogWriter;
     use arco_catalog::Tier1Compactor;
     use arco_catalog::write_options::WriteOptions;
     use arco_core::ScopedStorage;
-    use arco_core::storage::MemoryBackend;
+    use arco_core::storage::{
+        MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+    };
+    use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::Request;
     use bytes::Bytes;
+    use std::ops::Range;
     use std::sync::Arc;
+    use std::time::Duration;
     use tower::ServiceExt;
+
+    #[derive(Clone)]
+    struct PointerConflictBackend {
+        inner: Arc<MemoryBackend>,
+    }
+
+    impl PointerConflictBackend {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(MemoryBackend::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for PointerConflictBackend {
+        async fn get(&self, path: &str) -> arco_core::error::Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(
+            &self,
+            path: &str,
+            range: Range<u64>,
+        ) -> arco_core::error::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::error::Result<WriteResult> {
+            if path.contains("/_catalog/iceberg_pointers/")
+                && matches!(precondition, WritePrecondition::DoesNotExist)
+            {
+                return Ok(WriteResult::PreconditionFailed {
+                    current_version: "forced-precondition-failure".to_string(),
+                });
+            }
+
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::error::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::error::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::error::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(
+            &self,
+            path: &str,
+            expiry: Duration,
+        ) -> arco_core::error::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
 
     fn build_state() -> IcebergState {
         let storage = Arc::new(MemoryBackend::new());
@@ -620,26 +1446,37 @@ mod tests {
         IcebergState::with_config(storage, config)
     }
 
-    async fn seed_table_with_format(
-        state: &IcebergState,
-        namespace: &str,
-        table: &str,
-        format: Option<&str>,
-        with_pointer: bool,
-    ) -> String {
+    fn build_state_with_table_crud_enabled() -> IcebergState {
+        let storage = Arc::new(MemoryBackend::new());
+        let config = IcebergConfig {
+            allow_table_crud: true,
+            ..Default::default()
+        };
+        IcebergState::with_config(storage, config)
+            .with_compactor_factory(Arc::new(crate::state::Tier1CompactorFactory))
+    }
+
+    fn build_state_with_table_crud_and_write_enabled() -> IcebergState {
+        let storage = Arc::new(MemoryBackend::new());
+        let config = IcebergConfig {
+            allow_table_crud: true,
+            allow_write: true,
+            ..Default::default()
+        };
+        IcebergState::with_config(storage, config)
+            .with_compactor_factory(Arc::new(crate::state::Tier1CompactorFactory))
+    }
+
+    async fn seed_table(state: &IcebergState, namespace: &str, table: &str) -> String {
         let storage = ScopedStorage::new(Arc::clone(&state.storage), "acme", "analytics")
             .expect("scoped storage");
         let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
         let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
         writer.initialize().await.expect("init");
-        match writer
+        writer
             .create_namespace(namespace, None, WriteOptions::default())
             .await
-        {
-            Ok(_) => {}
-            Err(CatalogError::AlreadyExists { .. }) => {}
-            Err(err) => panic!("create namespace: {err}"),
-        }
+            .expect("create namespace");
 
         let table = writer
             .register_table(
@@ -648,7 +1485,7 @@ mod tests {
                     name: table.to_string(),
                     description: None,
                     location: Some("tenant=acme/workspace=analytics/warehouse/table".to_string()),
-                    format: format.map(str::to_string),
+                    format: Some("iceberg".to_string()),
                     columns: vec![],
                 },
                 WriteOptions::default(),
@@ -656,63 +1493,57 @@ mod tests {
             .await
             .expect("register table");
 
-        if with_pointer {
-            let pointer = IcebergTablePointer::new(
-                uuid::Uuid::parse_str(&table.id).expect("uuid"),
-                "tenant=acme/workspace=analytics/warehouse/table/metadata/00000.metadata.json"
-                    .to_string(),
-            );
-            let pointer_path =
-                IcebergTablePointer::storage_path(&uuid::Uuid::parse_str(&table.id).expect("uuid"));
-            let pointer_bytes = serde_json::to_vec(&pointer).expect("serialize");
-            storage
-                .put_raw(
-                    &pointer_path,
-                    Bytes::from(pointer_bytes),
-                    arco_core::storage::WritePrecondition::None,
-                )
-                .await
-                .expect("put pointer");
+        let pointer = IcebergTablePointer::new(
+            uuid::Uuid::parse_str(&table.id).expect("uuid"),
+            "tenant=acme/workspace=analytics/warehouse/table/metadata/00000.metadata.json"
+                .to_string(),
+        );
+        let pointer_path =
+            IcebergTablePointer::storage_path(&uuid::Uuid::parse_str(&table.id).expect("uuid"));
+        let pointer_bytes = serde_json::to_vec(&pointer).expect("serialize");
+        storage
+            .put_raw(
+                &pointer_path,
+                Bytes::from(pointer_bytes),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("put pointer");
 
-            let metadata = TableMetadata {
-                format_version: 2,
-                table_uuid: crate::types::TableUuid::new(
-                    uuid::Uuid::parse_str(&table.id).expect("uuid"),
-                ),
-                location: "tenant=acme/workspace=analytics/warehouse/table".to_string(),
-                last_sequence_number: 0,
-                last_updated_ms: 1234567890000,
-                last_column_id: 0,
-                current_schema_id: 0,
-                schemas: vec![],
-                current_snapshot_id: None,
-                snapshots: vec![],
-                snapshot_log: vec![],
-                metadata_log: vec![],
-                properties: HashMap::new(),
-                default_spec_id: 0,
-                partition_specs: vec![],
-                last_partition_id: 0,
-                refs: HashMap::new(),
-                default_sort_order_id: 0,
-                sort_orders: vec![],
-            };
-            let metadata_bytes = serde_json::to_vec(&metadata).expect("serialize");
-            storage
-                .put_raw(
-                    "warehouse/table/metadata/00000.metadata.json",
-                    Bytes::from(metadata_bytes),
-                    arco_core::storage::WritePrecondition::None,
-                )
-                .await
-                .expect("put metadata");
-        }
+        let metadata = TableMetadata {
+            format_version: 2,
+            table_uuid: crate::types::TableUuid::new(
+                uuid::Uuid::parse_str(&table.id).expect("uuid"),
+            ),
+            location: "tenant=acme/workspace=analytics/warehouse/table".to_string(),
+            last_sequence_number: 0,
+            last_updated_ms: 1234567890000,
+            last_column_id: 0,
+            current_schema_id: 0,
+            schemas: vec![],
+            current_snapshot_id: None,
+            snapshots: vec![],
+            snapshot_log: vec![],
+            metadata_log: vec![],
+            properties: HashMap::new(),
+            default_spec_id: 0,
+            partition_specs: vec![],
+            last_partition_id: 0,
+            refs: HashMap::new(),
+            default_sort_order_id: 0,
+            sort_orders: vec![],
+        };
+        let metadata_bytes = serde_json::to_vec(&metadata).expect("serialize");
+        storage
+            .put_raw(
+                "warehouse/table/metadata/00000.metadata.json",
+                Bytes::from(metadata_bytes),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("put metadata");
 
         table.id
-    }
-
-    async fn seed_table(state: &IcebergState, namespace: &str, table: &str) -> String {
-        seed_table_with_format(state, namespace, table, Some("iceberg"), true).await
     }
 
     fn app(state: IcebergState) -> Router {
@@ -730,7 +1561,7 @@ mod tests {
         seed_table(&state, "sales", "orders").await;
 
         let app = app(state);
-        let response = app.clone()
+        let response = app
             .oneshot(
                 Request::builder()
                     .uri("/v1/arco/namespaces/sales/tables")
@@ -743,109 +1574,6 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_list_tables_filters_non_iceberg() {
-        let state = build_state();
-        seed_table_with_format(&state, "sales", "orders", Some("iceberg"), false).await;
-        seed_table_with_format(&state, "sales", "legacy", Some("parquet"), false).await;
-
-        let app = app(state);
-        let response = app.clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/arco/namespaces/sales/tables")
-                    .header("X-Tenant-Id", "acme")
-                    .header("X-Workspace-Id", "analytics")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body read failed");
-        let list: ListTablesResponse =
-            serde_json::from_slice(&body).expect("json parse failed");
-
-        assert_eq!(list.identifiers.len(), 1);
-        assert_eq!(list.identifiers[0].name, "orders");
-        assert_eq!(list.identifiers[0].namespace, vec!["sales".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn test_list_tables_pagination() {
-        let state = build_state();
-        seed_table_with_format(&state, "sales", "beta", Some("iceberg"), false).await;
-        seed_table_with_format(&state, "sales", "alpha", Some("iceberg"), false).await;
-        seed_table_with_format(&state, "sales", "gamma", Some("iceberg"), false).await;
-
-        let app = app(state);
-        let response = app.clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/arco/namespaces/sales/tables?pageSize=1")
-                    .header("X-Tenant-Id", "acme")
-                    .header("X-Workspace-Id", "analytics")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body read failed");
-        let list: ListTablesResponse =
-            serde_json::from_slice(&body).expect("json parse failed");
-        assert_eq!(list.identifiers.len(), 1);
-        assert_eq!(list.identifiers[0].name, "alpha");
-        assert_eq!(list.identifiers[0].namespace, vec!["sales".to_string()]);
-        assert_eq!(list.next_page_token.as_deref(), Some("1"));
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/arco/namespaces/sales/tables?pageSize=1&pageToken=1")
-                    .header("X-Tenant-Id", "acme")
-                    .header("X-Workspace-Id", "analytics")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body read failed");
-        let list: ListTablesResponse =
-            serde_json::from_slice(&body).expect("json parse failed");
-        assert_eq!(list.identifiers.len(), 1);
-        assert_eq!(list.identifiers[0].name, "beta");
-        assert_eq!(list.identifiers[0].namespace, vec!["sales".to_string()]);
-        assert_eq!(list.next_page_token.as_deref(), Some("2"));
-    }
-
-    #[tokio::test]
-    async fn test_list_tables_namespace_not_found_returns_404() {
-        let state = build_state();
-        seed_table_with_format(&state, "sales", "orders", Some("iceberg"), false).await;
-
-        let app = app(state);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/arco/namespaces/missing/tables")
-                    .header("X-Tenant-Id", "acme")
-                    .header("X-Workspace-Id", "analytics")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -854,7 +1582,7 @@ mod tests {
         seed_table(&state, "sales", "orders").await;
 
         let app = app(state);
-        let response = app.clone()
+        let response = app
             .oneshot(
                 Request::builder()
                     .uri("/v1/arco/namespaces/sales/tables/orders")
@@ -867,118 +1595,6 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_load_table_missing_returns_404() {
-        let state = build_state();
-        seed_table(&state, "sales", "orders").await;
-
-        let app = app(state);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/arco/namespaces/sales/tables/missing")
-                    .header("X-Tenant-Id", "acme")
-                    .header("X-Workspace-Id", "analytics")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_load_table_includes_metadata_location() {
-        let state = build_state();
-        seed_table(&state, "sales", "orders").await;
-
-        let app = app(state);
-        let response = app.clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/arco/namespaces/sales/tables/orders")
-                    .header("X-Tenant-Id", "acme")
-                    .header("X-Workspace-Id", "analytics")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body read failed");
-        let response: LoadTableResponse =
-            serde_json::from_slice(&body).expect("json parse failed");
-
-        assert_eq!(
-            response.metadata_location,
-            "tenant=acme/workspace=analytics/warehouse/table/metadata/00000.metadata.json"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_load_table_sets_etag_header() {
-        let state = build_state();
-        seed_table(&state, "sales", "orders").await;
-
-        let app = app(state);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/arco/namespaces/sales/tables/orders")
-                    .header("X-Tenant-Id", "acme")
-                    .header("X-Workspace-Id", "analytics")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        assert!(response.headers().contains_key("ETag"));
-    }
-
-    #[tokio::test]
-    async fn test_load_table_if_none_match_etag_returns_not_modified() {
-        let state = build_state();
-        seed_table(&state, "sales", "orders").await;
-
-        let app = app(state);
-        let response = app.clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/arco/namespaces/sales/tables/orders")
-                    .header("X-Tenant-Id", "acme")
-                    .header("X-Workspace-Id", "analytics")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        let etag = response
-            .headers()
-            .get("ETag")
-            .and_then(|value| value.to_str().ok())
-            .expect("etag header");
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/arco/namespaces/sales/tables/orders")
-                    .header("X-Tenant-Id", "acme")
-                    .header("X-Workspace-Id", "analytics")
-                    .header("If-None-Match", etag)
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
     }
 
     #[tokio::test]
@@ -1026,75 +1642,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_head_table_missing_returns_404() {
-        let state = build_state();
-        seed_table(&state, "sales", "orders").await;
-
-        let app = app(state);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("HEAD")
-                    .uri("/v1/arco/namespaces/sales/tables/missing")
-                    .header("X-Tenant-Id", "acme")
-                    .header("X-Workspace-Id", "analytics")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_head_table_includes_etag_header() {
-        let state = build_state();
-        seed_table(&state, "sales", "orders").await;
-
-        let app = app(state);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("HEAD")
-                    .uri("/v1/arco/namespaces/sales/tables/orders")
-                    .header("X-Tenant-Id", "acme")
-                    .header("X-Workspace-Id", "analytics")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        assert!(response.headers().contains_key("ETag"));
-    }
-
-    #[tokio::test]
-    async fn test_head_table_returns_empty_body() {
-        let state = build_state();
-        seed_table(&state, "sales", "orders").await;
-
-        let app = app(state);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("HEAD")
-                    .uri("/v1/arco/namespaces/sales/tables/orders")
-                    .header("X-Tenant-Id", "acme")
-                    .header("X-Workspace-Id", "analytics")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body read failed");
-        assert!(body.is_empty());
-    }
-
-    #[tokio::test]
     async fn test_commit_table_guardrails_reject_set_location() {
         let state = build_state_with_write_enabled();
         seed_table(&state, "sales", "orders").await;
@@ -1117,6 +1664,984 @@ mod tests {
                     .body(Body::from(
                         serde_json::to_string(&request_body).expect("serialize body"),
                     ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    async fn seed_namespace_only(state: &IcebergState, namespace: &str) {
+        let storage = ScopedStorage::new(Arc::clone(&state.storage), "acme", "analytics")
+            .expect("scoped storage");
+        let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+        let writer = CatalogWriter::new(storage).with_sync_compactor(compactor);
+        writer.initialize().await.expect("init");
+        writer
+            .create_namespace(namespace, None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+    }
+
+    #[tokio::test]
+    async fn test_create_table() {
+        let state = build_state_with_table_crud_enabled();
+        seed_namespace_only(&state, "sales").await;
+
+        let app = app(state);
+        let req_body = serde_json::json!({
+            "name": "orders",
+            "schema": {
+                "schema-id": 0,
+                "type": "struct",
+                "fields": [
+                    {"id": 1, "name": "id", "required": true, "type": "long"},
+                    {"id": 2, "name": "data", "required": false, "type": "string"}
+                ]
+            },
+            "properties": {"owner": "data-team"}
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/sales/tables")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&req_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().get("ETag").is_some(),
+            "create-table should return ETag header"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .expect("body");
+        let resp: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(resp["metadata"]["table-uuid"].is_string());
+        assert_eq!(resp["metadata"]["format-version"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_create_table_then_load_succeeds() {
+        let state = build_state_with_table_crud_enabled();
+        seed_namespace_only(&state, "sales").await;
+
+        let req_body = serde_json::json!({
+            "name": "orders",
+            "schema": {
+                "schema-id": 0,
+                "type": "struct",
+                "fields": [
+                    {"id": 1, "name": "id", "required": true, "type": "long"}
+                ]
+            }
+        });
+
+        let create_resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/sales/tables")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&req_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(create_resp.status(), StatusCode::OK);
+
+        let load_resp = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/arco/namespaces/sales/tables/orders")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(load_resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(load_resp.into_body(), 65536)
+            .await
+            .expect("body");
+        let resp: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(resp["metadata"]["table-uuid"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_create_table_then_commit_with_uuid_assert_succeeds() {
+        let state = build_state_with_table_crud_and_write_enabled();
+        seed_namespace_only(&state, "sales").await;
+
+        let create_body = serde_json::json!({
+            "name": "orders",
+            "schema": {
+                "schema-id": 0,
+                "type": "struct",
+                "fields": [
+                    {"id": 1, "name": "id", "required": true, "type": "long"}
+                ]
+            }
+        });
+
+        let create_resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/sales/tables")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&create_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let create_body_bytes = axum::body::to_bytes(create_resp.into_body(), 65536)
+            .await
+            .expect("body");
+        let create_json: serde_json::Value =
+            serde_json::from_slice(&create_body_bytes).expect("json");
+        let table_uuid = create_json["metadata"]["table-uuid"]
+            .as_str()
+            .expect("table-uuid");
+
+        let commit_body = serde_json::json!({
+            "requirements": [
+                {"type": "assert-table-uuid", "uuid": table_uuid}
+            ],
+            "updates": []
+        });
+
+        let commit_resp = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/sales/tables/orders")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Idempotency-Key", "01924a7c-8d9f-7000-8000-000000000001")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&commit_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        let commit_status = commit_resp.status();
+        let commit_body_bytes = axum::body::to_bytes(commit_resp.into_body(), 65536)
+            .await
+            .expect("body");
+        let commit_body_str = String::from_utf8_lossy(&commit_body_bytes);
+
+        assert_eq!(
+            commit_status,
+            StatusCode::OK,
+            "commit with assert-table-uuid should succeed: {commit_body_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_disabled() {
+        let state = build_state();
+
+        let app = app(state);
+        let req_body = serde_json::json!({
+            "name": "orders",
+            "schema": {"schema-id": 0, "fields": []}
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/sales/tables")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&req_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+    }
+
+    #[tokio::test]
+    async fn test_drop_table() {
+        let state = build_state_with_table_crud_enabled();
+        seed_table(&state, "sales", "orders").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/arco/namespaces/sales/tables/orders")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_drop_table_with_purge_returns_406() {
+        let state = build_state_with_table_crud_enabled();
+        seed_table(&state, "sales", "orders").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/arco/namespaces/sales/tables/orders?purgeRequested=true")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+    }
+
+    #[tokio::test]
+    async fn test_drop_table_not_found() {
+        let state = build_state_with_table_crud_enabled();
+        seed_namespace_only(&state, "sales").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/arco/namespaces/sales/tables/nonexistent")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_drop_table_disabled() {
+        let state = build_state();
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/arco/namespaces/sales/tables/orders")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+    }
+
+    #[tokio::test]
+    async fn test_register_table() {
+        let state = build_state_with_table_crud_enabled();
+
+        let storage = ScopedStorage::new(Arc::clone(&state.storage), "acme", "analytics")
+            .expect("scoped storage");
+        let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+        let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
+        writer.initialize().await.expect("init");
+        writer
+            .create_namespace("imports", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+
+        let metadata = TableMetadata {
+            format_version: 2,
+            table_uuid: crate::types::TableUuid::new(uuid::Uuid::new_v4()),
+            location: "warehouse/imported".to_string(),
+            last_sequence_number: 0,
+            last_updated_ms: 1234567890000,
+            last_column_id: 1,
+            current_schema_id: 0,
+            schemas: vec![],
+            current_snapshot_id: None,
+            snapshots: vec![],
+            snapshot_log: vec![],
+            metadata_log: vec![],
+            properties: HashMap::new(),
+            default_spec_id: 0,
+            partition_specs: vec![],
+            last_partition_id: 0,
+            refs: HashMap::new(),
+            default_sort_order_id: 0,
+            sort_orders: vec![],
+        };
+        let metadata_bytes = serde_json::to_vec(&metadata).expect("serialize");
+        storage
+            .put_raw(
+                "warehouse/imported/metadata/v1.metadata.json",
+                Bytes::from(metadata_bytes),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("put metadata");
+
+        let app = app(state);
+        let req_body = serde_json::json!({
+            "name": "imported_table",
+            "metadata-location": "warehouse/imported/metadata/v1.metadata.json"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/imports/register")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&req_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .expect("body");
+        let resp: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(resp["metadata"]["format-version"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_register_table_then_commit_with_uuid_assert_succeeds() {
+        let state = build_state_with_table_crud_and_write_enabled();
+
+        let storage = ScopedStorage::new(Arc::clone(&state.storage), "acme", "analytics")
+            .expect("scoped storage");
+        let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+        let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
+        writer.initialize().await.expect("init");
+        writer
+            .create_namespace("imports", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+
+        let original_uuid = uuid::Uuid::new_v4();
+        let metadata = TableMetadata {
+            format_version: 2,
+            table_uuid: crate::types::TableUuid::new(original_uuid),
+            location: "warehouse/imported".to_string(),
+            last_sequence_number: 0,
+            last_updated_ms: 1234567890000,
+            last_column_id: 1,
+            current_schema_id: 0,
+            schemas: vec![],
+            current_snapshot_id: None,
+            snapshots: vec![],
+            snapshot_log: vec![],
+            metadata_log: vec![],
+            properties: HashMap::new(),
+            default_spec_id: 0,
+            partition_specs: vec![],
+            last_partition_id: 0,
+            refs: HashMap::new(),
+            default_sort_order_id: 0,
+            sort_orders: vec![],
+        };
+        let metadata_bytes = serde_json::to_vec(&metadata).expect("serialize");
+        storage
+            .put_raw(
+                "warehouse/imported/metadata/v1.metadata.json",
+                Bytes::from(metadata_bytes),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("put metadata");
+
+        let register_body = serde_json::json!({
+            "name": "imported_table",
+            "metadata-location": "warehouse/imported/metadata/v1.metadata.json"
+        });
+
+        let register_resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/imports/register")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&register_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(register_resp.status(), StatusCode::OK);
+
+        let register_body_bytes = axum::body::to_bytes(register_resp.into_body(), 65536)
+            .await
+            .expect("body");
+        let register_json: serde_json::Value =
+            serde_json::from_slice(&register_body_bytes).expect("json");
+        let table_uuid = register_json["metadata"]["table-uuid"]
+            .as_str()
+            .expect("table-uuid");
+
+        assert_ne!(
+            table_uuid,
+            original_uuid.to_string(),
+            "table-uuid should be updated to catalog UUID, not the original"
+        );
+
+        let commit_body = serde_json::json!({
+            "requirements": [
+                {"type": "assert-table-uuid", "uuid": table_uuid}
+            ],
+            "updates": []
+        });
+
+        let commit_resp = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/imports/tables/imported_table")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Idempotency-Key", "01924a7c-8d9f-7000-8000-000000000002")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&commit_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        let commit_status = commit_resp.status();
+        let commit_body_bytes = axum::body::to_bytes(commit_resp.into_body(), 65536)
+            .await
+            .expect("body");
+        let commit_body_str = String::from_utf8_lossy(&commit_body_bytes);
+
+        assert_eq!(
+            commit_status,
+            StatusCode::OK,
+            "commit with assert-table-uuid on registered table should succeed: {commit_body_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_register_table_disabled() {
+        let state = build_state();
+
+        let app = app(state);
+        let req_body = serde_json::json!({
+            "name": "imported",
+            "metadata-location": "warehouse/metadata.json"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/imports/register")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&req_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+    }
+
+    #[tokio::test]
+    async fn test_register_table_preserves_original_metadata_file() {
+        let state = build_state_with_table_crud_and_write_enabled();
+
+        let storage = ScopedStorage::new(Arc::clone(&state.storage), "acme", "analytics")
+            .expect("scoped storage");
+        let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+        let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
+        writer.initialize().await.expect("init");
+        writer
+            .create_namespace("immutable_test", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+
+        let original_uuid = uuid::Uuid::new_v4();
+        let metadata = TableMetadata {
+            format_version: 2,
+            table_uuid: crate::types::TableUuid::new(original_uuid),
+            location: "warehouse/immutable_test".to_string(),
+            last_sequence_number: 0,
+            last_updated_ms: 1234567890000,
+            last_column_id: 1,
+            current_schema_id: 0,
+            schemas: vec![],
+            current_snapshot_id: None,
+            snapshots: vec![],
+            snapshot_log: vec![],
+            metadata_log: vec![],
+            properties: HashMap::new(),
+            default_spec_id: 0,
+            partition_specs: vec![],
+            last_partition_id: 0,
+            refs: HashMap::new(),
+            default_sort_order_id: 0,
+            sort_orders: vec![],
+        };
+        let original_metadata_bytes = serde_json::to_vec(&metadata).expect("serialize");
+        let original_path = "warehouse/immutable_test/metadata/v1.metadata.json";
+        storage
+            .put_raw(
+                original_path,
+                Bytes::from(original_metadata_bytes.clone()),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("put metadata");
+
+        let register_body = serde_json::json!({
+            "name": "immutable_table",
+            "metadata-location": original_path
+        });
+
+        let register_resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/immutable_test/register")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&register_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(register_resp.status(), StatusCode::OK);
+
+        let register_body_bytes = axum::body::to_bytes(register_resp.into_body(), 65536)
+            .await
+            .expect("body");
+        let register_json: serde_json::Value =
+            serde_json::from_slice(&register_body_bytes).expect("json");
+
+        let returned_metadata_location = register_json["metadata-location"]
+            .as_str()
+            .expect("metadata-location");
+        assert!(
+            returned_metadata_location.contains("arco-registered-"),
+            "response should return new metadata location with arco-registered prefix: {returned_metadata_location}"
+        );
+
+        let catalog_uuid = register_json["metadata"]["table-uuid"]
+            .as_str()
+            .expect("table-uuid");
+        assert!(
+            returned_metadata_location.contains(catalog_uuid),
+            "new metadata location should contain catalog UUID"
+        );
+
+        let original_file_bytes = storage.get_raw(original_path).await.expect("get original");
+        let original_file_metadata: TableMetadata =
+            serde_json::from_slice(&original_file_bytes).expect("parse original");
+        assert_eq!(
+            original_file_metadata.table_uuid.as_uuid().to_string(),
+            original_uuid.to_string(),
+            "original metadata file should be unchanged"
+        );
+
+        let new_metadata_path = format!(
+            "warehouse/immutable_test/metadata/arco-registered-{catalog_uuid}.metadata.json"
+        );
+        let new_file_bytes = storage.get_raw(&new_metadata_path).await.expect("get new");
+        let new_file_metadata: TableMetadata =
+            serde_json::from_slice(&new_file_bytes).expect("parse new");
+        assert_eq!(
+            new_file_metadata.table_uuid.as_uuid().to_string(),
+            catalog_uuid,
+            "new metadata file should have catalog UUID"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_invalid_location_returns_400() {
+        let state = build_state_with_table_crud_and_write_enabled();
+        seed_namespace_only(&state, "test_ns").await;
+
+        let create_body = serde_json::json!({
+            "name": "invalid_loc_table",
+            "location": "gs://bucket",
+            "schema": {
+                "schema-id": 0,
+                "type": "struct",
+                "fields": [
+                    {"id": 1, "name": "id", "required": true, "type": "long"}
+                ]
+            }
+        });
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/test_ns/tables")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&create_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .expect("body");
+        let error: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let error_message = error["error"]["message"]
+            .as_str()
+            .or_else(|| error["message"].as_str())
+            .unwrap_or("");
+        assert!(
+            error_message.contains("Invalid table location"),
+            "Error should mention invalid location: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_cred_vending_header_but_disabled_returns_400_before_writes() {
+        let state = build_state_with_table_crud_and_write_enabled();
+        seed_namespace_only(&state, "cred_test").await;
+
+        let create_body = serde_json::json!({
+            "name": "cred_table",
+            "schema": {
+                "schema-id": 0,
+                "type": "struct",
+                "fields": [
+                    {"id": 1, "name": "id", "required": true, "type": "long"}
+                ]
+            }
+        });
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/cred_test/tables")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("X-Iceberg-Access-Delegation", "vended-credentials")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&create_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .expect("body");
+        let error: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let error_message = error["error"]["message"]
+            .as_str()
+            .or_else(|| error["message"].as_str())
+            .unwrap_or("");
+        assert!(
+            error_message.contains("Credential vending is not enabled"),
+            "Error should mention credential vending: {error}"
+        );
+
+        let storage = ScopedStorage::new(Arc::clone(&state.storage), "acme", "analytics")
+            .expect("scoped storage");
+        let reader = CatalogReader::new(storage);
+        let table = reader
+            .get_table("cred_test", "cred_table")
+            .await
+            .expect("get table");
+        assert!(
+            table.is_none(),
+            "Table should not exist when credential vending check fails early"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_pointer_conflict_rolls_back() {
+        let storage: Arc<dyn StorageBackend> = Arc::new(PointerConflictBackend::new());
+        let config = IcebergConfig {
+            allow_table_crud: true,
+            allow_write: true,
+            ..Default::default()
+        };
+        let state = IcebergState::with_config(storage, config)
+            .with_compactor_factory(Arc::new(crate::state::Tier1CompactorFactory));
+
+        seed_namespace_only(&state, "conflict_ns").await;
+
+        let create_body = serde_json::json!({
+            "name": "conflict_table",
+            "schema": {
+                "schema-id": 0,
+                "type": "struct",
+                "fields": [
+                    {"id": 1, "name": "id", "required": true, "type": "long"}
+                ]
+            }
+        });
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/conflict_ns/tables")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&create_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let scoped = ScopedStorage::new(Arc::clone(&state.storage), "acme", "analytics")
+            .expect("scoped storage");
+        let reader = CatalogReader::new(scoped.clone());
+        let table = reader
+            .get_table("conflict_ns", "conflict_table")
+            .await
+            .expect("get table");
+        assert!(table.is_none(), "catalog entry should be rolled back");
+
+        let objects = scoped
+            .list("warehouse/conflict_ns/conflict_table/metadata/")
+            .await
+            .expect("list");
+        assert!(objects.is_empty(), "metadata file should be rolled back");
+    }
+
+    #[tokio::test]
+    async fn test_register_table_pointer_conflict_rolls_back() {
+        let storage: Arc<dyn StorageBackend> = Arc::new(PointerConflictBackend::new());
+        let config = IcebergConfig {
+            allow_table_crud: true,
+            allow_write: true,
+            ..Default::default()
+        };
+        let state = IcebergState::with_config(storage, config)
+            .with_compactor_factory(Arc::new(crate::state::Tier1CompactorFactory));
+
+        let scoped = ScopedStorage::new(Arc::clone(&state.storage), "acme", "analytics")
+            .expect("scoped storage");
+        let compactor = Arc::new(Tier1Compactor::new(scoped.clone()));
+        let writer = CatalogWriter::new(scoped.clone()).with_sync_compactor(compactor);
+        writer.initialize().await.expect("init");
+        writer
+            .create_namespace("imports", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+
+        let metadata = TableMetadata {
+            format_version: 2,
+            table_uuid: crate::types::TableUuid::new(uuid::Uuid::new_v4()),
+            location: "warehouse/imported".to_string(),
+            last_sequence_number: 0,
+            last_updated_ms: 1234567890000,
+            last_column_id: 1,
+            current_schema_id: 0,
+            schemas: vec![],
+            current_snapshot_id: None,
+            snapshots: vec![],
+            snapshot_log: vec![],
+            metadata_log: vec![],
+            properties: HashMap::new(),
+            default_spec_id: 0,
+            partition_specs: vec![],
+            last_partition_id: 0,
+            refs: HashMap::new(),
+            default_sort_order_id: 0,
+            sort_orders: vec![],
+        };
+        let metadata_bytes = serde_json::to_vec(&metadata).expect("serialize");
+        scoped
+            .put_raw(
+                "warehouse/imported/metadata/v1.metadata.json",
+                Bytes::from(metadata_bytes),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("put metadata");
+
+        let register_body = serde_json::json!({
+            "name": "imported_table",
+            "metadata-location": "warehouse/imported/metadata/v1.metadata.json"
+        });
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/imports/register")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&register_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let reader = CatalogReader::new(scoped.clone());
+        let table = reader
+            .get_table("imports", "imported_table")
+            .await
+            .expect("get table");
+        assert!(table.is_none(), "catalog entry should be rolled back");
+
+        let objects = scoped
+            .list("warehouse/imported/metadata/")
+            .await
+            .expect("list");
+        assert_eq!(objects.len(), 1);
+        assert_eq!(
+            objects[0].as_str(),
+            "warehouse/imported/metadata/v1.metadata.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_report_metrics_returns_204_for_existing_table() {
+        let state = build_state();
+        seed_table(&state, "sales", "orders").await;
+
+        let app = app(state);
+        let req_body = serde_json::json!({
+            "report-type": "scan-report",
+            "table-name": "sales.orders",
+            "snapshot-id": 123456789,
+            "filter": {"type": "true"},
+            "schema-id": 0,
+            "projected-field-ids": [1],
+            "projected-field-names": ["id"],
+            "metrics": {}
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/sales/tables/orders/metrics")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&req_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_report_metrics_returns_404_for_missing_table() {
+        let state = build_state();
+        seed_namespace_only(&state, "sales").await;
+
+        let app = app(state);
+        let req_body = serde_json::json!({
+            "report-type": "scan-report",
+            "table-name": "sales.missing",
+            "snapshot-id": 123456789,
+            "metrics": {}
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/sales/tables/missing/metrics")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&req_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_report_metrics_rejects_invalid_report_type() {
+        let state = build_state();
+        seed_table(&state, "sales", "orders").await;
+
+        let app = app(state);
+        let req_body = serde_json::json!({
+            "report-type": "invalid-type",
+            "table-name": "sales.orders",
+            "snapshot-id": 123456789,
+            "metrics": {}
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/sales/tables/orders/metrics")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&req_body).unwrap()))
                     .expect("request"),
             )
             .await

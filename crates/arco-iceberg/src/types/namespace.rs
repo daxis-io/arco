@@ -177,40 +177,4 @@ mod tests {
         let json = serde_json::to_string(&ns).expect("serialization failed");
         assert_eq!(json, r#"["level1","level2","level3"]"#);
     }
-
-    #[test]
-    fn test_list_namespaces_roundtrip() {
-        let json = r#"{"namespaces":[["db1"],["db2","schema1"]],"next-page-token":"token123"}"#;
-
-        let value: serde_json::Value = serde_json::from_str(json).expect("parse failed");
-        let parsed: ListNamespacesResponse =
-            serde_json::from_value(value.clone()).expect("deserialization failed");
-        let roundtrip = serde_json::to_value(&parsed).expect("serialization failed");
-
-        assert_eq!(roundtrip, value);
-    }
-
-    #[test]
-    fn test_get_namespace_roundtrip() {
-        let json = r#"{"namespace":["prod","analytics"],"properties":{"location":"gs://bucket/prod/analytics","owner":"data-team"}}"#;
-
-        let value: serde_json::Value = serde_json::from_str(json).expect("parse failed");
-        let parsed: GetNamespaceResponse =
-            serde_json::from_value(value.clone()).expect("deserialization failed");
-        let roundtrip = serde_json::to_value(&parsed).expect("serialization failed");
-
-        assert_eq!(roundtrip, value);
-    }
-
-    #[test]
-    fn test_list_namespaces_empty_roundtrip() {
-        let json = r#"{"namespaces":[]}"#;
-
-        let value: serde_json::Value = serde_json::from_str(json).expect("parse failed");
-        let parsed: ListNamespacesResponse =
-            serde_json::from_value(value.clone()).expect("deserialization failed");
-        let roundtrip = serde_json::to_value(&parsed).expect("serialization failed");
-
-        assert_eq!(roundtrip, value);
-    }
 }

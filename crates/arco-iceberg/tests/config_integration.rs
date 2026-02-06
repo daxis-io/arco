@@ -1,9 +1,9 @@
 //! Integration tests for the /v1/config endpoint.
 
+use arco_core::storage::MemoryBackend;
 use arco_iceberg::router::iceberg_router;
 use arco_iceberg::state::IcebergState;
 use arco_iceberg::types::ConfigResponse;
-use arco_core::storage::MemoryBackend;
 use axum::body::Body;
 use axum::http::Request;
 use std::sync::Arc;

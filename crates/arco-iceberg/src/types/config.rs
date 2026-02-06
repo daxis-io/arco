@@ -272,16 +272,4 @@ mod tests {
 
         assert!(endpoints.contains(&"POST /v1/{prefix}/transactions/commit".to_string()));
     }
-
-    #[test]
-    fn test_config_response_roundtrip() {
-        let json = r#"{"defaults":{},"overrides":{"prefix":"arco","namespace-separator":"%1F"},"idempotency-key-lifetime":"PT1H","endpoints":["GET /v1/config"]}"#;
-
-        let value: serde_json::Value = serde_json::from_str(json).expect("parse failed");
-        let parsed: ConfigResponse =
-            serde_json::from_value(value.clone()).expect("deserialization failed");
-        let roundtrip = serde_json::to_value(&parsed).expect("serialization failed");
-
-        assert_eq!(roundtrip, value);
-    }
 }

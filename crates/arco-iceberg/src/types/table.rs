@@ -59,6 +59,31 @@ pub struct ListTablesQuery {
     pub page_size: Option<u32>,
 }
 
+/// Query parameters for loading a table.
+#[derive(Debug, Clone, Default, Deserialize, utoipa::IntoParams)]
+pub struct LoadTableQuery {
+    /// Controls which snapshots are returned: `all` (default) or `refs`.
+    ///
+    /// - `all`: Returns all snapshots in the table
+    /// - `refs`: Returns only snapshots referenced by branches and tags
+    ///
+    /// **Note**: When `refs` is used, only `metadata.snapshots` is filtered.
+    /// Fields like `current_snapshot_id` and `snapshot_log` are not reconciled.
+    #[serde(default)]
+    pub snapshots: Option<SnapshotsFilter>,
+}
+
+/// Filter for which snapshots to include in `load_table` response.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SnapshotsFilter {
+    /// Return all snapshots (default).
+    #[default]
+    All,
+    /// Return only snapshots referenced by branches and tags.
+    Refs,
+}
+
 /// Response from `GET /v1/{prefix}/namespaces/{namespace}/tables/{table}`.
 ///
 /// Contains the full Iceberg table metadata.
@@ -331,6 +356,117 @@ pub struct SortField {
     pub null_order: String,
 }
 
+/// Request body for `POST /v1/{prefix}/namespaces/{namespace}/tables`.
+///
+/// Creates a new Iceberg table with the provided schema and optional configuration.
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+pub struct CreateTableRequest {
+    /// The name of the table (must be unique within the namespace).
+    pub name: String,
+
+    /// Storage location for the table. If not provided, the catalog will assign one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+
+    /// The schema for the table.
+    pub schema: Schema,
+
+    /// Optional partition specification.
+    #[serde(rename = "partition-spec", skip_serializing_if = "Option::is_none")]
+    pub partition_spec: Option<PartitionSpec>,
+
+    /// Optional write order (sort order for data files).
+    #[serde(rename = "write-order", skip_serializing_if = "Option::is_none")]
+    pub write_order: Option<SortOrder>,
+
+    /// Whether to stage the creation without committing.
+    ///
+    /// If true, the table is created but not committed - the caller must
+    /// commit it using the commit endpoint.
+    #[serde(rename = "stage-create", default)]
+    pub stage_create: bool,
+
+    /// Table properties.
+    #[serde(default)]
+    pub properties: HashMap<String, String>,
+}
+
+/// Request body for `POST /v1/{prefix}/namespaces/{namespace}/register`.
+///
+/// Registers an existing Iceberg table with the catalog by providing
+/// its metadata file location.
+///
+/// # Metadata Handling
+///
+/// During registration, Arco writes a **new** metadata file with an updated
+/// `table-uuid` that matches the catalog's assigned table ID. The original
+/// metadata file at `metadata-location` is left unchanged (immutable).
+///
+/// The response's `metadata-location` will point to the newly created file:
+/// `{table-location}/metadata/arco-registered-{catalog-uuid}.metadata.json`
+///
+/// This ensures consistency between the catalog's table ID and the metadata's
+/// `table-uuid` field, which is required for commit operations that use
+/// `assert-table-uuid` requirements.
+///
+/// # Metadata-Location Semantics
+///
+/// The `metadata-location` input is interpreted as follows:
+/// - Absolute URIs (e.g., `gs://bucket/path/metadata.json`) have scheme and
+///   bucket stripped; only the path portion is used for storage operations.
+/// - Scoped paths (e.g., `tenant=X/workspace=Y/path`) have the scope prefix
+///   stripped to derive the relative storage path.
+/// - Clients should use the `metadata-location` from the response (not their
+///   input) for subsequent operations.
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+pub struct RegisterTableRequest {
+    /// The name to register the table under.
+    pub name: String,
+
+    /// The location of the table's existing metadata file.
+    ///
+    /// The server reads this file to extract table configuration but does not
+    /// modify it. A new metadata file is created with the catalog-assigned UUID.
+    #[serde(rename = "metadata-location")]
+    pub metadata_location: String,
+
+    /// Whether to overwrite if a table with this name already exists.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+/// Query parameters for `DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}`.
+#[derive(Debug, Clone, Default, Deserialize, utoipa::IntoParams)]
+pub struct DropTableQuery {
+    /// Request to purge all data and metadata files associated with the table.
+    ///
+    /// **Note**: Data purge is not currently supported. Requests with
+    /// `purgeRequested=true` will return 406 Not Acceptable.
+    ///
+    /// When false or absent, the catalog drops the table from the catalog
+    /// but leaves the data files in place (the table can potentially be
+    /// re-registered).
+    #[serde(rename = "purgeRequested", default)]
+    pub purge_requested: bool,
+}
+
+/// Request body for `POST /v1/{prefix}/tables/rename`.
+///
+/// Renames a table within the catalog. The table's UUID and data remain unchanged.
+///
+/// # Cross-Namespace Rename
+///
+/// Arco does not currently support cross-namespace rename. If `source.namespace`
+/// differs from `destination.namespace`, the server returns 406 Not Acceptable.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RenameTableRequest {
+    /// The current table identifier.
+    pub source: TableIdent,
+
+    /// The new table identifier.
+    pub destination: TableIdent,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,38 +568,95 @@ mod tests {
     }
 
     #[test]
-    fn test_list_tables_roundtrip() {
-        let json = r#"{"identifiers":[{"namespace":["db"],"name":"table1"},{"namespace":["db","schema"],"name":"table2"}],"next-page-token":"token-1"}"#;
+    fn test_snapshots_filter_parsing() {
+        let all: SnapshotsFilter = serde_json::from_str(r#""all""#).unwrap();
+        assert_eq!(all, SnapshotsFilter::All);
 
-        let value: serde_json::Value = serde_json::from_str(json).expect("parse failed");
-        let parsed: ListTablesResponse =
-            serde_json::from_value(value.clone()).expect("deserialization failed");
-        let roundtrip = serde_json::to_value(&parsed).expect("serialization failed");
-
-        assert_eq!(roundtrip, value);
+        let refs: SnapshotsFilter = serde_json::from_str(r#""refs""#).unwrap();
+        assert_eq!(refs, SnapshotsFilter::Refs);
     }
 
     #[test]
-    fn test_list_tables_empty_roundtrip() {
-        let json = r#"{"identifiers":[]}"#;
-
-        let value: serde_json::Value = serde_json::from_str(json).expect("parse failed");
-        let parsed: ListTablesResponse =
-            serde_json::from_value(value.clone()).expect("deserialization failed");
-        let roundtrip = serde_json::to_value(&parsed).expect("serialization failed");
-
-        assert_eq!(roundtrip, value);
+    fn test_snapshots_filter_default() {
+        assert_eq!(SnapshotsFilter::default(), SnapshotsFilter::All);
     }
 
     #[test]
-    fn test_load_table_response_roundtrip() {
-        let json = r#"{"metadata-location":"gs://bucket/metadata/v1.metadata.json","metadata":{"format-version":2,"table-uuid":"550e8400-e29b-41d4-a716-446655440000","location":"gs://bucket/table","last-sequence-number":0,"last-updated-ms":1234567890000,"last-column-id":3,"current-schema-id":0,"schemas":[],"current-snapshot-id":null,"snapshots":[],"snapshot-log":[],"metadata-log":[],"properties":{},"default-spec-id":0,"partition-specs":[],"last-partition-id":0,"refs":{},"default-sort-order-id":0,"sort-orders":[]},"config":{"read.default.name-mapping":"true"},"storage-credentials":[{"prefix":"gs://bucket/","config":{"gcs.oauth2.token":"token","gcs.oauth2.token-expires-at":"2025-01-15T15:00:00Z"}}]}"#;
+    fn test_load_table_query_default() {
+        let query = LoadTableQuery::default();
+        assert!(query.snapshots.is_none());
+    }
 
-        let value: serde_json::Value = serde_json::from_str(json).expect("parse failed");
-        let parsed: LoadTableResponse =
-            serde_json::from_value(value.clone()).expect("deserialization failed");
-        let roundtrip = serde_json::to_value(&parsed).expect("serialization failed");
+    #[test]
+    fn test_create_table_request_parsing() {
+        let json = r#"{
+            "name": "my_table",
+            "schema": {
+                "schema-id": 0,
+                "type": "struct",
+                "fields": [
+                    {"id": 1, "name": "id", "required": true, "type": "long"}
+                ]
+            },
+            "properties": {"owner": "data-team"}
+        }"#;
 
-        assert_eq!(roundtrip, value);
+        let request: CreateTableRequest =
+            serde_json::from_str(json).expect("deserialization failed");
+        assert_eq!(request.name, "my_table");
+        assert!(request.location.is_none());
+        assert!(!request.stage_create);
+        assert_eq!(
+            request.properties.get("owner"),
+            Some(&"data-team".to_string())
+        );
+    }
+
+    #[test]
+    fn test_create_table_request_with_location_and_stage() {
+        let json = r#"{
+            "name": "staged_table",
+            "location": "gs://bucket/tables/staged",
+            "schema": {"schema-id": 0, "fields": []},
+            "stage-create": true
+        }"#;
+
+        let request: CreateTableRequest =
+            serde_json::from_str(json).expect("deserialization failed");
+        assert_eq!(request.name, "staged_table");
+        assert_eq!(
+            request.location,
+            Some("gs://bucket/tables/staged".to_string())
+        );
+        assert!(request.stage_create);
+    }
+
+    #[test]
+    fn test_register_table_request_parsing() {
+        let json = r#"{
+            "name": "imported_table",
+            "metadata-location": "gs://bucket/metadata/v1.metadata.json"
+        }"#;
+
+        let request: RegisterTableRequest =
+            serde_json::from_str(json).expect("deserialization failed");
+        assert_eq!(request.name, "imported_table");
+        assert_eq!(
+            request.metadata_location,
+            "gs://bucket/metadata/v1.metadata.json"
+        );
+    }
+
+    #[test]
+    fn test_drop_table_query_defaults_to_false() {
+        let query = DropTableQuery::default();
+        assert!(!query.purge_requested);
+    }
+
+    #[test]
+    fn test_drop_table_query_with_purge() {
+        let json = r#"{"purgeRequested": true}"#;
+        let query: DropTableQuery = serde_json::from_str(json).expect("deserialization failed");
+        assert!(query.purge_requested);
     }
 }

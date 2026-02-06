@@ -6028,12 +6028,20 @@
               "type": "string"
             }
           },
+          "partitionKey": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Canonical partition key string (ADR-011). Preferred; cannot be combined with `partitions`.",
+            "minLength": 1
+          },
           "partitions": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/PartitionValue"
             },
-            "description": "Partition overrides (key=value pairs)."
+            "description": "Partition overrides (key=value pairs). Backward-compatible with older clients.\nCannot be combined with `partitionKey`."
           },
           "runKey": {
             "type": "string",

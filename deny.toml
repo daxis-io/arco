@@ -19,8 +19,10 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # In cargo-deny 0.18+, all advisories are denied by default.
 # Use "workspace" to only fail on direct workspace dependencies.
 unmaintained = "workspace"
-# Use ignore = [] to ignore specific advisories if needed
-ignore = []
+# Temporary: `RUSTSEC-2026-0009` requires `time >=0.3.47`, which currently
+# requires Rust 1.88 while CI is pinned to Rust 1.85.
+# Remove once the workspace toolchain is upgraded.
+ignore = ["RUSTSEC-2026-0009"]
 
 [licenses]
 # All licenses not in 'allow' are denied by default (cargo-deny 0.18+)

@@ -2992,6 +2992,36 @@ pub fn merge_schedule_tick_rows(rows: Vec<ScheduleTickRow>) -> Option<ScheduleTi
         })
 }
 
+/// Merges backfill rows from base snapshot and L0 deltas.
+///
+/// Uses `state_version` as the primary ordering key, with `row_version` (ULID)
+/// as a tiebreaker.
+#[must_use]
+pub fn merge_backfill_rows(rows: Vec<BackfillRow>) -> Option<BackfillRow> {
+    rows.into_iter().reduce(
+        |best, row| match row.state_version.cmp(&best.state_version) {
+            std::cmp::Ordering::Greater => row,
+            std::cmp::Ordering::Less => best,
+            std::cmp::Ordering::Equal => match row.row_version.cmp(&best.row_version) {
+                std::cmp::Ordering::Less => best,
+                std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => row,
+            },
+        },
+    )
+}
+
+/// Merges backfill chunk rows from base snapshot and L0 deltas.
+///
+/// Uses `row_version` (ULID) as the ordering key.
+#[must_use]
+pub fn merge_backfill_chunk_rows(rows: Vec<BackfillChunkRow>) -> Option<BackfillChunkRow> {
+    rows.into_iter()
+        .reduce(|best, row| match row.row_version.cmp(&best.row_version) {
+            std::cmp::Ordering::Less => best,
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => row,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

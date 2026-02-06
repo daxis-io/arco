@@ -11,19 +11,25 @@
 //! - TTL bounding
 //! - Domain validation
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
 
 use arco_api::config::{Config, CorsConfig};
 use arco_api::server::Server;
-use arco_core::storage::MemoryBackend;
+use arco_core::storage::{
+    MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+};
 use arco_test_utils::http_signed_url::HttpSignedUrlBackend;
+use reqwest::Url;
 
 // ============================================================================
 // Test Config Helper
@@ -42,17 +48,182 @@ fn test_config() -> Config {
     }
 }
 
+fn env_truthy(key: &str) -> bool {
+    matches!(
+        std::env::var(key),
+        Ok(value)
+            if value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+    )
+}
+
+fn require_http_signed_url_e2e() -> bool {
+    env_truthy("ARCO_REQUIRE_HTTP_SIGNED_URL_E2E") || env_truthy("CI")
+}
+
+fn allow_http_bind_fallback() -> bool {
+    env_truthy("ARCO_ALLOW_HTTP_BIND_FALLBACK")
+}
+
+fn is_listener_bind_restricted_error(err: &arco_core::Error) -> bool {
+    let arco_core::Error::Storage { message, .. } = err else {
+        return false;
+    };
+
+    if !message.starts_with("failed to bind http signed-url listener") {
+        return false;
+    }
+
+    // The underlying bind error is formatted into `message` by HttpSignedUrlBackend.
+    // We accept a small set of known strings/codes that indicate sandbox restrictions.
+    //
+    // Examples:
+    // - Linux: "Permission denied (os error 13)"
+    // - macOS: "Operation not permitted" or "Cannot assign requested address (os error 49)"
+    message.contains("Permission denied")
+        || message.contains("Operation not permitted")
+        || message.contains("Cannot assign requested address")
+        || message.contains("Address not available")
+        || message.contains("os error 13")
+        || message.contains("os error 49")
+}
+
+fn assert_signed_url_shape(
+    url: &str,
+    expected_object_path: &str,
+    supports_http: bool,
+) -> Result<()> {
+    let parsed = Url::parse(url).context("parse signed url")?;
+    assert_eq!(parsed.scheme(), "http", "signed url must use http");
+
+    let url_path = parsed.path();
+    let object_path = url_path
+        .strip_prefix("/objects/")
+        .with_context(|| format!("signed url path must start with /objects/: {url_path}"))?;
+    // The server-side minting path may include tenant/workspace prefixes.
+    assert!(
+        object_path.ends_with(expected_object_path),
+        "signed url object path must end with '{expected_object_path}', got '{object_path}'"
+    );
+
+    let query: std::collections::BTreeMap<String, String> = parsed
+        .query_pairs()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    assert!(query.contains_key("expires"), "signed url missing expires");
+    assert!(query.contains_key("sig"), "signed url missing sig");
+
+    if supports_http {
+        let host = parsed.host_str().unwrap_or_default();
+        assert!(
+            host == "127.0.0.1" || host == "localhost" || host == "::1",
+            "expected signed url host to be loopback, got '{host}'"
+        );
+    } else {
+        assert_eq!(
+            parsed.host_str().unwrap_or_default(),
+            "signed-url.invalid",
+            "expected stub backend host"
+        );
+    }
+
+    Ok(())
+}
+
+struct StubSignedUrlBackend {
+    inner: Arc<dyn StorageBackend>,
+}
+
+impl StubSignedUrlBackend {
+    fn new(inner: Arc<dyn StorageBackend>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageBackend for StubSignedUrlBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        self.inner.put(path, data, precondition).await
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        self.inner.head(path).await
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        let expires = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .saturating_add(expiry)
+            .as_secs();
+
+        Ok(format!(
+            "http://signed-url.invalid/objects/{path}?expires={expires}&sig=stub"
+        ))
+    }
+}
+
+async fn test_backend(
+    inner: Arc<MemoryBackend>,
+) -> Result<(Arc<dyn StorageBackend>, /* supports_http */ bool)> {
+    match HttpSignedUrlBackend::new(inner.clone()).await {
+        Ok(backend) => Ok((Arc::new(backend), true)),
+        Err(err) => {
+            // Some sandboxed environments disallow binding local TCP listeners. If we detect that
+            // case we can fall back to a stub backend that still implements `signed_url()`.
+            //
+            // In CI, we generally want to *fail* instead of silently losing coverage.
+            let require = require_http_signed_url_e2e();
+            let allow_fallback = allow_http_bind_fallback();
+
+            if is_listener_bind_restricted_error(&err) {
+                if require && !allow_fallback {
+                    return Err(anyhow::Error::new(err)).context(
+                        "http signed-url backend is required (CI or ARCO_REQUIRE_HTTP_SIGNED_URL_E2E=1); \
+set ARCO_ALLOW_HTTP_BIND_FALLBACK=1 to allow stub fallback",
+                    );
+                }
+
+                let inner: Arc<dyn StorageBackend> = inner;
+                Ok((Arc::new(StubSignedUrlBackend::new(inner)), false))
+            } else {
+                Err(anyhow::Error::new(err)).context("initialize http signed-url backend")
+            }
+        }
+    }
+}
+
 async fn test_router() -> Result<axum::Router> {
     let inner = Arc::new(MemoryBackend::new());
-    let backend = Arc::new(HttpSignedUrlBackend::new(inner).await?);
+    let (backend, _supports_http) = test_backend(inner).await?;
     Ok(Server::with_storage_backend(test_config(), backend).test_router())
 }
 
-async fn test_router_with_storage() -> Result<(axum::Router, Arc<MemoryBackend>)> {
+async fn test_router_with_storage() -> Result<(axum::Router, Arc<MemoryBackend>, bool)> {
     let inner = Arc::new(MemoryBackend::new());
-    let backend = Arc::new(HttpSignedUrlBackend::new(inner.clone()).await?);
+    let (backend, supports_http) = test_backend(inner.clone()).await?;
     let router = Server::with_storage_backend(test_config(), backend).test_router();
-    Ok((router, inner))
+    Ok((router, inner, supports_http))
 }
 
 // ============================================================================
@@ -176,7 +347,7 @@ mod e2e_browser_read {
         use arco_catalog::CatalogReader;
         use arco_core::CatalogDomain;
         use arco_core::ScopedStorage;
-        let (router, inner) = test_router_with_storage().await?;
+        let (router, inner, supports_http) = test_router_with_storage().await?;
 
         // Step 1: Create namespace (initializes catalog + writes snapshot v2)
         let create_ns = CreateNamespaceRequest {
@@ -248,7 +419,17 @@ mod e2e_browser_read {
             "expected http signed url"
         );
 
+        assert_signed_url_shape(&signed.url, &namespaces_path, supports_http)?;
+
         // Query Parquet bytes via signed URL using DuckDB (browser read analogue).
+        if !supports_http {
+            println!(
+                "Skipping DuckDB browser read (no local HTTP listener); \
+set ARCO_REQUIRE_HTTP_SIGNED_URL_E2E=1 to fail instead"
+            );
+            return Ok(());
+        }
+
         let signed_url = signed.url.clone();
         let count = tokio::time::timeout(
             Duration::from_secs(30),
@@ -400,7 +581,7 @@ mod signed_url_security {
         use arco_catalog::CatalogReader;
         use arco_core::{CatalogDomain, ScopedStorage};
 
-        let (router, inner) = test_router_with_storage().await?;
+        let (router, inner, _) = test_router_with_storage().await?;
 
         // Initialize catalog first.
         let create_ns = CreateNamespaceRequest {
@@ -438,7 +619,7 @@ mod signed_url_security {
         use arco_catalog::CatalogReader;
         use arco_core::{CatalogDomain, ScopedStorage};
 
-        let (router, inner) = test_router_with_storage().await?;
+        let (router, inner, _) = test_router_with_storage().await?;
 
         // Initialize catalog.
         let create_ns = CreateNamespaceRequest {

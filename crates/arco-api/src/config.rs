@@ -93,6 +93,12 @@ pub struct Config {
     #[serde(default)]
     pub run_key_fingerprint_cutoff: Option<DateTime<Utc>>,
 
+    /// Cutoff timestamp for strict time partition string validation (RFC3339).
+    ///
+    /// After this cutoff, time partitions must use `d:`/`t:` tagged values.
+    #[serde(default)]
+    pub partition_time_string_cutoff: Option<DateTime<Utc>>,
+
     /// Code version to stamp on new runs (e.g., deployment version or git SHA).
     #[serde(default)]
     pub code_version: Option<String>,
@@ -221,6 +227,7 @@ impl Default for Config {
             compactor_url: None,
             orchestration_compactor_url: None,
             run_key_fingerprint_cutoff: None,
+            partition_time_string_cutoff: None,
             code_version: None,
             iceberg: IcebergApiConfig::default(),
             unity_catalog: UnityCatalogApiConfig::default(),
@@ -367,6 +374,7 @@ impl Config {
     /// - `ARCO_COMPACTOR_URL`
     /// - `ARCO_ORCH_COMPACTOR_URL`
     /// - `ARCO_RUN_KEY_FINGERPRINT_CUTOFF` (RFC3339, e.g. "2025-01-01T00:00:00Z")
+    /// - `ARCO_PARTITION_TIME_STRING_CUTOFF` (RFC3339, e.g. "2025-01-01T00:00:00Z")
     /// - `ARCO_CODE_VERSION`
     /// - `ARCO_ICEBERG_ENABLED`
     /// - `ARCO_ICEBERG_PREFIX`
@@ -461,6 +469,9 @@ impl Config {
         }
         if let Some(cutoff) = env_datetime("ARCO_RUN_KEY_FINGERPRINT_CUTOFF")? {
             config.run_key_fingerprint_cutoff = Some(cutoff);
+        }
+        if let Some(cutoff) = env_datetime("ARCO_PARTITION_TIME_STRING_CUTOFF")? {
+            config.partition_time_string_cutoff = Some(cutoff);
         }
         if let Some(code_version) = env_string("ARCO_CODE_VERSION") {
             config.code_version = Some(code_version);

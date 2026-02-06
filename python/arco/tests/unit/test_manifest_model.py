@@ -129,3 +129,37 @@ class TestAssetEntry:
         assert entry.key["namespace"] == "raw"
         assert entry.key["name"] == "events"
         assert entry.description == "Raw events"
+
+    def test_partition_dimensions_include_kind_specific_config(self) -> None:
+        """Partition dimensions include granularity and values when available."""
+        from arco_flow.manifest.model import AssetEntry
+        from arco_flow.types import (
+            AssetDefinition,
+            AssetId,
+            AssetKey,
+            CodeLocation,
+            DailyPartition,
+            HourlyPartition,
+            PartitionStrategy,
+            StaticDimension,
+        )
+
+        definition = AssetDefinition(
+            key=AssetKey("raw", "events"),
+            id=AssetId.generate(),
+            code=CodeLocation(module="assets.raw", function="events"),
+            partitioning=PartitionStrategy(
+                dimensions=(
+                    DailyPartition("date"),
+                    HourlyPartition("hour"),
+                    StaticDimension("region", values=("us", "eu")),
+                )
+            ),
+        )
+
+        entry = AssetEntry.from_definition(definition)
+        dimensions = {dim["name"]: dim for dim in entry.partitioning["dimensions"]}
+
+        assert dimensions["date"]["granularity"] == "day"
+        assert dimensions["hour"]["granularity"] == "hour"
+        assert dimensions["region"]["values"] == ["us", "eu"]

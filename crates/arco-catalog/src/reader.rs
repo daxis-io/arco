@@ -595,6 +595,183 @@ impl CatalogReader {
     }
 
     // ========================================================================
+    // Catalog Operations (UC-like model)
+    // ========================================================================
+
+    /// Lists catalogs in the metastore.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be read or Parquet decoding fails.
+    pub async fn list_catalogs(&self) -> Result<Vec<Catalog>> {
+        let manifest = self.read_manifest().await?;
+
+        if manifest.catalog.snapshot_version == 0 {
+            return Ok(Vec::new());
+        }
+
+        let catalogs_path = CatalogPaths::snapshot_file(
+            CatalogDomain::Catalog,
+            manifest.catalog.snapshot_version,
+            "catalogs.parquet",
+        );
+
+        let records = match self.storage.get_raw(&catalogs_path).await {
+            Ok(bytes) => parquet_util::read_catalogs(&bytes)?,
+            Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+                Vec::new()
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        Ok(records.into_iter().map(Catalog::from).collect())
+    }
+
+    /// Gets a catalog by name.
+    ///
+    /// # Returns
+    ///
+    /// Returns `None` if the catalog doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be read or Parquet decoding fails.
+    pub async fn get_catalog(&self, name: &str) -> Result<Option<Catalog>> {
+        let catalogs = self.list_catalogs().await?;
+        Ok(catalogs.into_iter().find(|c| c.name == name))
+    }
+
+    /// Lists schemas (namespaces) within a catalog.
+    ///
+    /// Legacy namespaces with `catalog_id = NULL` are treated as belonging to the
+    /// `default` catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog doesn't exist or snapshot reads fail.
+    pub async fn list_schemas(&self, catalog: &str) -> Result<Vec<Namespace>> {
+        let manifest = self.read_manifest().await?;
+
+        if manifest.catalog.snapshot_version == 0 {
+            return Err(CatalogError::NotFound {
+                entity: "catalog".into(),
+                name: catalog.to_string(),
+            });
+        }
+
+        let catalogs_path = CatalogPaths::snapshot_file(
+            CatalogDomain::Catalog,
+            manifest.catalog.snapshot_version,
+            "catalogs.parquet",
+        );
+        let catalogs = match self.storage.get_raw(&catalogs_path).await {
+            Ok(bytes) => parquet_util::read_catalogs(&bytes)?,
+            Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+                Vec::new()
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let default_catalog_id = catalogs
+            .iter()
+            .find(|c| c.name == "default")
+            .map(|c| c.id.as_str());
+        let requested_catalog_id = catalogs
+            .iter()
+            .find(|c| c.name == catalog)
+            .map(|c| c.id.as_str());
+
+        let effective_requested_catalog_id = if let Some(id) = requested_catalog_id {
+            Some(id)
+        } else if catalog == "default" {
+            default_catalog_id
+        } else {
+            return Err(CatalogError::NotFound {
+                entity: "catalog".into(),
+                name: catalog.to_string(),
+            });
+        };
+
+        let ns_path = CatalogPaths::snapshot_file(
+            CatalogDomain::Catalog,
+            manifest.catalog.snapshot_version,
+            "namespaces.parquet",
+        );
+        let bytes = self.storage.get_raw(&ns_path).await?;
+        let records = parquet_util::read_namespaces(&bytes)?;
+
+        Ok(records
+            .into_iter()
+            .filter(|ns| match effective_requested_catalog_id {
+                Some(requested) => {
+                    ns.catalog_id.as_deref().or(default_catalog_id) == Some(requested)
+                }
+                None => ns.catalog_id.is_none(),
+            })
+            .map(Namespace::from)
+            .collect())
+    }
+
+    /// Lists tables within a schema (namespace) inside the given catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog or schema doesn't exist, or snapshot reads fail.
+    pub async fn list_tables_in_schema(&self, catalog: &str, schema: &str) -> Result<Vec<Table>> {
+        let manifest = self.read_manifest().await?;
+
+        if manifest.catalog.snapshot_version == 0 {
+            return Err(CatalogError::NotFound {
+                entity: "schema".into(),
+                name: format!("{catalog}.{schema}"),
+            });
+        }
+
+        let schemas = self.list_schemas(catalog).await?;
+        let namespace_id = schemas
+            .iter()
+            .find(|ns| ns.name == schema)
+            .map(|ns| ns.id.clone())
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "schema".into(),
+                name: format!("{catalog}.{schema}"),
+            })?;
+
+        let tables_path = CatalogPaths::snapshot_file(
+            CatalogDomain::Catalog,
+            manifest.catalog.snapshot_version,
+            "tables.parquet",
+        );
+        let bytes = self.storage.get_raw(&tables_path).await?;
+        let records = parquet_util::read_tables(&bytes)?;
+
+        Ok(records
+            .into_iter()
+            .filter(|t| t.namespace_id == namespace_id)
+            .map(Table::from)
+            .collect())
+    }
+
+    /// Gets a table by full UC-like name (catalog.schema.table).
+    ///
+    /// # Returns
+    ///
+    /// Returns `None` if the table doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog or schema doesn't exist, or snapshot reads fail.
+    pub async fn get_table_in_schema(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<Table>> {
+        let tables = self.list_tables_in_schema(catalog, schema).await?;
+        Ok(tables.into_iter().find(|t| t.name == table))
+    }
+
+    // ========================================================================
     // Namespace Operations (Tier 1 - snapshot reads)
     // ========================================================================
 

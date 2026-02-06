@@ -3,6 +3,9 @@
 //! This module provides idempotency support for catalog DDL operations:
 //! - `create_namespace`: Creates a namespace with idempotent retry semantics
 //! - `register_table`: Registers a table with idempotent retry semantics
+//! - `create_catalog`: Creates a catalog with idempotent retry semantics
+//! - `create_schema`: Creates a schema within a catalog with idempotent retry semantics
+//! - `register_table_in_schema`: Registers a table within a schema with idempotent retry semantics
 //!
 //! ## Protocol
 //!
@@ -20,7 +23,7 @@
 //! ```
 //!
 //! Where:
-//! - `operation`: One of `create_namespace`, `register_table`
+//! - `operation`: One of `create_namespace`, `register_table`, `create_catalog`, `create_schema`, `register_table_in_schema`
 //! - `key_hash_prefix`: First 2 characters of `SHA256(idempotency_key)`
 //! - `key_hash`: Full `SHA256(idempotency_key)`
 
@@ -81,6 +84,12 @@ pub enum CatalogOperation {
     CreateNamespace,
     /// Register a table in the catalog.
     RegisterTable,
+    /// Create a catalog.
+    CreateCatalog,
+    /// Create a schema within a catalog.
+    CreateSchema,
+    /// Register a table within a schema.
+    RegisterTableInSchema,
 }
 
 impl CatalogOperation {
@@ -90,6 +99,9 @@ impl CatalogOperation {
         match self {
             Self::CreateNamespace => "create_namespace",
             Self::RegisterTable => "register_table",
+            Self::CreateCatalog => "create_catalog",
+            Self::CreateSchema => "create_schema",
+            Self::RegisterTableInSchema => "register_table_in_schema",
         }
     }
 }

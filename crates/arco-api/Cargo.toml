@@ -31,6 +31,7 @@ azure = ["arco-core/azure", "arco-catalog/azure", "arco-flow/azure", "arco-uc/az
 [dependencies]
 arco-core = { path = "../arco-core" }
 arco-catalog = { path = "../arco-catalog" }
+arco-delta = { path = "../arco-delta" }
 arco-flow = { path = "../arco-flow" }
 arco-iceberg = { path = "../arco-iceberg" }
 arco-uc = { path = "../arco-uc" }
@@ -62,6 +63,7 @@ datafusion = "46"
 
 # IDs
 ulid = { workspace = true }
+uuid = { workspace = true }
 
 # Hashing/encoding
 base64 = { workspace = true }

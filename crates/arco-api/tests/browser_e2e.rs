@@ -397,9 +397,12 @@ mod signed_url_security {
 
     #[tokio::test]
     async fn test_ttl_bounded_to_maximum() -> Result<()> {
-        let router = test_router().await?;
+        use arco_catalog::CatalogReader;
+        use arco_core::{CatalogDomain, ScopedStorage};
 
-        // Initialize catalog first (writes snapshot v1).
+        let (router, inner) = test_router_with_storage().await?;
+
+        // Initialize catalog first.
         let create_ns = CreateNamespaceRequest {
             name: "ttl_test_ns".to_string(),
             description: None,
@@ -407,14 +410,19 @@ mod signed_url_security {
         let response = post_json(&router, "/api/v1/namespaces", &create_ns).await?;
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        let snapshot_version = 1_u64;
+        let storage = ScopedStorage::new(inner, "test-tenant", "test-workspace")?;
+        let reader = CatalogReader::new(storage);
+        let mintable = reader.get_mintable_paths(CatalogDomain::Catalog).await?;
+        let namespaces_path = mintable
+            .iter()
+            .find(|p| p.ends_with("/namespaces.parquet"))
+            .cloned()
+            .context("namespaces.parquet not mintable")?;
 
         // Request with excessive TTL (2 hours = 7200 seconds)
         let mint_req = MintUrlsRequest {
             domain: "catalog".to_string(),
-            paths: vec![format!(
-                "snapshots/catalog/v{snapshot_version}/namespaces.parquet"
-            )],
+            paths: vec![namespaces_path],
             ttl_seconds: Some(7200), // Exceeds MAX_TTL_SECONDS (3600)
         };
         let response = post_json(&router, "/api/v1/browser/urls", &mint_req).await?;
@@ -427,9 +435,12 @@ mod signed_url_security {
 
     #[tokio::test]
     async fn test_ttl_default_applied() -> Result<()> {
-        let router = test_router().await?;
+        use arco_catalog::CatalogReader;
+        use arco_core::{CatalogDomain, ScopedStorage};
 
-        // Initialize catalog (writes snapshot v1).
+        let (router, inner) = test_router_with_storage().await?;
+
+        // Initialize catalog.
         let create_ns = CreateNamespaceRequest {
             name: "default_ttl_ns".to_string(),
             description: None,
@@ -437,14 +448,19 @@ mod signed_url_security {
         let response = post_json(&router, "/api/v1/namespaces", &create_ns).await?;
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        let snapshot_version = 1_u64;
+        let storage = ScopedStorage::new(inner, "test-tenant", "test-workspace")?;
+        let reader = CatalogReader::new(storage);
+        let mintable = reader.get_mintable_paths(CatalogDomain::Catalog).await?;
+        let namespaces_path = mintable
+            .iter()
+            .find(|p| p.ends_with("/namespaces.parquet"))
+            .cloned()
+            .context("namespaces.parquet not mintable")?;
 
         // Request without TTL
         let mint_req = MintUrlsRequest {
             domain: "catalog".to_string(),
-            paths: vec![format!(
-                "snapshots/catalog/v{snapshot_version}/namespaces.parquet"
-            )],
+            paths: vec![namespaces_path],
             ttl_seconds: None,
         };
         let response = post_json(&router, "/api/v1/browser/urls", &mint_req).await?;

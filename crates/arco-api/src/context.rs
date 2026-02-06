@@ -3,7 +3,8 @@
 //! In debug mode, tenant/workspace are supplied via headers for local development.
 //! In production mode, tenant/workspace are extracted from a verified JWT. A user
 //! identifier claim is also required (default `sub`, configurable via
-//! `ARCO_JWT_USER_CLAIM`).
+//! `ARCO_JWT_USER_CLAIM`). Group memberships are optionally extracted from a
+//! configured claim (default `groups`, configurable via `ARCO_JWT_GROUPS_CLAIM`).
 
 use std::sync::Arc;
 
@@ -39,6 +40,8 @@ pub struct RequestContext {
     pub workspace: String,
     /// Optional user identifier (from JWT or debug headers).
     pub user_id: Option<String>,
+    /// Group memberships for the principal (from JWT or debug headers).
+    pub groups: Vec<String>,
     /// Request ID for tracing/correlation.
     pub request_id: String,
     /// Optional idempotency key (safe retries).
@@ -79,7 +82,7 @@ impl FromRequestParts<Arc<AppState>> for RequestContext {
 
         let debug_allowed = state.config.debug && state.config.posture.is_dev();
 
-        let (tenant, workspace, user_id) = if debug_allowed {
+        let (tenant, workspace, user_id, groups) = if debug_allowed {
             let tenant = header_string(headers, "X-Tenant-Id").ok_or_else(|| {
                 ApiError::unauthorized("missing X-Tenant-Id header (debug mode)")
                     .with_request_id(request_id.clone())
@@ -89,7 +92,8 @@ impl FromRequestParts<Arc<AppState>> for RequestContext {
                     .with_request_id(request_id.clone())
             })?;
             let user_id = user_id_from_headers(headers);
-            (tenant, workspace, user_id)
+            let groups = groups_from_headers(headers);
+            (tenant, workspace, user_id, groups)
         } else {
             extract_from_jwt(headers, state, &request_id)?
         };
@@ -101,6 +105,7 @@ impl FromRequestParts<Arc<AppState>> for RequestContext {
             tenant,
             workspace,
             user_id,
+            groups,
             request_id,
             idempotency_key,
         };
@@ -114,7 +119,7 @@ fn extract_from_jwt(
     headers: &HeaderMap,
     state: &AppState,
     request_id: &str,
-) -> Result<(String, String, Option<String>), ApiError> {
+) -> Result<(String, String, Option<String>, Vec<String>), ApiError> {
     let token = bearer_token(headers)
         .ok_or_else(|| ApiError::missing_auth().with_request_id(request_id.to_string()))?;
 
@@ -146,8 +151,9 @@ fn extract_from_jwt(
     let tenant = extract_required_claim(obj, &state.config.jwt.tenant_claim, request_id)?;
     let workspace = extract_required_claim(obj, &state.config.jwt.workspace_claim, request_id)?;
     let user_id = extract_required_claim(obj, &state.config.jwt.user_claim, request_id)?;
+    let groups = extract_groups_claim(obj, &state.config.jwt.groups_claim, request_id)?;
 
-    Ok((tenant, workspace, Some(user_id)))
+    Ok((tenant, workspace, Some(user_id), groups))
 }
 
 fn normalize_scope_id(raw: &str, field: &str, request_id: &str) -> Result<String, ApiError> {
@@ -231,6 +237,25 @@ fn user_id_from_headers(headers: &HeaderMap) -> Option<String> {
     header_string(headers, "X-User-Id").or_else(|| header_string(headers, "X-User-ID"))
 }
 
+fn groups_from_headers(headers: &HeaderMap) -> Vec<String> {
+    header_string(headers, "X-Groups")
+        .map(|raw| parse_group_list(&raw))
+        .unwrap_or_default()
+}
+
+fn parse_group_list(raw: &str) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut groups = Vec::new();
+
+    for group in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if seen.insert(group.to_string()) {
+            groups.push(group.to_string());
+        }
+    }
+
+    groups
+}
+
 fn extract_required_claim(
     obj: &serde_json::Map<String, Value>,
     claim: &str,
@@ -241,6 +266,41 @@ fn extract_required_claim(
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .ok_or_else(|| ApiError::invalid_token().with_request_id(request_id.to_string()))
+}
+
+fn extract_groups_claim(
+    obj: &serde_json::Map<String, Value>,
+    claim: &str,
+    request_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let Some(value) = obj.get(claim) else {
+        return Ok(Vec::new());
+    };
+
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::String(raw) => Ok(parse_group_list(raw)),
+        Value::Array(values) => {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut groups = Vec::new();
+
+            for value in values {
+                let Some(value) = value.as_str() else {
+                    return Err(ApiError::invalid_token().with_request_id(request_id.to_string()));
+                };
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if seen.insert(trimmed.to_string()) {
+                    groups.push(trimmed.to_string());
+                }
+            }
+
+            Ok(groups)
+        }
+        _ => Err(ApiError::invalid_token().with_request_id(request_id.to_string())),
+    }
 }
 
 fn require_issuer_claim(
@@ -343,9 +403,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_context_accepts_debug_headers_in_dev() {
-        let mut config = Config::default();
-        config.debug = true;
-        config.posture = Posture::Dev;
+        let config = Config {
+            debug: true,
+            posture: Posture::Dev,
+            ..Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let request = AxumRequest::builder()
@@ -353,6 +415,7 @@ mod tests {
             .header("X-Tenant-Id", "tenant-1")
             .header("X-Workspace-Id", "workspace-1")
             .header("X-User-Id", "user-1")
+            .header("X-Groups", "analysts,admins,analysts")
             .body(Body::empty())
             .expect("request");
         let (mut parts, _body) = request.into_parts();
@@ -363,13 +426,19 @@ mod tests {
         assert_eq!(ctx.tenant, "tenant-1");
         assert_eq!(ctx.workspace, "workspace-1");
         assert_eq!(ctx.user_id.as_deref(), Some("user-1"));
+        assert_eq!(
+            ctx.groups,
+            vec!["analysts".to_string(), "admins".to_string()]
+        );
     }
 
     #[tokio::test]
     async fn test_request_context_requires_jwt_outside_dev() {
-        let mut config = Config::default();
-        config.debug = true;
-        config.posture = Posture::Private;
+        let config = Config {
+            debug: true,
+            posture: Posture::Private,
+            ..Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let request = AxumRequest::builder()

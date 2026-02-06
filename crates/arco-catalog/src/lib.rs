@@ -118,7 +118,7 @@ pub use tier1_events::{CatalogDdlEvent, LineageDdlEvent};
 pub use tier1_writer::Tier1Writer;
 pub use write_options::{IdempotencyKey, SnapshotVersion, WriteOptions};
 pub use writer::{
-    CatalogWriter, Column, ColumnDefinition, EventSource, LineageEdge, Namespace,
+    Catalog, CatalogWriter, Column, ColumnDefinition, EventSource, LineageEdge, Namespace,
     RegisterTableRequest, Table, TablePatch,
 };
 

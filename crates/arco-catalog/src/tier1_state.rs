@@ -35,6 +35,13 @@ pub async fn load_catalog_state(
         CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "tables.parquet");
     let columns_path =
         CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "columns.parquet");
+    let catalogs_path =
+        CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "catalogs.parquet");
+
+    let catalogs = match storage.get_raw(&catalogs_path).await {
+        Ok(bytes) => parquet_util::read_catalogs(&bytes)?,
+        Err(_) => Vec::new(),
+    };
 
     let namespaces = match storage.get_raw(&ns_path).await {
         Ok(bytes) => parquet_util::read_namespaces(&bytes)?,
@@ -52,6 +59,7 @@ pub async fn load_catalog_state(
     };
 
     Ok(CatalogState {
+        catalogs,
         namespaces,
         tables,
         columns,

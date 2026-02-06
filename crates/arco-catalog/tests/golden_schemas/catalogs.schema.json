@@ -1,0 +1,32 @@
+{
+  "name": "catalogs",
+  "version": 1,
+  "fields": [
+    {
+      "name": "id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "name",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "description",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "created_at",
+      "data_type": "Int64",
+      "nullable": false
+    },
+    {
+      "name": "updated_at",
+      "data_type": "Int64",
+      "nullable": false
+    }
+  ]
+}
+

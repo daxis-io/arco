@@ -54,6 +54,12 @@ pub enum UnityCatalogError {
         /// Human readable message.
         message: String,
     },
+    /// Request rate/volume exceeds temporary service limits.
+    #[error("{message}")]
+    TooManyRequests {
+        /// Human readable message.
+        message: String,
+    },
     /// Feature is not supported by this deployment.
     #[error("{message}")]
     NotImplemented {
@@ -122,6 +128,15 @@ impl UnityCatalogError {
                     },
                 },
             ),
+            Self::TooManyRequests { message } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                UnityCatalogErrorResponse {
+                    error: UnityCatalogErrorDetail {
+                        error_code: "TOO_MANY_REQUESTS".to_string(),
+                        message: message.clone(),
+                    },
+                },
+            ),
             Self::NotImplemented { message } => (
                 StatusCode::NOT_IMPLEMENTED,
                 UnityCatalogErrorResponse {
@@ -162,3 +177,17 @@ impl IntoResponse for UnityCatalogError {
 
 /// Result type for UC facade handlers.
 pub type UnityCatalogResult<T> = Result<T, UnityCatalogError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn too_many_requests_maps_to_429_with_stable_error_code() {
+        let response = UnityCatalogError::TooManyRequests {
+            message: "rate limit exceeded".to_string(),
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+}

@@ -13,6 +13,28 @@ use utoipa::OpenApi;
         description = "Unity Catalog OSS parity facade for Arco (contract pinned by vendored OpenAPI spec)."
     ),
     paths(
+        crate::routes::catalogs::create_catalog,
+        crate::routes::catalogs::list_catalogs,
+        crate::routes::catalogs::get_catalog,
+        crate::routes::catalogs::update_catalog,
+        crate::routes::catalogs::delete_catalog,
+        crate::routes::schemas::create_schema,
+        crate::routes::schemas::list_schemas,
+        crate::routes::schemas::get_schema,
+        crate::routes::schemas::update_schema,
+        crate::routes::schemas::delete_schema,
+        crate::routes::tables::create_table,
+        crate::routes::tables::list_tables,
+        crate::routes::tables::get_table,
+        crate::routes::tables::delete_table,
+        crate::routes::permissions::get_permissions,
+        crate::routes::permissions::update_permissions,
+        crate::routes::credentials::temporary_model_version_credentials,
+        crate::routes::credentials::temporary_table_credentials,
+        crate::routes::credentials::temporary_volume_credentials,
+        crate::routes::credentials::temporary_path_credentials,
+        crate::routes::delta_commits::list_unbackfilled_commits,
+        crate::routes::delta_commits::register_commit,
         crate::routes::openapi::get_openapi_json,
     ),
     components(
@@ -21,6 +43,12 @@ use utoipa::OpenApi;
         )
     ),
     tags(
+        (name = "Catalogs", description = "Catalog operations"),
+        (name = "Schemas", description = "Schema operations"),
+        (name = "Tables", description = "Table operations"),
+        (name = "Permissions", description = "Permission operations"),
+        (name = "TemporaryCredentials", description = "Temporary credential operations"),
+        (name = "DeltaCommits", description = "Delta commit coordinator operations"),
         (name = "OpenAPI", description = "OpenAPI specification endpoint"),
     ),
 )]
@@ -58,5 +86,7 @@ mod tests {
         let spec = openapi();
         assert_eq!(spec.info.title, "Unity Catalog API (Arco facade)");
         assert!(spec.paths.paths.contains_key("/openapi.json"));
+        assert!(spec.paths.paths.contains_key("/catalogs"));
+        assert!(spec.paths.paths.contains_key("/delta/preview/commits"));
     }
 }

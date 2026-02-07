@@ -21,6 +21,12 @@ pub fn unity_catalog_router(state: UnityCatalogState) -> Router {
     let concurrency_limit = state.config.concurrency_limit;
 
     let router = Router::new()
+        .merge(routes::catalogs::routes())
+        .merge(routes::schemas::routes())
+        .merge(routes::tables::routes())
+        .merge(routes::permissions::routes())
+        .merge(routes::credentials::routes())
+        .merge(routes::delta_commits::routes())
         .route(
             "/openapi.json",
             axum::routing::get(routes::openapi::get_openapi_json),
@@ -69,8 +75,11 @@ mod tests {
     use super::*;
     use crate::state::UnityCatalogConfig;
     use arco_core::storage::MemoryBackend;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use std::time::Duration;
+    use tower::ServiceExt;
 
     #[test]
     fn test_router_creation() {
@@ -88,5 +97,41 @@ mod tests {
         };
         let state = UnityCatalogState::with_config(storage, config);
         let _router = unity_catalog_router(state);
+    }
+
+    #[tokio::test]
+    async fn known_scope_path_returns_not_implemented() {
+        let storage = Arc::new(MemoryBackend::new());
+        let state = UnityCatalogState::new(storage);
+        let app = unity_catalog_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/catalogs")
+            .header("X-Tenant-Id", "acme")
+            .header("X-Workspace-Id", "analytics")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn unknown_path_returns_not_found() {
+        let storage = Arc::new(MemoryBackend::new());
+        let state = UnityCatalogState::new(storage);
+        let app = unity_catalog_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/not-a-real-uc-route")
+            .header("X-Tenant-Id", "acme")
+            .header("X-Workspace-Id", "analytics")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

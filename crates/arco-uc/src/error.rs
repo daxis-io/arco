@@ -54,6 +54,12 @@ pub enum UnityCatalogError {
         /// Human readable message.
         message: String,
     },
+    /// Request rate/volume exceeds temporary service limits.
+    #[error("{message}")]
+    TooManyRequests {
+        /// Human readable message.
+        message: String,
+    },
     /// Feature is not supported by this deployment.
     #[error("{message}")]
     NotImplemented {
@@ -63,12 +69,6 @@ pub enum UnityCatalogError {
     /// Service unavailable (retryable).
     #[error("{message}")]
     ServiceUnavailable {
-        /// Human readable message.
-        message: String,
-    },
-    /// Too many requests / throttled.
-    #[error("{message}")]
-    TooManyRequests {
         /// Human readable message.
         message: String,
     },
@@ -128,6 +128,15 @@ impl UnityCatalogError {
                     },
                 },
             ),
+            Self::TooManyRequests { message } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                UnityCatalogErrorResponse {
+                    error: UnityCatalogErrorDetail {
+                        error_code: "TOO_MANY_REQUESTS".to_string(),
+                        message: message.clone(),
+                    },
+                },
+            ),
             Self::NotImplemented { message } => (
                 StatusCode::NOT_IMPLEMENTED,
                 UnityCatalogErrorResponse {
@@ -142,15 +151,6 @@ impl UnityCatalogError {
                 UnityCatalogErrorResponse {
                     error: UnityCatalogErrorDetail {
                         error_code: "SERVICE_UNAVAILABLE".to_string(),
-                        message: message.clone(),
-                    },
-                },
-            ),
-            Self::TooManyRequests { message } => (
-                StatusCode::TOO_MANY_REQUESTS,
-                UnityCatalogErrorResponse {
-                    error: UnityCatalogErrorDetail {
-                        error_code: "TOO_MANY_REQUESTS".to_string(),
                         message: message.clone(),
                     },
                 },

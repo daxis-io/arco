@@ -1,7 +1,8 @@
 # Unity Catalog OSS OpenAPI (PINNED COPY)
-# Upstream commit: 0c7edeed68b6014e787758c205ca1deafa1839d0
+# Source: https://raw.githubusercontent.com/unitycatalog/unitycatalog/34940b7f1c29d261072115fec8eea193c433791e/api/all.yaml
+# Upstream commit: 34940b7f1c29d261072115fec8eea193c433791e
 # Retrieved: 2026-02-06
-# Source: https://raw.githubusercontent.com/unitycatalog/unitycatalog/0c7edeed68b6014e787758c205ca1deafa1839d0/api/all.yaml
+
 openapi: 3.0.0
 servers:
   - url: http://localhost:8080/api/2.1/unity-catalog

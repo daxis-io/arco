@@ -23,6 +23,10 @@ pub struct UnityCatalogRequestContext {
     pub tenant: String,
     /// Workspace identifier.
     pub workspace: String,
+    /// Optional user identifier.
+    pub user_id: Option<String>,
+    /// Principal groups.
+    pub groups: Vec<String>,
     /// Request ID for tracing/correlation.
     pub request_id: String,
     /// Optional idempotency key (safe retries).
@@ -63,6 +67,9 @@ impl UnityCatalogRequestContext {
         Ok(Self {
             tenant,
             workspace,
+            user_id: header_string(headers, "X-User-Id")
+                .or_else(|| header_string(headers, "X-User-ID")),
+            groups: groups_from_headers(headers),
             request_id,
             idempotency_key: header_string(headers, "Idempotency-Key"),
         })
@@ -75,6 +82,18 @@ fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
 
 fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
     headers.get(name).and_then(header_value_to_string)
+}
+
+fn groups_from_headers(headers: &HeaderMap) -> Vec<String> {
+    header_string(headers, "X-Groups")
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|group| !group.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn header_value_to_string(value: &HeaderValue) -> Option<String> {

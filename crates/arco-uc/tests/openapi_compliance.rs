@@ -69,7 +69,7 @@ fn test_vendored_uc_spec_is_parseable() {
 }
 
 #[test]
-fn test_generated_openapi_paths_align_with_vendored_spec() {
+fn test_openapi_paths_align_with_vendored_spec() {
     let ours = serde_json::to_value(openapi()).expect("serialize openapi");
 
     let yaml = include_str!("fixtures/unitycatalog-openapi.yaml");

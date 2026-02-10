@@ -7,6 +7,17 @@ variable "project_id" {
   type        = string
 }
 
+variable "project_number" {
+  description = "GCP project number (used for deterministic Cloud Run URLs). If unset, Terraform will try to read it via the Cloud Resource Manager API."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.project_number == "" || can(regex("^\\d+$", var.project_number))
+    error_message = "project_number must be digits only (or empty to auto-discover)."
+  }
+}
+
 variable "region" {
   description = "GCP region for resources"
   type        = string
@@ -41,6 +52,26 @@ variable "api_code_version" {
 
 variable "compactor_image" {
   description = "Container image for Arco Compactor service"
+  type        = string
+}
+
+variable "flow_compactor_image" {
+  description = "Container image for Arco Flow orchestration compactor service"
+  type        = string
+}
+
+variable "flow_dispatcher_image" {
+  description = "Container image for Arco Flow dispatcher service"
+  type        = string
+}
+
+variable "flow_sweeper_image" {
+  description = "Container image for Arco Flow sweeper service"
+  type        = string
+}
+
+variable "flow_worker_image" {
+  description = "Container image for Arco Flow worker service"
   type        = string
 }
 
@@ -158,6 +189,12 @@ variable "jwt_secret_name" {
   description = "Secret Manager secret name containing JWT secret"
   type        = string
   default     = "arco-jwt-secret"
+}
+
+variable "tenant_secret_name" {
+  description = "Secret Manager secret name containing tenant secret (base64) for orchestration run_id HMAC"
+  type        = string
+  default     = "arco-tenant-secret"
 }
 
 # ============================================================================

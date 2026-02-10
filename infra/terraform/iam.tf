@@ -48,6 +48,14 @@ resource "google_secret_manager_secret_iam_member" "api_jwt_secret" {
   member    = "serviceAccount:${google_service_account.api.email}"
 }
 
+resource "google_secret_manager_secret_iam_member" "compactor_tenant_secret" {
+  count     = var.tenant_secret_name != "" && var.environment != "dev" ? 1 : 0
+  project   = var.project_id
+  secret_id = var.tenant_secret_name
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.compactor.email}"
+}
+
 # ============================================================================
 # Compactor Service Accounts (Split for Gate 5 Defense-in-Depth)
 # ============================================================================
@@ -96,6 +104,31 @@ resource "google_service_account" "invoker" {
 }
 
 # ============================================================================
+# Arco Flow Service Accounts
+# ============================================================================
+
+resource "google_service_account" "flow_controller" {
+  account_id   = "arco-flow-controller-${var.environment}"
+  display_name = "Arco Flow Controller (${var.environment})"
+  description  = "Service account for Arco Flow controllers (dispatcher/sweeper/automation)"
+  project      = var.project_id
+}
+
+resource "google_service_account" "flow_task_invoker" {
+  account_id   = "arco-flow-task-invoker-${var.environment}"
+  display_name = "Arco Flow Task Invoker (${var.environment})"
+  description  = "Service account used for Cloud Tasks OIDC invocations into Cloud Run"
+  project      = var.project_id
+}
+
+resource "google_service_account" "flow_worker" {
+  account_id   = "arco-flow-worker-${var.environment}"
+  display_name = "Arco Flow Worker (${var.environment})"
+  description  = "Service account for Arco Flow worker service (executes dispatched tasks)"
+  project      = var.project_id
+}
+
+# ============================================================================
 # Custom IAM Roles
 # ============================================================================
 
@@ -125,6 +158,64 @@ resource "google_cloud_run_v2_service_iam_member" "compactor_antientropy_invoker
   name     = google_cloud_run_v2_service.compactor.name
   role     = "roles/run.invoker"
   member   = "serviceAccount:${google_service_account.compactor_antientropy.email}"
+}
+
+# Flow compactor is invoked synchronously by the API and flow controller services.
+resource "google_cloud_run_v2_service_iam_member" "flow_compactor_invoker_api" {
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.flow_compactor.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.api.email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "flow_compactor_invoker_flow_controller" {
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.flow_compactor.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.flow_controller.email}"
+}
+
+# Cloud Tasks OIDC invoker can call worker and dispatcher timer ingest.
+resource "google_cloud_run_v2_service_iam_member" "flow_task_invoker_worker" {
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.flow_worker.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.flow_task_invoker.email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "flow_task_invoker_dispatcher" {
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.flow_dispatcher.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.flow_task_invoker.email}"
+}
+
+# Dispatcher/sweeper need to enqueue Cloud Tasks as the flow-controller SA.
+resource "google_cloud_tasks_queue_iam_member" "flow_controller_dispatch_enqueuer" {
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_tasks_queue.flow_dispatch.name
+  role     = "roles/cloudtasks.enqueuer"
+  member   = "serviceAccount:${google_service_account.flow_controller.email}"
+}
+
+resource "google_cloud_tasks_queue_iam_member" "flow_controller_timer_enqueuer" {
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_tasks_queue.flow_timer.name
+  role     = "roles/cloudtasks.enqueuer"
+  member   = "serviceAccount:${google_service_account.flow_controller.email}"
+}
+
+# Allow flow-controller to configure Cloud Tasks OIDC invocation identity.
+resource "google_service_account_iam_member" "flow_controller_act_as_task_invoker" {
+  service_account_id = google_service_account.flow_task_invoker.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.flow_controller.email}"
 }
 
 # ============================================================================
@@ -163,4 +254,19 @@ output "compactor_antientropy_service_account_email" {
 output "invoker_service_account_email" {
   description = "Email of the Invoker service account"
   value       = google_service_account.invoker.email
+}
+
+output "flow_controller_service_account_email" {
+  description = "Email of the Flow controller service account"
+  value       = google_service_account.flow_controller.email
+}
+
+output "flow_task_invoker_service_account_email" {
+  description = "Email of the Flow task invoker service account"
+  value       = google_service_account.flow_task_invoker.email
+}
+
+output "flow_worker_service_account_email" {
+  description = "Email of the Flow worker service account"
+  value       = google_service_account.flow_worker.email
 }

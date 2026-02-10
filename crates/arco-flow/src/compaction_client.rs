@@ -1,72 +1,63 @@
-//! Orchestration compaction helpers (sync or remote).
-
-use std::time::Duration;
+//! Remote orchestration compaction client.
+//!
+//! Flow controller services (dispatcher, sweeper, automation) append orchestration events
+//! to the ledger and must promptly trigger micro-compaction so Parquet projections stay
+//! fresh for subsequent reconciliations.
+//!
+//! In cloud deployments, this is done via the `arco-flow-compactor` Cloud Run service:
+//! `POST {ARCO_ORCH_COMPACTOR_URL}/compact` with `{ "event_paths": [...] }`.
 
 use serde::Serialize;
 
-use arco_core::ScopedStorage;
-use arco_flow::orchestration::OrchestrationLedgerWriter;
-use arco_flow::orchestration::compactor::MicroCompactor;
-use arco_flow::orchestration::events::OrchestrationEvent;
-use arco_flow::orchestration::ledger::LedgerWriter;
-
-use crate::config::Config;
-use crate::error::ApiError;
+use crate::error::{Error, Result};
 
 #[derive(Debug, Serialize)]
-struct CompactRequest {
-    event_paths: Vec<String>,
+struct CompactRequest<'a> {
+    event_paths: &'a [String],
 }
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
-const METADATA_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_ATTEMPTS: usize = 3;
-
-/// Compacts orchestration events using a remote compactor or inline micro-compactor.
-pub async fn compact_orchestration_events(
-    config: &Config,
-    storage: ScopedStorage,
-    event_paths: Vec<String>,
-) -> Result<(), ApiError> {
+/// Request compaction of the provided orchestration ledger event paths.
+///
+/// The compactor service is expected to be idempotent: re-compacting the same paths
+/// should be a no-op.
+///
+/// # Errors
+///
+/// Returns an error if the HTTP request fails or the service returns a non-success status.
+pub async fn compact_orchestration_events(url: &str, event_paths: Vec<String>) -> Result<()> {
     if event_paths.is_empty() {
         return Ok(());
     }
 
-    if let Some(url) = config.orchestration_compactor_url.as_ref() {
-        compact_remote(url, event_paths).await?;
-        return Ok(());
-    }
-
-    if config.debug {
-        let compactor = MicroCompactor::new(storage);
-        compactor
-            .compact_events(event_paths)
-            .await
-            .map_err(|e| ApiError::internal(format!("orchestration compaction failed: {e}")))?;
-    }
-
-    Ok(())
+    compact_orchestration_events_impl(url, &event_paths).await
 }
 
-async fn compact_remote(url: &str, event_paths: Vec<String>) -> Result<(), ApiError> {
+#[cfg(any(feature = "gcp", feature = "test-utils"))]
+async fn compact_orchestration_events_impl(url: &str, event_paths: &[String]) -> Result<()> {
+    use std::time::Duration;
+
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+    const METADATA_TIMEOUT: Duration = Duration::from_secs(2);
+
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
-        .map_err(|e| ApiError::internal(format!("failed to build HTTP client: {e}")))?;
+        .map_err(|e| Error::dispatch(format!("failed to build HTTP client: {e}")))?;
 
     let (endpoint, bearer_token) = build_compactor_endpoint(url)?;
     let auth_header = build_auth_header(&client, &endpoint, bearer_token, METADATA_TIMEOUT).await?;
 
+    // Basic retry for transient failures / CAS conflicts surfaced as HTTP status codes.
+    const MAX_ATTEMPTS: usize = 3;
     let mut attempt = 0;
+
     loop {
         attempt += 1;
 
         let mut request = client
             .post(&endpoint)
-            .json(&CompactRequest {
-                event_paths: event_paths.clone(),
-            })
+            .json(&CompactRequest { event_paths })
             .timeout(REQUEST_TIMEOUT);
 
         if let Some(auth_header) = auth_header.as_deref() {
@@ -74,27 +65,18 @@ async fn compact_remote(url: &str, event_paths: Vec<String>) -> Result<(), ApiEr
         }
 
         let response = request.send().await;
+
         match response {
             Ok(resp) if resp.status().is_success() => return Ok(()),
             Ok(resp) => {
                 let status = resp.status();
-                let body = resp.bytes().await.unwrap_or_default();
-
-                let message = serde_json::from_slice::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("error")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                    })
-                    .unwrap_or_else(|| String::from_utf8_lossy(&body).to_string());
+                let body = resp.text().await.unwrap_or_default();
 
                 let retryable =
                     status.as_u16() == 409 || status.as_u16() == 429 || status.is_server_error();
 
                 if retryable && attempt < MAX_ATTEMPTS {
-                    // Exponential backoff with cap; keep API path bounded.
+                    // Exponential backoff with a small deterministic cap.
                     let backoff_ms = 50_u64
                         .saturating_mul(2_u64.saturating_pow(attempt as u32 - 1))
                         .min(500);
@@ -102,14 +84,14 @@ async fn compact_remote(url: &str, event_paths: Vec<String>) -> Result<(), ApiEr
                     continue;
                 }
 
-                return Err(ApiError::internal(format!(
-                    "orchestration compaction failed ({status}): {message}"
+                return Err(Error::dispatch(format!(
+                    "orchestration compaction failed (status={status}): {body}"
                 )));
             }
             Err(err) => {
-                // Don't retry timeouts: the API request path should fail fast.
+                // Don't retry timeouts: failing fast avoids wedging controllers.
                 if err.is_timeout() {
-                    return Err(ApiError::internal(format!(
+                    return Err(Error::dispatch(format!(
                         "orchestration compaction request timed out: {err}"
                     )));
                 }
@@ -119,7 +101,7 @@ async fn compact_remote(url: &str, event_paths: Vec<String>) -> Result<(), ApiEr
                     continue;
                 }
 
-                return Err(ApiError::internal(format!(
+                return Err(Error::dispatch(format!(
                     "orchestration compaction request failed: {err}"
                 )));
             }
@@ -127,12 +109,16 @@ async fn compact_remote(url: &str, event_paths: Vec<String>) -> Result<(), ApiEr
     }
 }
 
-fn build_compactor_endpoint(url: &str) -> Result<(String, Option<String>), ApiError> {
+#[cfg(any(feature = "gcp", feature = "test-utils"))]
+fn build_compactor_endpoint(url: &str) -> Result<(String, Option<String>)> {
     let parsed = reqwest::Url::parse(url)
-        .map_err(|e| ApiError::internal(format!("invalid orchestration compactor URL: {e}")))?;
+        .map_err(|e| Error::configuration(format!("invalid orchestration compactor URL: {e}")))?;
 
     let bearer_token = bearer_token_from_url(&parsed);
 
+    // Strip userinfo from the URL before sending the request to avoid:
+    // 1) leaking credentials in logs / metrics
+    // 2) implicit basic-auth headers from the HTTP client
     let mut sanitized = parsed;
     let _ = sanitized.set_username("");
     let _ = sanitized.set_password(None);
@@ -141,6 +127,7 @@ fn build_compactor_endpoint(url: &str) -> Result<(String, Option<String>), ApiEr
     Ok((endpoint, bearer_token))
 }
 
+#[cfg(any(feature = "gcp", feature = "test-utils"))]
 fn bearer_token_from_url(url: &reqwest::Url) -> Option<String> {
     let username = url.username();
     if username != "bearer" {
@@ -149,16 +136,20 @@ fn bearer_token_from_url(url: &reqwest::Url) -> Option<String> {
     url.password().map(|value| value.to_string())
 }
 
+#[cfg(any(feature = "gcp", feature = "test-utils"))]
 async fn build_auth_header(
     client: &reqwest::Client,
     endpoint: &str,
     bearer_token: Option<String>,
-    metadata_timeout: Duration,
-) -> Result<Option<String>, ApiError> {
+    metadata_timeout: std::time::Duration,
+) -> Result<Option<String>> {
     if let Some(token) = bearer_token {
         return Ok(Some(format!("Bearer {token}")));
     }
 
+    // Default to GCP ID-token auth when calling Cloud Run. This keeps internal
+    // services private-by-default while allowing local/dev `http://127.0.0.1:*`
+    // compactors to work without auth.
     if !is_cloud_run_endpoint(endpoint) {
         return Ok(None);
     }
@@ -168,6 +159,7 @@ async fn build_auth_header(
     Ok(Some(format!("Bearer {id_token}")))
 }
 
+#[cfg(any(feature = "gcp", feature = "test-utils"))]
 fn is_cloud_run_endpoint(endpoint: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(endpoint) else {
         return false;
@@ -184,11 +176,13 @@ fn is_cloud_run_endpoint(endpoint: &str) -> bool {
     host.ends_with(".run.app") || host.ends_with(".a.run.app")
 }
 
+#[cfg(any(feature = "gcp", feature = "test-utils"))]
 async fn fetch_gcp_identity_token(
     client: &reqwest::Client,
     audience: &str,
-    timeout: Duration,
-) -> Result<String, ApiError> {
+    timeout: std::time::Duration,
+) -> Result<String> {
+    // Works on Cloud Run, GCE, and GKE with metadata server enabled.
     let mut url = reqwest::Url::parse(
         "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity",
     )
@@ -204,12 +198,12 @@ async fn fetch_gcp_identity_token(
         .timeout(timeout)
         .send()
         .await
-        .map_err(|e| ApiError::internal(format!("metadata identity token request failed: {e}")))?;
+        .map_err(|e| Error::dispatch(format!("metadata identity token request failed: {e}")))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(ApiError::internal(format!(
+        return Err(Error::dispatch(format!(
             "metadata identity token request failed (status={status}): {body}"
         )));
     }
@@ -217,37 +211,12 @@ async fn fetch_gcp_identity_token(
     response
         .text()
         .await
-        .map_err(|e| ApiError::internal(format!("metadata identity token read failed: {e}")))
+        .map_err(|e| Error::dispatch(format!("metadata identity token read failed: {e}")))
 }
 
-/// Ledger writer that triggers orchestration compaction after each event append.
-pub struct CompactingLedgerWriter {
-    ledger: LedgerWriter,
-    storage: ScopedStorage,
-    config: Config,
-}
-
-impl CompactingLedgerWriter {
-    /// Creates a new compacting ledger writer.
-    #[must_use]
-    pub fn new(storage: ScopedStorage, config: Config) -> Self {
-        Self {
-            ledger: LedgerWriter::new(storage.clone()),
-            storage,
-            config,
-        }
-    }
-}
-
-impl OrchestrationLedgerWriter for CompactingLedgerWriter {
-    async fn write_event(&self, event: &OrchestrationEvent) -> Result<(), String> {
-        let path = LedgerWriter::event_path(event);
-        self.ledger
-            .append(event.clone())
-            .await
-            .map_err(|e| format!("{e}"))?;
-        compact_orchestration_events(&self.config, self.storage.clone(), vec![path])
-            .await
-            .map_err(|e| format!("{e:?}"))
-    }
+#[cfg(not(any(feature = "gcp", feature = "test-utils")))]
+async fn compact_orchestration_events_impl(_url: &str, _event_paths: &[String]) -> Result<()> {
+    Err(Error::configuration(
+        "orchestration compaction requires the 'gcp' feature",
+    ))
 }

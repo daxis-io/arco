@@ -27,7 +27,9 @@ async fn seeded_router() -> SeededRouter {
     let compactor = Arc::new(Tier1Compactor::new(scoped.clone()));
     let writer = CatalogWriter::new(scoped)
         .with_sync_compactor(compactor)
-        .with_lock_policy(std::time::Duration::from_millis(10), 3);
+        // Tier-1 DDL now validates fencing token expiration; keep TTL comfortably above
+        // any in-process compaction/IO jitter to avoid flakiness.
+        .with_lock_policy(std::time::Duration::from_secs(5), 3);
     writer.initialize().await.expect("initialize");
 
     writer

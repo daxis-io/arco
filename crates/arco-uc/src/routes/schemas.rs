@@ -29,7 +29,7 @@ pub fn routes() -> Router<UnityCatalogState> {
     )
 )]
 pub async fn create_schema(method: Method, uri: OriginalUri) -> UnityCatalogError {
-    super::common::known_but_unsupported(method, uri).await
+    super::common::known_but_unsupported(&method, &uri)
 }
 
 /// `GET /schemas` (known UC operation; currently unsupported).
@@ -42,7 +42,7 @@ pub async fn create_schema(method: Method, uri: OriginalUri) -> UnityCatalogErro
     )
 )]
 pub async fn list_schemas(method: Method, uri: OriginalUri) -> UnityCatalogError {
-    super::common::known_but_unsupported(method, uri).await
+    super::common::known_but_unsupported(&method, &uri)
 }
 
 /// `GET /schemas/{full_name}` (known UC operation; currently unsupported).
@@ -58,7 +58,7 @@ pub async fn list_schemas(method: Method, uri: OriginalUri) -> UnityCatalogError
     )
 )]
 pub async fn get_schema(method: Method, uri: OriginalUri) -> UnityCatalogError {
-    super::common::known_but_unsupported(method, uri).await
+    super::common::known_but_unsupported(&method, &uri)
 }
 
 /// `PATCH /schemas/{full_name}` (known UC operation; currently unsupported).
@@ -74,7 +74,7 @@ pub async fn get_schema(method: Method, uri: OriginalUri) -> UnityCatalogError {
     )
 )]
 pub async fn update_schema(method: Method, uri: OriginalUri) -> UnityCatalogError {
-    super::common::known_but_unsupported(method, uri).await
+    super::common::known_but_unsupported(&method, &uri)
 }
 
 /// `DELETE /schemas/{full_name}` (known UC operation; currently unsupported).
@@ -90,5 +90,5 @@ pub async fn update_schema(method: Method, uri: OriginalUri) -> UnityCatalogErro
     )
 )]
 pub async fn delete_schema(method: Method, uri: OriginalUri) -> UnityCatalogError {
-    super::common::known_but_unsupported(method, uri).await
+    super::common::known_but_unsupported(&method, &uri)
 }

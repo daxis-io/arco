@@ -2,11 +2,13 @@
 
 use std::sync::OnceLock;
 
-/// Marker type exposing the vendored UC OpenAPI contract.
+use serde_json::json;
+
+/// Marker type exposing the vendored UC `OpenAPI` contract.
 pub struct UnityCatalogApiDoc;
 
 impl UnityCatalogApiDoc {
-    /// Returns the vendored OpenAPI contract.
+    /// Returns the vendored `OpenAPI` contract.
     #[must_use]
     pub fn openapi() -> serde_json::Value {
         openapi()
@@ -18,9 +20,28 @@ fn load_vendored_openapi() -> serde_json::Value {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/unitycatalog-openapi.yaml"
     ));
-    let yaml_value: serde_yaml::Value =
-        serde_yaml::from_str(yaml).expect("vendored UC fixture should parse as YAML");
-    serde_json::to_value(yaml_value).expect("vendored UC fixture should convert to JSON")
+    let yaml_value: serde_yaml::Value = match serde_yaml::from_str(yaml) {
+        Ok(value) => value,
+        Err(_) => {
+            // If the vendored fixture is malformed, fall back to a minimal spec.
+            // Fixture validation tests should fail loudly; production code should
+            // not panic.
+            return minimal_openapi();
+        }
+    };
+
+    serde_json::to_value(yaml_value).unwrap_or_else(|_| minimal_openapi())
+}
+
+fn minimal_openapi() -> serde_json::Value {
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Unity Catalog API",
+            "version": "0.0.0"
+        },
+        "paths": {}
+    })
 }
 
 static OPENAPI_CACHE: OnceLock<serde_json::Value> = OnceLock::new();

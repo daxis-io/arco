@@ -1,4 +1,4 @@
-//! Unity Catalog contract helpers backed by the pinned OpenAPI fixture.
+//! Unity Catalog contract helpers backed by the pinned `OpenAPI` fixture.
 
 use std::sync::OnceLock;
 
@@ -82,14 +82,18 @@ fn load_endpoint_patterns() -> Vec<EndpointPattern> {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/unitycatalog-openapi.yaml"
     ));
-    let parsed_yaml: serde_yaml::Value =
-        serde_yaml::from_str(yaml).expect("UC fixture should parse as YAML");
-    let parsed_json =
-        serde_json::to_value(parsed_yaml).expect("UC fixture should convert to JSON value");
-    let paths = parsed_json
+    let Ok(parsed_yaml) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
+        return Vec::new();
+    };
+    let Ok(parsed_json) = serde_json::to_value(parsed_yaml) else {
+        return Vec::new();
+    };
+    let Some(paths) = parsed_json
         .get("paths")
         .and_then(serde_json::Value::as_object)
-        .expect("UC fixture should contain OpenAPI `paths` object");
+    else {
+        return Vec::new();
+    };
 
     let mut patterns = Vec::new();
     for (path_template, path_item) in paths {
@@ -127,7 +131,7 @@ fn segments_match(expected: &[Segment], actual: &[&str]) -> bool {
         )
 }
 
-/// Returns true when the supplied method/path pair exists in the pinned UC OpenAPI spec.
+/// Returns true when the supplied method/path pair exists in the pinned UC `OpenAPI` spec.
 #[must_use]
 pub fn is_known_operation(method: &Method, path: &str) -> bool {
     let normalized = normalize_path(canonicalize_request_path(path));
@@ -136,9 +140,11 @@ pub fn is_known_operation(method: &Method, path: &str) -> bool {
         .filter(|segment| !segment.is_empty())
         .collect();
 
+    let method_str = method.as_str();
+
     endpoint_patterns()
         .iter()
-        .filter(|pattern| &pattern.method == method)
+        .filter(|pattern| pattern.method.as_str() == method_str)
         .any(|pattern| segments_match(&pattern.segments, &actual_segments))
 }
 
@@ -151,27 +157,31 @@ pub fn is_scope_a_operation(method: &Method, path: &str) -> bool {
         .filter(|segment| !segment.is_empty())
         .collect();
 
-    let scope_a_definitions: &[(&Method, &str)] = &[
-        (&Method::GET, "/catalogs"),
-        (&Method::GET, "/catalogs/{name}"),
-        (&Method::GET, "/schemas"),
-        (&Method::GET, "/schemas/{full_name}"),
-        (&Method::GET, "/tables"),
-        (&Method::GET, "/tables/{full_name}"),
-        (&Method::GET, "/permissions/{securable_type}/{full_name}"),
-        (&Method::POST, "/temporary-table-credentials"),
-        (&Method::POST, "/temporary-path-credentials"),
-        (&Method::GET, "/delta/preview/commits"),
-        (&Method::POST, "/delta/preview/commits"),
+    let method_str = method.as_str();
+    let scope_a_definitions: &[(&str, &str)] = &[
+        ("GET", "/catalogs"),
+        ("GET", "/catalogs/{name}"),
+        ("GET", "/schemas"),
+        ("GET", "/schemas/{full_name}"),
+        ("GET", "/tables"),
+        ("GET", "/tables/{full_name}"),
+        ("GET", "/permissions/{securable_type}/{full_name}"),
+        ("POST", "/temporary-table-credentials"),
+        ("POST", "/temporary-path-credentials"),
+        ("GET", "/delta/preview/commits"),
+        ("POST", "/delta/preview/commits"),
     ];
 
     endpoint_patterns().iter().any(|pattern| {
+        if pattern.method.as_str() != method_str {
+            return false;
+        }
+
         scope_a_definitions
             .iter()
             .any(|(allowed_method, allowed_path)| {
-                &pattern.method == *allowed_method
+                *allowed_method == method_str
                     && pattern.path_template == *allowed_path
-                    && &pattern.method == method
                     && segments_match(&pattern.segments, &actual_segments)
             })
     })

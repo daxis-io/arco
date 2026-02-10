@@ -348,6 +348,8 @@ async fn unity_catalog_auth_middleware(
     let uc_ctx = UnityCatalogRequestContext {
         tenant: ctx.tenant.clone(),
         workspace: ctx.workspace.clone(),
+        user_id: ctx.user_id.clone(),
+        groups: ctx.groups.clone(),
         request_id: ctx.request_id.clone(),
         idempotency_key: ctx.idempotency_key.clone(),
     };
@@ -414,6 +416,7 @@ fn api_error_to_unity_catalog_response(
         StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
             UnityCatalogError::Conflict { message }
         }
+        StatusCode::TOO_MANY_REQUESTS => UnityCatalogError::TooManyRequests { message },
         StatusCode::NOT_IMPLEMENTED => UnityCatalogError::NotImplemented { message },
         StatusCode::SERVICE_UNAVAILABLE => UnityCatalogError::ServiceUnavailable { message },
         _ => UnityCatalogError::Internal { message },
@@ -594,7 +597,8 @@ impl Server {
 
         // Mount Unity Catalog facade if enabled
         if state.config.unity_catalog.enabled {
-            let uc_state = UnityCatalogState::new(Arc::clone(&state.storage));
+            let uc_state = UnityCatalogState::new(Arc::clone(&state.storage))
+                .with_audit_emitter(Arc::new(state.audit().clone()));
 
             let uc_service = ServiceBuilder::new()
                 .layer(middleware::from_fn_with_state(
@@ -1276,6 +1280,33 @@ mod tests {
 
         // When Iceberg is disabled, the route should not exist (404)
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unity_catalog_error_mapping_preserves_429() -> Result<()> {
+        let err = ApiError::from_status_and_message(429, "rate limited").with_request_id("req-429");
+        let response = api_error_to_unity_catalog_response(&err, None);
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(request_id, Some("req-429"));
+
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .context("read response body")?;
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).context("parse JSON body")?;
+        assert_eq!(
+            payload
+                .get("error")
+                .and_then(|error| error.get("error_code"))
+                .and_then(serde_json::Value::as_str),
+            Some("TOO_MANY_REQUESTS")
+        );
         Ok(())
     }
 }

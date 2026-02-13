@@ -2358,16 +2358,6 @@
                 }
               }
             }
-          },
-          "422": {
-            "description": "Partition selector not supported",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UnprocessableEntityResponse"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -7569,29 +7559,6 @@
           "state": {
             "$ref": "#/components/schemas/RunStateResponse",
             "description": "Current run state."
-          }
-        }
-      },
-      "UnprocessableEntityResponse": {
-        "type": "object",
-        "description": "Error response for unsupported partition selectors.",
-        "required": [
-          "error",
-          "message",
-          "code"
-        ],
-        "properties": {
-          "code": {
-            "type": "string",
-            "description": "Stable error code."
-          },
-          "error": {
-            "type": "string",
-            "description": "Error category."
-          },
-          "message": {
-            "type": "string",
-            "description": "Human-readable error message."
           }
         }
       },

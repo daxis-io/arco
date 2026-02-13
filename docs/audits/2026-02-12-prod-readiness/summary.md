@@ -13,7 +13,7 @@
 | 0 | Re-baseline / tracker integrity | GO | 4 | 0 | `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-matrix-status.tsv` |
 | 1 | Release discipline / provenance | NO-GO | 0 | 4 | `docs/audits/2026-02-12-prod-readiness/signal-ledger.md` |
 | 2 | Storage / manifest / schema / invariants | GO | 7 | 0 | `docs/audits/2026-02-12-prod-readiness/findings/gate-2-findings.md` |
-| 3 | Layer-2 production blockers | PARTIAL | 2 | 5 | `crates/arco-api/src/compactor_client.rs`, `crates/arco-api/src/routes/orchestration.rs`, `crates/arco-flow/src/orchestration/controllers/backfill.rs` |
+| 3 | Layer-2 production blockers | PARTIAL | 5 | 2 | `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_projection_restart.log`, `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_run_bridge_convergence.log`, `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_runtime_observability.log` |
 | 4 | Deployment / observability / operations | NO-GO | 0 | 6 | `docs/audits/2026-02-12-prod-readiness/signal-ledger.md` |
 | 5 | Performance / security / release readiness | NO-GO | 0 | 6 | `docs/audits/2026-02-12-prod-readiness/signal-ledger.md` |
 | 7 | Final production promotion and handoff | NO-GO | 0 | 4 | `release_evidence/2026-02-12-prod-readiness/final-go/` |
@@ -39,6 +39,21 @@ Result: all required command-matrix commands exited `0`.
    - Tests: `crates/arco-iceberg/src/pointer.rs`, `crates/arco-flow/src/outbox.rs`, `crates/arco-flow/tests/orchestration_correctness_tests.rs`
 5. `G2-007` Runbook/operator checks refreshed for finalized Gate 2 invariants.
    - Runbook: `docs/runbooks/metrics-catalog.md`
+
+6. `G3-001` Layer-2 projection tables survive compactor restart and remain queryable.
+   - Evidence: `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_projection_restart.log`
+7. `G3-003` `RunRequested -> RunTriggered/PlanCreated` bridge converges under duplicate/conflict pressure.
+   - Code: `crates/arco-flow/src/orchestration/controllers/run_bridge.rs`, `crates/arco-flow/src/bin/arco_flow_dispatcher.rs`
+   - Evidence: `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_run_bridge_convergence.log`
+8. `G3-005` Runtime limits and SLO defaults are explicit, configurable, and enforced with runtime breach checks.
+   - Code: `crates/arco-flow/src/orchestration/runtime.rs`, `crates/arco-flow/src/bin/arco_flow_dispatcher.rs`
+   - Runbook: `docs/runbooks/metrics-catalog.md`
+   - Evidence: `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_runtime_observability.log`
+
+## Remaining Gate 3 Open Signals
+
+1. `G3-002` Timer callback ingestion with OIDC validation remains `NO-GO` (requires infra/runtime auth path completion and end-to-end callback proof).
+2. `G3-006` Operator metric emission is `PARTIAL`: local metrics are emitted, but dashboard/alert proof artifacts remain external.
 
 ## Audit Artifacts
 

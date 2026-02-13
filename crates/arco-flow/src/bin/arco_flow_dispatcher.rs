@@ -10,9 +10,9 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{DateTime, Duration, Utc};
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Utc};
+use metrics::{counter, gauge};
+use serde::Serialize;
 
 use arco_core::observability::{LogFormat, init_logging};
 use arco_core::storage::{ObjectStoreBackend, StorageBackend};
@@ -20,13 +20,18 @@ use arco_core::{InternalOidcConfig, InternalOidcError, InternalOidcVerifier, Sco
 use arco_flow::dispatch::cloud_tasks::{CloudTasksConfig, CloudTasksDispatcher};
 use arco_flow::dispatch::{EnqueueOptions, EnqueueResult};
 use arco_flow::error::{Error, Result};
+use arco_flow::metrics::{labels as metrics_labels, names as metrics_names};
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_flow::orchestration::controllers::{
-    DispatchAction, DispatchPayload, DispatcherController, ReadyDispatchController, TimerAction,
-    TimerController,
+    DispatchAction, DispatchPayload, DispatcherController, ReadyDispatchController,
+    RunBridgeAction, RunBridgeController, TimerAction, TimerController,
 };
 use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
+use arco_flow::orchestration::runtime::{
+    OrchestrationBacklogSnapshot, OrchestrationRuntimeConfig, OrchestrationSloSnapshot,
+    snapshot_backlog, snapshot_slos,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -39,7 +44,7 @@ struct AppState {
     timer_target_url: Option<String>,
     timer_audience: Option<String>,
     timer_queue: Option<String>,
-    task_token_signer: Option<TaskTokenSigner>,
+    runtime_config: OrchestrationRuntimeConfig,
 }
 
 #[derive(Debug, Serialize)]
@@ -51,6 +56,8 @@ struct RunError {
 
 #[derive(Debug, Serialize)]
 struct RunSummary {
+    run_bridge_emitted: usize,
+    run_bridge_skipped: usize,
     ready_dispatch_emitted: usize,
     ready_dispatch_skipped: usize,
     dispatch_actions: usize,
@@ -61,6 +68,12 @@ struct RunSummary {
     timer_enqueued: usize,
     timer_deduplicated: usize,
     timer_failed: usize,
+    slo_compaction_lag_seconds: f64,
+    slo_compaction_lag_target_seconds: f64,
+    slo_compaction_lag_breached: bool,
+    slo_run_requested_to_triggered_p95_seconds: Option<f64>,
+    slo_run_requested_to_triggered_target_seconds: f64,
+    slo_run_requested_to_triggered_breached: bool,
     errors: Vec<RunError>,
 }
 
@@ -241,8 +254,47 @@ async fn run_handler(
     State(state): State<AppState>,
 ) -> std::result::Result<Json<RunSummary>, ApiError> {
     let (manifest, fold_state) = state.compactor.load_state().await?;
+    let runtime = &state.runtime_config;
+    let now = Utc::now();
 
-    let ready_controller = ReadyDispatchController::with_defaults();
+    let snapshot = snapshot_backlog(now, &manifest, &fold_state);
+    emit_backlog_metrics(&snapshot);
+    let slo_snapshot = snapshot_slos(now, &manifest, &fold_state, runtime);
+    emit_slo_metrics(&slo_snapshot);
+
+    let run_bridge_controller = RunBridgeController::new(runtime.max_compaction_lag);
+    let run_bridge_actions = run_bridge_controller.reconcile(&manifest, &fold_state);
+
+    let mut run_bridge_events = Vec::new();
+    let mut run_bridge_emitted = 0;
+    let mut run_bridge_skipped = 0;
+    for action in run_bridge_actions {
+        match action {
+            RunBridgeAction::EmitRunEvents {
+                run_triggered,
+                plan_created,
+            } => {
+                run_bridge_emitted += 1;
+                run_bridge_events.push(OrchestrationEvent::new(
+                    state.tenant_id.clone(),
+                    state.workspace_id.clone(),
+                    run_triggered,
+                ));
+                run_bridge_events.push(OrchestrationEvent::new(
+                    state.tenant_id.clone(),
+                    state.workspace_id.clone(),
+                    plan_created,
+                ));
+            }
+            RunBridgeAction::Skip { .. } => run_bridge_skipped += 1,
+        }
+    }
+
+    if !run_bridge_events.is_empty() {
+        state.ledger.append_all(run_bridge_events).await?;
+    }
+
+    let ready_controller = ReadyDispatchController::new(runtime.max_compaction_lag);
     let ready_actions = ready_controller.reconcile(&manifest, &fold_state);
 
     let mut ready_events = Vec::new();
@@ -268,7 +320,7 @@ async fn run_handler(
     }
 
     let outbox_rows: Vec<_> = fold_state.dispatch_outbox.values().cloned().collect();
-    let dispatcher = DispatcherController::with_defaults();
+    let dispatcher = DispatcherController::new(runtime.max_compaction_lag);
     let dispatch_actions = dispatcher.reconcile(&manifest, &outbox_rows);
 
     let mut dispatch_events = Vec::new();
@@ -276,6 +328,7 @@ async fn run_handler(
     let mut dispatch_deduplicated = 0;
     let mut dispatch_failed = 0;
     let mut errors = Vec::new();
+    append_slo_breach_errors(&mut errors, &slo_snapshot);
 
     for action in &dispatch_actions {
         let DispatchAction::CreateCloudTask {
@@ -380,7 +433,7 @@ async fn run_handler(
     }
 
     let timer_rows: Vec<_> = fold_state.timers.values().cloned().collect();
-    let timer_controller = TimerController::with_defaults();
+    let timer_controller = TimerController::new(runtime.max_compaction_lag);
     let timer_actions = timer_controller.reconcile(&manifest, &timer_rows);
 
     let mut timer_events = Vec::new();
@@ -505,6 +558,8 @@ async fn run_handler(
     }
 
     let summary = RunSummary {
+        run_bridge_emitted,
+        run_bridge_skipped,
         ready_dispatch_emitted: ready_emitted,
         ready_dispatch_skipped: ready_skipped,
         dispatch_actions: dispatch_actions.len(),
@@ -515,6 +570,14 @@ async fn run_handler(
         timer_enqueued,
         timer_deduplicated,
         timer_failed,
+        slo_compaction_lag_seconds: slo_snapshot.compaction_lag_seconds,
+        slo_compaction_lag_target_seconds: slo_snapshot.compaction_lag_target_seconds,
+        slo_compaction_lag_breached: slo_snapshot.compaction_lag_breached,
+        slo_run_requested_to_triggered_p95_seconds: slo_snapshot
+            .run_requested_to_triggered_p95_seconds,
+        slo_run_requested_to_triggered_target_seconds: slo_snapshot
+            .run_requested_to_triggered_target_seconds,
+        slo_run_requested_to_triggered_breached: slo_snapshot.run_requested_to_triggered_breached,
         errors,
     };
 
@@ -522,6 +585,94 @@ async fn run_handler(
         Ok(Json(summary))
     } else {
         Err(ApiError::from_summary(summary))
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn emit_backlog_metrics(snapshot: &OrchestrationBacklogSnapshot) {
+    gauge!(
+        metrics_names::ORCH_BACKLOG_DEPTH,
+        metrics_labels::LANE => "run_bridge_pending".to_string(),
+    )
+    .set(snapshot.run_bridge_pending as f64);
+    gauge!(
+        metrics_names::ORCH_BACKLOG_DEPTH,
+        metrics_labels::LANE => "dispatch_outbox".to_string(),
+    )
+    .set(snapshot.dispatch_outbox_pending as f64);
+    gauge!(
+        metrics_names::ORCH_BACKLOG_DEPTH,
+        metrics_labels::LANE => "timers".to_string(),
+    )
+    .set(snapshot.timer_pending as f64);
+
+    gauge!(metrics_names::ORCH_COMPACTION_LAG_SECONDS).set(snapshot.compaction_lag_seconds);
+    gauge!(metrics_names::ORCH_RUN_KEY_CONFLICTS).set(snapshot.run_key_conflicts as f64);
+}
+
+fn emit_slo_metrics(snapshot: &OrchestrationSloSnapshot) {
+    gauge!(
+        metrics_names::ORCH_SLO_TARGET_SECONDS,
+        metrics_labels::SLO => "compaction_lag_p95".to_string(),
+    )
+    .set(snapshot.compaction_lag_target_seconds);
+    gauge!(
+        metrics_names::ORCH_SLO_OBSERVED_SECONDS,
+        metrics_labels::SLO => "compaction_lag_p95".to_string(),
+    )
+    .set(snapshot.compaction_lag_seconds);
+    if snapshot.compaction_lag_breached {
+        counter!(
+            metrics_names::ORCH_SLO_BREACHES_TOTAL,
+            metrics_labels::SLO => "compaction_lag_p95".to_string(),
+        )
+        .increment(1);
+    }
+
+    gauge!(
+        metrics_names::ORCH_SLO_TARGET_SECONDS,
+        metrics_labels::SLO => "run_requested_to_triggered_p95".to_string(),
+    )
+    .set(snapshot.run_requested_to_triggered_target_seconds);
+    if let Some(observed) = snapshot.run_requested_to_triggered_p95_seconds {
+        gauge!(
+            metrics_names::ORCH_SLO_OBSERVED_SECONDS,
+            metrics_labels::SLO => "run_requested_to_triggered_p95".to_string(),
+        )
+        .set(observed);
+    }
+    if snapshot.run_requested_to_triggered_breached {
+        counter!(
+            metrics_names::ORCH_SLO_BREACHES_TOTAL,
+            metrics_labels::SLO => "run_requested_to_triggered_p95".to_string(),
+        )
+        .increment(1);
+    }
+}
+
+fn append_slo_breach_errors(errors: &mut Vec<RunError>, snapshot: &OrchestrationSloSnapshot) {
+    if snapshot.compaction_lag_breached {
+        errors.push(RunError {
+            kind: "slo_breach_compaction_lag_p95".to_string(),
+            id: "compaction_lag_p95".to_string(),
+            message: format!(
+                "observed {:.3}s exceeded target {:.3}s",
+                snapshot.compaction_lag_seconds, snapshot.compaction_lag_target_seconds
+            ),
+        });
+    }
+    if snapshot.run_requested_to_triggered_breached {
+        errors.push(RunError {
+            kind: "slo_breach_run_requested_to_triggered_p95".to_string(),
+            id: "run_requested_to_triggered_p95".to_string(),
+            message: format!(
+                "observed {:.3}s exceeded target {:.3}s",
+                snapshot
+                    .run_requested_to_triggered_p95_seconds
+                    .unwrap_or_default(),
+                snapshot.run_requested_to_triggered_target_seconds
+            ),
+        });
     }
 }
 
@@ -636,7 +787,7 @@ async fn main() -> Result<()> {
     let timer_audience = optional_env("ARCO_FLOW_TIMER_AUDIENCE");
     let timer_queue = optional_env("ARCO_FLOW_TIMER_QUEUE");
     let service_account_email = optional_env("ARCO_FLOW_SERVICE_ACCOUNT_EMAIL");
-    let require_tasks_oidc = parse_bool_env("ARCO_FLOW_REQUIRE_TASKS_OIDC", false);
+    let runtime_config = OrchestrationRuntimeConfig::from_env()?;
     let port = resolve_port()?;
     let internal_auth = build_internal_auth()?;
     let task_token_signer = TaskTokenSigner::from_env()?;
@@ -692,7 +843,7 @@ async fn main() -> Result<()> {
         timer_target_url,
         timer_audience,
         timer_queue,
-        task_token_signer,
+        runtime_config,
     };
 
     let run_route = internal_auth.map_or_else(

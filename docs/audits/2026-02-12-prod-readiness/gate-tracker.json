@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
   "audit_date": "2026-02-12",
-  "generated_at_utc": "2026-02-12T19:42:58Z",
+  "generated_at_utc": "2026-02-13T01:25:48Z",
   "baseline_commit": "e896506f3c936c266a21fe556a107d37bd7075b5",
   "definition_of_done": "ALL_GATES_GO",
   "evidence_root": "release_evidence/2026-02-12-prod-readiness",
@@ -78,7 +78,7 @@
       "id": 3,
       "name": "Layer-2 production blockers",
       "status": "PARTIAL",
-      "status_reason": "Backfill selector parity and explicit compactor auth modes are closed; projection persistence, timer ingress, run bridge, limits/SLOs, and operator metrics remain.",
+      "status_reason": "Projection persistence, run bridge convergence, and runtime limits/SLO defaults are closed locally; timer ingress remains NO-GO and dashboard/alert proofs for operator metrics remain external.",
       "required_signal_ids": [
         "G3-001",
         "G3-002",
@@ -89,9 +89,10 @@
         "G3-007"
       ],
       "evidence": [
-        "crates/arco-api/src/routes/orchestration.rs",
-        "crates/arco-flow/src/orchestration/controllers/backfill.rs",
-        "release_evidence/2026-02-12-prod-readiness/gate-3/"
+        "release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_projection_restart.log",
+        "release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_run_bridge_convergence.log",
+        "release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_runtime_observability.log",
+        "release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/search_g3_metrics_names.log"
       ]
     },
     {
@@ -145,43 +146,195 @@
     }
   ],
   "signals": [
-    { "id": "G0-001", "owner": "Release Engineering", "status": "GO" },
-    { "id": "G0-002", "owner": "Release Engineering", "status": "GO" },
-    { "id": "G0-003", "owner": "Product + Engineering", "status": "GO" },
-    { "id": "G0-004", "owner": "Release Engineering", "status": "GO" },
-    { "id": "G1-001", "owner": "Release Engineering", "status": "NO-GO" },
-    { "id": "G1-002", "owner": "Release Engineering", "status": "NO-GO" },
-    { "id": "G1-003", "owner": "Release Engineering", "status": "NO-GO" },
-    { "id": "G1-004", "owner": "Security Engineering", "status": "NO-GO" },
-    { "id": "G2-001", "owner": "Core Platform", "status": "GO" },
-    { "id": "G2-002", "owner": "Core Platform", "status": "GO" },
-    { "id": "G2-003", "owner": "Compaction Team", "status": "GO" },
-    { "id": "G2-004", "owner": "Orchestration Team", "status": "GO" },
-    { "id": "G2-005", "owner": "Orchestration Team", "status": "GO" },
-    { "id": "G2-006", "owner": "Orchestration Team", "status": "GO" },
-    { "id": "G2-007", "owner": "SRE", "status": "GO" },
-    { "id": "G3-001", "owner": "Orchestration Team", "status": "NO-GO" },
-    { "id": "G3-002", "owner": "Platform + SRE", "status": "NO-GO" },
-    { "id": "G3-003", "owner": "Orchestration Team", "status": "NO-GO" },
-    { "id": "G3-004", "owner": "API + Orchestration", "status": "GO" },
-    { "id": "G3-005", "owner": "Platform + SRE", "status": "NO-GO" },
-    { "id": "G3-006", "owner": "Observability Team", "status": "NO-GO" },
-    { "id": "G3-007", "owner": "API + Platform", "status": "GO" },
-    { "id": "G4-001", "owner": "Platform + SRE", "status": "BLOCKED-EXTERNAL" },
-    { "id": "G4-002", "owner": "Platform + SRE", "status": "BLOCKED-EXTERNAL" },
-    { "id": "G4-003", "owner": "Platform + SRE", "status": "BLOCKED-EXTERNAL" },
-    { "id": "G4-004", "owner": "Observability Team", "status": "BLOCKED-EXTERNAL" },
-    { "id": "G4-005", "owner": "Observability Team", "status": "BLOCKED-EXTERNAL" },
-    { "id": "G4-006", "owner": "SRE", "status": "BLOCKED-EXTERNAL" },
-    { "id": "G5-001", "owner": "Perf Engineering", "status": "BLOCKED-EXTERNAL" },
-    { "id": "G5-002", "owner": "SRE + Product", "status": "NO-GO" },
-    { "id": "G5-003", "owner": "Security Engineering", "status": "BLOCKED-EXTERNAL" },
-    { "id": "G5-004", "owner": "Security Engineering", "status": "NO-GO" },
-    { "id": "G5-005", "owner": "SRE", "status": "BLOCKED-EXTERNAL" },
-    { "id": "G5-006", "owner": "Release Engineering", "status": "NO-GO" },
-    { "id": "G7-001", "owner": "Release Engineering", "status": "BLOCKED-EXTERNAL" },
-    { "id": "G7-002", "owner": "Daxis Integrations", "status": "BLOCKED-EXTERNAL" },
-    { "id": "G7-003", "owner": "Product + Release", "status": "NO-GO" },
-    { "id": "G7-004", "owner": "Release Engineering", "status": "NO-GO" }
+    {
+      "id": "G0-001",
+      "owner": "Release Engineering",
+      "status": "GO"
+    },
+    {
+      "id": "G0-002",
+      "owner": "Release Engineering",
+      "status": "GO"
+    },
+    {
+      "id": "G0-003",
+      "owner": "Product + Engineering",
+      "status": "GO"
+    },
+    {
+      "id": "G0-004",
+      "owner": "Release Engineering",
+      "status": "GO"
+    },
+    {
+      "id": "G1-001",
+      "owner": "Release Engineering",
+      "status": "NO-GO"
+    },
+    {
+      "id": "G1-002",
+      "owner": "Release Engineering",
+      "status": "NO-GO"
+    },
+    {
+      "id": "G1-003",
+      "owner": "Release Engineering",
+      "status": "NO-GO"
+    },
+    {
+      "id": "G1-004",
+      "owner": "Security Engineering",
+      "status": "NO-GO"
+    },
+    {
+      "id": "G2-001",
+      "owner": "Core Platform",
+      "status": "GO"
+    },
+    {
+      "id": "G2-002",
+      "owner": "Core Platform",
+      "status": "GO"
+    },
+    {
+      "id": "G2-003",
+      "owner": "Compaction Team",
+      "status": "GO"
+    },
+    {
+      "id": "G2-004",
+      "owner": "Orchestration Team",
+      "status": "GO"
+    },
+    {
+      "id": "G2-005",
+      "owner": "Orchestration Team",
+      "status": "GO"
+    },
+    {
+      "id": "G2-006",
+      "owner": "Orchestration Team",
+      "status": "GO"
+    },
+    {
+      "id": "G2-007",
+      "owner": "SRE",
+      "status": "GO"
+    },
+    {
+      "id": "G3-001",
+      "owner": "Orchestration Team",
+      "status": "GO"
+    },
+    {
+      "id": "G3-002",
+      "owner": "Platform + SRE",
+      "status": "NO-GO"
+    },
+    {
+      "id": "G3-003",
+      "owner": "Orchestration Team",
+      "status": "GO"
+    },
+    {
+      "id": "G3-004",
+      "owner": "API + Orchestration",
+      "status": "GO"
+    },
+    {
+      "id": "G3-005",
+      "owner": "Platform + SRE",
+      "status": "GO"
+    },
+    {
+      "id": "G3-006",
+      "owner": "Observability Team",
+      "status": "PARTIAL"
+    },
+    {
+      "id": "G3-007",
+      "owner": "API + Platform",
+      "status": "GO"
+    },
+    {
+      "id": "G4-001",
+      "owner": "Platform + SRE",
+      "status": "BLOCKED-EXTERNAL"
+    },
+    {
+      "id": "G4-002",
+      "owner": "Platform + SRE",
+      "status": "BLOCKED-EXTERNAL"
+    },
+    {
+      "id": "G4-003",
+      "owner": "Platform + SRE",
+      "status": "BLOCKED-EXTERNAL"
+    },
+    {
+      "id": "G4-004",
+      "owner": "Observability Team",
+      "status": "BLOCKED-EXTERNAL"
+    },
+    {
+      "id": "G4-005",
+      "owner": "Observability Team",
+      "status": "BLOCKED-EXTERNAL"
+    },
+    {
+      "id": "G4-006",
+      "owner": "SRE",
+      "status": "BLOCKED-EXTERNAL"
+    },
+    {
+      "id": "G5-001",
+      "owner": "Perf Engineering",
+      "status": "BLOCKED-EXTERNAL"
+    },
+    {
+      "id": "G5-002",
+      "owner": "SRE + Product",
+      "status": "NO-GO"
+    },
+    {
+      "id": "G5-003",
+      "owner": "Security Engineering",
+      "status": "BLOCKED-EXTERNAL"
+    },
+    {
+      "id": "G5-004",
+      "owner": "Security Engineering",
+      "status": "NO-GO"
+    },
+    {
+      "id": "G5-005",
+      "owner": "SRE",
+      "status": "BLOCKED-EXTERNAL"
+    },
+    {
+      "id": "G5-006",
+      "owner": "Release Engineering",
+      "status": "NO-GO"
+    },
+    {
+      "id": "G7-001",
+      "owner": "Release Engineering",
+      "status": "BLOCKED-EXTERNAL"
+    },
+    {
+      "id": "G7-002",
+      "owner": "Daxis Integrations",
+      "status": "BLOCKED-EXTERNAL"
+    },
+    {
+      "id": "G7-003",
+      "owner": "Product + Release",
+      "status": "NO-GO"
+    },
+    {
+      "id": "G7-004",
+      "owner": "Release Engineering",
+      "status": "NO-GO"
+    }
   ]
 }

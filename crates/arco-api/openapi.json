@@ -5634,7 +5634,7 @@
             "properties": {
               "filters": {
                 "type": "object",
-                "description": "Filter expressions.",
+                "description": "Filter bounds. Supported keys: `start`, `end`, `partition_start`, `partition_end`.",
                 "additionalProperties": {
                   "type": "string"
                 },
@@ -5713,7 +5713,7 @@
             "properties": {
               "filters": {
                 "type": "object",
-                "description": "Filter expressions.",
+                "description": "Filter bounds (`start`/`end`) captured on the backfill.",
                 "additionalProperties": {
                   "type": "string"
                 },

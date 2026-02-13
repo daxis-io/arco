@@ -77,6 +77,59 @@ Batch 3 command matrix output is archived at:
 
 ---
 
+## Gate 3 Batch 3 Local Checks (2026-02-12)
+
+These checks cover local/code-only Gate 3 closure work completed in Batch 3.
+
+### 1) Layer-2 projection durability across cold restart (`G3-001`)
+
+```bash
+cargo test -p arco-flow cold_restart_preserves_layer2_backfills_ticks_and_sensors -- --nocapture
+```
+
+Expected result: pass; schedule/sensor/backfill/run-key projection rows survive restart and remain queryable.
+
+### 2) `RunRequested -> RunTriggered/PlanCreated` bridge convergence (`G3-003`)
+
+```bash
+cargo test -p arco-flow --test run_bridge_controller_tests run_bridge_duplicate_and_conflict_requests_converge_after_first_emit -- --nocapture
+cargo test -p arco-flow --test run_bridge_controller_tests run_bridge_uses_matching_fingerprint_when_conflicts_exist -- --nocapture
+```
+
+Expected result: pass; first reconcile emits exactly one run, repeated reconcile converges to deterministic skip (`run_already_exists`), and bridge payload selection matches the canonical `request_fingerprint`.
+
+### 3) Explicit runtime limits + SLO defaults (`G3-005`)
+
+Runtime config vars (seconds):
+- `ARCO_FLOW_ORCH_MAX_COMPACTION_LAG_SECS` (default `30`)
+- `ARCO_FLOW_ORCH_SLO_P95_RUN_REQUESTED_TO_TRIGGERED_SECS` (default `10`)
+- `ARCO_FLOW_ORCH_SLO_P95_COMPACTION_LAG_SECS` (default `30`)
+
+```bash
+cargo test -p arco-flow --test runtime_observability_tests runtime_config_uses_expected_defaults -- --nocapture
+cargo test -p arco-flow --test runtime_observability_tests runtime_config_applies_env_overrides -- --nocapture
+cargo test -p arco-flow --test runtime_observability_tests runtime_config_rejects_non_positive_values -- --nocapture
+cargo test -p arco-flow --test runtime_observability_tests slo_snapshot_detects_compaction_lag_breach -- --nocapture
+cargo test -p arco-flow --test runtime_observability_tests slo_snapshot_detects_run_requested_to_triggered_p95_breach -- --nocapture
+```
+
+Expected result: pass; runtime limits are enforced, SLO defaults/overrides are deterministic, invalid non-positive values are rejected, and SLO breach detection is enforced at runtime.
+
+### 4) Operator metrics emission for backlog/lag/conflicts (`G3-006`)
+
+```bash
+rg -n "arco_orch_backlog_depth|arco_orch_compaction_lag_seconds|arco_orch_run_key_conflicts|arco_orch_controller_reconcile_seconds|arco_orch_slo_target_seconds|arco_orch_slo_observed_seconds|arco_orch_slo_breaches_total" \
+  crates/arco-flow/src/metrics.rs \
+  crates/arco-flow/src/bin/arco_flow_dispatcher.rs \
+  crates/arco-flow/src/orchestration/controllers/
+cargo test -p arco-flow --test runtime_observability_tests backlog_snapshot_reports_pending_counts_conflicts_and_lag -- --nocapture
+cargo test -p arco-flow --test runtime_observability_tests backlog_snapshot_counts_only_actionable_dispatch_and_timer_rows -- --nocapture
+```
+
+Expected result: metric names are present in dispatcher/controller paths and backlog gauges count actionable pending rows only.
+
+---
+
 ## Gate 5 Critical Metrics
 
 These metrics are essential for Gate 5 invariant monitoring.

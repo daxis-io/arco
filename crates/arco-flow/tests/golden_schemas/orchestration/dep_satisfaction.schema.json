@@ -1,0 +1,46 @@
+{
+  "name": "dep_satisfaction",
+  "version": 1,
+  "fields": [
+    {
+      "name": "run_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "upstream_task_key",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "downstream_task_key",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "satisfied",
+      "data_type": "Boolean",
+      "nullable": false
+    },
+    {
+      "name": "resolution",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "satisfied_at",
+      "data_type": "Int64",
+      "nullable": true
+    },
+    {
+      "name": "satisfying_attempt",
+      "data_type": "UInt32",
+      "nullable": true
+    },
+    {
+      "name": "row_version",
+      "data_type": "Utf8",
+      "nullable": false
+    }
+  ]
+}

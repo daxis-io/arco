@@ -27,6 +27,56 @@ All metrics include these labels:
 
 ---
 
+## Gate 2 Batch 3 Invariant Checks (2026-02-12)
+
+These checks are the local/code-only closure checks for Gate 2 Batch 3.
+
+### 1) Typed-path canonicalization (non-catalog flow/api/iceberg)
+
+No hardcoded storage path literals should remain in scoped modules:
+
+```bash
+rg -n '"(ledger|state|events|_catalog|orchestration|manifests|locks|snapshots|commits|sequence|quarantine)/[^"\\n]*"' \
+  crates/arco-flow/src/orchestration/ledger.rs \
+  crates/arco-flow/src/outbox.rs \
+  crates/arco-iceberg/src/pointer.rs \
+  crates/arco-iceberg/src/events.rs \
+  crates/arco-iceberg/src/idempotency.rs \
+  crates/arco-api/src/paths.rs \
+  crates/arco-api/src/routes/manifests.rs \
+  crates/arco-api/src/routes/orchestration.rs
+```
+
+Expected result: no matches.
+
+### 2) Deterministic/property invariants (out-of-order, duplicate, crash replay)
+
+```bash
+cargo test -p arco-flow --features test-utils --test property_tests compaction_is_out_of_order_and_duplicate_invariant -- --nocapture
+cargo test -p arco-flow --features test-utils --test property_tests compaction_crash_replay_converges_to_single_pass_state -- --nocapture
+```
+
+Expected result: all tests pass.
+
+### 3) Failure-injection checks (CAS race, partial writes, compaction replay)
+
+```bash
+cargo test -p arco-iceberg test_pointer_store_cas_race_has_single_winner -- --nocapture
+cargo test -p arco-flow ledger_writer_recovers_after_partial_batch_write_failure -- --nocapture
+cargo test -p arco-flow --test orchestration_correctness_tests test_compaction_replay_recovers_after_manifest_publish_failure -- --nocapture
+```
+
+Expected result: all tests pass.
+
+### 4) Batch matrix evidence (release gate input)
+
+Batch 3 command matrix output is archived at:
+
+- `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-matrix-status.tsv`
+- `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-logs/`
+
+---
+
 ## Gate 5 Critical Metrics
 
 These metrics are essential for Gate 5 invariant monitoring.

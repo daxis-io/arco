@@ -1,0 +1,1160 @@
+   Compiling arco-flow v0.1.0 (/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure/crates/arco-flow)
+   Compiling arco-test-utils v0.1.0 (/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure/crates/arco-test-utils)
+   Compiling arco-api v0.1.0 (/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure/crates/arco-api)
+   Compiling arco-iceberg v0.1.0 (/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure/crates/arco-iceberg)
+   Compiling arco-integration-tests v0.1.0 (/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure/crates/arco-integration-tests)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.93s
+     Running unittests src/lib.rs (target/debug/deps/arco_catalog-baf4dd18ac491bb8)
+
+running 133 tests
+test asset::tests::test_asset_format_extension ... ok
+test asset::tests::test_asset_key_empty_group ... ok
+test asset::tests::test_asset_key_parse_invalid ... ok
+test asset::tests::test_asset_key_invalid_start ... ok
+test asset::tests::test_asset_key_parse ... ok
+test asset::tests::test_asset_key_invalid_characters ... ok
+test asset::tests::test_asset_key_empty_name ... ok
+test asset::tests::test_asset_key_valid ... ok
+test asset::tests::test_asset_key_with_digits ... ok
+test asset::tests::test_asset_key_with_underscores ... ok
+test asset::tests::test_create_asset_request ... ok
+test asset::tests::test_asset_creation ... ok
+test gc::collector::tests::test_extract_snapshot_version_dir ... ok
+test gc::collector::tests::test_extract_version_number ... ok
+test asset::tests::test_asset_serialization ... ok
+test gc::collector::tests::test_gc_result_merge ... ok
+test gc::policy::tests::test_aggressive_policy ... ok
+test gc::policy::tests::test_conservative_policy ... ok
+test gc::policy::tests::test_default_policy ... ok
+test gc::policy::tests::test_development_policy ... ok
+test gc::policy::tests::test_serde_roundtrip ... ok
+test event_writer::tests::append_is_truly_append_only ... ok
+test event_writer::tests::append_event_creates_ledger_file ... ok
+test compactor::tests::compact_empty_ledger_is_noop ... ok
+test compactor::tests::unknown_event_version_can_be_quarantined ... ok
+test compactor::tests::unknown_event_version_is_rejected_by_default ... ok
+test gc::policy::tests::test_valid_policy ... ok
+test gc::policy::tests::test_validation_delay_hours ... ok
+test gc::policy::tests::test_validation_keep_snapshots ... ok
+test gc::policy::tests::test_validation_ledger_exceeds_max ... ok
+test event_writer::tests::events_are_ordered_chronologically ... ok
+test gc::collector::tests::test_gc_dry_run ... ok
+test gc::collector::tests::test_gc_empty_storage ... ok
+test idempotency::tests::test_canonical_hash_deterministic ... ok
+test idempotency::tests::test_canonical_hash_different_content ... ok
+test event_writer::tests::sequence_positions_are_monotonic ... ok
+test idempotency::tests::test_check_idempotency_new_request ... ok
+test idempotency::tests::test_check_idempotency_no_key ... ok
+test idempotency::tests::test_check_idempotency_in_progress_not_stale ... ok
+test idempotency::tests::test_check_idempotency_conflict ... ok
+test idempotency::tests::test_check_idempotency_replay ... ok
+test idempotency::tests::test_hash_key_deterministic ... ok
+test idempotency::tests::test_calculate_retry_after_jitter_range ... ok
+test idempotency::tests::test_calculate_retry_after_bounds ... ok
+test event_writer::tests::concurrent_appends_allocate_unique_sequence_positions ... ok
+test idempotency::tests::test_check_idempotency_stale_takeover ... ok
+test idempotency::tests::test_marker_finalize_failed ... ok
+test idempotency::tests::test_idempotency_store_claim ... ok
+test idempotency::tests::test_marker_serialization_roundtrip ... ok
+test idempotency::tests::test_marker_state_transitions ... ok
+test idempotency::tests::test_idempotency_store_finalize_conflict ... ok
+test idempotency::tests::test_idempotency_store_finalize ... ok
+test idempotency::tests::test_storage_path_format ... ok
+test idempotency::tests::test_validate_uuidv7_invalid_format ... ok
+test idempotency::tests::test_validate_uuidv7_invalid_version ... ok
+test idempotency::tests::test_takeover_cas_preserves_finalized_state ... ok
+test idempotency::tests::test_validate_uuidv7_valid ... ok
+test idempotency::tests::test_takeover_race_returns_replay_when_finalized ... ok
+test manifest::tests::test_catalog_manifest_has_parent_hash_field ... ok
+test manifest::tests::test_commit_record_hash_chain ... ok
+test manifest::tests::test_commit_record_hash_includes_prev ... ok
+test manifest::tests::test_commit_successor ... ok
+test manifest::tests::test_compute_manifest_hash_deterministic ... ok
+test manifest::tests::test_compute_manifest_hash_different_bytes ... ok
+test manifest::tests::test_core_manifest_structure ... ok
+test manifest::tests::test_execution_manifest_structure ... ok
+test manifest::tests::test_domain_manifests_independent_serialization ... ok
+test manifest::tests::test_governance_manifest_structure ... ok
+test manifest::tests::test_lineage_manifest_structure ... ok
+test manifest::tests::test_next_version ... ok
+test manifest::tests::test_root_manifest_accepts_legacy_fields ... ok
+test manifest::tests::test_root_manifest_contains_only_pointers ... ok
+test manifest::tests::test_validate_succession_commit_ulid_regression_rejected ... ok
+test manifest::tests::test_root_manifest_roundtrip ... ok
+test manifest::tests::test_validate_succession_fencing_token_regression_rejected ... ok
+test manifest::tests::test_validate_succession_no_parent_hash_allowed ... ok
+test manifest::tests::test_validate_succession_parent_hash_mismatch_rejected ... ok
+test manifest::tests::test_validate_succession_same_version_allowed ... ok
+test manifest::tests::test_validate_succession_valid ... ok
+test manifest::tests::test_validate_succession_version_regression_rejected ... ok
+test reader::tests::test_get_freshness_requires_manifest ... ok
+test reader::tests::test_get_mintable_paths_requires_manifest ... ok
+test reader::tests::test_lineage_graph_default ... ok
+test reader::tests::test_list_namespaces_no_manifest ... ok
+test reader::tests::test_mint_signed_urls_validates_paths ... ok
+test reconciler::tests::extract_snapshot_version_parses_tier1_and_tier2 ... ok
+test reader::tests::test_reader_new ... ok
+test search_tombstone::tests::test_archived_tombstone ... ok
+test search_tombstone::tests::test_deleted_tombstone ... ok
+test search_tombstone::tests::test_moved_tombstone ... ok
+test reconciler::tests::check_uses_scope_relative_paths_and_joins_snapshot_files ... ok
+test search_tombstone::tests::test_renamed_tombstone ... ok
+test search_tombstone::tests::test_tombstone_expiry ... ok
+test reader::tests::test_search_mintable_paths_from_snapshot ... ok
+test search_tombstone::tests::test_tombstone_batch ... ok
+test tier1_writer::tests::test_initialize_catalog_creates_required_files ... ok
+test tier1_writer::tests::test_cas_conflict_retries_and_succeeds ... ok
+test search_tombstone::tests::test_tombstone_reason_variants ... ok
+test search_tombstone::tests::test_tombstone_serialization ... ok
+test tier1_writer::tests::test_initialize_idempotent ... ok
+test tier1_writer::tests::test_commit_chain_has_prev_hash ... ok
+test tier1_writer::tests::test_update_with_cas ... ok
+test search_tombstone::tests::test_hot_token_skew_handling ... ok
+test compactor::tests::compact_processes_ledger_events ... ok
+test compactor::tests::parquet_write_is_deterministic ... ok
+test compactor::tests::late_event_is_quarantined ... ok
+test parquet_util::tests::read_tables_tolerates_missing_optional_columns ... ok
+test parquet_util::tests::read_lineage_edges_tolerates_missing_optional_columns ... ok
+test writer::tests::test_event_writer_returns_owned ... ok
+test parquet_util::tests::read_namespaces_tolerates_missing_optional_columns ... ok
+test parquet_util::tests::read_columns_tolerates_missing_optional_columns ... ok
+test writer::tests::test_create_catalog ... ok
+test writer::tests::test_initialize_creates_manifests ... ok
+test writer::tests::test_create_duplicate_catalog_fails ... ok
+test writer::tests::test_create_namespace ... ok
+test compactor::tests::concurrent_compactors_retry_on_cas_conflict ... ok
+test writer::tests::test_create_duplicate_namespace_fails ... ok
+test tier1_compactor::tests::sync_compact_search_writes_snapshot ... ok
+test writer::tests::test_create_schema_sets_catalog_id ... ok
+test compactor::tests::second_compaction_only_processes_new_events ... ok
+test writer::tests::test_lineage_writes_publish_and_increment_manifest ... ok
+test writer::tests::test_create_namespace_creates_default_catalog_once ... ok
+test writer::tests::test_domain_split_separate_locks ... ok
+test writer::tests::test_delete_namespace ... ok
+test writer::tests::test_rename_table_not_found_fails ... ok
+test writer::tests::test_register_table ... ok
+test writer::tests::test_register_table_in_schema_uses_catalog_and_schema ... ok
+test writer::tests::test_create_schema_allows_same_name_in_different_catalogs ... ok
+test writer::tests::test_rename_table_cross_namespace_fails ... ok
+test writer::tests::test_rename_table_same_name_noop ... ok
+test writer::tests::test_rename_table ... ok
+test writer::tests::test_rename_table_conflict_fails ... ok
+test writer::tests::test_register_table_resolves_namespace_in_default_catalog ... ok
+
+test result: ok. 133 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/concurrent_writers.rs (target/debug/deps/concurrent_writers-0adc3edea1f08b0f)
+
+running 3 tests
+test test_two_writers_initialize_race ... ok
+test test_loser_can_retry ... ok
+test test_many_concurrent_updates ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/failure_injection.rs (target/debug/deps/failure_injection-a2854b86ca229f18)
+
+running 6 tests
+test failing_backend_fail_all_mode ... ok
+test failing_backend_single_shot_failure ... ok
+test tier1_lock_failure_does_not_corrupt_state ... ok
+test tier1_initialize_idempotent_after_failure ... ok
+test tier1_crash_between_snapshot_and_cas ... ok
+test tier1_reader_sees_only_committed_state ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/path_contracts.rs (target/debug/deps/path_contracts-1e2047155f965432)
+
+running 8 tests
+test contract_lock_paths_canonical_naming ... ok
+test contract_manifest_paths_canonical_naming ... ok
+test contract_ledger_paths_canonical_structure ... ok
+test contract_snapshot_paths_canonical_structure ... ok
+test contract_state_paths_canonical_structure ... ok
+test contract_root_manifest_is_entry_point ... ok
+test contract_legacy_name_normalization ... ok
+test contract_event_writer_path_format ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/schema_contracts.rs (target/debug/deps/schema_contracts-7f3d03de58603ee3)
+
+running 25 tests
+test contract_lineage_edges_required_fields ... ok
+test contract_namespaces_required_fields ... ok
+test contract_columns_required_fields ... ok
+test contract_catalogs_required_fields ... ok
+test contract_id_fields_are_strings ... ok
+test contract_tables_required_fields ... ok
+test contract_timestamp_fields_use_milliseconds ... ok
+test contract_lineage_edges_parquet_schema_backward_compatible ... ok
+test contract_catalogs_parquet_schema_backward_compatible ... ok
+test contract_namespaces_parquet_schema_backward_compatible ... ok
+test contract_tables_parquet_schema_backward_compatible ... ok
+test contract_columns_parquet_schema_backward_compatible ... ok
+test generate_golden_schemas ... ignored
+test current_schemas_match_golden_field_count ... ok
+test golden_schemas_are_valid_and_parseable ... ok
+test contract_namespaces_parquet_write_is_deterministic ... ok
+test contract_catalogs_parquet_write_is_deterministic ... ok
+test contract_columns_parquet_write_is_deterministic ... ok
+test contract_tables_parquet_write_is_deterministic ... ok
+test contract_lineage_edges_parquet_write_is_deterministic ... ok
+test contract_lineage_edges_roundtrip_preserves_schema ... ok
+test contract_catalogs_roundtrip_preserves_schema ... ok
+test contract_tables_roundtrip_preserves_schema ... ok
+test contract_columns_roundtrip_preserves_schema ... ok
+test contract_namespaces_roundtrip_preserves_schema ... ok
+
+test result: ok. 24 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src/lib.rs (target/debug/deps/arco_cli-acad302f7032e675)
+
+running 12 tests
+test commands::status::tests::test_status_args_list ... ok
+test commands::deploy::tests::test_deploy_args_parsing ... ok
+test commands::deploy::tests::test_deploy_args_with_deployed_by ... ok
+test commands::status::tests::test_status_args_parsing ... ok
+test commands::run::tests::test_run_args_multiple_assets ... ok
+test commands::run::tests::test_run_args_rerun_subset_parsing ... ok
+test commands::run::tests::test_run_args_parsing ... ok
+test commands::run::tests::test_run_args_comma_separated_assets ... ok
+test commands::logs::tests::test_logs_args_parsing ... ok
+test commands::run::tests::test_run_args_rerun_from_failure_parsing ... ok
+test commands::run_key_backfill::tests::test_backfill_args_parsing ... ok
+test tests::test_cli_config_from_flags ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/arco-466839e343824316)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/arco_compactor-77cb9d369faf391f)
+
+running 25 tests
+test anti_entropy::tests::test_bounded_per_run ... ok
+test notification_consumer::tests::test_default_config_domains ... ok
+test anti_entropy::tests::test_cursor_lifecycle ... ok
+test sync_compact::tests::test_sync_compact_error_display ... ok
+test notification_consumer::tests::test_event_notification_from_path ... ok
+test notification_consumer::tests::test_event_notification_invalid_path ... ok
+test anti_entropy::tests::test_cursor_path_format ... ok
+test anti_entropy::tests::test_anti_entropy_is_only_lister ... ok
+test notification_consumer::tests::test_notification_does_not_list ... ok
+test notification_consumer::tests::test_consumer_rejects_unconfigured_domain ... ok
+test tests::test_normalize_metrics_secret_trims_empty ... ok
+test notification_consumer::tests::test_consumer_batch_size_flush ... ok
+test notification_consumer::tests::test_event_batch_grouping ... ok
+test notification_consumer::tests::test_event_batch_drain ... ok
+test sync_compact::tests::test_sync_compact_executions_is_unsupported ... ok
+test sync_compact::tests::test_sync_compact_request_serialization ... ok
+test anti_entropy::tests::test_cursor_serialization ... ok
+test anti_entropy::tests::test_anti_entropy_pass_empty ... ok
+test anti_entropy::tests::test_search_anti_entropy_uses_bounded_scan_cursor ... ok
+test tests::test_metrics_gate_rejects_missing_or_wrong_secret ... ok
+test notification_consumer::tests::test_consumer_flush ... ok
+test tests::test_metrics_gate_disabled_when_secret_empty ... ok
+test tests::test_metrics_gate_accepts_x_metrics_secret ... ok
+test tests::test_metrics_gate_accepts_bearer_secret ... ok
+test tests::test_metrics_gate_accepts_when_both_headers_present ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running unittests src/lib.rs (target/debug/deps/arco_core-4cd9d0ecf29ef13a)
+
+running 173 tests
+test audit::tests::test_audit_action_is_deny ... ok
+test audit::tests::test_audit_sink_config_default ... ok
+test audit::tests::test_audit_action_category ... ok
+test audit::tests::test_audit_emitter_with_tracing ... ok
+test audit::tests::test_audit_action_display ... ok
+test backpressure::tests::test_accept_below_soft ... ok
+test backpressure::tests::test_accept_with_warning ... ok
+test audit::tests::test_audit_event_builder_missing_required_field ... ok
+test backpressure::tests::test_no_listing_required ... ok
+test backpressure::tests::test_backpressure_error_display ... ok
+test backpressure::tests::test_pending_lag_calculation ... ok
+test backpressure::tests::test_pending_lag_no_underflow ... ok
+test audit::tests::test_audit_action_serde_roundtrip ... ok
+test audit::tests::test_audit_event_redacts_jwt_token_in_resource ... ok
+test audit::tests::test_audit_event_redacts_jwt_in_actor ... ok
+test audit::tests::test_pre_auth_deny_event_no_tenant ... ok
+test audit::tests::test_audit_event_redacts_signed_url_in_resource ... ok
+test backpressure::tests::test_registry_tracks_domains ... ok
+test audit::tests::test_audit_event_serialization_no_secrets ... ok
+test backpressure::tests::test_registry_check_returns_decision ... ok
+test audit::tests::test_audit_event_schema_fields_present ... ok
+test audit::tests::test_audit_event_schema_optional_fields_skipped_when_none ... ok
+test backpressure::tests::test_registry_check_rejects ... ok
+test backpressure::tests::test_reject_above_hard ... ok
+test backpressure::tests::test_retry_after_scales_with_lag ... ok
+test canonical_json::tests::canonical_partition_key_sorts_dimensions ... ok
+test canonical_json::tests::handles_booleans ... ok
+test canonical_json::tests::handles_empty_array ... ok
+test canonical_json::tests::handles_empty_object ... ok
+test audit::tests::test_test_audit_sink_clear ... ok
+test audit::tests::test_test_audit_sink_captures_events ... ok
+test audit::tests::test_audit_emitter_emit_checked_succeeds ... ok
+test canonical_json::tests::handles_null ... ok
+test audit::tests::test_test_audit_sink_find_by_action ... ok
+test canonical_json::tests::rejects_explicit_floats ... ok
+test canonical_json::tests::rejects_float_like_integers ... ok
+test canonical_json::tests::rejects_floats ... ok
+test canonical_json::tests::rejects_nan_and_infinity ... ok
+test canonical_json::tests::sorts_object_keys_and_has_no_whitespace ... ok
+test canonical_json::tests::string_escaping_is_stable ... ok
+test catalog_paths::tests::test_all_domains ... ok
+test catalog_paths::tests::test_commit_paths ... ok
+test catalog_paths::tests::test_domain_lock_paths ... ok
+test catalog_paths::tests::test_domain_manifest_paths ... ok
+test catalog_paths::tests::test_ledger_paths ... ok
+test catalog_paths::tests::test_legacy_domain_detection ... ok
+test audit::tests::test_audit_event_serde_roundtrip ... ok
+test audit::tests::test_audit_event_builder ... ok
+test canonical_json::tests::handles_large_integers ... ok
+test canonical_json::tests::allows_integers ... ok
+test canonical_json::tests::handles_negative_integers ... ok
+test canonical_json::tests::deeply_nested_structure ... ok
+test canonical_json::tests::sorts_nested_objects_recursively ... ok
+test canonical_json::tests::preserves_array_order ... ok
+test catalog_paths::tests::test_domain_manifest_str_with_legacy_names ... ok
+test catalog_paths::tests::test_quarantine_paths ... ok
+test catalog_paths::tests::test_legacy_name_normalization ... ok
+test catalog_paths::tests::test_root_manifest_path ... ok
+test catalog_paths::tests::test_sequence_paths ... ok
+test catalog_event::tests::idempotency_key_is_deterministic ... ok
+test catalog_paths::tests::test_snapshot_paths ... ok
+test catalog_paths::tests::test_state_paths ... ok
+test id::tests::asset_id_roundtrip ... ok
+test id::tests::ids_are_unique ... ok
+test id::tests::event_id_roundtrip ... ok
+test id::tests::invalid_id_returns_error ... ok
+test id::tests::materialization_id_roundtrip ... ok
+test id::tests::materialization_ids_are_unique ... ok
+test id::tests::run_id_roundtrip ... ok
+test id::tests::task_id_roundtrip ... ok
+test id::tests::task_ids_are_unique ... ok
+test lock::tests::test_paths ... ok
+test observability::tests::test_redacted_clone ... ok
+test observability::tests::test_orchestration_span_creates_span ... ok
+test observability::tests::test_redacted_debug_hides_value ... ok
+test observability::tests::test_redacted_default ... ok
+test observability::tests::test_redacted_display_hides_value ... ok
+test observability::tests::test_redacted_equality ... ok
+test observability::tests::test_redacted_expose_reveals_value ... ok
+test observability::tests::test_redacted_into_inner ... ok
+test observability::tests::test_span_helper_creates_span ... ok
+test lock::tests::test_lock_info_expiry ... ok
+test partition::tests::test_canonical_deterministic_regardless_of_insertion_order ... ok
+test observability::tests::test_init_logging_succeeds ... ok
+test partition::tests::test_canonical_string_all_types ... ok
+test partition::tests::test_canonical_string_single_date ... ok
+test partition::tests::test_canonical_string_sorted_keys ... ok
+test partition::tests::test_canonical_string_url_safe ... ok
+test partition::tests::test_empty_partition_key ... ok
+test partition::tests::test_parse_accepts_valid_timestamp ... ok
+test partition::tests::test_parse_rejects_duplicate_keys ... ok
+test partition::tests::test_parse_rejects_invalid_date_day ... ok
+test partition::tests::test_parse_rejects_invalid_date_month ... ok
+test partition::tests::test_parse_rejects_invalid_timestamp_format ... ok
+test partition::tests::test_parse_rejects_year_before_1970 ... ok
+test partition::tests::test_partition_id_format ... ok
+test partition::tests::test_partition_id_derivation ... ok
+test partition::tests::test_partition_key_parse_invalid_key ... ok
+  2026-02-12T05:37:01.078251Z  WARN arco_core::publish: PublishPermit dropped without being consumed, fencing_token: FencingToken(1), domain: catalog, commit_ulid: 01KH85MK4NGTZREG02R2X6VWYW, issuer: test.lock
+    at crates/arco-core/src/publish.rs:314
+
+test partition::tests::test_partition_key_parse_missing_equals ... ok
+test lock::tests::test_force_break ... ok
+test lock::tests::test_lock_prevents_second_acquisition ... ok
+test lock::tests::test_acquire_and_release ... ok
+test lock::tests::test_lock_with_operation ... ok
+test lock::tests::test_extend_ttl ... ok
+  2026-02-12T05:37:01.078413Z  WARN arco_core::publish: PublishPermit dropped without being consumed, fencing_token: FencingToken(42), domain: catalog, commit_ulid: 01KH85MK4PY0YG755E1YJPJ3RV, issuer: test-lock
+    at crates/arco-core/src/publish.rs:314
+
+  2026-02-12T05:37:01.078416Z  WARN arco_core::publish: PublishPermit dropped without being consumed, fencing_token: FencingToken(1), domain: b, commit_ulid: 01KH85MK4P35A6RSGQYJYENDJ7, issuer: lock-a
+    at crates/arco-core/src/publish.rs:314
+
+test lock::tests::test_permit_issuer_from_lock_guard ...   2026-02-12T05:37:01.078430Z  WARN arco_core::publish: PublishPermit dropped without being consumed, fencing_token: FencingToken(1), domain: a, commit_ulid: 01KH85MK4PKBQSXMPF89N8XMXK, issuer: lock-a
+    at crates/arco-core/src/publish.rs:314
+
+ok
+test partition::tests::test_partition_key_parse_unknown_type ... ok
+  2026-02-12T05:37:01.078470Z  WARN arco_core::publish: PublishPermit dropped without being consumed, fencing_token: FencingToken(100), domain: catalog, commit_ulid: 01KH85MK4PDQJV3BB46Y3NFEAQ, issuer: lock-a
+    at crates/arco-core/src/publish.rs:314
+
+test partition::tests::test_partition_key_roundtrip ... ok
+test partition::tests::test_scalar_value_type_tags ... ok
+test publish::tests::test_create_permit_has_no_expected_version ... ok
+test publish::tests::test_fencing_token_ordering ... ok
+test publish::tests::test_different_issuers_same_token ... ok
+  2026-02-12T05:37:01.078557Z  WARN arco_core::publish: PublishPermit dropped without being consumed, fencing_token: FencingToken(42), domain: catalog, commit_ulid: 01KH85MK4PSKS3V1ZDAV3RSSW7, issuer: test-lock
+    at crates/arco-core/src/publish.rs:314
+
+test publish::tests::test_fencing_token_from_issuer ... ok
+  2026-02-12T05:37:01.078566Z  WARN arco_core::publish: PublishPermit dropped without being consumed, fencing_token: FencingToken(42), domain: catalog, commit_ulid: 01KH85MK4P6WQ7JHDKGR0875G2, issuer: test-lock
+    at crates/arco-core/src/publish.rs:314
+
+test publish::tests::test_permit_consumes_once ... ok
+test scoped_storage::tests::test_canonical_ledger_paths ... ok
+test publish::tests::test_permit_has_unique_commit_ulid ... ok
+  2026-02-12T05:37:01.078624Z  WARN arco_core::publish: Manifest publish failed - CAS race, fencing_token: FencingToken(42), domain: catalog, commit_ulid: 01KH85MK4PM319C7W92FZD0NE3, manifest: manifests/catalog.manifest.json, current_version: 1
+    at crates/arco-core/src/publish.rs:412
+
+test scoped_storage::tests::test_canonical_manifest_paths ... ok
+test scoped_storage::tests::test_canonical_lock_paths ... ok
+test scoped_storage::tests::test_canonical_snapshot_paths ... ok
+test publish::tests::test_publisher_cas_race ... ok
+test scoped_storage::tests::test_canonical_state_paths ... ok
+test publish::tests::test_publisher_success ... ok
+test scoped_storage::tests::test_cross_scope_delete_fails ... ok
+test scoped_storage::tests::test_empty_tenant_id_returns_error ... ok
+test scoped_storage::tests::test_different_tenants_isolation ... ok
+test scoped_storage::tests::test_legacy_core_paths ... ok
+test scoped_storage::tests::test_legacy_ledger_paths ... ok
+test scoped_storage::tests::test_cross_scope_read_fails ... ok
+test scoped_storage::tests::test_legacy_governance_paths ... ok
+test scoped_storage::tests::test_legacy_catalog_path_operations ... ok
+test scoped_storage::tests::test_legacy_state_paths ... ok
+test scoped_storage::tests::test_tenant_with_dots_returns_error ... ok
+test scoped_storage::tests::test_tenant_with_newline_returns_error ... ok
+test scoped_storage::tests::test_list_isolation_boundary ... ok
+test scoped_storage::tests::test_tenant_with_slash_returns_error ... ok
+test scoped_storage::tests::test_tenant_with_space_returns_error ... ok
+test scoped_storage::tests::test_path_traversal_prevention ... ok
+test scoped_storage::tests::test_valid_relative_paths ... ok
+test scoped_storage::tests::test_tenant_workspace_isolation ... ok
+test storage::tests::test_delete ... ok
+test storage::tests::test_get_range_invalid_end_before_start ... ok
+test storage::tests::test_get_range_clamps_end ... ok
+test storage::tests::test_memory_backend_roundtrip ... ok
+test storage::tests::test_list_with_prefix ... ok
+test storage::tests::test_get_range_invalid_start ... ok
+test storage::tests::test_get_range_valid ... ok
+test storage::tests::test_object_meta_has_required_fields ... ok
+test storage::tests::test_precondition_does_not_exist ... ok
+test storage::tests::test_precondition_matches_version ... ok
+test storage_keys::tests::test_commit_key_format ... ok
+test storage::tests::test_signed_url_generation ... ok
+test storage_keys::tests::test_keys_implement_display ... ok
+test storage_keys::tests::test_ledger_key_format ... ok
+test storage_keys::tests::test_lock_key_format ... ok
+test storage_keys::tests::test_quarantine_key_format ... ok
+test storage_keys::tests::test_manifest_key_format ... ok
+test storage_keys::tests::test_sequence_key_format ... ok
+test storage_keys::tests::test_state_key_format ... ok
+test storage_traits::tests::test_cas_store_requires_version ... ok
+test tenant::tests::invalid_tenant_ids ... ok
+test storage_traits::tests::test_meta_store_head ... ok
+test tenant::tests::storage_prefix ... ok
+test tenant::tests::valid_tenant_ids ... ok
+test storage_traits::tests::test_ledger_put_store_uses_does_not_exist ... ok
+test storage_traits::tests::test_read_store_works ... ok
+test lock::tests::test_expired_lock_can_be_taken_over ... ok
+test canonical_json::tests::proptests::same_content_same_canonical_bytes ... ok
+test lock::tests::test_fencing_token_increments_on_takeover ... ok
+test publish::tests::test_permit_cannot_consume_twice - should panic ... ok
+test partition::proptests::canonical_string_url_safe ... ok
+test partition::proptests::partition_key_roundtrip ... ok
+test partition::proptests::canonical_string_deterministic ... ok
+test partition::proptests::partition_id_deterministic ... ok
+test canonical_json::tests::proptests::insertion_order_does_not_affect_canonical_output ... ok
+
+test result: ok. 173 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/canonical_json_golden.rs (target/debug/deps/canonical_json_golden-1461a887be8c8f80)
+
+running 2 tests
+test golden_vectors_document_python_equivalent ... ok
+test canonical_json_golden_vectors ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/integration.rs (target/debug/deps/integration-5107d2ebdf4d71ca)
+
+running 4 tests
+test cross_language::partition_key_test::test_fixture_count ... ok
+test cross_language::partition_key_test::test_canonical_is_path_safe ... ok
+test cross_language::partition_key_test::test_all_fixtures_match_expected_canonical ... ok
+test cross_language::partition_key_test::test_round_trip_all_fixtures ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ui.rs (target/debug/deps/ui-4848eb87f2bc56be)
+
+running 1 test
+    Checking arco-core-tests v0.0.0 (/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure/target/tests/trybuild/arco-core)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.33s
+
+
+test tests/ui/api_cannot_cas_manifest.rs ... ok
+test tests/ui/ledger_only_cannot_put_state.rs ... ok
+test tests/ui/read_only_cannot_put_ledger.rs ... ok
+test tests/ui/string_paths_rejected.rs ... ok
+
+
+test trait_separation_compile_failures ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.99s
+
+     Running unittests src/lib.rs (target/debug/deps/arco_delta-78811ba9d1a47a33)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/arco_iceberg-b7ad646c694563ac)
+
+running 293 tests
+test audit::tests::test_format_table_resource_no_secrets ... ok
+test audit::tests::test_emit_cred_vend_allow ... ok
+test audit::tests::test_emit_iceberg_commit_without_sequence ... ok
+test audit::tests::test_emit_iceberg_commit ... ok
+test audit::tests::test_emit_iceberg_commit_deny ... ok
+test audit::tests::test_emit_cred_vend_deny ... ok
+test commit::tests::test_validate_default_sort_order_id_success ... ok
+test commit::tests::test_validate_multiple_requirements_one_fails ... ok
+test commit::tests::test_validate_missing_ref ... ok
+test commit::tests::test_validate_current_schema_id_success ... ok
+test commit::tests::test_validate_default_spec_id_success ... ok
+test commit::tests::test_validate_last_assigned_field_id_success ... ok
+test commit::tests::test_validate_ref_snapshot_id_failure ... ok
+test commit::tests::test_validate_ref_snapshot_id_fallback_current_snapshot ... ok
+test commit::tests::test_validate_multiple_requirements ... ok
+test commit::tests::test_validate_current_schema_id_failure ... ok
+test commit::tests::test_validate_last_assigned_partition_id_success ... ok
+test commit::tests::test_validate_ref_snapshot_id_success ... ok
+test commit::tests::test_validate_table_uuid_failure ... ok
+test commit::tests::test_validate_table_uuid_success ... ok
+test context::tests::test_missing_tenant_header ... ok
+test credentials::gcs::tests::test_config_default ... ok
+test coordinator::tests::test_build_metadata_location ... ok
+test credentials::gcs::tests::test_config_with_ttl_clamping ... ok
+test credentials::gcs::tests::test_extract_gcs_prefix_bucket_no_slash ... ok
+test context::tests::test_context_from_headers ... ok
+test credentials::gcs::tests::test_extract_gcs_prefix_bucket_only ... ok
+test credentials::gcs::tests::test_extract_gcs_prefix_directory_no_trailing_slash ... ok
+test credentials::gcs::tests::test_extract_gcs_prefix_directory_with_dots ... ok
+test credentials::gcs::tests::test_extract_gcs_prefix_double_slash_normalized ... ok
+test credentials::gcs::tests::test_extract_gcs_prefix_empty_bucket_rejected ... ok
+test credentials::gcs::tests::test_extract_gcs_prefix_nested_directory ... ok
+test credentials::gcs::tests::test_extract_gcs_prefix_non_gcs ... ok
+test credentials::gcs::tests::test_extract_gcs_prefix_trailing_slash_normalized ... ok
+test credentials::gcs::tests::test_extract_gcs_prefix_with_nested_path ... ok
+test error::tests::test_error_status_codes ... ok
+test error::tests::test_error_type_mapping ... ok
+test error::tests::test_error_response_serialization ... ok
+test events::tests::test_pending_receipt_path ... ok
+test events::tests::test_committed_receipt_path ... ok
+test gc::tests::test_clean_committed_receipts_respects_90_day_retention ... ok
+test gc::tests::test_clean_pending_receipts_deletes_old ... ok
+test gc::tests::test_check_in_progress_action_safe_to_delete ... ok
+test gc::tests::test_check_in_progress_action_mark_failed ... ok
+test gc::tests::test_clean_pending_receipts_skips_recent ... ok
+test gc::tests::test_clean_pending_receipts_empty ... ok
+test gc::tests::test_committed_marker_eligible_after_lifetime_plus_grace ... ok
+test gc::tests::test_clean_table_skips_fresh_markers ... ok
+test gc::tests::test_clean_in_progress_marker_marks_failed_then_deletes ... ok
+test gc::tests::test_clean_receipts_for_date_combines_results ... ok
+test gc::tests::test_clean_in_progress_with_pointer_moved ... ok
+test gc::tests::test_clean_orphans_multiple_files ... ok
+test gc::tests::test_clean_orphans_skips_recent_orphans ... ok
+test gc::tests::test_clean_receipts_for_date_range ... ok
+test gc::tests::test_clean_orphans_deletes_old_orphans ... ok
+test gc::tests::test_clean_in_progress_marker_with_pointer_not_found ... ok
+test gc::tests::test_clean_all_handles_multiple_tables ... ok
+test events::tests::test_committed_receipt_serialization ... ok
+test events::tests::test_pending_receipt_serialization ... ok
+test gc::tests::test_clean_table_deletes_expired_markers ... ok
+test gc::tests::test_event_receipt_gc_config_defaults ... ok
+test gc::tests::test_event_receipt_gc_ignores_non_json ... ok
+test gc::tests::test_find_orphans_all_in_allowlist ... ok
+test gc::tests::test_failed_marker_eligible_after_lifetime_plus_grace ... ok
+test gc::tests::test_find_orphans_detects_orphan ... ok
+test gc::tests::test_find_orphans_empty_directory ... ok
+test gc::tests::test_idempotency_gc_config_parses_lifetime ... ok
+test gc::tests::test_find_orphans_ignores_non_metadata_files ... ok
+test gc::tests::test_in_progress_marker_eligible_after_timeout_plus_grace ... ok
+test gc::tests::test_list_markers_empty ... ok
+test gc::tests::test_list_all_markers_detects_path_mismatch ... ok
+test gc::tests::test_list_markers_ignores_non_json_files ... ok
+test gc::tests::test_list_markers_handles_parse_errors_gracefully ... ok
+test gc::tests::test_list_markers_finds_all_markers ... ok
+test gc::tests::test_list_all_markers_groups_by_table ... ok
+test idempotency::tests::test_hash_key_deterministic ... ok
+test gc::tests::test_metadata_retention_policy_parses_properties ... ok
+test gc::tests::test_metadata_gc_clean_table_skips_when_delete_after_commit_false ... ok
+test gc::tests::test_metadata_gc_clean_table_deletes_orphans ... ok
+test idempotency::tests::test_canonical_hash_different_content ... ok
+test gc::tests::test_metadata_gc_plan_respects_previous_versions_max ... ok
+test idempotency::tests::test_canonical_hash_deterministic ... ok
+test idempotency::tests::test_idempotency_store_claim ... ok
+test idempotency::tests::test_idempotency_store_finalize_conflict ... ok
+test idempotency::tests::test_marker_finalize_failed_clears_commit_fields ... ok
+test idempotency::tests::test_marker_staleness_boundaries ... ok
+test idempotency::tests::test_marker_serialization_roundtrip ... ok
+test idempotency::tests::test_marker_state_transitions ... ok
+test idempotency::tests::test_storage_path_format ... ok
+test idempotency::tests::test_validate_uuidv7_invalid_format ... ok
+test idempotency::tests::test_validate_uuidv7_invalid_variant ... ok
+test idempotency::tests::test_validate_uuidv7_invalid_version ... ok
+test idempotency::tests::test_validate_uuidv7_non_canonical ... ok
+test idempotency::tests::test_validate_uuidv7_valid ... ok
+test metrics::tests::test_endpoint_label_unmatched ... ok
+test metrics::tests::test_should_record_error ... ok
+test metrics::tests::test_status_class ... ok
+test paths::tests::test_resolve_metadata_path_rejects_empty_path ... ok
+test paths::tests::test_resolve_metadata_path_with_scheme_and_scope ... ok
+test paths::tests::test_resolve_metadata_path_with_scope_only ... ok
+test paths::tests::test_resolve_metadata_path_without_scope ... ok
+test pointer::tests::test_effective_pointer_no_pending ... ok
+test pointer::tests::test_effective_pointer_pending_tx_missing ... ok
+test pointer::tests::test_finalize_pending ... ok
+test pointer::tests::test_effective_pointer_pending_committed ... ok
+test pointer::tests::test_effective_pointer_pending_not_committed ... ok
+test pointer::tests::test_pointer_store_cas_conflict ... ok
+test pointer::tests::test_pointer_serialization_roundtrip ... ok
+test pointer::tests::test_pointer_store_create ... ok
+test pointer::tests::test_pointer_v1_backward_compatible ... ok
+test pointer::tests::test_pointer_version_validation ... ok
+test pointer::tests::test_pointer_store_list_all ... ok
+test pointer::tests::test_storage_path ... ok
+test pointer::tests::test_pointer_with_pending ... ok
+test pointer::tests::test_update_source_unknown_fallback ... ok
+test pointer::tests::test_update_source_variants ... ok
+test reconciler::tests::test_metadata_log_chain_entry ... ok
+test reconciler::tests::test_metadata_log_walker_commit_keys ... ok
+test reconciler::tests::test_metadata_log_walker_cycle_detection ... ok
+test reconciler::tests::test_metadata_log_walker_chain_of_three ... ok
+test reconciler::tests::test_metadata_log_walker_new ... ok
+test reconciler::tests::test_metadata_log_walker_includes_refs ... ok
+test reconciler::tests::test_metadata_log_walker_resolves_scoped_uri ... ok
+test reconciler::tests::test_metadata_log_walker_single_metadata ... ok
+test reconciler::tests::test_metadata_log_walker_with_custom_depth ... ok
+test reconciler::tests::test_metadata_log_walker_respects_depth_limit ... ok
+test reconciler::tests::test_metadata_log_walker_skips_corrupt_metadata ... ok
+test reconciler::tests::test_reconciler_config_default ... ok
+test reconciler::tests::test_receipt_backfiller_creates_missing_receipts ... ok
+test reconciler::tests::test_receipt_backfiller_content_is_valid ... ok
+test reconciler::tests::test_receipt_backfiller_skips_existing_receipts ... ok
+test reconciler::tests::test_reconciler_reconcile_all_empty ... ok
+test reconciler::tests::test_receipt_backfiller_uses_correct_date_path ... ok
+test reconciler::tests::test_reconciler_reconcile_table_with_missing_pointer ... ok
+test reconciler::tests::test_reconciliation_report_add_table_result ... ok
+test reconciler::tests::test_reconciliation_report_new ... ok
+test reconciler::tests::test_reconciler_reconcile_table_success ... ok
+test reconciler::tests::test_table_reconciliation_result_new ... ok
+test reconciler::tests::test_reconciliation_report_serialization ... ok
+test reconciler::tests::test_table_reconciliation_result_with_error ... ok
+test reconciler::tests::test_reconciler_reconcile_all_multiple_tables ... ok
+test router::tests::test_router_with_timeout_and_concurrency ... ok
+test routes::catalog::tests::test_commit_transaction_empty_changes_returns_400 ... ok
+test routes::catalog::tests::test_commit_transaction_missing_identifier_returns_400 ... ok
+test routes::catalog::tests::test_rename_table_disabled_returns_406 ... ok
+test routes::catalog::tests::test_commit_transaction_write_disabled_returns_400 ... ok
+test routes::catalog::tests::test_commit_transaction_multi_table_returns_406 ... ok
+test routes::config::tests::test_get_config_accepts_warehouse_query ... ok
+test router::tests::test_router_creation ... ok
+test routes::config::tests::test_get_config_content ... ok
+test routes::config::tests::test_get_config_includes_credentials_when_enabled ... ok
+test routes::config::tests::test_get_config_has_required_endpoints ... ok
+test routes::config::tests::test_get_config_returns_200 ... ok
+test routes::namespaces::tests::test_delete_namespace_disabled ... ok
+test routes::namespaces::tests::test_create_namespace_disabled ... ok
+test routes::namespaces::tests::test_head_namespace_not_found ... ok
+test routes::namespaces::tests::test_delete_namespace_not_found ... ok
+test openapi::tests::test_openapi_generation ... ok
+test routes::namespaces::tests::test_create_namespace ... ok
+test routes::namespaces::tests::test_list_namespaces ... ok
+test routes::namespaces::tests::test_update_properties_overlap_returns_422 ... ok
+test routes::tables::tests::test_create_table_disabled ... ok
+test routes::namespaces::tests::test_delete_namespace ... ok
+test routes::namespaces::tests::test_update_properties_unknown_keys_in_missing ... ok
+test routes::catalog::tests::test_rename_table_cross_namespace_returns_406 ... ok
+test routes::namespaces::tests::test_update_properties_persists_comment ... ok
+test routes::catalog::tests::test_rename_table_not_found_returns_404 ... ok
+test openapi::tests::test_openapi_json_serialization ... ok
+test routes::namespaces::tests::test_create_namespace_already_exists ... ok
+test routes::tables::tests::test_commit_table_guardrails_reject_set_location ... ok
+test routes::tables::tests::test_create_table_with_cred_vending_header_but_disabled_returns_400_before_writes ... ok
+test routes::tables::tests::test_drop_table_disabled ... ok
+test routes::tables::tests::test_drop_table_not_found ... ok
+test routes::tables::tests::test_create_table_with_invalid_location_returns_400 ... ok
+test routes::tables::tests::test_create_table ... ok
+test routes::namespaces::tests::test_head_namespace_exists_returns_no_content ... ok
+test routes::tables::tests::test_create_table_then_load_succeeds ... ok
+test routes::tables::tests::test_register_table_disabled ... ok
+test routes::tables::tests::test_create_table_then_commit_with_uuid_assert_succeeds ... ok
+test routes::tables::tests::test_drop_table_with_purge_returns_406 ... ok
+test routes::tables::tests::test_head_table_exists_returns_no_content ... ok
+test routes::tables::tests::test_load_table ... ok
+test routes::tables::tests::test_create_table_pointer_conflict_rolls_back ... ok
+test routes::tables::tests::test_register_table_preserves_original_metadata_file ... ok
+test routes::utils::tests::test_paginate ... ok
+test routes::utils::tests::test_parse_namespace_percent_encoded ... ok
+test routes::utils::tests::test_parse_namespace_percent_encoded_lowercase ... ok
+test routes::utils::tests::test_parse_namespace_unit_separator ... ok
+test schema_projection::tests::test_column_id_differs_by_field ... ok
+test schema_projection::tests::test_column_id_differs_by_table ... ok
+test routes::catalog::tests::test_rename_table_returns_204 ... ok
+test schema_projection::tests::test_column_id_generation_is_stable ... ok
+test schema_projection::tests::test_column_record_serialization ... ok
+test routes::tables::tests::test_drop_table ... ok
+test schema_projection::tests::test_decimal_type_deserialize ... ok
+test schema_projection::tests::test_iceberg_schema_deserialize ... ok
+test schema_projection::tests::test_map_binary ... ok
+test schema_projection::tests::test_map_boolean ... ok
+test schema_projection::tests::test_map_date ... ok
+test schema_projection::tests::test_map_decimal ... ok
+test schema_projection::tests::test_map_double ... ok
+test schema_projection::tests::test_map_fixed ... ok
+test routes::tables::tests::test_register_table ... ok
+test schema_projection::tests::test_map_float ... ok
+test schema_projection::tests::test_map_int ... ok
+test schema_projection::tests::test_map_list ... ok
+test schema_projection::tests::test_map_long ... ok
+test schema_projection::tests::test_map_map ... ok
+test schema_projection::tests::test_map_nested_complex ... ok
+test schema_projection::tests::test_map_string ... ok
+test schema_projection::tests::test_map_time ... ok
+test schema_projection::tests::test_map_struct ... ok
+test schema_projection::tests::test_map_timestamp ... ok
+test schema_projection::tests::test_map_timestamptz ... ok
+test schema_projection::tests::test_map_uuid ... ok
+test schema_projection::tests::test_project_simple_schema ... ok
+test schema_projection::tests::test_project_nested_flattens_struct ... ok
+test state::tests::test_decode_percent_passthrough ... ok
+test transactions::tests::test_storage_path ... ok
+test state::tests::test_namespace_separator_decoding ... ok
+test schema_projection::tests::test_project_with_complex_types ... ok
+test transactions::tests::test_transaction_record_serialization_roundtrip ... ok
+test transactions::tests::test_transaction_staleness ... ok
+test routes::tables::tests::test_load_table_if_none_match_star ... ok
+test transactions::tests::test_transaction_status_transitions ... ok
+test transactions::tests::test_transaction_store_create ... ok
+test transactions::tests::test_transaction_store_cas ... ok
+test transactions::tests::test_transaction_table_lookup ... ok
+test transactions::tests::test_transaction_store_load ... ok
+test types::commit::tests::test_assert_table_uuid ... ok
+test types::commit::tests::test_commit_table_request_builder ... ok
+test routes::tables::tests::test_register_table_pointer_conflict_rolls_back ... ok
+test types::commit::tests::test_commit_table_response_serialization ... ok
+test types::commit::tests::test_commit_table_request_deserialization ... ok
+test types::commit::tests::test_guardrail_allows_add_snapshot ... ok
+test types::commit::tests::test_guardrail_allows_normal_properties ... ok
+test types::commit::tests::test_guardrail_rejects_arco_properties ... ok
+test types::commit::tests::test_guardrail_rejects_mixed_case_arco_properties ... ok
+test types::commit::tests::test_guardrail_rejects_remove_arco_properties ... ok
+test types::commit::tests::test_guardrail_rejects_set_location ... ok
+test types::commit::tests::test_table_update_add_snapshot ... ok
+test types::commit::tests::test_table_update_set_snapshot_ref ... ok
+test types::commit::tests::test_table_update_set_snapshot_ref_invalid_type ... ok
+test types::commit::tests::test_update_requirement_deserialization ... ok
+test types::config::tests::test_allow_write_does_not_advertise_namespace_crud ... ok
+test types::config::tests::test_arco_default_has_read_endpoints ... ok
+test types::config::tests::test_config_response_deserialization ... ok
+test types::config::tests::test_config_response_serialization ... ok
+test types::config::tests::test_metrics_endpoint_always_advertised ... ok
+test types::config::tests::test_namespace_crud_advertises_endpoints ... ok
+test types::config::tests::test_rename_endpoint_advertised_with_table_crud ... ok
+test types::config::tests::test_rename_endpoint_not_advertised_without_table_crud ... ok
+test types::config::tests::test_table_crud_advertises_endpoints ... ok
+test types::config::tests::test_table_crud_not_advertised_by_default ... ok
+test types::config::tests::test_transactions_commit_advertised_when_both_flags_enabled ... ok
+test types::config::tests::test_transactions_commit_not_advertised_by_default ... ok
+test routes::tables::tests::test_report_metrics_rejects_invalid_report_type ... ok
+test types::credentials::tests::test_access_delegation_parsing ... ok
+test types::config::tests::test_transactions_commit_not_advertised_without_write ... ok
+test types::credentials::tests::test_gcs_credential ... ok
+test types::credentials::tests::test_s3_credential ... ok
+test types::credentials::tests::test_supported_delegation ... ok
+test types::ids::tests::test_commit_key_deterministic ... ok
+test types::credentials::tests::test_credential_serialization ... ok
+test types::ids::tests::test_object_version_newtype ... ok
+test types::ids::tests::test_table_uuid_roundtrip ... ok
+test types::ids::tests::test_commit_key_different_locations ... ok
+test types::metrics::tests::test_minimal_report_deserialization ... ok
+test types::metrics::tests::test_scan_report_deserialization ... ok
+test types::namespace::tests::test_list_namespaces_no_token ... ok
+test types::namespace::tests::test_list_namespaces_response ... ok
+test types::metrics::tests::test_commit_report_deserialization ... ok
+test types::namespace::tests::test_namespace_ident_nested ... ok
+test types::namespace::tests::test_get_namespace_response ... ok
+test routes::tables::tests::test_report_metrics_returns_404_for_missing_table ... ok
+test types::table::tests::test_drop_table_query_defaults_to_false ... ok
+test types::table::tests::test_create_table_request_parsing ... ok
+test types::table::tests::test_create_table_request_with_location_and_stage ... ok
+test types::table::tests::test_drop_table_query_with_purge ... ok
+test types::table::tests::test_list_tables_response ... ok
+test types::table::tests::test_load_table_query_default ... ok
+test types::table::tests::test_load_table_response_minimal ... ok
+test types::table::tests::test_snapshots_filter_default ... ok
+test types::table::tests::test_load_table_response_with_credentials ... ok
+test types::table::tests::test_register_table_request_parsing ... ok
+test types::table::tests::test_snapshots_filter_parsing ... ok
+test types::table::tests::test_table_ident_simple ... ok
+test routes::tables::tests::test_list_tables ... ok
+test routes::tables::tests::test_report_metrics_returns_204_for_existing_table ... ok
+test routes::tables::tests::test_register_table_then_commit_with_uuid_assert_succeeds ... ok
+test idempotency::tests::prop_canonical_hash_order_invariant ... ok
+test pointer::tests::prop_pointer_store_cas_roundtrip ... ok
+test metrics::tests::test_request_metrics_labels ... ok
+
+test result: ok. 293 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/audit_wiring.rs (target/debug/deps/audit_wiring-f7315f27981af6fd)
+
+running 3 tests
+test test_credential_vend_deny_emits_audit_when_disabled ... ok
+test test_load_table_does_not_emit_audit ... ok
+test test_commit_with_wrong_uuid_emits_deny_audit ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/commit_flow.rs (target/debug/deps/commit_flow-7703361297e16e5b)
+
+running 15 tests
+test multi_table_transactions::test_tx_commit_crash_before_commit_record_not_visible ... ok
+test multi_table_transactions::test_max_tables_limit_returns_400 ... ok
+test multi_table_transactions::test_tx_commit_crash_after_commit_record_visible ... ok
+test multi_table_transactions::test_stale_tx_record_aborted_on_retry ... ok
+test multi_table_transactions::test_tx_commit_overlap_conflict ... ok
+test multi_table_transactions::test_committed_pending_finalized_on_prepare ... ok
+test multi_table_transactions::test_finalize_only_affects_current_tx_id ... ok
+test multi_table_transactions::test_tx_request_hash_mismatch_returns_conflict ... ok
+test multi_table_transactions::test_tx_idempotency_replay_returns_success ... ok
+test multi_table_transactions::test_tx_commit_two_tables_success_is_atomic ... ok
+test test_commit_table_success_persists_state ... ok
+test test_commit_table_idempotent_replay_returns_cached_response ... ok
+test test_transactions_commit_single_table_returns_204 ... ok
+test test_transactions_commit_multi_table_returns_406_when_disabled ... ok
+test test_transactions_commit_multi_table_returns_204 ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/config_integration.rs (target/debug/deps/config_integration-ccf877eeb7df4373)
+
+running 1 test
+test test_config_endpoint_includes_request_id_and_fields ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/crate_structure.rs (target/debug/deps/crate_structure-57cee7c72127035c)
+
+running 1 test
+test test_crate_public_exports ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/credential_vending.rs (target/debug/deps/credential_vending-2598b97ff6da8734)
+
+running 7 tests
+test test_default_config ... ok
+test test_config_builder ... ok
+test test_ttl_clamping ... ok
+test test_storage_credential_gcs_format ... ok
+test test_iceberg_state_with_credentials ... ok
+test test_mock_provider_returns_empty_for_non_gcs ... ok
+test test_mock_provider_returns_gcs_credentials ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/openapi_compliance.rs (target/debug/deps/openapi_compliance-b02b0ac5fe72251d)
+
+running 1 test
+test test_openapi_paths_align_with_official_spec ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/reconciliation_tests.rs (target/debug/deps/reconciliation_tests-a7035464a241dceb)
+
+running 8 tests
+test test_type_mapper_all_primitive_types ... ok
+test test_schema_projection_with_real_iceberg_schema ... ok
+test test_orphan_cleanup_flow ... ok
+test test_event_receipt_gc_flow ... ok
+test test_gc_flow_with_controlled_timestamps ... ok
+test test_reconcile_all_multiple_tables ... ok
+test test_full_reconciliation_flow_with_memory_backend ... ok
+test test_concurrent_reconciliation_safety ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/roundtrip.rs (target/debug/deps/roundtrip-9f32bc7c87b6a24a)
+
+running 15 tests
+test test_list_namespaces_empty_roundtrip ... ok
+test test_error_response_roundtrip_unauthorized ... ok
+test test_get_namespace_roundtrip ... ok
+test test_error_response_roundtrip_forbidden ... ok
+test test_error_response_roundtrip_service_unavailable ... ok
+test test_error_response_roundtrip_internal ... ok
+test test_list_namespaces_null_token_is_omitted ... ok
+test test_error_response_roundtrip ... ok
+test test_config_response_roundtrip ... ok
+test test_list_namespaces_roundtrip ... ok
+test test_table_credentials_roundtrip ... ok
+test test_load_table_response_roundtrip_minimal ... ok
+test test_table_credentials_multiple_prefixes_roundtrip ... ok
+test test_list_tables_roundtrip ... ok
+test test_load_table_response_roundtrip ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/arco_integration_tests-da74d86be0a1600f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/catalog_flow.rs (target/debug/deps/catalog_flow-86b3e51d38625f24)
+
+running 2 tests
+test test_asset_id_uniqueness ... ok
+test test_tenant_isolation ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/catalog_idempotency.rs (target/debug/deps/catalog_idempotency-78fa634cb5021320)
+
+running 3 tests
+test create_catalog_is_idempotent_with_idempotency_key ... ok
+test create_schema_is_idempotent_with_idempotency_key ... ok
+test register_table_in_schema_is_idempotent_with_idempotency_key ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/datafusion_query_data.rs (target/debug/deps/datafusion_query_data-205a05a84b6ee001)
+
+running 2 tests
+test query_data_does_not_fail_when_other_registered_tables_are_missing ... ok
+test query_data_can_select_from_registered_parquet_table ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/delta_commit_coordinator.rs (target/debug/deps/delta_commit_coordinator-e3e883acfbfc7934)
+
+running 2 tests
+test expired_inflight_commit_is_recovered_but_not_acked_for_unrelated_idempotency_key ... ok
+test delta_commit_writes_delta_log_enforces_occ_and_replays_idempotency ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/iam_smoke.rs (target/debug/deps/iam_smoke-aa238711ca4c7677)
+
+running 6 tests
+test test_api_can_write_commits ... ignored, requires deployed IAM with API credentials
+test test_api_can_write_ledger ... ignored, requires deployed IAM with API credentials
+test test_api_can_write_locks ... ignored, requires deployed IAM with API credentials
+test test_api_cannot_write_state ... ignored, requires deployed IAM with API credentials
+test test_api_cannot_write_state_even_if_path_contains_ledger_segment ... ignored, requires deployed IAM with API credentials
+test test_iam_summary ... ignored, requires deployed IAM with API credentials
+
+test result: ok. 0 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/iceberg_rest_catalog.rs (target/debug/deps/iceberg_rest_catalog-4875f6d4064038de)
+
+running 1 test
+test test_rest_catalog_roundtrip ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+     Running tests/ledger_namespace.rs (target/debug/deps/ledger_namespace-0ea53ffb2e84a21a)
+
+running 1 test
+test flow_ledger_namespace_does_not_collide_with_catalog_compaction ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/arco_proto-b6c7688ffb7df436)
+
+running 3 tests
+test tests::test_request_header_has_all_fields ... ok
+test tests::test_tenant_id_roundtrip ... ok
+test tests::test_partition_key_serialization ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/golden_fixtures.rs (target/debug/deps/golden_fixtures-61cc59f4609d9846)
+
+running 4 tests
+test test_fixture_backward_compatibility ... ok
+test test_id_types_serde_roundtrip ... ok
+test test_partition_key_golden_fixture ... ok
+test test_scalar_value_variants ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/arco_test_utils-2fe786cb21d38da0)
+
+running 10 tests
+test simulation::tests::test_scenario_builder ... ok
+test simulation::tests::test_clock_advancement ... ok
+test simulation::tests::test_operation_recording ... ok
+test simulation::tests::test_seeded_clock_is_deterministic ... ok
+test simulation::tests::test_deterministic_failures ... ok
+test storage::tests::tracing_storage_cas_works ... ok
+test storage::tests::tracing_storage_records_operations ... ok
+test storage::tests::tracing_storage_failure_injection ... ok
+test fixtures::tests::linear_dag_has_correct_structure ... ok
+test fixtures::tests::diamond_dag_has_correct_structure ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/contracts.rs (target/debug/deps/contracts-cbdcf4dbc23224c6)
+
+running 9 tests
+test contract_ids_are_url_safe ... ok
+test contract_event_envelope_matches_architecture ... ok
+test contract_idempotency_key_is_stable_for_same_event ... ok
+test contract_schema_version_enables_schema_evolution ... ok
+test contract_plan_toposort_respects_dependencies ... ok
+test contract_plan_stages_reflect_dependency_depth ... ok
+test contract_plan_fingerprint_is_deterministic ... ok
+test contract_plan_fingerprint_survives_serialization ... ok
+test contract_events_serialize_to_json ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/tier2.rs (target/debug/deps/tier2-611507fb4ac820b2)
+
+running 17 tests
+test invariant1_append_only_ingest ... ok
+test invariant6_listing_dependency_documented ... ok
+test invariant2_compactor_sole_parquet_writer ... ok
+test invariant5_readers_never_need_ledger ... ok
+test invariant4_atomic_publish ... ok
+test tier2_compactor_sole_parquet_writer ... ok
+test tier2_workspace_isolation ... ok
+test tier2_out_of_order_processing ... ok
+test tier2_crash_recovery ... ok
+test invariant3_idempotent_compaction ... ok
+test tier2_idempotent_events ... ok
+test tier2_append_compact_read_loop ... ok
+test tier2_derived_current_pointers ... ok
+test tier2_snapshot_does_not_shrink_across_compactions ... ok
+test tier2_incremental_compaction ... ok
+test datafusion_reads_parquet_bytes ... ok
+test tier2_concurrent_compactor_race ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running unittests src/lib.rs (target/debug/deps/arco_uc-509ffc401e0c57f6)
+
+running 3 tests
+test router::tests::test_router_creation ... ok
+test router::tests::test_router_with_timeout_and_concurrency ... ok
+test openapi::tests::test_openapi_generation ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/openapi_compliance.rs (target/debug/deps/openapi_compliance-7402e27fb82fe58a)
+
+running 2 tests
+test test_openapi_paths_align_with_vendored_spec ... ignored, Requires pinned Unity Catalog OSS OpenAPI spec fixture (replace placeholder).
+test test_vendored_uc_spec_is_parseable ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/xtask-eb1c467b66a45d79)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests arco_catalog
+
+running 8 tests
+test crates/arco-catalog/src/gc/collector.rs - gc::collector::GarbageCollector (line 92) ... ignored
+test crates/arco-catalog/src/gc/mod.rs - gc (line 23) ... ignored
+test crates/arco-catalog/src/lib.rs - (line 49) ... ignored
+test crates/arco-catalog/src/reader.rs - reader::CatalogReader (line 107) ... ignored
+test crates/arco-catalog/src/writer.rs - writer::CatalogWriter::new (line 413) ... ignored
+test crates/arco-catalog/src/manifest.rs - manifest::compute_manifest_hash (line 49) ... ok
+test crates/arco-catalog/src/gc/policy.rs - gc::policy::RetentionPolicy (line 19) ... ok
+test crates/arco-catalog/src/search_tombstone.rs - search_tombstone::SearchTombstone (line 41) ... ok
+
+test result: ok. 3 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests arco_cli
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests arco_core
+
+running 22 tests
+test crates/arco-core/src/lock.rs - lock (line 18) ... ignored
+test crates/arco-core/src/publish.rs - publish (line 26) ... ignored
+test crates/arco-core/src/publish.rs - publish::PermitIssuer (line 110) ... ignored
+test crates/arco-core/src/publish.rs - publish::PublishPermit (line 242) ... ignored
+test crates/arco-core/src/publish.rs - publish::Publisher (line 349) ... ignored
+test crates/arco-core/src/storage_traits.rs - storage_traits (line 25) ... ignored
+test crates/arco-core/src/audit.rs - audit::TestAuditSink (line 645) ... ok
+test crates/arco-core/src/audit.rs - audit (line 16) ... ok
+test crates/arco-core/src/id.rs - id (line 9) ... ok
+test crates/arco-core/src/observability.rs - observability::Redacted (line 53) ... ok
+test crates/arco-core/src/tenant.rs - tenant (line 10) ... ok
+test crates/arco-core/src/observability.rs - observability::orchestration_span (line 173) ... ok
+test crates/arco-core/src/catalog_paths.rs - catalog_paths::CatalogPaths (line 96) ... ok
+test crates/arco-core/src/observability.rs - observability::catalog_span (line 152) ... ok
+test crates/arco-core/src/observability.rs - observability (line 12) ... ok
+test crates/arco-core/src/lib.rs - (line 21) ... ok
+test crates/arco-core/src/lib.rs - prelude (line 58) ... ok
+test crates/arco-core/src/partition.rs - partition (line 30) ... ok
+test crates/arco-core/src/backpressure.rs - backpressure::BackpressureState (line 55) ... ok
+test crates/arco-core/src/storage_keys.rs - storage_keys (line 25) ... ok
+test crates/arco-core/src/observability.rs - observability::init_logging (line 121) ... ok
+test crates/arco-core/src/tenant.rs - tenant::TenantId::storage_prefix (line 62) ... ok
+
+test result: ok. 16 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests arco_delta
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests arco_iceberg
+
+running 5 tests
+test crates/arco-iceberg/src/credentials/mod.rs - credentials (line 14) ... ignored
+test crates/arco-iceberg/src/lib.rs - (line 30) ... ignored
+test crates/arco-iceberg/src/reconciler.rs - reconciler (line 17) ... ignored
+test crates/arco-iceberg/src/pointer.rs - pointer::IcebergTablePointer (line 34) ... ok
+test crates/arco-iceberg/src/types/commit.rs - types::commit::CommitTableRequestBuilder (line 290) ... ok
+
+test result: ok. 2 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests arco_integration_tests
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests arco_proto
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests arco_test_utils
+
+running 2 tests
+test crates/arco-test-utils/src/lib.rs - (line 11) ... ignored
+test crates/arco-test-utils/src/simulation.rs - simulation (line 16) ... ignored
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests arco_uc
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

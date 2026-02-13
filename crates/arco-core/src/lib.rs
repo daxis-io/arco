@@ -39,6 +39,7 @@ pub mod canonical_json;
 pub mod catalog_event;
 pub mod catalog_paths;
 pub mod error;
+pub mod flow_paths;
 pub mod id;
 pub mod internal_oidc;
 pub mod lock;
@@ -88,6 +89,7 @@ pub mod prelude {
 pub use catalog_event::{CatalogEvent, CatalogEventPayload};
 pub use catalog_paths::{CatalogDomain, CatalogPaths};
 pub use error::{Error, Result};
+pub use flow_paths::FlowPaths;
 pub use id::{AssetId, EventId, MaterializationId, RunId, TaskId};
 pub use internal_oidc::{
     InternalOidcConfig, InternalOidcError, InternalOidcVerifier, VerifiedPrincipal,

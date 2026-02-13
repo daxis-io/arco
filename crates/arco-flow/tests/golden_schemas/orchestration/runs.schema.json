@@ -1,0 +1,86 @@
+{
+  "name": "runs",
+  "version": 1,
+  "fields": [
+    {
+      "name": "run_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "plan_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "state",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "run_key",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "cancel_requested",
+      "data_type": "Boolean",
+      "nullable": false
+    },
+    {
+      "name": "tasks_total",
+      "data_type": "UInt32",
+      "nullable": false
+    },
+    {
+      "name": "tasks_completed",
+      "data_type": "UInt32",
+      "nullable": false
+    },
+    {
+      "name": "tasks_succeeded",
+      "data_type": "UInt32",
+      "nullable": false
+    },
+    {
+      "name": "tasks_failed",
+      "data_type": "UInt32",
+      "nullable": false
+    },
+    {
+      "name": "tasks_skipped",
+      "data_type": "UInt32",
+      "nullable": false
+    },
+    {
+      "name": "tasks_cancelled",
+      "data_type": "UInt32",
+      "nullable": false
+    },
+    {
+      "name": "triggered_at",
+      "data_type": "Int64",
+      "nullable": false
+    },
+    {
+      "name": "completed_at",
+      "data_type": "Int64",
+      "nullable": true
+    },
+    {
+      "name": "labels",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "code_version",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "row_version",
+      "data_type": "Utf8",
+      "nullable": false
+    }
+  ]
+}

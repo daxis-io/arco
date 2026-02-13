@@ -141,7 +141,6 @@ use utoipa::{Modify, OpenApi};
             crate::routes::orchestration::CreateBackfillRequest,
             crate::routes::orchestration::CreateBackfillResponse,
             crate::routes::orchestration::PartitionSelectorRequest,
-            crate::routes::orchestration::UnprocessableEntityResponse,
             crate::routes::orchestration::BackfillResponse,
             crate::routes::orchestration::PartitionSelectorResponse,
             crate::routes::orchestration::BackfillStateResponse,

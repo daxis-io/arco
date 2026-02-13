@@ -1,0 +1,76 @@
+{
+  "name": "partition_status",
+  "version": 1,
+  "fields": [
+    {
+      "name": "tenant_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "workspace_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "asset_key",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "partition_key",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "last_materialization_run_id",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "last_materialization_at",
+      "data_type": "Int64",
+      "nullable": true
+    },
+    {
+      "name": "last_materialization_code_version",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "last_attempt_run_id",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "last_attempt_at",
+      "data_type": "Int64",
+      "nullable": true
+    },
+    {
+      "name": "last_attempt_outcome",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "stale_since",
+      "data_type": "Int64",
+      "nullable": true
+    },
+    {
+      "name": "stale_reason_code",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "partition_values",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "row_version",
+      "data_type": "Utf8",
+      "nullable": false
+    }
+  ]
+}

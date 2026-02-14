@@ -93,9 +93,6 @@ pub mod names {
     /// Gauge: Visibility lag measured as committed-vs-visible event skew.
     pub const ORCH_COMPACTOR_VISIBILITY_LAG_EVENTS: &str =
         "arco_flow_orch_compactor_visibility_lag_events";
-    /// Counter: Compaction requests rejected due to stale/missing fencing state.
-    pub const ORCH_COMPACTOR_STALE_FENCE_REJECTS_TOTAL: &str =
-        "arco_flow_orch_compactor_stale_fence_rejects_total";
 }
 
 /// Label keys used across metrics.

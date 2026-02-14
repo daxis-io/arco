@@ -15,19 +15,15 @@ use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 use ulid::Ulid;
 
-use arco_core::{DistributedLock, ScopedStorage, WritePrecondition, WriteResult};
+use arco_core::{ScopedStorage, WritePrecondition, WriteResult};
 use metrics::{counter, gauge, histogram};
 
 use crate::error::{Error, Result};
 use crate::metrics::{labels as metric_labels, names as metric_names};
 use crate::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
 use crate::paths::{
-    orchestration_compaction_lock_path, orchestration_l0_dir, orchestration_manifest_path,
-    orchestration_manifest_pointer_path, orchestration_manifest_snapshot_path,
-};
-
-use arco_core::publish::{
-    SnapshotPointerDurability, SnapshotPointerPublishOutcome, publish_snapshot_pointer_transaction,
+    orchestration_l0_dir, orchestration_manifest_path, orchestration_manifest_pointer_path,
+    orchestration_manifest_snapshot_path,
 };
 
 use super::fold::{
@@ -81,12 +77,6 @@ impl CompactionVisibility {
 }
 
 type PublishOutcome = CompactionVisibility;
-
-#[derive(Debug, Clone)]
-struct FencingValidation {
-    lock_path: String,
-    request_epoch: u64,
-}
 
 /// Micro-compactor for orchestration events.
 ///
@@ -170,92 +160,38 @@ impl MicroCompactor {
     ///
     /// Returns an error if storage reads/writes or Parquet encoding fail.
     pub async fn compact_events(&self, event_paths: Vec<String>) -> Result<CompactionResult> {
-        self.compact_events_inner(event_paths, None).await
+        self.compact_events_with_epoch(event_paths, None).await
     }
 
-    /// Runs micro-compaction with explicit fencing requirements.
+    /// Runs micro-compaction and validates the caller's lock epoch when supplied.
     ///
-    /// This is the preferred entrypoint for lock-protected callers. It enforces:
-    /// - `request_epoch == current_lock_epoch`
-    /// - `request_epoch >= pointer_epoch`
-    /// - lock revalidation immediately before pointer CAS publish
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::StaleFencingToken` or `Error::FencingLockUnavailable`
-    /// when the caller's epoch is stale or lock state is invalid.
-    pub async fn compact_events_fenced(
-        &self,
-        event_paths: Vec<String>,
-        fencing_token: u64,
-        lock_path: &str,
-    ) -> Result<CompactionResult> {
-        self.compact_events_inner(
-            event_paths,
-            Some(FencingValidation {
-                lock_path: lock_path.to_string(),
-                request_epoch: fencing_token,
-            }),
-        )
-        .await
-    }
-
-    /// Compatibility wrapper that applies default orchestration lock fencing.
-    ///
-    /// New callers should use `compact_events_fenced` to supply lock path explicitly.
-    /// Existing callers may continue passing an epoch only.
+    /// # Arguments
+    /// * `event_paths` - Explicit paths to event files to process
+    /// * `expected_epoch` - Optional lock epoch associated with this write attempt
     ///
     /// # Errors
     ///
     /// Returns an error if storage reads/writes fail, Parquet encoding fails,
-    /// or the supplied epoch is stale relative to lock/pointer epoch.
+    /// or the supplied epoch is stale relative to the current pointer epoch.
+    #[tracing::instrument(skip(self, event_paths), fields(event_count = event_paths.len()))]
+    #[allow(clippy::too_many_lines)]
     pub async fn compact_events_with_epoch(
         &self,
         event_paths: Vec<String>,
         expected_epoch: Option<u64>,
     ) -> Result<CompactionResult> {
-        match expected_epoch {
-            Some(epoch) => {
-                self.compact_events_fenced(event_paths, epoch, orchestration_compaction_lock_path())
-                    .await
-            }
-            None => self.compact_events_inner(event_paths, None).await,
-        }
-    }
-
-    /// Runs micro-compaction and validates fencing context when supplied.
-    ///
-    /// # Arguments
-    /// * `event_paths` - Explicit paths to event files to process
-    /// * `fencing` - Optional lock/epoch associated with this write attempt
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if storage reads/writes fail, Parquet encoding fails,
-    /// or fencing validation fails.
-    #[tracing::instrument(skip(self, event_paths), fields(event_count = event_paths.len()))]
-    #[allow(clippy::too_many_lines)]
-    async fn compact_events_inner(
-        &self,
-        event_paths: Vec<String>,
-        fencing: Option<FencingValidation>,
-    ) -> Result<CompactionResult> {
         let ack_started = Instant::now();
-
-        if let Some(fencing) = fencing.as_ref() {
-            self.validate_lock_epoch(fencing).await?;
-        }
 
         // Load current manifest + version for CAS
         let (mut manifest, pointer_version, previous_pointer) =
             self.read_manifest_with_version().await?;
-        validate_fencing_against_pointer(fencing.as_ref(), previous_pointer.as_ref())?;
+        validate_expected_epoch(expected_epoch, previous_pointer.as_ref())?;
 
         if event_paths.is_empty() {
             let mut visibility_status = CompactionVisibility::Visible;
             if pointer_version.is_none() {
                 match self
-                    .publish_manifest(&manifest, None, previous_pointer.as_ref(), fencing.as_ref())
+                    .publish_manifest(&manifest, None, previous_pointer.as_ref())
                     .await
                 {
                     Ok(outcome) => visibility_status = outcome,
@@ -399,18 +335,18 @@ impl MicroCompactor {
 
         let mut visibility_status = CompactionVisibility::Visible;
         let manifest_revision = if manifest_changed {
-            let previous_manifest_path = previous_pointer.as_ref().map_or_else(
-                || orchestration_manifest_path().to_string(),
-                |p| p.manifest_path.clone(),
-            );
+            let previous_manifest_path = previous_pointer
+                .as_ref()
+                .map(|p| p.manifest_path.clone())
+                .unwrap_or_else(|| orchestration_manifest_path().to_string());
 
             manifest.manifest_id =
                 next_manifest_id(&manifest.manifest_id).map_err(Error::serialization)?;
             manifest.previous_manifest_path = Some(previous_manifest_path);
             let pointer_epoch = previous_pointer.as_ref().map_or(0, |p| p.epoch);
             manifest.epoch = manifest.epoch.max(pointer_epoch);
-            if let Some(fencing) = fencing.as_ref() {
-                manifest.epoch = manifest.epoch.max(fencing.request_epoch);
+            if let Some(expected_epoch) = expected_epoch {
+                manifest.epoch = manifest.epoch.max(expected_epoch);
             }
 
             let new_revision = Ulid::new().to_string();
@@ -421,7 +357,6 @@ impl MicroCompactor {
                     &manifest,
                     pointer_version.as_deref(),
                     previous_pointer.as_ref(),
-                    fencing.as_ref(),
                 )
                 .await
             {
@@ -862,13 +797,28 @@ impl MicroCompactor {
         manifest: &OrchestrationManifest,
         current_pointer_version: Option<&str>,
         previous_pointer: Option<&OrchestrationManifestPointer>,
-        fencing: Option<&FencingValidation>,
     ) -> Result<PublishOutcome> {
         let snapshot_path = orchestration_manifest_snapshot_path(&manifest.manifest_id);
-        let manifest_json =
-            serde_json::to_string_pretty(manifest).map_err(|e| Error::Serialization {
-                message: format!("failed to serialize manifest: {e}"),
-            })?;
+        let json = serde_json::to_string_pretty(manifest).map_err(|e| Error::Serialization {
+            message: format!("failed to serialize manifest: {e}"),
+        })?;
+
+        let snapshot_result = self
+            .storage
+            .put_raw(
+                &snapshot_path,
+                Bytes::from(json),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+        match snapshot_result {
+            WriteResult::Success { .. } => {}
+            WriteResult::PreconditionFailed { .. } => {
+                return Err(Error::storage(format!(
+                    "immutable manifest snapshot already exists: {snapshot_path}"
+                )));
+            }
+        }
 
         let pointer_path = orchestration_manifest_pointer_path();
         let parent_pointer_hash = match previous_pointer {
@@ -894,38 +844,43 @@ impl MicroCompactor {
                 message: format!("failed to serialize manifest pointer: {e}"),
             })?;
 
-        let durability = match self.durability_mode {
-            DurabilityMode::Visible => SnapshotPointerDurability::Visible,
-            DurabilityMode::Persisted => SnapshotPointerDurability::Persisted,
-        };
+        let precondition = current_pointer_version
+            .map_or(WritePrecondition::DoesNotExist, |version| {
+                WritePrecondition::MatchesVersion(version.to_string())
+            });
 
-        let outcome = publish_snapshot_pointer_transaction(
-            &self.storage,
-            &pointer.manifest_path,
-            Bytes::from(manifest_json.clone()),
-            pointer_path,
-            Bytes::from(pointer_json),
-            current_pointer_version,
-            Some((orchestration_manifest_path(), Bytes::from(manifest_json))),
-            durability,
-            async {
-                if let Some(fencing) = fencing {
-                    // Mandatory pre-publish lock revalidation for hard stale-writer fencing.
-                    self.validate_lock_epoch_core(fencing).await?;
+        let pointer_result = self
+            .storage
+            .put_raw(pointer_path, Bytes::from(pointer_json), precondition)
+            .await?;
+
+        match pointer_result {
+            WriteResult::Success { .. } => {
+                // Legacy compatibility shim for readers still bound to the stable path.
+                let legacy_json =
+                    serde_json::to_string_pretty(manifest).map_err(|e| Error::Serialization {
+                        message: format!("failed to serialize legacy manifest: {e}"),
+                    })?;
+                let _ = self
+                    .storage
+                    .put_raw(
+                        orchestration_manifest_path(),
+                        Bytes::from(legacy_json),
+                        WritePrecondition::None,
+                    )
+                    .await?;
+                Ok(PublishOutcome::Visible)
+            }
+            WriteResult::PreconditionFailed { .. } => {
+                if self.durability_mode == DurabilityMode::Persisted {
+                    tracing::warn!(
+                        manifest_id = %manifest.manifest_id,
+                        "pointer CAS lost race in Persisted mode; returning persisted acknowledgement"
+                    );
+                    Ok(PublishOutcome::PersistedNotVisible)
+                } else {
+                    Err(Error::storage("manifest publish failed - concurrent write"))
                 }
-                Ok(())
-            },
-        )
-        .await?;
-
-        match outcome {
-            SnapshotPointerPublishOutcome::Visible { .. } => Ok(PublishOutcome::Visible),
-            SnapshotPointerPublishOutcome::PersistedNotVisible => {
-                tracing::warn!(
-                    manifest_id = %manifest.manifest_id,
-                    "pointer CAS lost race in Persisted mode; returning persisted acknowledgement"
-                );
-                Ok(PublishOutcome::PersistedNotVisible)
             }
         }
     }
@@ -1341,24 +1296,19 @@ fn delta_state_is_empty(state: &FoldState) -> bool {
         && state.schedule_ticks.is_empty()
 }
 
-fn validate_fencing_against_pointer(
-    fencing: Option<&FencingValidation>,
+fn validate_expected_epoch(
+    expected_epoch: Option<u64>,
     pointer: Option<&OrchestrationManifestPointer>,
 ) -> Result<()> {
-    let (Some(fencing), Some(pointer)) = (fencing, pointer) else {
+    let (Some(request_epoch), Some(pointer)) = (expected_epoch, pointer) else {
         return Ok(());
     };
 
-    if fencing.request_epoch < pointer.epoch {
-        counter!(
-            metric_names::ORCH_COMPACTOR_STALE_FENCE_REJECTS_TOTAL,
-            "reason" => "pointer_epoch_mismatch".to_string()
-        )
-        .increment(1);
-        return Err(Error::StaleFencingToken {
-            expected: pointer.epoch,
-            provided: fencing.request_epoch,
-        });
+    if request_epoch < pointer.epoch {
+        return Err(Error::storage(format!(
+            "stale epoch: request epoch {request_epoch} is behind pointer epoch {}",
+            pointer.epoch
+        )));
     }
 
     Ok(())
@@ -1425,10 +1375,6 @@ fn update_watermarks(
         return false;
     }
 
-    let event_count = u64::try_from(events.len()).unwrap_or(u64::MAX);
-    let (committed_count, visible_count) = watermark_event_counts(&manifest.watermarks);
-    let next_committed_count = committed_count.saturating_add(event_count);
-
     let last_path = events.last().map(|(path, _)| path.clone());
     let previous_visible = manifest.watermarks.last_visible_event_id.clone();
     let next_visible = if durability_mode == DurabilityMode::Visible {
@@ -1439,13 +1385,7 @@ fn update_watermarks(
 
     manifest.watermarks = Watermarks {
         last_committed_event_id: Some(last_event_id.to_string()),
-        committed_event_count: Some(next_committed_count),
         last_visible_event_id: next_visible.clone(),
-        visible_event_count: Some(if durability_mode == DurabilityMode::Visible {
-            next_committed_count
-        } else {
-            visible_count
-        }),
         events_processed_through: next_visible,
         last_processed_file: last_path,
         last_processed_at: Utc::now(),
@@ -1460,32 +1400,15 @@ fn durability_mode_label(mode: DurabilityMode) -> &'static str {
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
 fn visibility_lag_events(watermarks: &Watermarks) -> f64 {
-    let (committed_count, visible_count) = watermark_event_counts(watermarks);
-    committed_count.saturating_sub(visible_count) as f64
-}
-
-fn watermark_event_counts(watermarks: &Watermarks) -> (u64, u64) {
-    let committed_count = watermarks.committed_event_count.unwrap_or({
-        match watermarks.last_committed_event_id.as_deref() {
-            Some(_) => 1,
-            None => 0,
-        }
-    });
-
-    let visible_count = watermarks.visible_event_count.unwrap_or_else(|| {
-        match (
-            watermarks.last_committed_event_id.as_deref(),
-            watermarks.last_visible_event_id.as_deref(),
-        ) {
-            (Some(committed), Some(visible)) if committed == visible => committed_count,
-            (Some(_), Some(_)) => committed_count.saturating_sub(1),
-            (Some(_), None) | (None, _) => 0,
-        }
-    });
-
-    (committed_count, visible_count.min(committed_count))
+    match (
+        watermarks.last_committed_event_id.as_deref(),
+        watermarks.last_visible_event_id.as_deref(),
+    ) {
+        (Some(committed), Some(visible)) if committed == visible => 0.0,
+        (Some(_), _) => 1.0,
+        (None, _) => 0.0,
+    }
 }
 
 fn record_compaction_metrics(
@@ -2231,9 +2154,7 @@ mod tests {
 
         let mut manifest = OrchestrationManifest::new("01HQXYZ123REV");
         manifest.manifest_id = "00000000000000000000".to_string();
-        compactor
-            .publish_manifest(&manifest, None, None, None)
-            .await?;
+        compactor.publish_manifest(&manifest, None, None).await?;
 
         let (_current, version, pointer) = compactor.read_manifest_with_version().await?;
         let version = version.expect("pointer version");
@@ -2243,13 +2164,13 @@ mod tests {
         competing.manifest_id = "00000000000000000001".to_string();
         competing.revision_ulid = "01HQXYZ124REV".to_string();
         compactor
-            .publish_manifest(&competing, Some(&version), Some(&pointer), None)
+            .publish_manifest(&competing, Some(&version), Some(&pointer))
             .await?;
 
         let mut stale = manifest;
         stale.manifest_id = "00000000000000000002".to_string();
         let err = compactor
-            .publish_manifest(&stale, Some(&version), Some(&pointer), None)
+            .publish_manifest(&stale, Some(&version), Some(&pointer))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("manifest publish failed"));
@@ -2259,99 +2180,19 @@ mod tests {
 
     #[tokio::test]
     async fn compact_with_stale_epoch_is_rejected() -> Result<()> {
-        let (compactor, storage) = create_test_compactor().await?;
-        let lock_path = orchestration_compaction_lock_path();
-        let lock = DistributedLock::new(storage.backend().clone(), lock_path);
-        let guard = lock.acquire(Duration::from_secs(30), 1).await?;
-        let request_epoch = guard.fencing_token().sequence();
+        let (compactor, _storage) = create_test_compactor().await?;
 
         let mut manifest = OrchestrationManifest::new("01HQXYZ200REV");
         manifest.manifest_id = "00000000000000000000".to_string();
-        manifest.epoch = request_epoch.saturating_add(1);
-        compactor
-            .publish_manifest(&manifest, None, None, None)
-            .await?;
+        manifest.epoch = 5;
+        compactor.publish_manifest(&manifest, None, None).await?;
 
         let error = compactor
-            .compact_events_fenced(vec![], request_epoch, lock_path)
+            .compact_events_with_epoch(vec![], Some(4))
             .await
             .expect_err("stale epoch must be rejected");
-        assert!(error.to_string().contains("stale fencing token"));
+        assert!(error.to_string().contains("stale epoch"));
 
-        drop(guard);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn compact_events_fenced_rejects_without_current_lock() -> Result<()> {
-        let (compactor, _storage) = create_test_compactor().await?;
-
-        let error = compactor
-            .compact_events_fenced(vec![], 1, orchestration_compaction_lock_path())
-            .await
-            .expect_err("missing lock must be rejected");
-        assert!(error.to_string().contains("fencing lock unavailable"));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn compact_events_fenced_rejects_on_lock_epoch_mismatch() -> Result<()> {
-        let (compactor, storage) = create_test_compactor().await?;
-        let lock_path = orchestration_compaction_lock_path();
-        let lock = DistributedLock::new(storage.backend().clone(), lock_path);
-        let guard = lock.acquire(Duration::from_secs(30), 1).await?;
-        let stale_epoch = guard.fencing_token().sequence().saturating_add(1);
-
-        let error = compactor
-            .compact_events_fenced(vec![], stale_epoch, lock_path)
-            .await
-            .expect_err("epoch mismatch must be rejected");
-        assert!(error.to_string().contains("stale fencing token"));
-
-        drop(guard);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn compact_events_fenced_rejects_when_pointer_epoch_is_newer() -> Result<()> {
-        let (compactor, storage) = create_test_compactor().await?;
-        let lock_path = orchestration_compaction_lock_path();
-        let lock = DistributedLock::new(storage.backend().clone(), lock_path);
-        let guard = lock.acquire(Duration::from_secs(30), 1).await?;
-        let epoch = guard.fencing_token().sequence();
-
-        let mut manifest = OrchestrationManifest::new("01HQXYZ220REV");
-        manifest.manifest_id = "00000000000000000000".to_string();
-        manifest.epoch = epoch.saturating_add(5);
-        compactor
-            .publish_manifest(&manifest, None, None, None)
-            .await?;
-
-        let error = compactor
-            .compact_events_fenced(vec![], epoch, lock_path)
-            .await
-            .expect_err("stale pointer epoch must be rejected");
-        assert!(error.to_string().contains("stale fencing token"));
-
-        drop(guard);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn compact_events_fenced_accepts_matching_lock_epoch() -> Result<()> {
-        let (compactor, storage) = create_test_compactor().await?;
-        let lock_path = orchestration_compaction_lock_path();
-        let lock = DistributedLock::new(storage.backend().clone(), lock_path);
-        let guard = lock.acquire(Duration::from_secs(30), 1).await?;
-        let epoch = guard.fencing_token().sequence();
-
-        let result = compactor
-            .compact_events_fenced(vec![], epoch, lock_path)
-            .await?;
-        assert_eq!(result.events_processed, 0);
-
-        drop(guard);
         Ok(())
     }
 
@@ -2367,9 +2208,7 @@ mod tests {
         let mut base = OrchestrationManifest::new("01HQXYZ210REV");
         base.manifest_id = "00000000000000000000".to_string();
         base.epoch = 5;
-        let base_outcome = persisted_a
-            .publish_manifest(&base, None, None, None)
-            .await?;
+        let base_outcome = persisted_a.publish_manifest(&base, None, None).await?;
         assert_eq!(base_outcome, PublishOutcome::Visible);
 
         let (_manifest, stale_version, stale_pointer) =
@@ -2381,7 +2220,7 @@ mod tests {
         winner.manifest_id = "00000000000000000001".to_string();
         winner.epoch = 5;
         let winner_outcome = persisted_a
-            .publish_manifest(&winner, Some(&stale_version), Some(&stale_pointer), None)
+            .publish_manifest(&winner, Some(&stale_version), Some(&stale_pointer))
             .await?;
         assert_eq!(winner_outcome, PublishOutcome::Visible);
 
@@ -2389,7 +2228,7 @@ mod tests {
         stale.manifest_id = "00000000000000000002".to_string();
         stale.epoch = 5;
         let stale_outcome = persisted_b
-            .publish_manifest(&stale, Some(&stale_version), Some(&stale_pointer), None)
+            .publish_manifest(&stale, Some(&stale_version), Some(&stale_pointer))
             .await?;
         assert_eq!(stale_outcome, PublishOutcome::PersistedNotVisible);
 
@@ -2429,9 +2268,7 @@ mod tests {
         let mut manifest = OrchestrationManifest::new("01HQXYZ123REV");
         manifest.watermarks = Watermarks {
             last_committed_event_id: Some("evt_01".to_string()),
-            committed_event_count: Some(1),
             last_visible_event_id: Some("evt_01".to_string()),
-            visible_event_count: Some(1),
             events_processed_through: Some("evt_01".to_string()),
             last_processed_file: Some(orchestration_event_path("2025-01-15", "evt_01")),
             last_processed_at: Utc::now(),
@@ -2462,17 +2299,13 @@ mod tests {
             manifest.watermarks.events_processed_through.as_deref(),
             Some("evt_01")
         );
-        assert_eq!(manifest.watermarks.committed_event_count, Some(2));
-        assert_eq!(manifest.watermarks.visible_event_count, Some(1));
     }
 
     #[test]
     fn visibility_lag_reports_zero_when_committed_is_visible() {
         let watermarks = Watermarks {
             last_committed_event_id: Some("evt_03".to_string()),
-            committed_event_count: Some(3),
             last_visible_event_id: Some("evt_03".to_string()),
-            visible_event_count: Some(3),
             events_processed_through: Some("evt_03".to_string()),
             last_processed_file: None,
             last_processed_at: Utc::now(),
@@ -2484,65 +2317,11 @@ mod tests {
     fn visibility_lag_reports_one_when_visibility_trails_commit() {
         let watermarks = Watermarks {
             last_committed_event_id: Some("evt_03".to_string()),
-            committed_event_count: Some(3),
             last_visible_event_id: Some("evt_02".to_string()),
-            visible_event_count: Some(2),
             events_processed_through: Some("evt_02".to_string()),
             last_processed_file: None,
             last_processed_at: Utc::now(),
         };
         assert_eq!(visibility_lag_events(&watermarks), 1.0);
-    }
-
-    #[test]
-    fn visibility_lag_reports_quantitative_gap_when_visibility_lags_multiple_events() {
-        let watermarks = Watermarks {
-            last_committed_event_id: Some("evt_42".to_string()),
-            committed_event_count: Some(42),
-            last_visible_event_id: Some("evt_37".to_string()),
-            visible_event_count: Some(37),
-            events_processed_through: Some("evt_37".to_string()),
-            last_processed_file: None,
-            last_processed_at: Utc::now(),
-        };
-        assert_eq!(visibility_lag_events(&watermarks), 5.0);
-    }
-
-    #[test]
-    fn persisted_mode_advances_committed_counter_only() {
-        let mut manifest = OrchestrationManifest::new("01HQXYZ124REV");
-        manifest.watermarks = Watermarks {
-            last_committed_event_id: Some("evt_10".to_string()),
-            committed_event_count: Some(10),
-            last_visible_event_id: Some("evt_10".to_string()),
-            visible_event_count: Some(10),
-            events_processed_through: Some("evt_10".to_string()),
-            last_processed_file: Some(orchestration_event_path("2025-01-15", "evt_10")),
-            last_processed_at: Utc::now(),
-        };
-
-        let mut event = make_plan_created_event();
-        event.event_id = "evt_11".to_string();
-        let path = orchestration_event_path("2025-01-15", &event.event_id);
-        let events = vec![(path, event.clone())];
-
-        let changed = update_watermarks(
-            &mut manifest,
-            &events,
-            &event.event_id,
-            DurabilityMode::Persisted,
-        );
-        assert!(changed);
-        assert_eq!(
-            manifest.watermarks.last_committed_event_id.as_deref(),
-            Some("evt_11")
-        );
-        assert_eq!(
-            manifest.watermarks.last_visible_event_id.as_deref(),
-            Some("evt_10")
-        );
-        assert_eq!(manifest.watermarks.committed_event_count, Some(11));
-        assert_eq!(manifest.watermarks.visible_event_count, Some(10));
-        assert_eq!(visibility_lag_events(&manifest.watermarks), 1.0);
     }
 }

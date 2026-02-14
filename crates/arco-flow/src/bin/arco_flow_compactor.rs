@@ -34,8 +34,8 @@ struct InternalAuthState {
 #[derive(Debug, Deserialize)]
 struct CompactRequest {
     event_paths: Vec<String>,
-    fencing_token: u64,
-    lock_path: String,
+    #[serde(default)]
+    epoch: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -112,11 +112,7 @@ async fn compact_handler(
         visibility_status,
     } = state
         .compactor
-        .compact_events_fenced(
-            request.event_paths,
-            request.fencing_token,
-            &request.lock_path,
-        )
+        .compact_events_with_epoch(request.event_paths, request.epoch)
         .await?;
 
     Ok(Json(CompactResponse {

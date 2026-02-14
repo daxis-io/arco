@@ -18,7 +18,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CatalogError, Result};
-use crate::manifest::{CatalogDomainManifest, ExecutionsManifest, LineageManifest, RootManifest};
+use crate::manifest::{
+    CatalogDomainManifest, DomainManifestPointer, ExecutionsManifest, LineageManifest, RootManifest,
+};
 
 // ============================================================================
 // Reconciliation Report
@@ -271,6 +273,17 @@ impl Reconciler {
             failed_count: 0,
         };
 
+        let protected_paths: HashSet<String> =
+            if let Some(domain) = Self::parse_domain(&report.domain) {
+                self.load_expected_paths(domain)
+                    .await?
+                    .map_or_else(HashSet::new, |(_, expected, _)| {
+                        expected.into_iter().collect()
+                    })
+            } else {
+                HashSet::new()
+            };
+
         for issue in &report.issues {
             if !issue.repairable {
                 result.skipped_count += 1;
@@ -279,6 +292,15 @@ impl Reconciler {
 
             match issue.issue_type {
                 IssueType::OrphanedSnapshot | IssueType::OldSnapshotVersion => {
+                    if protected_paths.contains(&issue.path) {
+                        tracing::warn!(
+                            path = %issue.path,
+                            domain = %report.domain,
+                            "skipping repair delete for currently referenced snapshot path"
+                        );
+                        result.skipped_count += 1;
+                        continue;
+                    }
                     match self.storage.delete(&issue.path).await {
                         Ok(()) => result.repaired_count += 1,
                         Err(e) => {
@@ -307,12 +329,15 @@ impl Reconciler {
         };
         root.normalize_paths();
 
-        let domain_path = match domain {
+        let legacy_domain_path = match domain {
             CatalogDomain::Catalog => root.catalog_manifest_path,
             CatalogDomain::Lineage => root.lineage_manifest_path,
             CatalogDomain::Executions => root.executions_manifest_path,
             CatalogDomain::Search => root.search_manifest_path,
         };
+        let domain_path = self
+            .resolve_domain_manifest_path(domain, &legacy_domain_path)
+            .await?;
 
         match domain {
             CatalogDomain::Catalog => {
@@ -425,6 +450,7 @@ impl Reconciler {
         let bytes = match self.storage.get_raw(path).await {
             Ok(b) => b,
             Err(arco_core::Error::NotFound(_)) => return Ok(None),
+            Err(arco_core::Error::ResourceNotFound { .. }) => return Ok(None),
             Err(e) => return Err(CatalogError::from(e)),
         };
 
@@ -438,6 +464,41 @@ impl Reconciler {
     async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
         let paths = self.storage.list(prefix).await?;
         Ok(paths.into_iter().map(|p| p.to_string()).collect())
+    }
+
+    async fn resolve_domain_manifest_path(
+        &self,
+        domain: CatalogDomain,
+        legacy_path: &str,
+    ) -> Result<String> {
+        let pointer_path = CatalogPaths::domain_manifest_pointer(domain);
+        match self.storage.get_raw(&pointer_path).await {
+            Ok(pointer_bytes) => {
+                let pointer: DomainManifestPointer = serde_json::from_slice(&pointer_bytes)
+                    .map_err(|e| CatalogError::Serialization {
+                        message: format!("failed to parse JSON at '{pointer_path}': {e}"),
+                    })?;
+                match self.storage.head_raw(&pointer.manifest_path).await {
+                    Ok(Some(_)) => Ok(pointer.manifest_path),
+                    Ok(None) => Ok(legacy_path.to_string()),
+                    Err(e) => Err(CatalogError::from(e)),
+                }
+            }
+            Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+                Ok(legacy_path.to_string())
+            }
+            Err(e) => Err(CatalogError::from(e)),
+        }
+    }
+
+    fn parse_domain(value: &str) -> Option<CatalogDomain> {
+        match value {
+            "catalog" | "core" => Some(CatalogDomain::Catalog),
+            "lineage" => Some(CatalogDomain::Lineage),
+            "executions" => Some(CatalogDomain::Executions),
+            "search" | "governance" => Some(CatalogDomain::Search),
+            _ => None,
+        }
     }
 
     /// Attempts to extract a snapshot version number from a scope-relative path.
@@ -511,8 +572,10 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::manifest::DomainManifestPointer;
     use arco_core::storage::{MemoryBackend, WritePrecondition};
     use bytes::Bytes;
+    use chrono::Utc;
 
     #[test]
     fn extract_snapshot_version_parses_tier1_and_tier2() {
@@ -565,6 +628,10 @@ mod tests {
         });
 
         let manifest = CatalogDomainManifest {
+            manifest_id: crate::manifest::format_manifest_id(1),
+            epoch: 0,
+            previous_manifest_path: Some("manifests/catalog/00000000000000000000.json".to_string()),
+            writer_session_id: Some("reconciler-test".to_string()),
             snapshot_version: 1,
             snapshot_path: snapshot_path.clone(),
             snapshot: Some(snapshot),
@@ -618,5 +685,241 @@ mod tests {
                 "issue path must be scope-relative"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn check_prefers_pointer_manifest_over_legacy_manifest() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+
+        let mut root = RootManifest::new();
+        root.normalize_paths();
+        storage
+            .put_raw(
+                CatalogPaths::ROOT_MANIFEST,
+                Bytes::from(serde_json::to_vec(&root).expect("serialize root")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write root");
+
+        let mut legacy_snapshot = crate::manifest::SnapshotInfo::new(
+            1,
+            CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1),
+        );
+        legacy_snapshot.add_file(crate::manifest::SnapshotFile {
+            path: "legacy.parquet".to_string(),
+            checksum_sha256: "00".repeat(32),
+            byte_size: 1,
+            row_count: 0,
+            position_range: None,
+        });
+        let legacy = CatalogDomainManifest {
+            manifest_id: crate::manifest::format_manifest_id(1),
+            epoch: 1,
+            previous_manifest_path: Some("manifests/catalog/00000000000000000000.json".to_string()),
+            writer_session_id: Some("legacy-session".to_string()),
+            snapshot_version: 1,
+            snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1),
+            snapshot: Some(legacy_snapshot),
+            watermark_event_id: None,
+            last_commit_id: None,
+            fencing_token: Some(1),
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                &root.catalog_manifest_path,
+                Bytes::from(serde_json::to_vec(&legacy).expect("serialize legacy")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write legacy");
+
+        let pointed_manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, "00000000000000000002");
+        let mut pointed_snapshot = crate::manifest::SnapshotInfo::new(
+            2,
+            CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 2),
+        );
+        pointed_snapshot.add_file(crate::manifest::SnapshotFile {
+            path: "current.parquet".to_string(),
+            checksum_sha256: "11".repeat(32),
+            byte_size: 1,
+            row_count: 0,
+            position_range: None,
+        });
+        let pointed = CatalogDomainManifest {
+            manifest_id: crate::manifest::format_manifest_id(2),
+            epoch: 2,
+            previous_manifest_path: Some("manifests/catalog/00000000000000000001.json".to_string()),
+            writer_session_id: Some("pointer-session".to_string()),
+            snapshot_version: 2,
+            snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 2),
+            snapshot: Some(pointed_snapshot),
+            watermark_event_id: None,
+            last_commit_id: None,
+            fencing_token: Some(2),
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                &pointed_manifest_path,
+                Bytes::from(serde_json::to_vec(&pointed).expect("serialize pointed")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write pointed");
+
+        let pointer = DomainManifestPointer {
+            manifest_id: "00000000000000000002".to_string(),
+            manifest_path: pointed_manifest_path,
+            epoch: 2,
+            parent_pointer_hash: None,
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                &CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
+                Bytes::from(serde_json::to_vec(&pointer).expect("serialize pointer")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write pointer");
+
+        storage
+            .put_raw(
+                &CatalogPaths::snapshot_file(CatalogDomain::Catalog, 2, "current.parquet"),
+                Bytes::from_static(b"ok"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write pointed file");
+
+        let reconciler = Reconciler::new(storage);
+        let report = reconciler
+            .check(CatalogDomain::Catalog)
+            .await
+            .expect("check");
+
+        assert_eq!(report.manifest_snapshot_version, 2);
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|issue| !issue.path.contains("/v2/current.parquet")),
+            "current pointer-targeted snapshot file must not be flagged"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_skips_pointer_targeted_snapshot_paths() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+
+        let mut root = RootManifest::new();
+        root.normalize_paths();
+        storage
+            .put_raw(
+                CatalogPaths::ROOT_MANIFEST,
+                Bytes::from(serde_json::to_vec(&root).expect("serialize root")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write root");
+
+        let pointed_manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, "00000000000000000002");
+        let mut pointed_snapshot = crate::manifest::SnapshotInfo::new(
+            2,
+            CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 2),
+        );
+        pointed_snapshot.add_file(crate::manifest::SnapshotFile {
+            path: "current.parquet".to_string(),
+            checksum_sha256: "22".repeat(32),
+            byte_size: 1,
+            row_count: 0,
+            position_range: None,
+        });
+        let pointed = CatalogDomainManifest {
+            manifest_id: crate::manifest::format_manifest_id(2),
+            epoch: 2,
+            previous_manifest_path: Some("manifests/catalog/00000000000000000001.json".to_string()),
+            writer_session_id: Some("pointer-session".to_string()),
+            snapshot_version: 2,
+            snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 2),
+            snapshot: Some(pointed_snapshot),
+            watermark_event_id: None,
+            last_commit_id: None,
+            fencing_token: Some(2),
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                &pointed_manifest_path,
+                Bytes::from(serde_json::to_vec(&pointed).expect("serialize pointed")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write pointed");
+
+        let pointer = DomainManifestPointer {
+            manifest_id: "00000000000000000002".to_string(),
+            manifest_path: pointed_manifest_path,
+            epoch: 2,
+            parent_pointer_hash: None,
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                &CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
+                Bytes::from(serde_json::to_vec(&pointer).expect("serialize pointer")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write pointer");
+
+        let protected_file =
+            CatalogPaths::snapshot_file(CatalogDomain::Catalog, 2, "current.parquet");
+        storage
+            .put_raw(
+                &protected_file,
+                Bytes::from_static(b"ok"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write protected file");
+
+        let report = ReconciliationReport {
+            domain: CatalogDomain::Catalog.as_str().to_string(),
+            checked_at: Utc::now(),
+            manifest_snapshot_version: 2,
+            manifest_snapshot_count: 1,
+            storage_snapshot_count: 1,
+            ledger_event_count: 0,
+            issues: vec![ReconciliationIssue {
+                issue_type: IssueType::OrphanedSnapshot,
+                path: protected_file.clone(),
+                description: "stale report".to_string(),
+                severity: Severity::Warning,
+                repairable: true,
+            }],
+        };
+
+        let reconciler = Reconciler::new(storage.clone());
+        let result = reconciler.repair(&report).await.expect("repair");
+
+        assert_eq!(result.repaired_count, 0);
+        assert_eq!(result.skipped_count, 1);
+        storage
+            .get_raw(&protected_file)
+            .await
+            .expect("protected file must remain");
     }
 }

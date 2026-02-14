@@ -26,6 +26,8 @@ struct AppState {
 #[derive(Debug, Deserialize)]
 struct CompactRequest {
     event_paths: Vec<String>,
+    #[serde(default)]
+    epoch: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -33,6 +35,7 @@ struct CompactResponse {
     events_processed: u32,
     delta_id: Option<String>,
     manifest_revision: String,
+    visibility_status: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,12 +80,17 @@ async fn compact_handler(
         events_processed,
         delta_id,
         manifest_revision,
-    } = state.compactor.compact_events(request.event_paths).await?;
+        visibility_status,
+    } = state
+        .compactor
+        .compact_events_with_epoch(request.event_paths, request.epoch)
+        .await?;
 
     Ok(Json(CompactResponse {
         events_processed,
         delta_id,
         manifest_revision,
+        visibility_status: visibility_status.as_str().to_string(),
     }))
 }
 

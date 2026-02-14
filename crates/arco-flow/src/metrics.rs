@@ -85,6 +85,14 @@ pub mod names {
     pub const RUN_REQUESTS_TOTAL: &str = "arco_flow_run_requests_total";
     /// Counter: Sensor evaluations by type and status.
     pub const SENSOR_EVALS_TOTAL: &str = "arco_flow_sensor_evals_total";
+    /// Counter: Orchestration compaction acknowledgements.
+    pub const ORCH_COMPACTIONS_TOTAL: &str = "arco_flow_orch_compactions_total";
+    /// Histogram: End-to-end compaction acknowledgement latency in seconds.
+    pub const ORCH_COMPACTOR_ACK_LATENCY_SECONDS: &str =
+        "arco_flow_orch_compactor_ack_latency_seconds";
+    /// Gauge: Visibility lag measured as committed-vs-visible event skew.
+    pub const ORCH_COMPACTOR_VISIBILITY_LAG_EVENTS: &str =
+        "arco_flow_orch_compactor_visibility_lag_events";
 }
 
 /// Label keys used across metrics.
@@ -111,6 +119,8 @@ pub mod labels {
     pub const SOURCE: &str = "source";
     /// Sensor type (push, poll).
     pub const SENSOR_TYPE: &str = "sensor_type";
+    /// Durability mode label.
+    pub const DURABILITY_MODE: &str = "durability_mode";
 }
 
 /// High-level interface for recording orchestration metrics.

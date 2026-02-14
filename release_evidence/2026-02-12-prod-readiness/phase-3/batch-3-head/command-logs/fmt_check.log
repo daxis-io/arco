@@ -1,0 +1,5 @@
+# command: cargo fmt --all --check
+# start_utc: 2026-02-14T04:44:01Z
+
+# exit_code: 0
+# end_utc: 2026-02-14T04:44:02Z

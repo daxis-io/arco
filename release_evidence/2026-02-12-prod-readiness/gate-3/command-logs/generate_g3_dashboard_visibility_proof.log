@@ -1,0 +1,50 @@
+# command: python3 /tmp/g3_dashboard_proof.py
+# start_utc: 2026-02-14T04:44:01Z
+# Dashboard Visibility Proof (G3-006)
+
+Generated UTC: 2026-02-14T04:44:02Z
+Source: `infra/monitoring/dashboard.json`
+
+| Metric | Covered | Panels |
+|---|---|---|
+| `arco_orch_backlog_depth` | YES | Backlog Depth by Lane |
+| `arco_orch_compaction_lag_seconds` | YES | Compaction Lag (seconds) |
+| `arco_orch_run_key_conflicts` | YES | Run Key Conflicts |
+| `arco_orch_controller_reconcile_seconds` | YES | Controller Reconcile p95 (seconds) |
+| `arco_orch_slo_target_seconds` | YES | SLO Target (seconds) |
+| `arco_orch_slo_observed_seconds` | YES | SLO Observed (seconds) |
+| `arco_orch_slo_breaches_total` | YES | SLO Breaches (5m increase) |
+
+## Query Evidence
+
+### `arco_orch_backlog_depth`
+- panel: `Backlog Depth by Lane`
+  - expr: `sum(arco_orch_backlog_depth) by (lane)`
+
+### `arco_orch_compaction_lag_seconds`
+- panel: `Compaction Lag (seconds)`
+  - expr: `max(arco_orch_compaction_lag_seconds)`
+
+### `arco_orch_run_key_conflicts`
+- panel: `Run Key Conflicts`
+  - expr: `max(arco_orch_run_key_conflicts)`
+
+### `arco_orch_controller_reconcile_seconds`
+- panel: `Controller Reconcile p95 (seconds)`
+  - expr: `histogram_quantile(0.95, sum(rate(arco_orch_controller_reconcile_seconds_bucket[5m])) by (le, controller))`
+
+### `arco_orch_slo_target_seconds`
+- panel: `SLO Target (seconds)`
+  - expr: `max(arco_orch_slo_target_seconds) by (slo)`
+
+### `arco_orch_slo_observed_seconds`
+- panel: `SLO Observed (seconds)`
+  - expr: `max(arco_orch_slo_observed_seconds) by (slo)`
+
+### `arco_orch_slo_breaches_total`
+- panel: `SLO Breaches (5m increase)`
+  - expr: `sum(increase(arco_orch_slo_breaches_total[5m])) by (slo)`
+
+
+# exit_code: 0
+# end_utc: 2026-02-14T04:44:02Z

@@ -1,7 +1,9 @@
+# command: jq -e . docs/audits/2026-02-12-prod-readiness/gate-tracker.json
+# start_utc: 2026-02-14T04:46:21Z
 {
   "schema_version": "1.0",
   "audit_date": "2026-02-12",
-  "generated_at_utc": "2026-02-14T04:55:51Z",
+  "generated_at_utc": "2026-02-14T04:45:24Z",
   "baseline_commit": "e896506f3c936c266a21fe556a107d37bd7075b5",
   "definition_of_done": "ALL_GATES_GO",
   "evidence_root": "release_evidence/2026-02-12-prod-readiness",
@@ -102,8 +104,8 @@
     {
       "id": 4,
       "name": "Deployment / observability / operations",
-      "status": "PARTIAL",
-      "status_reason": "Local Terraform/observability/SLO evidence refreshed (init/validate, plan synthesis, rule checks, controlled drill), but live staging apply, Cloud Run/IAM capture, and human drill signoff remain external blockers.",
+      "status": "NO-GO",
+      "status_reason": "Staging deployment and observability proof artifacts are external and not yet executed.",
       "required_signal_ids": [
         "G4-001",
         "G4-002",
@@ -113,13 +115,7 @@
         "G4-006"
       ],
       "evidence": [
-        "release_evidence/2026-02-12-prod-readiness/gate-4/terraform/g4-001-readiness-status.md",
-        "release_evidence/2026-02-12-prod-readiness/gate-4/terraform/g4-002-terraform-plan-apply-evidence.md",
-        "release_evidence/2026-02-12-prod-readiness/gate-4/cloud-run/g4-003-cloud-run-iam-evidence.md",
-        "release_evidence/2026-02-12-prod-readiness/gate-4/observability/g4-004-observability-deployment-proof.md",
-        "release_evidence/2026-02-12-prod-readiness/gate-4/observability/g4-005-slo-burn-rate-thresholds-proof.md",
-        "release_evidence/2026-02-12-prod-readiness/gate-4/drills/g4-006-incident-drill-signoff-handoff.md",
-        "release_evidence/2026-02-12-prod-readiness/gate-4/external-handoff-checklist.md"
+        "release_evidence/2026-02-12-prod-readiness/gate-4/"
       ]
     },
     {
@@ -269,12 +265,12 @@
     {
       "id": "G4-001",
       "owner": "Platform + SRE",
-      "status": "PARTIAL"
+      "status": "BLOCKED-EXTERNAL"
     },
     {
       "id": "G4-002",
       "owner": "Platform + SRE",
-      "status": "PARTIAL"
+      "status": "BLOCKED-EXTERNAL"
     },
     {
       "id": "G4-003",
@@ -284,12 +280,12 @@
     {
       "id": "G4-004",
       "owner": "Observability Team",
-      "status": "PARTIAL"
+      "status": "BLOCKED-EXTERNAL"
     },
     {
       "id": "G4-005",
       "owner": "Observability Team",
-      "status": "PARTIAL"
+      "status": "BLOCKED-EXTERNAL"
     },
     {
       "id": "G4-006",
@@ -348,3 +344,6 @@
     }
   ]
 }
+
+# exit_code: 0
+# end_utc: 2026-02-14T04:46:21Z

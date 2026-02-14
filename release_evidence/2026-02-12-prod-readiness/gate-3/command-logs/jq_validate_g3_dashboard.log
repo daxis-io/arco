@@ -1,9 +1,15 @@
+# command: jq -e . infra/monitoring/dashboard.json
+# start_utc: 2026-02-14T04:43:16Z
 {
   "$schema": "https://grafana.com/schema/dashboard/v0",
   "title": "Arco Orchestration Operator",
   "description": "Operational dashboard for Layer-2 orchestration backlog, lag, conflicts, controller latency, and SLOs",
   "uid": "arco-orchestration-operator",
-  "tags": ["arco", "orchestration", "operator"],
+  "tags": [
+    "arco",
+    "orchestration",
+    "operator"
+  ],
   "refresh": "30s",
   "time": {
     "from": "now-6h",
@@ -13,7 +19,12 @@
     {
       "title": "Backlog Depth by Lane",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
       "targets": [
         {
           "expr": "sum(arco_orch_backlog_depth) by (lane)",
@@ -25,7 +36,12 @@
     {
       "title": "Compaction Lag (seconds)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
       "targets": [
         {
           "expr": "max(arco_orch_compaction_lag_seconds)",
@@ -37,7 +53,12 @@
     {
       "title": "Run Key Conflicts",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
       "targets": [
         {
           "expr": "max(arco_orch_run_key_conflicts)",
@@ -49,7 +70,12 @@
     {
       "title": "Controller Reconcile p95 (seconds)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.95, sum(rate(arco_orch_controller_reconcile_seconds_bucket[5m])) by (le, controller))",
@@ -61,7 +87,12 @@
     {
       "title": "SLO Target (seconds)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
       "targets": [
         {
           "expr": "max(arco_orch_slo_target_seconds) by (slo)",
@@ -73,7 +104,12 @@
     {
       "title": "SLO Observed (seconds)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
       "targets": [
         {
           "expr": "max(arco_orch_slo_observed_seconds) by (slo)",
@@ -85,7 +121,12 @@
     {
       "title": "SLO Breaches (5m increase)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
       "targets": [
         {
           "expr": "sum(increase(arco_orch_slo_breaches_total[5m])) by (slo)",
@@ -96,3 +137,6 @@
     }
   ]
 }
+
+# exit_code: 0
+# end_utc: 2026-02-14T04:43:16Z

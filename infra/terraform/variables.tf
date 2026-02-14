@@ -212,3 +212,61 @@ variable "vpc_connector_name" {
   type        = string
   default     = ""
 }
+
+# ============================================================================
+# Cloud Tasks (Flow Dispatcher / Timer Callbacks)
+# ============================================================================
+
+variable "flow_dispatch_queue_name" {
+  description = "Cloud Tasks queue name for task dispatch payloads"
+  type        = string
+  default     = "arco-flow-dispatch"
+}
+
+variable "flow_timer_queue_name" {
+  description = "Cloud Tasks queue name for timer callback payloads"
+  type        = string
+  default     = "arco-flow-timers"
+}
+
+variable "flow_dispatcher_service_name" {
+  description = "Optional Cloud Run service name for arco_flow_dispatcher (used for timer callback invoker IAM)"
+  type        = string
+  default     = ""
+}
+
+variable "flow_queue_max_attempts" {
+  description = "Maximum Cloud Tasks delivery attempts for flow queues"
+  type        = number
+  default     = 5
+}
+
+variable "flow_queue_min_backoff_seconds" {
+  description = "Minimum Cloud Tasks retry backoff for flow queues"
+  type        = number
+  default     = 10
+}
+
+variable "flow_queue_max_backoff_seconds" {
+  description = "Maximum Cloud Tasks retry backoff for flow queues"
+  type        = number
+  default     = 300
+}
+
+variable "flow_queue_max_retry_duration_seconds" {
+  description = "Maximum retry window for flow queues"
+  type        = number
+  default     = 3600
+}
+
+variable "flow_queue_max_dispatches_per_second" {
+  description = "Max dispatch throughput per second for flow queues"
+  type        = number
+  default     = 50
+}
+
+variable "flow_queue_max_concurrent_dispatches" {
+  description = "Max concurrent dispatches for flow queues"
+  type        = number
+  default     = 500
+}

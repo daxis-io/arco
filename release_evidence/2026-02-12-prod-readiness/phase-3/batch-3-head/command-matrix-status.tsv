@@ -1,12 +1,12 @@
 command	exit_code	start_utc	end_utc	cmd
-fmt_check	0	2026-02-13T01:23:16Z	2026-02-13T01:23:17Z	cargo fmt --all --check
-clippy_workspace	0	2026-02-13T01:23:17Z	2026-02-13T01:23:17Z	cargo clippy --workspace --all-features -- -D warnings
-test_workspace_excl_flow_api	0	2026-02-13T01:23:17Z	2026-02-13T01:24:05Z	cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
-test_arco_flow_default	0	2026-02-13T01:24:05Z	2026-02-13T01:24:24Z	cargo test -p arco-flow --tests
-test_arco_flow_test_utils	0	2026-02-13T01:24:24Z	2026-02-13T01:24:43Z	cargo test -p arco-flow --features test-utils --tests
-test_arco_flow_all_features	0	2026-02-13T01:24:43Z	2026-02-13T01:25:03Z	cargo test -p arco-flow --all-features --tests
-test_arco_api_all_features	0	2026-02-13T01:25:03Z	2026-02-13T01:25:08Z	cargo test -p arco-api --all-features --tests
-test_docs_workspace	0	2026-02-13T01:25:08Z	2026-02-13T01:25:32Z	cargo test --doc --workspace
-cargo_deny_all	0	2026-02-13T01:25:32Z	2026-02-13T01:25:33Z	cargo deny check bans licenses sources advisories
-buf_lint_proto	0	2026-02-13T01:25:33Z	2026-02-13T01:25:33Z	buf lint proto/
-buf_breaking_proto	0	2026-02-13T01:25:33Z	2026-02-13T01:25:33Z	buf breaking proto/ --against '.git#branch=main,subdir=proto'
+fmt_check	0	2026-02-14T04:44:01Z	2026-02-14T04:44:02Z	cargo fmt --all --check
+clippy_workspace	0	2026-02-14T04:44:02Z	2026-02-14T04:44:03Z	cargo clippy --workspace --all-features -- -D warnings
+test_workspace_excl_flow_api	0	2026-02-14T04:44:03Z	2026-02-14T04:44:17Z	cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
+test_arco_flow_default	0	2026-02-14T04:44:17Z	2026-02-14T04:44:18Z	cargo test -p arco-flow --tests
+test_arco_flow_test_utils	0	2026-02-14T04:44:18Z	2026-02-14T04:44:19Z	cargo test -p arco-flow --features test-utils --tests
+test_arco_flow_all_features	0	2026-02-14T04:44:19Z	2026-02-14T04:44:21Z	cargo test -p arco-flow --all-features --tests
+test_arco_api_all_features	0	2026-02-14T04:44:21Z	2026-02-14T04:44:24Z	cargo test -p arco-api --all-features --tests
+test_docs_workspace	0	2026-02-14T04:44:24Z	2026-02-14T04:44:42Z	cargo test --doc --workspace
+cargo_deny_all	0	2026-02-14T04:44:42Z	2026-02-14T04:44:42Z	cargo deny check bans licenses sources advisories
+buf_lint_proto	0	2026-02-14T04:44:42Z	2026-02-14T04:44:43Z	buf lint proto/
+buf_breaking_proto	0	2026-02-14T04:44:43Z	2026-02-14T04:44:43Z	buf breaking proto/ --against .git#branch=main,subdir=proto

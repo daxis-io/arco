@@ -1,6 +1,7 @@
 # Production Readiness Audit - Arco Daxis Prod GO
 
 - Audit date: 2026-02-12
+- Evidence refresh UTC: 2026-02-14T04:55:51Z
 - Baseline commit: `e896506f3c936c266a21fe556a107d37bd7075b5`
 - Scope: all currently identified closure signals in the "Arco Daxis Production GO Closure Plan"
 - Definition of Done (locked): `ALL GATES GO`
@@ -13,8 +14,8 @@
 | 0 | Re-baseline / tracker integrity | GO | 4 | 0 | `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-matrix-status.tsv` |
 | 1 | Release discipline / provenance | NO-GO | 0 | 4 | `docs/audits/2026-02-12-prod-readiness/signal-ledger.md` |
 | 2 | Storage / manifest / schema / invariants | GO | 7 | 0 | `docs/audits/2026-02-12-prod-readiness/findings/gate-2-findings.md` |
-| 3 | Layer-2 production blockers | PARTIAL | 5 | 2 | `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_projection_restart.log`, `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_run_bridge_convergence.log`, `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_runtime_observability.log` |
-| 4 | Deployment / observability / operations | NO-GO | 0 | 6 | `docs/audits/2026-02-12-prod-readiness/signal-ledger.md` |
+| 3 | Layer-2 production blockers | GO | 7 | 0 | `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_projection_restart.log`, `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_timer_callback_oidc.log`, `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/promtool_g3_orch_alert_drill.log` |
+| 4 | Deployment / observability / operations | PARTIAL | 0 | 6 | `release_evidence/2026-02-12-prod-readiness/gate-4/README.md` |
 | 5 | Performance / security / release readiness | NO-GO | 0 | 6 | `docs/audits/2026-02-12-prod-readiness/signal-ledger.md` |
 | 7 | Final production promotion and handoff | NO-GO | 0 | 4 | `release_evidence/2026-02-12-prod-readiness/final-go/` |
 
@@ -49,11 +50,32 @@ Result: all required command-matrix commands exited `0`.
    - Code: `crates/arco-flow/src/orchestration/runtime.rs`, `crates/arco-flow/src/bin/arco_flow_dispatcher.rs`
    - Runbook: `docs/runbooks/metrics-catalog.md`
    - Evidence: `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_runtime_observability.log`
+9. `G3-002` Timer callback ingestion with fail-closed OIDC validation is implemented end-to-end.
+   - Code/infra: `crates/arco-flow/src/bin/arco_flow_dispatcher.rs`, `infra/terraform/cloud_tasks.tf`, `infra/terraform/iam.tf`
+   - Evidence: `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_timer_callback_ingestion.log`, `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_timer_callback_oidc.log`, `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/terraform_init_g3_timer_callback.log`, `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/terraform_validate_g3_timer_callback.log`
+   - Auth semantics: valid audience/issuer claims are accepted; missing auth and audience/issuer mismatches are rejected fail-closed.
+   - IAM contract: dispatcher caller SA (`arco-api-*`) has `roles/iam.serviceAccountUser` on invoker SA for OIDC task identity (`iam.serviceAccounts.actAs`).
+10. `G3-006` Operator metric visibility + alerting now includes dashboard coverage and controlled fire-drill proof.
+   - Observability config: `infra/monitoring/dashboard.json`, `infra/monitoring/alerts.yaml`
+   - Evidence: `release_evidence/2026-02-12-prod-readiness/gate-3/observability_dashboard_visibility_proof.md`, `release_evidence/2026-02-12-prod-readiness/gate-3/observability_alert_rule_proof.md`, `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/promtool_g3_orch_alert_drill.log`
 
-## Remaining Gate 3 Open Signals
+## Gate 3 Status
 
-1. `G3-002` Timer callback ingestion with OIDC validation remains `NO-GO` (requires infra/runtime auth path completion and end-to-end callback proof).
-2. `G3-006` Operator metric emission is `PARTIAL`: local metrics are emitted, but dashboard/alert proof artifacts remain external.
+All Gate 3 signals (`G3-001` through `G3-007`) are now `GO` with archived, reproducible evidence under `release_evidence/2026-02-12-prod-readiness/gate-3/`.
+
+## Gate 4 Status
+
+Gate 4 has refreshed local evidence and executable handoff artifacts, but remains incomplete:
+
+- `G4-001`: PARTIAL (`staging.tfvars` + IAM/SA locking verified locally)
+- `G4-002`: PARTIAL (`terraform init/validate` pass; plan synth succeeds then fails on `invalid_rapt`; apply/re-plan pending)
+- `G4-003`: BLOCKED-EXTERNAL (Cloud Run + IAM captures blocked by interactive reauth)
+- `G4-004`: PARTIAL (dashboard/scrape config proofs + local controlled drill captured; live staging visibility pending)
+- `G4-005`: PARTIAL (threshold matrix documented and local threshold drill passed; staged drill signoff pending)
+- `G4-006`: BLOCKED-EXTERNAL (incident drill transcript + reviewer signoff require human execution)
+
+Primary handoff artifact:
+- `release_evidence/2026-02-12-prod-readiness/gate-4/external-handoff-checklist.md`
 
 ## Audit Artifacts
 

@@ -128,6 +128,75 @@ cargo test -p arco-flow --test runtime_observability_tests backlog_snapshot_coun
 
 Expected result: metric names are present in dispatcher/controller paths and backlog gauges count actionable pending rows only.
 
+Dashboard + alert proof checks:
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+dashboard = json.loads(Path("infra/monitoring/dashboard.json").read_text())
+required = [
+    "arco_orch_backlog_depth",
+    "arco_orch_compaction_lag_seconds",
+    "arco_orch_run_key_conflicts",
+    "arco_orch_controller_reconcile_seconds",
+    "arco_orch_slo_target_seconds",
+    "arco_orch_slo_observed_seconds",
+    "arco_orch_slo_breaches_total",
+]
+exprs = [t.get("expr", "") for p in dashboard.get("panels", []) for t in p.get("targets", [])]
+missing = [m for m in required if not any(m in e for e in exprs)]
+assert not missing, f"missing dashboard metrics: {missing}"
+print("dashboard covers all required G3-006 metrics")
+PY
+
+promtool check rules infra/monitoring/alerts.yaml
+promtool test rules release_evidence/2026-02-12-prod-readiness/gate-3/observability_orch_alert_drill.test.yaml
+```
+
+Expected result: dashboard contains each required metric query, alert rules compile, and controlled-signal drill fires expected alerts.
+
+### 5) Timer callback ingestion + OIDC validation (`G3-002`)
+
+```bash
+cargo test -p arco-flow --bin arco_flow_dispatcher -- --nocapture
+cargo test -p arco-flow --all-features --bin arco_flow_dispatcher callback_auth_ -- --nocapture
+terraform -chdir=infra/terraform init -backend=false
+terraform -chdir=infra/terraform validate
+```
+
+Expected result: callback ingestion path emits `TimerFired` deterministically, missing/invalid auth is rejected, valid OIDC claims are accepted, and Terraform queue/IAM contracts validate cleanly.
+
+---
+
+## Gate 4 Staging SLO + Burn-Rate Threshold Checks (2026-02-14)
+
+These checks document the thresholds currently enforced by
+`infra/monitoring/alerts.yaml` and provide a deterministic drill harness for
+their behavior.
+
+### Threshold Matrix (alerts.yaml contract)
+
+| Alert | Threshold | Window | `for` | Notes |
+|---|---|---|---|---|
+| `ArcoApiErrorRateHigh` | `5xx / total > 0.01` | `rate(...[5m])` | `5m` | API error budget guardrail |
+| `ArcoRateLimitHitsHigh` | `increase(rate_limit_hits_total[1m]) > 100` | `1m` | `1m` | Per-endpoint pressure signal |
+| `ArcoCompactionLagHigh` | `compaction_lag_seconds > 600` | gauge | `5m` | Compactor lag threshold |
+| `ArcoCasRetryRateHigh` | `increase(cas_retry_total[1m]) > 10` | `1m` | `5m` | CAS contention threshold |
+| `ArcoOrchSloObservedAboveTarget` | `observed > target` | gauge | `5m` | Runtime SLO over-target condition |
+| `ArcoOrchSloBreachesIncreasing` | `increase(arco_orch_slo_breaches_total[5m]) > 0` | `5m` | `1m` | Short-window burn-rate proxy |
+
+### Controlled Drill (local rule test)
+
+```bash
+promtool check rules infra/monitoring/alerts.yaml
+promtool test rules \
+  release_evidence/2026-02-12-prod-readiness/gate-4/observability/observability_gate4_alert_drill.test.yaml
+```
+
+Expected result: rule check passes and controlled series fire all threshold
+alerts in the matrix.
+
 ---
 
 ## Gate 5 Critical Metrics

@@ -1,3 +1,5 @@
+# command: cargo deny check bans licenses sources advisories
+# start_utc: 2026-02-14T04:44:42Z
 warning[duplicate]: found 2 duplicate entries for crate 'arrow-arith'
    ┌─ /Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/Cargo.lock:34:1
    │  
@@ -10957,3 +10959,6 @@ warning[duplicate]: found 2 duplicate entries for crate 'winnow'
           └── toml v0.9.10+spec-1.1.0 (*)
 
 advisories ok, bans ok, licenses ok, sources ok
+
+# exit_code: 0
+# end_utc: 2026-02-14T04:44:42Z

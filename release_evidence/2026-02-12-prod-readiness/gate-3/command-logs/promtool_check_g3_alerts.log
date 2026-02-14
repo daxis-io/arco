@@ -1,0 +1,8 @@
+# command: promtool check rules infra/monitoring/alerts.yaml
+# start_utc: 2026-02-14T04:43:16Z
+Checking infra/monitoring/alerts.yaml
+  SUCCESS: 14 rules found
+
+
+# exit_code: 0
+# end_utc: 2026-02-14T04:43:16Z

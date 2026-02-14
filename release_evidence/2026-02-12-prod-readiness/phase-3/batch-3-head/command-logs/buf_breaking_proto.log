@@ -1,0 +1,5 @@
+# command: buf breaking proto/ --against .git#branch=main,subdir=proto
+# start_utc: 2026-02-14T04:44:43Z
+
+# exit_code: 0
+# end_utc: 2026-02-14T04:44:43Z

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -12,7 +13,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use metrics::{counter, gauge};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use arco_core::observability::{LogFormat, init_logging};
 use arco_core::storage::{ObjectStoreBackend, StorageBackend};
@@ -22,12 +23,14 @@ use arco_flow::dispatch::{EnqueueOptions, EnqueueResult};
 use arco_flow::error::{Error, Result};
 use arco_flow::metrics::{labels as metrics_labels, names as metrics_names};
 use arco_flow::orchestration::LedgerWriter;
-use arco_flow::orchestration::compactor::MicroCompactor;
+use arco_flow::orchestration::compactor::{MicroCompactor, TimerRow};
 use arco_flow::orchestration::controllers::{
     DispatchAction, DispatchPayload, DispatcherController, ReadyDispatchController,
     RunBridgeAction, RunBridgeController, TimerAction, TimerController,
 };
-use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
+use arco_flow::orchestration::events::{
+    OrchestrationEvent, OrchestrationEventData, TimerType as EventTimerType,
+};
 use arco_flow::orchestration::runtime::{
     OrchestrationBacklogSnapshot, OrchestrationRuntimeConfig, OrchestrationSloSnapshot,
     snapshot_backlog, snapshot_slos,
@@ -44,6 +47,7 @@ struct AppState {
     timer_target_url: Option<String>,
     timer_audience: Option<String>,
     timer_queue: Option<String>,
+    timer_callback_auth: TimerCallbackAuth,
     runtime_config: OrchestrationRuntimeConfig,
 }
 
@@ -84,6 +88,7 @@ struct ErrorResponse {
 
 #[derive(Debug)]
 struct ApiError {
+    status: StatusCode,
     message: String,
     summary: Option<RunSummary>,
 }
@@ -203,8 +208,33 @@ impl TaskTokenSigner {
 impl ApiError {
     fn from_summary(summary: RunSummary) -> Self {
         Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "dispatcher run completed with errors".to_string(),
             summary: Some(summary),
+        }
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            summary: None,
+        }
+    }
+
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+            summary: None,
+        }
+    }
+
+    fn service_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+            summary: None,
         }
     }
 }
@@ -212,6 +242,7 @@ impl ApiError {
 impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
         Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
             message: error.to_string(),
             summary: None,
         }
@@ -220,13 +251,12 @@ impl From<Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = StatusCode::INTERNAL_SERVER_ERROR;
         if let Some(summary) = self.summary {
-            return (status, Json(summary)).into_response();
+            return (self.status, Json(summary)).into_response();
         }
 
         (
-            status,
+            self.status,
             Json(ErrorResponse {
                 error: self.message,
             }),
@@ -235,7 +265,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TimerPayload {
     timer_id: String,
     timer_type: arco_flow::orchestration::compactor::fold::TimerType,
@@ -245,8 +275,290 @@ struct TimerPayload {
     fire_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+enum TimerCallbackAuth {
+    Disabled,
+    Oidc {
+        audience: String,
+        issuer: String,
+        tokeninfo_url: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(not(feature = "gcp"), allow(dead_code))]
+struct OidcTokenInfo {
+    aud: Option<String>,
+    iss: Option<String>,
+    exp: Option<String>,
+}
+
+impl TimerCallbackAuth {
+    fn from_env(timer_target_url: Option<&str>) -> Result<Self> {
+        let Some(default_audience) = timer_target_url else {
+            return Ok(Self::Disabled);
+        };
+
+        let audience = optional_env("ARCO_FLOW_TIMER_CALLBACK_OIDC_AUDIENCE")
+            .unwrap_or_else(|| default_audience.to_string());
+        let issuer = optional_env("ARCO_FLOW_TIMER_CALLBACK_OIDC_ISSUER")
+            .unwrap_or_else(|| "https://accounts.google.com".to_string());
+        let tokeninfo_url = optional_env("ARCO_FLOW_TIMER_CALLBACK_OIDC_TOKENINFO_URL")
+            .unwrap_or_else(|| "https://oauth2.googleapis.com/tokeninfo".to_string());
+
+        if audience.trim().is_empty() {
+            return Err(Error::configuration(
+                "ARCO_FLOW_TIMER_CALLBACK_OIDC_AUDIENCE cannot be empty",
+            ));
+        }
+
+        if issuer.trim().is_empty() {
+            return Err(Error::configuration(
+                "ARCO_FLOW_TIMER_CALLBACK_OIDC_ISSUER cannot be empty",
+            ));
+        }
+
+        if tokeninfo_url.trim().is_empty() {
+            return Err(Error::configuration(
+                "ARCO_FLOW_TIMER_CALLBACK_OIDC_TOKENINFO_URL cannot be empty",
+            ));
+        }
+
+        Ok(Self::Oidc {
+            audience,
+            issuer,
+            tokeninfo_url,
+        })
+    }
+
+    async fn validate_headers(&self, headers: &HeaderMap) -> std::result::Result<(), String> {
+        let token = bearer_token(headers).ok_or_else(|| {
+            "Authorization header required for timer callback (expected Bearer token)".to_string()
+        })?;
+        self.validate_token(&token).await
+    }
+
+    async fn validate_token(&self, token: &str) -> std::result::Result<(), String> {
+        match self {
+            Self::Disabled => Err("timer callback auth is not configured".to_string()),
+            Self::Oidc {
+                audience,
+                issuer,
+                tokeninfo_url,
+            } => validate_oidc_token(token, audience, issuer, tokeninfo_url).await,
+        }
+    }
+
+    #[cfg(test)]
+    fn oidc_for_tests(audience: &str, issuer: &str, tokeninfo_url: &str) -> Self {
+        Self::Oidc {
+            audience: audience.to_string(),
+            issuer: issuer.to_string(),
+            tokeninfo_url: tokeninfo_url.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "gcp")]
+async fn validate_oidc_token(
+    token: &str,
+    expected_audience: &str,
+    expected_issuer: &str,
+    tokeninfo_url: &str,
+) -> std::result::Result<(), String> {
+    let response = reqwest::Client::new()
+        .get(tokeninfo_url)
+        .query(&[("id_token", token)])
+        .send()
+        .await
+        .map_err(|e| format!("failed to validate OIDC token: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "tokeninfo response unavailable".to_string());
+        return Err(format!(
+            "OIDC token rejected by tokeninfo endpoint: {status} ({body})"
+        ));
+    }
+
+    let info = response
+        .json::<OidcTokenInfo>()
+        .await
+        .map_err(|e| format!("failed to parse tokeninfo response: {e}"))?;
+
+    let audience = info
+        .aud
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "OIDC token missing aud claim".to_string())?;
+    if audience != expected_audience {
+        return Err(format!(
+            "OIDC token audience mismatch: expected {expected_audience}, got {audience}"
+        ));
+    }
+
+    let issuer = info
+        .iss
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "OIDC token missing iss claim".to_string())?;
+    if !issuer_matches(expected_issuer, issuer) {
+        return Err(format!(
+            "OIDC token issuer mismatch: expected {expected_issuer}, got {issuer}"
+        ));
+    }
+
+    let exp = info
+        .exp
+        .as_deref()
+        .ok_or_else(|| "OIDC token missing exp claim".to_string())?
+        .parse::<i64>()
+        .map_err(|_| "OIDC token exp claim is invalid".to_string())?;
+
+    if exp <= Utc::now().timestamp() {
+        return Err("OIDC token is expired".to_string());
+    }
+
+    Ok(())
+}
+
+#[cfg(not(feature = "gcp"))]
+async fn validate_oidc_token(
+    _token: &str,
+    _expected_audience: &str,
+    _expected_issuer: &str,
+    _tokeninfo_url: &str,
+) -> std::result::Result<(), String> {
+    Err("OIDC validation requires the gcp feature".to_string())
+}
+
+#[cfg_attr(not(feature = "gcp"), allow(dead_code))]
+fn issuer_matches(expected: &str, actual: &str) -> bool {
+    expected == actual
+        || (expected == "https://accounts.google.com" && actual == "accounts.google.com")
+        || (expected == "accounts.google.com" && actual == "https://accounts.google.com")
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get("Authorization")?.to_str().ok()?;
+    let token = raw.strip_prefix("Bearer ")?;
+    if token.trim().is_empty() {
+        return None;
+    }
+    Some(token.to_string())
+}
+
 async fn health_handler() -> StatusCode {
     StatusCode::OK
+}
+
+fn timer_fired_event_data_from_payload(
+    payload: &TimerPayload,
+) -> std::result::Result<OrchestrationEventData, String> {
+    let parsed = TimerRow::parse_timer_id(&payload.timer_id).ok_or_else(|| {
+        format!(
+            "invalid timer_id format for callback payload: {}",
+            payload.timer_id
+        )
+    })?;
+
+    if payload.run_id.is_some() && payload.run_id != parsed.run_id {
+        return Err(format!(
+            "timer callback run_id does not match timer_id: payload={:?}, timer_id={:?}",
+            payload.run_id, parsed.run_id
+        ));
+    }
+
+    if payload.task_key.is_some() && payload.task_key != parsed.task_key {
+        return Err(format!(
+            "timer callback task_key does not match timer_id: payload={:?}, timer_id={:?}",
+            payload.task_key, parsed.task_key
+        ));
+    }
+
+    if payload.attempt.is_some() && payload.attempt != parsed.attempt {
+        return Err(format!(
+            "timer callback attempt does not match timer_id: payload={:?}, timer_id={:?}",
+            payload.attempt, parsed.attempt
+        ));
+    }
+
+    let timer_type = match parsed.timer_type {
+        arco_flow::orchestration::compactor::TimerType::Retry => EventTimerType::Retry,
+        arco_flow::orchestration::compactor::TimerType::HeartbeatCheck => {
+            EventTimerType::HeartbeatCheck
+        }
+        arco_flow::orchestration::compactor::TimerType::Cron => EventTimerType::Cron,
+        arco_flow::orchestration::compactor::TimerType::SlaCheck => EventTimerType::SlaCheck,
+    };
+
+    Ok(OrchestrationEventData::TimerFired {
+        timer_id: payload.timer_id.clone(),
+        timer_type,
+        run_id: parsed.run_id,
+        task_key: parsed.task_key,
+        attempt: parsed.attempt,
+    })
+}
+
+async fn append_timer_fired_event(
+    ledger: &LedgerWriter,
+    tenant_id: &str,
+    workspace_id: &str,
+    payload: &TimerPayload,
+) -> Result<()> {
+    let event_data = timer_fired_event_data_from_payload(payload).map_err(Error::configuration)?;
+    let event = OrchestrationEvent::new(tenant_id, workspace_id, event_data);
+    ledger.append(event).await
+}
+
+async fn timer_callback_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<TimerPayload>,
+) -> std::result::Result<StatusCode, ApiError> {
+    validate_and_append_timer_callback(
+        &state.timer_callback_auth,
+        &headers,
+        &state.ledger,
+        &state.tenant_id,
+        &state.workspace_id,
+        &payload,
+    )
+    .await?;
+
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn validate_and_append_timer_callback(
+    auth: &TimerCallbackAuth,
+    headers: &HeaderMap,
+    ledger: &LedgerWriter,
+    tenant_id: &str,
+    workspace_id: &str,
+    payload: &TimerPayload,
+) -> std::result::Result<(), ApiError> {
+    if matches!(auth, TimerCallbackAuth::Disabled) {
+        return Err(ApiError::service_unavailable(
+            "timer callback auth is not configured",
+        ));
+    }
+
+    auth.validate_headers(headers)
+        .await
+        .map_err(ApiError::unauthorized)?;
+
+    append_timer_fired_event(ledger, tenant_id, workspace_id, payload)
+        .await
+        .map_err(|err| match err {
+            Error::Configuration { message } => ApiError::bad_request(message),
+            _ => ApiError::from(err),
+        })?;
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -684,6 +996,23 @@ fn optional_env(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 
+fn validate_timer_callback_oidc_contract(
+    timer_target_url: Option<&str>,
+    service_account_email: Option<&str>,
+) -> Result<()> {
+    if timer_target_url.is_some() {
+        let has_service_account =
+            service_account_email.is_some_and(|value| !value.trim().is_empty());
+        if !has_service_account {
+            return Err(Error::configuration(
+                "ARCO_FLOW_SERVICE_ACCOUNT_EMAIL is required when ARCO_FLOW_TIMER_TARGET_URL is configured",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn parse_bool_env(key: &str, default: bool) -> bool {
     std::env::var(key).map_or(default, |value| value.eq_ignore_ascii_case("true"))
 }
@@ -787,6 +1116,11 @@ async fn main() -> Result<()> {
     let timer_audience = optional_env("ARCO_FLOW_TIMER_AUDIENCE");
     let timer_queue = optional_env("ARCO_FLOW_TIMER_QUEUE");
     let service_account_email = optional_env("ARCO_FLOW_SERVICE_ACCOUNT_EMAIL");
+    validate_timer_callback_oidc_contract(
+        timer_target_url.as_deref(),
+        service_account_email.as_deref(),
+    )?;
+    let timer_callback_auth = TimerCallbackAuth::from_env(timer_target_url.as_deref())?;
     let runtime_config = OrchestrationRuntimeConfig::from_env()?;
     let port = resolve_port()?;
     let internal_auth = build_internal_auth()?;
@@ -843,6 +1177,7 @@ async fn main() -> Result<()> {
         timer_target_url,
         timer_audience,
         timer_queue,
+        timer_callback_auth,
         runtime_config,
     };
 
@@ -858,7 +1193,8 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health_handler))
-        .route("/run", run_route)
+        .route("/run", post(run_handler))
+        .route("/timers/callback", post(timer_callback_handler))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -869,4 +1205,617 @@ async fn main() -> Result<()> {
     axum::serve(listener, app)
         .await
         .map_err(|e| Error::configuration(format!("server error: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+    use std::sync::Arc;
+
+    use arco_core::MemoryBackend;
+    use arco_core::ScopedStorage;
+    use arco_flow::orchestration::compactor::fold::TimerState;
+
+    #[cfg(feature = "gcp")]
+    use axum::http::HeaderValue;
+    #[cfg(feature = "gcp")]
+    use chrono::Duration;
+
+    fn timer_payload(timer_id: &str) -> TimerPayload {
+        TimerPayload {
+            timer_id: timer_id.to_string(),
+            run_id: Some("run-1".to_string()),
+            task_key: Some("task-a".to_string()),
+            attempt: Some(1),
+            fire_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn timer_payload_maps_to_timer_fired_event() {
+        let payload = timer_payload("timer:retry:run-1:task-a:1:1705320000");
+        let event = timer_fired_event_data_from_payload(&payload).expect("event data");
+        match event {
+            OrchestrationEventData::TimerFired {
+                timer_id,
+                run_id,
+                task_key,
+                attempt,
+                ..
+            } => {
+                assert_eq!(timer_id, payload.timer_id);
+                assert_eq!(run_id.as_deref(), Some("run-1"));
+                assert_eq!(task_key.as_deref(), Some("task-a"));
+                assert_eq!(attempt, Some(1));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timer_payload_rejects_mismatched_metadata() {
+        let payload = TimerPayload {
+            timer_id: "timer:retry:run-1:task-a:1:1705320000".to_string(),
+            run_id: Some("wrong-run".to_string()),
+            task_key: Some("task-a".to_string()),
+            attempt: Some(1),
+            fire_at: Utc::now(),
+        };
+
+        let err = timer_fired_event_data_from_payload(&payload).expect_err("must reject mismatch");
+        assert!(
+            err.contains("run_id"),
+            "expected run_id mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn timer_callback_contract_requires_service_account_when_timer_target_is_configured() {
+        let err = validate_timer_callback_oidc_contract(
+            Some("https://dispatcher.internal/timers/callback"),
+            None,
+        )
+        .expect_err("missing service account should fail closed");
+        assert!(
+            err.to_string()
+                .contains("ARCO_FLOW_SERVICE_ACCOUNT_EMAIL is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn timer_callback_contract_allows_disabled_timer_target_without_service_account() {
+        validate_timer_callback_oidc_contract(None, None)
+            .expect("contract should allow disabled timer callback queue");
+    }
+
+    #[tokio::test]
+    async fn callback_ingestion_duplicate_is_idempotent_after_compaction() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+        let ledger = LedgerWriter::new(storage.clone());
+        let compactor = MicroCompactor::new(storage.clone());
+
+        let payload = timer_payload("timer:retry:run-1:task-a:1:1705320000");
+        append_timer_fired_event(&ledger, "tenant", "workspace", &payload).await?;
+        append_timer_fired_event(&ledger, "tenant", "workspace", &payload).await?;
+
+        let mut paths: Vec<String> = storage
+            .list("ledger/orchestration/")
+            .await?
+            .into_iter()
+            .map(|p| p.as_str().to_string())
+            .collect();
+        paths.sort();
+        compactor.compact_events(paths).await?;
+
+        let (_manifest, state) = compactor.load_state().await?;
+        let timer = state
+            .timers
+            .get("timer:retry:run-1:task-a:1:1705320000")
+            .expect("timer row");
+        assert_eq!(timer.state, TimerState::Fired);
+        assert!(
+            state
+                .idempotency_keys
+                .contains_key("timer_fired:timer:retry:run-1:task-a:1:1705320000"),
+            "timer fired idempotency key should be present"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn callback_auth_rejects_missing_bearer() {
+        let auth = TimerCallbackAuth::oidc_for_tests(
+            "https://dispatcher.internal/timers/callback",
+            "https://accounts.google.com",
+            "http://127.0.0.1:1/tokeninfo",
+        );
+        let headers = HeaderMap::new();
+        let err = auth
+            .validate_headers(&headers)
+            .await
+            .expect_err("missing auth must be rejected");
+        assert!(
+            err.contains("Authorization"),
+            "expected auth header error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_ingestion_rejects_when_auth_disabled() -> Result<()> {
+        let storage = ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")?;
+        let ledger = LedgerWriter::new(storage.clone());
+        let headers = HeaderMap::new();
+        let payload = timer_payload("timer:retry:run-1:task-a:1:1705320000");
+
+        let err = validate_and_append_timer_callback(
+            &TimerCallbackAuth::Disabled,
+            &headers,
+            &ledger,
+            "tenant",
+            "workspace",
+            &payload,
+        )
+        .await
+        .expect_err("disabled auth must reject callback");
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+
+        assert!(
+            storage.list("ledger/orchestration/").await?.is_empty(),
+            "disabled auth should not append events"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn callback_ingestion_rejects_missing_bearer_and_does_not_append() -> Result<()> {
+        let storage = ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")?;
+        let ledger = LedgerWriter::new(storage.clone());
+        let headers = HeaderMap::new();
+        let payload = timer_payload("timer:retry:run-1:task-a:1:1705320000");
+        let auth = TimerCallbackAuth::oidc_for_tests(
+            "https://dispatcher.internal/timers/callback",
+            "https://accounts.google.com",
+            "http://127.0.0.1:1/tokeninfo",
+        );
+
+        let err = validate_and_append_timer_callback(
+            &auth,
+            &headers,
+            &ledger,
+            "tenant",
+            "workspace",
+            &payload,
+        )
+        .await
+        .expect_err("missing bearer token must be rejected");
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        assert!(
+            storage.list("ledger/orchestration/").await?.is_empty(),
+            "unauthorized callback should not append events"
+        );
+
+        Ok(())
+    }
+
+    #[cfg(feature = "gcp")]
+    #[tokio::test]
+    async fn callback_auth_accepts_valid_tokeninfo_claims() {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use serde::Deserialize;
+
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            id_token: String,
+        }
+
+        let expected_aud = "https://dispatcher.internal/timers/callback".to_string();
+        let app = Router::new().route(
+            "/tokeninfo",
+            get(move |Query(params): Query<Params>| {
+                let expected_aud = expected_aud.clone();
+                async move {
+                    if params.id_token == "valid-token" {
+                        let payload = serde_json::json!({
+                            "iss": "https://accounts.google.com",
+                            "aud": expected_aud,
+                            "exp": (Utc::now() + Duration::minutes(5)).timestamp().to_string(),
+                        });
+                        (StatusCode::OK, Json(payload)).into_response()
+                    } else {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(serde_json::json!({"error": "invalid token"})),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+
+        let auth = TimerCallbackAuth::oidc_for_tests(
+            "https://dispatcher.internal/timers/callback",
+            "https://accounts.google.com",
+            &format!("http://{addr}/tokeninfo"),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_str("Bearer valid-token").expect("header value"),
+        );
+        auth.validate_headers(&headers)
+            .await
+            .expect("valid token should pass");
+
+        server.abort();
+    }
+
+    #[cfg(feature = "gcp")]
+    #[tokio::test]
+    async fn callback_ingestion_accepts_valid_oidc_and_appends_timer_fired() -> Result<()> {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use serde::Deserialize;
+
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            id_token: String,
+        }
+
+        let expected_aud = "https://dispatcher.internal/timers/callback".to_string();
+        let app = Router::new().route(
+            "/tokeninfo",
+            get(move |Query(params): Query<Params>| {
+                let expected_aud = expected_aud.clone();
+                async move {
+                    if params.id_token == "valid-token" {
+                        let payload = serde_json::json!({
+                            "iss": "https://accounts.google.com",
+                            "aud": expected_aud,
+                            "exp": (Utc::now() + Duration::minutes(5)).timestamp().to_string(),
+                        });
+                        (StatusCode::OK, Json(payload)).into_response()
+                    } else {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(serde_json::json!({"error": "invalid token"})),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+
+        let storage = ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")?;
+        let ledger = LedgerWriter::new(storage.clone());
+        let auth = TimerCallbackAuth::oidc_for_tests(
+            "https://dispatcher.internal/timers/callback",
+            "https://accounts.google.com",
+            &format!("http://{addr}/tokeninfo"),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_str("Bearer valid-token").expect("header value"),
+        );
+        let payload = timer_payload("timer:retry:run-1:task-a:1:1705320000");
+
+        validate_and_append_timer_callback(
+            &auth,
+            &headers,
+            &ledger,
+            "tenant",
+            "workspace",
+            &payload,
+        )
+        .await
+        .expect("valid callback should append event");
+
+        let paths = storage.list("ledger/orchestration/").await?;
+        assert_eq!(paths.len(), 1, "expected exactly one appended ledger event");
+        let event_bytes = storage.get_raw(paths[0].as_str()).await?;
+        let event: OrchestrationEvent = serde_json::from_slice(&event_bytes).expect("parse event");
+
+        match event.data {
+            OrchestrationEventData::TimerFired { timer_id, .. } => {
+                assert_eq!(timer_id, payload.timer_id);
+            }
+            other => panic!("expected TimerFired event, got {other:?}"),
+        }
+
+        server.abort();
+        Ok(())
+    }
+
+    #[cfg(feature = "gcp")]
+    #[tokio::test]
+    async fn callback_auth_rejects_audience_mismatch() {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use serde::Deserialize;
+
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            id_token: String,
+        }
+
+        let app = Router::new().route(
+            "/tokeninfo",
+            get(move |Query(params): Query<Params>| async move {
+                if params.id_token == "bad-audience-token" {
+                    let payload = serde_json::json!({
+                        "iss": "https://accounts.google.com",
+                        "aud": "https://not-dispatcher.example/callback",
+                        "exp": (Utc::now() + Duration::minutes(5)).timestamp().to_string(),
+                    });
+                    (StatusCode::OK, Json(payload)).into_response()
+                } else {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({"error": "invalid token"})),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+
+        let auth = TimerCallbackAuth::oidc_for_tests(
+            "https://dispatcher.internal/timers/callback",
+            "https://accounts.google.com",
+            &format!("http://{addr}/tokeninfo"),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_str("Bearer bad-audience-token").expect("header value"),
+        );
+        let err = auth
+            .validate_headers(&headers)
+            .await
+            .expect_err("audience mismatch should be rejected");
+        assert!(
+            err.contains("audience mismatch"),
+            "expected audience mismatch error, got: {err}"
+        );
+
+        server.abort();
+    }
+
+    #[cfg(feature = "gcp")]
+    #[tokio::test]
+    async fn callback_auth_rejects_issuer_mismatch() {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use serde::Deserialize;
+
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            id_token: String,
+        }
+
+        let app = Router::new().route(
+            "/tokeninfo",
+            get(move |Query(params): Query<Params>| async move {
+                if params.id_token == "bad-issuer-token" {
+                    let payload = serde_json::json!({
+                        "iss": "https://malicious-issuer.example",
+                        "aud": "https://dispatcher.internal/timers/callback",
+                        "exp": (Utc::now() + Duration::minutes(5)).timestamp().to_string(),
+                    });
+                    (StatusCode::OK, Json(payload)).into_response()
+                } else {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({"error": "invalid token"})),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+
+        let auth = TimerCallbackAuth::oidc_for_tests(
+            "https://dispatcher.internal/timers/callback",
+            "https://accounts.google.com",
+            &format!("http://{addr}/tokeninfo"),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_str("Bearer bad-issuer-token").expect("header value"),
+        );
+        let err = auth
+            .validate_headers(&headers)
+            .await
+            .expect_err("issuer mismatch should be rejected");
+        assert!(
+            err.contains("issuer mismatch"),
+            "expected issuer mismatch error, got: {err}"
+        );
+
+        server.abort();
+    }
+
+    #[cfg(feature = "gcp")]
+    #[tokio::test]
+    async fn callback_ingestion_rejects_audience_mismatch_and_does_not_append() -> Result<()> {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use serde::Deserialize;
+
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            id_token: String,
+        }
+
+        let app = Router::new().route(
+            "/tokeninfo",
+            get(move |Query(params): Query<Params>| async move {
+                if params.id_token == "bad-audience-token" {
+                    let payload = serde_json::json!({
+                        "iss": "https://accounts.google.com",
+                        "aud": "https://wrong.internal/timers/callback",
+                        "exp": (Utc::now() + Duration::minutes(5)).timestamp().to_string(),
+                    });
+                    (StatusCode::OK, Json(payload)).into_response()
+                } else {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({"error": "invalid token"})),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+
+        let storage = ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")?;
+        let ledger = LedgerWriter::new(storage.clone());
+        let auth = TimerCallbackAuth::oidc_for_tests(
+            "https://dispatcher.internal/timers/callback",
+            "https://accounts.google.com",
+            &format!("http://{addr}/tokeninfo"),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_str("Bearer bad-audience-token").expect("header value"),
+        );
+        let payload = timer_payload("timer:retry:run-1:task-a:1:1705320000");
+
+        let err = validate_and_append_timer_callback(
+            &auth,
+            &headers,
+            &ledger,
+            "tenant",
+            "workspace",
+            &payload,
+        )
+        .await
+        .expect_err("audience mismatch should reject callback");
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        assert!(
+            storage.list("ledger/orchestration/").await?.is_empty(),
+            "rejected callback should not append events"
+        );
+
+        server.abort();
+        Ok(())
+    }
+
+    #[cfg(feature = "gcp")]
+    #[tokio::test]
+    async fn callback_ingestion_rejects_issuer_mismatch_and_does_not_append() -> Result<()> {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use serde::Deserialize;
+
+        #[derive(Debug, Deserialize)]
+        struct Params {
+            id_token: String,
+        }
+
+        let app = Router::new().route(
+            "/tokeninfo",
+            get(move |Query(params): Query<Params>| async move {
+                if params.id_token == "bad-issuer-token" {
+                    let payload = serde_json::json!({
+                        "iss": "https://malicious-issuer.example",
+                        "aud": "https://dispatcher.internal/timers/callback",
+                        "exp": (Utc::now() + Duration::minutes(5)).timestamp().to_string(),
+                    });
+                    (StatusCode::OK, Json(payload)).into_response()
+                } else {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({"error": "invalid token"})),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+
+        let storage = ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")?;
+        let ledger = LedgerWriter::new(storage.clone());
+        let auth = TimerCallbackAuth::oidc_for_tests(
+            "https://dispatcher.internal/timers/callback",
+            "https://accounts.google.com",
+            &format!("http://{addr}/tokeninfo"),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_str("Bearer bad-issuer-token").expect("header value"),
+        );
+        let payload = timer_payload("timer:retry:run-1:task-a:1:1705320000");
+
+        let err = validate_and_append_timer_callback(
+            &auth,
+            &headers,
+            &ledger,
+            "tenant",
+            "workspace",
+            &payload,
+        )
+        .await
+        .expect_err("issuer mismatch should reject callback");
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        assert!(
+            storage.list("ledger/orchestration/").await?.is_empty(),
+            "rejected callback should not append events"
+        );
+
+        server.abort();
+        Ok(())
+    }
 }

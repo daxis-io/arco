@@ -1,4 +1,5 @@
-[UTC] 2026-02-14T04:51:29Z
+[UTC] 2026-02-15T16:23:59Z
+[CMD] gcloud auth print-access-token
 ERROR: (gcloud.auth.print-access-token) There was a problem refreshing your current auth tokens: Reauthentication failed. cannot prompt during non-interactive execution.
 Please run:
 
@@ -11,4 +12,4 @@ If you have already logged in with a different account, run:
   $ gcloud config set account ACCOUNT
 
 to select an already authenticated account to use.
-token_refresh=FAILED
+[EXIT] 1

@@ -1,9 +1,16 @@
 step	command	exit_code	utc
-services_list	gcloud run services list --project='dataverse-dev-471815' --region='us-central1' --platform=managed --format=json	1	2026-02-14T04:46:41Z
-service_describe_api	gcloud run services describe arco-api-staging --project='dataverse-dev-471815' --region='us-central1' --platform=managed --format=json	1	2026-02-14T04:46:41Z
-service_describe_compactor	gcloud run services describe arco-compactor-staging --project='dataverse-dev-471815' --region='us-central1' --platform=managed --format=json	1	2026-02-14T04:46:42Z
-revisions_api	gcloud run revisions list --project='dataverse-dev-471815' --region='us-central1' --platform=managed --service=arco-api-staging --format=json	1	2026-02-14T04:46:43Z
-revisions_compactor	gcloud run revisions list --project='dataverse-dev-471815' --region='us-central1' --platform=managed --service=arco-compactor-staging --format=json	1	2026-02-14T04:46:44Z
-iam_policy_api	gcloud run services get-iam-policy arco-api-staging --project='dataverse-dev-471815' --region='us-central1' --platform=managed --format=json	1	2026-02-14T04:46:44Z
-iam_policy_compactor	gcloud run services get-iam-policy arco-compactor-staging --project='dataverse-dev-471815' --region='us-central1' --platform=managed --format=json	1	2026-02-14T04:46:45Z
-iam_policy_project_filtered	gcloud projects get-iam-policy 'dataverse-dev-471815' --format=json	1	2026-02-14T04:46:46Z
+gcloud_version	gcloud --version	0	2026-02-15T16:23:56Z
+auth_list	gcloud auth list	0	2026-02-15T16:23:57Z
+config_account	gcloud config get-value account	0	2026-02-15T16:23:57Z
+config_project	gcloud config get-value project	0	2026-02-15T16:23:58Z
+config_account_project	gcloud config list --format='value(core.account,core.project)'	0	2026-02-15T16:23:58Z
+auth_print_access_token	gcloud auth print-access-token	1	2026-02-15T16:23:59Z
+adc_print_access_token	gcloud auth application-default print-access-token	1	2026-02-15T16:24:00Z
+services_list	gcloud run services list --project=dataverse-dev-471815 --region=us-central1 --platform=managed --format=json	1	2026-02-15T16:24:01Z
+service_describe_api	gcloud run services describe arco-api-staging --project=dataverse-dev-471815 --region=us-central1 --platform=managed --format=json	1	2026-02-15T16:24:01Z
+service_describe_compactor	gcloud run services describe arco-compactor-staging --project=dataverse-dev-471815 --region=us-central1 --platform=managed --format=json	1	2026-02-15T16:24:02Z
+revisions_api	gcloud run revisions list --project=dataverse-dev-471815 --region=us-central1 --platform=managed --service=arco-api-staging --format=json	1	2026-02-15T16:24:03Z
+revisions_compactor	gcloud run revisions list --project=dataverse-dev-471815 --region=us-central1 --platform=managed --service=arco-compactor-staging --format=json	1	2026-02-15T16:24:04Z
+iam_policy_api	gcloud run services get-iam-policy arco-api-staging --project=dataverse-dev-471815 --region=us-central1 --platform=managed --format=json	1	2026-02-15T16:24:05Z
+iam_policy_compactor	gcloud run services get-iam-policy arco-compactor-staging --project=dataverse-dev-471815 --region=us-central1 --platform=managed --format=json	1	2026-02-15T16:24:05Z
+iam_policy_project	gcloud projects get-iam-policy dataverse-dev-471815 --format=json	1	2026-02-15T16:24:06Z

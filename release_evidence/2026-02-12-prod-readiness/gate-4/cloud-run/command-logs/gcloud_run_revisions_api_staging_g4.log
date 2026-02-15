@@ -1,3 +1,6 @@
+[UTC] 2026-02-15T16:24:03Z
+[CMD] gcloud run revisions list --project=dataverse-dev-471815 --region=us-central1 --platform=managed --service=arco-api-staging --format=json
+[]
 ERROR: (gcloud.run.revisions.list) There was a problem refreshing your current auth tokens: Reauthentication failed. cannot prompt during non-interactive execution.
 Please run:
 
@@ -10,4 +13,4 @@ If you have already logged in with a different account, run:
   $ gcloud config set account ACCOUNT
 
 to select an already authenticated account to use.
-[]
+[EXIT] 1

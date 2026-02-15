@@ -1,6 +1,6 @@
 # G4-002 Terraform Plan/Apply Evidence
 
-Generated UTC: 2026-02-14T04:51:40Z
+Generated UTC: 2026-02-15T16:24:48Z
 Status: PARTIAL (interactive GCP reauthentication required to complete apply + re-plan)
 
 ## Executed Commands
@@ -37,14 +37,13 @@ Owner: Platform + SRE
 
 2. Execute staging apply.
    - Command:
-     - `# First replace placeholder values in infra/terraform/environments/staging.tfvars`
      - `terraform -chdir=infra/terraform plan -var-file=environments/staging.tfvars -lock=false -input=false -no-color -out=../../release_evidence/2026-02-12-prod-readiness/gate-4/terraform/staging.tfplan`
      - `terraform -chdir=infra/terraform apply -input=false -auto-approve -no-color ../../release_evidence/2026-02-12-prod-readiness/gate-4/terraform/staging.tfplan`
      - `terraform -chdir=infra/terraform plan -var-file=environments/staging.tfvars -lock=false -input=false -no-color`
    - Expected output:
      - Initial plan exits `0`.
      - Apply exits `0`.
-     - Re-plan exits `0` and reports no changes.
+     - Re-plan exits `0` and reports `No changes`.
    - Artifact destination:
      - `terraform/command-logs/terraform_plan_g4_external.log`
      - `terraform/command-logs/terraform_apply_g4_external.log`

@@ -1,2 +1,4 @@
-[UTC] 2026-02-14T15:27:51Z
-[REDACTED_ACCOUNT_1]	dataverse-dev-471815
+[UTC] 2026-02-15T16:23:58Z
+[CMD] gcloud config list --format='value(core.account,core.project)'
+[REDACTED_EMAIL]	dataverse-dev-471815
+[EXIT] 0

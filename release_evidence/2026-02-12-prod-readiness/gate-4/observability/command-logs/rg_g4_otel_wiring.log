@@ -1,11 +1,14 @@
-1:receivers:
+[UTC] 2026-02-15T16:24:07Z
+[CMD] rg -n '(arco-api|arco-compactor|prometheus|otlp|scrape|metrics)' "/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/infra/monitoring/otel-collector.yaml"
+2:  prometheus:
+4:      scrape_configs:
 5:        - job_name: arco-api
+6:          metrics_path: /metrics
 8:            - targets: ["arco-api:8080"]
 9:        - job_name: arco-compactor
+10:          metrics_path: /metrics
 12:            - targets: ["arco-compactor:8081"]
-13:          authorization:
-21:exporters:
-22:  googlecloud:
-26:  pipelines:
+16:  otlp:
+27:    metrics:
 28:      receivers: [prometheus, otlp]
-29:      exporters: [googlecloud]
+[EXIT] 0

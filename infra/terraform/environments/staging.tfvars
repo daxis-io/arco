@@ -3,13 +3,13 @@
 # This file is committed as a complete, non-secret baseline for Gate 4 evidence.
 # Replace project/image/identity values during external staging execution if needed.
 
-project_id  = "replace-with-staging-project-id"
+project_id  = "dataverse-dev-471815"
 region      = "us-central1"
 environment = "staging"
 
 # Container images
-api_image        = "us-central1-docker.pkg.dev/replace-with-staging-project/arco/arco-api:staging"
-compactor_image  = "us-central1-docker.pkg.dev/replace-with-staging-project/arco/arco-compactor:staging"
+api_image        = "us-central1-docker.pkg.dev/dataverse-dev-471815/arco/arco-api:staging"
+compactor_image  = "us-central1-docker.pkg.dev/dataverse-dev-471815/arco/arco-compactor:staging"
 api_code_version = "2026-02-12-prod-readiness"
 
 # Compactor anti-entropy scope (required)

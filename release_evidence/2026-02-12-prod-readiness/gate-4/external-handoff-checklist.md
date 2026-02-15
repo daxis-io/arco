@@ -1,6 +1,6 @@
 # Gate 4 External Handoff Checklist
 
-Generated UTC: 2026-02-14T04:51:40Z
+Generated UTC: 2026-02-15T16:24:48Z
 
 ## G4-001 / G4-002 Terraform Apply + Drift-Free Re-Plan
 
@@ -8,7 +8,7 @@ Owner: Platform + SRE
 
 | Step | Command | Expected Artifact | Destination Path |
 |---|---|---|---|
-| Set real staging values | update `infra/terraform/environments/staging.tfvars` (`project_id`, image refs, issuer/audience, queue/service names) | reviewed tfvars with non-placeholder values | `gate-4/terraform/staging.tfvars.approved.snapshot` |
+| Confirm staging tfvars values | review `infra/terraform/environments/staging.tfvars` (`project_id`, image refs, issuer/audience, queue/service names) | approved snapshot with reviewer initials | `gate-4/terraform/staging.tfvars.approved.snapshot` |
 | Reauth CLI | `gcloud auth login` | successful reauth transcript | `gate-4/terraform/command-logs/gcloud_auth_login_manual.log` |
 | Reauth ADC | `gcloud auth application-default login` | ADC ready transcript | `gate-4/terraform/command-logs/gcloud_adc_login_manual.log` |
 | Plan | `terraform -chdir=infra/terraform plan -var-file=environments/staging.tfvars -lock=false -input=false -no-color -out=../../release_evidence/2026-02-12-prod-readiness/gate-4/terraform/staging.tfplan` | plan exits `0` and plan file | `gate-4/terraform/command-logs/terraform_plan_g4_external.log` |
@@ -21,6 +21,8 @@ Owner: Platform + SRE
 
 | Step | Command | Expected Artifact | Destination Path |
 |---|---|---|---|
+| Reauth for API access | `gcloud auth login && gcloud auth application-default login` | non-interactive reauth failure cleared | `gate-4/cloud-run/command-logs/gcloud_auth_login_manual.log`, `gate-4/cloud-run/command-logs/gcloud_adc_login_manual.log` |
+| Set project | `gcloud config set project dataverse-dev-471815` | project set transcript | `gate-4/cloud-run/command-logs/gcloud_project_set_manual.log` |
 | List services | `gcloud run services list --project=dataverse-dev-471815 --region=us-central1 --platform=managed --format=json` | JSON list with `arco-api-staging` and `arco-compactor-staging` | `gate-4/cloud-run/command-logs/gcloud_run_services_list_g4_external.json` |
 | API describe | `gcloud run services describe arco-api-staging --project=dataverse-dev-471815 --region=us-central1 --platform=managed --format=json` | service + latest revision details | `gate-4/cloud-run/command-logs/gcloud_run_service_describe_api_staging_g4_external.json` |
 | Compactor describe | `gcloud run services describe arco-compactor-staging --project=dataverse-dev-471815 --region=us-central1 --platform=managed --format=json` | service + latest revision details | `gate-4/cloud-run/command-logs/gcloud_run_service_describe_compactor_staging_g4_external.json` |

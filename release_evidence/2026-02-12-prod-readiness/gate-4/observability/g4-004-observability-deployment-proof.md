@@ -1,7 +1,7 @@
 # G4-004 Observability Deployment Proof
 
-Generated UTC: 2026-02-14T04:51:40Z
-Status: PARTIAL (config + drill proven locally; live staging deployment visibility pending)
+Generated UTC: 2026-02-15T16:24:48Z
+Status: PARTIAL (config + controlled drill proven locally; live staging deployment visibility pending)
 
 ## Local Evidence (Complete)
 
@@ -14,6 +14,8 @@ Status: PARTIAL (config + drill proven locally; live staging deployment visibili
 - Controlled alert drill passes:
   - `observability/observability_gate4_alert_drill.test.yaml`
   - `observability/command-logs/promtool_test_g4_alert_drill.log`
+- Fresh local verification matrix:
+  - `observability/observability-command-status.tsv`
 
 ## Remaining External Evidence Required
 

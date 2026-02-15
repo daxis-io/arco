@@ -1,3 +1,5 @@
+[UTC] 2026-02-15T16:23:56Z
+[CMD] terraform -chdir="/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/infra/terraform" plan -var-file=environments/staging.tfvars -lock=false -input=false -no-color -out="/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/release_evidence/2026-02-12-prod-readiness/gate-4/terraform/staging.tfplan"
 data.google_project.current: Reading...
 
 Terraform used the selected providers to generate the following execution
@@ -28,7 +30,7 @@ Terraform planned the following actions, but then encountered a problem:
       + location                 = "us-central1"
       + name                     = "arco-compactor-antientropy-staging"
       + observed_generation      = (known after apply)
-      + project                  = "replace-with-staging-project-id"
+      + project                  = "dataverse-dev-471815"
       + reconciling              = (known after apply)
       + terminal_condition       = (known after apply)
       + terraform_labels         = {
@@ -44,7 +46,7 @@ Terraform planned the following actions, but then encountered a problem:
           + template {
               + execution_environment = (known after apply)
               + max_retries           = 3
-              + service_account       = "arco-compactor-ae-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+              + service_account       = "[REDACTED_EMAIL]"
               + timeout               = (known after apply)
 
               + containers {
@@ -55,13 +57,13 @@ Terraform planned the following actions, but then encountered a problem:
                       + "--workspace-id",
                       + "staging",
                       + "--storage-bucket",
-                      + "replace-with-staging-project-id-arco-catalog-staging",
+                      + "dataverse-dev-471815-arco-catalog-staging",
                       + "--domain",
                       + "catalog",
                       + "--max-objects-per-run",
                       + "1000",
                     ]
-                  + image = "us-central1-docker.pkg.dev/replace-with-staging-project/arco/arco-compactor:staging"
+                  + image = "us-central1-docker.pkg.dev/dataverse-dev-471815/arco/arco-compactor:staging"
 
                   + env {
                       + name  = "ARCO_COMPACTOR_AUDIENCE"
@@ -77,7 +79,7 @@ Terraform planned the following actions, but then encountered a problem:
                     }
                   + env {
                       + name  = "ARCO_STORAGE_BUCKET"
-                      + value = "replace-with-staging-project-id-arco-catalog-staging"
+                      + value = "dataverse-dev-471815-arco-catalog-staging"
                     }
 
                   + resources (known after apply)
@@ -93,9 +95,9 @@ Terraform planned the following actions, but then encountered a problem:
       + etag     = (known after apply)
       + id       = (known after apply)
       + location = "us-central1"
-      + member   = "serviceAccount:arco-invoker-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member   = "serviceAccount:[REDACTED_EMAIL]"
       + name     = "arco-compactor-antientropy-staging"
-      + project  = "replace-with-staging-project-id"
+      + project  = "dataverse-dev-471815"
       + role     = "roles/run.invoker"
     }
 
@@ -122,7 +124,7 @@ Terraform planned the following actions, but then encountered a problem:
       + location                = "us-central1"
       + name                    = "arco-api-staging"
       + observed_generation     = (known after apply)
-      + project                 = "replace-with-staging-project-id"
+      + project                 = "dataverse-dev-471815"
       + reconciling             = (known after apply)
       + terminal_condition      = (known after apply)
       + terraform_labels        = {
@@ -138,12 +140,12 @@ Terraform planned the following actions, but then encountered a problem:
 
       + template {
           + max_instance_request_concurrency = (known after apply)
-          + service_account                  = "arco-api-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+          + service_account                  = "[REDACTED_EMAIL]"
           + timeout                          = (known after apply)
 
           + containers {
               + build_info = (known after apply)
-              + image      = "us-central1-docker.pkg.dev/replace-with-staging-project/arco/arco-api:staging"
+              + image      = "us-central1-docker.pkg.dev/dataverse-dev-471815/arco/arco-api:staging"
 
               + env {
                   + name  = "ARCO_API_PUBLIC"
@@ -194,7 +196,7 @@ Terraform planned the following actions, but then encountered a problem:
                 }
               + env {
                   + name  = "ARCO_STORAGE_BUCKET"
-                  + value = "replace-with-staging-project-id-arco-catalog-staging"
+                  + value = "dataverse-dev-471815-arco-catalog-staging"
                 }
 
               + liveness_probe {
@@ -271,7 +273,7 @@ Terraform planned the following actions, but then encountered a problem:
       + location                = "us-central1"
       + name                    = "arco-compactor-staging"
       + observed_generation     = (known after apply)
-      + project                 = "replace-with-staging-project-id"
+      + project                 = "dataverse-dev-471815"
       + reconciling             = (known after apply)
       + terminal_condition      = (known after apply)
       + terraform_labels        = {
@@ -287,12 +289,12 @@ Terraform planned the following actions, but then encountered a problem:
 
       + template {
           + max_instance_request_concurrency = (known after apply)
-          + service_account                  = "arco-compactor-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+          + service_account                  = "[REDACTED_EMAIL]"
           + timeout                          = (known after apply)
 
           + containers {
               + build_info = (known after apply)
-              + image      = "us-central1-docker.pkg.dev/replace-with-staging-project/arco/arco-compactor:staging"
+              + image      = "us-central1-docker.pkg.dev/dataverse-dev-471815/arco/arco-compactor:staging"
 
               + env {
                   + name  = "ARCO_COMPACTOR_GC_ENABLED"
@@ -316,7 +318,7 @@ Terraform planned the following actions, but then encountered a problem:
                 }
               + env {
                   + name  = "ARCO_STORAGE_BUCKET"
-                  + value = "replace-with-staging-project-id-arco-catalog-staging"
+                  + value = "dataverse-dev-471815-arco-catalog-staging"
                 }
 
               + liveness_probe {
@@ -375,9 +377,9 @@ Terraform planned the following actions, but then encountered a problem:
       + etag     = (known after apply)
       + id       = (known after apply)
       + location = "us-central1"
-      + member   = "serviceAccount:arco-compactor-ae-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member   = "serviceAccount:[REDACTED_EMAIL]"
       + name     = "arco-compactor-staging"
-      + project  = "replace-with-staging-project-id"
+      + project  = "dataverse-dev-471815"
       + role     = "roles/run.invoker"
     }
 
@@ -386,9 +388,9 @@ Terraform planned the following actions, but then encountered a problem:
       + etag     = (known after apply)
       + id       = (known after apply)
       + location = "us-central1"
-      + member   = "serviceAccount:arco-invoker-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member   = "serviceAccount:[REDACTED_EMAIL]"
       + name     = "arco-compactor-staging"
-      + project  = "replace-with-staging-project-id"
+      + project  = "dataverse-dev-471815"
       + role     = "roles/run.invoker"
     }
 
@@ -397,9 +399,9 @@ Terraform planned the following actions, but then encountered a problem:
       + etag     = (known after apply)
       + id       = (known after apply)
       + location = "us-central1"
-      + member   = "serviceAccount:arco-invoker-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member   = "serviceAccount:[REDACTED_EMAIL]"
       + name     = "arco-flow-dispatcher-staging"
-      + project  = "replace-with-staging-project-id"
+      + project  = "dataverse-dev-471815"
       + role     = "roles/run.invoker"
     }
 
@@ -409,7 +411,7 @@ Terraform planned the following actions, but then encountered a problem:
       + id          = (known after apply)
       + name        = "arco-compactor-antientropy-trigger-staging"
       + paused      = (known after apply)
-      + project     = "replace-with-staging-project-id"
+      + project     = "dataverse-dev-471815"
       + region      = "us-central1"
       + schedule    = "*/15 * * * *"
       + state       = (known after apply)
@@ -417,10 +419,10 @@ Terraform planned the following actions, but then encountered a problem:
 
       + http_target {
           + http_method = "POST"
-          + uri         = "https://us-central1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/replace-with-staging-project-id/jobs/arco-compactor-antientropy-staging:run"
+          + uri         = "https://us-central1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/dataverse-dev-471815/jobs/arco-compactor-antientropy-staging:run"
 
           + oauth_token {
-              + service_account_email = "arco-invoker-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+              + service_account_email = "[REDACTED_EMAIL]"
             }
         }
 
@@ -439,7 +441,7 @@ Terraform planned the following actions, but then encountered a problem:
       + id            = (known after apply)
       + location      = "us-central1"
       + name          = "arco-flow-dispatch-staging"
-      + project       = "replace-with-staging-project-id"
+      + project       = "dataverse-dev-471815"
       + state         = (known after apply)
 
       + rate_limits {
@@ -467,7 +469,7 @@ Terraform planned the following actions, but then encountered a problem:
       + id            = (known after apply)
       + location      = "us-central1"
       + name          = "arco-flow-timers-staging"
-      + project       = "replace-with-staging-project-id"
+      + project       = "dataverse-dev-471815"
       + state         = (known after apply)
 
       + rate_limits {
@@ -498,7 +500,7 @@ Terraform planned the following actions, but then encountered a problem:
       + permissions = [
           + "storage.objects.get",
         ]
-      + project     = "replace-with-staging-project-id"
+      + project     = "dataverse-dev-471815"
       + role_id     = "storageObjectReaderNoList"
       + stage       = "GA"
       + title       = "Storage Object Reader (No List)"
@@ -508,8 +510,8 @@ Terraform planned the following actions, but then encountered a problem:
   + resource "google_project_iam_member" "api_cloud_tasks_enqueuer" {
       + etag    = (known after apply)
       + id      = (known after apply)
-      + member  = "serviceAccount:arco-api-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
-      + project = "replace-with-staging-project-id"
+      + member  = "serviceAccount:[REDACTED_EMAIL]"
+      + project = "dataverse-dev-471815"
       + role    = "roles/cloudtasks.enqueuer"
     }
 
@@ -530,7 +532,7 @@ Terraform planned the following actions, but then encountered a problem:
           + "service"     = "arco"
         }
       + name                  = (known after apply)
-      + project               = "replace-with-staging-project-id"
+      + project               = "dataverse-dev-471815"
       + secret_id             = "arco-jwt-secret-staging"
       + terraform_labels      = {
           + "environment"                = "staging"
@@ -548,8 +550,8 @@ Terraform planned the following actions, but then encountered a problem:
   + resource "google_secret_manager_secret_iam_member" "api_jwt_secret" {
       + etag      = (known after apply)
       + id        = (known after apply)
-      + member    = "serviceAccount:arco-api-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
-      + project   = "replace-with-staging-project-id"
+      + member    = "serviceAccount:[REDACTED_EMAIL]"
+      + project   = "dataverse-dev-471815"
       + role      = "roles/secretmanager.secretAccessor"
       + secret_id = "arco-jwt-secret-staging"
     }
@@ -560,11 +562,11 @@ Terraform planned the following actions, but then encountered a problem:
       + description  = "Service account for Arco API - handles DDL, reads, signed URLs"
       + disabled     = false
       + display_name = "Arco API Service (staging)"
-      + email        = "arco-api-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + email        = "[REDACTED_EMAIL]"
       + id           = (known after apply)
-      + member       = "serviceAccount:arco-api-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member       = "serviceAccount:[REDACTED_EMAIL]"
       + name         = (known after apply)
-      + project      = "replace-with-staging-project-id"
+      + project      = "dataverse-dev-471815"
       + unique_id    = (known after apply)
     }
 
@@ -574,11 +576,11 @@ Terraform planned the following actions, but then encountered a problem:
       + description  = "Fast-path compactor - sole writer of Parquet state, NO list permission"
       + disabled     = false
       + display_name = "Arco Compactor Fast-Path (staging)"
-      + email        = "arco-compactor-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + email        = "[REDACTED_EMAIL]"
       + id           = (known after apply)
-      + member       = "serviceAccount:arco-compactor-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member       = "serviceAccount:[REDACTED_EMAIL]"
       + name         = (known after apply)
-      + project      = "replace-with-staging-project-id"
+      + project      = "dataverse-dev-471815"
       + unique_id    = (known after apply)
     }
 
@@ -588,11 +590,11 @@ Terraform planned the following actions, but then encountered a problem:
       + description  = "Anti-entropy job - can list ledger/ to discover missed events"
       + disabled     = false
       + display_name = "Arco Compactor Anti-Entropy (staging)"
-      + email        = "arco-compactor-ae-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + email        = "[REDACTED_EMAIL]"
       + id           = (known after apply)
-      + member       = "serviceAccount:arco-compactor-ae-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member       = "serviceAccount:[REDACTED_EMAIL]"
       + name         = (known after apply)
-      + project      = "replace-with-staging-project-id"
+      + project      = "dataverse-dev-471815"
       + unique_id    = (known after apply)
     }
 
@@ -602,11 +604,11 @@ Terraform planned the following actions, but then encountered a problem:
       + description  = "Service account for invoking Arco services (Cloud Scheduler, Pub/Sub)"
       + disabled     = false
       + display_name = "Arco Service Invoker (staging)"
-      + email        = "arco-invoker-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + email        = "[REDACTED_EMAIL]"
       + id           = (known after apply)
-      + member       = "serviceAccount:arco-invoker-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member       = "serviceAccount:[REDACTED_EMAIL]"
       + name         = (known after apply)
-      + project      = "replace-with-staging-project-id"
+      + project      = "dataverse-dev-471815"
       + unique_id    = (known after apply)
     }
 
@@ -614,7 +616,7 @@ Terraform planned the following actions, but then encountered a problem:
   + resource "google_service_account_iam_member" "api_can_act_as_invoker_for_cloud_tasks_oidc" {
       + etag               = (known after apply)
       + id                 = (known after apply)
-      + member             = "serviceAccount:arco-api-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member             = "serviceAccount:[REDACTED_EMAIL]"
       + role               = "roles/iam.serviceAccountUser"
       + service_account_id = (known after apply)
     }
@@ -635,8 +637,8 @@ Terraform planned the following actions, but then encountered a problem:
           + "service"     = "arco"
         }
       + location                    = "US-CENTRAL1"
-      + name                        = "replace-with-staging-project-id-arco-catalog-staging"
-      + project                     = "replace-with-staging-project-id"
+      + name                        = "dataverse-dev-471815-arco-catalog-staging"
+      + project                     = "dataverse-dev-471815"
       + project_number              = (known after apply)
       + public_access_prevention    = "enforced"
       + rpo                         = (known after apply)
@@ -694,25 +696,25 @@ Terraform planned the following actions, but then encountered a problem:
 
   # google_storage_bucket_iam_member.api_read_all will be created
   + resource "google_storage_bucket_iam_member" "api_read_all" {
-      + bucket = "replace-with-staging-project-id-arco-catalog-staging"
+      + bucket = "dataverse-dev-471815-arco-catalog-staging"
       + etag   = (known after apply)
       + id     = (known after apply)
-      + member = "serviceAccount:arco-api-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member = "serviceAccount:[REDACTED_EMAIL]"
       + role   = "roles/storage.objectViewer"
     }
 
   # google_storage_bucket_iam_member.api_write_commits will be created
   + resource "google_storage_bucket_iam_member" "api_write_commits" {
-      + bucket = "replace-with-staging-project-id-arco-catalog-staging"
+      + bucket = "dataverse-dev-471815-arco-catalog-staging"
       + etag   = (known after apply)
       + id     = (known after apply)
-      + member = "serviceAccount:arco-api-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member = "serviceAccount:[REDACTED_EMAIL]"
       + role   = "roles/storage.objectCreator"
 
       + condition {
           + description = "Gate 5: API can create commit records (immutable)"
           + expression  = <<-EOT
-                resource.name.matches("^projects/_/buckets/replace-with-staging-project-id-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/commits/")
+                resource.name.matches("^projects/_/buckets/dataverse-dev-471815-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/commits/")
             EOT
           + title       = "ApiWriteCommits"
         }
@@ -720,16 +722,16 @@ Terraform planned the following actions, but then encountered a problem:
 
   # google_storage_bucket_iam_member.api_write_ledger will be created
   + resource "google_storage_bucket_iam_member" "api_write_ledger" {
-      + bucket = "replace-with-staging-project-id-arco-catalog-staging"
+      + bucket = "dataverse-dev-471815-arco-catalog-staging"
       + etag   = (known after apply)
       + id     = (known after apply)
-      + member = "serviceAccount:arco-api-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member = "serviceAccount:[REDACTED_EMAIL]"
       + role   = "roles/storage.objectCreator"
 
       + condition {
           + description = "Gate 5: API can create ledger events (immutable)"
           + expression  = <<-EOT
-                resource.name.matches("^projects/_/buckets/replace-with-staging-project-id-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/ledger/")
+                resource.name.matches("^projects/_/buckets/dataverse-dev-471815-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/ledger/")
             EOT
           + title       = "ApiWriteLedger"
         }
@@ -737,16 +739,16 @@ Terraform planned the following actions, but then encountered a problem:
 
   # google_storage_bucket_iam_member.api_write_locks will be created
   + resource "google_storage_bucket_iam_member" "api_write_locks" {
-      + bucket = "replace-with-staging-project-id-arco-catalog-staging"
+      + bucket = "dataverse-dev-471815-arco-catalog-staging"
       + etag   = (known after apply)
       + id     = (known after apply)
-      + member = "serviceAccount:arco-api-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member = "serviceAccount:[REDACTED_EMAIL]"
       + role   = "roles/storage.objectUser"
 
       + condition {
           + description = "Gate 5: API can manage distributed locks"
           + expression  = <<-EOT
-                resource.name.matches("^projects/_/buckets/replace-with-staging-project-id-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/locks/")
+                resource.name.matches("^projects/_/buckets/dataverse-dev-471815-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/locks/")
             EOT
           + title       = "ApiWriteLocks"
         }
@@ -754,16 +756,16 @@ Terraform planned the following actions, but then encountered a problem:
 
   # google_storage_bucket_iam_member.compactor_antientropy_list_ledger will be created
   + resource "google_storage_bucket_iam_member" "compactor_antientropy_list_ledger" {
-      + bucket = "replace-with-staging-project-id-arco-catalog-staging"
+      + bucket = "dataverse-dev-471815-arco-catalog-staging"
       + etag   = (known after apply)
       + id     = (known after apply)
-      + member = "serviceAccount:arco-compactor-ae-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member = "serviceAccount:[REDACTED_EMAIL]"
       + role   = "roles/storage.objectViewer"
 
       + condition {
           + description = "Gate 5: Anti-entropy can list ledger/ to find missed events"
           + expression  = <<-EOT
-                resource.name.matches("^projects/_/buckets/replace-with-staging-project-id-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/ledger/")
+                resource.name.matches("^projects/_/buckets/dataverse-dev-471815-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/ledger/")
             EOT
           + title       = "CompactorAntiEntropyListLedger"
         }
@@ -771,25 +773,25 @@ Terraform planned the following actions, but then encountered a problem:
 
   # google_storage_bucket_iam_member.compactor_antientropy_read_all will be created
   + resource "google_storage_bucket_iam_member" "compactor_antientropy_read_all" {
-      + bucket = "replace-with-staging-project-id-arco-catalog-staging"
+      + bucket = "dataverse-dev-471815-arco-catalog-staging"
       + etag   = (known after apply)
       + id     = (known after apply)
-      + member = "serviceAccount:arco-compactor-ae-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member = "serviceAccount:[REDACTED_EMAIL]"
       + role   = (known after apply)
     }
 
   # google_storage_bucket_iam_member.compactor_antientropy_write_cursor will be created
   + resource "google_storage_bucket_iam_member" "compactor_antientropy_write_cursor" {
-      + bucket = "replace-with-staging-project-id-arco-catalog-staging"
+      + bucket = "dataverse-dev-471815-arco-catalog-staging"
       + etag   = (known after apply)
       + id     = (known after apply)
-      + member = "serviceAccount:arco-compactor-ae-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member = "serviceAccount:[REDACTED_EMAIL]"
       + role   = "roles/storage.objectUser"
 
       + condition {
           + description = "Gate 5: Anti-entropy can update state/anti_entropy cursor"
           + expression  = <<-EOT
-                resource.name.matches("^projects/_/buckets/replace-with-staging-project-id-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/state/anti_entropy/")
+                resource.name.matches("^projects/_/buckets/dataverse-dev-471815-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/state/anti_entropy/")
             EOT
           + title       = "CompactorAntiEntropyWriteCursor"
         }
@@ -797,20 +799,20 @@ Terraform planned the following actions, but then encountered a problem:
 
   # google_storage_bucket_iam_member.compactor_fastpath_read_objects will be created
   + resource "google_storage_bucket_iam_member" "compactor_fastpath_read_objects" {
-      + bucket = "replace-with-staging-project-id-arco-catalog-staging"
+      + bucket = "dataverse-dev-471815-arco-catalog-staging"
       + etag   = (known after apply)
       + id     = (known after apply)
-      + member = "serviceAccount:arco-compactor-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member = "serviceAccount:[REDACTED_EMAIL]"
       + role   = (known after apply)
 
       + condition {
           + description = "Gate 5: Fast-path compactor can read ledger/manifests/state/snapshots/l0"
           + expression  = <<-EOT
-                resource.name.matches("^projects/_/buckets/replace-with-staging-project-id-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/ledger/") ||
-                resource.name.matches("^projects/_/buckets/replace-with-staging-project-id-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/manifests/") ||
-                resource.name.matches("^projects/_/buckets/replace-with-staging-project-id-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/snapshots/") ||
-                resource.name.matches("^projects/_/buckets/replace-with-staging-project-id-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/state/") ||
-                resource.name.matches("^projects/_/buckets/replace-with-staging-project-id-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/l0/")
+                resource.name.matches("^projects/_/buckets/dataverse-dev-471815-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/ledger/") ||
+                resource.name.matches("^projects/_/buckets/dataverse-dev-471815-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/manifests/") ||
+                resource.name.matches("^projects/_/buckets/dataverse-dev-471815-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/snapshots/") ||
+                resource.name.matches("^projects/_/buckets/dataverse-dev-471815-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/state/") ||
+                resource.name.matches("^projects/_/buckets/dataverse-dev-471815-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/l0/")
             EOT
           + title       = "CompactorFastpathReadObjects"
         }
@@ -818,16 +820,16 @@ Terraform planned the following actions, but then encountered a problem:
 
   # google_storage_bucket_iam_member.compactor_write_l0 will be created
   + resource "google_storage_bucket_iam_member" "compactor_write_l0" {
-      + bucket = "replace-with-staging-project-id-arco-catalog-staging"
+      + bucket = "dataverse-dev-471815-arco-catalog-staging"
       + etag   = (known after apply)
       + id     = (known after apply)
-      + member = "serviceAccount:arco-compactor-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member = "serviceAccount:[REDACTED_EMAIL]"
       + role   = "roles/storage.objectUser"
 
       + condition {
           + description = "Gate 5: Fast-path compactor can write l0/ tier"
           + expression  = <<-EOT
-                resource.name.matches("^projects/_/buckets/replace-with-staging-project-id-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/l0/")
+                resource.name.matches("^projects/_/buckets/dataverse-dev-471815-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/l0/")
             EOT
           + title       = "CompactorFastpathWriteL0"
         }
@@ -835,16 +837,16 @@ Terraform planned the following actions, but then encountered a problem:
 
   # google_storage_bucket_iam_member.compactor_write_manifests will be created
   + resource "google_storage_bucket_iam_member" "compactor_write_manifests" {
-      + bucket = "replace-with-staging-project-id-arco-catalog-staging"
+      + bucket = "dataverse-dev-471815-arco-catalog-staging"
       + etag   = (known after apply)
       + id     = (known after apply)
-      + member = "serviceAccount:arco-compactor-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member = "serviceAccount:[REDACTED_EMAIL]"
       + role   = "roles/storage.objectUser"
 
       + condition {
           + description = "Gate 5: Fast-path compactor can update manifests"
           + expression  = <<-EOT
-                resource.name.matches("^projects/_/buckets/replace-with-staging-project-id-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/manifests/")
+                resource.name.matches("^projects/_/buckets/dataverse-dev-471815-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/manifests/")
             EOT
           + title       = "CompactorFastpathWriteManifests"
         }
@@ -852,16 +854,16 @@ Terraform planned the following actions, but then encountered a problem:
 
   # google_storage_bucket_iam_member.compactor_write_snapshots will be created
   + resource "google_storage_bucket_iam_member" "compactor_write_snapshots" {
-      + bucket = "replace-with-staging-project-id-arco-catalog-staging"
+      + bucket = "dataverse-dev-471815-arco-catalog-staging"
       + etag   = (known after apply)
       + id     = (known after apply)
-      + member = "serviceAccount:arco-compactor-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member = "serviceAccount:[REDACTED_EMAIL]"
       + role   = "roles/storage.objectCreator"
 
       + condition {
           + description = "Gate 5: Fast-path compactor can write snapshots/ (Tier-1 Parquet)"
           + expression  = <<-EOT
-                resource.name.matches("^projects/_/buckets/replace-with-staging-project-id-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/snapshots/")
+                resource.name.matches("^projects/_/buckets/dataverse-dev-471815-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/snapshots/")
             EOT
           + title       = "CompactorFastpathWriteSnapshots"
         }
@@ -869,16 +871,16 @@ Terraform planned the following actions, but then encountered a problem:
 
   # google_storage_bucket_iam_member.compactor_write_state will be created
   + resource "google_storage_bucket_iam_member" "compactor_write_state" {
-      + bucket = "replace-with-staging-project-id-arco-catalog-staging"
+      + bucket = "dataverse-dev-471815-arco-catalog-staging"
       + etag   = (known after apply)
       + id     = (known after apply)
-      + member = "serviceAccount:arco-compactor-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+      + member = "serviceAccount:[REDACTED_EMAIL]"
       + role   = "roles/storage.objectCreator"
 
       + condition {
           + description = "Gate 5: Fast-path compactor can write state/ (Parquet snapshots)"
           + expression  = <<-EOT
-                resource.name.matches("^projects/_/buckets/replace-with-staging-project-id-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/state/")
+                resource.name.matches("^projects/_/buckets/dataverse-dev-471815-arco-catalog-staging/objects/tenant=[^/]+/workspace=[^/]+/state/")
             EOT
           + title       = "CompactorFastpathWriteState"
         }
@@ -887,23 +889,24 @@ Terraform planned the following actions, but then encountered a problem:
 Plan: 32 to add, 0 to change, 0 to destroy.
 
 Changes to Outputs:
-  + api_service_account_email                   = "arco-api-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+  + api_service_account_email                   = "[REDACTED_EMAIL]"
   + api_service_name                            = "arco-api-staging"
   + api_url                                     = (known after apply)
-  + catalog_bucket                              = "replace-with-staging-project-id-arco-catalog-staging"
-  + compactor_antientropy_service_account_email = "arco-compactor-ae-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
-  + compactor_service_account_email             = "arco-compactor-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+  + catalog_bucket                              = "dataverse-dev-471815-arco-catalog-staging"
+  + compactor_antientropy_service_account_email = "[REDACTED_EMAIL]"
+  + compactor_service_account_email             = "[REDACTED_EMAIL]"
   + compactor_service_name                      = "arco-compactor-staging"
   + compactor_url                               = (known after apply)
   + environment                                 = "staging"
   + flow_dispatch_queue_name                    = "arco-flow-dispatch-staging"
   + flow_timer_queue_name                       = "arco-flow-timers-staging"
-  + invoker_service_account_email               = "arco-invoker-staging@replace-with-staging-project-id.iam.gserviceaccount.com"
+  + invoker_service_account_email               = "[REDACTED_EMAIL]"
   + region                                      = "us-central1"
 
-Error: Error when reading or editing Project "replace-with-staging-project-id": Get "https://cloudresourcemanager.googleapis.com/v1/projects/replace-with-staging-project-id?alt=json&prettyPrint=false": oauth2: "invalid_grant" "reauth related error (invalid_rapt)" "https://support.google.com/a/answer/9368756"
+Error: Error when reading or editing Project "dataverse-dev-471815": Get "https://cloudresourcemanager.googleapis.com/v1/projects/dataverse-dev-471815?alt=json&prettyPrint=false": oauth2: "invalid_grant" "reauth related error (invalid_rapt)" "https://support.google.com/a/answer/9368756"
 
   with data.google_project.current,
   on cloud_tasks.tf line 12, in data "google_project" "current":
   12: data "google_project" "current" {
 
+[EXIT] 1

@@ -1,12 +1,13 @@
 # Gate 4 Evidence
 
-Batch 3 Gate 4 execution artifacts (2026-02-14 UTC refresh).
+Batch 3 Gate 4 execution artifacts (2026-02-15 UTC refresh).
 
 ## Terraform
 
 - `terraform/staging_tfvars_iam_readiness_proof.md`
 - `terraform/g4-001-readiness-status.md`
 - `terraform/terraform-command-status.tsv`
+- `terraform/command-logs/generate_g4_tfvars_iam_readiness_proof.log`
 - `terraform/command-logs/terraform_init_g4.log`
 - `terraform/command-logs/terraform_validate_g4.log`
 - `terraform/command-logs/terraform_plan_g4.log`
@@ -17,6 +18,13 @@ Batch 3 Gate 4 execution artifacts (2026-02-14 UTC refresh).
 ## Cloud Run + IAM
 
 - `cloud-run/cloud-run-command-status.tsv`
+- `cloud-run/command-logs/gcloud_version.log`
+- `cloud-run/command-logs/gcloud_auth_list.log`
+- `cloud-run/command-logs/gcloud_config_account.log`
+- `cloud-run/command-logs/gcloud_config_project.log`
+- `cloud-run/command-logs/gcloud_config_account_project.log`
+- `cloud-run/command-logs/gcloud_print_access_token_account_primary.log`
+- `cloud-run/command-logs/gcloud_adc_print_access_token.log`
 - `cloud-run/command-logs/gcloud_run_services_list_g4.log`
 - `cloud-run/command-logs/gcloud_run_service_describe_api_staging_g4.log`
 - `cloud-run/command-logs/gcloud_run_service_describe_compactor_staging_g4.log`
@@ -34,6 +42,9 @@ Batch 3 Gate 4 execution artifacts (2026-02-14 UTC refresh).
 - `observability/observability_scrape_wiring_proof.md`
 - `observability/observability_alert_threshold_proof.md`
 - `observability/observability_gate4_alert_drill.test.yaml`
+- `observability/command-logs/jq_validate_g4_dashboard.log`
+- `observability/command-logs/rg_g4_otel_wiring.log`
+- `observability/command-logs/promtool_check_g4_alerts.log`
 - `observability/command-logs/promtool_test_g4_alert_drill.log`
 - `observability/g4-004-observability-deployment-proof.md`
 - `observability/g4-005-slo-burn-rate-thresholds-proof.md`
@@ -45,3 +56,8 @@ Batch 3 Gate 4 execution artifacts (2026-02-14 UTC refresh).
 ## Cross-Signal Handoff
 
 - `external-handoff-checklist.md`
+
+## Integrity Logs
+
+- `command-logs/final_verification_gate4.log`
+- `command-logs/gate4_status_matrix_snapshot.log`

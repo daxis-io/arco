@@ -1,7 +1,7 @@
 # Production Readiness Audit - Arco Daxis Prod GO
 
 - Audit date: 2026-02-12
-- Evidence refresh UTC: 2026-02-14T04:55:51Z
+- Evidence refresh UTC: 2026-02-15T16:24:48Z
 - Baseline commit: `e896506f3c936c266a21fe556a107d37bd7075b5`
 - Scope: all currently identified closure signals in the "Arco Daxis Production GO Closure Plan"
 - Definition of Done (locked): `ALL GATES GO`
@@ -67,9 +67,9 @@ All Gate 3 signals (`G3-001` through `G3-007`) are now `GO` with archived, repro
 
 Gate 4 has refreshed local evidence and executable handoff artifacts, but remains incomplete:
 
-- `G4-001`: PARTIAL (`staging.tfvars` + IAM/SA locking verified locally)
-- `G4-002`: PARTIAL (`terraform init/validate` pass; plan synth succeeds then fails on `invalid_rapt`; apply/re-plan pending)
-- `G4-003`: BLOCKED-EXTERNAL (Cloud Run + IAM captures blocked by interactive reauth)
+- `G4-001`: PARTIAL (`staging.tfvars` now carries concrete staging project/image values; IAM/SA locking verified locally)
+- `G4-002`: PARTIAL (`terraform init/validate` pass; plan synthesis succeeds then fails on `invalid_rapt`; apply/re-plan pending interactive reauth)
+- `G4-003`: BLOCKED-EXTERNAL (Cloud Run + IAM captures blocked by interactive reauth despite refreshed preflight checks)
 - `G4-004`: PARTIAL (dashboard/scrape config proofs + local controlled drill captured; live staging visibility pending)
 - `G4-005`: PARTIAL (threshold matrix documented and local threshold drill passed; staged drill signoff pending)
 - `G4-006`: BLOCKED-EXTERNAL (incident drill transcript + reviewer signoff require human execution)

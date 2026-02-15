@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
   "audit_date": "2026-02-12",
-  "generated_at_utc": "2026-02-14T04:55:51Z",
+  "generated_at_utc": "2026-02-15T16:24:48Z",
   "baseline_commit": "e896506f3c936c266a21fe556a107d37bd7075b5",
   "definition_of_done": "ALL_GATES_GO",
   "evidence_root": "release_evidence/2026-02-12-prod-readiness",
@@ -103,7 +103,7 @@
       "id": 4,
       "name": "Deployment / observability / operations",
       "status": "PARTIAL",
-      "status_reason": "Local Terraform/observability/SLO evidence refreshed (init/validate, plan synthesis, rule checks, controlled drill), but live staging apply, Cloud Run/IAM capture, and human drill signoff remain external blockers.",
+      "status_reason": "Fresh 2026-02-15 execution reran Terraform, Cloud Run/IAM, and observability command matrices with archived logs. Local Terraform + observability checks remain reproducible, but authenticated staging apply, Cloud Run/IAM data capture, live staging observability evidence, and human drill signoff are still externally blocked.",
       "required_signal_ids": [
         "G4-001",
         "G4-002",

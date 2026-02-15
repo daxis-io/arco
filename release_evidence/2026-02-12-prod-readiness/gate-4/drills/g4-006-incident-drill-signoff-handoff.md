@@ -1,6 +1,6 @@
 # G4-006 Incident Drills + Reviewer Signoff Handoff
 
-Prepared UTC: 2026-02-14T04:51:40Z
+Prepared UTC: 2026-02-15T16:24:48Z
 Status: BLOCKED-EXTERNAL (requires human drill execution and reviewer signoff)
 
 ## Local Prework Evidence

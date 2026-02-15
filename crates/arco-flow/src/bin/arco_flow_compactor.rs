@@ -34,8 +34,8 @@ struct InternalAuthState {
 #[derive(Debug, Deserialize)]
 struct CompactRequest {
     event_paths: Vec<String>,
-    #[serde(default)]
-    epoch: Option<u64>,
+    fencing_token: u64,
+    lock_path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -112,7 +112,11 @@ async fn compact_handler(
         visibility_status,
     } = state
         .compactor
-        .compact_events_with_epoch(request.event_paths, request.epoch)
+        .compact_events_fenced(
+            request.event_paths,
+            request.fencing_token,
+            &request.lock_path,
+        )
         .await?;
 
     Ok(Json(CompactResponse {
@@ -182,53 +186,6 @@ fn load_tenant_secret() -> Result<Vec<u8>> {
     }
 
     Ok(secret)
-}
-
-fn build_internal_auth() -> Result<Option<Arc<InternalAuthState>>> {
-    let config = InternalOidcConfig::from_env().map_err(|e| Error::configuration(e.to_string()))?;
-    let Some(config) = config else {
-        return Ok(None);
-    };
-
-    let enforce = config.enforce;
-    let verifier =
-        InternalOidcVerifier::new(config).map_err(|e| Error::configuration(e.to_string()))?;
-    Ok(Some(Arc::new(InternalAuthState {
-        verifier: Arc::new(verifier),
-        enforce,
-    })))
-}
-
-async fn internal_auth_middleware(
-    State(state): State<Arc<InternalAuthState>>,
-    request: axum::http::Request<Body>,
-    next: Next,
-) -> Response {
-    match state.verifier.verify_headers(request.headers()).await {
-        Ok(_) => next.run(request).await,
-        Err(err) => {
-            if state.enforce {
-                let message = match err {
-                    InternalOidcError::MissingBearerToken => "missing bearer token".to_string(),
-                    InternalOidcError::InvalidToken(reason) => format!("invalid token: {reason}"),
-                    InternalOidcError::PrincipalNotAllowlisted => {
-                        "principal not allowlisted".to_string()
-                    }
-                    InternalOidcError::JwksRefresh(reason) => {
-                        format!("jwks refresh failed: {reason}")
-                    }
-                };
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(ErrorResponse { error: message }),
-                )
-                    .into_response();
-            }
-
-            tracing::warn!(error = %err, "internal auth check failed in report-only mode");
-            next.run(request).await
-        }
-    }
 }
 
 #[cfg(test)]

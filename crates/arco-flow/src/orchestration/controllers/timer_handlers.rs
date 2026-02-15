@@ -330,7 +330,9 @@ mod tests {
     fn fresh_watermarks(now: DateTime<Utc>) -> Watermarks {
         Watermarks {
             last_committed_event_id: Some("01HQ123EVT".to_string()),
+            committed_event_count: Some(1),
             last_visible_event_id: Some("01HQ123EVT".to_string()),
+            visible_event_count: Some(1),
             events_processed_through: Some("01HQ123EVT".to_string()),
             last_processed_file: Some(orchestration_event_path("2025-01-15", "01HQ123")),
             last_processed_at: now - Duration::seconds(5),
@@ -340,7 +342,9 @@ mod tests {
     fn stale_watermarks(now: DateTime<Utc>) -> Watermarks {
         Watermarks {
             last_committed_event_id: Some("01HQ123EVT".to_string()),
+            committed_event_count: Some(1),
             last_visible_event_id: Some("01HQ123EVT".to_string()),
+            visible_event_count: Some(1),
             events_processed_through: Some("01HQ123EVT".to_string()),
             last_processed_file: Some(orchestration_event_path("2025-01-15", "01HQ123")),
             last_processed_at: now - Duration::seconds(45),

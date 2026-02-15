@@ -1,9 +1,8 @@
 [UTC] 2026-02-14T04:45:27Z
     Credentialed Accounts
 ACTIVE  ACCOUNT
-        ethan@daxistech.io
-*       ethan@urbanskitech.com
+        [REDACTED_ACCOUNT_2]
+*       [REDACTED_ACCOUNT_1]
 
 To set the active account, run:
     $ gcloud config set account `ACCOUNT`
-

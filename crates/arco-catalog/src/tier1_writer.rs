@@ -16,9 +16,11 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
-use arco_core::publish::Publisher;
+use arco_core::publish::{
+    SnapshotPointerDurability, SnapshotPointerPublishOutcome, publish_snapshot_pointer_transaction,
+};
 use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
-use arco_core::storage_keys::{CommitKey, LedgerKey, ManifestKey};
+use arco_core::storage_keys::{CommitKey, LedgerKey};
 use arco_core::storage_traits::{CommitPutStore, LedgerPutStore};
 use arco_core::{
     CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths, EventId, ScopedStorage,
@@ -295,8 +297,6 @@ impl Tier1Writer {
     where
         F: FnMut(&mut CatalogDomainManifest) -> Result<()>,
     {
-        let issuer = guard.permit_issuer();
-        let publisher = Publisher::new(&self.storage);
         let writer_epoch = guard.fencing_token().sequence();
 
         for attempt in 1..=self.cas_max_retries {
@@ -367,88 +367,48 @@ impl Tier1Writer {
                 CatalogDomain::Catalog,
                 &catalog.manifest_id,
             );
-            match self
-                .storage
-                .put_raw(
-                    &snapshot_manifest_path,
-                    catalog_bytes.clone(),
-                    WritePrecondition::DoesNotExist,
-                )
-                .await?
-            {
-                WriteResult::Success { .. } => {}
-                WriteResult::PreconditionFailed { .. } => {
-                    if attempt == self.cas_max_retries {
-                        return Err(CatalogError::PreconditionFailed {
-                            message: format!(
-                                "manifest snapshot already exists after max retries: {snapshot_manifest_path}"
-                            ),
-                        });
-                    }
-                    crate::metrics::record_cas_retry("catalog_manifest_snapshot");
-                    continue;
-                }
-            }
 
             let pointer = DomainManifestPointer {
                 manifest_id: catalog.manifest_id.clone(),
-                manifest_path: snapshot_manifest_path,
+                manifest_path: snapshot_manifest_path.clone(),
                 epoch: writer_epoch,
                 parent_pointer_hash: pointer_parent_hash.clone(),
                 updated_at: Utc::now(),
             };
-
-            let permit = pointer_expected_version.as_deref().map_or_else(
-                || {
-                    issuer.issue_create_permit_with_commit_ulid(
-                        CatalogDomain::Catalog.as_str(),
-                        commit_ulid.clone(),
-                    )
-                },
-                |expected_version| {
-                    issuer.issue_permit_with_commit_ulid(
-                        CatalogDomain::Catalog.as_str(),
-                        expected_version.to_string(),
-                        commit_ulid.clone(),
-                    )
-                },
-            );
-
-            match publisher
-                .publish(
-                    permit,
-                    &ManifestKey::domain_pointer(CatalogDomain::Catalog),
-                    json_bytes(&pointer)?,
-                )
-                .await?
+            let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+            match publish_snapshot_pointer_transaction(
+                &self.storage,
+                &snapshot_manifest_path,
+                catalog_bytes.clone(),
+                &pointer_path,
+                json_bytes(&pointer)?,
+                pointer_expected_version.as_deref(),
+                Some((&root.catalog_manifest_path, catalog_bytes.clone())),
+                SnapshotPointerDurability::Visible,
+                async { Ok(()) },
+            )
+            .await
             {
-                WriteResult::Success { .. } => {
-                    // Legacy migration shim: keep mutable manifest path readable.
-                    match self
-                        .storage
-                        .put_raw(
-                            &root.catalog_manifest_path,
-                            catalog_bytes.clone(),
-                            WritePrecondition::None,
-                        )
-                        .await?
-                    {
-                        WriteResult::Success { .. } | WriteResult::PreconditionFailed { .. } => {}
-                    }
+                Ok(SnapshotPointerPublishOutcome::Visible { .. }) => {
                     self.persist_commit_record(&commit).await?;
                     return Ok(commit);
                 }
-                WriteResult::PreconditionFailed { .. } => {
+                Ok(SnapshotPointerPublishOutcome::PersistedNotVisible) => {
+                    return Err(CatalogError::InvariantViolation {
+                        message:
+                            "unexpected persisted-not-visible outcome in visible durability mode"
+                                .to_string(),
+                    });
+                }
+                Err(arco_core::Error::PreconditionFailed { .. }) => {
                     if attempt == self.cas_max_retries {
                         return Err(CatalogError::PreconditionFailed {
                             message: "manifest update lost CAS race after max retries".into(),
                         });
                     }
-
-                    // Another writer updated the manifest between read and write.
-                    // Retry from fresh state.
                     crate::metrics::record_cas_retry("catalog_manifest_pointer");
                 }
+                Err(e) => return Err(CatalogError::from(e)),
             }
         }
 

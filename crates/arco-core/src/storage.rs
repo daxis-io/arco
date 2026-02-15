@@ -627,6 +627,81 @@ impl StorageBackend for MemoryBackend {
 mod tests {
     use super::*;
 
+    async fn run_precondition_conformance<B: StorageBackend>(
+        backend: &B,
+        base_path: &str,
+    ) -> Result<()> {
+        let path = format!("{base_path}/conformance.txt");
+
+        let first = backend
+            .put(&path, Bytes::from("v1"), WritePrecondition::DoesNotExist)
+            .await?;
+        let first_version = match first {
+            WriteResult::Success { version } => version,
+            WriteResult::PreconditionFailed { .. } => {
+                panic!("first DoesNotExist write must succeed")
+            }
+        };
+        assert!(!first_version.is_empty(), "version token must be non-empty");
+
+        let duplicate = backend
+            .put(
+                &path,
+                Bytes::from("v1-duplicate"),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+        match duplicate {
+            WriteResult::PreconditionFailed { current_version } => {
+                assert_eq!(current_version, first_version);
+            }
+            WriteResult::Success { .. } => panic!("second DoesNotExist write must fail"),
+        }
+
+        let second = backend
+            .put(
+                &path,
+                Bytes::from("v2"),
+                WritePrecondition::MatchesVersion(first_version.clone()),
+            )
+            .await?;
+        let second_version = match second {
+            WriteResult::Success { version } => version,
+            WriteResult::PreconditionFailed { .. } => {
+                panic!("MatchesVersion with current token must succeed")
+            }
+        };
+        assert_ne!(
+            first_version, second_version,
+            "version token must advance on successful conditional write"
+        );
+
+        let stale = backend
+            .put(
+                &path,
+                Bytes::from("v3"),
+                WritePrecondition::MatchesVersion(first_version),
+            )
+            .await?;
+        match stale {
+            WriteResult::PreconditionFailed { current_version } => {
+                assert_eq!(current_version, second_version);
+            }
+            WriteResult::Success { .. } => panic!("stale MatchesVersion must fail"),
+        }
+
+        let meta = backend
+            .head(&path)
+            .await?
+            .expect("conformance object should exist");
+        assert_eq!(meta.version, second_version);
+        assert!(
+            !meta.version.is_empty(),
+            "head version token must be non-empty"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_memory_backend_roundtrip() {
         let backend = MemoryBackend::new();
@@ -851,5 +926,35 @@ mod tests {
 
         backend.delete("del.txt").await.expect("should succeed");
         assert!(backend.head("del.txt").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_memory_backend_precondition_conformance_harness() {
+        let backend = MemoryBackend::new();
+        run_precondition_conformance(&backend, "memory")
+            .await
+            .expect("memory backend must satisfy precondition conformance");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ARCO_TEST_GCS_BUCKET and cloud credentials"]
+    async fn test_gcs_backend_precondition_conformance_harness() {
+        let bucket = std::env::var("ARCO_TEST_GCS_BUCKET")
+            .expect("ARCO_TEST_GCS_BUCKET must be set for this test");
+        let backend = ObjectStoreBackend::gcs(&bucket).expect("gcs backend");
+        run_precondition_conformance(&backend, "gcs")
+            .await
+            .expect("gcs backend must satisfy precondition conformance");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ARCO_TEST_S3_BUCKET and cloud credentials"]
+    async fn test_s3_backend_precondition_conformance_harness() {
+        let bucket = std::env::var("ARCO_TEST_S3_BUCKET")
+            .expect("ARCO_TEST_S3_BUCKET must be set for this test");
+        let backend = ObjectStoreBackend::s3(&bucket).expect("s3 backend");
+        run_precondition_conformance(&backend, "s3")
+            .await
+            .expect("s3 backend must satisfy precondition conformance");
     }
 }

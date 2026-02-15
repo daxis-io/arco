@@ -17,14 +17,14 @@ Batch 3 Gate 4 execution artifacts (2026-02-14 UTC refresh).
 ## Cloud Run + IAM
 
 - `cloud-run/cloud-run-command-status.tsv`
-- `cloud-run/command-logs/gcloud_run_services_list_g4.json`
-- `cloud-run/command-logs/gcloud_run_service_describe_api_staging_g4.json`
-- `cloud-run/command-logs/gcloud_run_service_describe_compactor_staging_g4.json`
-- `cloud-run/command-logs/gcloud_run_revisions_api_staging_g4.json`
-- `cloud-run/command-logs/gcloud_run_revisions_compactor_staging_g4.json`
-- `cloud-run/command-logs/gcloud_run_iam_policy_api_staging_g4.json`
-- `cloud-run/command-logs/gcloud_run_iam_policy_compactor_staging_g4.json`
-- `cloud-run/command-logs/gcloud_project_iam_policy_g4.json`
+- `cloud-run/command-logs/gcloud_run_services_list_g4.log`
+- `cloud-run/command-logs/gcloud_run_service_describe_api_staging_g4.log`
+- `cloud-run/command-logs/gcloud_run_service_describe_compactor_staging_g4.log`
+- `cloud-run/command-logs/gcloud_run_revisions_api_staging_g4.log`
+- `cloud-run/command-logs/gcloud_run_revisions_compactor_staging_g4.log`
+- `cloud-run/command-logs/gcloud_run_iam_policy_api_staging_g4.log`
+- `cloud-run/command-logs/gcloud_run_iam_policy_compactor_staging_g4.log`
+- `cloud-run/command-logs/gcloud_project_iam_policy_g4.log`
 - `cloud-run/g4-003-cloud-run-iam-evidence.md`
 
 ## Observability

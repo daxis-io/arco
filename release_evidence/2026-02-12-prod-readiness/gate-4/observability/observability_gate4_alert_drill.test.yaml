@@ -1,8 +1,8 @@
 rule_files:
-  - /Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/infra/monitoring/alerts.yaml
+  - ../../../../infra/monitoring/alerts.yaml
 evaluation_interval: 1m
 tests:
-  - name: g4_threshold_alerts_fire_with_controlled_signal
+  - name: g4_core_threshold_alerts_fire_with_controlled_signal
     interval: 1m
     input_series:
       - series: 'api_request_total{status_class="5xx"}'
@@ -69,3 +69,37 @@ tests:
                 Runtime SLO breach counter increased in the last 5 minutes for compaction_lag_p95.
                 Increase: 5
               runbook_url: "https://docs.arco.dev/runbooks/scheduler-not-progressing"
+  - name: g4_rate_and_cas_threshold_alerts_fire
+    interval: 30s
+    input_series:
+      - series: 'rate_limit_hits_total{endpoint="/v1/query"}'
+        values: "0 60 120 180 240 300 360 420 480 540 600 660 720 780 840 900 960 1020 1080 1140 1200 1260 1320 1380 1440"
+      - series: 'cas_retry_total{operation="cas_manifest"}'
+        values: "0 10 20 30 40 50 60 70 80 90 100 110 120 130 140 150 160 170 180 190 200 210 220 230 240"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: ArcoRateLimitHitsHigh
+        exp_alerts:
+          - exp_labels:
+              endpoint: /v1/query
+              severity: warning
+              service: arco-api
+            exp_annotations:
+              summary: "Rate limit hits > 100/min for endpoint /v1/query"
+              description: |
+                Endpoint /v1/query is hitting rate limits frequently.
+                Rate: 120 hits/min
+              runbook_url: "https://docs.arco.dev/runbooks/rate-limiting"
+      - eval_time: 8m
+        alertname: ArcoCasRetryRateHigh
+        exp_alerts:
+          - exp_labels:
+              operation: cas_manifest
+              severity: warning
+              service: arco-catalog
+            exp_annotations:
+              summary: "CAS retry rate > 10/min for cas_manifest"
+              description: |
+                High CAS retry rate indicates contention on catalog writes.
+                Current rate: 20.0 retries/min
+              runbook_url: "https://docs.arco.dev/runbooks/cas-contention"

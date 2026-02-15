@@ -1,7 +1,7 @@
 # G4-002 Terraform Plan/Apply Evidence
 
 Generated UTC: 2026-02-14T04:51:40Z
-Status: BLOCKED-EXTERNAL (interactive GCP reauthentication required)
+Status: PARTIAL (interactive GCP reauthentication required to complete apply + re-plan)
 
 ## Executed Commands
 

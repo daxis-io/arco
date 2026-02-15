@@ -19,6 +19,9 @@ Source: `cloud-run/cloud-run-command-status.tsv`
 All commands failed with non-interactive reauth errors:
 - `Reauthentication failed. cannot prompt during non-interactive execution.`
 
+Failed command transcripts are stored as `.log` artifacts under
+`cloud-run/command-logs/` to keep unsuccessful captures explicitly non-JSON.
+
 ## External Completion Steps
 
 Owner: Platform + SRE
@@ -46,3 +49,8 @@ Owner: Platform + SRE
      - `gcloud run services get-iam-policy arco-api-staging --project=dataverse-dev-471815 --region=us-central1 --platform=managed --format=json > release_evidence/2026-02-12-prod-readiness/gate-4/cloud-run/command-logs/gcloud_run_iam_policy_api_staging_g4_external.json`
      - `gcloud run services get-iam-policy arco-compactor-staging --project=dataverse-dev-471815 --region=us-central1 --platform=managed --format=json > release_evidence/2026-02-12-prod-readiness/gate-4/cloud-run/command-logs/gcloud_run_iam_policy_compactor_staging_g4_external.json`
    - Expected output: IAM bindings showing required `roles/run.invoker` and service account principals.
+
+4. Capture project-level IAM policy evidence.
+   - Command:
+     - `gcloud projects get-iam-policy dataverse-dev-471815 --format=json > release_evidence/2026-02-12-prod-readiness/gate-4/cloud-run/command-logs/gcloud_project_iam_policy_g4_external.json`
+   - Expected output: Project IAM bindings export for reviewer verification of environment-level principals.

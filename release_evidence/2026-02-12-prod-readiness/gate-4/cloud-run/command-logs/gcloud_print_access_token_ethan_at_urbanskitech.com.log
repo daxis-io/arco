@@ -11,4 +11,4 @@ If you have already logged in with a different account, run:
   $ gcloud config set account ACCOUNT
 
 to select an already authenticated account to use.
-token_refresh=OK
+token_refresh=FAILED

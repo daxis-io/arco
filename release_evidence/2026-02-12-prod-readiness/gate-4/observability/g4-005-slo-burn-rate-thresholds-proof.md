@@ -20,7 +20,9 @@ Status: PARTIAL
 
 Validated firing behavior for:
 - `ArcoApiErrorRateHigh`
+- `ArcoRateLimitHitsHigh`
 - `ArcoCompactionLagHigh`
+- `ArcoCasRetryRateHigh`
 - `ArcoOrchSloObservedAboveTarget`
 - `ArcoOrchSloBreachesIncreasing` (short-window burn-rate proxy)
 

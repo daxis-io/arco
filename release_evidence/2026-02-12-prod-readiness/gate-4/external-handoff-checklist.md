@@ -28,6 +28,7 @@ Owner: Platform + SRE
 | Compactor revisions | `gcloud run revisions list --project=dataverse-dev-471815 --region=us-central1 --platform=managed --service=arco-compactor-staging --format=json` | revision history JSON | `gate-4/cloud-run/command-logs/gcloud_run_revisions_compactor_staging_g4_external.json` |
 | API IAM policy | `gcloud run services get-iam-policy arco-api-staging --project=dataverse-dev-471815 --region=us-central1 --platform=managed --format=json` | IAM bindings JSON | `gate-4/cloud-run/command-logs/gcloud_run_iam_policy_api_staging_g4_external.json` |
 | Compactor IAM policy | `gcloud run services get-iam-policy arco-compactor-staging --project=dataverse-dev-471815 --region=us-central1 --platform=managed --format=json` | IAM bindings JSON | `gate-4/cloud-run/command-logs/gcloud_run_iam_policy_compactor_staging_g4_external.json` |
+| Project IAM policy | `gcloud projects get-iam-policy dataverse-dev-471815 --format=json` | project IAM bindings JSON | `gate-4/cloud-run/command-logs/gcloud_project_iam_policy_g4_external.json` |
 
 ## G4-004 / G4-005 Staging Observability Verification
 

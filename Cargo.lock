@@ -494,6 +494,7 @@ dependencies = [
 name = "arco-uc"
 version = "0.1.0"
 dependencies = [
+ "arco-catalog",
  "arco-core",
  "axum 0.7.9",
  "gcp_auth",

@@ -51,6 +51,7 @@ tracing = { workspace = true }
 gcp_auth = { workspace = true, optional = true }
 
 [dev-dependencies]
+arco-catalog = { path = "../arco-catalog" }
 tokio = { workspace = true }
 tokio-test = { workspace = true }
 serde_yaml = { workspace = true }

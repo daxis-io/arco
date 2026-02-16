@@ -2,6 +2,7 @@
 
 use axum::Router;
 use axum::error_handling::HandleErrorLayer;
+use axum::extract::OriginalUri;
 use axum::http::StatusCode;
 use axum::middleware;
 use tower::ServiceBuilder;
@@ -24,7 +25,13 @@ pub fn unity_catalog_router(state: UnityCatalogState) -> Router {
             "/openapi.json",
             axum::routing::get(routes::openapi::get_openapi_json),
         )
-        .fallback(not_supported)
+        .merge(routes::catalogs::routes())
+        .merge(routes::schemas::routes())
+        .merge(routes::tables::routes())
+        .merge(routes::permissions::routes())
+        .merge(routes::credentials::routes())
+        .merge(routes::delta_commits::routes())
+        .fallback(not_found)
         .layer(middleware::from_fn(context_middleware))
         .layer(TraceLayer::new_for_http());
 
@@ -45,9 +52,9 @@ pub fn unity_catalog_router(state: UnityCatalogState) -> Router {
     router.with_state(state)
 }
 
-async fn not_supported() -> UnityCatalogError {
-    UnityCatalogError::NotImplemented {
-        message: "not supported".to_string(),
+async fn not_found(uri: OriginalUri) -> UnityCatalogError {
+    UnityCatalogError::NotFound {
+        message: format!("route not found: {}", uri.0.path()),
     }
 }
 

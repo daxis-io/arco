@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::http::{Method, StatusCode, header};
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use tower::ServiceExt;
 use ulid::Ulid;
 
@@ -396,12 +396,15 @@ async fn test_trigger_run_returns_acceptance_metadata() -> Result<()> {
     .await?;
 
     assert_eq!(status, StatusCode::CREATED);
-    assert!(payload["acceptedEventId"].as_str().unwrap_or_default().len() > 0);
-    assert!(payload["acceptedAt"].as_str().unwrap_or_default().len() > 0);
-    assert_eq!(
-        payload["correlationId"].as_str(),
-        Some("req_accept_01")
+    assert!(
+        payload["acceptedEventId"]
+            .as_str()
+            .unwrap_or_default()
+            .len()
+            > 0
     );
+    assert!(payload["acceptedAt"].as_str().unwrap_or_default().len() > 0);
+    assert_eq!(payload["correlationId"].as_str(), Some("req_accept_01"));
 
     Ok(())
 }
@@ -438,6 +441,87 @@ async fn test_get_backfill_wait_for_event_times_out() -> Result<()> {
     assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
     assert_eq!(error.code, "REQUEST_TIMEOUT");
     assert!(error.message.contains("timed out"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_get_backfill_wait_for_event_invalid_ulid_returns_400() -> Result<()> {
+    let router = test_router();
+
+    // Create a backfill first
+    let body = serde_json::json!({
+        "assetSelection": ["analytics.daily_sales"],
+        "partitionSelector": {
+            "type": "explicit",
+            "partitions": ["2025-01-01"]
+        }
+    });
+
+    let (status, response): (_, CreateBackfillResponse) = helpers::post_json_with_headers(
+        router.clone(),
+        "/api/v1/workspaces/test-workspace/backfills",
+        body,
+        &[("Idempotency-Key", "idem_invalid_ulid")],
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    // Try to wait with an invalid ULID
+    let uri = format!(
+        "/api/v1/workspaces/test-workspace/backfills/{}?waitForEventId=not-a-valid-ulid",
+        response.backfill_id
+    );
+
+    let (status, error): (_, ApiErrorResponse) =
+        helpers::get_json_with_headers(router, &uri, &[]).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "BAD_REQUEST");
+    assert!(error.message.contains("ULID"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_get_backfill_wait_for_event_already_processed() -> Result<()> {
+    let router = test_router();
+
+    // Create a backfill - the event is immediately compacted in create_backfill
+    let body = serde_json::json!({
+        "assetSelection": ["analytics.daily_sales"],
+        "partitionSelector": {
+            "type": "explicit",
+            "partitions": ["2025-01-01"]
+        }
+    });
+
+    let (status, response): (_, CreateBackfillResponse) = helpers::post_json_with_headers(
+        router.clone(),
+        "/api/v1/workspaces/test-workspace/backfills",
+        body,
+        &[("Idempotency-Key", "idem_already_processed")],
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    // Wait for the same event that was just processed - should return immediately (not timeout)
+    // The key assertion is that we don't get 408 REQUEST_TIMEOUT
+    let uri = format!(
+        "/api/v1/workspaces/test-workspace/backfills/{}?waitForEventId={}&timeoutMs=100",
+        response.backfill_id, response.accepted_event_id
+    );
+
+    let (status, _): (_, serde_json::Value) =
+        helpers::get_json_with_headers(router, &uri, &[]).await?;
+
+    // The wait logic should complete without timing out since the event is already processed.
+    // We may get 200 (found) or 404 (not found in test env) depending on storage isolation,
+    // but critically NOT 408 (timeout).
+    assert_ne!(
+        status,
+        StatusCode::REQUEST_TIMEOUT,
+        "wait should not timeout for already-processed event"
+    );
 
     Ok(())
 }

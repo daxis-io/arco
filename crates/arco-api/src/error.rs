@@ -98,16 +98,33 @@ impl ApiError {
 
     /// Returns an error response when a request times out.
     pub fn request_timeout(message: impl Into<String>) -> Self {
-        Self::new(
-            StatusCode::REQUEST_TIMEOUT,
-            "REQUEST_TIMEOUT",
-            message,
-        )
+        Self::new(StatusCode::REQUEST_TIMEOUT, "REQUEST_TIMEOUT", message)
     }
 
     /// Returns an internal error response.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", message)
+    }
+
+    /// Builds an API error from an HTTP status and message.
+    pub fn from_status_and_message(status: u16, message: impl Into<String>) -> Self {
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let message = message.into();
+        match status {
+            StatusCode::BAD_REQUEST => Self::bad_request(message),
+            StatusCode::UNAUTHORIZED => Self::unauthorized(message),
+            StatusCode::FORBIDDEN => Self::forbidden(message),
+            StatusCode::NOT_FOUND => Self::not_found(message),
+            StatusCode::CONFLICT => Self::conflict(message),
+            StatusCode::PRECONDITION_FAILED => Self::precondition_failed(message),
+            StatusCode::NOT_ACCEPTABLE => Self::not_acceptable(message),
+            StatusCode::NOT_IMPLEMENTED => Self::not_implemented(message),
+            StatusCode::REQUEST_TIMEOUT => Self::request_timeout(message),
+            StatusCode::UNPROCESSABLE_ENTITY => {
+                Self::unprocessable_entity("UNPROCESSABLE_ENTITY", message)
+            }
+            _ => Self::new(status, "UPSTREAM_ERROR", message),
+        }
     }
 
     /// Returns an error response for unsupported operations (406).

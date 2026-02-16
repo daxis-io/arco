@@ -26,7 +26,7 @@ use std::time::Duration;
 use axum::extract::Query as AxumQuery;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
@@ -39,14 +39,15 @@ use utoipa::{IntoParams, ToSchema};
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
 use crate::orchestration_compaction::compact_orchestration_events;
-use crate::paths::backfill_idempotency_path;
+use crate::paths::{MANIFEST_IDEMPOTENCY_PREFIX, MANIFEST_PREFIX, backfill_idempotency_path};
+use crate::routes::manifests::StoredManifest;
 use crate::server::AppState;
 use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::{
     BackfillChunkRow, BackfillRow, FoldState, MicroCompactor, OrchestrationManifest,
-    PartitionStatusRow, RunRow, RunState as FoldRunState, ScheduleStateRow, ScheduleTickRow,
-    SensorEvalRow, SensorStateRow, TaskRow, TaskState as FoldTaskState,
+    PartitionStatusRow, RunRow, RunState as FoldRunState, ScheduleDefinitionRow, ScheduleStateRow,
+    ScheduleTickRow, SensorEvalRow, SensorStateRow, TaskRow, TaskState as FoldTaskState,
 };
 use arco_flow::orchestration::controllers::{PubSubMessage, PushSensorHandler};
 use arco_flow::orchestration::events::{
@@ -649,6 +650,21 @@ pub struct RunRequestResponse {
 pub struct ScheduleResponse {
     /// Schedule identifier.
     pub schedule_id: String,
+    /// Cron expression for the schedule.
+    pub cron_expression: String,
+    /// IANA timezone used for evaluation.
+    pub timezone: String,
+    /// Maximum catchup window (minutes).
+    pub catchup_window_minutes: u32,
+    /// Maximum catchup ticks per evaluation.
+    pub max_catchup_ticks: u32,
+    /// Asset selection captured on the definition.
+    #[serde(default)]
+    pub asset_selection: Vec<String>,
+    /// Whether the schedule is enabled.
+    pub enabled: bool,
+    /// Definition row version.
+    pub definition_version: String,
     /// Last `scheduled_for` timestamp that was processed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_scheduled_for: Option<DateTime<Utc>>,
@@ -1842,6 +1858,7 @@ fn parse_pagination(limit: u32, cursor: Option<&str>) -> Result<(usize, usize), 
 }
 
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 5_000;
+const MAX_WAIT_TIMEOUT_MS: u64 = 30_000;
 const WAIT_BACKOFF_INITIAL_MS: u64 = 20;
 const WAIT_BACKOFF_MAX_MS: u64 = 250;
 
@@ -1886,19 +1903,30 @@ async fn wait_for_event_processed(
     event_id: &str,
     timeout: Duration,
 ) -> Result<(), ApiError> {
+    let span = tracing::info_span!(
+        "wait_for_event",
+        event_id = %event_id,
+        timeout_ms = %timeout.as_millis(),
+    );
+    let _guard = span.enter();
+
     let target = Ulid::from_string(event_id)
         .map_err(|_| ApiError::bad_request("waitForEventId must be a ULID"))?;
     let start = Instant::now();
     let deadline = start + timeout;
     let mut backoff = Duration::from_millis(WAIT_BACKOFF_INITIAL_MS);
+    let mut poll_count: u32 = 0;
 
     loop {
+        poll_count += 1;
         let manifest = load_orchestration_manifest(ctx, state).await?;
         if watermark_reached(&manifest, &target) {
+            tracing::debug!(poll_count, elapsed_ms = %start.elapsed().as_millis(), "event processed");
             return Ok(());
         }
 
         if Instant::now() >= deadline {
+            tracing::debug!(poll_count, "wait timed out");
             return Err(ApiError::request_timeout(format!(
                 "timed out waiting for event {event_id}"
             )));
@@ -1907,6 +1935,7 @@ async fn wait_for_event_processed(
         let remaining = deadline.saturating_duration_since(Instant::now());
         let sleep_for = backoff.min(remaining);
         if sleep_for.is_zero() {
+            tracing::debug!(poll_count, "wait timed out (zero remaining)");
             return Err(ApiError::request_timeout(format!(
                 "timed out waiting for event {event_id}"
             )));
@@ -1920,9 +1949,7 @@ async fn wait_for_event_processed(
 fn resolve_backfill_chunk_size(chunk_size: Option<u32>) -> Result<u32, ApiError> {
     let resolved = chunk_size.unwrap_or(DEFAULT_BACKFILL_CHUNK_SIZE);
     if resolved == 0 {
-        return Err(ApiError::bad_request(
-            "chunkSize must be greater than zero",
-        ));
+        return Err(ApiError::bad_request("chunkSize must be greater than zero"));
     }
     Ok(resolved)
 }
@@ -2064,9 +2091,8 @@ async fn reserve_backfill_idempotency(
         accepted_at,
     };
 
-    let record_json = serde_json::to_string(&record).map_err(|e| {
-        ApiError::internal(format!("failed to serialize idempotency record: {e}"))
-    })?;
+    let record_json = serde_json::to_string(&record)
+        .map_err(|e| ApiError::internal(format!("failed to serialize idempotency record: {e}")))?;
     let record_path = backfill_idempotency_path(key);
 
     // Attempt atomic reservation with CAS
@@ -3495,13 +3521,19 @@ fn filter_sensor_evals_by_status(
     evals.retain(|eval| {
         matches!(
             (&eval.status, filter),
-            (SensorEvalStatusResponse::Triggered, SensorEvalStatusFilter::Triggered)
-                | (SensorEvalStatusResponse::NoNewData, SensorEvalStatusFilter::NoNewData)
-                | (SensorEvalStatusResponse::Error { .. }, SensorEvalStatusFilter::Error)
-                | (
-                    SensorEvalStatusResponse::SkippedStaleCursor,
-                    SensorEvalStatusFilter::SkippedStaleCursor
-                )
+            (
+                SensorEvalStatusResponse::Triggered,
+                SensorEvalStatusFilter::Triggered
+            ) | (
+                SensorEvalStatusResponse::NoNewData,
+                SensorEvalStatusFilter::NoNewData
+            ) | (
+                SensorEvalStatusResponse::Error { .. },
+                SensorEvalStatusFilter::Error
+            ) | (
+                SensorEvalStatusResponse::SkippedStaleCursor,
+                SensorEvalStatusFilter::SkippedStaleCursor
+            )
         )
     });
 }
@@ -3736,6 +3768,9 @@ pub(crate) async fn trigger_run(
                     state: run_state,
                     created: false,
                     created_at: existing.created_at,
+                    accepted_event_id: existing.event_id,
+                    accepted_at: existing.created_at,
+                    correlation_id: Some(correlation_id),
                 }),
             ));
         }
@@ -3920,6 +3955,18 @@ pub(crate) async fn trigger_run(
         }
     }
 
+    if plan_context.is_none() {
+        plan_context = Some(load_run_plan_context(&storage, &request).await?);
+    }
+    let Some(plan_context_ref) = plan_context.as_ref() else {
+        return Err(ApiError::internal("internal error: missing plan context"));
+    };
+    let tasks = build_task_defs_for_request(
+        plan_context_ref,
+        &request,
+        resolved_partition_key.canonical(),
+    )?;
+
     if request.run_key.is_none() {
         let run_event_id = Ulid::new().to_string();
         let plan_event_id = Ulid::new().to_string();
@@ -3950,8 +3997,8 @@ pub(crate) async fn trigger_run(
 
     compact_orchestration_events(&state.config, storage.clone(), event_paths).await?;
 
-    let accepted_event_id = accepted_event_id
-        .ok_or_else(|| ApiError::internal("missing accepted_event_id for run"))?;
+    let accepted_event_id =
+        accepted_event_id.ok_or_else(|| ApiError::internal("missing accepted_event_id for run"))?;
     let accepted_at =
         accepted_at.ok_or_else(|| ApiError::internal("missing accepted_at for run"))?;
 
@@ -5670,7 +5717,11 @@ pub(crate) async fn get_backfill(
     ensure_workspace(&ctx, &workspace_id)?;
 
     if let Some(ref event_id) = query.wait_for_event_id {
-        let timeout = Duration::from_millis(query.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS));
+        let timeout_ms = query
+            .timeout_ms
+            .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
+            .min(MAX_WAIT_TIMEOUT_MS);
+        let timeout = Duration::from_millis(timeout_ms);
         wait_for_event_processed(&ctx, &state, event_id, timeout).await?;
     }
 
@@ -5968,7 +6019,94 @@ mod tests {
     use anyhow::{Result, anyhow};
     use arco_core::partition::{PartitionKey, ScalarValue};
     use axum::http::StatusCode;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use chrono::{Duration, TimeZone};
+    use serde_json::json;
+
+    fn hash_trigger_fingerprint_payload(
+        request: &TriggerRunRequest,
+        partition_key: Option<String>,
+    ) -> Result<String> {
+        #[derive(Serialize)]
+        struct FingerprintPayload {
+            selection: Vec<String>,
+            include_upstream: bool,
+            include_downstream: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            partition_key: Option<String>,
+            labels: BTreeMap<String, String>,
+        }
+
+        let mut selection: Vec<String> = request
+            .selection
+            .iter()
+            .map(|value| {
+                arco_flow::orchestration::canonicalize_asset_key(value).map_err(anyhow::Error::msg)
+            })
+            .collect::<Result<_, _>>()?;
+        selection.sort();
+        selection.dedup();
+
+        let labels = request
+            .labels
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+
+        let payload = FingerprintPayload {
+            selection,
+            include_upstream: request.include_upstream,
+            include_downstream: request.include_downstream,
+            partition_key,
+            labels,
+        };
+
+        let json = serde_json::to_vec(&payload)?;
+        Ok(hex::encode(Sha256::digest(&json)))
+    }
+
+    fn partitioning_spec(dimensions: Vec<DimensionSpec>) -> PartitioningSpec {
+        PartitioningSpec {
+            is_partitioned: !dimensions.is_empty(),
+            dimensions,
+        }
+    }
+
+    fn time_dimension(name: &str, granularity: Option<&str>) -> DimensionSpec {
+        DimensionSpec {
+            name: name.to_string(),
+            kind: "time".to_string(),
+            granularity: granularity.map(str::to_string),
+            values: None,
+        }
+    }
+
+    fn static_dimension(name: &str) -> DimensionSpec {
+        DimensionSpec {
+            name: name.to_string(),
+            kind: "static".to_string(),
+            granularity: None,
+            values: None,
+        }
+    }
+
+    fn static_dimension_with_values(name: &str, values: Vec<&str>) -> DimensionSpec {
+        DimensionSpec {
+            name: name.to_string(),
+            kind: "static".to_string(),
+            granularity: None,
+            values: Some(values.into_iter().map(str::to_string).collect()),
+        }
+    }
+
+    fn tenant_dimension(name: &str) -> DimensionSpec {
+        DimensionSpec {
+            name: name.to_string(),
+            kind: "tenant".to_string(),
+            granularity: None,
+            values: None,
+        }
+    }
 
     #[test]
     fn test_trigger_request_deserialization() {
@@ -6609,6 +6747,8 @@ mod tests {
                 scheduled_for: base - Duration::days(2),
                 asset_selection: vec![],
                 status: TickStatusResponse::Triggered,
+                skip_reason: None,
+                error_message: None,
                 run_key: None,
                 run_id: None,
             },
@@ -6618,6 +6758,8 @@ mod tests {
                 scheduled_for: base - Duration::days(1),
                 asset_selection: vec![],
                 status: TickStatusResponse::Triggered,
+                skip_reason: None,
+                error_message: None,
                 run_key: None,
                 run_id: None,
             },
@@ -6627,6 +6769,8 @@ mod tests {
                 scheduled_for: base,
                 asset_selection: vec![],
                 status: TickStatusResponse::Triggered,
+                skip_reason: None,
+                error_message: None,
                 run_key: None,
                 run_id: None,
             },
@@ -6637,9 +6781,11 @@ mod tests {
         filter_ticks_by_time_range(&mut ticks, Some(since), Some(until));
 
         assert_eq!(ticks.len(), 2);
-        assert!(ticks
-            .iter()
-            .all(|tick| tick.scheduled_for >= since && tick.scheduled_for <= until));
+        assert!(
+            ticks
+                .iter()
+                .all(|tick| tick.scheduled_for >= since && tick.scheduled_for <= until)
+        );
     }
 
     #[test]

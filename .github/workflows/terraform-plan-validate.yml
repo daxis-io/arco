@@ -25,6 +25,11 @@ jobs:
         run: terraform -chdir=infra/terraform validate
 
       - name: Terraform Plan (Base Vars, No Refresh)
+        env:
+          # This workflow validates static plan generation only; it does not apply.
+          # Supplying an explicit token avoids ADC lookup in CI environments without
+          # gcloud credentials while keeping provider configuration exercised.
+          GOOGLE_OAUTH_ACCESS_TOKEN: "ci-plan-noop-token"
         run: |
           terraform -chdir=infra/terraform plan \
             -refresh=false \
@@ -41,6 +46,9 @@ jobs:
             -var="jwt_secret_name="
 
       - name: Terraform Plan (Flow-Enabled Vars, No Refresh)
+        env:
+          # Keep credentialless plan checks deterministic in PR CI.
+          GOOGLE_OAUTH_ACCESS_TOKEN: "ci-plan-noop-token"
         run: |
           terraform -chdir=infra/terraform plan \
             -refresh=false \

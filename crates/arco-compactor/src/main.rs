@@ -42,8 +42,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -53,9 +55,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use arco_catalog::Compactor;
-use arco_core::CatalogDomain;
 use arco_core::scoped_storage::ScopedStorage;
 use arco_core::storage::{ObjectStoreBackend, StorageBackend};
+use arco_core::{CatalogDomain, InternalOidcConfig, InternalOidcError, InternalOidcVerifier};
 
 use crate::notification_consumer::{
     EventNotification, NotificationConsumer, NotificationConsumerConfig,
@@ -378,6 +380,12 @@ struct AutoAntiEntropyConfig {
     max_objects_per_run: usize,
     reprocess_batch_size: usize,
     reprocess_timeout_secs: u64,
+}
+
+#[derive(Clone)]
+struct InternalAuthState {
+    verifier: Arc<InternalOidcVerifier>,
+    enforce: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -909,7 +917,11 @@ mod tests {
     async fn test_metrics_gate_disabled_when_secret_empty() {
         metrics::init_metrics();
         let state = test_state();
-        let router = build_router(state, normalize_metrics_secret(Some("  ".to_string())));
+        let router = build_router(
+            state,
+            normalize_metrics_secret(Some("  ".to_string())),
+            None,
+        );
         let response = router
             .oneshot(
                 Request::builder()
@@ -926,7 +938,7 @@ mod tests {
     async fn test_metrics_gate_accepts_x_metrics_secret() {
         metrics::init_metrics();
         let state = test_state();
-        let router = build_router(state, Some("topsecret".to_string()));
+        let router = build_router(state, Some("topsecret".to_string()), None);
         let response = router
             .oneshot(
                 Request::builder()
@@ -944,7 +956,7 @@ mod tests {
     async fn test_metrics_gate_accepts_bearer_secret() {
         metrics::init_metrics();
         let state = test_state();
-        let router = build_router(state, Some("topsecret".to_string()));
+        let router = build_router(state, Some("topsecret".to_string()), None);
         let response = router
             .oneshot(
                 Request::builder()
@@ -961,7 +973,7 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_gate_rejects_missing_or_wrong_secret() {
         let state = test_state();
-        let router = build_router(Arc::clone(&state), Some("topsecret".to_string()));
+        let router = build_router(Arc::clone(&state), Some("topsecret".to_string()), None);
         let response = router
             .oneshot(
                 Request::builder()
@@ -973,7 +985,7 @@ mod tests {
             .expect("request failed");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-        let router = build_router(state, Some("topsecret".to_string()));
+        let router = build_router(state, Some("topsecret".to_string()), None);
         let response = router
             .oneshot(
                 Request::builder()
@@ -991,7 +1003,7 @@ mod tests {
     async fn test_metrics_gate_accepts_when_both_headers_present() {
         metrics::init_metrics();
         let state = test_state();
-        let router = build_router(state, Some("topsecret".to_string()));
+        let router = build_router(state, Some("topsecret".to_string()), None);
         let response = router
             .oneshot(
                 Request::builder()
@@ -1029,19 +1041,108 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
-fn build_router(state: Arc<ServiceState>, metrics_secret: Option<String>) -> Router {
+fn build_internal_auth() -> Result<Option<Arc<InternalAuthState>>> {
+    let config =
+        InternalOidcConfig::from_env().map_err(|e| anyhow!("invalid internal auth config: {e}"))?;
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    let enforce = config.enforce;
+    let verifier = InternalOidcVerifier::new(config)
+        .map_err(|e| anyhow!("invalid internal auth config: {e}"))?;
+
+    Ok(Some(Arc::new(InternalAuthState {
+        verifier: Arc::new(verifier),
+        enforce,
+    })))
+}
+
+async fn internal_auth_middleware(
+    State(state): State<Arc<InternalAuthState>>,
+    request: axum::http::Request<Body>,
+    next: Next,
+) -> impl IntoResponse {
+    match state.verifier.verify_headers(request.headers()).await {
+        Ok(_) => next.run(request).await.into_response(),
+        Err(err) => {
+            if state.enforce {
+                let message = match err {
+                    InternalOidcError::MissingBearerToken => "missing bearer token".to_string(),
+                    InternalOidcError::InvalidToken(reason) => format!("invalid token: {reason}"),
+                    InternalOidcError::PrincipalNotAllowlisted => {
+                        "principal not allowlisted".to_string()
+                    }
+                    InternalOidcError::JwksRefresh(reason) => {
+                        format!("jwks refresh failed: {reason}")
+                    }
+                };
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "unauthorized",
+                        "message": message,
+                    })),
+                )
+                    .into_response();
+            }
+
+            tracing::warn!(error = %err, "internal auth check failed in report-only mode");
+            next.run(request).await.into_response()
+        }
+    }
+}
+
+fn build_router(
+    state: Arc<ServiceState>,
+    metrics_secret: Option<String>,
+    internal_auth: Option<Arc<InternalAuthState>>,
+) -> Router {
     // Build HTTP router
     // Note: /internal/anti-entropy is separate from /internal/sync-compact
     // because they have different IAM requirements:
     // - sync-compact: compactor-fastpath-sa (NO list)
     // - anti-entropy: compactor-antientropy-sa (WITH list)
+    let compact_route = if let Some(auth) = internal_auth.clone() {
+        post(compact).route_layer(middleware::from_fn_with_state(
+            auth,
+            internal_auth_middleware,
+        ))
+    } else {
+        post(compact)
+    };
+    let notify_route = if let Some(auth) = internal_auth.clone() {
+        post(notify_handler).route_layer(middleware::from_fn_with_state(
+            auth,
+            internal_auth_middleware,
+        ))
+    } else {
+        post(notify_handler)
+    };
+    let sync_compact_route = if let Some(auth) = internal_auth.clone() {
+        post(sync_compact_handler).route_layer(middleware::from_fn_with_state(
+            auth,
+            internal_auth_middleware,
+        ))
+    } else {
+        post(sync_compact_handler)
+    };
+    let anti_entropy_route = if let Some(auth) = internal_auth {
+        post(anti_entropy_handler).route_layer(middleware::from_fn_with_state(
+            auth,
+            internal_auth_middleware,
+        ))
+    } else {
+        post(anti_entropy_handler)
+    };
+
     let base_router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
-        .route("/compact", post(compact))
-        .route("/internal/notify", post(notify_handler))
-        .route("/internal/sync-compact", post(sync_compact_handler))
-        .route("/internal/anti-entropy", post(anti_entropy_handler));
+        .route("/compact", compact_route)
+        .route("/internal/notify", notify_route)
+        .route("/internal/sync-compact", sync_compact_route)
+        .route("/internal/anti-entropy", anti_entropy_route);
 
     let router = if let Some(secret) = metrics_secret {
         tracing::info!(
@@ -1114,6 +1215,7 @@ async fn main() -> Result<()> {
         } => {
             let scoped_storage = scoped.scoped_storage()?;
             let metrics_secret = normalize_metrics_secret(metrics_secret);
+            let internal_auth = build_internal_auth()?;
 
             // Initialize metrics before starting
             metrics::init_metrics();
@@ -1180,7 +1282,7 @@ async fn main() -> Result<()> {
                 }
             });
 
-            let router = build_router(Arc::clone(&state), metrics_secret);
+            let router = build_router(Arc::clone(&state), metrics_secret, internal_auth);
 
             // Spawn compaction loop
             let state_clone = Arc::clone(&state);

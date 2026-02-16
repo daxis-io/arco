@@ -40,6 +40,7 @@ pub mod catalog_event;
 pub mod catalog_paths;
 pub mod error;
 pub mod id;
+pub mod internal_oidc;
 pub mod lock;
 pub mod observability;
 pub mod partition;
@@ -88,6 +89,9 @@ pub use catalog_event::{CatalogEvent, CatalogEventPayload};
 pub use catalog_paths::{CatalogDomain, CatalogPaths};
 pub use error::{Error, Result};
 pub use id::{AssetId, EventId, MaterializationId, RunId, TaskId};
+pub use internal_oidc::{
+    InternalOidcConfig, InternalOidcError, InternalOidcVerifier, VerifiedPrincipal,
+};
 pub use lock::{DistributedLock, LockGuard, LockInfo};
 pub use observability::{LogFormat, Redacted, init_logging};
 pub use partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};

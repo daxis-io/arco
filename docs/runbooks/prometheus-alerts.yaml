@@ -4,6 +4,41 @@
 # Adjust thresholds based on your SLOs and traffic patterns.
 
 groups:
+  - name: arco-flow-go-live-gates
+    rules:
+      - alert: ArcoFlowCallback5xxRateHigh
+        expr: |
+          (
+            sum(rate(arco_orch_callbacks_total{result=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(arco_orch_callbacks_total[5m])), 1)
+          ) > 0.01
+          and
+          sum(rate(arco_orch_callbacks_total[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: critical
+          team: data-platform
+        annotations:
+          summary: Callback 5xx rate exceeds 1%
+          description: |
+            Callback 5xx ratio exceeded 1% over 5m with sufficient request volume.
+            Check callback auth, token validation, and ledger write dependencies.
+          runbook_url: https://docs.arco.dev/runbooks/high-task-failure-rate
+
+      - alert: ArcoFlowStaleFenceRejects
+        expr: increase(arco_flow_orch_compactor_stale_fence_rejects_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          team: data-platform
+        annotations:
+          summary: Stale fence rejects detected
+          description: |
+            Orchestration compactor reported stale fence rejects in the last 5 minutes.
+            This indicates competing writers or lock epoch drift.
+          runbook_url: https://docs.arco.dev/runbooks/storage-integrity-verification
+
   - name: arco-flow-slos
     rules:
       # Task Failure Rate SLO: < 5% failure rate

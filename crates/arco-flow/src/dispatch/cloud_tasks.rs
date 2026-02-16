@@ -707,13 +707,9 @@ mod gcp_impl {
         }
 
         async fn queue_depth(&self) -> Result<usize> {
-            // Cloud Tasks doesn't provide an efficient way to get exact queue depth.
-            // The API lists tasks with pagination, which is expensive for large queues.
-            // Production systems should use Cloud Monitoring metrics instead.
-            //
-            // For now, return 0 as a sentinel value indicating "unknown".
-            // Callers should use metrics for accurate queue depth monitoring.
-            Ok(0)
+            Err(Error::dispatch(
+                "cloud tasks queue_depth is unavailable; use Cloud Monitoring backlog metrics",
+            ))
         }
 
         fn queue_name(&self) -> &str {
@@ -802,7 +798,9 @@ mod placeholder_impl {
         }
 
         async fn queue_depth(&self) -> Result<usize> {
-            Ok(0)
+            Err(Error::dispatch(
+                "cloud tasks queue_depth is unavailable when gcp feature is disabled",
+            ))
         }
 
         fn queue_name(&self) -> &str {

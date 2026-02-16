@@ -267,6 +267,33 @@ Request latency distribution.
 
 Pending compaction work items.
 
+### Flow Orchestration
+
+#### `arco_orch_callbacks_total`
+**Type:** Counter
+**Labels:** `handler`, `result`
+
+Worker callback outcomes by HTTP-style result code (`200`, `401`, `409`, `500`, ...).
+
+#### `arco_orch_callback_errors_total`
+**Type:** Counter
+**Labels:** `handler`, `result`
+
+Subset counter for non-2xx callback outcomes.
+
+#### `arco_orch_callback_duration_seconds`
+**Type:** Histogram
+**Labels:** `handler`
+
+End-to-end callback handler latency.
+
+#### `arco_flow_dispatch_queue_depth`
+**Type:** Gauge
+**Labels:** `queue`
+
+Dispatch queue depth from queue implementations that expose reliable depth.
+Cloud Tasks backends no longer emit a sentinel `0` for unknown depth; use provider backlog metrics instead.
+
 #### `arco_compactor_last_run_timestamp`
 **Type:** Gauge
 **Labels:** `domain`, `trigger`

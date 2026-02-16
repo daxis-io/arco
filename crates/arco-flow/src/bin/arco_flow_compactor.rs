@@ -315,14 +315,15 @@ async fn main() -> Result<()> {
         compactor: MicroCompactor::with_tenant_secret(storage, tenant_secret),
     };
 
-    let compact_route = if let Some(auth) = internal_auth {
-        post(compact_handler).route_layer(middleware::from_fn_with_state(
-            auth,
-            internal_auth_middleware,
-        ))
-    } else {
-        post(compact_handler)
-    };
+    let compact_route = internal_auth.map_or_else(
+        || post(compact_handler),
+        |auth| {
+            post(compact_handler).route_layer(middleware::from_fn_with_state(
+                auth,
+                internal_auth_middleware,
+            ))
+        },
+    );
 
     let app = Router::new()
         .route("/health", get(health_handler))

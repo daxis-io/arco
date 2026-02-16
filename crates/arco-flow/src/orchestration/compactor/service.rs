@@ -399,10 +399,10 @@ impl MicroCompactor {
 
         let mut visibility_status = CompactionVisibility::Visible;
         let manifest_revision = if manifest_changed {
-            let previous_manifest_path = previous_pointer
-                .as_ref()
-                .map(|p| p.manifest_path.clone())
-                .unwrap_or_else(|| orchestration_manifest_path().to_string());
+            let previous_manifest_path = previous_pointer.as_ref().map_or_else(
+                || orchestration_manifest_path().to_string(),
+                |p| p.manifest_path.clone(),
+            );
 
             manifest.manifest_id =
                 next_manifest_id(&manifest.manifest_id).map_err(Error::serialization)?;

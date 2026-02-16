@@ -289,6 +289,7 @@ impl Tier1Writer {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn update_inner<F>(
         &self,
         guard: &LockGuard<dyn StorageBackend>,

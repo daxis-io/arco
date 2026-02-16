@@ -205,6 +205,7 @@ impl Tier1Compactor {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn sync_compact_catalog(
         &self,
         event_paths: Vec<String>,
@@ -411,6 +412,7 @@ impl Tier1Compactor {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn sync_compact_lineage(
         &self,
         event_paths: Vec<String>,

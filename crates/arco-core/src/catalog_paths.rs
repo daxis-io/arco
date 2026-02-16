@@ -10,10 +10,15 @@
 //! tenant={tenant}/workspace={workspace}/
 //! ├── manifests/
 //! │   ├── root.manifest.json
-//! │   ├── catalog.manifest.json
-//! │   ├── lineage.manifest.json
-//! │   ├── executions.manifest.json
-//! │   └── search.manifest.json
+//! │   ├── catalog.manifest.json          # Legacy compatibility path
+//! │   ├── lineage.manifest.json          # Legacy compatibility path
+//! │   ├── executions.manifest.json       # Legacy compatibility path
+//! │   ├── search.manifest.json           # Legacy compatibility path
+//! │   ├── catalog.pointer.json
+//! │   ├── lineage.pointer.json
+//! │   ├── executions.pointer.json
+//! │   ├── search.pointer.json
+//! │   └── {domain}/{manifest_id}.json    # Immutable snapshots
 //! ├── locks/
 //! │   ├── catalog.lock.json
 //! │   ├── lineage.lock.json
@@ -120,6 +125,24 @@ impl CatalogPaths {
     #[must_use]
     pub fn domain_manifest(domain: CatalogDomain) -> String {
         format!("manifests/{}.manifest.json", domain.as_str())
+    }
+
+    /// Returns the manifest pointer path for a domain.
+    ///
+    /// During migration this can coexist with the legacy mutable domain manifest.
+    /// New writers publish immutable snapshots and CAS-swap this pointer.
+    #[must_use]
+    pub fn domain_manifest_pointer(domain: CatalogDomain) -> String {
+        format!("manifests/{}.pointer.json", domain.as_str())
+    }
+
+    /// Returns the immutable manifest snapshot path for a domain.
+    ///
+    /// `manifest_id` should be a fixed-width, zero-padded decimal identifier
+    /// (e.g. `00000000000000000042`) so lexical order matches numeric order.
+    #[must_use]
+    pub fn domain_manifest_snapshot(domain: CatalogDomain, manifest_id: &str) -> String {
+        format!("manifests/{}/{}.json", domain.as_str(), manifest_id)
     }
 
     /// Returns the manifest path for a domain by string name.
@@ -329,6 +352,30 @@ mod tests {
         assert_eq!(
             CatalogPaths::domain_manifest(CatalogDomain::Search),
             "manifests/search.manifest.json"
+        );
+    }
+
+    #[test]
+    fn test_domain_manifest_pointer_paths() {
+        assert_eq!(
+            CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
+            "manifests/catalog.pointer.json"
+        );
+        assert_eq!(
+            CatalogPaths::domain_manifest_pointer(CatalogDomain::Lineage),
+            "manifests/lineage.pointer.json"
+        );
+    }
+
+    #[test]
+    fn test_domain_manifest_snapshot_paths() {
+        assert_eq!(
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, "00000000000000000001"),
+            "manifests/catalog/00000000000000000001.json"
+        );
+        assert_eq!(
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Search, "00000000000000042000"),
+            "manifests/search/00000000000000042000.json"
         );
     }
 

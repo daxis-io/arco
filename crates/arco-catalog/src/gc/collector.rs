@@ -12,7 +12,8 @@ use arco_core::{CatalogDomain, CatalogPaths};
 use crate::error::{CatalogError, Result};
 use crate::gc::RetentionPolicy;
 use crate::manifest::{
-    CatalogDomainManifest, ExecutionsManifest, LineageManifest, RootManifest, SearchManifest,
+    CatalogDomainManifest, DomainManifestPointer, ExecutionsManifest, LineageManifest,
+    RootManifest, SearchManifest,
 };
 
 // =========================================================================
@@ -398,6 +399,7 @@ impl GarbageCollector {
     async fn find_old_snapshot_versions(&self) -> Result<Vec<String>> {
         let mut old_versions = Vec::new();
         let cutoff = Utc::now() - Duration::hours(i64::from(self.policy.delay_hours));
+        let referenced = self.get_referenced_snapshots().await?;
 
         for domain in CatalogDomain::all() {
             let prefix = format!("snapshots/{}/", domain.as_str());
@@ -448,6 +450,9 @@ impl GarbageCollector {
                 .into_iter()
                 .skip(self.policy.keep_snapshots as usize)
             {
+                if referenced.contains(&dir) {
+                    continue;
+                }
                 if last_modified < cutoff {
                     old_versions.push(dir);
                 }
@@ -489,30 +494,36 @@ impl GarbageCollector {
 
         // Read root manifest to find domain manifests
         let root = self.read_root_manifest().await?;
+        let catalog_manifest_path = self
+            .resolve_domain_manifest_path(CatalogDomain::Catalog, &root.catalog_manifest_path)
+            .await?;
+        let lineage_manifest_path = self
+            .resolve_domain_manifest_path(CatalogDomain::Lineage, &root.lineage_manifest_path)
+            .await?;
+        let executions_manifest_path = self
+            .resolve_domain_manifest_path(CatalogDomain::Executions, &root.executions_manifest_path)
+            .await?;
+        let search_manifest_path = self
+            .resolve_domain_manifest_path(CatalogDomain::Search, &root.search_manifest_path)
+            .await?;
 
         // Catalog domain
-        if let Ok(manifest) = self
-            .read_catalog_manifest(&root.catalog_manifest_path)
-            .await
-        {
+        if let Ok(manifest) = self.read_catalog_manifest(&catalog_manifest_path).await {
             if !manifest.snapshot_path.is_empty() {
-                referenced.insert(manifest.snapshot_path);
+                referenced.insert(normalize_directory_path(&manifest.snapshot_path));
             }
         }
 
         // Lineage domain
-        if let Ok(manifest) = self
-            .read_lineage_manifest(&root.lineage_manifest_path)
-            .await
-        {
+        if let Ok(manifest) = self.read_lineage_manifest(&lineage_manifest_path).await {
             if !manifest.edges_path.is_empty() {
-                referenced.insert(manifest.edges_path);
+                referenced.insert(normalize_directory_path(&manifest.edges_path));
             }
         }
 
         // Executions domain
         if let Ok(manifest) = self
-            .read_executions_manifest(&root.executions_manifest_path)
+            .read_executions_manifest(&executions_manifest_path)
             .await
         {
             if let Some(path) = manifest.snapshot_path {
@@ -529,9 +540,9 @@ impl GarbageCollector {
         }
 
         // Search domain
-        if let Ok(manifest) = self.read_search_manifest(&root.search_manifest_path).await {
+        if let Ok(manifest) = self.read_search_manifest(&search_manifest_path).await {
             if !manifest.base_path.is_empty() {
-                referenced.insert(manifest.base_path);
+                referenced.insert(normalize_directory_path(&manifest.base_path));
             }
         }
 
@@ -549,9 +560,12 @@ impl GarbageCollector {
         }
 
         let root = self.read_root_manifest().await?;
+        let executions_manifest_path = self
+            .resolve_domain_manifest_path(CatalogDomain::Executions, &root.executions_manifest_path)
+            .await?;
 
         if let Ok(manifest) = self
-            .read_executions_manifest(&root.executions_manifest_path)
+            .read_executions_manifest(&executions_manifest_path)
             .await
         {
             Ok(manifest.last_compaction_at)
@@ -668,6 +682,31 @@ impl GarbageCollector {
             message: format!("failed to parse search manifest: {e}"),
         })
     }
+
+    async fn resolve_domain_manifest_path(
+        &self,
+        domain: CatalogDomain,
+        legacy_path: &str,
+    ) -> Result<String> {
+        let pointer_path = CatalogPaths::domain_manifest_pointer(domain);
+        match self.storage.get_raw(&pointer_path).await {
+            Ok(pointer_bytes) => {
+                let pointer: DomainManifestPointer = serde_json::from_slice(&pointer_bytes)
+                    .map_err(|e| CatalogError::Serialization {
+                        message: format!("failed to parse JSON at {pointer_path}: {e}"),
+                    })?;
+                match self.storage.head_raw(&pointer.manifest_path).await {
+                    Ok(Some(_)) => Ok(pointer.manifest_path),
+                    Ok(None) => Ok(legacy_path.to_string()),
+                    Err(e) => Err(CatalogError::from(e)),
+                }
+            }
+            Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+                Ok(legacy_path.to_string())
+            }
+            Err(e) => Err(CatalogError::from(e)),
+        }
+    }
 }
 
 // =========================================================================
@@ -705,10 +744,20 @@ fn extract_version_number(path: &str) -> Option<u64> {
         .and_then(|part| part[1..].parse().ok())
 }
 
+fn normalize_directory_path(path: &str) -> String {
+    if path.ends_with('/') {
+        path.to_string()
+    } else {
+        format!("{path}/")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arco_core::storage::MemoryBackend;
+    use arco_core::storage::{MemoryBackend, WritePrecondition};
+    use bytes::Bytes;
+    use chrono::Utc;
     use std::sync::Arc;
 
     #[test]
@@ -799,5 +848,196 @@ mod tests {
         assert!(report.orphaned_snapshots.is_empty());
         assert!(report.old_ledger_events.is_empty());
         assert!(report.old_snapshot_versions.is_empty());
+    }
+
+    fn catalog_manifest_for_version(
+        version: u64,
+        manifest_id: u64,
+        file_name: &str,
+        epoch: u64,
+    ) -> CatalogDomainManifest {
+        let snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, version);
+        let mut snapshot = crate::manifest::SnapshotInfo::new(version, snapshot_path.clone());
+        snapshot.add_file(crate::manifest::SnapshotFile {
+            path: file_name.to_string(),
+            checksum_sha256: "11".repeat(32),
+            byte_size: 1,
+            row_count: 1,
+            position_range: None,
+        });
+
+        CatalogDomainManifest {
+            manifest_id: crate::manifest::format_manifest_id(manifest_id),
+            epoch,
+            previous_manifest_path: None,
+            writer_session_id: Some(format!("gc-test-{manifest_id}")),
+            snapshot_version: version,
+            snapshot_path,
+            snapshot: Some(snapshot),
+            watermark_event_id: None,
+            last_commit_id: None,
+            fencing_token: Some(epoch),
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_does_not_flag_pointer_target_snapshot_as_orphan() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        let tier1_writer = crate::Tier1Writer::new(storage.clone());
+        tier1_writer.initialize().await.expect("init");
+
+        let root_bytes = storage
+            .get_raw(CatalogPaths::ROOT_MANIFEST)
+            .await
+            .expect("read root");
+        let mut root: RootManifest = serde_json::from_slice(&root_bytes).expect("parse root");
+        root.normalize_paths();
+
+        let legacy_manifest = catalog_manifest_for_version(1, 1, "legacy.parquet", 1);
+        storage
+            .put_raw(
+                &root.catalog_manifest_path,
+                Bytes::from(serde_json::to_vec(&legacy_manifest).expect("serialize legacy")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write legacy");
+
+        let pointed_manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, "00000000000000000002");
+        let pointed_manifest = catalog_manifest_for_version(2, 2, "current.parquet", 2);
+        storage
+            .put_raw(
+                &pointed_manifest_path,
+                Bytes::from(serde_json::to_vec(&pointed_manifest).expect("serialize pointed")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write pointed");
+
+        let pointer = DomainManifestPointer {
+            manifest_id: "00000000000000000002".to_string(),
+            manifest_path: pointed_manifest_path,
+            epoch: 2,
+            parent_pointer_hash: None,
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                &CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
+                Bytes::from(serde_json::to_vec(&pointer).expect("serialize pointer")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write pointer");
+
+        storage
+            .put_raw(
+                &CatalogPaths::snapshot_file(CatalogDomain::Catalog, 2, "current.parquet"),
+                Bytes::from_static(b"ok"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write pointed file");
+
+        let collector = GarbageCollector::new(storage, RetentionPolicy::default());
+        let report = collector.collect_dry_run().await.expect("dry run");
+        let pointed_dir = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 2);
+        assert!(
+            !report.orphaned_snapshots.contains(&pointed_dir),
+            "pointer-targeted snapshot directory must never be treated as orphaned"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_snapshot_gc_never_selects_pointer_target_manifest_version() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        let tier1_writer = crate::Tier1Writer::new(storage.clone());
+        tier1_writer.initialize().await.expect("init");
+
+        let root_bytes = storage
+            .get_raw(CatalogPaths::ROOT_MANIFEST)
+            .await
+            .expect("read root");
+        let mut root: RootManifest = serde_json::from_slice(&root_bytes).expect("parse root");
+        root.normalize_paths();
+
+        let legacy_manifest = catalog_manifest_for_version(1, 1, "legacy.parquet", 1);
+        storage
+            .put_raw(
+                &root.catalog_manifest_path,
+                Bytes::from(serde_json::to_vec(&legacy_manifest).expect("serialize legacy")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write legacy");
+
+        let pointed_manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, "00000000000000000002");
+        let pointed_manifest = catalog_manifest_for_version(2, 2, "current.parquet", 2);
+        storage
+            .put_raw(
+                &pointed_manifest_path,
+                Bytes::from(serde_json::to_vec(&pointed_manifest).expect("serialize pointed")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write pointed");
+
+        let pointer = DomainManifestPointer {
+            manifest_id: "00000000000000000002".to_string(),
+            manifest_path: pointed_manifest_path,
+            epoch: 2,
+            parent_pointer_hash: None,
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                &CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
+                Bytes::from(serde_json::to_vec(&pointer).expect("serialize pointer")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write pointer");
+
+        storage
+            .put_raw(
+                &CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "legacy.parquet"),
+                Bytes::from_static(b"old"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write legacy file");
+        storage
+            .put_raw(
+                &CatalogPaths::snapshot_file(CatalogDomain::Catalog, 2, "current.parquet"),
+                Bytes::from_static(b"new"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write current file");
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let collector = GarbageCollector::new(
+            storage,
+            RetentionPolicy {
+                keep_snapshots: 0,
+                delay_hours: 0,
+                ledger_retention_hours: 1,
+                max_age_days: 1,
+            },
+        );
+        let report = collector.collect_dry_run().await.expect("dry run");
+        let pointed_dir = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 2);
+        assert!(
+            !report.old_snapshot_versions.contains(&pointed_dir),
+            "pointer-targeted snapshot directory must never be selected as old snapshot GC candidate"
+        );
     }
 }

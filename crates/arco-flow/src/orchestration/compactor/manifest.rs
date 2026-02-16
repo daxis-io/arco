@@ -12,6 +12,69 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Fixed width for immutable orchestration manifest identifiers.
+pub const MANIFEST_ID_WIDTH: usize = 20;
+
+/// Initial manifest ID used for bootstrap state.
+pub const INITIAL_MANIFEST_ID: &str = "00000000000000000000";
+
+fn default_manifest_id() -> String {
+    INITIAL_MANIFEST_ID.to_string()
+}
+
+/// Formats an orchestration manifest ID as fixed-width decimal.
+#[must_use]
+pub fn format_manifest_id(value: u64) -> String {
+    format!("{value:0MANIFEST_ID_WIDTH$}")
+}
+
+/// Parses a fixed-width manifest ID.
+///
+/// # Errors
+///
+/// Returns an error when the ID is not exactly 20 decimal digits or overflows `u64`.
+pub fn parse_manifest_id(manifest_id: &str) -> Result<u64, String> {
+    if manifest_id.len() != MANIFEST_ID_WIDTH || !manifest_id.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "invalid manifest_id '{manifest_id}': expected {MANIFEST_ID_WIDTH} decimal digits"
+        ));
+    }
+    manifest_id
+        .parse::<u64>()
+        .map_err(|e| format!("invalid manifest_id '{manifest_id}': cannot parse as u64 ({e})"))
+}
+
+/// Computes the next fixed-width manifest ID.
+///
+/// # Errors
+///
+/// Returns an error when the previous ID is invalid or cannot be incremented.
+pub fn next_manifest_id(previous: &str) -> Result<String, String> {
+    let previous = parse_manifest_id(previous)?;
+    let next = previous
+        .checked_add(1)
+        .ok_or_else(|| "manifest_id overflow while generating successor".to_string())?;
+    Ok(format_manifest_id(next))
+}
+
+/// Orchestration manifest pointer (visibility gate for immutable snapshots).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchestrationManifestPointer {
+    /// Immutable manifest ID (fixed-width decimal).
+    #[serde(default = "default_manifest_id")]
+    pub manifest_id: String,
+    /// Path to immutable manifest snapshot.
+    pub manifest_path: String,
+    /// Lock epoch that published this pointer.
+    #[serde(default)]
+    pub epoch: u64,
+    /// Hash of the previous raw pointer payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_pointer_hash: Option<String>,
+    /// Publish timestamp.
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Orchestration manifest tracking compaction state.
 ///
 /// This follows the unified platform pattern from ADR-020:
@@ -20,6 +83,18 @@ use std::collections::HashMap;
 /// - CAS publish for atomic updates
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestrationManifest {
+    /// Immutable manifest snapshot ID (fixed-width decimal).
+    #[serde(default = "default_manifest_id")]
+    pub manifest_id: String,
+
+    /// Lock epoch that authored this manifest.
+    #[serde(default)]
+    pub epoch: u64,
+
+    /// Previous immutable manifest snapshot path, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_manifest_path: Option<String>,
+
     /// Schema version for forward compatibility.
     pub schema_version: u32,
 
@@ -50,6 +125,9 @@ impl OrchestrationManifest {
     #[must_use]
     pub fn new(revision_ulid: impl Into<String>) -> Self {
         Self {
+            manifest_id: default_manifest_id(),
+            epoch: 0,
+            previous_manifest_path: None,
             schema_version: 1,
             revision_ulid: revision_ulid.into(),
             published_at: Utc::now(),
@@ -80,6 +158,14 @@ impl OrchestrationManifest {
 /// that Parquet projections are reasonably fresh.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Watermarks {
+    /// Last event durably committed by compaction bookkeeping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_committed_event_id: Option<String>,
+
+    /// Last event currently visible to readers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_visible_event_id: Option<String>,
+
     /// ULID of last processed event.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub events_processed_through: Option<String>,

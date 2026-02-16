@@ -15,6 +15,9 @@ pub struct SyncCompactRequest {
     pub event_paths: Vec<String>,
 
     /// Fencing token from the distributed lock.
+    ///
+    /// Semantically this is the lock epoch: compaction requests must carry the
+    /// current lock sequence number and stale epochs must be rejected.
     pub fencing_token: u64,
 
     /// Optional request ID for tracing.

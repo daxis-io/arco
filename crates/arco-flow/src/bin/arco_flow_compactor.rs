@@ -188,6 +188,53 @@ fn load_tenant_secret() -> Result<Vec<u8>> {
     Ok(secret)
 }
 
+fn build_internal_auth() -> Result<Option<Arc<InternalAuthState>>> {
+    let config = InternalOidcConfig::from_env().map_err(|e| Error::configuration(e.to_string()))?;
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    let enforce = config.enforce;
+    let verifier =
+        InternalOidcVerifier::new(config).map_err(|e| Error::configuration(e.to_string()))?;
+    Ok(Some(Arc::new(InternalAuthState {
+        verifier: Arc::new(verifier),
+        enforce,
+    })))
+}
+
+async fn internal_auth_middleware(
+    State(state): State<Arc<InternalAuthState>>,
+    request: axum::http::Request<Body>,
+    next: Next,
+) -> Response {
+    match state.verifier.verify_headers(request.headers()).await {
+        Ok(_) => next.run(request).await,
+        Err(err) => {
+            if state.enforce {
+                let message = match err {
+                    InternalOidcError::MissingBearerToken => "missing bearer token".to_string(),
+                    InternalOidcError::InvalidToken(reason) => format!("invalid token: {reason}"),
+                    InternalOidcError::PrincipalNotAllowlisted => {
+                        "principal not allowlisted".to_string()
+                    }
+                    InternalOidcError::JwksRefresh(reason) => {
+                        format!("jwks refresh failed: {reason}")
+                    }
+                };
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse { error: message }),
+                )
+                    .into_response();
+            }
+
+            tracing::warn!(error = %err, "internal auth check failed in report-only mode");
+            next.run(request).await
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1460,13 +1460,14 @@ fn durability_mode_label(mode: DurabilityMode) -> &'static str {
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn visibility_lag_events(watermarks: &Watermarks) -> f64 {
     let (committed_count, visible_count) = watermark_event_counts(watermarks);
     committed_count.saturating_sub(visible_count) as f64
 }
 
 fn watermark_event_counts(watermarks: &Watermarks) -> (u64, u64) {
-    let committed_count = watermarks.committed_event_count.unwrap_or_else(|| {
+    let committed_count = watermarks.committed_event_count.unwrap_or({
         match watermarks.last_committed_event_id.as_deref() {
             Some(_) => 1,
             None => 0,
@@ -1480,8 +1481,7 @@ fn watermark_event_counts(watermarks: &Watermarks) -> (u64, u64) {
         ) {
             (Some(committed), Some(visible)) if committed == visible => committed_count,
             (Some(_), Some(_)) => committed_count.saturating_sub(1),
-            (Some(_), None) => 0,
-            (None, _) => 0,
+            (Some(_), None) | (None, _) => 0,
         }
     });
 

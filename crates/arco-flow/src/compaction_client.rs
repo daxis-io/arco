@@ -36,6 +36,7 @@ pub async fn compact_orchestration_events(url: &str, event_paths: Vec<String>) -
 async fn compact_orchestration_events_impl(url: &str, event_paths: &[String]) -> Result<()> {
     use std::time::Duration;
 
+    const MAX_ATTEMPTS: usize = 3;
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
     const METADATA_TIMEOUT: Duration = Duration::from_secs(2);
@@ -49,7 +50,6 @@ async fn compact_orchestration_events_impl(url: &str, event_paths: &[String]) ->
     let auth_header = build_auth_header(&client, &endpoint, bearer_token, METADATA_TIMEOUT).await?;
 
     // Basic retry for transient failures / CAS conflicts surfaced as HTTP status codes.
-    const MAX_ATTEMPTS: usize = 3;
     let mut attempt = 0;
 
     loop {
@@ -77,8 +77,9 @@ async fn compact_orchestration_events_impl(url: &str, event_paths: &[String]) ->
 
                 if retryable && attempt < MAX_ATTEMPTS {
                     // Exponential backoff with a small deterministic cap.
+                    let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
                     let backoff_ms = 50_u64
-                        .saturating_mul(2_u64.saturating_pow(attempt as u32 - 1))
+                        .saturating_mul(2_u64.saturating_pow(exponent))
                         .min(500);
                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     continue;
@@ -133,7 +134,7 @@ fn bearer_token_from_url(url: &reqwest::Url) -> Option<String> {
     if username != "bearer" {
         return None;
     }
-    url.password().map(|value| value.to_string())
+    url.password().map(str::to_string)
 }
 
 #[cfg(any(feature = "gcp", feature = "test-utils"))]
@@ -186,7 +187,7 @@ async fn fetch_gcp_identity_token(
     let mut url = reqwest::Url::parse(
         "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity",
     )
-    .expect("metadata identity URL is valid");
+    .map_err(|e| Error::dispatch(format!("invalid metadata identity URL: {e}")))?;
 
     url.query_pairs_mut()
         .append_pair("audience", audience)

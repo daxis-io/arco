@@ -1,7 +1,7 @@
 //! Helpers for Cloud Run flow controller services.
 //!
 //! Flow controller services (dispatcher, sweeper, automation) operate by:
-//! 1. Reading Parquet projections (via [`MicroCompactor::load_state`])
+//! 1. Reading Parquet projections (via [`crate::orchestration::compactor::MicroCompactor::load_state`])
 //! 2. Reconciling via stateless controllers
 //! 3. Appending orchestration events to the ledger
 //! 4. Triggering micro-compaction so Parquet projections stay fresh
@@ -18,6 +18,10 @@ use crate::orchestration::events::OrchestrationEvent;
 ///
 /// In production, flow services should always compact the exact event paths they append
 /// so subsequent reconciliations observe updated Parquet projections.
+///
+/// # Errors
+///
+/// Returns an error if appending events to the ledger fails or if remote compaction fails.
 pub async fn append_events_and_compact(
     ledger: &LedgerWriter,
     orch_compactor_url: Option<&str>,

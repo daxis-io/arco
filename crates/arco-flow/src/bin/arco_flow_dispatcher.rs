@@ -445,7 +445,10 @@ async fn run_handler(
                 target_url,
                 &body,
                 options,
-                state.timer_audience.as_deref().or(Some(target_url.as_str())),
+                state
+                    .timer_audience
+                    .as_deref()
+                    .or(Some(target_url.as_str())),
             )
             .await;
 
@@ -692,14 +695,15 @@ async fn main() -> Result<()> {
         task_token_signer,
     };
 
-    let run_route = if let Some(auth) = internal_auth {
-        post(run_handler).route_layer(middleware::from_fn_with_state(
-            auth,
-            internal_auth_middleware,
-        ))
-    } else {
-        post(run_handler)
-    };
+    let run_route = internal_auth.map_or_else(
+        || post(run_handler),
+        |auth| {
+            post(run_handler).route_layer(middleware::from_fn_with_state(
+                auth,
+                internal_auth_middleware,
+            ))
+        },
+    );
 
     let app = Router::new()
         .route("/health", get(health_handler))

@@ -434,7 +434,6 @@ dependencies = [
  "arco-delta",
  "arco-flow",
  "arco-iceberg",
- "arrow 54.3.1",
  "axum 0.7.9",
  "bytes",
  "chrono",

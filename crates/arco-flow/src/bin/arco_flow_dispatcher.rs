@@ -1,5 +1,6 @@
 //! Arco Flow orchestration dispatcher service.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -40,7 +41,10 @@ struct AppState {
     timer_audience: Option<String>,
     timer_queue: Option<String>,
     task_token_signer: Option<TaskTokenSigner>,
+    timer_ingest_secret: Option<String>,
 }
+
+const TIMER_INGEST_SECRET_HEADER: &str = "X-Arco-Timer-Ingest-Secret";
 
 #[derive(Debug, Serialize)]
 struct RunError {
@@ -324,6 +328,7 @@ async fn run_handler(
                 body.as_bytes(),
                 options,
                 Some(state.dispatch_target_url.as_str()),
+                None,
             )
             .await;
 
@@ -449,6 +454,7 @@ async fn run_handler(
                     .timer_audience
                     .as_deref()
                     .or(Some(target_url.as_str())),
+                timer_ingest_headers(state.timer_ingest_secret.as_deref()),
             )
             .await;
 
@@ -531,6 +537,19 @@ fn required_env(key: &str) -> Result<String> {
 
 fn optional_env(key: &str) -> Option<String> {
     std::env::var(key).ok()
+}
+
+fn timer_ingest_headers(secret: Option<&str>) -> Option<HashMap<String, String>> {
+    secret.and_then(|secret| {
+        let secret = secret.trim();
+        if secret.is_empty() {
+            return None;
+        }
+
+        let mut headers = HashMap::new();
+        headers.insert(TIMER_INGEST_SECRET_HEADER.to_string(), secret.to_string());
+        Some(headers)
+    })
 }
 
 fn parse_bool_env(key: &str, default: bool) -> bool {
@@ -635,6 +654,7 @@ async fn main() -> Result<()> {
     let timer_target_url = optional_env("ARCO_FLOW_TIMER_TARGET_URL");
     let timer_audience = optional_env("ARCO_FLOW_TIMER_AUDIENCE");
     let timer_queue = optional_env("ARCO_FLOW_TIMER_QUEUE");
+    let timer_ingest_secret = optional_env("ARCO_FLOW_TIMER_INGEST_SECRET");
     let service_account_email = optional_env("ARCO_FLOW_SERVICE_ACCOUNT_EMAIL");
     let require_tasks_oidc = parse_bool_env("ARCO_FLOW_REQUIRE_TASKS_OIDC", false);
     let port = resolve_port()?;
@@ -678,6 +698,13 @@ async fn main() -> Result<()> {
 
     let cloud_tasks = build_cloud_tasks(cloud_config).await?;
 
+    if timer_target_url.is_some() && timer_ingest_headers(timer_ingest_secret.as_deref()).is_none()
+    {
+        return Err(Error::configuration(
+            "ARCO_FLOW_TIMER_INGEST_SECRET required when ARCO_FLOW_TIMER_TARGET_URL is set",
+        ));
+    }
+
     let backend = ObjectStoreBackend::from_bucket(&bucket)?;
     let backend: Arc<dyn StorageBackend> = Arc::new(backend);
     let storage = ScopedStorage::new(backend, tenant_id.clone(), workspace_id.clone())?;
@@ -693,6 +720,7 @@ async fn main() -> Result<()> {
         timer_audience,
         timer_queue,
         task_token_signer,
+        timer_ingest_secret,
     };
 
     let run_route = internal_auth.map_or_else(

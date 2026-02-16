@@ -68,10 +68,6 @@ impl InternalOidcConfig {
     /// - `ARCO_INTERNAL_AUTH_JWKS_URL` (optional)
     /// - `ARCO_INTERNAL_AUTH_HS256_SECRET` (optional; tests/dev)
     /// - `ARCO_INTERNAL_AUTH_JWKS_CACHE_TTL_SECS` (optional)
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidInput`] when required configuration is missing or malformed.
     pub fn from_env() -> Result<Option<Self>, Error> {
         let enforce = parse_env_bool("ARCO_INTERNAL_AUTH_ENFORCE", false)?;
         let issuer = env_string("ARCO_INTERNAL_AUTH_ISSUER");
@@ -185,11 +181,6 @@ pub struct InternalOidcVerifier {
 
 impl InternalOidcVerifier {
     /// Creates a new verifier from config.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidInput`] when issuer/audience/allowlists are invalid, and
-    /// [`Error::Internal`] when the HTTP client cannot be created.
     pub fn new(config: InternalOidcConfig) -> Result<Self, Error> {
         if config.issuer.trim().is_empty() {
             return Err(Error::InvalidInput(
@@ -228,11 +219,6 @@ impl InternalOidcVerifier {
     }
 
     /// Validates the bearer token in request headers.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`InternalOidcError::MissingBearerToken`] when the header is absent or malformed,
-    /// or any error returned by [`Self::verify_token`].
     pub async fn verify_headers(
         &self,
         headers: &HeaderMap,
@@ -242,12 +228,6 @@ impl InternalOidcVerifier {
     }
 
     /// Validates a raw JWT token.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`InternalOidcError::InvalidToken`] for invalid signatures/claims,
-    /// [`InternalOidcError::JwksRefresh`] when JWKS retrieval fails, or
-    /// [`InternalOidcError::PrincipalNotAllowlisted`] when principal checks fail.
     pub async fn verify_token(&self, token: &str) -> Result<VerifiedPrincipal, InternalOidcError> {
         let claims = if let Some(secret) = self.config.hs256_secret.as_deref() {
             self.decode_hs256(token, secret)?

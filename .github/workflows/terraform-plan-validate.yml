@@ -1,5 +1,8 @@
 name: Terraform Validate and Plan
 
+permissions:
+  contents: read
+
 on:
   pull_request:
     paths:
@@ -37,10 +40,15 @@ jobs:
             -input=false \
             -no-color \
             -var="project_id=test-project" \
+            -var="project_number=123456789012" \
             -var="region=us-central1" \
             -var="environment=dev" \
             -var="api_image=example.com/arco-api:test" \
             -var="compactor_image=example.com/arco-compactor:test" \
+            -var="flow_compactor_image=example.com/arco-flow-compactor:test" \
+            -var="flow_dispatcher_image=example.com/arco-flow-dispatcher:test" \
+            -var="flow_sweeper_image=example.com/arco-flow-sweeper:test" \
+            -var="flow_worker_image=example.com/arco-flow-worker:test" \
             -var="compactor_tenant_id=test-tenant" \
             -var="compactor_workspace_id=test-workspace" \
             -var="jwt_secret_name="
@@ -56,16 +64,15 @@ jobs:
             -input=false \
             -no-color \
             -var="project_id=test-project" \
+            -var="project_number=123456789012" \
             -var="region=us-central1" \
             -var="environment=dev" \
             -var="api_image=example.com/arco-api:test" \
             -var="compactor_image=example.com/arco-compactor:test" \
+            -var="flow_compactor_image=example.com/arco-flow-compactor:test" \
             -var="compactor_tenant_id=test-tenant" \
             -var="compactor_workspace_id=test-workspace" \
             -var="jwt_secret_name=" \
             -var="flow_dispatcher_image=example.com/arco-flow-dispatcher:test" \
             -var="flow_sweeper_image=example.com/arco-flow-sweeper:test" \
-            -var="flow_timer_ingest_image=example.com/arco-flow-timer-ingest:test" \
-            -var="flow_dispatch_target_url=https://worker.internal.example/dispatch" \
-            -var="flow_tenant_id=test-tenant" \
-            -var="flow_workspace_id=test-workspace"
+            -var="flow_worker_image=example.com/arco-flow-worker:test"

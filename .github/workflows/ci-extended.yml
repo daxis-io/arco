@@ -51,7 +51,7 @@ jobs:
       - name: Install protoc
         run: |
           sudo apt-get update -o Acquire::Retries=3
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
       - name: Free disk space
         run: |
           df -h
@@ -83,7 +83,7 @@ jobs:
       - name: Install protoc
         run: |
           sudo apt-get update -o Acquire::Retries=3
-          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
       - name: Free disk space
         run: |
           df -h

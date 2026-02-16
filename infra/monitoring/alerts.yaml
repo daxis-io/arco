@@ -140,3 +140,38 @@ groups:
             Garbage collection encountered {{ $value | printf "%.0f" }} errors in the last hour.
             Phase: {{ $labels.phase }}
           runbook_url: "https://docs.arco.dev/runbooks/gc-failure"
+
+  - name: arco.flow-go-live
+    rules:
+      - alert: ArcoOrchCallback5xxRateHigh
+        expr: |
+          (
+            sum(rate(arco_orch_callbacks_total{result=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(arco_orch_callbacks_total[5m])), 1)
+          ) > 0.01
+          and
+          sum(rate(arco_orch_callbacks_total[5m])) > 0.2
+        for: 5m
+        labels:
+          severity: critical
+          service: arco-flow
+        annotations:
+          summary: "Orchestration callback 5xx rate > 1%"
+          description: |
+            Callback 5xx rate is above 1% for 5 minutes with sufficient volume.
+            Investigate callback auth/validation and downstream ledger writes.
+          runbook_url: "https://docs.arco.dev/runbooks/high-task-failure-rate"
+
+      - alert: ArcoOrchCompactorStaleFenceRejects
+        expr: increase(arco_flow_orch_compactor_stale_fence_rejects_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: arco-flow
+        annotations:
+          summary: "Stale fence rejects detected in orchestration compactor"
+          description: |
+            Stale fencing rejects should be zero outside controlled game days.
+            Review lock ownership and competing compactor writers immediately.
+          runbook_url: "https://docs.arco.dev/runbooks/storage-integrity-verification"

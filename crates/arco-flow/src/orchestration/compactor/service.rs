@@ -399,10 +399,10 @@ impl MicroCompactor {
 
         let mut visibility_status = CompactionVisibility::Visible;
         let manifest_revision = if manifest_changed {
-            let previous_manifest_path = previous_pointer
-                .as_ref()
-                .map(|p| p.manifest_path.clone())
-                .unwrap_or_else(|| orchestration_manifest_path().to_string());
+            let previous_manifest_path = previous_pointer.as_ref().map_or_else(
+                || orchestration_manifest_path().to_string(),
+                |p| p.manifest_path.clone(),
+            );
 
             manifest.manifest_id =
                 next_manifest_id(&manifest.manifest_id).map_err(Error::serialization)?;
@@ -1462,11 +1462,13 @@ fn durability_mode_label(mode: DurabilityMode) -> &'static str {
 
 fn visibility_lag_events(watermarks: &Watermarks) -> f64 {
     let (committed_count, visible_count) = watermark_event_counts(watermarks);
-    committed_count.saturating_sub(visible_count) as f64
+    let lag = committed_count.saturating_sub(visible_count);
+    let lag_u32 = u32::try_from(lag).unwrap_or(u32::MAX);
+    f64::from(lag_u32)
 }
 
 fn watermark_event_counts(watermarks: &Watermarks) -> (u64, u64) {
-    let committed_count = watermarks.committed_event_count.unwrap_or_else(|| {
+    let committed_count = watermarks.committed_event_count.unwrap_or({
         match watermarks.last_committed_event_id.as_deref() {
             Some(_) => 1,
             None => 0,
@@ -1480,8 +1482,7 @@ fn watermark_event_counts(watermarks: &Watermarks) -> (u64, u64) {
         ) {
             (Some(committed), Some(visible)) if committed == visible => committed_count,
             (Some(_), Some(_)) => committed_count.saturating_sub(1),
-            (Some(_), None) => 0,
-            (None, _) => 0,
+            (Some(_), None) | (None, _) => 0,
         }
     });
 

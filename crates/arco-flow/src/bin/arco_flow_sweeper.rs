@@ -548,15 +548,6 @@ async fn main() -> Result<()> {
         task_token_signer,
     };
 
-    let run_route = if let Some(auth) = internal_auth {
-        post(run_handler).route_layer(middleware::from_fn_with_state(
-            auth,
-            internal_auth_middleware,
-        ))
-    } else {
-        post(run_handler)
-    };
-
     let run_route = internal_auth.map_or_else(
         || post(run_handler),
         |auth| {

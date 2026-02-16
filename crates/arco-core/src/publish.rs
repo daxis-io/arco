@@ -459,6 +459,7 @@ pub enum SnapshotPointerPublishOutcome {
 /// # Errors
 ///
 /// Returns `Error::PreconditionFailed` for snapshot conflicts or strict-mode pointer CAS loss.
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_snapshot_pointer_transaction<B>(
     storage: &ScopedStorage,
     snapshot_path: &str,

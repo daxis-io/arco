@@ -68,6 +68,9 @@
 pub(crate) mod dag;
 pub(crate) mod paths;
 
+/// Remote orchestration compaction client for flow services.
+pub mod compaction_client;
+
 pub mod dispatch;
 
 pub mod error;

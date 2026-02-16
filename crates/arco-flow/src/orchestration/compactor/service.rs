@@ -1229,6 +1229,35 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
     merged
 }
 
+fn sha256_prefixed(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(bytes);
+    format!("sha256:{}", hex::encode(hash))
+}
+
+fn validate_fencing_against_pointer(
+    fencing: Option<&FencingValidation>,
+    pointer: Option<&OrchestrationManifestPointer>,
+) -> Result<()> {
+    let (Some(fencing), Some(pointer)) = (fencing, pointer) else {
+        return Ok(());
+    };
+
+    if fencing.request_epoch < pointer.epoch {
+        counter!(
+            metric_names::ORCH_COMPACTOR_STALE_FENCE_REJECTS_TOTAL,
+            "reason" => "pointer_epoch_mismatch".to_string()
+        )
+        .increment(1);
+        return Err(Error::StaleFencingToken {
+            expected: pointer.epoch,
+            provided: fencing.request_epoch,
+        });
+    }
+
+    Ok(())
+}
+
 fn insert_changed<K, V>(
     delta: &mut std::collections::HashMap<K, V>,
     base: &std::collections::HashMap<K, V>,

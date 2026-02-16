@@ -45,6 +45,8 @@ class DispatchPayload:
     attempt: int
     attempt_id: str
     traceparent: str | None
+    task_token: str | None
+    token_expires_at: str | None
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> DispatchPayload:
@@ -53,6 +55,8 @@ class DispatchPayload:
         attempt = _get_field(payload, "attempt", "attempt")
         attempt_id = _get_field(payload, "attempt_id", "attemptId")
         traceparent = _get_field(payload, "traceparent", "traceparent")
+        task_token = _get_field(payload, "task_token", "taskToken")
+        token_expires_at = _get_field(payload, "token_expires_at", "tokenExpiresAt")
 
         if not run_id or not task_key or not attempt or not attempt_id:
             msg = "dispatch payload missing required fields"
@@ -64,7 +68,15 @@ class DispatchPayload:
             attempt=int(attempt),
             attempt_id=str(attempt_id),
             traceparent=str(traceparent) if traceparent else None,
+            task_token=str(task_token) if task_token else None,
+            token_expires_at=str(token_expires_at) if token_expires_at else None,
         )
+
+
+def _select_task_token(payload_token: str | None, fallback_token: str) -> str:
+    if payload_token and payload_token.strip():
+        return payload_token
+    return fallback_token
 
 
 class DispatchWorker:
@@ -102,6 +114,7 @@ class DispatchWorker:
         self._client.close()
 
     def handle_dispatch(self, payload: DispatchPayload) -> None:
+        callback_token = _select_task_token(payload.task_token, self._task_token)
         started_at = _now_iso()
         self._client.task_started(
             task_key=payload.task_key,
@@ -110,7 +123,7 @@ class DispatchWorker:
             worker_id=self.worker_id,
             traceparent=payload.traceparent,
             started_at=started_at,
-            task_token=self._task_token,
+            task_token=callback_token,
         )
 
         stdout_buffer = io.StringIO()
@@ -148,7 +161,7 @@ class DispatchWorker:
                 completed_at=completed_at,
                 output=output_payload,
                 error=error_payload,
-                task_token=self._task_token,
+                task_token=callback_token,
             )
 
             try:

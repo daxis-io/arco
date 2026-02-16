@@ -3,8 +3,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -12,15 +14,21 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 
-use arco_core::ScopedStorage;
 use arco_core::observability::{LogFormat, init_logging};
 use arco_core::storage::{ObjectStoreBackend, StorageBackend};
+use arco_core::{InternalOidcConfig, InternalOidcError, InternalOidcVerifier, ScopedStorage};
 use arco_flow::error::{Error, Result};
 use arco_flow::orchestration::compactor::{CompactionResult, MicroCompactor};
 
 #[derive(Clone)]
 struct AppState {
     compactor: MicroCompactor,
+}
+
+#[derive(Clone)]
+struct InternalAuthState {
+    verifier: Arc<InternalOidcVerifier>,
+    enforce: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,6 +188,53 @@ fn load_tenant_secret() -> Result<Vec<u8>> {
     Ok(secret)
 }
 
+fn build_internal_auth() -> Result<Option<Arc<InternalAuthState>>> {
+    let config = InternalOidcConfig::from_env().map_err(|e| Error::configuration(e.to_string()))?;
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    let enforce = config.enforce;
+    let verifier =
+        InternalOidcVerifier::new(config).map_err(|e| Error::configuration(e.to_string()))?;
+    Ok(Some(Arc::new(InternalAuthState {
+        verifier: Arc::new(verifier),
+        enforce,
+    })))
+}
+
+async fn internal_auth_middleware(
+    State(state): State<Arc<InternalAuthState>>,
+    request: axum::http::Request<Body>,
+    next: Next,
+) -> Response {
+    match state.verifier.verify_headers(request.headers()).await {
+        Ok(_) => next.run(request).await,
+        Err(err) => {
+            if state.enforce {
+                let message = match err {
+                    InternalOidcError::MissingBearerToken => "missing bearer token".to_string(),
+                    InternalOidcError::InvalidToken(reason) => format!("invalid token: {reason}"),
+                    InternalOidcError::PrincipalNotAllowlisted => {
+                        "principal not allowlisted".to_string()
+                    }
+                    InternalOidcError::JwksRefresh(reason) => {
+                        format!("jwks refresh failed: {reason}")
+                    }
+                };
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse { error: message }),
+                )
+                    .into_response();
+            }
+
+            tracing::warn!(error = %err, "internal auth check failed in report-only mode");
+            next.run(request).await
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +305,7 @@ async fn main() -> Result<()> {
     let bucket = required_env("ARCO_STORAGE_BUCKET")?;
     let port = resolve_port()?;
     let tenant_secret = load_tenant_secret()?;
+    let internal_auth = build_internal_auth()?;
 
     let backend = ObjectStoreBackend::from_bucket(&bucket)?;
     let backend: Arc<dyn StorageBackend> = Arc::new(backend);
@@ -259,9 +315,19 @@ async fn main() -> Result<()> {
         compactor: MicroCompactor::with_tenant_secret(storage, tenant_secret),
     };
 
+    let compact_route = internal_auth.map_or_else(
+        || post(compact_handler),
+        |auth| {
+            post(compact_handler).route_layer(middleware::from_fn_with_state(
+                auth,
+                internal_auth_middleware,
+            ))
+        },
+    );
+
     let app = Router::new()
         .route("/health", get(health_handler))
-        .route("/compact", post(compact_handler))
+        .route("/compact", compact_route)
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

@@ -38,6 +38,7 @@ async fn setup_catalog(
     let namespaces: Vec<parquet_util::NamespaceRecord> = (0..num_namespaces)
         .map(|i| parquet_util::NamespaceRecord {
             id: format!("ns-{i:04}"),
+            catalog_id: None,
             name: format!("namespace_{i}"),
             description: Some(format!("Namespace {i} for benchmarking")),
             created_at: now_ms,

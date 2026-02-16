@@ -1,0 +1,415 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/lib.rs (target/debug/deps/arco_iceberg-e8ba795044fcb37d)
+
+running 300 tests
+test audit::tests::test_format_table_resource_no_secrets ... ok
+test audit::tests::test_emit_iceberg_commit_deny ... ok
+test audit::tests::test_emit_iceberg_commit ... ok
+test audit::tests::test_emit_cred_vend_deny ... ok
+test commit::tests::test_validate_default_spec_id_success ... ok
+test commit::tests::test_validate_current_schema_id_failure ... ok
+test commit::tests::test_validate_missing_ref ... ok
+test commit::tests::test_validate_last_assigned_partition_id_success ... ok
+test commit::tests::test_validate_default_sort_order_id_success ... ok
+test commit::tests::test_validate_multiple_requirements_one_fails ... ok
+test commit::tests::test_validate_multiple_requirements ... ok
+test commit::tests::test_validate_ref_snapshot_id_failure ... ok
+test commit::tests::test_validate_current_schema_id_success ... ok
+test commit::tests::test_validate_ref_snapshot_id_fallback_current_snapshot ... ok
+test commit::tests::test_validate_last_assigned_field_id_success ... ok
+test audit::tests::test_emit_iceberg_commit_without_sequence ... ok
+test audit::tests::test_emit_cred_vend_allow ... ok
+test commit::tests::test_validate_ref_snapshot_id_success ... ok
+test commit::tests::test_validate_table_uuid_failure ... ok
+test commit::tests::test_validate_table_uuid_success ... ok
+test context::tests::test_missing_tenant_header ... ok
+test coordinator::tests::test_build_metadata_location ... ok
+test context::tests::test_context_from_headers ... ok
+test error::tests::test_error_status_codes ... ok
+test error::tests::test_error_response_serialization ... ok
+test error::tests::test_error_type_mapping ... ok
+test events::tests::test_committed_receipt_path ... ok
+test events::tests::test_pending_receipt_path ... ok
+test events::tests::test_pending_receipt_serialization ... ok
+test events::tests::test_committed_receipt_serialization ... ok
+test gc::tests::test_check_in_progress_action_safe_to_delete ... ok
+test gc::tests::test_clean_committed_receipts_respects_90_day_retention ... ok
+test gc::tests::test_check_in_progress_action_mark_failed ... ok
+test gc::tests::test_clean_in_progress_with_pointer_moved ... ok
+test gc::tests::test_clean_orphans_multiple_files ... ok
+test gc::tests::test_clean_pending_receipts_deletes_old ... ok
+test gc::tests::test_clean_in_progress_marker_marks_failed_then_deletes ... ok
+test gc::tests::test_clean_orphans_deletes_old_orphans ... ok
+test gc::tests::test_clean_in_progress_marker_with_pointer_not_found ... ok
+test gc::tests::test_clean_all_handles_multiple_tables ... ok
+test gc::tests::test_clean_orphans_skips_recent_orphans ... ok
+test gc::tests::test_clean_pending_receipts_skips_recent ... ok
+test gc::tests::test_clean_pending_receipts_empty ... ok
+test gc::tests::test_committed_marker_eligible_after_lifetime_plus_grace ... ok
+test gc::tests::test_clean_receipts_for_date_combines_results ... ok
+test gc::tests::test_event_receipt_gc_config_defaults ... ok
+test gc::tests::test_clean_receipts_for_date_range ... ok
+test gc::tests::test_event_receipt_gc_ignores_non_json ... ok
+test gc::tests::test_failed_marker_eligible_after_lifetime_plus_grace ... ok
+test gc::tests::test_clean_table_deletes_expired_markers ... ok
+test gc::tests::test_clean_table_skips_fresh_markers ... ok
+test gc::tests::test_find_orphans_detects_orphan ... ok
+test gc::tests::test_find_orphans_all_in_allowlist ... ok
+test gc::tests::test_find_orphans_empty_directory ... ok
+test gc::tests::test_find_orphans_ignores_non_metadata_files ... ok
+test gc::tests::test_idempotency_gc_config_parses_lifetime ... ok
+test gc::tests::test_in_progress_marker_eligible_after_timeout_plus_grace ... ok
+test gc::tests::test_list_markers_empty ... ok
+test gc::tests::test_list_all_markers_detects_path_mismatch ... ok
+test gc::tests::test_list_all_markers_groups_by_table ... ok
+test gc::tests::test_list_markers_handles_parse_errors_gracefully ... ok
+test gc::tests::test_list_markers_ignores_non_json_files ... ok
+test gc::tests::test_metadata_gc_clean_table_skips_when_delete_after_commit_false ... ok
+test gc::tests::test_metadata_retention_policy_parses_properties ... ok
+test gc::tests::test_list_markers_finds_all_markers ... ok
+test gc::tests::test_metadata_gc_clean_table_deletes_orphans ... ok
+test gc::tests::test_metadata_gc_plan_respects_previous_versions_max ... ok
+test idempotency::tests::test_hash_key_deterministic ... ok
+test idempotency::tests::test_canonical_hash_different_content ... ok
+test idempotency::tests::test_canonical_hash_deterministic ... ok
+test idempotency::tests::test_idempotency_store_claim ... ok
+test idempotency::tests::test_idempotency_store_finalize_conflict ... ok
+test idempotency::tests::test_marker_serialization_roundtrip ... ok
+test idempotency::tests::test_marker_finalize_failed_clears_commit_fields ... ok
+test idempotency::tests::test_marker_staleness_boundaries ... ok
+test idempotency::tests::test_marker_state_transitions ... ok
+test idempotency::tests::test_storage_path_format ... ok
+test idempotency::tests::test_validate_uuidv7_invalid_format ... ok
+test idempotency::tests::test_validate_uuidv7_invalid_variant ... ok
+test idempotency::tests::test_validate_uuidv7_invalid_version ... ok
+test idempotency::tests::test_validate_uuidv7_non_canonical ... ok
+test idempotency::tests::test_validate_uuidv7_valid ... ok
+test metrics::tests::test_endpoint_label_unmatched ... ok
+test metrics::tests::test_should_record_error ... ok
+test metrics::tests::test_status_class ... ok
+test paths::tests::test_resolve_metadata_path_with_scheme_and_scope ... ok
+test paths::tests::test_resolve_metadata_path_rejects_empty_path ... ok
+test paths::tests::test_resolve_metadata_path_with_scope_only ... ok
+test paths::tests::test_resolve_metadata_path_without_scope ... ok
+test pointer::tests::test_effective_pointer_no_pending ... ok
+test pointer::tests::test_effective_pointer_pending_not_committed ... ok
+test pointer::tests::test_effective_pointer_pending_committed ... ok
+test pointer::tests::test_finalize_pending ... ok
+test pointer::tests::test_effective_pointer_pending_tx_missing ... ok
+test pointer::tests::test_pointer_store_cas_conflict ... ok
+test pointer::tests::test_pointer_store_cas_race_has_single_winner ... ok
+test pointer::tests::test_pointer_v1_backward_compatible ... ok
+test pointer::tests::test_pointer_serialization_roundtrip ... ok
+test pointer::tests::test_pointer_version_validation ... ok
+test pointer::tests::test_pointer_with_pending ... ok
+test pointer::tests::test_pointer_store_create ... ok
+test pointer::tests::test_storage_path ... ok
+test pointer::tests::test_pointer_store_list_all ... ok
+test pointer::tests::test_update_source_unknown_fallback ... ok
+test pointer::tests::test_update_source_variants ... ok
+test pointer_store::tests::test_exists_true_and_false ... ok
+test reconciler::tests::test_metadata_log_chain_entry ... ok
+test pointer_store::tests::test_get_missing_pointer_returns_not_found ... ok
+test pointer_store::tests::test_get_existing_pointer_returns_pointer_and_version ... ok
+test reconciler::tests::test_metadata_log_walker_cycle_detection ... ok
+test reconciler::tests::test_metadata_log_walker_commit_keys ... ok
+test reconciler::tests::test_metadata_log_walker_includes_refs ... ok
+test reconciler::tests::test_metadata_log_walker_new ... ok
+test reconciler::tests::test_metadata_log_walker_chain_of_three ... ok
+test reconciler::tests::test_metadata_log_walker_with_custom_depth ... ok
+test reconciler::tests::test_metadata_log_walker_skips_corrupt_metadata ... ok
+test reconciler::tests::test_metadata_log_walker_respects_depth_limit ... ok
+test reconciler::tests::test_metadata_log_walker_single_metadata ... ok
+test reconciler::tests::test_metadata_log_walker_resolves_scoped_uri ... ok
+test reconciler::tests::test_receipt_backfiller_content_is_valid ... ok
+test reconciler::tests::test_receipt_backfiller_skips_existing_receipts ... ok
+test reconciler::tests::test_reconciler_config_default ... ok
+test reconciler::tests::test_receipt_backfiller_creates_missing_receipts ... ok
+test reconciler::tests::test_reconciler_reconcile_all_empty ... ok
+test reconciler::tests::test_reconciler_reconcile_table_with_missing_pointer ... ok
+test reconciler::tests::test_reconciliation_report_add_table_result ... ok
+test reconciler::tests::test_reconciliation_report_new ... ok
+test reconciler::tests::test_receipt_backfiller_uses_correct_date_path ... ok
+test reconciler::tests::test_reconciliation_report_serialization ... ok
+test reconciler::tests::test_reconciler_reconcile_all_multiple_tables ... ok
+test reconciler::tests::test_table_reconciliation_result_new ... ok
+test reconciler::tests::test_reconciler_reconcile_table_success ... ok
+test reconciler::tests::test_table_reconciliation_result_with_error ... ok
+test routes::catalog::tests::test_commit_transaction_empty_changes_returns_400 ... ok
+test router::tests::test_router_creation ... ok
+test routes::catalog::tests::test_commit_transaction_missing_identifier_returns_400 ... ok
+test routes::catalog::tests::test_commit_transaction_multi_table_returns_406 ... ok
+test routes::catalog::tests::test_commit_transaction_write_disabled_returns_400 ... ok
+test router::tests::test_router_with_timeout_and_concurrency ... ok
+test routes::catalog::tests::test_rename_table_disabled_returns_406 ... ok
+test routes::config::tests::test_get_config_accepts_warehouse_query ... ok
+test routes::config::tests::test_get_config_returns_200 ... ok
+test routes::config::tests::test_get_config_includes_credentials_when_enabled ... ok
+test routes::config::tests::test_get_config_has_required_endpoints ... ok
+test routes::config::tests::test_get_config_content ... ok
+test openapi::tests::test_openapi_generation ... ok
+test routes::namespaces::tests::test_create_namespace_disabled ... ok
+test routes::namespaces::tests::test_delete_namespace_disabled ... ok
+test routes::namespaces::tests::test_delete_namespace_not_found ... ok
+test openapi::tests::test_openapi_json_serialization ... ok
+test routes::namespaces::tests::test_get_namespace_non_existent_returns_404 ... ok
+test routes::namespaces::tests::test_create_namespace_already_exists ... ok
+test routes::namespaces::tests::test_get_namespace_nested_identifier_decodes_separator ... ok
+test routes::catalog::tests::test_rename_table_cross_namespace_returns_406 ... ok
+test routes::namespaces::tests::test_get_namespace_existing_returns_properties ... ok
+test routes::namespaces::tests::test_head_namespace_not_found ... ok
+test routes::namespaces::tests::test_list_namespaces_empty_catalog_returns_empty_list ... ok
+test routes::namespaces::tests::test_create_namespace ... ok
+test routes::namespaces::tests::test_head_namespace_exists_returns_no_content_without_body ... ok
+test routes::namespaces::tests::test_delete_namespace ... ok
+test routes::catalog::tests::test_rename_table_not_found_returns_404 ... ok
+test routes::namespaces::tests::test_get_namespace_identifier_is_url_decoded ... ok
+test routes::namespaces::tests::test_list_namespaces_invalid_page_token_returns_400 ... ok
+test routes::catalog::tests::test_rename_table_returns_204 ... ok
+test routes::namespaces::tests::test_list_namespaces_page_size_zero_returns_400 ... ok
+test routes::namespaces::tests::test_update_properties_overlap_returns_422 ... ok
+test routes::namespaces::tests::test_list_namespaces_returns_namespaces_from_catalog ... ok
+test routes::namespaces::tests::test_list_namespaces_page_token_out_of_range_returns_400 ... ok
+test routes::namespaces::tests::test_list_namespaces_pagination_with_page_token_and_size ... ok
+test routes::tables::tests::test_commit_table_guardrails_reject_set_location ... ok
+test routes::tables::tests::test_create_table_disabled ... ok
+test routes::namespaces::tests::test_update_properties_unknown_keys_in_missing ... ok
+test routes::namespaces::tests::test_list_namespaces_parent_not_found_returns_404 ... ok
+test routes::tables::tests::test_create_table ... ok
+test routes::namespaces::tests::test_update_properties_persists_comment ... ok
+test routes::tables::tests::test_drop_table_disabled ... ok
+test routes::namespaces::tests::test_list_namespaces_parent_filtering ... ok
+test routes::tables::tests::test_create_table_then_commit_with_uuid_assert_succeeds ... ok
+test routes::tables::tests::test_create_table_with_cred_vending_header_but_disabled_returns_400_before_writes ... ok
+test routes::tables::tests::test_list_tables_namespace_not_found_returns_404 ... ok
+test routes::tables::tests::test_drop_table_not_found ... ok
+test routes::tables::tests::test_create_table_with_invalid_location_returns_400 ... ok
+test routes::tables::tests::test_drop_table ... ok
+test routes::tables::tests::test_head_table_missing_returns_not_found_and_no_body ... ok
+test routes::tables::tests::test_head_table_exists_returns_no_content ... ok
+test routes::tables::tests::test_create_table_pointer_conflict_rolls_back ... ok
+test routes::tables::tests::test_register_table_disabled ... ok
+test routes::tables::tests::test_drop_table_with_purge_returns_406 ... ok
+test routes::tables::tests::test_load_table_if_none_match_star ... ok
+test routes::tables::tests::test_load_table_if_none_match_etag_returns_not_modified ... ok
+test routes::tables::tests::test_load_table_missing_returns_404 ... ok
+test routes::utils::tests::test_parse_namespace_percent_encoded ... ok
+test routes::utils::tests::test_parse_namespace_percent_encoded_lowercase ... ok
+test routes::utils::tests::test_parse_namespace_unit_separator ... ok
+test routes::utils::tests::test_paginate ... ok
+test schema_projection::tests::test_column_id_differs_by_field ... ok
+test routes::tables::tests::test_register_table ... ok
+test idempotency::tests::prop_canonical_hash_order_invariant ... ok
+test routes::tables::tests::test_register_table_pointer_conflict_rolls_back ... ok
+test routes::tables::tests::test_list_tables_filters_non_iceberg_and_supports_pagination ... ok
+test schema_projection::tests::test_column_id_differs_by_table ... ok
+test schema_projection::tests::test_column_id_generation_is_stable ... ok
+test schema_projection::tests::test_column_record_serialization ... ok
+test schema_projection::tests::test_map_date ... ok
+test schema_projection::tests::test_decimal_type_deserialize ... ok
+test schema_projection::tests::test_iceberg_schema_deserialize ... ok
+test schema_projection::tests::test_map_binary ... ok
+test schema_projection::tests::test_map_boolean ... ok
+test routes::tables::tests::test_create_table_then_load_succeeds ... ok
+test routes::tables::tests::test_report_metrics_rejects_invalid_report_type ... ok
+test schema_projection::tests::test_map_decimal ... ok
+test schema_projection::tests::test_map_double ... ok
+test schema_projection::tests::test_map_float ... ok
+test schema_projection::tests::test_map_fixed ... ok
+test schema_projection::tests::test_map_int ... ok
+test schema_projection::tests::test_map_list ... ok
+test schema_projection::tests::test_map_long ... ok
+test schema_projection::tests::test_map_map ... ok
+test schema_projection::tests::test_map_nested_complex ... ok
+test schema_projection::tests::test_map_string ... ok
+test schema_projection::tests::test_map_struct ... ok
+test schema_projection::tests::test_map_time ... ok
+test schema_projection::tests::test_map_timestamp ... ok
+test schema_projection::tests::test_map_timestamptz ... ok
+test schema_projection::tests::test_map_uuid ... ok
+test schema_projection::tests::test_project_with_complex_types ... ok
+test state::tests::test_decode_percent_passthrough ... ok
+test schema_projection::tests::test_project_nested_flattens_struct ... ok
+test schema_projection::tests::test_project_simple_schema ... ok
+test state::tests::test_namespace_separator_decoding ... ok
+test transactions::tests::test_storage_path ... ok
+test transactions::tests::test_transaction_staleness ... ok
+test transactions::tests::test_transaction_status_transitions ... ok
+test transactions::tests::test_transaction_record_serialization_roundtrip ... ok
+test transactions::tests::test_transaction_store_cas ... ok
+test transactions::tests::test_transaction_table_lookup ... ok
+test transactions::tests::test_transaction_store_create ... ok
+test transactions::tests::test_transaction_store_load ... ok
+test types::commit::tests::test_assert_table_uuid ... ok
+test types::commit::tests::test_commit_table_request_builder ... ok
+test types::commit::tests::test_commit_table_response_serialization ... ok
+test types::commit::tests::test_guardrail_allows_add_snapshot ... ok
+test types::commit::tests::test_commit_table_request_deserialization ... ok
+test types::commit::tests::test_guardrail_allows_normal_properties ... ok
+test types::commit::tests::test_guardrail_rejects_arco_properties ... ok
+test types::commit::tests::test_guardrail_rejects_remove_arco_properties ... ok
+test types::commit::tests::test_guardrail_rejects_mixed_case_arco_properties ... ok
+test types::commit::tests::test_guardrail_rejects_set_location ... ok
+test types::commit::tests::test_table_update_set_snapshot_ref ... ok
+test types::commit::tests::test_table_update_add_snapshot ... ok
+test types::commit::tests::test_table_update_set_snapshot_ref_invalid_type ... ok
+test types::commit::tests::test_update_requirement_deserialization ... ok
+test types::config::tests::test_allow_write_does_not_advertise_namespace_crud ... ok
+test types::config::tests::test_arco_default_has_read_endpoints ... ok
+test types::config::tests::test_config_response_deserialization ... ok
+test types::config::tests::test_config_response_serialization ... ok
+test types::config::tests::test_metrics_endpoint_always_advertised ... ok
+test types::config::tests::test_rename_endpoint_advertised_with_table_crud ... ok
+test types::config::tests::test_namespace_crud_advertises_endpoints ... ok
+test types::config::tests::test_rename_endpoint_not_advertised_without_table_crud ... ok
+test types::config::tests::test_table_crud_advertises_endpoints ... ok
+test types::config::tests::test_table_crud_not_advertised_by_default ... ok
+test types::config::tests::test_transactions_commit_not_advertised_by_default ... ok
+test types::config::tests::test_transactions_commit_advertised_when_both_flags_enabled ... ok
+test types::config::tests::test_transactions_commit_not_advertised_without_write ... ok
+test types::credentials::tests::test_access_delegation_parsing ... ok
+test types::credentials::tests::test_credential_serialization ... ok
+test types::credentials::tests::test_gcs_credential ... ok
+test types::credentials::tests::test_s3_credential ... ok
+test types::credentials::tests::test_supported_delegation ... ok
+test types::ids::tests::test_commit_key_deterministic ... ok
+test routes::tables::tests::test_register_table_then_commit_with_uuid_assert_succeeds ... ok
+test types::ids::tests::test_object_version_newtype ... ok
+test types::ids::tests::test_commit_key_different_locations ... ok
+test types::ids::tests::test_table_uuid_roundtrip ... ok
+test types::metrics::tests::test_minimal_report_deserialization ... ok
+test routes::tables::tests::test_report_metrics_returns_204_for_existing_table ... ok
+test types::metrics::tests::test_commit_report_deserialization ... ok
+test types::namespace::tests::test_get_namespace_response ... ok
+test types::namespace::tests::test_list_namespaces_no_token ... ok
+test types::metrics::tests::test_scan_report_deserialization ... ok
+test types::namespace::tests::test_list_namespaces_response ... ok
+test types::namespace::tests::test_namespace_ident_nested ... ok
+test types::table::tests::test_create_table_request_parsing ... ok
+test routes::tables::tests::test_report_metrics_returns_404_for_missing_table ... ok
+test types::table::tests::test_drop_table_query_defaults_to_false ... ok
+test types::table::tests::test_create_table_request_with_location_and_stage ... ok
+test types::table::tests::test_drop_table_query_with_purge ... ok
+test types::table::tests::test_list_tables_response ... ok
+test types::table::tests::test_load_table_query_default ... ok
+test types::table::tests::test_register_table_request_parsing ... ok
+test types::table::tests::test_load_table_response_minimal ... ok
+test types::table::tests::test_load_table_response_with_credentials ... ok
+test types::table::tests::test_snapshots_filter_default ... ok
+test types::table::tests::test_snapshots_filter_parsing ... ok
+test types::table::tests::test_table_ident_simple ... ok
+test routes::tables::tests::test_load_table_returns_metadata_location_and_etag ... ok
+test routes::tables::tests::test_register_table_preserves_original_metadata_file ... ok
+test pointer::tests::prop_pointer_store_cas_roundtrip ... ok
+test metrics::tests::test_request_metrics_labels ... ok
+
+test result: ok. 300 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running tests/audit_wiring.rs (target/debug/deps/audit_wiring-1969b3328aeb0790)
+
+running 3 tests
+test test_credential_vend_deny_emits_audit_when_disabled ... ok
+test test_commit_with_wrong_uuid_emits_deny_audit ... ok
+test test_load_table_does_not_emit_audit ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/commit_flow.rs (target/debug/deps/commit_flow-3d39c5baa77b9e4a)
+
+running 15 tests
+test multi_table_transactions::test_max_tables_limit_returns_400 ... ok
+test multi_table_transactions::test_tx_commit_crash_before_commit_record_not_visible ... ok
+test multi_table_transactions::test_tx_commit_crash_after_commit_record_visible ... ok
+test multi_table_transactions::test_tx_commit_overlap_conflict ... ok
+test multi_table_transactions::test_tx_idempotency_replay_returns_success ... ok
+test multi_table_transactions::test_stale_tx_record_aborted_on_retry ... ok
+test multi_table_transactions::test_finalize_only_affects_current_tx_id ... ok
+test multi_table_transactions::test_committed_pending_finalized_on_prepare ... ok
+test multi_table_transactions::test_tx_request_hash_mismatch_returns_conflict ... ok
+test multi_table_transactions::test_tx_commit_two_tables_success_is_atomic ... ok
+test test_commit_table_success_persists_state ... ok
+test test_commit_table_idempotent_replay_returns_cached_response ... ok
+test test_transactions_commit_single_table_returns_204 ... ok
+test test_transactions_commit_multi_table_returns_406_when_disabled ... ok
+test test_transactions_commit_multi_table_returns_204 ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/config_integration.rs (target/debug/deps/config_integration-ddc875d8ecd2f3b4)
+
+running 1 test
+test test_config_endpoint_includes_request_id_and_fields ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/crate_structure.rs (target/debug/deps/crate_structure-2c24619802f607c7)
+
+running 1 test
+test test_crate_public_exports ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/credential_vending.rs (target/debug/deps/credential_vending-24742a3f5c670352)
+
+running 5 tests
+test test_ttl_clamping ... ok
+test test_storage_credential_gcs_format ... ok
+test test_iceberg_state_with_credentials ... ok
+test test_mock_provider_returns_empty_for_non_gcs ... ok
+test test_mock_provider_returns_gcs_credentials ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/openapi_compliance.rs (target/debug/deps/openapi_compliance-a888dad97dcdd014)
+
+running 1 test
+test test_openapi_paths_align_with_official_spec ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/reconciliation_tests.rs (target/debug/deps/reconciliation_tests-c04d884ca55d43b8)
+
+running 8 tests
+test test_type_mapper_all_primitive_types ... ok
+test test_schema_projection_with_real_iceberg_schema ... ok
+test test_event_receipt_gc_flow ... ok
+test test_orphan_cleanup_flow ... ok
+test test_gc_flow_with_controlled_timestamps ... ok
+test test_reconcile_all_multiple_tables ... ok
+test test_full_reconciliation_flow_with_memory_backend ... ok
+test test_concurrent_reconciliation_safety ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/roundtrip.rs (target/debug/deps/roundtrip-1f261952e6343c4e)
+
+running 15 tests
+test test_error_response_roundtrip ... ok
+test test_config_response_roundtrip ... ok
+test test_error_response_roundtrip_forbidden ... ok
+test test_error_response_roundtrip_internal ... ok
+test test_error_response_roundtrip_service_unavailable ... ok
+test test_list_namespaces_empty_roundtrip ... ok
+test test_error_response_roundtrip_unauthorized ... ok
+test test_list_namespaces_null_token_is_omitted ... ok
+test test_get_namespace_roundtrip ... ok
+test test_list_namespaces_roundtrip ... ok
+test test_list_tables_roundtrip ... ok
+test test_table_credentials_multiple_prefixes_roundtrip ... ok
+test test_table_credentials_roundtrip ... ok
+test test_load_table_response_roundtrip_minimal ... ok
+test test_load_table_response_roundtrip ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests arco_iceberg
+
+running 5 tests
+test crates/arco-iceberg/src/credentials/mod.rs - credentials (line 14) ... ignored
+test crates/arco-iceberg/src/lib.rs - (line 30) ... ignored
+test crates/arco-iceberg/src/reconciler.rs - reconciler (line 17) ... ignored
+test crates/arco-iceberg/src/pointer.rs - pointer::IcebergTablePointer (line 35) ... ok
+test crates/arco-iceberg/src/types/commit.rs - types::commit::CommitTableRequestBuilder (line 290) ... ok
+
+test result: ok. 2 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

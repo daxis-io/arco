@@ -1,7 +1,7 @@
 # Production Readiness Audit - Arco Daxis Prod GO
 
 - Audit date: 2026-02-12
-- Evidence refresh UTC: 2026-02-15T16:24:48Z
+- Evidence refresh UTC: 2026-02-16T02:41:23Z
 - Baseline commit: `e896506f3c936c266a21fe556a107d37bd7075b5`
 - Scope: all currently identified closure signals in the "Arco Daxis Production GO Closure Plan"
 - Definition of Done (locked): `ALL GATES GO`
@@ -12,12 +12,12 @@
 | Gate | Area | Status | Closed Signals | Open Signals | Primary Evidence |
 |---:|---|---|---:|---:|---|
 | 0 | Re-baseline / tracker integrity | GO | 4 | 0 | `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-matrix-status.tsv` |
-| 1 | Release discipline / provenance | NO-GO | 0 | 4 | `docs/audits/2026-02-12-prod-readiness/signal-ledger.md` |
+| 1 | Release discipline / provenance | PARTIAL | 2 | 2 | `release_evidence/2026-02-12-prod-readiness/gate-1/README.md` |
 | 2 | Storage / manifest / schema / invariants | GO | 7 | 0 | `docs/audits/2026-02-12-prod-readiness/findings/gate-2-findings.md` |
 | 3 | Layer-2 production blockers | GO | 7 | 0 | `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_projection_restart.log`, `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_timer_callback_oidc.log`, `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/promtool_g3_orch_alert_drill.log` |
 | 4 | Deployment / observability / operations | PARTIAL | 0 | 6 | `release_evidence/2026-02-12-prod-readiness/gate-4/README.md` |
-| 5 | Performance / security / release readiness | NO-GO | 0 | 6 | `docs/audits/2026-02-12-prod-readiness/signal-ledger.md` |
-| 7 | Final production promotion and handoff | NO-GO | 0 | 4 | `release_evidence/2026-02-12-prod-readiness/final-go/` |
+| 5 | Performance / security / release readiness | NO-GO | 0 | 6 | `release_evidence/2026-02-12-prod-readiness/gate-5/README.md` |
+| 7 | Final production promotion and handoff | NO-GO | 1 | 3 | `release_evidence/2026-02-12-prod-readiness/final-go/g7-004-final-readiness-report-handoff.md` |
 
 ## Batch 3 Re-baseline Results
 
@@ -26,6 +26,19 @@ Fresh command matrix execution at current HEAD is archived at:
 - `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-logs/`
 
 Result: all required command-matrix commands exited `0`.
+
+## Gate 1 Status
+
+Gate 1 is now `PARTIAL` with local/code closure for two signals and external execution pending for two signals:
+
+- `G1-002`: GO (deterministic, immutable collector script with manifest integrity proof)
+- `G1-003`: GO (release-tag CI fail-closed checks for changelog + release notes)
+- `G1-001`: PARTIAL (signed tag evidence + provenance pipeline wiring complete; remote attestation run pending)
+- `G1-004`: PARTIAL (SBOM retention/publication wiring complete; remote release publication evidence pending)
+
+Primary artifacts:
+- `release_evidence/2026-02-12-prod-readiness/gate-1/README.md`
+- `release_evidence/2026-02-12-prod-readiness/gate-1/external-handoff-checklist.md`
 
 ## Signals Closed In Batch 3
 
@@ -76,6 +89,34 @@ Gate 4 has refreshed local evidence and executable handoff artifacts, but remain
 
 Primary handoff artifact:
 - `release_evidence/2026-02-12-prod-readiness/gate-4/external-handoff-checklist.md`
+
+## Gate 5 Status
+
+Gate 5 evidence has been materially refreshed with new signal-level artifacts and command logs, but remains `NO-GO`:
+
+- `G5-001`: BLOCKED-EXTERNAL (benchmark regression fixed; staging load/soak + telemetry capture still pending external execution)
+- `G5-002`: BLOCKED-EXTERNAL (retention/cost policy validated by tests; SRE/Product approvals pending)
+- `G5-003`: BLOCKED-EXTERNAL (pen-test execution/report/triage pending external run)
+- `G5-004`: BLOCKED-EXTERNAL (CI static-key path migrated to OIDC/WIF in workflow; variable provisioning + security approval pending)
+- `G5-005`: BLOCKED-EXTERNAL (rollback drill requires authenticated staging/prod execution)
+- `G5-006`: BLOCKED-EXTERNAL (release notes/signoff pack created; Eng/SRE/Security signoffs pending)
+
+Primary artifacts:
+- `release_evidence/2026-02-12-prod-readiness/gate-5/README.md`
+- `release_evidence/2026-02-12-prod-readiness/gate-5/external-handoff-checklist.md`
+
+## Gate 7 Status
+
+Gate 7 remains `NO-GO` despite final report publication:
+
+- `G7-001`: BLOCKED-EXTERNAL (production canary progression not executed)
+- `G7-002`: BLOCKED-EXTERNAL (production integration validation pending)
+- `G7-003`: NO-GO (messaging update blocked while non-GO gates remain)
+- `G7-004`: GO (final readiness report + handoff published with ownership and artifact links)
+
+Primary artifacts:
+- `release_evidence/2026-02-12-prod-readiness/final-go/README.md`
+- `release_evidence/2026-02-12-prod-readiness/final-go/external-handoff-checklist.md`
 
 ## Audit Artifacts
 

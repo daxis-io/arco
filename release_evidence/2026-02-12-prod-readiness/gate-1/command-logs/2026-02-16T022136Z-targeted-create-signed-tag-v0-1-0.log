@@ -1,0 +1,7 @@
+mkdir: .git: Not a directory
+Saving key ".git/gate1-signing/ci_signing_key" failed: Not a directory
+error: Couldn't load public key /Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/.git/gate1-signing/ci_signing_key: No such file or directory?
+
+error: unable to sign the tag
+The tag message has been left in /Users/ethanurbanski/arco/.git/worktrees/codex-prod-go-closure-batch3/TAG_EDITMSG
+fatal: Not a valid object name v0.1.0

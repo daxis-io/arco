@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
 
@@ -33,6 +34,17 @@ jobs:
         with:
           fail-on-severity: high
           deny-licenses: GPL-3.0, AGPL-3.0
+
+  release-tag-discipline:
+    name: Release Tag Discipline
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Validate changelog + release notes for release tag
+        run: bash tools/check-release-tag-discipline.sh --tag "${GITHUB_REF_NAME}"
 
   gates:
     name: Gates
@@ -274,7 +286,7 @@ jobs:
       - name: Check IAM smoke prerequisites
         id: iam_smoke_prereq
         run: |
-          if [ -z "${{ secrets.GCP_SA_KEY_API }}" ] || [ -z "${{ vars.ARCO_BUCKET_DEV }}" ]; then
+          if [ -z "${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}" ] || [ -z "${{ vars.GCP_SERVICE_ACCOUNT }}" ] || [ -z "${{ vars.ARCO_BUCKET_DEV }}" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -284,7 +296,8 @@ jobs:
         if: steps.iam_smoke_prereq.outputs.skip != 'true'
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY_API }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - name: Run API IAM smoke tests
         if: steps.iam_smoke_prereq.outputs.skip != 'true'
@@ -298,7 +311,7 @@ jobs:
       - name: Skip IAM smoke tests (missing config)
         if: steps.iam_smoke_prereq.outputs.skip == 'true'
         run: |
-          echo "Skipping IAM smoke tests: missing secrets.GCP_SA_KEY_API or vars.ARCO_BUCKET_DEV"
+          echo "Skipping IAM smoke tests: missing vars.GCP_WORKLOAD_IDENTITY_PROVIDER, vars.GCP_SERVICE_ACCOUNT, or vars.ARCO_BUCKET_DEV"
 
   # ==========================================================================
   # Compile-Negative Tests (Gate 5 trait separation)

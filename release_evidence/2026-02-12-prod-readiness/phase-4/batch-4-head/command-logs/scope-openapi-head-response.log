@@ -1,0 +1,12 @@
+   381	      summary: Check if a namespace exists
+   382	      operationId: namespaceExists
+   383	      description:
+   384	        Check if a namespace exists. The response does not contain a body.
+   385	      responses:
+   386	        204:
+   387	          description: Success, no content
+   388	        400:
+   389	          $ref: '#/components/responses/BadRequestErrorResponse'
+   390	        401:
+   391	          $ref: '#/components/responses/UnauthorizedResponse'
+   392	        403:

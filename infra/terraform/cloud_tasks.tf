@@ -9,12 +9,8 @@
 # - Dispatcher caller SA (`arco-api-*`) gets `iam.serviceAccounts.actAs` on invoker SA (see iam.tf)
 # - Timer callback endpoint validates OIDC issuer/audience and rejects unauthorized traffic
 
-data "google_project" "current" {
-  project_id = var.project_id
-}
-
 locals {
-  cloud_tasks_service_agent = "service-${data.google_project.current.number}@gcp-sa-cloudtasks.iam.gserviceaccount.com"
+  cloud_tasks_service_agent = "service-${local.project_number}@gcp-sa-cloudtasks.iam.gserviceaccount.com"
 }
 
 resource "google_cloud_tasks_queue" "flow_dispatch" {

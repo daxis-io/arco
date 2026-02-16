@@ -1,0 +1,23 @@
+# command: rg -n "update-traffic|TRAFFIC_TARGET|percent = 100|compactor-first|deploy" scripts/deploy.sh infra/terraform/cloud_run.tf
+# start_utc: 2026-02-15T18:25:08Z
+infra/terraform/cloud_run.tf:8:# The deploy script enforces this ordering (see scripts/deploy.sh).
+infra/terraform/cloud_run.tf:24:  # Don't route traffic until manually verified (compactor-first deployment)
+infra/terraform/cloud_run.tf:150:  # Traffic routing (can be customized for canary deployments)
+infra/terraform/cloud_run.tf:152:    type    = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
+infra/terraform/cloud_run.tf:153:    percent = 100
+infra/terraform/cloud_run.tf:270:    type    = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
+infra/terraform/cloud_run.tf:271:    percent = 100
+scripts/deploy.sh:5:# Deploys Arco Cloud Run services with a compactor-first hard gate:
+scripts/deploy.sh:7:#   successful compaction cycle before considering the deploy successful.
+scripts/deploy.sh:14:#   ./scripts/deploy.sh [--env dev|staging|prod] [--dry-run] [--timeout SECONDS]
+scripts/deploy.sh:34:  --dry-run           Show what would be deployed without making changes
+scripts/deploy.sh:161:deploy_terraform() {
+scripts/deploy.sh:175:    log "DRY RUN: Would deploy compactor first (terraform plan -target=google_cloud_run_v2_service.compactor)"
+scripts/deploy.sh:178:    log "DRY RUN: Would deploy remaining resources (terraform plan)"
+scripts/deploy.sh:183:    # Deploy the compactor revision first, wait for it to become healthy, then deploy API.
+scripts/deploy.sh:190:deploy_terraform_remaining() {
+scripts/deploy.sh:235:  log "Starting Arco deployment (env=$ENVIRONMENT, project=$PROJECT_ID, region=$REGION)"
+scripts/deploy.sh:237:  deploy_terraform
+scripts/deploy.sh:244:  # HARD GATE: compactor must be healthy before deploy is considered successful.
+scripts/deploy.sh:247:  # Only after the compactor is healthy do we deploy the API revision / remaining infra.
+scripts/deploy.sh:248:  deploy_terraform_remaining

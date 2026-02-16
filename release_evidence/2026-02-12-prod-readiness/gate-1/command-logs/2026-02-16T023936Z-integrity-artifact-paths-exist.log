@@ -1,0 +1,10 @@
+exists: release_evidence/2026-02-12-prod-readiness/gate-1/README.md
+exists: release_evidence/2026-02-12-prod-readiness/gate-1/g1-scope-checklist.md
+exists: release_evidence/2026-02-12-prod-readiness/gate-1/g1-001-signed-tag-provenance-evidence.md
+exists: release_evidence/2026-02-12-prod-readiness/gate-1/g1-002-immutable-collector-evidence.md
+exists: release_evidence/2026-02-12-prod-readiness/gate-1/g1-003-release-tag-ci-enforcement-evidence.md
+exists: release_evidence/2026-02-12-prod-readiness/gate-1/g1-004-sbom-retention-evidence.md
+exists: release_evidence/2026-02-12-prod-readiness/gate-1/external-handoff-checklist.md
+exists: release_evidence/2026-02-12-prod-readiness/gate-1/command-matrix-status.tsv
+exists: release_evidence/2026-02-12-prod-readiness/gate-1/latest-pack-path.txt
+exists: release_evidence/2026-02-12-prod-readiness/gate-1/collector-packs/v0.1.0/352cba80c843fd9cf54b1ab169bd0ac081c51bde-dc3072977aef3b0572c58498bea6ceddab26fd22/manifest.sha256

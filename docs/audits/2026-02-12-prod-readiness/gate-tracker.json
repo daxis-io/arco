@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
   "audit_date": "2026-02-12",
-  "generated_at_utc": "2026-02-15T16:24:48Z",
+  "generated_at_utc": "2026-02-16T02:41:23Z",
   "baseline_commit": "e896506f3c936c266a21fe556a107d37bd7075b5",
   "definition_of_done": "ALL_GATES_GO",
   "evidence_root": "release_evidence/2026-02-12-prod-readiness",
@@ -43,8 +43,8 @@
     {
       "id": 1,
       "name": "Release discipline / provenance",
-      "status": "NO-GO",
-      "status_reason": "Signed release tag provenance and SBOM/release-note enforcement evidence not yet produced.",
+      "status": "PARTIAL",
+      "status_reason": "Release-tag CI enforcement and immutable collector are closed with local evidence; signed-tag provenance and SBOM publication/retention are implemented but still require a remote GitHub release-tag workflow run to capture attestation and published asset evidence.",
       "required_signal_ids": [
         "G1-001",
         "G1-002",
@@ -52,7 +52,12 @@
         "G1-004"
       ],
       "evidence": [
-        "release_evidence/2026-02-12-prod-readiness/gate-1/"
+        "release_evidence/2026-02-12-prod-readiness/gate-1/README.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-1/g1-001-signed-tag-provenance-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-1/g1-002-immutable-collector-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-1/g1-003-release-tag-ci-enforcement-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-1/g1-004-sbom-retention-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-1/external-handoff-checklist.md"
       ]
     },
     {
@@ -126,7 +131,7 @@
       "id": 5,
       "name": "Performance / security / release readiness",
       "status": "NO-GO",
-      "status_reason": "Soak/load, pen-test, rollback drill, and signoff-pack evidence not yet produced.",
+      "status_reason": "Benchmark compile regression is fixed and CI OIDC/WIF migration is implemented, but 10x load/24h soak execution, pen-test execution, live rollback drill, and cross-functional approvals remain externally blocked.",
       "required_signal_ids": [
         "G5-001",
         "G5-002",
@@ -136,14 +141,21 @@
         "G5-006"
       ],
       "evidence": [
-        "release_evidence/2026-02-12-prod-readiness/gate-5/"
+        "release_evidence/2026-02-12-prod-readiness/gate-5/README.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-5/perf/g5-001-soak-load-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-5/g5-002-retention-cost-control-policy.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-5/security/g5-003-pen-test-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-5/security/g5-004-secrets-rotation-policy-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-5/rollback/g5-005-rollback-drill-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-5/signoff/g5-006-release-notes-signoff-pack.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-5/external-handoff-checklist.md"
       ]
     },
     {
       "id": 7,
       "name": "Final production promotion and handoff",
       "status": "NO-GO",
-      "status_reason": "Canary progression, production integration validation, messaging, and handoff report are not yet complete.",
+      "status_reason": "Final readiness report/handoff is refreshed, but canary progression and production integration validation remain externally blocked; messaging update gate remains closed because required gates are not all GO.",
       "required_signal_ids": [
         "G7-001",
         "G7-002",
@@ -151,7 +163,12 @@
         "G7-004"
       ],
       "evidence": [
-        "release_evidence/2026-02-12-prod-readiness/final-go/"
+        "release_evidence/2026-02-12-prod-readiness/final-go/README.md",
+        "release_evidence/2026-02-12-prod-readiness/final-go/g7-001-canary-progression-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/final-go/g7-002-production-integration-validation-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/final-go/g7-003-messaging-update-gate.md",
+        "release_evidence/2026-02-12-prod-readiness/final-go/g7-004-final-readiness-report-handoff.md",
+        "release_evidence/2026-02-12-prod-readiness/final-go/external-handoff-checklist.md"
       ]
     }
   ],
@@ -179,22 +196,22 @@
     {
       "id": "G1-001",
       "owner": "Release Engineering",
-      "status": "NO-GO"
+      "status": "PARTIAL"
     },
     {
       "id": "G1-002",
       "owner": "Release Engineering",
-      "status": "NO-GO"
+      "status": "GO"
     },
     {
       "id": "G1-003",
       "owner": "Release Engineering",
-      "status": "NO-GO"
+      "status": "GO"
     },
     {
       "id": "G1-004",
       "owner": "Security Engineering",
-      "status": "NO-GO"
+      "status": "PARTIAL"
     },
     {
       "id": "G2-001",
@@ -304,7 +321,7 @@
     {
       "id": "G5-002",
       "owner": "SRE + Product",
-      "status": "NO-GO"
+      "status": "BLOCKED-EXTERNAL"
     },
     {
       "id": "G5-003",
@@ -314,7 +331,7 @@
     {
       "id": "G5-004",
       "owner": "Security Engineering",
-      "status": "NO-GO"
+      "status": "BLOCKED-EXTERNAL"
     },
     {
       "id": "G5-005",
@@ -324,7 +341,7 @@
     {
       "id": "G5-006",
       "owner": "Release Engineering",
-      "status": "NO-GO"
+      "status": "BLOCKED-EXTERNAL"
     },
     {
       "id": "G7-001",
@@ -344,7 +361,7 @@
     {
       "id": "G7-004",
       "owner": "Release Engineering",
-      "status": "NO-GO"
+      "status": "GO"
     }
   ]
 }

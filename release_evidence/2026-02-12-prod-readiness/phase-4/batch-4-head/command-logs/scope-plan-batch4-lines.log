@@ -1,0 +1,46 @@
+   165	## Batch 4: Namespace Read Operations
+   166	
+   167	### Task 4.1: Implement list namespaces handler
+   168	**TDD: Write tests for namespace listing with pagination**
+   169	
+   170	Endpoint: `GET /v1/{prefix}/namespaces`
+   171	
+   172	Steps:
+   173	1. Write test: list returns namespaces from catalog
+   174	2. Write test: pagination with `pageToken` and `pageSize`
+   175	3. Write test: parent namespace filtering (if supported)
+   176	4. Write test: empty catalog returns empty list
+   177	5. Create `src/routes/namespaces.rs` with list handler
+   178	
+   179	Files:
+   180	- `crates/arco-iceberg/src/routes/namespaces.rs`
+   181	
+   182	### Task 4.2: Implement get namespace handler
+   183	**TDD: Write tests for namespace retrieval**
+   184	
+   185	Endpoint: `GET /v1/{prefix}/namespaces/{namespace}`
+   186	
+   187	Steps:
+   188	1. Write test: get existing namespace returns properties
+   189	2. Write test: get non-existent namespace returns 404
+   190	3. Write test: namespace identifier is URL-decoded correctly
+   191	4. Write test: nested namespaces decode separator correctly (%1F)
+   192	5. Add get handler to `src/routes/namespaces.rs`
+   193	
+   194	Files:
+   195	- `crates/arco-iceberg/src/routes/namespaces.rs` (update)
+   196	
+   197	### Task 4.3: Implement HEAD namespace handler
+   198	**TDD: Write tests for namespace existence check**
+   199	
+   200	Endpoint: `HEAD /v1/{prefix}/namespaces/{namespace}`
+   201	
+   202	Steps:
+   203	1. Write test: HEAD existing namespace returns 200
+   204	2. Write test: HEAD non-existent namespace returns 404
+   205	3. Write test: response has no body
+   206	4. Add HEAD handler
+   207	
+   208	Files:
+   209	- `crates/arco-iceberg/src/routes/namespaces.rs` (update)
+   210	

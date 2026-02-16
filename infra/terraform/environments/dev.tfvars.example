@@ -10,6 +10,12 @@ environment = "dev"
 # Container images (update with your registry)
 api_image       = "gcr.io/your-project/arco-api:latest"
 compactor_image = "gcr.io/your-project/arco-compactor:latest"
+flow_dispatcher_image = "gcr.io/your-project/arco-flow-dispatcher:latest"
+flow_sweeper_image = "gcr.io/your-project/arco-flow-sweeper:latest"
+flow_timer_ingest_image = "gcr.io/your-project/arco-flow-timer-ingest:latest"
+flow_dispatch_target_url = "https://worker.internal.example/dispatch"
+flow_tenant_id = "tenant-dev"
+flow_workspace_id = "workspace-dev"
 api_code_version = "local-dev"
 
 # Cloud Run scaling (dev: scale to zero)

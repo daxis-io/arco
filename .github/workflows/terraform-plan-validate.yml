@@ -1,0 +1,63 @@
+name: Terraform Validate and Plan
+
+on:
+  pull_request:
+    paths:
+      - "infra/terraform/**"
+      - ".github/workflows/terraform-plan-validate.yml"
+  workflow_dispatch:
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Terraform Init
+        run: terraform -chdir=infra/terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform -chdir=infra/terraform validate
+
+      - name: Terraform Plan (Base Vars, No Refresh)
+        run: |
+          terraform -chdir=infra/terraform plan \
+            -refresh=false \
+            -lock=false \
+            -input=false \
+            -no-color \
+            -var="project_id=test-project" \
+            -var="region=us-central1" \
+            -var="environment=dev" \
+            -var="api_image=example.com/arco-api:test" \
+            -var="compactor_image=example.com/arco-compactor:test" \
+            -var="compactor_tenant_id=test-tenant" \
+            -var="compactor_workspace_id=test-workspace" \
+            -var="jwt_secret_name="
+
+      - name: Terraform Plan (Flow-Enabled Vars, No Refresh)
+        run: |
+          terraform -chdir=infra/terraform plan \
+            -refresh=false \
+            -lock=false \
+            -input=false \
+            -no-color \
+            -var="project_id=test-project" \
+            -var="region=us-central1" \
+            -var="environment=dev" \
+            -var="api_image=example.com/arco-api:test" \
+            -var="compactor_image=example.com/arco-compactor:test" \
+            -var="compactor_tenant_id=test-tenant" \
+            -var="compactor_workspace_id=test-workspace" \
+            -var="jwt_secret_name=" \
+            -var="flow_dispatcher_image=example.com/arco-flow-dispatcher:test" \
+            -var="flow_sweeper_image=example.com/arco-flow-sweeper:test" \
+            -var="flow_timer_ingest_image=example.com/arco-flow-timer-ingest:test" \
+            -var="flow_dispatch_target_url=https://worker.internal.example/dispatch" \
+            -var="flow_tenant_id=test-tenant" \
+            -var="flow_workspace_id=test-workspace"

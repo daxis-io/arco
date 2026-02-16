@@ -266,14 +266,15 @@ async fn main() -> Result<()> {
         ledger: LedgerWriter::new(storage),
     };
 
-    let timer_route = if let Some(auth) = internal_auth {
-        post(timer_fired_handler).route_layer(middleware::from_fn_with_state(
-            auth,
-            internal_auth_middleware,
-        ))
-    } else {
-        post(timer_fired_handler)
-    };
+    let timer_route = internal_auth.map_or_else(
+        || post(timer_fired_handler),
+        |auth| {
+            post(timer_fired_handler).route_layer(middleware::from_fn_with_state(
+                auth,
+                internal_auth_middleware,
+            ))
+        },
+    );
 
     let app = Router::new()
         .route("/health", get(health_handler))

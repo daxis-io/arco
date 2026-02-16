@@ -1,5 +1,9 @@
 use arco_core::FlowPaths;
 
+const ORCHESTRATION_MANIFEST_POINTER_PATH: &str = "state/orchestration/manifest.pointer.json";
+const ORCHESTRATION_MANIFEST_SNAPSHOT_PREFIX: &str = "state/orchestration/manifests";
+const ORCHESTRATION_COMPACTION_LOCK_PATH: &str = "locks/orchestration.compaction.lock.json";
+
 pub fn orchestration_event_path(date: &str, event_id: &str) -> String {
     FlowPaths::orchestration_event_path(date, event_id)
 }

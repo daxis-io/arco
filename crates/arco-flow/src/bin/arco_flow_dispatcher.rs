@@ -11,7 +11,8 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use metrics::{counter, gauge};
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +48,7 @@ struct AppState {
     timer_target_url: Option<String>,
     timer_audience: Option<String>,
     timer_queue: Option<String>,
+    task_token_signer: Option<TaskTokenSigner>,
     timer_callback_auth: TimerCallbackAuth,
     runtime_config: OrchestrationRuntimeConfig,
 }
@@ -1115,6 +1117,7 @@ async fn main() -> Result<()> {
     let timer_target_url = optional_env("ARCO_FLOW_TIMER_TARGET_URL");
     let timer_audience = optional_env("ARCO_FLOW_TIMER_AUDIENCE");
     let timer_queue = optional_env("ARCO_FLOW_TIMER_QUEUE");
+    let require_tasks_oidc = parse_bool_env("ARCO_FLOW_REQUIRE_TASKS_OIDC", false);
     let service_account_email = optional_env("ARCO_FLOW_SERVICE_ACCOUNT_EMAIL");
     validate_timer_callback_oidc_contract(
         timer_target_url.as_deref(),
@@ -1177,6 +1180,7 @@ async fn main() -> Result<()> {
         timer_target_url,
         timer_audience,
         timer_queue,
+        task_token_signer,
         timer_callback_auth,
         runtime_config,
     };
@@ -1193,7 +1197,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health_handler))
-        .route("/run", post(run_handler))
+        .route("/run", run_route)
         .route("/timers/callback", post(timer_callback_handler))
         .with_state(state);
 

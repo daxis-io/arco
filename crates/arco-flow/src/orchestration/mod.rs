@@ -37,6 +37,8 @@ pub mod callbacks;
 pub mod compactor;
 pub mod controllers;
 pub mod events;
+/// Helpers for Cloud Run flow controller services.
+pub mod flow_service;
 pub mod ids;
 pub mod ledger;
 pub mod run_key;

@@ -4,13 +4,22 @@
 # Usage: terraform apply -var-file=environments/dev.tfvars
 
 project_id  = "your-gcp-project-id"
+project_number = "123456789012"
 region      = "us-central1"
 environment = "dev"
 
 # Container images (update with your registry)
 api_image       = "gcr.io/your-project/arco-api:latest"
 compactor_image = "gcr.io/your-project/arco-compactor:latest"
+flow_compactor_image = "gcr.io/your-project/arco-flow-compactor:latest"
+flow_dispatcher_image = "gcr.io/your-project/arco-flow-dispatcher:latest"
+flow_sweeper_image = "gcr.io/your-project/arco-flow-sweeper:latest"
+flow_worker_image = "gcr.io/your-project/arco-flow-worker:latest"
 api_code_version = "local-dev"
+
+# Single-tenant dev cluster settings (used by anti-entropy jobs + flow compactor)
+compactor_tenant_id = "tenant"
+compactor_workspace_id = "workspace"
 
 # Cloud Run scaling (dev: scale to zero)
 api_min_instances       = 0

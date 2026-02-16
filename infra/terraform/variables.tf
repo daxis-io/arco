@@ -7,6 +7,17 @@ variable "project_id" {
   type        = string
 }
 
+variable "project_number" {
+  description = "GCP project number (used for deterministic Cloud Run URLs). If unset, Terraform will try to read it via the Cloud Resource Manager API."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.project_number == "" || can(regex("^\\d+$", var.project_number))
+    error_message = "project_number must be digits only (or empty to auto-discover)."
+  }
+}
+
 variable "region" {
   description = "GCP region for resources"
   type        = string
@@ -44,40 +55,24 @@ variable "compactor_image" {
   type        = string
 }
 
+variable "flow_compactor_image" {
+  description = "Container image for Arco Flow orchestration compactor service"
+  type        = string
+}
+
 variable "flow_dispatcher_image" {
   description = "Container image for Arco Flow dispatcher service"
   type        = string
-  default     = ""
 }
 
 variable "flow_sweeper_image" {
   description = "Container image for Arco Flow sweeper service"
   type        = string
-  default     = ""
 }
 
-variable "flow_timer_ingest_image" {
-  description = "Container image for Arco Flow timer-ingest service"
+variable "flow_worker_image" {
+  description = "Container image for Arco Flow worker service"
   type        = string
-  default     = ""
-}
-
-variable "flow_dispatch_target_url" {
-  description = "Worker dispatch endpoint URL for Cloud Tasks dispatch callbacks"
-  type        = string
-  default     = ""
-}
-
-variable "flow_tenant_id" {
-  description = "Tenant ID for flow control-plane services"
-  type        = string
-  default     = ""
-}
-
-variable "flow_workspace_id" {
-  description = "Workspace ID for flow control-plane services"
-  type        = string
-  default     = ""
 }
 
 # ============================================================================
@@ -168,36 +163,6 @@ variable "compactor_max_instances" {
   default     = 1
 }
 
-variable "flow_cpu" {
-  description = "CPU allocation for Flow services"
-  type        = string
-  default     = "1"
-}
-
-variable "flow_memory" {
-  description = "Memory allocation for Flow services"
-  type        = string
-  default     = "512Mi"
-}
-
-variable "flow_min_instances" {
-  description = "Minimum instances for Flow services"
-  type        = number
-  default     = 0
-}
-
-variable "flow_max_instances" {
-  description = "Maximum instances for Flow services"
-  type        = number
-  default     = 2
-}
-
-variable "flow_require_tasks_oidc" {
-  description = "Require Cloud Tasks OIDC for flow dispatcher/sweeper"
-  type        = bool
-  default     = true
-}
-
 # ============================================================================
 # Security Configuration
 # ============================================================================
@@ -224,6 +189,12 @@ variable "jwt_secret_name" {
   description = "Secret Manager secret name containing JWT secret"
   type        = string
   default     = "arco-jwt-secret"
+}
+
+variable "tenant_secret_name" {
+  description = "Secret Manager secret name containing tenant secret (base64) for orchestration run_id HMAC"
+  type        = string
+  default     = "arco-tenant-secret"
 }
 
 # ============================================================================

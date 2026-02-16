@@ -94,6 +94,39 @@ resource "google_storage_bucket_iam_member" "api_read_all" {
 }
 
 # ============================================================================
+# Flow Controller Service Account: ledger/ write + (ledger/, state/) read (NO list)
+# ============================================================================
+
+resource "google_storage_bucket_iam_member" "flow_controller_write_ledger" {
+  bucket = google_storage_bucket.catalog.name
+  role   = "roles/storage.objectCreator"
+  member = "serviceAccount:${google_service_account.flow_controller.email}"
+
+  condition {
+    title       = "FlowControllerWriteLedger"
+    description = "Gate 5: Flow controllers can create orchestration ledger events"
+    expression  = <<-EOT
+      resource.name.matches("${local.ledger_prefix_regex}")
+    EOT
+  }
+}
+
+resource "google_storage_bucket_iam_member" "flow_controller_read_objects" {
+  bucket = google_storage_bucket.catalog.name
+  role   = google_project_iam_custom_role.storage_object_reader_no_list.name
+  member = "serviceAccount:${google_service_account.flow_controller.email}"
+
+  condition {
+    title       = "FlowControllerReadObjects"
+    description = "Gate 5: Flow controllers can read projections (state/) and ledger events (no list)"
+    expression  = <<-EOT
+      resource.name.matches("${local.ledger_prefix_regex}") ||
+      resource.name.matches("${local.state_prefix_regex}")
+    EOT
+  }
+}
+
+# ============================================================================
 # Compactor Fast-Path Service Account (Patch 9)
 # ============================================================================
 #

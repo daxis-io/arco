@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use arco_core::ScopedStorage;
+use arco_core::{DistributedLock, ScopedStorage};
+use arco_flow::error::Error as FlowError;
 use arco_flow::orchestration::OrchestrationLedgerWriter;
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_flow::orchestration::events::OrchestrationEvent;
@@ -16,12 +17,13 @@ use crate::error::ApiError;
 #[derive(Debug, Serialize)]
 struct CompactRequest {
     event_paths: Vec<String>,
+    fencing_token: u64,
+    lock_path: String,
 }
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
-const METADATA_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_ATTEMPTS: usize = 3;
+const COMPACTION_LOCK_TTL: Duration = Duration::from_secs(30);
+const COMPACTION_LOCK_MAX_RETRIES: u32 = 8;
+const ORCHESTRATION_COMPACTION_LOCK_PATH: &str = "locks/orchestration.compaction.lock.json";
 
 /// Compacts orchestration events using a remote compactor or inline micro-compactor.
 pub async fn compact_orchestration_events(
@@ -32,193 +34,95 @@ pub async fn compact_orchestration_events(
     if event_paths.is_empty() {
         return Ok(());
     }
+    if config.orchestration_compactor_url.is_none() && !config.debug {
+        return Ok(());
+    }
+
+    let lock_path = ORCHESTRATION_COMPACTION_LOCK_PATH.to_string();
+    let lock = DistributedLock::new(storage.backend().clone(), lock_path.clone());
+    let guard = lock
+        .acquire(COMPACTION_LOCK_TTL, COMPACTION_LOCK_MAX_RETRIES)
+        .await
+        .map_err(|e| match e {
+            arco_core::Error::PreconditionFailed { message } => ApiError::conflict(format!(
+                "orchestration compaction lock unavailable: {message}"
+            )),
+            other => ApiError::from(other),
+        })?;
+    let fencing_token = guard.fencing_token().sequence();
 
     if let Some(url) = config.orchestration_compactor_url.as_ref() {
-        compact_remote(url, event_paths).await?;
-        return Ok(());
+        let client = reqwest::Client::new();
+        let endpoint = format!("{}/compact", url.trim_end_matches('/'));
+        let response = client
+            .post(endpoint)
+            .json(&CompactRequest {
+                event_paths,
+                fencing_token,
+                lock_path,
+            })
+            .send()
+            .await
+            .map_err(|e| {
+                ApiError::internal(format!("orchestration compaction request failed: {e}"))
+            })?;
+
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ApiError::internal(format!("compaction error body read failed: {e}")))?;
+        let message = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| String::from_utf8_lossy(&body).to_string());
+
+        return Err(map_remote_compaction_error(status, &message));
     }
 
     if config.debug {
         let compactor = MicroCompactor::new(storage);
         compactor
-            .compact_events(event_paths)
+            .compact_events_fenced(event_paths, fencing_token, &lock_path)
             .await
-            .map_err(|e| ApiError::internal(format!("orchestration compaction failed: {e}")))?;
+            .map_err(|e| map_inline_compaction_error(&e))?;
     }
 
     Ok(())
 }
 
-async fn compact_remote(url: &str, event_paths: Vec<String>) -> Result<(), ApiError> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .map_err(|e| ApiError::internal(format!("failed to build HTTP client: {e}")))?;
+fn map_remote_compaction_error(status: reqwest::StatusCode, message: &str) -> ApiError {
+    let detail = format!("orchestration compaction failed ({status}): {message}");
+    if status == reqwest::StatusCode::CONFLICT || status == reqwest::StatusCode::PRECONDITION_FAILED
+    {
+        ApiError::conflict(detail)
+    } else {
+        ApiError::internal(detail)
+    }
+}
 
-    let (endpoint, bearer_token) = build_compactor_endpoint(url)?;
-    let auth_header = build_auth_header(&client, &endpoint, bearer_token, METADATA_TIMEOUT).await?;
-
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-
-        let mut request = client
-            .post(&endpoint)
-            .json(&CompactRequest {
-                event_paths: event_paths.clone(),
-            })
-            .timeout(REQUEST_TIMEOUT);
-
-        if let Some(auth_header) = auth_header.as_deref() {
-            request = request.header(reqwest::header::AUTHORIZATION, auth_header);
+fn map_inline_compaction_error(error: &FlowError) -> ApiError {
+    let detail = format!("orchestration compaction failed: {error}");
+    match error {
+        FlowError::StaleFencingToken { .. } | FlowError::FencingLockUnavailable { .. } => {
+            ApiError::conflict(detail)
         }
-
-        let response = request.send().await;
-        match response {
-            Ok(resp) if resp.status().is_success() => return Ok(()),
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.bytes().await.unwrap_or_default();
-
-                let message = serde_json::from_slice::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("error")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                    })
-                    .unwrap_or_else(|| String::from_utf8_lossy(&body).to_string());
-
-                let retryable =
-                    status.as_u16() == 409 || status.as_u16() == 429 || status.is_server_error();
-
-                if retryable && attempt < MAX_ATTEMPTS {
-                    // Exponential backoff with cap; keep API path bounded.
-                    let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
-                    let backoff_ms = 50_u64
-                        .saturating_mul(2_u64.saturating_pow(exponent))
-                        .min(500);
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    continue;
-                }
-
-                return Err(ApiError::internal(format!(
-                    "orchestration compaction failed ({status}): {message}"
-                )));
-            }
-            Err(err) => {
-                // Don't retry timeouts: the API request path should fail fast.
-                if err.is_timeout() {
-                    return Err(ApiError::internal(format!(
-                        "orchestration compaction request timed out: {err}"
-                    )));
-                }
-
-                if attempt < MAX_ATTEMPTS {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    continue;
-                }
-
-                return Err(ApiError::internal(format!(
-                    "orchestration compaction request failed: {err}"
-                )));
-            }
+        FlowError::Core(arco_core::Error::PreconditionFailed { message })
+            if message.contains("fencing") || message.contains("stale fencing token") =>
+        {
+            ApiError::conflict(detail)
         }
+        _ => ApiError::internal(detail),
     }
-}
-
-fn build_compactor_endpoint(url: &str) -> Result<(String, Option<String>), ApiError> {
-    let parsed = reqwest::Url::parse(url)
-        .map_err(|e| ApiError::internal(format!("invalid orchestration compactor URL: {e}")))?;
-
-    let bearer_token = bearer_token_from_url(&parsed);
-
-    let mut sanitized = parsed;
-    let _ = sanitized.set_username("");
-    let _ = sanitized.set_password(None);
-
-    let endpoint = format!("{}/compact", sanitized.as_str().trim_end_matches('/'));
-    Ok((endpoint, bearer_token))
-}
-
-fn bearer_token_from_url(url: &reqwest::Url) -> Option<String> {
-    let username = url.username();
-    if username != "bearer" {
-        return None;
-    }
-    url.password().map(str::to_string)
-}
-
-async fn build_auth_header(
-    client: &reqwest::Client,
-    endpoint: &str,
-    bearer_token: Option<String>,
-    metadata_timeout: Duration,
-) -> Result<Option<String>, ApiError> {
-    if let Some(token) = bearer_token {
-        return Ok(Some(format!("Bearer {token}")));
-    }
-
-    if !is_cloud_run_endpoint(endpoint) {
-        return Ok(None);
-    }
-
-    let audience = endpoint.trim_end_matches("/compact");
-    let id_token = fetch_gcp_identity_token(client, audience, metadata_timeout).await?;
-    Ok(Some(format!("Bearer {id_token}")))
-}
-
-fn is_cloud_run_endpoint(endpoint: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(endpoint) else {
-        return false;
-    };
-
-    if url.scheme() != "https" {
-        return false;
-    }
-
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-
-    host.ends_with(".run.app") || host.ends_with(".a.run.app")
-}
-
-async fn fetch_gcp_identity_token(
-    client: &reqwest::Client,
-    audience: &str,
-    timeout: Duration,
-) -> Result<String, ApiError> {
-    let mut url = reqwest::Url::parse(
-        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity",
-    )
-    .map_err(|e| ApiError::internal(format!("invalid metadata identity URL: {e}")))?;
-
-    url.query_pairs_mut()
-        .append_pair("audience", audience)
-        .append_pair("format", "full");
-
-    let response = client
-        .get(url)
-        .header("Metadata-Flavor", "Google")
-        .timeout(timeout)
-        .send()
-        .await
-        .map_err(|e| ApiError::internal(format!("metadata identity token request failed: {e}")))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(ApiError::internal(format!(
-            "metadata identity token request failed (status={status}): {body}"
-        )));
-    }
-
-    response
-        .text()
-        .await
-        .map_err(|e| ApiError::internal(format!("metadata identity token read failed: {e}")))
 }
 
 /// Ledger writer that triggers orchestration compaction after each event append.
@@ -250,5 +154,36 @@ impl OrchestrationLedgerWriter for CompactingLedgerWriter {
         compact_orchestration_events(&self.config, self.storage.clone(), vec![path])
             .await
             .map_err(|e| format!("{e:?}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arco_flow::error::Error as FlowError;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn maps_remote_compaction_conflict_to_http_409() {
+        let error = map_remote_compaction_error(StatusCode::CONFLICT, "stale fencing token");
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn maps_remote_compaction_non_conflict_to_http_500() {
+        let error = map_remote_compaction_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "upstream internal error",
+        );
+        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn maps_inline_fencing_precondition_to_http_409() {
+        let error =
+            map_inline_compaction_error(&FlowError::Core(arco_core::Error::PreconditionFailed {
+                message: "stale fencing token".to_string(),
+            }));
+        assert_eq!(error.status(), StatusCode::CONFLICT);
     }
 }

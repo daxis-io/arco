@@ -328,7 +328,9 @@ fn parity_m2_backfill_reconcile_returns_empty_when_compaction_watermarks_are_sta
 
     let watermarks = Watermarks {
         last_committed_event_id: None,
+        committed_event_count: None,
         last_visible_event_id: None,
+        visible_event_count: None,
         events_processed_through: None,
         last_processed_file: None,
         last_processed_at: Utc::now() - Duration::seconds(120),

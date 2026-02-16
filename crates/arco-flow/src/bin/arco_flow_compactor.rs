@@ -26,8 +26,8 @@ struct AppState {
 #[derive(Debug, Deserialize)]
 struct CompactRequest {
     event_paths: Vec<String>,
-    #[serde(default)]
-    epoch: Option<u64>,
+    fencing_token: u64,
+    lock_path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,12 +45,26 @@ struct ErrorResponse {
 
 #[derive(Debug)]
 struct ApiError {
+    status: StatusCode,
     message: String,
 }
 
 impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
+        let status = match &error {
+            Error::StaleFencingToken { .. } | Error::FencingLockUnavailable { .. } => {
+                StatusCode::CONFLICT
+            }
+            Error::Core(arco_core::Error::PreconditionFailed { .. }) => StatusCode::CONFLICT,
+            Error::Core(
+                arco_core::Error::InvalidInput(_)
+                | arco_core::Error::InvalidId { .. }
+                | arco_core::Error::Validation { .. },
+            ) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
         Self {
+            status,
             message: error.to_string(),
         }
     }
@@ -59,7 +73,7 @@ impl From<Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            self.status,
             Json(ErrorResponse {
                 error: self.message,
             }),
@@ -76,6 +90,13 @@ async fn compact_handler(
     State(state): State<AppState>,
     Json(request): Json<CompactRequest>,
 ) -> std::result::Result<Json<CompactResponse>, ApiError> {
+    if request.lock_path.trim().is_empty() {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "invalid request: lock_path must not be empty".to_string(),
+        });
+    }
+
     let CompactionResult {
         events_processed,
         delta_id,
@@ -83,7 +104,11 @@ async fn compact_handler(
         visibility_status,
     } = state
         .compactor
-        .compact_events_with_epoch(request.event_paths, request.epoch)
+        .compact_events_fenced(
+            request.event_paths,
+            request.fencing_token,
+            &request.lock_path,
+        )
         .await?;
 
     Ok(Json(CompactResponse {
@@ -153,6 +178,67 @@ fn load_tenant_secret() -> Result<Vec<u8>> {
     }
 
     Ok(secret)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arco_core::Error as CoreError;
+    use arco_core::MemoryBackend;
+
+    #[test]
+    fn compact_request_requires_fencing_fields() {
+        let raw = r#"{"event_paths":["ledger/orchestration/2025-01-15/evt_01.json"]}"#;
+        assert!(serde_json::from_str::<CompactRequest>(raw).is_err());
+    }
+
+    #[test]
+    fn compact_request_accepts_fenced_payload() {
+        let raw = r#"{
+            "event_paths":["ledger/orchestration/2025-01-15/evt_01.json"],
+            "fencing_token":7,
+            "lock_path":"locks/orchestration.compaction.lock.json"
+        }"#;
+        let parsed: CompactRequest = serde_json::from_str(raw).expect("valid fenced request");
+        assert_eq!(parsed.fencing_token, 7);
+        assert_eq!(parsed.lock_path, "locks/orchestration.compaction.lock.json");
+    }
+
+    #[test]
+    fn api_error_maps_core_precondition_to_conflict() {
+        let error = Error::Core(CoreError::PreconditionFailed {
+            message: "manifest publish failed - concurrent write".to_string(),
+        });
+        let api_error = ApiError::from(error);
+        assert_eq!(api_error.status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn api_error_maps_core_invalid_input_to_bad_request() {
+        let error = Error::Core(CoreError::InvalidInput("invalid lock_path".to_string()));
+        let api_error = ApiError::from(error);
+        assert_eq!(api_error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn compact_handler_rejects_empty_lock_path() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("storage");
+        let state = AppState {
+            compactor: MicroCompactor::new(storage),
+        };
+
+        let request = CompactRequest {
+            event_paths: Vec::new(),
+            fencing_token: 1,
+            lock_path: "   ".to_string(),
+        };
+
+        let err = compact_handler(State(state), Json(request))
+            .await
+            .expect_err("empty lock_path must fail");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
 }
 
 #[tokio::main]

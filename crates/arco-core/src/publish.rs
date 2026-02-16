@@ -35,11 +35,13 @@
 //! ```
 
 use std::fmt;
+use std::future::Future;
 
 use bytes::Bytes;
 
-use crate::error::Result;
-use crate::storage::WriteResult;
+use crate::error::{Error, Result};
+use crate::scoped_storage::ScopedStorage;
+use crate::storage::{WritePrecondition, WriteResult};
 use crate::storage_keys::ManifestKey;
 use crate::storage_traits::CasStore;
 
@@ -424,9 +426,108 @@ impl<'a, S: CasStore + ?Sized> Publisher<'a, S> {
     }
 }
 
+/// Durability policy for snapshot+pointer publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPointerDurability {
+    /// Return success only when pointer CAS succeeds (read-visible).
+    Visible,
+    /// Return success once snapshot is persisted, even if pointer CAS loses a race.
+    Persisted,
+}
+
+/// Outcome of a snapshot+pointer publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotPointerPublishOutcome {
+    /// Snapshot persisted and pointer CAS succeeded.
+    Visible {
+        /// Version token returned by the pointer CAS write.
+        pointer_version: String,
+    },
+    /// Snapshot persisted but pointer CAS lost a race.
+    PersistedNotVisible,
+}
+
+/// Publishes immutable snapshot then CAS-updates a visibility pointer.
+///
+/// This helper standardizes the shared snapshot+pointer transaction protocol used by
+/// compaction/writer paths:
+/// 1. Write immutable snapshot with `DoesNotExist`.
+/// 2. Run caller-provided pre-pointer validation.
+/// 3. CAS write pointer (`DoesNotExist` or `MatchesVersion`).
+/// 4. Optionally mirror legacy manifest path on visible success.
+///
+/// # Errors
+///
+/// Returns `Error::PreconditionFailed` for snapshot conflicts or strict-mode pointer CAS loss.
+#[allow(clippy::too_many_arguments)]
+pub async fn publish_snapshot_pointer_transaction<B>(
+    storage: &ScopedStorage,
+    snapshot_path: &str,
+    snapshot_payload: Bytes,
+    pointer_path: &str,
+    pointer_payload: Bytes,
+    expected_pointer_version: Option<&str>,
+    legacy_mirror: Option<(&str, Bytes)>,
+    durability: SnapshotPointerDurability,
+    before_pointer_publish: B,
+) -> Result<SnapshotPointerPublishOutcome>
+where
+    B: Future<Output = Result<()>>,
+{
+    let snapshot_result = storage
+        .put_raw(
+            snapshot_path,
+            snapshot_payload,
+            WritePrecondition::DoesNotExist,
+        )
+        .await?;
+    match snapshot_result {
+        WriteResult::Success { .. } => {}
+        WriteResult::PreconditionFailed { .. } => {
+            return Err(Error::PreconditionFailed {
+                message: format!("immutable manifest snapshot already exists: {snapshot_path}"),
+            });
+        }
+    }
+
+    before_pointer_publish.await?;
+
+    let pointer_precondition = expected_pointer_version
+        .map_or(WritePrecondition::DoesNotExist, |v| {
+            WritePrecondition::MatchesVersion(v.to_string())
+        });
+    let pointer_result = storage
+        .put_raw(pointer_path, pointer_payload, pointer_precondition)
+        .await?;
+
+    match pointer_result {
+        WriteResult::Success { version } => {
+            if let Some((legacy_path, legacy_payload)) = legacy_mirror {
+                let _ = storage
+                    .put_raw(legacy_path, legacy_payload, WritePrecondition::None)
+                    .await?;
+            }
+            Ok(SnapshotPointerPublishOutcome::Visible {
+                pointer_version: version,
+            })
+        }
+        WriteResult::PreconditionFailed { .. } => {
+            if durability == SnapshotPointerDurability::Persisted {
+                Ok(SnapshotPointerPublishOutcome::PersistedNotVisible)
+            } else {
+                Err(Error::PreconditionFailed {
+                    message: "manifest publish failed - concurrent write".to_string(),
+                })
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CatalogPaths;
+    use crate::scoped_storage::ScopedStorage;
     use crate::storage::MemoryBackend;
     use crate::storage::StorageBackend;
     use crate::storage::WritePrecondition;
@@ -545,5 +646,80 @@ mod tests {
             .expect("publish");
 
         assert!(matches!(result, WriteResult::PreconditionFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn snapshot_pointer_publish_conflict_in_persisted_mode_returns_persisted_not_visible() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("scoped");
+
+        let pointer_path = CatalogPaths::domain_manifest_pointer(crate::CatalogDomain::Catalog);
+        storage
+            .put_raw(
+                &pointer_path,
+                Bytes::from_static(b"{\"manifestId\":\"00000000000000000000\"}"),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("seed pointer");
+
+        let current = storage
+            .head_raw(&pointer_path)
+            .await
+            .expect("head pointer")
+            .expect("pointer exists");
+
+        let outcome = publish_snapshot_pointer_transaction(
+            &storage,
+            "manifests/catalog/00000000000000000001.json",
+            Bytes::from_static(b"{\"manifestId\":\"00000000000000000001\"}"),
+            &pointer_path,
+            Bytes::from_static(b"{\"manifestId\":\"00000000000000000001\"}"),
+            Some("stale-version"),
+            None,
+            SnapshotPointerDurability::Persisted,
+            async { Ok(()) },
+        )
+        .await
+        .expect("publish outcome");
+        assert_eq!(outcome, SnapshotPointerPublishOutcome::PersistedNotVisible);
+
+        let pointer_after = storage
+            .head_raw(&pointer_path)
+            .await
+            .expect("head pointer after")
+            .expect("pointer exists");
+        assert_eq!(pointer_after.version, current.version);
+    }
+
+    #[tokio::test]
+    async fn snapshot_pointer_publish_visible_writes_legacy_mirror() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("scoped");
+
+        let pointer_path = CatalogPaths::domain_manifest_pointer(crate::CatalogDomain::Catalog);
+        let legacy_path = CatalogPaths::domain_manifest(crate::CatalogDomain::Catalog);
+        let snapshot_payload = Bytes::from_static(b"{\"manifestId\":\"00000000000000000001\"}");
+
+        let outcome = publish_snapshot_pointer_transaction(
+            &storage,
+            "manifests/catalog/00000000000000000001.json",
+            snapshot_payload.clone(),
+            &pointer_path,
+            snapshot_payload.clone(),
+            None,
+            Some((legacy_path.as_str(), snapshot_payload.clone())),
+            SnapshotPointerDurability::Visible,
+            async { Ok(()) },
+        )
+        .await
+        .expect("publish outcome");
+        assert!(matches!(
+            outcome,
+            SnapshotPointerPublishOutcome::Visible { pointer_version } if !pointer_version.is_empty()
+        ));
+
+        let legacy = storage.get_raw(&legacy_path).await.expect("legacy exists");
+        assert_eq!(legacy, snapshot_payload);
     }
 }

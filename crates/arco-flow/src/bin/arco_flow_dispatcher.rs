@@ -3,17 +3,20 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
-use serde::Serialize;
+use chrono::{DateTime, Duration, Utc};
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use serde::{Deserialize, Serialize};
 
-use arco_core::ScopedStorage;
 use arco_core::observability::{LogFormat, init_logging};
 use arco_core::storage::{ObjectStoreBackend, StorageBackend};
+use arco_core::{InternalOidcConfig, InternalOidcError, InternalOidcVerifier, ScopedStorage};
 use arco_flow::dispatch::cloud_tasks::{CloudTasksConfig, CloudTasksDispatcher};
 use arco_flow::dispatch::{EnqueueOptions, EnqueueResult};
 use arco_flow::error::{Error, Result};
@@ -34,7 +37,9 @@ struct AppState {
     cloud_tasks: Arc<CloudTasksDispatcher>,
     dispatch_target_url: String,
     timer_target_url: Option<String>,
+    timer_audience: Option<String>,
     timer_queue: Option<String>,
+    task_token_signer: Option<TaskTokenSigner>,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,6 +73,118 @@ struct ErrorResponse {
 struct ApiError {
     message: String,
     summary: Option<RunSummary>,
+}
+
+#[derive(Clone)]
+struct InternalAuthState {
+    verifier: Arc<InternalOidcVerifier>,
+    enforce: bool,
+}
+
+#[derive(Clone)]
+struct TaskTokenSigner {
+    encoding_key: Arc<EncodingKey>,
+    issuer: String,
+    audience: String,
+    ttl: Duration,
+    subject: Option<String>,
+    email: Option<String>,
+    azp: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CallbackTaskTokenClaims {
+    task_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    run_id: String,
+    attempt: u32,
+    iss: String,
+    aud: String,
+    exp: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sub: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    azp: Option<String>,
+}
+
+impl TaskTokenSigner {
+    fn from_env() -> Result<Option<Self>> {
+        let secret =
+            optional_env("ARCO_FLOW_TASK_TOKEN_SECRET").or_else(|| optional_env("ARCO_JWT_SECRET"));
+        let Some(secret) = secret else {
+            return Ok(None);
+        };
+
+        let issuer = optional_env("ARCO_FLOW_TASK_TOKEN_ISSUER")
+            .or_else(|| optional_env("ARCO_JWT_ISSUER"))
+            .ok_or_else(|| {
+                Error::configuration(
+                    "ARCO_FLOW_TASK_TOKEN_ISSUER or ARCO_JWT_ISSUER is required when callback token signing is enabled",
+                )
+            })?;
+        let audience = optional_env("ARCO_FLOW_TASK_TOKEN_AUDIENCE")
+            .or_else(|| optional_env("ARCO_JWT_AUDIENCE"))
+            .ok_or_else(|| {
+                Error::configuration(
+                    "ARCO_FLOW_TASK_TOKEN_AUDIENCE or ARCO_JWT_AUDIENCE is required when callback token signing is enabled",
+                )
+            })?;
+        let ttl_secs =
+            std::env::var("ARCO_FLOW_TASK_TOKEN_TTL_SECS")
+                .ok()
+                .map_or(Ok(300_u64), |value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| Error::configuration("invalid ARCO_FLOW_TASK_TOKEN_TTL_SECS"))
+                })?;
+
+        Ok(Some(Self {
+            encoding_key: Arc::new(EncodingKey::from_secret(secret.as_bytes())),
+            issuer,
+            audience,
+            ttl: Duration::seconds(i64::try_from(ttl_secs).unwrap_or(300)),
+            subject: optional_env("ARCO_FLOW_TASK_TOKEN_SUB"),
+            email: optional_env("ARCO_FLOW_TASK_TOKEN_EMAIL"),
+            azp: optional_env("ARCO_FLOW_TASK_TOKEN_AZP"),
+        }))
+    }
+
+    fn mint(
+        &self,
+        tenant_id: &str,
+        workspace_id: &str,
+        run_id: &str,
+        task_id: &str,
+        attempt: u32,
+    ) -> Result<(String, DateTime<Utc>)> {
+        let expires_at = Utc::now() + self.ttl;
+        let claims = CallbackTaskTokenClaims {
+            task_id: task_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            run_id: run_id.to_string(),
+            attempt,
+            iss: self.issuer.clone(),
+            aud: self.audience.clone(),
+            exp: usize::try_from(expires_at.timestamp())
+                .map_err(|_| Error::configuration("failed to convert token expiry timestamp"))?,
+            sub: self.subject.clone(),
+            email: self.email.clone(),
+            azp: self.azp.clone(),
+        };
+
+        let token = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            self.encoding_key.as_ref(),
+        )
+        .map_err(|e| Error::configuration(format!("failed to mint callback task token: {e}")))?;
+
+        Ok((token, expires_at))
+    }
 }
 
 impl ApiError {
@@ -108,6 +225,7 @@ impl IntoResponse for ApiError {
 #[derive(Debug, Serialize)]
 struct TimerPayload {
     timer_id: String,
+    timer_type: arco_flow::orchestration::compactor::fold::TimerType,
     run_id: Option<String>,
     task_key: Option<String>,
     attempt: Option<u32>,
@@ -173,12 +291,22 @@ async fn run_handler(
             continue;
         };
 
-        let payload = DispatchPayload::new(
+        let mut payload = DispatchPayload::new(
             run_id.clone(),
             task_key.clone(),
             *attempt,
             attempt_id.clone(),
         );
+        if let Some(signer) = state.task_token_signer.as_ref() {
+            let (task_token, expires_at) = signer.mint(
+                &state.tenant_id,
+                &state.workspace_id,
+                run_id,
+                task_key,
+                *attempt,
+            )?;
+            payload = payload.with_task_token(task_token, expires_at);
+        }
         let body = payload
             .to_json()
             .map_err(|e| Error::serialization(format!("dispatch payload error: {e}")))?;
@@ -272,6 +400,7 @@ async fn run_handler(
         let TimerAction::CreateTimer {
             timer_id,
             cloud_task_id,
+            timer_type,
             fire_at,
             run_id,
             task_key,
@@ -289,6 +418,7 @@ async fn run_handler(
 
         let payload = TimerPayload {
             timer_id: timer_id.clone(),
+            timer_type: *timer_type,
             run_id: run_id.clone(),
             task_key: task_key.clone(),
             attempt: *attempt,
@@ -315,7 +445,7 @@ async fn run_handler(
                 target_url,
                 &body,
                 options,
-                Some(target_url.as_str()),
+                state.timer_audience.as_deref().or(Some(target_url.as_str())),
             )
             .await;
 
@@ -440,6 +570,53 @@ async fn build_cloud_tasks(config: CloudTasksConfig) -> Result<CloudTasksDispatc
     }
 }
 
+fn build_internal_auth() -> Result<Option<Arc<InternalAuthState>>> {
+    let config = InternalOidcConfig::from_env().map_err(|e| Error::configuration(e.to_string()))?;
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    let enforce = config.enforce;
+    let verifier =
+        InternalOidcVerifier::new(config).map_err(|e| Error::configuration(e.to_string()))?;
+    Ok(Some(Arc::new(InternalAuthState {
+        verifier: Arc::new(verifier),
+        enforce,
+    })))
+}
+
+async fn internal_auth_middleware(
+    State(state): State<Arc<InternalAuthState>>,
+    request: axum::http::Request<Body>,
+    next: Next,
+) -> Response {
+    match state.verifier.verify_headers(request.headers()).await {
+        Ok(_) => next.run(request).await,
+        Err(err) => {
+            if state.enforce {
+                let message = match err {
+                    InternalOidcError::MissingBearerToken => "missing bearer token".to_string(),
+                    InternalOidcError::InvalidToken(reason) => format!("invalid token: {reason}"),
+                    InternalOidcError::PrincipalNotAllowlisted => {
+                        "principal not allowlisted".to_string()
+                    }
+                    InternalOidcError::JwksRefresh(reason) => {
+                        format!("jwks refresh failed: {reason}")
+                    }
+                };
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse { error: message }),
+                )
+                    .into_response();
+            }
+
+            tracing::warn!(error = %err, "internal auth check failed in report-only mode");
+            next.run(request).await
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging(log_format_from_env());
@@ -453,9 +630,26 @@ async fn main() -> Result<()> {
     let queue_name =
         optional_env("ARCO_FLOW_QUEUE").unwrap_or_else(|| "arco-flow-dispatch".to_string());
     let timer_target_url = optional_env("ARCO_FLOW_TIMER_TARGET_URL");
+    let timer_audience = optional_env("ARCO_FLOW_TIMER_AUDIENCE");
     let timer_queue = optional_env("ARCO_FLOW_TIMER_QUEUE");
     let service_account_email = optional_env("ARCO_FLOW_SERVICE_ACCOUNT_EMAIL");
+    let require_tasks_oidc = parse_bool_env("ARCO_FLOW_REQUIRE_TASKS_OIDC", false);
     let port = resolve_port()?;
+    let internal_auth = build_internal_auth()?;
+    let task_token_signer = TaskTokenSigner::from_env()?;
+
+    if require_tasks_oidc && service_account_email.is_none() {
+        return Err(Error::configuration(
+            "ARCO_FLOW_SERVICE_ACCOUNT_EMAIL is required when ARCO_FLOW_REQUIRE_TASKS_OIDC=true",
+        ));
+    }
+
+    let environment = optional_env("ARCO_ENVIRONMENT").unwrap_or_else(|| "dev".to_string());
+    if !environment.eq_ignore_ascii_case("dev") && timer_target_url.is_none() {
+        return Err(Error::configuration(
+            "ARCO_FLOW_TIMER_TARGET_URL is required outside dev environments",
+        ));
+    }
 
     let mut cloud_config = CloudTasksConfig::new(
         project_id,
@@ -493,12 +687,23 @@ async fn main() -> Result<()> {
         cloud_tasks: Arc::new(cloud_tasks),
         dispatch_target_url,
         timer_target_url,
+        timer_audience,
         timer_queue,
+        task_token_signer,
+    };
+
+    let run_route = if let Some(auth) = internal_auth {
+        post(run_handler).route_layer(middleware::from_fn_with_state(
+            auth,
+            internal_auth_middleware,
+        ))
+    } else {
+        post(run_handler)
     };
 
     let app = Router::new()
         .route("/health", get(health_handler))
-        .route("/run", post(run_handler))
+        .route("/run", run_route)
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

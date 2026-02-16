@@ -57,6 +57,8 @@ sha2 = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
+reqwest = { workspace = true }
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 
 # Optional test utilities
 proptest = { workspace = true, optional = true }

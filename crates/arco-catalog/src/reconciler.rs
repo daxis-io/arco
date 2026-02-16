@@ -449,8 +449,9 @@ impl Reconciler {
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
         let bytes = match self.storage.get_raw(path).await {
             Ok(b) => b,
-            Err(arco_core::Error::NotFound(_)) => return Ok(None),
-            Err(arco_core::Error::ResourceNotFound { .. }) => return Ok(None),
+            Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+                return Ok(None);
+            }
             Err(e) => return Err(CatalogError::from(e)),
         };
 

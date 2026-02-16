@@ -1103,42 +1103,38 @@ fn build_router(
     // because they have different IAM requirements:
     // - sync-compact: compactor-fastpath-sa (NO list)
     // - anti-entropy: compactor-antientropy-sa (WITH list)
-    let compact_route = internal_auth.clone().map_or_else(
-        || post(compact),
-        |auth| {
-            post(compact).route_layer(middleware::from_fn_with_state(
-                auth,
-                internal_auth_middleware,
-            ))
-        },
-    );
-    let notify_route = internal_auth.clone().map_or_else(
-        || post(notify_handler),
-        |auth| {
-            post(notify_handler).route_layer(middleware::from_fn_with_state(
-                auth,
-                internal_auth_middleware,
-            ))
-        },
-    );
-    let sync_compact_route = internal_auth.clone().map_or_else(
-        || post(sync_compact_handler),
-        |auth| {
-            post(sync_compact_handler).route_layer(middleware::from_fn_with_state(
-                auth,
-                internal_auth_middleware,
-            ))
-        },
-    );
-    let anti_entropy_route = internal_auth.map_or_else(
-        || post(anti_entropy_handler),
-        |auth| {
-            post(anti_entropy_handler).route_layer(middleware::from_fn_with_state(
-                auth,
-                internal_auth_middleware,
-            ))
-        },
-    );
+    let compact_route = if let Some(auth) = internal_auth.clone() {
+        post(compact).route_layer(middleware::from_fn_with_state(
+            auth,
+            internal_auth_middleware,
+        ))
+    } else {
+        post(compact)
+    };
+    let notify_route = if let Some(auth) = internal_auth.clone() {
+        post(notify_handler).route_layer(middleware::from_fn_with_state(
+            auth,
+            internal_auth_middleware,
+        ))
+    } else {
+        post(notify_handler)
+    };
+    let sync_compact_route = if let Some(auth) = internal_auth.clone() {
+        post(sync_compact_handler).route_layer(middleware::from_fn_with_state(
+            auth,
+            internal_auth_middleware,
+        ))
+    } else {
+        post(sync_compact_handler)
+    };
+    let anti_entropy_route = if let Some(auth) = internal_auth {
+        post(anti_entropy_handler).route_layer(middleware::from_fn_with_state(
+            auth,
+            internal_auth_middleware,
+        ))
+    } else {
+        post(anti_entropy_handler)
+    };
 
     let base_router = Router::new()
         .route("/health", get(health))

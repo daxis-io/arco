@@ -55,6 +55,12 @@ variable "compactor_image" {
   type        = string
 }
 
+variable "flow_compactor_image" {
+  description = "Container image for Arco Flow compactor service"
+  type        = string
+  default     = ""
+}
+
 variable "flow_dispatcher_image" {
   description = "Container image for Arco Flow dispatcher service"
   type        = string
@@ -69,6 +75,12 @@ variable "flow_sweeper_image" {
 
 variable "flow_timer_ingest_image" {
   description = "Container image for Arco Flow timer-ingest service"
+  type        = string
+  default     = ""
+}
+
+variable "flow_worker_image" {
+  description = "Container image for Arco Flow worker service"
   type        = string
   default     = ""
 }

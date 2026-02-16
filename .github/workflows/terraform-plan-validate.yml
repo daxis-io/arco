@@ -1,5 +1,8 @@
 name: Terraform Validate and Plan
 
+permissions:
+  contents: read
+
 on:
   pull_request:
     paths:
@@ -25,6 +28,8 @@ jobs:
         run: terraform -chdir=infra/terraform validate
 
       - name: Terraform Plan (Base Vars, No Refresh)
+        env:
+          GOOGLE_OAUTH_ACCESS_TOKEN: "ci-plan-noop-token"
         run: |
           terraform -chdir=infra/terraform plan \
             -refresh=false \
@@ -32,6 +37,7 @@ jobs:
             -input=false \
             -no-color \
             -var="project_id=test-project" \
+            -var="project_number=123456789012" \
             -var="region=us-central1" \
             -var="environment=dev" \
             -var="api_image=example.com/arco-api:test" \
@@ -41,6 +47,8 @@ jobs:
             -var="jwt_secret_name="
 
       - name: Terraform Plan (Flow-Enabled Vars, No Refresh)
+        env:
+          GOOGLE_OAUTH_ACCESS_TOKEN: "ci-plan-noop-token"
         run: |
           terraform -chdir=infra/terraform plan \
             -refresh=false \
@@ -48,6 +56,7 @@ jobs:
             -input=false \
             -no-color \
             -var="project_id=test-project" \
+            -var="project_number=123456789012" \
             -var="region=us-central1" \
             -var="environment=dev" \
             -var="api_image=example.com/arco-api:test" \

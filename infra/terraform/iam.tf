@@ -200,7 +200,7 @@ resource "google_cloud_run_v2_service_iam_member" "invoker_flow_dispatcher" {
   count    = local.flow_services_enabled ? 1 : 0
   project  = var.project_id
   location = var.region
-  name     = google_cloud_run_v2_service.flow_dispatcher[0].name
+  name     = google_cloud_run_v2_service.flow_dispatcher.name
   role     = "roles/run.invoker"
   member   = "serviceAccount:${google_service_account.invoker.email}"
 }
@@ -209,7 +209,7 @@ resource "google_cloud_run_v2_service_iam_member" "invoker_flow_sweeper" {
   count    = local.flow_services_enabled ? 1 : 0
   project  = var.project_id
   location = var.region
-  name     = google_cloud_run_v2_service.flow_sweeper[0].name
+  name     = google_cloud_run_v2_service.flow_sweeper.name
   role     = "roles/run.invoker"
   member   = "serviceAccount:${google_service_account.invoker.email}"
 }

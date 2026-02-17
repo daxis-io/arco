@@ -3,52 +3,44 @@
 use chrono::NaiveDate;
 use uuid::Uuid;
 
+use arco_core::IcebergPaths as CoreIcebergPaths;
+
 use crate::error::{IcebergError, IcebergResult};
 use crate::types::CommitKey;
 
-pub const ICEBERG_POINTER_PREFIX: &str = "_catalog/iceberg_pointers";
-pub const ICEBERG_IDEMPOTENCY_PREFIX: &str = "_catalog/iceberg_idempotency";
-pub const ICEBERG_TRANSACTIONS_PREFIX: &str = "_catalog/iceberg_transactions";
+pub const ICEBERG_POINTER_PREFIX: &str = CoreIcebergPaths::POINTER_PREFIX;
+pub const ICEBERG_IDEMPOTENCY_PREFIX: &str = CoreIcebergPaths::IDEMPOTENCY_PREFIX;
 
 pub fn iceberg_pointer_path(table_uuid: &Uuid) -> String {
-    format!("{ICEBERG_POINTER_PREFIX}/{table_uuid}.json")
+    CoreIcebergPaths::pointer_path(table_uuid)
 }
 
 pub fn iceberg_idempotency_table_prefix(table_uuid: &Uuid) -> String {
-    format!("{ICEBERG_IDEMPOTENCY_PREFIX}/{table_uuid}/")
+    CoreIcebergPaths::idempotency_table_prefix(table_uuid)
 }
 
 pub fn iceberg_idempotency_marker_path(table_uuid: &Uuid, key_hash: &str) -> String {
-    let prefix = &key_hash[..2.min(key_hash.len())];
-    format!("{ICEBERG_IDEMPOTENCY_PREFIX}/{table_uuid}/{prefix}/{key_hash}.json")
+    CoreIcebergPaths::idempotency_marker_path(table_uuid, key_hash)
 }
 
 pub fn iceberg_transaction_record_path(tx_id: &str) -> String {
-    format!("{ICEBERG_TRANSACTIONS_PREFIX}/{tx_id}.json")
+    CoreIcebergPaths::transaction_record_path(tx_id)
 }
 
 pub fn iceberg_pending_receipt_prefix(date: NaiveDate) -> String {
-    format!("events/{}/iceberg/pending/", date.format("%Y-%m-%d"))
+    CoreIcebergPaths::pending_receipt_prefix(date)
 }
 
 pub fn iceberg_committed_receipt_prefix(date: NaiveDate) -> String {
-    format!("events/{}/iceberg/committed/", date.format("%Y-%m-%d"))
+    CoreIcebergPaths::committed_receipt_prefix(date)
 }
 
 pub fn iceberg_pending_receipt_path(date: NaiveDate, commit_key: &CommitKey) -> String {
-    format!(
-        "{}{}.json",
-        iceberg_pending_receipt_prefix(date),
-        commit_key
-    )
+    CoreIcebergPaths::pending_receipt_path(date, commit_key)
 }
 
 pub fn iceberg_committed_receipt_path(date: NaiveDate, commit_key: &CommitKey) -> String {
-    format!(
-        "{}{}.json",
-        iceberg_committed_receipt_prefix(date),
-        commit_key
-    )
+    CoreIcebergPaths::committed_receipt_path(date, commit_key)
 }
 
 /// Resolves a metadata location into a storage-relative path.

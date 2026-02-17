@@ -2285,7 +2285,7 @@
         "tags": [
           "Orchestration"
         ],
-        "summary": "Create a backfill.",
+        "summary": "Create a new backfill.",
         "operationId": "create_backfill",
         "parameters": [
           {
@@ -2310,7 +2310,7 @@
         },
         "responses": {
           "200": {
-            "description": "Idempotent backfill replay",
+            "description": "Existing backfill returned",
             "content": {
               "application/json": {
                 "schema": {
@@ -2320,7 +2320,7 @@
             }
           },
           "202": {
-            "description": "Backfill created",
+            "description": "Backfill accepted",
             "content": {
               "application/json": {
                 "schema": {
@@ -2350,7 +2350,7 @@
             }
           },
           "409": {
-            "description": "Idempotency key conflict",
+            "description": "Idempotency conflict",
             "content": {
               "application/json": {
                 "schema": {
@@ -2392,26 +2392,6 @@
             "schema": {
               "type": "string"
             }
-          },
-          {
-            "name": "waitForEventId",
-            "in": "query",
-            "description": "Wait until this event ID is processed",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "timeoutMs",
-            "in": "query",
-            "description": "Timeout in milliseconds (defaults to 5000)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int64",
-              "minimum": 0
-            }
           }
         ],
         "responses": {
@@ -2427,16 +2407,6 @@
           },
           "404": {
             "description": "Backfill not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "408": {
-            "description": "Timed out waiting for event",
             "content": {
               "application/json": {
                 "schema": {
@@ -3603,26 +3573,6 @@
             }
           },
           {
-            "name": "since",
-            "in": "query",
-            "description": "Filter ticks after this timestamp (inclusive)",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "format": "date-time"
-            }
-          },
-          {
-            "name": "until",
-            "in": "query",
-            "description": "Filter ticks before this timestamp (inclusive)",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "format": "date-time"
-            }
-          },
-          {
             "name": "status",
             "in": "query",
             "description": "Filter by status",
@@ -4564,7 +4514,6 @@
         "type": "object",
         "description": "Request to create a backfill.",
         "required": [
-          "assetSelection",
           "partitionSelector"
         ],
         "properties": {
@@ -4575,20 +4524,13 @@
             },
             "description": "Assets to backfill."
           },
-          "backfillId": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Optional backfill identifier (ULID)."
-          },
           "chunkSize": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int32",
-            "description": "Number of partitions per chunk (defaults to 10).",
+            "description": "Number of partitions per chunk (0 uses default).",
             "minimum": 0
           },
           "clientRequestId": {
@@ -4596,7 +4538,7 @@
               "string",
               "null"
             ],
-            "description": "Optional client request ID (for idempotency)."
+            "description": "Client request ID for idempotency."
           },
           "maxConcurrentRuns": {
             "type": [
@@ -4604,12 +4546,12 @@
               "null"
             ],
             "format": "int32",
-            "description": "Maximum concurrent chunk runs (defaults to 2).",
+            "description": "Maximum concurrent chunk runs (0 uses default).",
             "minimum": 0
           },
           "partitionSelector": {
             "$ref": "#/components/schemas/PartitionSelectorRequest",
-            "description": "Partition selector (explicit only; range/filter planned once `PartitionResolver` is implemented)."
+            "description": "Partition selector."
           }
         }
       },
@@ -4625,22 +4567,15 @@
           "acceptedAt": {
             "type": "string",
             "format": "date-time",
-            "description": "When the event was accepted."
+            "description": "Time the event was accepted."
           },
           "acceptedEventId": {
             "type": "string",
-            "description": "Event identifier accepted by the ledger."
+            "description": "Event ID that was accepted."
           },
           "backfillId": {
             "type": "string",
             "description": "Backfill identifier."
-          },
-          "correlationId": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Optional correlation ID for request tracing."
           }
         }
       },
@@ -5492,14 +5427,6 @@
             "description": "Maximum ticks to return.",
             "minimum": 0
           },
-          "since": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time",
-            "description": "Filter ticks after this timestamp (inclusive)."
-          },
           "status": {
             "oneOf": [
               {
@@ -5510,14 +5437,6 @@
                 "description": "Filter by tick status."
               }
             ]
-          },
-          "until": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time",
-            "description": "Filter ticks before this timestamp (inclusive)."
           }
         }
       },
@@ -5800,7 +5719,7 @@
             "properties": {
               "filters": {
                 "type": "object",
-                "description": "Filter expressions.",
+                "description": "Filter bounds. Supported keys: `start`, `end`, `partition_start`, `partition_end`.",
                 "additionalProperties": {
                   "type": "string"
                 },
@@ -5879,7 +5798,7 @@
             "properties": {
               "filters": {
                 "type": "object",
-                "description": "Filter expressions.",
+                "description": "Filter bounds (`start`/`end`) captured on the backfill.",
                 "additionalProperties": {
                   "type": "string"
                 },
@@ -6557,6 +6476,7 @@
           "timezone",
           "catchupWindowMinutes",
           "maxCatchupTicks",
+          "assetSelection",
           "enabled",
           "definitionVersion"
         ],
@@ -6566,12 +6486,12 @@
             "items": {
               "type": "string"
             },
-            "description": "Asset selection captured on the definition."
+            "description": "Asset selection snapshot stored with the definition."
           },
           "catchupWindowMinutes": {
             "type": "integer",
             "format": "int32",
-            "description": "Maximum catchup window (minutes).",
+            "description": "Maximum time window for catchup.",
             "minimum": 0
           },
           "cronExpression": {
@@ -6580,7 +6500,7 @@
           },
           "definitionVersion": {
             "type": "string",
-            "description": "Definition row version."
+            "description": "Current definition version."
           },
           "enabled": {
             "type": "boolean",
@@ -6611,7 +6531,7 @@
           "maxCatchupTicks": {
             "type": "integer",
             "format": "int32",
-            "description": "Maximum catchup ticks per evaluation.",
+            "description": "Maximum number of ticks to catch up per evaluation.",
             "minimum": 0
           },
           "scheduleId": {
@@ -7711,27 +7631,9 @@
           "planId",
           "state",
           "created",
-          "createdAt",
-          "acceptedEventId",
-          "acceptedAt"
+          "createdAt"
         ],
         "properties": {
-          "acceptedAt": {
-            "type": "string",
-            "format": "date-time",
-            "description": "When the event was accepted."
-          },
-          "acceptedEventId": {
-            "type": "string",
-            "description": "Event identifier accepted by the ledger."
-          },
-          "correlationId": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Optional correlation ID for request tracing."
-          },
           "created": {
             "type": "boolean",
             "description": "Whether this is a new run or an existing one (`run_key` deduplication)."

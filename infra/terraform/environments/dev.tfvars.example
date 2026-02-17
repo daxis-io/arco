@@ -17,9 +17,9 @@ flow_sweeper_image = "gcr.io/your-project/arco-flow-sweeper:latest"
 flow_worker_image = "gcr.io/your-project/arco-flow-worker:latest"
 api_code_version = "local-dev"
 
-# Single-tenant dev cluster settings (used by anti-entropy jobs + flow compactor)
-compactor_tenant_id = "tenant"
-compactor_workspace_id = "workspace"
+# Compactor anti-entropy scope (required)
+compactor_tenant_id    = "dev-tenant"
+compactor_workspace_id = "dev-workspace"
 
 # Cloud Run scaling (dev: scale to zero)
 api_min_instances       = 0
@@ -44,3 +44,10 @@ jwt_audience    = ""
 
 # Networking (dev: no VPC connector)
 vpc_connector_name = ""
+
+# Flow dispatcher Cloud Tasks queues
+flow_dispatch_queue_name = "arco-flow-dispatch"
+flow_timer_queue_name    = "arco-flow-timers"
+
+# Optional: set when dispatcher Cloud Run service is managed/deployed
+# flow_dispatcher_service_name = "arco-flow-dispatcher-dev"

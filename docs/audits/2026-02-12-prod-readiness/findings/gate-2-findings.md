@@ -6,7 +6,7 @@
 
 ## Overall Status
 
-`PARTIAL` (additional closure signals resolved in this batch; full gate closure still pending)
+`GO` (all local/code-only Gate 2 closure signals are closed for Batch 3)
 
 ## Signals Closed
 
@@ -18,21 +18,27 @@
 2. **Orchestration schema golden fixtures and compatibility gates are now present.**
    - Contract test: `crates/arco-flow/tests/orchestration_schema_contracts.rs`
    - Golden fixtures: `crates/arco-flow/tests/golden_schemas/orchestration/`
-   - Evidence: `release_evidence/2026-02-12-prod-readiness/phase-2/batch-2-head/command-logs/test_arco_flow_all_features.log`
+   - Evidence: `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-logs/test_arco_flow_all_features.log`
+3. **Typed non-catalog path canonicalization is complete in scoped flow/api/iceberg modules.**
+   - Core typed paths expanded for flow/API/Iceberg: `crates/arco-core/src/flow_paths.rs`
+   - Callsite migrations: `crates/arco-api/src/paths.rs`, `crates/arco-api/src/routes/manifests.rs`, `crates/arco-api/src/routes/orchestration.rs`, `crates/arco-iceberg/src/paths.rs`, `crates/arco-iceberg/src/pointer.rs`
+   - Contract coverage: `crates/arco-core/tests/flow_paths_contracts.rs`
+4. **Deterministic/property invariants now explicitly cover out-of-order, duplicate, and crash-recovery replay behavior.**
+   - Property tests: `crates/arco-flow/tests/property_tests.rs`
+   - Deterministic replay test: `crates/arco-flow/tests/orchestration_correctness_tests.rs`
+   - Evidence: `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-logs/test_arco_flow_test_utils.log`, `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-logs/test_arco_flow_all_features.log`
+5. **Failure-injection coverage now explicitly includes CAS race, partial writes, and compaction replay.**
+   - CAS race: `crates/arco-iceberg/src/pointer.rs`
+   - Partial write replay: `crates/arco-flow/src/outbox.rs`
+   - Compaction replay after manifest publish failure: `crates/arco-flow/tests/orchestration_correctness_tests.rs`
+   - Evidence: `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-logs/test_arco_flow_default.log`, `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-logs/test_arco_flow_all_features.log`
+6. **Runbook/operator checks are refreshed with scriptable Batch 3 invariants.**
+   - Runbook update: `docs/runbooks/metrics-catalog.md`
+   - Evidence: `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-matrix-status.tsv`
 
 ## Signals Still Open
 
-1. **Path canonicalization for non-catalog domains remains partially fragmented.**
-   - Typed flow/orchestration path builders now exist in core and are consumed by flow path helpers.
-   - Progress: `crates/arco-core/src/flow_paths.rs`, `crates/arco-flow/src/paths.rs`, `crates/arco-core/tests/flow_paths_contracts.rs`
-   - Remaining: wider API/Iceberg callsite migration and hardcoded path debt retirement.
-
-2. **Failure-injection and property coverage needs explicit expansion for all targeted failure classes.**
-   - Existing crash/CAS behavior tests exist in catalog/orchestration areas.
-   - Closure target: deterministic tests explicitly covering CAS race, partial write windows, and compaction replay paths listed in the closure plan.
-
-3. **Runbook updates for finalized invariants have not yet been refreshed for this audit cycle.**
-   - Closure target: update and sign off operator checks in runbooks with linked drill evidence.
+None (for local/code-only Batch 3 scope).
 
 ## Gate 2 Exit Conditions (for GO)
 

@@ -856,6 +856,14 @@ impl BackfillController {
     }
 
     fn filter_start_end(filters: &HashMap<String, String>) -> Option<(&str, &str)> {
+        if filters.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "start" | "end" | "partition_start" | "partition_end"
+            )
+        }) {
+            return None;
+        }
         let start = filters
             .get("start")
             .or_else(|| filters.get("partition_start"))?;
@@ -1642,6 +1650,38 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e.data, OrchestrationEventData::RunRequested { .. })),
             "Expected RunRequested event"
+        );
+    }
+
+    #[test]
+    fn test_backfill_reconcile_skips_filter_selector_with_unsupported_keys() {
+        let controller = BackfillController::new(test_partition_resolver());
+
+        let mut filters = HashMap::new();
+        filters.insert("start".to_string(), "2025-01-01".to_string());
+        filters.insert("end".to_string(), "2025-01-03".to_string());
+        filters.insert("region".to_string(), "us-*".to_string());
+
+        let mut backfills = HashMap::new();
+        backfills.insert(
+            "bf_filter_unsupported".into(),
+            BackfillRow {
+                backfill_id: "bf_filter_unsupported".into(),
+                partition_selector: PartitionSelector::Filter { filters },
+                total_partitions: 0,
+                chunk_size: 2,
+                max_concurrent_runs: 1,
+                ..default_backfill_row()
+            },
+        );
+
+        let watermarks = fresh_watermarks();
+        let events =
+            controller.reconcile(&watermarks, &backfills, &HashMap::new(), &HashMap::new());
+
+        assert!(
+            events.is_empty(),
+            "unsupported filter keys must not silently schedule chunks"
         );
     }
 }

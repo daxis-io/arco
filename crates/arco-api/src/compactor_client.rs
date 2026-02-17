@@ -132,7 +132,8 @@ impl CompactorClient {
         let jitter_seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .subsec_nanos() as u64;
+            .subsec_nanos();
+        let jitter_seed = u64::from(jitter_seed);
         let jitter_ms = jitter_seed % (jitter_window_ms + 1);
         Duration::from_millis(
             backoff_ms

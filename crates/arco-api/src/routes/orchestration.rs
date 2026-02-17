@@ -21,17 +21,19 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::Query as AxumQuery;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::time::{Instant, sleep};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::context::RequestContext;
@@ -43,9 +45,9 @@ use crate::server::AppState;
 use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::{
-    BackfillChunkRow, BackfillRow, FoldState, MicroCompactor, PartitionStatusRow, RunRow,
-    RunState as FoldRunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
-    SensorEvalRow, SensorStateRow, TaskRow, TaskState as FoldTaskState,
+    BackfillChunkRow, BackfillRow, FoldState, MicroCompactor, OrchestrationManifest,
+    PartitionStatusRow, RunRow, RunState as FoldRunState, ScheduleDefinitionRow, ScheduleStateRow,
+    ScheduleTickRow, SensorEvalRow, SensorStateRow, TaskRow, TaskState as FoldTaskState,
 };
 use arco_flow::orchestration::controllers::{PubSubMessage, PushSensorHandler};
 use arco_flow::orchestration::events::{
@@ -56,7 +58,7 @@ use arco_flow::orchestration::run_key::{
     FingerprintPolicy, ReservationResult, RunKeyReservation, get_reservation, reservation_path,
     reserve_run_key,
 };
-use ulid::Ulid;
+use ulid::{Generator, Ulid};
 
 // ============================================================================
 // Request/Response Types
@@ -285,6 +287,13 @@ pub struct TriggerRunResponse {
     pub created: bool,
     /// Run creation timestamp.
     pub created_at: DateTime<Utc>,
+    /// Event identifier accepted by the ledger.
+    pub accepted_event_id: String,
+    /// When the event was accepted.
+    pub accepted_at: DateTime<Utc>,
+    /// Optional correlation ID for request tracing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
 }
 
 /// Response after backfilling a `run_key` reservation.
@@ -602,6 +611,20 @@ pub enum SensorEvalStatusResponse {
     SkippedStaleCursor,
 }
 
+/// Sensor evaluation status filter (query parameter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SensorEvalStatusFilter {
+    /// Sensor triggered one or more runs.
+    Triggered,
+    /// Sensor evaluated but no new data found.
+    NoNewData,
+    /// Sensor evaluation failed.
+    Error,
+    /// Sensor evaluation was skipped due to stale cursor (CAS failed).
+    SkippedStaleCursor,
+}
+
 /// Run request returned from sensor evaluation.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -631,15 +654,16 @@ pub struct ScheduleResponse {
     pub cron_expression: String,
     /// IANA timezone used for evaluation.
     pub timezone: String,
-    /// Maximum time window for catchup.
+    /// Maximum catchup window (minutes).
     pub catchup_window_minutes: u32,
-    /// Maximum number of ticks to catch up per evaluation.
+    /// Maximum catchup ticks per evaluation.
     pub max_catchup_ticks: u32,
-    /// Asset selection snapshot stored with the definition.
+    /// Asset selection captured on the definition.
+    #[serde(default)]
     pub asset_selection: Vec<String>,
     /// Whether the schedule is enabled.
     pub enabled: bool,
-    /// Current definition version.
+    /// Definition row version.
     pub definition_version: String,
     /// Last `scheduled_for` timestamp that was processed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -741,8 +765,28 @@ pub struct ListTicksQuery {
     pub limit: Option<u32>,
     /// Cursor for pagination.
     pub cursor: Option<String>,
+    /// Filter ticks after this timestamp (inclusive).
+    pub since: Option<DateTime<Utc>>,
+    /// Filter ticks before this timestamp (inclusive).
+    pub until: Option<DateTime<Utc>>,
     /// Filter by tick status.
     pub status: Option<TickStatusResponse>,
+}
+
+/// Query parameters for listing sensor evaluations.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSensorEvalsQuery {
+    /// Maximum evaluations to return.
+    pub limit: Option<u32>,
+    /// Cursor for pagination.
+    pub cursor: Option<String>,
+    /// Filter evaluations after this timestamp (inclusive).
+    pub since: Option<DateTime<Utc>>,
+    /// Filter evaluations before this timestamp (inclusive).
+    pub until: Option<DateTime<Utc>>,
+    /// Filter by evaluation status.
+    pub status: Option<SensorEvalStatusFilter>,
 }
 
 // ============================================================================
@@ -827,39 +871,41 @@ pub struct ListSensorEvalsResponse {
 // Backfill API Types
 // ============================================================================
 
-const DEFAULT_BACKFILL_CHUNK_SIZE: u32 = 10;
-const DEFAULT_BACKFILL_MAX_CONCURRENT_RUNS: u32 = 2;
-
 /// Request to create a backfill.
 #[derive(Debug, Deserialize, ToSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateBackfillRequest {
-    /// Assets to backfill.
-    #[serde(default)]
-    pub asset_selection: Vec<String>,
-    /// Partition selector.
-    pub partition_selector: PartitionSelectorRequest,
-    /// Client request ID for idempotency.
+    /// Optional backfill identifier (ULID).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backfill_id: Option<String>,
+    /// Optional client request ID (for idempotency).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_request_id: Option<String>,
-    /// Number of partitions per chunk (0 uses default).
+    /// Assets to backfill.
+    pub asset_selection: Vec<String>,
+    /// Partition selector (explicit only; range/filter planned once `PartitionResolver` is implemented).
+    pub partition_selector: PartitionSelectorRequest,
+    /// Number of partitions per chunk (defaults to 10).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_size: Option<u32>,
-    /// Maximum concurrent chunk runs (0 uses default).
+    /// Maximum concurrent chunk runs (defaults to 2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_runs: Option<u32>,
 }
 
 /// Response after creating a backfill.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateBackfillResponse {
     /// Backfill identifier.
     pub backfill_id: String,
-    /// Event ID that was accepted.
+    /// Event identifier accepted by the ledger.
     pub accepted_event_id: String,
-    /// Time the event was accepted.
+    /// When the event was accepted.
     pub accepted_at: DateTime<Utc>,
+    /// Optional correlation ID for request tracing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
 }
 
 /// Partition selector request.
@@ -1106,6 +1152,16 @@ pub struct ListBackfillsQuery {
     pub state: Option<BackfillStateResponse>,
 }
 
+/// Query parameters for waiting on compaction watermarks.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitForEventQuery {
+    /// Event ID to wait for before returning.
+    pub wait_for_event_id: Option<String>,
+    /// Timeout in milliseconds (defaults to 5000).
+    pub timeout_ms: Option<u64>,
+}
+
 /// Query parameters for listing backfill chunks.
 #[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
 #[serde(rename_all = "camelCase")]
@@ -1135,6 +1191,20 @@ pub struct ListPartitionsQuery {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+// Keep in sync with BackfillController defaults.
+const DEFAULT_BACKFILL_CHUNK_SIZE: u32 = 10;
+const DEFAULT_BACKFILL_MAX_CONCURRENT_RUNS: u32 = 2;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackfillIdempotencyRecord {
+    idempotency_key: String,
+    request_fingerprint: String,
+    backfill_id: String,
+    accepted_event_id: String,
+    accepted_at: DateTime<Utc>,
+}
 
 fn ensure_workspace(ctx: &RequestContext, workspace_id: &str) -> Result<(), ApiError> {
     if workspace_id != ctx.workspace {
@@ -1787,13 +1857,221 @@ fn parse_pagination(limit: u32, cursor: Option<&str>) -> Result<(usize, usize), 
     Ok((limit as usize, offset))
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct BackfillIdempotencyRecord {
-    idempotency_key: String,
-    backfill_id: String,
-    accepted_event_id: String,
-    accepted_at: DateTime<Utc>,
-    fingerprint: String,
+const DEFAULT_WAIT_TIMEOUT_MS: u64 = 5_000;
+const MAX_WAIT_TIMEOUT_MS: u64 = 30_000;
+const WAIT_BACKOFF_INITIAL_MS: u64 = 20;
+const WAIT_BACKOFF_MAX_MS: u64 = 250;
+
+fn user_id_for_events(ctx: &RequestContext) -> String {
+    ctx.user_id.clone().unwrap_or_else(|| "api".to_string())
+}
+
+async fn load_orchestration_manifest(
+    ctx: &RequestContext,
+    state: &AppState,
+) -> Result<OrchestrationManifest, ApiError> {
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+    let compactor = MicroCompactor::new(storage);
+    let (manifest, _) = compactor
+        .load_state()
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to load orchestration manifest: {e}")))?;
+    Ok(manifest)
+}
+
+fn watermark_reached(manifest: &OrchestrationManifest, target: &Ulid) -> bool {
+    let Some(ref watermark) = manifest.watermarks.events_processed_through else {
+        return false;
+    };
+
+    Ulid::from_string(watermark).map_or_else(
+        |_| {
+            tracing::warn!(
+                watermark = %watermark,
+                "invalid events_processed_through watermark"
+            );
+            false
+        },
+        |value| value >= *target,
+    )
+}
+
+async fn wait_for_event_processed(
+    ctx: &RequestContext,
+    state: &AppState,
+    event_id: &str,
+    timeout: Duration,
+) -> Result<(), ApiError> {
+    let span = tracing::info_span!(
+        "wait_for_event",
+        event_id = %event_id,
+        timeout_ms = %timeout.as_millis(),
+    );
+    let _guard = span.enter();
+
+    let target = Ulid::from_string(event_id)
+        .map_err(|_| ApiError::bad_request("waitForEventId must be a ULID"))?;
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut backoff = Duration::from_millis(WAIT_BACKOFF_INITIAL_MS);
+    let mut poll_count: u32 = 0;
+
+    loop {
+        poll_count += 1;
+        let manifest = load_orchestration_manifest(ctx, state).await?;
+        if watermark_reached(&manifest, &target) {
+            tracing::debug!(poll_count, elapsed_ms = %start.elapsed().as_millis(), "event processed");
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            tracing::debug!(poll_count, "wait timed out");
+            return Err(ApiError::request_timeout(format!(
+                "timed out waiting for event {event_id}"
+            )));
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let sleep_for = backoff.min(remaining);
+        if sleep_for.is_zero() {
+            tracing::debug!(poll_count, "wait timed out (zero remaining)");
+            return Err(ApiError::request_timeout(format!(
+                "timed out waiting for event {event_id}"
+            )));
+        }
+
+        sleep(sleep_for).await;
+        backoff = (backoff * 2).min(Duration::from_millis(WAIT_BACKOFF_MAX_MS));
+    }
+}
+
+fn resolve_backfill_chunk_size(chunk_size: Option<u32>) -> Result<u32, ApiError> {
+    let resolved = chunk_size.unwrap_or(DEFAULT_BACKFILL_CHUNK_SIZE);
+    if resolved == 0 {
+        return Err(ApiError::bad_request("chunkSize must be greater than zero"));
+    }
+    Ok(resolved)
+}
+
+fn resolve_backfill_max_concurrent(max_concurrent_runs: Option<u32>) -> Result<u32, ApiError> {
+    let resolved = max_concurrent_runs.unwrap_or(DEFAULT_BACKFILL_MAX_CONCURRENT_RUNS);
+    if resolved == 0 {
+        return Err(ApiError::bad_request(
+            "maxConcurrentRuns must be greater than zero",
+        ));
+    }
+    Ok(resolved)
+}
+
+fn resolve_backfill_idempotency_key(
+    ctx: &RequestContext,
+    request: &CreateBackfillRequest,
+) -> Option<String> {
+    ctx.idempotency_key
+        .clone()
+        .or_else(|| request.client_request_id.clone())
+}
+
+fn resolve_backfill_client_request_id(
+    idempotency_key: Option<&str>,
+    request: &CreateBackfillRequest,
+) -> String {
+    idempotency_key
+        .map(ToString::to_string)
+        .or_else(|| request.client_request_id.clone())
+        .unwrap_or_else(|| Ulid::new().to_string())
+}
+
+fn validate_backfill_asset_selection(asset_selection: &[String]) -> Result<(), ApiError> {
+    if asset_selection.is_empty() {
+        return Err(ApiError::bad_request("assetSelection cannot be empty"));
+    }
+    if asset_selection.len() != 1 {
+        return Err(ApiError::bad_request(
+            "multi-asset backfills are not supported yet",
+        ));
+    }
+    if asset_selection
+        .first()
+        .is_some_and(|asset| asset.trim().is_empty())
+    {
+        return Err(ApiError::bad_request("assetSelection cannot be empty"));
+    }
+    Ok(())
+}
+
+fn parse_partition_selector(
+    selector: &PartitionSelectorRequest,
+) -> Result<(PartitionSelector, u32), ApiError> {
+    match selector {
+        PartitionSelectorRequest::Explicit { partitions } => {
+            if partitions.is_empty() {
+                return Err(ApiError::bad_request(
+                    "partitionSelector.partitions cannot be empty",
+                ));
+            }
+            if partitions.iter().any(|key| key.trim().is_empty()) {
+                return Err(ApiError::bad_request(
+                    "partitionSelector.partitions cannot contain empty values",
+                ));
+            }
+            Ok((
+                PartitionSelector::Explicit {
+                    partition_keys: partitions.clone(),
+                },
+                usize_to_u32_saturating(partitions.len()),
+            ))
+        }
+        PartitionSelectorRequest::Range { start, end } => {
+            if start.trim().is_empty() || end.trim().is_empty() {
+                return Err(ApiError::bad_request(
+                    "range selector requires start and end",
+                ));
+            }
+            Ok((
+                PartitionSelector::Range {
+                    start: start.clone(),
+                    end: end.clone(),
+                },
+                0,
+            ))
+        }
+        PartitionSelectorRequest::Filter { filters } => {
+            if filters.is_empty() {
+                return Err(ApiError::bad_request("filter selector cannot be empty"));
+            }
+            if filters
+                .iter()
+                .any(|(key, value)| key.trim().is_empty() || value.trim().is_empty())
+            {
+                return Err(ApiError::bad_request(
+                    "filter selector keys and values must be non-empty",
+                ));
+            }
+            if filter_selector_bounds(filters).is_none() {
+                return Err(ApiError::bad_request(
+                    "filter selector requires start/end bounds",
+                ));
+            }
+            Ok((
+                PartitionSelector::Filter {
+                    filters: filters.clone(),
+                },
+                0,
+            ))
+        }
+    }
+}
+
+fn filter_selector_bounds(filters: &HashMap<String, String>) -> Option<(&str, &str)> {
+    let start = filters
+        .get("start")
+        .or_else(|| filters.get("partition_start"))?;
+    let end = filters
+        .get("end")
+        .or_else(|| filters.get("partition_end"))?;
+    Some((start.as_str(), end.as_str()))
 }
 
 #[derive(Serialize)]
@@ -1833,23 +2111,6 @@ impl From<&PartitionSelector> for BackfillFingerprintPartitionSelector {
     }
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LegacyBackfillFingerprintPayload {
-    asset_selection: Vec<String>,
-    partitions: Vec<String>,
-    chunk_size: u32,
-    max_concurrent_runs: u32,
-}
-
-struct BackfillCreateInput {
-    asset_selection: Vec<String>,
-    partition_selector: PartitionSelector,
-    total_partitions: u32,
-    chunk_size: u32,
-    max_concurrent_runs: u32,
-}
-
 fn compute_backfill_fingerprint(
     asset_selection: &[String],
     partition_selector: &PartitionSelector,
@@ -1863,34 +2124,115 @@ fn compute_backfill_fingerprint(
         max_concurrent_runs,
     };
     let json = serde_json::to_vec(&payload).map_err(|e| {
-        ApiError::internal(format!("failed to serialize backfill fingerprint: {e}"))
+        ApiError::internal(format!(
+            "failed to serialize backfill request fingerprint: {e}"
+        ))
     })?;
     let hash = Sha256::digest(&json);
     Ok(hex::encode(hash))
 }
 
-fn compute_legacy_backfill_fingerprint(
-    asset_selection: &[String],
-    partition_selector: &PartitionSelector,
-    chunk_size: u32,
-    max_concurrent_runs: u32,
-) -> Result<Option<String>, ApiError> {
-    let PartitionSelector::Explicit { partition_keys } = partition_selector else {
-        return Ok(None);
+/// Result of attempting to reserve an idempotency slot.
+enum IdempotencyReservation {
+    /// Slot reserved successfully; proceed with backfill creation.
+    Reserved,
+    /// Idempotent replay; return cached response.
+    Replay(CreateBackfillResponse),
+}
+
+/// Atomically reserve an idempotency slot before creating the backfill.
+///
+/// This prevents race conditions by storing the idempotency record BEFORE
+/// writing the event. If two concurrent requests have the same idempotency key,
+/// exactly one will succeed in reserving the slot.
+async fn reserve_backfill_idempotency(
+    storage: &ScopedStorage,
+    idempotency_key: Option<&str>,
+    request_fingerprint: &str,
+    requested_backfill_id: Option<&str>,
+    backfill_id: &str,
+    accepted_event_id: &str,
+    accepted_at: DateTime<Utc>,
+) -> Result<IdempotencyReservation, ApiError> {
+    let Some(key) = idempotency_key else {
+        return Ok(IdempotencyReservation::Reserved);
     };
-    let payload = LegacyBackfillFingerprintPayload {
-        asset_selection: asset_selection.to_vec(),
-        partitions: partition_keys.clone(),
-        chunk_size,
-        max_concurrent_runs,
+
+    let record = BackfillIdempotencyRecord {
+        idempotency_key: key.to_string(),
+        request_fingerprint: request_fingerprint.to_string(),
+        backfill_id: backfill_id.to_string(),
+        accepted_event_id: accepted_event_id.to_string(),
+        accepted_at,
     };
-    let json = serde_json::to_vec(&payload).map_err(|e| {
-        ApiError::internal(format!(
-            "failed to serialize legacy backfill fingerprint: {e}"
-        ))
-    })?;
-    let hash = Sha256::digest(&json);
-    Ok(Some(hex::encode(hash)))
+
+    let record_json = serde_json::to_string(&record)
+        .map_err(|e| ApiError::internal(format!("failed to serialize idempotency record: {e}")))?;
+    let record_path = backfill_idempotency_path(key);
+
+    // Attempt atomic reservation with CAS
+    let result = storage
+        .put_raw(
+            &record_path,
+            Bytes::from(record_json),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to store idempotency record: {e}")))?;
+
+    match result {
+        WriteResult::Success { .. } => {
+            // Successfully reserved the slot
+            Ok(IdempotencyReservation::Reserved)
+        }
+        WriteResult::PreconditionFailed { .. } => {
+            // Slot already taken - check if it's a valid replay or conflict
+            check_existing_idempotency_record(
+                storage,
+                key,
+                request_fingerprint,
+                requested_backfill_id,
+            )
+            .await
+        }
+    }
+}
+
+/// Check an existing idempotency record for replay or conflict.
+async fn check_existing_idempotency_record(
+    storage: &ScopedStorage,
+    idempotency_key: &str,
+    request_fingerprint: &str,
+    requested_backfill_id: Option<&str>,
+) -> Result<IdempotencyReservation, ApiError> {
+    let Some(existing) = load_backfill_idempotency_record(storage, idempotency_key).await? else {
+        // Record was deleted between CAS failure and read - rare but possible
+        // Return conflict to be safe; client can retry
+        return Err(ApiError::conflict(
+            "idempotency key reservation conflict; please retry",
+        ));
+    };
+
+    if let Some(requested_backfill_id) = requested_backfill_id {
+        if requested_backfill_id != existing.backfill_id {
+            return Err(ApiError::conflict(
+                "idempotency key already used for a different backfill",
+            ));
+        }
+    }
+
+    if existing.request_fingerprint == request_fingerprint {
+        return Ok(IdempotencyReservation::Replay(CreateBackfillResponse {
+            backfill_id: existing.backfill_id,
+            accepted_event_id: existing.accepted_event_id,
+            accepted_at: existing.accepted_at,
+            correlation_id: None,
+        }));
+    }
+
+    Err(ApiError::conflict(
+        "idempotency key already used for a different backfill request",
+    ))
 }
 
 async fn load_backfill_idempotency_record(
@@ -1902,189 +2244,15 @@ async fn load_backfill_idempotency_record(
         Ok(bytes) => {
             let record: BackfillIdempotencyRecord =
                 serde_json::from_slice(&bytes).map_err(|e| {
-                    ApiError::internal(format!("failed to parse backfill idempotency record: {e}"))
+                    ApiError::internal(format!("failed to parse idempotency record: {e}"))
                 })?;
             Ok(Some(record))
         }
         Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => Ok(None),
         Err(err) => Err(ApiError::internal(format!(
-            "failed to read backfill idempotency record: {err}"
+            "failed to read idempotency record: {err}"
         ))),
     }
-}
-
-async fn store_backfill_idempotency_record(
-    storage: &ScopedStorage,
-    record: &BackfillIdempotencyRecord,
-) -> Result<(), ApiError> {
-    let record_json = serde_json::to_string(record).map_err(|e| {
-        ApiError::internal(format!(
-            "failed to serialize backfill idempotency record: {e}"
-        ))
-    })?;
-    let record_path = backfill_idempotency_path(&record.idempotency_key);
-    let result = storage
-        .put_raw(
-            &record_path,
-            Bytes::from(record_json),
-            WritePrecondition::DoesNotExist,
-        )
-        .await
-        .map_err(|e| {
-            ApiError::internal(format!("failed to store backfill idempotency record: {e}"))
-        })?;
-
-    if matches!(result, WriteResult::PreconditionFailed { .. }) {
-        tracing::warn!(
-            idempotency_key = %record.idempotency_key,
-            backfill_id = %record.backfill_id,
-            "backfill idempotency record already exists after write"
-        );
-    }
-
-    Ok(())
-}
-
-fn parse_partition_selector(
-    selector: PartitionSelectorRequest,
-) -> Result<(PartitionSelector, u32), ApiError> {
-    match selector {
-        PartitionSelectorRequest::Explicit { partitions } => {
-            if partitions.is_empty() {
-                return Err(ApiError::bad_request("partition selector cannot be empty"));
-            }
-            if partitions.iter().any(String::is_empty) {
-                return Err(ApiError::bad_request("partition key cannot be empty"));
-            }
-            Ok((
-                PartitionSelector::Explicit {
-                    partition_keys: partitions.clone(),
-                },
-                u32::try_from(partitions.len()).unwrap_or(u32::MAX),
-            ))
-        }
-        PartitionSelectorRequest::Range { start, end } => {
-            if start.trim().is_empty() || end.trim().is_empty() {
-                return Err(ApiError::bad_request(
-                    "range selector requires start and end",
-                ));
-            }
-            Ok((PartitionSelector::Range { start, end }, 0))
-        }
-        PartitionSelectorRequest::Filter { filters } => {
-            if filters.is_empty() {
-                return Err(ApiError::bad_request("filter selector cannot be empty"));
-            }
-            if filters
-                .iter()
-                .any(|(key, value)| key.trim().is_empty() || value.trim().is_empty())
-            {
-                return Err(ApiError::bad_request(
-                    "filter selector keys and values must be non-empty",
-                ));
-            }
-            if filter_selector_bounds(&filters).is_none() {
-                return Err(ApiError::bad_request(
-                    "filter selector requires start/end bounds",
-                ));
-            }
-            Ok((PartitionSelector::Filter { filters }, 0))
-        }
-    }
-}
-
-fn filter_selector_bounds(filters: &HashMap<String, String>) -> Option<(&str, &str)> {
-    let start = filters
-        .get("start")
-        .or_else(|| filters.get("partition_start"))?;
-    let end = filters
-        .get("end")
-        .or_else(|| filters.get("partition_end"))?;
-    Some((start.as_str(), end.as_str()))
-}
-
-async fn resolve_backfill_idempotency(
-    storage: &ScopedStorage,
-    idempotency_key: &str,
-    fingerprint: &str,
-    compatibility_fingerprints: &[String],
-) -> Result<Option<CreateBackfillResponse>, ApiError> {
-    if let Some(existing) = load_backfill_idempotency_record(storage, idempotency_key).await? {
-        if existing.fingerprint == fingerprint
-            || compatibility_fingerprints
-                .iter()
-                .any(|value| value == &existing.fingerprint)
-        {
-            return Ok(Some(CreateBackfillResponse {
-                backfill_id: existing.backfill_id,
-                accepted_event_id: existing.accepted_event_id,
-                accepted_at: existing.accepted_at,
-            }));
-        }
-
-        return Err(ApiError::conflict(
-            "idempotency key already used for a different backfill",
-        ));
-    }
-
-    Ok(None)
-}
-
-async fn append_backfill_created_event(
-    state: &AppState,
-    ctx: &RequestContext,
-    workspace_id: &str,
-    input: BackfillCreateInput,
-    idempotency_key: &str,
-    storage: &ScopedStorage,
-    fingerprint: String,
-) -> Result<CreateBackfillResponse, ApiError> {
-    let backfill_id = Ulid::new().to_string();
-    let event = OrchestrationEvent::new(
-        &ctx.tenant,
-        workspace_id,
-        OrchestrationEventData::BackfillCreated {
-            backfill_id: backfill_id.clone(),
-            client_request_id: idempotency_key.to_string(),
-            asset_selection: input.asset_selection,
-            partition_selector: input.partition_selector,
-            total_partitions: input.total_partitions,
-            chunk_size: input.chunk_size,
-            max_concurrent_runs: input.max_concurrent_runs,
-            parent_backfill_id: None,
-        },
-    );
-
-    let accepted_event_id = event.event_id.clone();
-    let accepted_at = event.timestamp;
-
-    let ledger = LedgerWriter::new(storage.clone());
-    let event_path = LedgerWriter::event_path(&event);
-    ledger
-        .append(event)
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to write BackfillCreated event: {e}")))?;
-
-    compact_orchestration_events(&state.config, storage.clone(), vec![event_path]).await?;
-
-    let record = BackfillIdempotencyRecord {
-        idempotency_key: idempotency_key.to_string(),
-        backfill_id: backfill_id.clone(),
-        accepted_event_id: accepted_event_id.clone(),
-        accepted_at,
-        fingerprint,
-    };
-    store_backfill_idempotency_record(storage, &record).await?;
-
-    Ok(CreateBackfillResponse {
-        backfill_id,
-        accepted_event_id,
-        accepted_at,
-    })
-}
-
-fn user_id_for_events(ctx: &RequestContext) -> String {
-    ctx.user_id.clone().unwrap_or_else(|| "api".to_string())
 }
 
 async fn load_orchestration_state(
@@ -2101,10 +2269,36 @@ async fn load_orchestration_state(
     Ok(fold_state)
 }
 
+#[derive(Clone)]
 struct RunEventOverrides {
     run_event_id: String,
     plan_event_id: String,
     created_at: DateTime<Utc>,
+}
+
+fn generate_monotonic_event_ids(created_at: DateTime<Utc>) -> Result<(String, String), ApiError> {
+    let millis = u64::try_from(created_at.timestamp_millis())
+        .map_err(|_| ApiError::internal("event timestamp before unix epoch"))?;
+    let event_time = std::time::UNIX_EPOCH + Duration::from_millis(millis);
+    let mut generator = Generator::new();
+    let run_event_id = generator
+        .generate_from_datetime(event_time)
+        .map_err(|err| ApiError::internal(format!("failed to generate run event id: {err}")))?
+        .to_string();
+    let plan_event_id = generator
+        .generate_from_datetime(event_time)
+        .map_err(|err| ApiError::internal(format!("failed to generate plan event id: {err}")))?
+        .to_string();
+    Ok((run_event_id, plan_event_id))
+}
+
+fn new_run_event_overrides(created_at: DateTime<Utc>) -> Result<RunEventOverrides, ApiError> {
+    let (run_event_id, plan_event_id) = generate_monotonic_event_ids(created_at)?;
+    Ok(RunEventOverrides {
+        run_event_id,
+        plan_event_id,
+        created_at,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2122,6 +2316,11 @@ async fn append_run_events(
     tasks: Vec<TaskDef>,
     overrides: Option<RunEventOverrides>,
 ) -> Result<Vec<String>, ApiError> {
+    let overrides = match overrides {
+        Some(overrides) => overrides,
+        None => new_run_event_overrides(Utc::now())?,
+    };
+
     let mut run_triggered = OrchestrationEvent::new(
         tenant_id,
         workspace_id,
@@ -2136,13 +2335,11 @@ async fn append_run_events(
         },
     );
 
-    if let Some(ref overrides) = overrides {
-        apply_event_metadata(
-            &mut run_triggered,
-            &overrides.run_event_id,
-            overrides.created_at,
-        );
-    }
+    apply_event_metadata(
+        &mut run_triggered,
+        &overrides.run_event_id,
+        overrides.created_at,
+    );
 
     let run_event_path = LedgerWriter::event_path(&run_triggered);
     ledger
@@ -2160,13 +2357,11 @@ async fn append_run_events(
         },
     );
 
-    if let Some(ref overrides) = overrides {
-        apply_event_metadata(
-            &mut plan_created,
-            &overrides.plan_event_id,
-            overrides.created_at,
-        );
-    }
+    apply_event_metadata(
+        &mut plan_created,
+        &overrides.plan_event_id,
+        overrides.created_at,
+    );
 
     let plan_event_path = LedgerWriter::event_path(&plan_created);
     ledger
@@ -3245,7 +3440,7 @@ fn map_sensor_eval(row: &SensorEvalRow) -> SensorEvalResponse {
         cursor_after: row.cursor_after.clone(),
         evaluated_at: row.evaluated_at,
         status: map_sensor_eval_status(&row.status),
-        run_requests_count: u32::try_from(row.run_requests.len()).unwrap_or(u32::MAX),
+        run_requests_count: usize_to_u32_saturating(row.run_requests.len()),
     }
 }
 
@@ -3277,7 +3472,7 @@ fn map_partition_selector(selector: &PartitionSelector) -> PartitionSelectorResp
 
 fn build_chunk_counts(chunks: &[&BackfillChunkRow]) -> ChunkCounts {
     let mut counts = ChunkCounts {
-        total: u32::try_from(chunks.len()).unwrap_or(u32::MAX),
+        total: usize_to_u32_saturating(chunks.len()),
         ..Default::default()
     };
 
@@ -3377,6 +3572,10 @@ fn map_partition_status(row: &PartitionStatusRow) -> PartitionStatusApiResponse 
     }
 }
 
+fn usize_to_u32_saturating(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 fn paginate<T: Clone>(items: &[T], limit: usize, offset: usize) -> (Vec<T>, Option<String>) {
     let end = (offset + limit).min(items.len());
     let page = items.get(offset..end).unwrap_or_default().to_vec();
@@ -3395,6 +3594,66 @@ fn filter_ticks_by_status(
     if let Some(filter) = status {
         ticks.retain(|tick| tick.status == filter);
     }
+}
+
+fn filter_ticks_by_time_range(
+    ticks: &mut Vec<ScheduleTickResponse>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) {
+    if since.is_none() && until.is_none() {
+        return;
+    }
+
+    ticks.retain(|tick| {
+        let after_since = since.is_none_or(|since| tick.scheduled_for >= since);
+        let before_until = until.is_none_or(|until| tick.scheduled_for <= until);
+        after_since && before_until
+    });
+}
+
+fn filter_sensor_evals_by_status(
+    evals: &mut Vec<SensorEvalResponse>,
+    status: Option<SensorEvalStatusFilter>,
+) {
+    let Some(filter) = status else {
+        return;
+    };
+
+    evals.retain(|eval| {
+        matches!(
+            (&eval.status, filter),
+            (
+                SensorEvalStatusResponse::Triggered,
+                SensorEvalStatusFilter::Triggered
+            ) | (
+                SensorEvalStatusResponse::NoNewData,
+                SensorEvalStatusFilter::NoNewData
+            ) | (
+                SensorEvalStatusResponse::Error { .. },
+                SensorEvalStatusFilter::Error
+            ) | (
+                SensorEvalStatusResponse::SkippedStaleCursor,
+                SensorEvalStatusFilter::SkippedStaleCursor
+            )
+        )
+    });
+}
+
+fn filter_sensor_evals_by_time_range(
+    evals: &mut Vec<SensorEvalResponse>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) {
+    if since.is_none() && until.is_none() {
+        return;
+    }
+
+    evals.retain(|eval| {
+        let after_since = since.is_none_or(|since| eval.evaluated_at >= since);
+        let before_until = until.is_none_or(|until| eval.evaluated_at <= until);
+        after_since && before_until
+    });
 }
 
 // ============================================================================
@@ -3453,12 +3712,15 @@ pub(crate) async fn trigger_run(
     let run_id = Ulid::new().to_string();
     let plan_id = Ulid::new().to_string();
     let now = Utc::now();
+    let correlation_id = ctx.request_id.clone();
 
     // Create storage for reservation and ledger
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
     let ledger = LedgerWriter::new(storage.clone());
     let mut run_event_overrides: Option<RunEventOverrides> = None;
+    let mut accepted_event_id: Option<String> = None;
+    let mut accepted_at: Option<DateTime<Utc>> = None;
 
     let has_partition_request = request.partition_key.is_some() || !request.partitions.is_empty();
     let mut plan_context: Option<RunPlanContext> = None;
@@ -3608,6 +3870,9 @@ pub(crate) async fn trigger_run(
                     state: run_state,
                     created: false,
                     created_at: existing.created_at,
+                    accepted_event_id: existing.event_id,
+                    accepted_at: existing.created_at,
+                    correlation_id: Some(correlation_id),
                 }),
             ));
         }
@@ -3621,14 +3886,13 @@ pub(crate) async fn trigger_run(
             plan_context = Some(load_run_plan_context(&storage, &request).await?);
         }
 
-        let run_event_id = Ulid::new().to_string();
-        let plan_event_id = Ulid::new().to_string();
+        let generated_overrides = new_run_event_overrides(now)?;
         let reservation = RunKeyReservation {
             run_key: run_key.clone(),
             run_id: run_id.clone(),
             plan_id: plan_id.clone(),
-            event_id: run_event_id.clone(),
-            plan_event_id: Some(plan_event_id.clone()),
+            event_id: generated_overrides.run_event_id.clone(),
+            plan_event_id: Some(generated_overrides.plan_event_id.clone()),
             request_fingerprint: request_fingerprint.clone(),
             created_at: now,
         };
@@ -3647,11 +3911,9 @@ pub(crate) async fn trigger_run(
             ReservationResult::Reserved => {
                 // We won the race - proceed to emit events
                 tracing::debug!(run_key = %run_key, "run_key reserved, proceeding with run creation");
-                run_event_overrides = Some(RunEventOverrides {
-                    run_event_id,
-                    plan_event_id,
-                    created_at: now,
-                });
+                accepted_event_id = Some(generated_overrides.run_event_id.clone());
+                accepted_at = Some(now);
+                run_event_overrides = Some(generated_overrides);
             }
             ReservationResult::AlreadyExists(existing) => {
                 if let (Some(existing_fp), Some(_)) = (
@@ -3763,6 +4025,9 @@ pub(crate) async fn trigger_run(
                         state: run_state,
                         created: false,
                         created_at: existing.created_at,
+                        accepted_event_id: existing.event_id,
+                        accepted_at: existing.created_at,
+                        correlation_id: Some(correlation_id),
                     }),
                 ));
             }
@@ -3799,15 +4064,12 @@ pub(crate) async fn trigger_run(
         resolved_partition_key.canonical(),
     )?;
 
-    tracing::info!(
-        manifest_id = %plan_context_ref.manifest_id,
-        manifest_deployed_at = %plan_context_ref.deployed_at,
-        root_assets = ?plan_context_ref.root_assets,
-        include_upstream = request.include_upstream,
-        include_downstream = request.include_downstream,
-        planned_tasks = tasks.len(),
-        "planning run from latest manifest"
-    );
+    if request.run_key.is_none() {
+        let generated_overrides = new_run_event_overrides(now)?;
+        accepted_event_id = Some(generated_overrides.run_event_id.clone());
+        accepted_at = Some(now);
+        run_event_overrides = Some(generated_overrides);
+    }
 
     let event_paths = append_run_events(
         &ledger,
@@ -3827,6 +4089,11 @@ pub(crate) async fn trigger_run(
 
     compact_orchestration_events(&state.config, storage.clone(), event_paths).await?;
 
+    let accepted_event_id =
+        accepted_event_id.ok_or_else(|| ApiError::internal("missing accepted_event_id for run"))?;
+    let accepted_at =
+        accepted_at.ok_or_else(|| ApiError::internal("missing accepted_at for run"))?;
+
     Ok((
         StatusCode::CREATED,
         Json(TriggerRunResponse {
@@ -3835,6 +4102,9 @@ pub(crate) async fn trigger_run(
             state: RunStateResponse::Pending,
             created: true,
             created_at: now,
+            accepted_event_id,
+            accepted_at,
+            correlation_id: Some(correlation_id),
         }),
     ))
 }
@@ -4015,15 +4285,14 @@ pub(crate) async fn rerun_run(
     let fingerprint_policy =
         FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff);
 
-    let run_event_id = Ulid::new().to_string();
-    let plan_event_id = Ulid::new().to_string();
+    let generated_overrides = new_run_event_overrides(now)?;
 
     let reservation = RunKeyReservation {
         run_key: run_key.clone(),
         run_id: run_id.clone(),
         plan_id: plan_id.clone(),
-        event_id: run_event_id.clone(),
-        plan_event_id: Some(plan_event_id.clone()),
+        event_id: generated_overrides.run_event_id.clone(),
+        plan_event_id: Some(generated_overrides.plan_event_id.clone()),
         request_fingerprint: request_fingerprint.clone(),
         created_at: now,
     };
@@ -4032,11 +4301,7 @@ pub(crate) async fn rerun_run(
         .await
         .map_err(|e| ApiError::internal(format!("failed to reserve run_key: {e}")))?
     {
-        ReservationResult::Reserved => Some(RunEventOverrides {
-            run_event_id,
-            plan_event_id,
-            created_at: now,
-        }),
+        ReservationResult::Reserved => Some(generated_overrides),
         ReservationResult::AlreadyExists(existing) => {
             let mut run_state = RunStateResponse::Pending;
             let mut run_found = false;
@@ -5142,6 +5407,8 @@ pub(crate) async fn get_schedule_tick(
         ("schedule_id" = String, Path, description = "Schedule ID"),
         ("limit" = Option<u32>, Query, description = "Maximum ticks to return"),
         ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("since" = Option<DateTime<Utc>>, Query, description = "Filter ticks after this timestamp (inclusive)"),
+        ("until" = Option<DateTime<Utc>>, Query, description = "Filter ticks before this timestamp (inclusive)"),
         ("status" = Option<TickStatusResponse>, Query, description = "Filter by status"),
     ),
     responses(
@@ -5170,11 +5437,8 @@ pub(crate) async fn list_schedule_ticks(
         .map(map_schedule_tick)
         .collect();
     filter_ticks_by_status(&mut ticks, query.status);
-    ticks.sort_by(|a, b| {
-        b.scheduled_for
-            .cmp(&a.scheduled_for)
-            .then_with(|| b.tick_id.cmp(&a.tick_id))
-    });
+    filter_ticks_by_time_range(&mut ticks, query.since, query.until);
+    ticks.sort_by(|a, b| b.scheduled_for.cmp(&a.scheduled_for));
 
     let (page, next_cursor) = paginate(&ticks, limit, offset);
 
@@ -5271,6 +5535,9 @@ pub(crate) async fn get_sensor(
         ("sensor_id" = String, Path, description = "Sensor ID"),
         ("limit" = Option<u32>, Query, description = "Maximum evaluations to return"),
         ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("since" = Option<DateTime<Utc>>, Query, description = "Filter evaluations after this timestamp (inclusive)"),
+        ("until" = Option<DateTime<Utc>>, Query, description = "Filter evaluations before this timestamp (inclusive)"),
+        ("status" = Option<SensorEvalStatusFilter>, Query, description = "Filter by status"),
     ),
     responses(
         (status = 200, description = "List of evaluations", body = ListSensorEvalsResponse),
@@ -5282,7 +5549,7 @@ pub(crate) async fn list_sensor_evals(
     State(state): State<Arc<AppState>>,
     ctx: RequestContext,
     Path((workspace_id, sensor_id)): Path<(String, String)>,
-    AxumQuery(query): AxumQuery<ListQuery>,
+    AxumQuery(query): AxumQuery<ListSensorEvalsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
     let (limit, offset) = parse_pagination(
@@ -5297,6 +5564,8 @@ pub(crate) async fn list_sensor_evals(
         .filter(|e| e.sensor_id == sensor_id)
         .map(map_sensor_eval)
         .collect();
+    filter_sensor_evals_by_status(&mut evals, query.status);
+    filter_sensor_evals_by_time_range(&mut evals, query.since, query.until);
     evals.sort_by(|a, b| b.evaluated_at.cmp(&a.evaluated_at));
 
     let (page, next_cursor) = paginate(&evals, limit, offset);
@@ -5311,7 +5580,7 @@ pub(crate) async fn list_sensor_evals(
 // Backfill Routes
 // ============================================================================
 
-/// Create a new backfill.
+/// Create a backfill.
 #[utoipa::path(
     post,
     path = "/api/v1/workspaces/{workspace_id}/backfills",
@@ -5320,11 +5589,11 @@ pub(crate) async fn list_sensor_evals(
     ),
     request_body = CreateBackfillRequest,
     responses(
-        (status = 202, description = "Backfill accepted", body = CreateBackfillResponse),
-        (status = 200, description = "Existing backfill returned", body = CreateBackfillResponse),
+        (status = 202, description = "Backfill created", body = CreateBackfillResponse),
+        (status = 200, description = "Idempotent backfill replay", body = CreateBackfillResponse),
         (status = 400, description = "Invalid request", body = ApiErrorBody),
-        (status = 409, description = "Idempotency conflict", body = ApiErrorBody),
         (status = 404, description = "Workspace not found", body = ApiErrorBody),
+        (status = 409, description = "Idempotency key conflict", body = ApiErrorBody),
     ),
     tag = "Orchestration",
     security(("bearerAuth" = []))
@@ -5334,90 +5603,119 @@ pub(crate) async fn create_backfill(
     ctx: RequestContext,
     Path(workspace_id): Path<String>,
     Json(request): Json<CreateBackfillRequest>,
-) -> Result<Response, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
+    let span = tracing::info_span!(
+        "create_backfill",
+        workspace_id = %workspace_id,
+        backfill_id = tracing::field::Empty,
+    );
+    let _guard = span.enter();
+
+    tracing::info!(
+        asset_selection = ?request.asset_selection,
+        "Creating backfill"
+    );
+
+    // Validate request
     ensure_workspace(&ctx, &workspace_id)?;
-
-    let CreateBackfillRequest {
-        asset_selection,
-        partition_selector,
-        client_request_id,
+    validate_backfill_asset_selection(&request.asset_selection)?;
+    let (partition_selector, total_partitions) =
+        parse_partition_selector(&request.partition_selector)?;
+    let chunk_size = resolve_backfill_chunk_size(request.chunk_size)?;
+    let max_concurrent_runs = resolve_backfill_max_concurrent(request.max_concurrent_runs)?;
+    let request_fingerprint = compute_backfill_fingerprint(
+        &request.asset_selection,
+        &partition_selector,
         chunk_size,
         max_concurrent_runs,
-    } = request;
-
-    if asset_selection.is_empty() {
-        return Err(ApiError::bad_request("assetSelection cannot be empty"));
-    }
-
-    if asset_selection.len() > 1 {
-        return Err(ApiError::bad_request(
-            "multi-asset backfills are not supported yet",
-        ));
-    }
-
-    let idempotency_key = client_request_id
-        .or_else(|| ctx.idempotency_key.clone())
-        .ok_or_else(|| ApiError::bad_request("clientRequestId or Idempotency-Key is required"))?;
-
-    let (partition_selector, total_partitions) = parse_partition_selector(partition_selector)?;
-
-    let chunk_size = match chunk_size {
-        Some(0) | None => DEFAULT_BACKFILL_CHUNK_SIZE,
-        Some(value) => value,
-    };
-    let max_concurrent_runs = match max_concurrent_runs {
-        Some(0) | None => DEFAULT_BACKFILL_MAX_CONCURRENT_RUNS,
-        Some(value) => value,
-    };
-    let input = BackfillCreateInput {
-        asset_selection,
-        partition_selector,
-        total_partitions,
-        chunk_size,
-        max_concurrent_runs,
-    };
-
-    let fingerprint = compute_backfill_fingerprint(
-        &input.asset_selection,
-        &input.partition_selector,
-        input.chunk_size,
-        input.max_concurrent_runs,
     )?;
-    let compatibility_fingerprints = compute_legacy_backfill_fingerprint(
-        &input.asset_selection,
-        &input.partition_selector,
-        input.chunk_size,
-        input.max_concurrent_runs,
-    )?
-    .into_iter()
-    .collect::<Vec<_>>();
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
+    let idempotency_key = resolve_backfill_idempotency_key(&ctx, &request);
 
-    if let Some(existing) = resolve_backfill_idempotency(
+    // Generate identifiers upfront so we can reserve idempotency slot atomically
+    let backfill_id = request
+        .backfill_id
+        .clone()
+        .unwrap_or_else(|| Ulid::new().to_string());
+    let accepted_event_id = Ulid::new().to_string();
+    let accepted_at = Utc::now();
+    let correlation_id = ctx.request_id.clone();
+
+    tracing::Span::current().record("backfill_id", &backfill_id);
+
+    // Atomically reserve idempotency slot BEFORE writing event
+    // This prevents race conditions where two concurrent requests both create backfills
+    match reserve_backfill_idempotency(
         &storage,
-        &idempotency_key,
-        &fingerprint,
-        &compatibility_fingerprints,
+        idempotency_key.as_deref(),
+        &request_fingerprint,
+        request.backfill_id.as_deref(),
+        &backfill_id,
+        &accepted_event_id,
+        accepted_at,
     )
     .await?
     {
-        return Ok((StatusCode::OK, Json(existing)).into_response());
+        IdempotencyReservation::Replay(response) => {
+            tracing::info!(
+                backfill_id = %response.backfill_id,
+                "Idempotent replay - returning cached response"
+            );
+            return Ok((StatusCode::OK, Json(response)));
+        }
+        IdempotencyReservation::Reserved => {
+            // Proceed with backfill creation
+        }
     }
 
-    let response = append_backfill_created_event(
-        state.as_ref(),
-        &ctx,
-        &workspace_id,
-        input,
-        &idempotency_key,
-        &storage,
-        fingerprint,
-    )
-    .await?;
+    // Build and write the event
+    let client_request_id =
+        resolve_backfill_client_request_id(idempotency_key.as_deref(), &request);
 
-    Ok((StatusCode::ACCEPTED, Json(response)).into_response())
+    let mut event = OrchestrationEvent::new(
+        &ctx.tenant,
+        &workspace_id,
+        OrchestrationEventData::BackfillCreated {
+            backfill_id: backfill_id.clone(),
+            client_request_id,
+            asset_selection: request.asset_selection.clone(),
+            partition_selector,
+            total_partitions,
+            chunk_size,
+            max_concurrent_runs,
+            parent_backfill_id: None,
+        },
+    );
+    // Use the pre-generated event_id and timestamp for consistency with idempotency record
+    event.event_id.clone_from(&accepted_event_id);
+    event.timestamp = accepted_at;
+
+    let event_path = LedgerWriter::event_path(&event);
+
+    let ledger = LedgerWriter::new(storage.clone());
+    ledger
+        .append(event)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to write BackfillCreated event: {e}")))?;
+
+    compact_orchestration_events(&state.config, storage.clone(), vec![event_path]).await?;
+
+    tracing::info!(
+        accepted_event_id = %accepted_event_id,
+        "Backfill created successfully"
+    );
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(CreateBackfillResponse {
+            backfill_id,
+            accepted_event_id,
+            accepted_at,
+            correlation_id: Some(correlation_id),
+        }),
+    ))
 }
 
 /// List backfills.
@@ -5482,11 +5780,14 @@ pub(crate) async fn list_backfills(
     path = "/api/v1/workspaces/{workspace_id}/backfills/{backfill_id}",
     params(
         ("workspace_id" = String, Path, description = "Workspace ID"),
-        ("backfill_id" = String, Path, description = "Backfill ID")
+        ("backfill_id" = String, Path, description = "Backfill ID"),
+        ("waitForEventId" = Option<String>, Query, description = "Wait until this event ID is processed"),
+        ("timeoutMs" = Option<u64>, Query, description = "Timeout in milliseconds (defaults to 5000)")
     ),
     responses(
         (status = 200, description = "Backfill details", body = BackfillResponse),
         (status = 404, description = "Backfill not found", body = ApiErrorBody),
+        (status = 408, description = "Timed out waiting for event", body = ApiErrorBody),
     ),
     tag = "Orchestration",
     security(("bearerAuth" = []))
@@ -5495,8 +5796,19 @@ pub(crate) async fn get_backfill(
     State(state): State<Arc<AppState>>,
     ctx: RequestContext,
     Path((workspace_id, backfill_id)): Path<(String, String)>,
+    AxumQuery(query): AxumQuery<WaitForEventQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
+
+    if let Some(ref event_id) = query.wait_for_event_id {
+        let timeout_ms = query
+            .timeout_ms
+            .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
+            .min(MAX_WAIT_TIMEOUT_MS);
+        let timeout = Duration::from_millis(timeout_ms);
+        wait_for_event_processed(&ctx, &state, event_id, timeout).await?;
+    }
+
     let fold_state = load_orchestration_state(&ctx, &state).await?;
 
     let backfill = fold_state
@@ -5672,21 +5984,19 @@ pub(crate) async fn get_asset_partition_summary(
         )));
     }
 
-    let total = u32::try_from(partitions.len()).unwrap_or(u32::MAX);
-    let materialized = u32::try_from(
+    let total = usize_to_u32_saturating(partitions.len());
+    let materialized = usize_to_u32_saturating(
         partitions
             .iter()
             .filter(|p| p.last_materialization_run_id.is_some())
             .count(),
-    )
-    .unwrap_or(u32::MAX);
-    let stale_count = u32::try_from(
+    );
+    let stale_count = usize_to_u32_saturating(
         partitions
             .iter()
             .filter(|p| p.stale_since.is_some())
             .count(),
-    )
-    .unwrap_or(u32::MAX);
+    );
     let missing = total.saturating_sub(materialized);
 
     Ok(Json(AssetPartitionSummaryResponse {
@@ -5794,7 +6104,7 @@ mod tests {
     use arco_core::partition::{PartitionKey, ScalarValue};
     use axum::http::StatusCode;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    use chrono::Duration;
+    use chrono::{Duration, TimeZone};
     use serde_json::json;
 
     fn hash_trigger_fingerprint_payload(
@@ -6397,211 +6707,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_partition_selector_rejects_filter_without_bounds() {
-        let mut filters = HashMap::new();
-        filters.insert("region".to_string(), "us-*".to_string());
-
-        let err = parse_partition_selector(PartitionSelectorRequest::Filter { filters })
-            .expect_err("expected bounds validation error");
-        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(err.message(), "filter selector requires start/end bounds");
-    }
-
-    #[test]
-    fn test_compute_backfill_fingerprint_is_deterministic_for_filter_selector() -> Result<()> {
-        let mut first = HashMap::new();
-        first.insert("partition_end".to_string(), "2025-01-10".to_string());
-        first.insert("region".to_string(), "us-*".to_string());
-        first.insert("partition_start".to_string(), "2025-01-01".to_string());
-
-        let mut second = HashMap::new();
-        second.insert("partition_start".to_string(), "2025-01-01".to_string());
-        second.insert("region".to_string(), "us-*".to_string());
-        second.insert("partition_end".to_string(), "2025-01-10".to_string());
-
-        let selector_a = PartitionSelector::Filter { filters: first };
-        let selector_b = PartitionSelector::Filter { filters: second };
-        let asset_selection = vec!["analytics.daily".to_string()];
-
-        let fingerprint_a = compute_backfill_fingerprint(&asset_selection, &selector_a, 10, 2)
-            .map_err(|err| anyhow!("{err:?}"))?;
-        let fingerprint_b = compute_backfill_fingerprint(&asset_selection, &selector_b, 10, 2)
-            .map_err(|err| anyhow!("{err:?}"))?;
-
-        assert_eq!(
-            fingerprint_a, fingerprint_b,
-            "fingerprint must be stable across equivalent filter map orderings"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_create_backfill_accepts_legacy_explicit_idempotency_fingerprint() -> Result<()> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct LegacyBackfillFingerprintPayload {
-            asset_selection: Vec<String>,
-            partitions: Vec<String>,
-            chunk_size: u32,
-            max_concurrent_runs: u32,
-        }
-
-        fn legacy_backfill_fingerprint(
-            asset_selection: &[String],
-            partitions: &[String],
-            chunk_size: u32,
-            max_concurrent_runs: u32,
-        ) -> Result<String> {
-            let payload = LegacyBackfillFingerprintPayload {
-                asset_selection: asset_selection.to_vec(),
-                partitions: partitions.to_vec(),
-                chunk_size,
-                max_concurrent_runs,
-            };
-            let json = serde_json::to_vec(&payload)?;
-            Ok(hex::encode(Sha256::digest(&json)))
-        }
-
-        let mut config = crate::config::Config::default();
-        config.debug = true;
-        let state = Arc::new(AppState::with_memory_storage(config));
-
-        let ctx = RequestContext {
-            tenant: "tenant".to_string(),
-            workspace: "workspace".to_string(),
-            user_id: Some("user@example.com".to_string()),
-            groups: vec![],
-            request_id: "req_legacy_01".to_string(),
-            idempotency_key: None,
-        };
-
-        let asset_selection = vec!["analytics.daily".to_string()];
-        let partitions = vec!["2025-01-01".to_string(), "2025-01-02".to_string()];
-        let legacy_fingerprint = legacy_backfill_fingerprint(&asset_selection, &partitions, 10, 2)?;
-        let accepted_at = Utc::now();
-
-        let record = BackfillIdempotencyRecord {
-            idempotency_key: "legacy_idem_01".to_string(),
-            backfill_id: "bf_legacy_existing".to_string(),
-            accepted_event_id: "evt_legacy_existing".to_string(),
-            accepted_at,
-            fingerprint: legacy_fingerprint,
-        };
-
-        let backend = state.storage_backend().map_err(|err| anyhow!("{err:?}"))?;
-        let storage = ctx
-            .scoped_storage(backend)
-            .map_err(|err| anyhow!("{err:?}"))?;
-        store_backfill_idempotency_record(&storage, &record)
-            .await
-            .map_err(|err| anyhow!("{err:?}"))?;
-
-        let request = CreateBackfillRequest {
-            asset_selection,
-            partition_selector: PartitionSelectorRequest::Explicit { partitions },
-            client_request_id: Some("legacy_idem_01".to_string()),
-            chunk_size: None,
-            max_concurrent_runs: None,
-        };
-
-        let response = create_backfill(
-            State(state),
-            ctx.clone(),
-            Path(ctx.workspace.clone()),
-            Json(request),
-        )
-        .await
-        .map_err(|err| anyhow!("{err:?}"))?;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await?;
-        let payload: CreateBackfillResponse = serde_json::from_slice(&body)?;
-        assert_eq!(payload.backfill_id, "bf_legacy_existing");
-        assert_eq!(payload.accepted_event_id, "evt_legacy_existing");
-        assert_eq!(payload.accepted_at, accepted_at);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_create_backfill_accepts_range_selector() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
-        let state = Arc::new(AppState::with_memory_storage(config));
-
-        let ctx = RequestContext {
-            tenant: "tenant".to_string(),
-            workspace: "workspace".to_string(),
-            user_id: Some("user@example.com".to_string()),
-            groups: vec![],
-            request_id: "req_01".to_string(),
-            idempotency_key: None,
-        };
-
-        let request = CreateBackfillRequest {
-            asset_selection: vec!["analytics.daily".to_string()],
-            partition_selector: PartitionSelectorRequest::Range {
-                start: "2025-01-01".to_string(),
-                end: "2025-01-03".to_string(),
-            },
-            client_request_id: Some("bf_range_001".to_string()),
-            chunk_size: Some(2),
-            max_concurrent_runs: Some(1),
-        };
-
-        let response = create_backfill(
-            State(state),
-            ctx.clone(),
-            Path(ctx.workspace.clone()),
-            Json(request),
-        )
-        .await
-        .map_err(|err| anyhow!("{err:?}"))?;
-
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_create_backfill_accepts_filter_selector() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
-        let state = Arc::new(AppState::with_memory_storage(config));
-
-        let ctx = RequestContext {
-            tenant: "tenant".to_string(),
-            workspace: "workspace".to_string(),
-            user_id: Some("user@example.com".to_string()),
-            groups: vec![],
-            request_id: "req_01".to_string(),
-            idempotency_key: None,
-        };
-
-        let mut filters = HashMap::new();
-        filters.insert("start".to_string(), "2025-01-01".to_string());
-        filters.insert("end".to_string(), "2025-01-03".to_string());
-
-        let request = CreateBackfillRequest {
-            asset_selection: vec!["analytics.daily".to_string()],
-            partition_selector: PartitionSelectorRequest::Filter { filters },
-            client_request_id: Some("bf_filter_001".to_string()),
-            chunk_size: Some(2),
-            max_concurrent_runs: Some(1),
-        };
-
-        let response = create_backfill(
-            State(state),
-            ctx.clone(),
-            Path(ctx.workspace.clone()),
-            Json(request),
-        )
-        .await
-        .map_err(|err| anyhow!("{err:?}"))?;
-
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        Ok(())
-    }
-
-    #[test]
     fn test_build_chunk_counts_index_groups_by_backfill() {
         let rows = vec![
             BackfillChunkRow {
@@ -6714,6 +6819,99 @@ mod tests {
 
         assert_eq!(ticks.len(), 1);
         assert_eq!(ticks[0].status, TickStatusResponse::Failed);
+    }
+
+    #[test]
+    fn test_filter_ticks_by_time_range_inclusive() {
+        let base = Utc.with_ymd_and_hms(2025, 1, 3, 0, 0, 0).unwrap();
+        let mut ticks = vec![
+            ScheduleTickResponse {
+                tick_id: "tick_1".to_string(),
+                schedule_id: "sched".to_string(),
+                scheduled_for: base - Duration::days(2),
+                asset_selection: vec![],
+                status: TickStatusResponse::Triggered,
+                skip_reason: None,
+                error_message: None,
+                run_key: None,
+                run_id: None,
+            },
+            ScheduleTickResponse {
+                tick_id: "tick_2".to_string(),
+                schedule_id: "sched".to_string(),
+                scheduled_for: base - Duration::days(1),
+                asset_selection: vec![],
+                status: TickStatusResponse::Triggered,
+                skip_reason: None,
+                error_message: None,
+                run_key: None,
+                run_id: None,
+            },
+            ScheduleTickResponse {
+                tick_id: "tick_3".to_string(),
+                schedule_id: "sched".to_string(),
+                scheduled_for: base,
+                asset_selection: vec![],
+                status: TickStatusResponse::Triggered,
+                skip_reason: None,
+                error_message: None,
+                run_key: None,
+                run_id: None,
+            },
+        ];
+
+        let since = base - Duration::days(1);
+        let until = base;
+        filter_ticks_by_time_range(&mut ticks, Some(since), Some(until));
+
+        assert_eq!(ticks.len(), 2);
+        assert!(
+            ticks
+                .iter()
+                .all(|tick| tick.scheduled_for >= since && tick.scheduled_for <= until)
+        );
+    }
+
+    #[test]
+    fn test_filter_sensor_evals_by_time_range_and_status() {
+        let base = Utc.with_ymd_and_hms(2025, 2, 1, 12, 0, 0).unwrap();
+        let mut evals = vec![
+            SensorEvalResponse {
+                eval_id: "eval_1".to_string(),
+                sensor_id: "sensor".to_string(),
+                cursor_before: None,
+                cursor_after: None,
+                evaluated_at: base - Duration::days(2),
+                status: SensorEvalStatusResponse::Triggered,
+                run_requests_count: 1,
+            },
+            SensorEvalResponse {
+                eval_id: "eval_2".to_string(),
+                sensor_id: "sensor".to_string(),
+                cursor_before: None,
+                cursor_after: None,
+                evaluated_at: base - Duration::days(1),
+                status: SensorEvalStatusResponse::NoNewData,
+                run_requests_count: 0,
+            },
+            SensorEvalResponse {
+                eval_id: "eval_3".to_string(),
+                sensor_id: "sensor".to_string(),
+                cursor_before: None,
+                cursor_after: None,
+                evaluated_at: base,
+                status: SensorEvalStatusResponse::Triggered,
+                run_requests_count: 2,
+            },
+        ];
+
+        let since = base - Duration::days(1);
+        let until = base;
+        filter_sensor_evals_by_status(&mut evals, Some(SensorEvalStatusFilter::Triggered));
+        filter_sensor_evals_by_time_range(&mut evals, Some(since), Some(until));
+
+        assert_eq!(evals.len(), 1);
+        assert_eq!(evals[0].eval_id, "eval_3");
     }
 
     #[test]
@@ -6902,8 +7100,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_trigger_run_reemits_when_reservation_exists() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..crate::config::Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
@@ -7086,8 +7286,10 @@ mod tests {
     #[tokio::test]
     async fn test_trigger_run_normalizes_reserve_run_key_fingerprint_mismatch_for_equivalent_variants()
     -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..crate::config::Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
@@ -7179,8 +7381,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_trigger_run_conflicts_on_fingerprint_mismatch() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..crate::config::Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
@@ -7254,8 +7458,10 @@ mod tests {
     #[tokio::test]
     async fn test_trigger_run_falls_back_to_scan_when_index_points_to_missing_manifest()
     -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..crate::config::Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
@@ -7350,9 +7556,11 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_run_key_updates_missing_fingerprint() -> Result<()> {
         let cutoff = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let mut config = crate::config::Config::default();
-        config.debug = true;
-        config.run_key_fingerprint_cutoff = Some(cutoff);
+        let config = crate::config::Config {
+            debug: true,
+            run_key_fingerprint_cutoff: Some(cutoff),
+            ..crate::config::Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
@@ -7430,8 +7638,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_run_key_conflicts_on_mismatch() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..crate::config::Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {

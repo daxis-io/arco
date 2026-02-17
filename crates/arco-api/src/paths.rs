@@ -2,7 +2,7 @@ use base64::Engine;
 
 pub const MANIFEST_PREFIX: &str = "manifests/";
 pub const MANIFEST_IDEMPOTENCY_PREFIX: &str = "manifests/idempotency/";
-pub const BACKFILL_IDEMPOTENCY_PREFIX: &str = "orchestration/backfills/idempotency/";
+pub const BACKFILL_IDEMPOTENCY_PREFIX: &str = "backfills/idempotency/";
 
 pub fn manifest_path(manifest_id: &str) -> String {
     format!("{MANIFEST_PREFIX}{manifest_id}.json")

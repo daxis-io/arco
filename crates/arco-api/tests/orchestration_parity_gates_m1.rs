@@ -15,7 +15,7 @@ use axum::middleware;
 use chrono::{Duration, Utc};
 use serde::Deserialize;
 use tower::ServiceExt;
-use ulid::Ulid;
+use ulid::{Generator, Ulid};
 
 use arco_api::config::{Config, Posture};
 use arco_api::context::{RequestContext, auth_middleware};
@@ -745,9 +745,11 @@ async fn parity_m1_rejects_unknown_assets() -> Result<()> {
 }
 
 fn test_state_and_router() -> Result<(Arc<AppState>, axum::Router)> {
-    let mut config = Config::default();
-    config.debug = true;
-    config.posture = Posture::Dev;
+    let config = Config {
+        debug: true,
+        posture: Posture::Dev,
+        ..Config::default()
+    };
 
     let state = Arc::new(AppState::with_memory_storage(config));
     let auth_layer = middleware::from_fn_with_state(state.clone(), auth_middleware);
@@ -778,6 +780,19 @@ async fn append_events_and_compact(
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
     let ledger = LedgerWriter::new(storage.clone());
+
+    let mut events = events;
+    let mut generator = Generator::new();
+    let id_base_time = std::time::SystemTime::now()
+        .checked_add(std::time::Duration::from_secs(5))
+        .ok_or_else(|| anyhow!("failed to build synthetic event-id time"))?;
+    for (index, event) in events.iter_mut().enumerate() {
+        let event_time = id_base_time + std::time::Duration::from_millis(index as u64);
+        event.event_id = generator
+            .generate_from_datetime(event_time)
+            .map_err(|err| anyhow!("failed to generate monotonic event id: {err}"))?
+            .to_string();
+    }
 
     let mut event_paths = Vec::with_capacity(events.len());
     for event in events {

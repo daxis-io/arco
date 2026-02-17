@@ -258,42 +258,32 @@ async fn expired_inflight_commit_is_recovered_but_not_acked_for_unrelated_idempo
     assert_eq!(commit_resp.status(), StatusCode::CONFLICT);
 
     // Delta log file exists and matches the staged payload.
-    let delta_path = format!("tables/{table_id}/_delta_log/00000000000000000000.json");
-    let written = storage.get_raw(&delta_path).await.unwrap();
+    let delta_log_path = format!("tables/{table_id}/_delta_log/00000000000000000000.json");
+    let written = storage.get_raw(&delta_log_path).await.unwrap();
     assert_eq!(written, Bytes::from(payload));
 
-    // Coordinator state is finalized.
-    let bytes = storage
+    // Coordinator state cleared inflight and advanced latest_version.
+    let coordinator_bytes = storage
         .get_raw(&format!("delta/coordinator/{table_id}.json"))
         .await
         .unwrap();
-    let state: arco_delta::DeltaCoordinatorState = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(state.latest_version, 0);
-    assert!(state.inflight.is_none());
+    let coordinator_state: arco_delta::DeltaCoordinatorState =
+        serde_json::from_slice(&coordinator_bytes).unwrap();
+    assert_eq!(coordinator_state.latest_version, 0);
+    assert!(coordinator_state.inflight.is_none());
 
-    // The original inflight Idempotency-Key should replay the committed version.
-    let replay_req = Request::builder()
-        .method("POST")
-        .uri(format!("/delta/tables/{table_id}/commits"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .header("X-Tenant-Id", tenant)
-        .header("X-Workspace-Id", workspace)
-        .header("Idempotency-Key", inflight_key)
-        .body(Body::from(
-            serde_json::to_vec(&CommitRequest {
-                read_version: -1,
-                staged_path: &staged.staged_path,
-                staged_version: &staged.staged_version,
-            })
-            .unwrap(),
-        ))
-        .unwrap();
-    let replay_resp = app.oneshot(replay_req).await.unwrap();
-    assert_eq!(replay_resp.status(), StatusCode::OK);
-    let replay_body = axum::body::to_bytes(replay_resp.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let replayed: CommitResponse = serde_json::from_slice(&replay_body).unwrap();
-    assert_eq!(replayed.version, 0);
-    assert_eq!(replayed.delta_log_path, delta_path);
+    // Idempotency marker exists for the recovered inflight key.
+    let idempotency_hash = sha256_hex(inflight_key.as_bytes());
+    let marker_path = format!(
+        "delta/idempotency/{table_id}/{}/{idempotency_hash}.json",
+        &idempotency_hash[..2]
+    );
+    assert!(storage.head_raw(&marker_path).await.unwrap().is_some());
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
 }

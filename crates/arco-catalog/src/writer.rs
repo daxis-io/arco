@@ -2389,6 +2389,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_register_table_in_schema_uses_catalog_and_schema() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_catalog("analytics", None, WriteOptions::default())
+            .await
+            .expect("create analytics catalog");
+        let sales = writer
+            .create_schema("analytics", "sales", None, WriteOptions::default())
+            .await
+            .expect("create sales schema");
+
+        let table = writer
+            .register_table_in_schema(
+                "analytics",
+                "sales",
+                RegisterTableInSchemaRequest {
+                    name: "orders".to_string(),
+                    description: None,
+                    location: Some("gs://bucket/warehouse/sales/orders".to_string()),
+                    format: Some("delta".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+
+        assert_eq!(table.namespace_id, sales.id);
+        assert_eq!(table.name, "orders");
+    }
+
+    #[tokio::test]
     async fn test_event_writer_returns_owned() {
         let writer = setup();
         let source = EventSource::new("test-service");

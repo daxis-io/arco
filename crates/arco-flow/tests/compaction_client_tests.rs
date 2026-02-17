@@ -88,10 +88,21 @@ async fn compaction_client_sends_static_bearer_token_when_configured() {
     let result =
         compact_orchestration_events(&authed_url, vec!["ledger/events/1.json".to_string()]).await;
 
+    #[cfg(any(feature = "gcp", feature = "test-utils"))]
     assert!(
         result.is_ok(),
         "expected compaction request to succeed with auth header, got: {result:?}"
     );
+
+    #[cfg(not(any(feature = "gcp", feature = "test-utils")))]
+    {
+        let err = result.expect_err("expected configuration error without gcp/test-utils feature");
+        assert!(
+            err.to_string()
+                .contains("orchestration compaction requires the 'gcp' feature"),
+            "unexpected error when gcp/test-utils feature is disabled: {err}"
+        );
+    }
 }
 
 #[tokio::test]

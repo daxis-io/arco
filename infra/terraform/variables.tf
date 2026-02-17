@@ -56,23 +56,51 @@ variable "compactor_image" {
 }
 
 variable "flow_compactor_image" {
-  description = "Container image for Arco Flow orchestration compactor service"
+  description = "Container image for Arco Flow compactor service"
   type        = string
+  default     = ""
 }
 
 variable "flow_dispatcher_image" {
   description = "Container image for Arco Flow dispatcher service"
   type        = string
+  default     = ""
 }
 
 variable "flow_sweeper_image" {
   description = "Container image for Arco Flow sweeper service"
   type        = string
+  default     = ""
+}
+
+variable "flow_timer_ingest_image" {
+  description = "Container image for Arco Flow timer-ingest service"
+  type        = string
+  default     = ""
 }
 
 variable "flow_worker_image" {
   description = "Container image for Arco Flow worker service"
   type        = string
+  default     = ""
+}
+
+variable "flow_dispatch_target_url" {
+  description = "Worker dispatch endpoint URL for Cloud Tasks dispatch callbacks"
+  type        = string
+  default     = ""
+}
+
+variable "flow_tenant_id" {
+  description = "Tenant ID for flow control-plane services"
+  type        = string
+  default     = ""
+}
+
+variable "flow_workspace_id" {
+  description = "Workspace ID for flow control-plane services"
+  type        = string
+  default     = ""
 }
 
 # ============================================================================
@@ -161,6 +189,36 @@ variable "compactor_max_instances" {
   description = "Maximum instances for Compactor service"
   type        = number
   default     = 1
+}
+
+variable "flow_cpu" {
+  description = "CPU allocation for Flow services"
+  type        = string
+  default     = "1"
+}
+
+variable "flow_memory" {
+  description = "Memory allocation for Flow services"
+  type        = string
+  default     = "512Mi"
+}
+
+variable "flow_min_instances" {
+  description = "Minimum instances for Flow services"
+  type        = number
+  default     = 0
+}
+
+variable "flow_max_instances" {
+  description = "Maximum instances for Flow services"
+  type        = number
+  default     = 2
+}
+
+variable "flow_require_tasks_oidc" {
+  description = "Require Cloud Tasks OIDC for flow dispatcher/sweeper"
+  type        = bool
+  default     = true
 }
 
 # ============================================================================

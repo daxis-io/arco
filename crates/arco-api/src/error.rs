@@ -118,6 +118,7 @@ impl ApiError {
             StatusCode::NOT_FOUND => "NOT_FOUND",
             StatusCode::CONFLICT => "CONFLICT",
             StatusCode::PRECONDITION_FAILED => "PRECONDITION_FAILED",
+            StatusCode::TOO_MANY_REQUESTS => "TOO_MANY_REQUESTS",
             _ => "INTERNAL",
         };
         Self::new(status, code, message)

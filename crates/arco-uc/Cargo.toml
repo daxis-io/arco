@@ -24,6 +24,7 @@ azure = ["arco-core/azure"]
 
 [dependencies]
 arco-core = { path = "../arco-core" }
+arco-catalog = { path = "../arco-catalog" }
 
 # HTTP
 axum = { workspace = true }
@@ -37,6 +38,8 @@ serde_json = { workspace = true }
 
 # IDs
 ulid = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

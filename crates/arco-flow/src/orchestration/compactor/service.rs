@@ -163,6 +163,25 @@ impl MicroCompactor {
         self.compact_events_with_epoch(event_paths, None).await
     }
 
+    /// Compatibility wrapper for callers that provide an explicit lock path.
+    ///
+    /// This branch validates epoch freshness against the pointer epoch only, so
+    /// `lock_path` is currently accepted for API compatibility and ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if storage reads/writes fail, Parquet encoding fails,
+    /// or the supplied fencing token is stale.
+    pub async fn compact_events_fenced(
+        &self,
+        event_paths: Vec<String>,
+        fencing_token: u64,
+        _lock_path: &str,
+    ) -> Result<CompactionResult> {
+        self.compact_events_with_epoch(event_paths, Some(fencing_token))
+            .await
+    }
+
     /// Runs micro-compaction and validates the caller's lock epoch when supplied.
     ///
     /// # Arguments
@@ -335,10 +354,10 @@ impl MicroCompactor {
 
         let mut visibility_status = CompactionVisibility::Visible;
         let manifest_revision = if manifest_changed {
-            let previous_manifest_path = previous_pointer
-                .as_ref()
-                .map(|p| p.manifest_path.clone())
-                .unwrap_or_else(|| orchestration_manifest_path().to_string());
+            let previous_manifest_path = previous_pointer.as_ref().map_or_else(
+                || orchestration_manifest_path().to_string(),
+                |p| p.manifest_path.clone(),
+            );
 
             manifest.manifest_id =
                 next_manifest_id(&manifest.manifest_id).map_err(Error::serialization)?;

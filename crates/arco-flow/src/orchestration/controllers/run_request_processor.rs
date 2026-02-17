@@ -243,7 +243,7 @@ fn resolve_from_backfill_chunks(
         .backfill_chunks
         .values()
         .filter(|chunk| chunk.run_key == key.run_key)
-        .max_by(backfill_chunk_order)?;
+        .max_by(|a, b| backfill_chunk_order(a, b))?;
 
     let backfill = state.backfills.get(&chunk.backfill_id)?;
 
@@ -263,7 +263,7 @@ fn resolve_from_backfill_chunks(
     })
 }
 
-fn backfill_chunk_order(a: &&BackfillChunkRow, b: &&BackfillChunkRow) -> std::cmp::Ordering {
+fn backfill_chunk_order(a: &BackfillChunkRow, b: &BackfillChunkRow) -> std::cmp::Ordering {
     a.chunk_index
         .cmp(&b.chunk_index)
         .then_with(|| a.row_version.cmp(&b.row_version))

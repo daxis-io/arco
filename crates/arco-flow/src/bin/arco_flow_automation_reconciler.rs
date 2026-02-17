@@ -70,6 +70,7 @@ impl IntoResponse for ApiError {
     }
 }
 
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Serialize, Default)]
 struct RunSummary {
     schedule_events: usize,
@@ -177,6 +178,7 @@ async fn run_handler(
     Ok(Json(summary))
 }
 
+#[allow(clippy::too_many_lines)]
 fn process_fired_timers(
     fold_state: &FoldState,
     watermarks: &Watermarks,
@@ -315,6 +317,7 @@ fn process_fired_timers(
     PendingTimerEvents { events, emitted }
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn reschedule_timer_event(
     tenant_id: &str,
     workspace_id: &str,

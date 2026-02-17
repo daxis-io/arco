@@ -104,12 +104,12 @@ impl DeltaCommitCoordinator {
     /// Commits a staged Delta payload (Mode B).
     ///
     /// This function:
-    /// 1) Applies idempotency replay if a committed marker exists.
-    /// 2) Recovers and finalizes any expired inflight commit.
+    /// 1) Recovers and finalizes any expired or already-materialized inflight commit.
+    /// 2) Applies idempotency replay if a committed marker exists.
     /// 3) Reserves the next version via CAS.
     /// 4) Writes `_delta_log/{version}.json` with `DoesNotExist` precondition.
-    /// 5) Finalizes coordinator state (`latest_version` + clear inflight) via CAS.
-    /// 6) Writes an idempotency marker for safe retries.
+    /// 5) Writes an idempotency marker for safe retries.
+    /// 6) Finalizes coordinator state (`latest_version` + clear inflight) via CAS.
     ///
     /// # Errors
     ///
@@ -127,6 +127,17 @@ impl DeltaCommitCoordinator {
 
         let request_hash = request_hash(&req)?;
 
+        if let Some(recovered) = self.recover_inflight(now).await? {
+            if recovered.commit_id == req.idempotency_key {
+                if recovered.request_hash != request_hash {
+                    return Err(DeltaError::conflict(
+                        "Idempotency-Key already used with different request body".to_string(),
+                    ));
+                }
+                return Ok(recovered.response);
+            }
+        }
+
         if let Some(record) = self.read_idempotency_record(&req.idempotency_key).await? {
             if record.request_hash != request_hash {
                 return Err(DeltaError::conflict(
@@ -137,17 +148,6 @@ impl DeltaCommitCoordinator {
                 version: record.version,
                 delta_log_path: record.delta_log_path,
             });
-        }
-
-        if let Some(recovered) = self.recover_inflight(now).await? {
-            if recovered.commit_id == req.idempotency_key {
-                if recovered.request_hash != request_hash {
-                    return Err(DeltaError::conflict(
-                        "Idempotency-Key already used with different request body".to_string(),
-                    ));
-                }
-                return Ok(recovered.response);
-            }
         }
 
         let reserved = self.reserve_or_resume_inflight(&req, now).await?;
@@ -184,10 +184,10 @@ impl DeltaCommitCoordinator {
             delta_log_path: delta_log_path.clone(),
         };
 
-        self.finalize_inflight(&req.idempotency_key, reserved.version)
+        self.write_idempotency_record(&req.idempotency_key, &request_hash, &response, now)
             .await?;
 
-        self.write_idempotency_record(&req.idempotency_key, &request_hash, &response, now)
+        self.finalize_inflight(&req.idempotency_key, reserved.version)
             .await?;
 
         Ok(response)
@@ -276,6 +276,29 @@ impl DeltaCommitCoordinator {
                     };
                 }
 
+                let read_version = inflight
+                    .read_version
+                    .unwrap_or_else(|| inflight.version.saturating_sub(1));
+                let recovered_request_hash = request_hash(&CommitDeltaRequest {
+                    read_version,
+                    staged_path: inflight.staged_path.clone(),
+                    staged_version: inflight.staged_version.clone(),
+                    idempotency_key: inflight.commit_id.clone(),
+                })?;
+
+                let response = CommitDeltaResponse {
+                    version: inflight.version,
+                    delta_log_path: delta_log_path.clone(),
+                };
+
+                self.write_idempotency_record(
+                    &inflight.commit_id,
+                    &recovered_request_hash,
+                    &response,
+                    now,
+                )
+                .await?;
+
                 let mut updated = state.clone();
                 updated.latest_version = inflight.version.max(state.latest_version);
                 updated.inflight = None;
@@ -283,29 +306,6 @@ impl DeltaCommitCoordinator {
                 let put = self.store_state(&updated, Some(current_version)).await?;
                 match put {
                     WriteResult::Success { .. } => {
-                        let read_version = inflight
-                            .read_version
-                            .unwrap_or_else(|| inflight.version.saturating_sub(1));
-                        let recovered_request_hash = request_hash(&CommitDeltaRequest {
-                            read_version,
-                            staged_path: inflight.staged_path.clone(),
-                            staged_version: inflight.staged_version.clone(),
-                            idempotency_key: inflight.commit_id.clone(),
-                        })?;
-
-                        let response = CommitDeltaResponse {
-                            version: inflight.version,
-                            delta_log_path: delta_log_path.clone(),
-                        };
-
-                        self.write_idempotency_record(
-                            &inflight.commit_id,
-                            &recovered_request_hash,
-                            &response,
-                            now,
-                        )
-                        .await?;
-
                         return Ok(Some(RecoveredInflight {
                             commit_id: inflight.commit_id,
                             request_hash: recovered_request_hash,

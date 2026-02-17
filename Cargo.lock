@@ -434,12 +434,14 @@ dependencies = [
  "arco-delta",
  "arco-flow",
  "arco-iceberg",
+ "arrow 54.3.1",
  "axum 0.7.9",
  "bytes",
  "chrono",
  "hex",
  "iceberg",
  "iceberg-catalog-rest",
+ "parquet 54.3.1",
  "serde",
  "serde_json",
  "sha2",
@@ -492,8 +494,10 @@ dependencies = [
 name = "arco-uc"
 version = "0.1.0"
 dependencies = [
+ "arco-catalog",
  "arco-core",
  "axum 0.7.9",
+ "bytes",
  "gcp_auth",
  "http",
  "serde",
@@ -507,6 +511,7 @@ dependencies = [
  "tracing",
  "ulid",
  "utoipa",
+ "uuid",
 ]
 
 [[package]]

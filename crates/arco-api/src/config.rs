@@ -41,6 +41,122 @@ impl Default for Posture {
     }
 }
 
+/// Compactor auth mode for sync compaction calls.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactorAuthMode {
+    /// Do not attach authorization headers.
+    None,
+    /// Attach a static bearer token configured via environment.
+    StaticBearer,
+    /// Fetch a GCP identity token from metadata server.
+    GcpIdToken,
+}
+
+impl Default for CompactorAuthMode {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+/// Compactor auth configuration.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CompactorAuthConfig {
+    /// Auth mode.
+    #[serde(default)]
+    pub mode: CompactorAuthMode,
+    /// Static bearer token for `static_bearer` mode.
+    #[serde(default)]
+    pub static_bearer_token: Option<String>,
+    /// Audience override for `gcp_id_token` mode.
+    #[serde(default)]
+    pub audience: Option<String>,
+    /// Metadata URL override for `gcp_id_token` mode (primarily tests).
+    #[serde(default)]
+    pub metadata_url: Option<String>,
+}
+
+impl std::fmt::Debug for CompactorAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompactorAuthConfig")
+            .field("mode", &self.mode)
+            .field(
+                "static_bearer_token",
+                &self.static_bearer_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("audience", &self.audience)
+            .field("metadata_url", &self.metadata_url)
+            .finish()
+    }
+}
+
+impl CompactorAuthConfig {
+    /// No auth mode.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            mode: CompactorAuthMode::None,
+            static_bearer_token: None,
+            audience: None,
+            metadata_url: None,
+        }
+    }
+
+    /// Static bearer auth helper.
+    #[must_use]
+    pub fn static_bearer(token: impl Into<String>) -> Self {
+        Self {
+            mode: CompactorAuthMode::StaticBearer,
+            static_bearer_token: Some(token.into()),
+            audience: None,
+            metadata_url: None,
+        }
+    }
+
+    /// GCP id token auth helper.
+    #[must_use]
+    pub fn gcp_id_token(audience: Option<&str>) -> Self {
+        Self {
+            mode: CompactorAuthMode::GcpIdToken,
+            static_bearer_token: None,
+            audience: audience.map(str::to_string),
+            metadata_url: None,
+        }
+    }
+
+    /// Test helper to override metadata URL.
+    #[must_use]
+    pub fn with_metadata_url(mut self, metadata_url: impl Into<String>) -> Self {
+        self.metadata_url = Some(metadata_url.into());
+        self
+    }
+
+    /// Validates auth settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if required fields for the active mode are missing.
+    pub fn validate(&self, debug: bool) -> Result<()> {
+        if self.mode == CompactorAuthMode::StaticBearer
+            && self
+                .static_bearer_token
+                .as_deref()
+                .is_none_or(|token| token.trim().is_empty())
+        {
+            return Err(Error::InvalidInput(
+                "ARCO_COMPACTOR_AUTH_STATIC_BEARER_TOKEN is required when ARCO_COMPACTOR_AUTH_MODE=static_bearer"
+                    .to_string(),
+            ));
+        }
+        if !debug && self.metadata_url.is_some() {
+            return Err(Error::InvalidInput(
+                "ARCO_COMPACTOR_GCP_METADATA_URL is only allowed when ARCO_DEBUG=true".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Configuration for the Arco API server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -82,6 +198,10 @@ pub struct Config {
     /// Compactor base URL for sync compaction (e.g., `<http://compactor:8081>`).
     #[serde(default)]
     pub compactor_url: Option<String>,
+
+    /// Compactor auth mode/token/audience for sync compaction calls.
+    #[serde(default)]
+    pub compactor_auth: CompactorAuthConfig,
 
     /// Orchestration compactor base URL for sync compaction (e.g., `<http://arco-flow-compactor:8080>`).
     #[serde(default)]
@@ -225,6 +345,7 @@ impl Default for Config {
             rate_limit: RateLimitConfig::default(),
             storage: StorageConfig::default(),
             compactor_url: None,
+            compactor_auth: CompactorAuthConfig::default(),
             orchestration_compactor_url: None,
             run_key_fingerprint_cutoff: None,
             partition_time_string_cutoff: None,
@@ -372,6 +493,10 @@ impl Config {
     /// - `ARCO_JWT_GROUPS_CLAIM`
     /// - `ARCO_STORAGE_BUCKET`
     /// - `ARCO_COMPACTOR_URL`
+    /// - `ARCO_COMPACTOR_AUTH_MODE` (`none` | `static_bearer` | `gcp_id_token`)
+    /// - `ARCO_COMPACTOR_AUTH_STATIC_BEARER_TOKEN`
+    /// - `ARCO_COMPACTOR_AUTH_AUDIENCE`
+    /// - `ARCO_COMPACTOR_GCP_METADATA_URL`
     /// - `ARCO_ORCH_COMPACTOR_URL`
     /// - `ARCO_RUN_KEY_FINGERPRINT_CUTOFF` (RFC3339, e.g. "2025-01-01T00:00:00Z")
     /// - `ARCO_PARTITION_TIME_STRING_CUTOFF` (RFC3339, e.g. "2025-01-01T00:00:00Z")
@@ -463,6 +588,19 @@ impl Config {
         }
         if let Some(url) = env_string("ARCO_COMPACTOR_URL") {
             config.compactor_url = Some(url);
+        }
+        if let Some(mode) = env_string("ARCO_COMPACTOR_AUTH_MODE") {
+            config.compactor_auth.mode =
+                parse_compactor_auth_mode("ARCO_COMPACTOR_AUTH_MODE", &mode)?;
+        }
+        if let Some(token) = env_string("ARCO_COMPACTOR_AUTH_STATIC_BEARER_TOKEN") {
+            config.compactor_auth.static_bearer_token = Some(token);
+        }
+        if let Some(audience) = env_string("ARCO_COMPACTOR_AUTH_AUDIENCE") {
+            config.compactor_auth.audience = Some(audience);
+        }
+        if let Some(metadata_url) = env_string("ARCO_COMPACTOR_GCP_METADATA_URL") {
+            config.compactor_auth.metadata_url = Some(metadata_url);
         }
         if let Some(url) = env_string("ARCO_ORCH_COMPACTOR_URL") {
             config.orchestration_compactor_url = Some(url);
@@ -645,6 +783,18 @@ fn parse_bool(name: &str, value: &str) -> Result<bool> {
         "false" | "0" | "no" | "n" => Ok(false),
         _ => Err(Error::InvalidInput(format!(
             "{name} must be a boolean (true/false/1/0)"
+        ))),
+    }
+}
+
+fn parse_compactor_auth_mode(name: &str, value: &str) -> Result<CompactorAuthMode> {
+    let mode = value.trim().to_ascii_lowercase();
+    match mode.as_str() {
+        "none" => Ok(CompactorAuthMode::None),
+        "static_bearer" => Ok(CompactorAuthMode::StaticBearer),
+        "gcp_id_token" => Ok(CompactorAuthMode::GcpIdToken),
+        _ => Err(Error::InvalidInput(format!(
+            "{name} must be one of: none, static_bearer, gcp_id_token (got {value})"
         ))),
     }
 }
@@ -839,5 +989,61 @@ mod tests {
     fn parse_bool_rejects_invalid_values() {
         assert!(parse_bool("TEST", "maybe").is_err());
         assert!(parse_bool("TEST", "").is_err());
+    }
+
+    #[test]
+    fn parse_compactor_auth_mode_accepts_all_modes() -> Result<()> {
+        assert_eq!(
+            parse_compactor_auth_mode("TEST", "none")?,
+            CompactorAuthMode::None
+        );
+        assert_eq!(
+            parse_compactor_auth_mode("TEST", "static_bearer")?,
+            CompactorAuthMode::StaticBearer
+        );
+        assert_eq!(
+            parse_compactor_auth_mode("TEST", "gcp_id_token")?,
+            CompactorAuthMode::GcpIdToken
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_compactor_auth_mode_rejects_invalid_value() {
+        let err = parse_compactor_auth_mode("TEST", "legacy").unwrap_err();
+        let Error::InvalidInput(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("TEST"));
+        assert!(message.contains("legacy"));
+    }
+
+    #[test]
+    fn compactor_auth_debug_redacts_static_token() {
+        let auth = CompactorAuthConfig::static_bearer("super-secret");
+        let dbg = format!("{auth:?}");
+        assert!(dbg.contains("REDACTED"));
+        assert!(!dbg.contains("super-secret"));
+    }
+
+    #[test]
+    fn compactor_auth_metadata_override_rejected_outside_debug() {
+        let auth = CompactorAuthConfig::gcp_id_token(None)
+            .with_metadata_url("http://127.0.0.1:8181/token");
+        let err = auth
+            .validate(false)
+            .expect_err("metadata override should be blocked outside debug");
+        let Error::InvalidInput(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("ARCO_COMPACTOR_GCP_METADATA_URL"));
+    }
+
+    #[test]
+    fn compactor_auth_metadata_override_allowed_in_debug() -> Result<()> {
+        let auth = CompactorAuthConfig::gcp_id_token(None)
+            .with_metadata_url("http://127.0.0.1:8181/token");
+        auth.validate(true)?;
+        Ok(())
     }
 }

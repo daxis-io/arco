@@ -3759,6 +3759,35 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "Filter evaluations after this timestamp (inclusive)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "description": "Filter evaluations before this timestamp (inclusive)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Filter by status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SensorEvalStatusFilter"
+            }
           }
         ],
         "responses": {
@@ -3900,6 +3929,13 @@
           "code": {
             "type": "string",
             "description": "Stable machine-readable error code."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional error category (e.g., `unprocessable_entity`)."
           },
           "message": {
             "type": "string",
@@ -5257,6 +5293,55 @@
               "$ref": "#/components/schemas/SchemaResponse"
             },
             "description": "List of schemas."
+          }
+        }
+      },
+      "ListSensorEvalsQuery": {
+        "type": "object",
+        "description": "Query parameters for listing sensor evaluations.",
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cursor for pagination."
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Maximum evaluations to return.",
+            "minimum": 0
+          },
+          "since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Filter evaluations after this timestamp (inclusive)."
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SensorEvalStatusFilter",
+                "description": "Filter by evaluation status."
+              }
+            ]
+          },
+          "until": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Filter evaluations before this timestamp (inclusive)."
           }
         }
       },
@@ -6672,6 +6757,16 @@
             "description": "Evaluation status."
           }
         }
+      },
+      "SensorEvalStatusFilter": {
+        "type": "string",
+        "description": "Sensor evaluation status filter (query parameter).",
+        "enum": [
+          "TRIGGERED",
+          "NO_NEW_DATA",
+          "ERROR",
+          "SKIPPED_STALE_CURSOR"
+        ]
       },
       "SensorEvalStatusResponse": {
         "oneOf": [

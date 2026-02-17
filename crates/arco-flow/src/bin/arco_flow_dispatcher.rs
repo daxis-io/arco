@@ -1219,7 +1219,7 @@ mod tests {
 
     use arco_core::MemoryBackend;
     use arco_core::ScopedStorage;
-    use arco_flow::orchestration::compactor::fold::TimerState;
+    use arco_flow::orchestration::compactor::fold::{TimerState, TimerType};
 
     #[cfg(feature = "gcp")]
     use axum::http::HeaderValue;
@@ -1229,6 +1229,7 @@ mod tests {
     fn timer_payload(timer_id: &str) -> TimerPayload {
         TimerPayload {
             timer_id: timer_id.to_string(),
+            timer_type: TimerType::Retry,
             run_id: Some("run-1".to_string()),
             task_key: Some("task-a".to_string()),
             attempt: Some(1),
@@ -1261,6 +1262,7 @@ mod tests {
     fn timer_payload_rejects_mismatched_metadata() {
         let payload = TimerPayload {
             timer_id: "timer:retry:run-1:task-a:1:1705320000".to_string(),
+            timer_type: TimerType::Retry,
             run_id: Some("wrong-run".to_string()),
             task_key: Some("task-a".to_string()),
             attempt: Some(1),

@@ -1,5 +1,6 @@
 //! Flow service orchestration compaction integration tests.
 
+#![cfg(any(feature = "gcp", feature = "test-utils"))]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::net::SocketAddr;

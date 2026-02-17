@@ -605,6 +605,20 @@ pub enum SensorEvalStatusResponse {
     SkippedStaleCursor,
 }
 
+/// Sensor evaluation status filter (query parameter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SensorEvalStatusFilter {
+    /// Sensor triggered one or more runs.
+    Triggered,
+    /// Sensor evaluated but no new data found.
+    NoNewData,
+    /// Sensor evaluation failed.
+    Error,
+    /// Sensor evaluation was skipped due to stale cursor (CAS failed).
+    SkippedStaleCursor,
+}
+
 /// Run request returned from sensor evaluation.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -746,6 +760,22 @@ pub struct ListTicksQuery {
     pub cursor: Option<String>,
     /// Filter by tick status.
     pub status: Option<TickStatusResponse>,
+}
+
+/// Query parameters for listing sensor evaluations.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSensorEvalsQuery {
+    /// Maximum evaluations to return.
+    pub limit: Option<u32>,
+    /// Cursor for pagination.
+    pub cursor: Option<String>,
+    /// Filter evaluations after this timestamp (inclusive).
+    pub since: Option<DateTime<Utc>>,
+    /// Filter evaluations before this timestamp (inclusive).
+    pub until: Option<DateTime<Utc>>,
+    /// Filter by evaluation status.
+    pub status: Option<SensorEvalStatusFilter>,
 }
 
 // ============================================================================
@@ -3462,6 +3492,50 @@ fn filter_ticks_by_status(
     }
 }
 
+fn filter_sensor_evals_by_status(
+    evals: &mut Vec<SensorEvalResponse>,
+    status: Option<SensorEvalStatusFilter>,
+) {
+    let Some(filter) = status else {
+        return;
+    };
+
+    evals.retain(|eval| {
+        matches!(
+            (&eval.status, filter),
+            (
+                SensorEvalStatusResponse::Triggered,
+                SensorEvalStatusFilter::Triggered
+            ) | (
+                SensorEvalStatusResponse::NoNewData,
+                SensorEvalStatusFilter::NoNewData
+            ) | (
+                SensorEvalStatusResponse::Error { .. },
+                SensorEvalStatusFilter::Error
+            ) | (
+                SensorEvalStatusResponse::SkippedStaleCursor,
+                SensorEvalStatusFilter::SkippedStaleCursor
+            )
+        )
+    });
+}
+
+fn filter_sensor_evals_by_time_range(
+    evals: &mut Vec<SensorEvalResponse>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) {
+    if since.is_none() && until.is_none() {
+        return;
+    }
+
+    evals.retain(|eval| {
+        let after_since = since.is_none_or(|since| eval.evaluated_at >= since);
+        let before_until = until.is_none_or(|until| eval.evaluated_at <= until);
+        after_since && before_until
+    });
+}
+
 // ============================================================================
 // Route Handlers
 // ============================================================================
@@ -5336,6 +5410,9 @@ pub(crate) async fn get_sensor(
         ("sensor_id" = String, Path, description = "Sensor ID"),
         ("limit" = Option<u32>, Query, description = "Maximum evaluations to return"),
         ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("since" = Option<DateTime<Utc>>, Query, description = "Filter evaluations after this timestamp (inclusive)"),
+        ("until" = Option<DateTime<Utc>>, Query, description = "Filter evaluations before this timestamp (inclusive)"),
+        ("status" = Option<SensorEvalStatusFilter>, Query, description = "Filter by status"),
     ),
     responses(
         (status = 200, description = "List of evaluations", body = ListSensorEvalsResponse),
@@ -5347,7 +5424,7 @@ pub(crate) async fn list_sensor_evals(
     State(state): State<Arc<AppState>>,
     ctx: RequestContext,
     Path((workspace_id, sensor_id)): Path<(String, String)>,
-    AxumQuery(query): AxumQuery<ListQuery>,
+    AxumQuery(query): AxumQuery<ListSensorEvalsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
     let (limit, offset) = parse_pagination(
@@ -5362,6 +5439,8 @@ pub(crate) async fn list_sensor_evals(
         .filter(|e| e.sensor_id == sensor_id)
         .map(map_sensor_eval)
         .collect();
+    filter_sensor_evals_by_status(&mut evals, query.status);
+    filter_sensor_evals_by_time_range(&mut evals, query.since, query.until);
     evals.sort_by(|a, b| b.evaluated_at.cmp(&a.evaluated_at));
 
     let (page, next_cursor) = paginate(&evals, limit, offset);

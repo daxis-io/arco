@@ -14,4 +14,7 @@ This folder stores reproducible artifacts for the Daxis Prod GO closure cycle.
 
 ## Current state
 
-As of 2026-02-12, only `phase-0/` contains completed evidence. Other folders are intentionally present as closure targets referenced by the gate tracker.
+As of 2026-02-12:
+- `phase-0/` contains initial re-baseline evidence.
+- `phase-2/` contains Batch 2 implementation verification evidence.
+- Gate folders remain open closure targets for subsequent phases.

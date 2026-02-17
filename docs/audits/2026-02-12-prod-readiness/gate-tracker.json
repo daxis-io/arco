@@ -1,17 +1,18 @@
 {
   "schema_version": "1.0",
   "audit_date": "2026-02-12",
-  "generated_at_utc": "2026-02-12T05:39:03Z",
+  "generated_at_utc": "2026-02-12T18:05:31Z",
   "baseline_commit": "e896506f3c936c266a21fe556a107d37bd7075b5",
   "definition_of_done": "ALL_GATES_GO",
   "evidence_root": "release_evidence/2026-02-12-prod-readiness",
   "command_matrix": {
-    "status_file": "release_evidence/2026-02-12-prod-readiness/phase-0/current-head/command-matrix-status.tsv",
+    "status_file": "release_evidence/2026-02-12-prod-readiness/phase-2/batch-2-head/command-matrix-status.tsv",
     "all_pass": true,
     "required_commands": [
       "cargo fmt --all --check",
       "cargo clippy --workspace --all-features -- -D warnings",
       "cargo test --workspace --all-features --exclude arco-flow --exclude arco-api",
+      "cargo test -p arco-api --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_",
       "cargo test -p arco-flow --tests",
       "cargo test -p arco-flow --features test-utils --tests",
       "cargo test -p arco-flow --all-features --tests",
@@ -36,7 +37,7 @@
       ],
       "evidence": [
         "docs/audits/2026-02-12-prod-readiness/signal-ledger.md",
-        "release_evidence/2026-02-12-prod-readiness/phase-0/current-head/command-matrix-status.tsv",
+        "release_evidence/2026-02-12-prod-readiness/phase-2/batch-2-head/command-matrix-status.tsv",
         "docs/audits/2026-02-12-prod-readiness/summary.md"
       ]
     },
@@ -59,7 +60,7 @@
       "id": 2,
       "name": "Storage / manifest / schema / invariants",
       "status": "PARTIAL",
-      "status_reason": "Search anti-entropy bounded scan is closed; path unification, schema golden fixtures, and invariant/failure-injection gaps remain.",
+      "status_reason": "Search anti-entropy and orchestration schema fixtures are closed; path unification and invariant/failure-injection coverage gaps remain.",
       "required_signal_ids": [
         "G2-001",
         "G2-002",
@@ -78,14 +79,15 @@
       "id": 3,
       "name": "Layer-2 production blockers",
       "status": "PARTIAL",
-      "status_reason": "Backfill selector parity is closed; projection persistence, timer ingress, run bridge, limits/SLOs, and operator metrics remain.",
+      "status_reason": "Backfill selector parity and explicit compactor auth modes are closed; projection persistence, timer ingress, run bridge, limits/SLOs, and operator metrics remain.",
       "required_signal_ids": [
         "G3-001",
         "G3-002",
         "G3-003",
         "G3-004",
         "G3-005",
-        "G3-006"
+        "G3-006",
+        "G3-007"
       ],
       "evidence": [
         "crates/arco-api/src/routes/orchestration.rs",
@@ -152,10 +154,10 @@
     { "id": "G1-002", "owner": "Release Engineering", "status": "NO-GO" },
     { "id": "G1-003", "owner": "Release Engineering", "status": "NO-GO" },
     { "id": "G1-004", "owner": "Security Engineering", "status": "NO-GO" },
-    { "id": "G2-001", "owner": "Core Platform", "status": "NO-GO" },
+    { "id": "G2-001", "owner": "Core Platform", "status": "PARTIAL" },
     { "id": "G2-002", "owner": "Core Platform", "status": "NO-GO" },
     { "id": "G2-003", "owner": "Compaction Team", "status": "GO" },
-    { "id": "G2-004", "owner": "Orchestration Team", "status": "NO-GO" },
+    { "id": "G2-004", "owner": "Orchestration Team", "status": "GO" },
     { "id": "G2-005", "owner": "Orchestration Team", "status": "PARTIAL" },
     { "id": "G2-006", "owner": "Orchestration Team", "status": "PARTIAL" },
     { "id": "G2-007", "owner": "SRE", "status": "NO-GO" },
@@ -165,6 +167,7 @@
     { "id": "G3-004", "owner": "API + Orchestration", "status": "GO" },
     { "id": "G3-005", "owner": "Platform + SRE", "status": "NO-GO" },
     { "id": "G3-006", "owner": "Observability Team", "status": "NO-GO" },
+    { "id": "G3-007", "owner": "API + Platform", "status": "GO" },
     { "id": "G4-001", "owner": "Platform + SRE", "status": "BLOCKED-EXTERNAL" },
     { "id": "G4-002", "owner": "Platform + SRE", "status": "BLOCKED-EXTERNAL" },
     { "id": "G4-003", "owner": "Platform + SRE", "status": "BLOCKED-EXTERNAL" },

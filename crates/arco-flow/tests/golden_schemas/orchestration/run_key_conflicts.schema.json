@@ -1,0 +1,41 @@
+{
+  "name": "run_key_conflicts",
+  "version": 1,
+  "fields": [
+    {
+      "name": "tenant_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "workspace_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "run_key",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "existing_fingerprint",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "conflicting_fingerprint",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "conflicting_event_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "detected_at",
+      "data_type": "Int64",
+      "nullable": false
+    }
+  ]
+}

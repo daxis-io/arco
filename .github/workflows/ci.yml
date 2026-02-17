@@ -124,6 +124,7 @@ jobs:
           sudo mkdir -p /mnt/target
           sudo chown -R "$(id -u):$(id -g)" /mnt/target
       - run: cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
+      - run: cargo test -p arco-api --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_
       - run: cargo test -p arco-api --all-features --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_
       - run: cargo test -p arco-api --all-features --test orchestration_parity_gates_m1
       - run: cargo test -p arco-flow --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_

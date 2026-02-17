@@ -132,8 +132,10 @@ impl AppState {
         }
 
         let rate_limit = Arc::new(RateLimitState::new(config.rate_limit.clone()));
+        let compactor_auth = config.compactor_auth.clone();
         let sync_compactor = config.compactor_url.as_ref().map(|url| {
-            let client: Arc<dyn SyncCompactor> = Arc::new(CompactorClient::new(url.clone()));
+            let client: Arc<dyn SyncCompactor> =
+                Arc::new(CompactorClient::new(url.clone(), compactor_auth.clone()));
             client
         });
         let audit = audit_emitter.unwrap_or_else(|| Arc::new(AuditEmitter::with_tracing()));
@@ -167,8 +169,10 @@ impl AppState {
             );
         }
 
+        let compactor_auth = config.compactor_auth.clone();
         let sync_compactor = config.compactor_url.as_ref().map(|url| {
-            let client: Arc<dyn SyncCompactor> = Arc::new(CompactorClient::new(url.clone()));
+            let client: Arc<dyn SyncCompactor> =
+                Arc::new(CompactorClient::new(url.clone(), compactor_auth.clone()));
             client
         });
         Self {
@@ -838,6 +842,10 @@ impl Server {
             ));
         }
 
+        if self.config.compactor_url.is_some() {
+            self.config.compactor_auth.validate(self.config.debug)?;
+        }
+
         if self.config.iceberg.enabled
             && (self.config.iceberg.allow_namespace_crud || self.config.iceberg.allow_table_crud)
             && !self.config.debug
@@ -1026,7 +1034,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    use crate::config::Posture;
+    use crate::config::{CompactorAuthMode, Posture};
 
     #[test]
     fn test_posture_allows_debug_in_dev() -> Result<()> {
@@ -1133,6 +1141,41 @@ mod tests {
         let server = builder.build();
         server.validate_config()?;
         Ok(())
+    }
+
+    #[test]
+    fn test_static_bearer_mode_requires_token() {
+        let mut builder = ServerBuilder::new();
+        configure_non_dev_jwt(&mut builder);
+        builder.config.jwt.issuer = Some("test-issuer".to_string());
+        builder.config.jwt.audience = Some("test-audience".to_string());
+        builder.config.compactor_auth.mode = CompactorAuthMode::StaticBearer;
+        builder.config.compactor_auth.static_bearer_token = None;
+
+        let server = builder.build();
+        let err = server.validate_config().unwrap_err();
+        let arco_core::Error::InvalidInput(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("ARCO_COMPACTOR_AUTH_STATIC_BEARER_TOKEN"));
+    }
+
+    #[test]
+    fn test_metadata_override_requires_debug_mode() {
+        let mut builder = ServerBuilder::new();
+        configure_non_dev_jwt(&mut builder);
+        builder.config.jwt.issuer = Some("test-issuer".to_string());
+        builder.config.jwt.audience = Some("test-audience".to_string());
+        builder.config.compactor_auth.mode = CompactorAuthMode::GcpIdToken;
+        builder.config.compactor_auth.metadata_url =
+            Some("http://127.0.0.1:8181/token".to_string());
+
+        let server = builder.build();
+        let err = server.validate_config().unwrap_err();
+        let arco_core::Error::InvalidInput(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("ARCO_COMPACTOR_GCP_METADATA_URL"));
     }
 
     #[tokio::test]

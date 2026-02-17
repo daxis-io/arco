@@ -54,6 +54,5 @@ coverage/
 *.tfstate.backup
 *.tfplan
 
-# Local tooling
-/.claude/
-/.worktrees/
+# Local AI assistant tooling
+.claude/

@@ -58,7 +58,7 @@ use arco_flow::orchestration::run_key::{
     FingerprintPolicy, ReservationResult, RunKeyReservation, get_reservation, reservation_path,
     reserve_run_key,
 };
-use ulid::Ulid;
+use ulid::{Generator, Ulid};
 
 // ============================================================================
 // Request/Response Types
@@ -2194,10 +2194,36 @@ async fn load_orchestration_state(
     Ok(fold_state)
 }
 
+#[derive(Clone)]
 struct RunEventOverrides {
     run_event_id: String,
     plan_event_id: String,
     created_at: DateTime<Utc>,
+}
+
+fn generate_monotonic_event_ids(created_at: DateTime<Utc>) -> Result<(String, String), ApiError> {
+    let millis = u64::try_from(created_at.timestamp_millis())
+        .map_err(|_| ApiError::internal("event timestamp before unix epoch"))?;
+    let event_time = std::time::UNIX_EPOCH + Duration::from_millis(millis);
+    let mut generator = Generator::new();
+    let run_event_id = generator
+        .generate_from_datetime(event_time)
+        .map_err(|err| ApiError::internal(format!("failed to generate run event id: {err}")))?
+        .to_string();
+    let plan_event_id = generator
+        .generate_from_datetime(event_time)
+        .map_err(|err| ApiError::internal(format!("failed to generate plan event id: {err}")))?
+        .to_string();
+    Ok((run_event_id, plan_event_id))
+}
+
+fn new_run_event_overrides(created_at: DateTime<Utc>) -> Result<RunEventOverrides, ApiError> {
+    let (run_event_id, plan_event_id) = generate_monotonic_event_ids(created_at)?;
+    Ok(RunEventOverrides {
+        run_event_id,
+        plan_event_id,
+        created_at,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2215,6 +2241,11 @@ async fn append_run_events(
     tasks: Vec<TaskDef>,
     overrides: Option<RunEventOverrides>,
 ) -> Result<Vec<String>, ApiError> {
+    let overrides = match overrides {
+        Some(overrides) => overrides,
+        None => new_run_event_overrides(Utc::now())?,
+    };
+
     let mut run_triggered = OrchestrationEvent::new(
         tenant_id,
         workspace_id,
@@ -2229,13 +2260,11 @@ async fn append_run_events(
         },
     );
 
-    if let Some(ref overrides) = overrides {
-        apply_event_metadata(
-            &mut run_triggered,
-            &overrides.run_event_id,
-            overrides.created_at,
-        );
-    }
+    apply_event_metadata(
+        &mut run_triggered,
+        &overrides.run_event_id,
+        overrides.created_at,
+    );
 
     let run_event_path = LedgerWriter::event_path(&run_triggered);
     ledger
@@ -2253,13 +2282,11 @@ async fn append_run_events(
         },
     );
 
-    if let Some(ref overrides) = overrides {
-        apply_event_metadata(
-            &mut plan_created,
-            &overrides.plan_event_id,
-            overrides.created_at,
-        );
-    }
+    apply_event_metadata(
+        &mut plan_created,
+        &overrides.plan_event_id,
+        overrides.created_at,
+    );
 
     let plan_event_path = LedgerWriter::event_path(&plan_created);
     ledger
@@ -3784,14 +3811,13 @@ pub(crate) async fn trigger_run(
             plan_context = Some(load_run_plan_context(&storage, &request).await?);
         }
 
-        let run_event_id = Ulid::new().to_string();
-        let plan_event_id = Ulid::new().to_string();
+        let generated_overrides = new_run_event_overrides(now)?;
         let reservation = RunKeyReservation {
             run_key: run_key.clone(),
             run_id: run_id.clone(),
             plan_id: plan_id.clone(),
-            event_id: run_event_id.clone(),
-            plan_event_id: Some(plan_event_id.clone()),
+            event_id: generated_overrides.run_event_id.clone(),
+            plan_event_id: Some(generated_overrides.plan_event_id.clone()),
             request_fingerprint: request_fingerprint.clone(),
             created_at: now,
         };
@@ -3810,13 +3836,9 @@ pub(crate) async fn trigger_run(
             ReservationResult::Reserved => {
                 // We won the race - proceed to emit events
                 tracing::debug!(run_key = %run_key, "run_key reserved, proceeding with run creation");
-                accepted_event_id = Some(run_event_id.clone());
+                accepted_event_id = Some(generated_overrides.run_event_id.clone());
                 accepted_at = Some(now);
-                run_event_overrides = Some(RunEventOverrides {
-                    run_event_id,
-                    plan_event_id,
-                    created_at: now,
-                });
+                run_event_overrides = Some(generated_overrides);
             }
             ReservationResult::AlreadyExists(existing) => {
                 if let (Some(existing_fp), Some(_)) = (
@@ -3968,15 +3990,10 @@ pub(crate) async fn trigger_run(
     )?;
 
     if request.run_key.is_none() {
-        let run_event_id = Ulid::new().to_string();
-        let plan_event_id = Ulid::new().to_string();
-        accepted_event_id = Some(run_event_id.clone());
+        let generated_overrides = new_run_event_overrides(now)?;
+        accepted_event_id = Some(generated_overrides.run_event_id.clone());
         accepted_at = Some(now);
-        run_event_overrides = Some(RunEventOverrides {
-            run_event_id,
-            plan_event_id,
-            created_at: now,
-        });
+        run_event_overrides = Some(generated_overrides);
     }
 
     let event_paths = append_run_events(
@@ -4193,15 +4210,14 @@ pub(crate) async fn rerun_run(
     let fingerprint_policy =
         FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff);
 
-    let run_event_id = Ulid::new().to_string();
-    let plan_event_id = Ulid::new().to_string();
+    let generated_overrides = new_run_event_overrides(now)?;
 
     let reservation = RunKeyReservation {
         run_key: run_key.clone(),
         run_id: run_id.clone(),
         plan_id: plan_id.clone(),
-        event_id: run_event_id.clone(),
-        plan_event_id: Some(plan_event_id.clone()),
+        event_id: generated_overrides.run_event_id.clone(),
+        plan_event_id: Some(generated_overrides.plan_event_id.clone()),
         request_fingerprint: request_fingerprint.clone(),
         created_at: now,
     };
@@ -4210,11 +4226,7 @@ pub(crate) async fn rerun_run(
         .await
         .map_err(|e| ApiError::internal(format!("failed to reserve run_key: {e}")))?
     {
-        ReservationResult::Reserved => Some(RunEventOverrides {
-            run_event_id,
-            plan_event_id,
-            created_at: now,
-        }),
+        ReservationResult::Reserved => Some(generated_overrides),
         ReservationResult::AlreadyExists(existing) => {
             let mut run_state = RunStateResponse::Pending;
             let mut run_found = false;

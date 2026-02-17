@@ -383,6 +383,24 @@ async fn test_create_backfill_returns_correlation_id() -> Result<()> {
 async fn test_trigger_run_returns_acceptance_metadata() -> Result<()> {
     let router = test_router();
 
+    let manifest = serde_json::json!({
+        "manifestVersion": "1.0",
+        "codeVersionId": "trigger-acceptance-test",
+        "assets": [{
+            "key": {"namespace": "analytics", "name": "daily_sales"},
+            "id": "01HQXYZ123",
+            "description": "Daily sales asset"
+        }]
+    });
+    let (status, _deploy): (_, serde_json::Value) = helpers::post_json_with_headers(
+        router.clone(),
+        "/api/v1/workspaces/test-workspace/manifests",
+        manifest,
+        &[("Idempotency-Key", "idem_trigger_acceptance_manifest")],
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+
     let body = serde_json::json!({
         "selection": ["analytics.daily_sales"]
     });
@@ -395,7 +413,7 @@ async fn test_trigger_run_returns_acceptance_metadata() -> Result<()> {
     )
     .await?;
 
-    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(status, StatusCode::CREATED, "payload: {payload}");
     assert!(
         payload["acceptedEventId"]
             .as_str()

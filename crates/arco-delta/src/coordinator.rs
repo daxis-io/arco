@@ -104,8 +104,8 @@ impl DeltaCommitCoordinator {
     /// Commits a staged Delta payload (Mode B).
     ///
     /// This function:
-    /// 1) Applies idempotency replay if a committed marker exists.
-    /// 2) Recovers and finalizes any expired inflight commit.
+    /// 1) Recovers and finalizes any expired or already-materialized inflight commit.
+    /// 2) Applies idempotency replay if a committed marker exists.
     /// 3) Reserves the next version via CAS.
     /// 4) Writes `_delta_log/{version}.json` with `DoesNotExist` precondition.
     /// 5) Writes an idempotency marker for safe retries.
@@ -127,6 +127,17 @@ impl DeltaCommitCoordinator {
 
         let request_hash = request_hash(&req)?;
 
+        if let Some(recovered) = self.recover_inflight(now).await? {
+            if recovered.commit_id == req.idempotency_key {
+                if recovered.request_hash != request_hash {
+                    return Err(DeltaError::conflict(
+                        "Idempotency-Key already used with different request body".to_string(),
+                    ));
+                }
+                return Ok(recovered.response);
+            }
+        }
+
         if let Some(record) = self.read_idempotency_record(&req.idempotency_key).await? {
             if record.request_hash != request_hash {
                 return Err(DeltaError::conflict(
@@ -137,17 +148,6 @@ impl DeltaCommitCoordinator {
                 version: record.version,
                 delta_log_path: record.delta_log_path,
             });
-        }
-
-        if let Some(recovered) = self.recover_inflight(now).await? {
-            if recovered.commit_id == req.idempotency_key {
-                if recovered.request_hash != request_hash {
-                    return Err(DeltaError::conflict(
-                        "Idempotency-Key already used with different request body".to_string(),
-                    ));
-                }
-                return Ok(recovered.response);
-            }
         }
 
         let reserved = self.reserve_or_resume_inflight(&req, now).await?;
@@ -291,8 +291,6 @@ impl DeltaCommitCoordinator {
                     delta_log_path: delta_log_path.clone(),
                 };
 
-                // Persist replay information before clearing inflight state so retries
-                // can always recover a successful commit even if storage is transiently unavailable.
                 self.write_idempotency_record(
                     &inflight.commit_id,
                     &recovered_request_hash,
@@ -544,47 +542,37 @@ fn coordinator_path(table_id: Uuid) -> String {
 }
 
 fn delta_log_path(table_id: Uuid, version: i64) -> Result<String> {
-    if version < 0 {
-        return Err(DeltaError::bad_request(
-            "delta log version must be non-negative",
-        ));
-    }
-    Ok(format!("tables/{table_id}/_delta_log/{version:020}.json"))
+    let version_u64 = u64::try_from(version).map_err(|_| DeltaError::bad_request("version < 0"))?;
+    Ok(format!(
+        "tables/{table_id}/_delta_log/{version_u64:020}.json"
+    ))
 }
 
 fn idempotency_path(table_id: Uuid, idempotency_key: &str) -> String {
     let hash = sha256_hex(idempotency_key.as_bytes());
-    let prefix = hash.get(0..2).unwrap_or("00");
+    let prefix = &hash[..2.min(hash.len())];
     format!("delta/idempotency/{table_id}/{prefix}/{hash}.json")
 }
 
 fn request_hash(req: &CommitDeltaRequest) -> Result<String> {
-    let value = serde_json::json!({
-        "read_version": req.read_version,
-        "staged_path": req.staged_path,
-        "staged_version": req.staged_version,
-    });
-
-    let canonical = serde_jcs::to_string(&value)
-        .map_err(|e| DeltaError::serialization(format!("failed to canonicalize request: {e}")))?;
+    let value = serde_json::to_value(req).map_err(|e| {
+        DeltaError::serialization(format!("failed to serialize commit request: {e}"))
+    })?;
+    let canonical = serde_jcs::to_string(&value).map_err(|e| {
+        DeltaError::serialization(format!("failed to canonicalize commit request: {e}"))
+    })?;
     Ok(sha256_hex(canonical.as_bytes()))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(bytes);
+    hasher.update(data);
     hex::encode(hasher.finalize())
 }
 
 fn validate_uuidv7(key: &str) -> Result<()> {
     let uuid = Uuid::parse_str(key)
-        .map_err(|_| DeltaError::bad_request("Idempotency-Key must be a valid UUIDv7"))?;
-
-    if uuid.get_variant() != uuid::Variant::RFC4122 {
-        return Err(DeltaError::bad_request(
-            "Idempotency-Key must use RFC4122 variant",
-        ));
-    }
+        .map_err(|_| DeltaError::bad_request("Idempotency-Key must be a valid UUID"))?;
     if uuid.get_version_num() != 7 {
         return Err(DeltaError::bad_request(
             "Idempotency-Key must be UUIDv7 (RFC 9562)",

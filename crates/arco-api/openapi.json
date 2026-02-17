@@ -4531,6 +4531,45 @@
           }
         }
       },
+      "CommitRequest": {
+        "type": "object",
+        "required": [
+          "read_version",
+          "staged_path",
+          "staged_version"
+        ],
+        "properties": {
+          "read_version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Optimistic concurrency token: the version the client read."
+          },
+          "staged_path": {
+            "type": "string",
+            "description": "Path returned by the stage endpoint."
+          },
+          "staged_version": {
+            "type": "string",
+            "description": "Version returned by the stage endpoint."
+          }
+        }
+      },
+      "CommitResponse": {
+        "type": "object",
+        "required": [
+          "version",
+          "delta_log_path"
+        ],
+        "properties": {
+          "delta_log_path": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "CreateBackfillRequest": {
         "type": "object",
         "description": "Request to create a backfill.",
@@ -4612,6 +4651,26 @@
               "null"
             ],
             "description": "Optional correlation ID for request tracing."
+          }
+        }
+      },
+      "CreateCatalogRequest": {
+        "type": "object",
+        "description": "Request to create a catalog.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional description."
+          },
+          "name": {
+            "type": "string",
+            "description": "Catalog name (unique within workspace)."
           }
         }
       },
@@ -5277,6 +5336,38 @@
               "$ref": "#/components/schemas/ScheduleResponse"
             },
             "description": "List of schedules."
+          }
+        }
+      },
+      "ListSchemaTablesResponse": {
+        "type": "object",
+        "description": "List tables response.",
+        "required": [
+          "tables"
+        ],
+        "properties": {
+          "tables": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SchemaTableResponse"
+            },
+            "description": "List of tables."
+          }
+        }
+      },
+      "ListSchemasResponse": {
+        "type": "object",
+        "description": "List schemas response.",
+        "required": [
+          "schemas"
+        ],
+        "properties": {
+          "schemas": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SchemaResponse"
+            },
+            "description": "List of schemas."
           }
         }
       },
@@ -6476,7 +6567,6 @@
           "timezone",
           "catchupWindowMinutes",
           "maxCatchupTicks",
-          "assetSelection",
           "enabled",
           "definitionVersion"
         ],
@@ -6486,12 +6576,12 @@
             "items": {
               "type": "string"
             },
-            "description": "Asset selection snapshot stored with the definition."
+            "description": "Asset selection captured on the definition."
           },
           "catchupWindowMinutes": {
             "type": "integer",
             "format": "int32",
-            "description": "Maximum time window for catchup.",
+            "description": "Maximum catchup window (minutes).",
             "minimum": 0
           },
           "cronExpression": {
@@ -6500,7 +6590,7 @@
           },
           "definitionVersion": {
             "type": "string",
-            "description": "Current definition version."
+            "description": "Definition row version."
           },
           "enabled": {
             "type": "boolean",
@@ -6531,7 +6621,7 @@
           "maxCatchupTicks": {
             "type": "integer",
             "format": "int32",
-            "description": "Maximum number of ticks to catch up per evaluation.",
+            "description": "Maximum catchup ticks per evaluation.",
             "minimum": 0
           },
           "scheduleId": {
@@ -7672,29 +7762,6 @@
           "state": {
             "$ref": "#/components/schemas/RunStateResponse",
             "description": "Current run state."
-          }
-        }
-      },
-      "UnprocessableEntityResponse": {
-        "type": "object",
-        "description": "Error response for unsupported partition selectors.",
-        "required": [
-          "error",
-          "message",
-          "code"
-        ],
-        "properties": {
-          "code": {
-            "type": "string",
-            "description": "Stable error code."
-          },
-          "error": {
-            "type": "string",
-            "description": "Error category."
-          },
-          "message": {
-            "type": "string",
-            "description": "Human-readable error message."
           }
         }
       },

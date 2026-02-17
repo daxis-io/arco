@@ -120,6 +120,9 @@ impl ApiError {
             StatusCode::NOT_ACCEPTABLE => Self::not_acceptable(message),
             StatusCode::NOT_IMPLEMENTED => Self::not_implemented(message),
             StatusCode::REQUEST_TIMEOUT => Self::request_timeout(message),
+            StatusCode::TOO_MANY_REQUESTS => {
+                Self::new(StatusCode::TOO_MANY_REQUESTS, "TOO_MANY_REQUESTS", message)
+            }
             StatusCode::UNPROCESSABLE_ENTITY => {
                 Self::unprocessable_entity("UNPROCESSABLE_ENTITY", message)
             }

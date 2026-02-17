@@ -325,31 +325,19 @@ async fn unity_catalog_auth_middleware(
     }
 
     let (mut parts, body) = req.into_parts();
-    let resource = parts.uri.path().to_string();
     let request_id = crate::context::request_id_from_headers(&parts.headers)
         .unwrap_or_else(|| ulid::Ulid::new().to_string());
 
     let ctx = match RequestContext::from_request_parts(&mut parts, &state).await {
         Ok(ctx) => ctx,
         Err(err) => {
-            let reason = if err.code() == "MISSING_AUTH" {
-                crate::audit::REASON_MISSING_TOKEN
-            } else {
-                crate::audit::REASON_INVALID_TOKEN
-            };
-            let audit_request_id = err.request_id().unwrap_or(&request_id);
-            crate::audit::emit_auth_deny(&state, audit_request_id, &resource, reason);
             return api_error_to_unity_catalog_response(&err, Some(&request_id));
         }
     };
 
-    crate::audit::emit_auth_allow(&state, &ctx, &resource);
-
     let uc_ctx = UnityCatalogRequestContext {
         tenant: ctx.tenant.clone(),
         workspace: ctx.workspace.clone(),
-        user_id: ctx.user_id.clone(),
-        groups: ctx.groups.clone(),
         request_id: ctx.request_id.clone(),
         idempotency_key: ctx.idempotency_key.clone(),
     };
@@ -416,9 +404,9 @@ fn api_error_to_unity_catalog_response(
         StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
             UnityCatalogError::Conflict { message }
         }
-        StatusCode::TOO_MANY_REQUESTS => UnityCatalogError::TooManyRequests { message },
         StatusCode::NOT_IMPLEMENTED => UnityCatalogError::NotImplemented { message },
         StatusCode::SERVICE_UNAVAILABLE => UnityCatalogError::ServiceUnavailable { message },
+        StatusCode::TOO_MANY_REQUESTS => UnityCatalogError::TooManyRequests { message },
         _ => UnityCatalogError::Internal { message },
     };
 
@@ -513,11 +501,17 @@ impl Server {
 
         let auth_layer =
             middleware::from_fn_with_state(Arc::clone(&state), crate::context::auth_middleware);
+        let uc_auth_layer =
+            middleware::from_fn_with_state(Arc::clone(&state), crate::context::auth_middleware);
         let task_auth_layer = middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::routes::tasks::task_auth_middleware,
         );
         let rate_limit_layer = middleware::from_fn_with_state(
+            Arc::clone(&state.rate_limit),
+            crate::rate_limit::rate_limit_middleware,
+        );
+        let uc_rate_limit_layer = middleware::from_fn_with_state(
             Arc::clone(&state.rate_limit),
             crate::rate_limit::rate_limit_middleware,
         );
@@ -550,6 +544,13 @@ impl Server {
                     .route_layer(task_rate_limit_layer)
                     .layer(task_auth_layer),
             );
+
+        router = router.nest(
+            "/_uc/api/2.1/unity-catalog",
+            crate::routes::uc::routes()
+                .route_layer(uc_rate_limit_layer)
+                .layer(uc_auth_layer),
+        );
 
         // Mount Iceberg REST Catalog if enabled
         // Uses nest_service since Iceberg router has its own state type
@@ -597,8 +598,7 @@ impl Server {
 
         // Mount Unity Catalog facade if enabled
         if state.config.unity_catalog.enabled {
-            let uc_state = UnityCatalogState::new(Arc::clone(&state.storage))
-                .with_audit_emitter(Arc::new(state.audit().clone()));
+            let uc_state = UnityCatalogState::new(Arc::clone(&state.storage));
 
             let uc_service = ServiceBuilder::new()
                 .layer(middleware::from_fn_with_state(
@@ -1221,7 +1221,7 @@ mod tests {
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok());
-        assert!(content_type.map_or(false, |value| value.starts_with("application/json")));
+        assert!(content_type.is_some_and(|value| value.starts_with("application/json")));
 
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await

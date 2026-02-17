@@ -1709,7 +1709,7 @@ mod query {
         let cursor = Cursor::new(body.to_vec());
         let mut reader = StreamReader::try_new(cursor, None).context("open arrow stream reader")?;
         let mut rows = 0;
-        while let Some(batch) = reader.next() {
+        for batch in &mut reader {
             let batch = batch.context("read arrow batch")?;
             rows += batch.num_rows();
         }
@@ -1851,7 +1851,7 @@ mod query {
         let deny_event = events
             .iter()
             .find(|e| e.action == AuditAction::AuthDeny)
-            .expect("should have AuthDeny event");
+            .context("should have AuthDeny event")?;
         assert_eq!(deny_event.decision_reason, "missing_token");
 
         Ok(())

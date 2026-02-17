@@ -77,65 +77,6 @@ pub struct TriggerRunRequest {
     pub include_downstream: bool,
     /// Partition overrides (key=value strings). Backward-compatible with older clients.
     #[serde(default)]
-    pub include_upstream: bool,
-    /// Include downstream dependents of the selection.
-    #[serde(default)]
-    pub include_downstream: bool,
-    /// Partition overrides (key=value strings). Backward-compatible with older clients.
-    #[serde(default)]
-    pub partitions: Vec<PartitionValue>,
-    /// Canonical partition key string (ADR-011). Preferred; cannot be combined with `partitions`.
-    #[schema(min_length = 1)]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partition_key: Option<String>,
-    /// Idempotency key for deduplication (409 if reused with different payload).
-    /// Reservations created before the fingerprint cutoff remain lenient.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_key: Option<String>,
-    /// Additional labels for the run.
-    #[serde(default)]
-    pub labels: HashMap<String, String>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize, ToSchema, Clone)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct TriggerRunRequestWithPartitionKey {
-    /// Asset selection (asset keys to materialize).
-    #[serde(default)]
-    pub selection: Vec<String>,
-    /// Include upstream dependencies of the selection.
-    #[serde(default)]
-    pub include_upstream: bool,
-    /// Include downstream dependents of the selection.
-    #[serde(default)]
-    pub include_downstream: bool,
-    /// Canonical partition key string (ADR-011).
-    #[schema(min_length = 1)]
-    pub partition_key: String,
-    /// Idempotency key for deduplication (409 if reused with different payload).
-    /// Reservations created before the fingerprint cutoff remain lenient.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_key: Option<String>,
-    /// Additional labels for the run.
-    #[serde(default)]
-    pub labels: HashMap<String, String>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize, ToSchema, Clone)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct TriggerRunRequestWithPartitions {
-    /// Asset selection (asset keys to materialize).
-    #[serde(default)]
-    pub selection: Vec<String>,
-    /// Include upstream dependencies of the selection.
-    #[serde(default)]
-    pub include_upstream: bool,
-    /// Include downstream dependents of the selection.
-    #[serde(default)]
-    pub include_downstream: bool,
-    /// Partition overrides (key=value strings). Backward-compatible with older clients.
     pub partitions: Vec<PartitionValue>,
     /// Canonical partition key string (ADR-011). Preferred; cannot be combined with `partitions`.
     #[schema(min_length = 1)]
@@ -6859,6 +6800,7 @@ mod tests {
             tenant: "tenant".to_string(),
             workspace: "workspace".to_string(),
             user_id: Some("user@example.com".to_string()),
+            groups: vec![],
             request_id: "req_01".to_string(),
             idempotency_key: None,
         };
@@ -7026,6 +6968,7 @@ mod tests {
             tenant: "tenant".to_string(),
             workspace: "workspace".to_string(),
             user_id: Some("user@example.com".to_string()),
+            groups: vec![],
             request_id: "req_01".to_string(),
             idempotency_key: None,
         };

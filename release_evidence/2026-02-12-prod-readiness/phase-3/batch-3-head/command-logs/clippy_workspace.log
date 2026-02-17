@@ -1,7 +1,0 @@
-# command: cargo clippy --workspace --all-features -- -D warnings
-# start_utc: 2026-02-14T04:44:02Z
-    Checking arco-flow v0.1.0 (/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/crates/arco-flow)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.03s
-
-# exit_code: 0
-# end_utc: 2026-02-14T04:44:03Z

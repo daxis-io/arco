@@ -1,6 +1,0 @@
-[UTC] 2026-02-14T04:45:26Z
-Terraform v1.12.2
-on darwin_arm64
-
-Your version of Terraform is out of date! The latest version
-is 1.14.5. You can update by downloading from https://developer.hashicorp.com/terraform/install

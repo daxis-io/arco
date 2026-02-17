@@ -1,5 +1,0 @@
-[UTC] 2026-02-15T16:23:55Z
-[CMD] terraform -chdir="/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/infra/terraform" validate -no-color
-Success! The configuration is valid.
-
-[EXIT] 0

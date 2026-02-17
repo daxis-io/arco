@@ -1,6 +1,0 @@
-15:2. `release_notes/vX.Y.Z.md` must exist and include:
-25:bash tools/check-release-tag-discipline.sh --tag vX.Y.Z
-31:2. Update versioned release notes (`release_notes/vX.Y.Z.md`).
-34:   bash tools/check-release-tag-discipline.sh --tag vX.Y.Z
-54:bash tools/collect_release_evidence.sh --tag vX.Y.Z
-65:## SBOM Retention Policy

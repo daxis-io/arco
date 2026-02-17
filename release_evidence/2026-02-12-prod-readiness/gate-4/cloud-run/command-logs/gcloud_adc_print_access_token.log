@@ -1,9 +1,0 @@
-[UTC] 2026-02-15T16:24:00Z
-[CMD] gcloud auth application-default print-access-token
-ERROR: (gcloud.auth.application-default.print-access-token) There was a problem refreshing your current auth tokens: Reauthentication failed. cannot prompt during non-interactive execution.
-Please run:
-
-  $ gcloud auth application-default login
-
-to obtain new credentials.
-[EXIT] 1

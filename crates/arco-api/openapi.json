@@ -2358,16 +2358,6 @@
                 }
               }
             }
-          },
-          "422": {
-            "description": "Unsupported partition selector",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
           }
         },
         "security": [

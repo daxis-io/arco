@@ -2001,50 +2001,125 @@ fn validate_backfill_asset_selection(asset_selection: &[String]) -> Result<(), A
     Ok(())
 }
 
-fn extract_explicit_partition_keys(
+fn parse_partition_selector(
     selector: &PartitionSelectorRequest,
-) -> Result<&[String], ApiError> {
-    let partitions = match selector {
-        PartitionSelectorRequest::Explicit { partitions } => partitions,
-        PartitionSelectorRequest::Range { .. } | PartitionSelectorRequest::Filter { .. } => {
-            return Err(ApiError::unprocessable_entity(
-                "PARTITION_SELECTOR_NOT_SUPPORTED",
-                "Only explicit partition lists are supported. Range and filter selectors require a PartitionResolver (not yet implemented).",
-            ));
+) -> Result<(PartitionSelector, u32), ApiError> {
+    match selector {
+        PartitionSelectorRequest::Explicit { partitions } => {
+            if partitions.is_empty() {
+                return Err(ApiError::bad_request(
+                    "partitionSelector.partitions cannot be empty",
+                ));
+            }
+            if partitions.iter().any(|key| key.trim().is_empty()) {
+                return Err(ApiError::bad_request(
+                    "partitionSelector.partitions cannot contain empty values",
+                ));
+            }
+            Ok((
+                PartitionSelector::Explicit {
+                    partition_keys: partitions.clone(),
+                },
+                usize_to_u32_saturating(partitions.len()),
+            ))
         }
-    };
+        PartitionSelectorRequest::Range { start, end } => {
+            if start.trim().is_empty() || end.trim().is_empty() {
+                return Err(ApiError::bad_request(
+                    "range selector requires start and end",
+                ));
+            }
+            Ok((
+                PartitionSelector::Range {
+                    start: start.clone(),
+                    end: end.clone(),
+                },
+                0,
+            ))
+        }
+        PartitionSelectorRequest::Filter { filters } => {
+            if filters.is_empty() {
+                return Err(ApiError::bad_request("filter selector cannot be empty"));
+            }
+            if filters
+                .iter()
+                .any(|(key, value)| key.trim().is_empty() || value.trim().is_empty())
+            {
+                return Err(ApiError::bad_request(
+                    "filter selector keys and values must be non-empty",
+                ));
+            }
+            if filter_selector_bounds(filters).is_none() {
+                return Err(ApiError::bad_request(
+                    "filter selector requires start/end bounds",
+                ));
+            }
+            Ok((
+                PartitionSelector::Filter {
+                    filters: filters.clone(),
+                },
+                0,
+            ))
+        }
+    }
+}
 
-    if partitions.is_empty() {
-        return Err(ApiError::bad_request(
-            "partitionSelector.partitions cannot be empty",
-        ));
+fn filter_selector_bounds(filters: &HashMap<String, String>) -> Option<(&str, &str)> {
+    let start = filters
+        .get("start")
+        .or_else(|| filters.get("partition_start"))?;
+    let end = filters
+        .get("end")
+        .or_else(|| filters.get("partition_end"))?;
+    Some((start.as_str(), end.as_str()))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackfillFingerprintPayload {
+    asset_selection: Vec<String>,
+    partition_selector: BackfillFingerprintPartitionSelector,
+    chunk_size: u32,
+    max_concurrent_runs: u32,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum BackfillFingerprintPartitionSelector {
+    Range { start: String, end: String },
+    Explicit { partition_keys: Vec<String> },
+    Filter { filters: BTreeMap<String, String> },
+}
+
+impl From<&PartitionSelector> for BackfillFingerprintPartitionSelector {
+    fn from(selector: &PartitionSelector) -> Self {
+        match selector {
+            PartitionSelector::Range { start, end } => Self::Range {
+                start: start.clone(),
+                end: end.clone(),
+            },
+            PartitionSelector::Explicit { partition_keys } => Self::Explicit {
+                partition_keys: partition_keys.clone(),
+            },
+            PartitionSelector::Filter { filters } => Self::Filter {
+                filters: filters
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            },
+        }
     }
-    if partitions.iter().any(|key| key.trim().is_empty()) {
-        return Err(ApiError::bad_request(
-            "partitionSelector.partitions cannot contain empty values",
-        ));
-    }
-    Ok(partitions)
 }
 
 fn compute_backfill_fingerprint(
     asset_selection: &[String],
-    partition_keys: &[String],
+    partition_selector: &PartitionSelector,
     chunk_size: u32,
     max_concurrent_runs: u32,
 ) -> Result<String, ApiError> {
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct FingerprintPayload<'a> {
-        asset_selection: &'a [String],
-        partition_keys: &'a [String],
-        chunk_size: u32,
-        max_concurrent_runs: u32,
-    }
-
-    let payload = FingerprintPayload {
-        asset_selection,
-        partition_keys,
+    let payload = BackfillFingerprintPayload {
+        asset_selection: asset_selection.to_vec(),
+        partition_selector: partition_selector.into(),
         chunk_size,
         max_concurrent_runs,
     };
@@ -5519,7 +5594,6 @@ pub(crate) async fn list_sensor_evals(
         (status = 400, description = "Invalid request", body = ApiErrorBody),
         (status = 404, description = "Workspace not found", body = ApiErrorBody),
         (status = 409, description = "Idempotency key conflict", body = ApiErrorBody),
-        (status = 422, description = "Unsupported partition selector", body = ApiErrorBody),
     ),
     tag = "Orchestration",
     security(("bearerAuth" = []))
@@ -5545,12 +5619,13 @@ pub(crate) async fn create_backfill(
     // Validate request
     ensure_workspace(&ctx, &workspace_id)?;
     validate_backfill_asset_selection(&request.asset_selection)?;
-    let partition_keys = extract_explicit_partition_keys(&request.partition_selector)?;
+    let (partition_selector, total_partitions) =
+        parse_partition_selector(&request.partition_selector)?;
     let chunk_size = resolve_backfill_chunk_size(request.chunk_size)?;
     let max_concurrent_runs = resolve_backfill_max_concurrent(request.max_concurrent_runs)?;
     let request_fingerprint = compute_backfill_fingerprint(
         &request.asset_selection,
-        partition_keys,
+        &partition_selector,
         chunk_size,
         max_concurrent_runs,
     )?;
@@ -5598,7 +5673,6 @@ pub(crate) async fn create_backfill(
     // Build and write the event
     let client_request_id =
         resolve_backfill_client_request_id(idempotency_key.as_deref(), &request);
-    let total_partitions = usize_to_u32_saturating(partition_keys.len());
 
     let mut event = OrchestrationEvent::new(
         &ctx.tenant,
@@ -5607,9 +5681,7 @@ pub(crate) async fn create_backfill(
             backfill_id: backfill_id.clone(),
             client_request_id,
             asset_selection: request.asset_selection.clone(),
-            partition_selector: PartitionSelector::Explicit {
-                partition_keys: partition_keys.to_vec(),
-            },
+            partition_selector,
             total_partitions,
             chunk_size,
             max_concurrent_runs,

@@ -115,7 +115,7 @@ mod helpers {
 }
 
 #[tokio::test]
-async fn test_create_backfill_rejects_non_explicit_selector() -> Result<()> {
+async fn test_create_backfill_accepts_range_selector() -> Result<()> {
     let router = test_router();
 
     let body = serde_json::json!({
@@ -128,7 +128,7 @@ async fn test_create_backfill_rejects_non_explicit_selector() -> Result<()> {
         "clientRequestId": "req_01"
     });
 
-    let (status, error): (_, ApiErrorResponse) = helpers::post_json_with_headers(
+    let (status, response): (_, CreateBackfillResponse) = helpers::post_json_with_headers(
         router,
         "/api/v1/workspaces/test-workspace/backfills",
         body,
@@ -136,13 +136,41 @@ async fn test_create_backfill_rejects_non_explicit_selector() -> Result<()> {
     )
     .await?;
 
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(error.code, "PARTITION_SELECTOR_NOT_SUPPORTED");
-    assert_eq!(
-        error.message,
-        "Only explicit partition lists are supported. Range and filter selectors require a PartitionResolver (not yet implemented)."
-    );
-    assert_eq!(error.error.as_deref(), Some("unprocessable_entity"));
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(!response.backfill_id.is_empty());
+    assert!(!response.accepted_event_id.is_empty());
+    assert!(!response.accepted_at.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_create_backfill_rejects_filter_without_bounds() -> Result<()> {
+    let router = test_router();
+
+    let body = serde_json::json!({
+        "assetSelection": ["analytics.daily_sales"],
+        "partitionSelector": {
+            "type": "filter",
+            "filters": {
+                "region": "us-*"
+            }
+        },
+        "clientRequestId": "req_filter_invalid"
+    });
+
+    let (status, error): (_, ApiErrorResponse) = helpers::post_json_with_headers(
+        router,
+        "/api/v1/workspaces/test-workspace/backfills",
+        body,
+        &[("Idempotency-Key", "idem_filter_invalid")],
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "BAD_REQUEST");
+    assert_eq!(error.message, "filter selector requires start/end bounds");
+    assert!(error.error.is_none() || error.error.as_deref() == Some("bad_request"));
 
     Ok(())
 }
@@ -302,9 +330,10 @@ async fn test_create_backfill_rejects_filter_selector() -> Result<()> {
     )
     .await?;
 
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(error.code, "PARTITION_SELECTOR_NOT_SUPPORTED");
-    assert_eq!(error.error.as_deref(), Some("unprocessable_entity"));
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code, "BAD_REQUEST");
+    assert_eq!(error.message, "filter selector requires start/end bounds");
+    assert!(error.error.is_none() || error.error.as_deref() == Some("bad_request"));
 
     Ok(())
 }

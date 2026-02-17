@@ -494,8 +494,10 @@ dependencies = [
 name = "arco-uc"
 version = "0.1.0"
 dependencies = [
+ "arco-catalog",
  "arco-core",
  "axum 0.7.9",
+ "bytes",
  "gcp_auth",
  "http",
  "serde",
@@ -509,6 +511,7 @@ dependencies = [
  "tracing",
  "ulid",
  "utoipa",
+ "uuid",
 ]
 
 [[package]]

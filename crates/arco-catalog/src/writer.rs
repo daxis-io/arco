@@ -1318,7 +1318,7 @@ impl CatalogWriter {
                 });
             }
         }
-        let mut state =
+        let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
         let target_catalog = if catalog == "default" {

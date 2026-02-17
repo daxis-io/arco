@@ -406,6 +406,7 @@ fn api_error_to_unity_catalog_response(
         }
         StatusCode::NOT_IMPLEMENTED => UnityCatalogError::NotImplemented { message },
         StatusCode::SERVICE_UNAVAILABLE => UnityCatalogError::ServiceUnavailable { message },
+        StatusCode::TOO_MANY_REQUESTS => UnityCatalogError::TooManyRequests { message },
         _ => UnityCatalogError::Internal { message },
     };
 

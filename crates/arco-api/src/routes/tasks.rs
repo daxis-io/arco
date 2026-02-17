@@ -1266,10 +1266,10 @@ mod tests {
 
     #[test]
     fn test_jwt_task_token_validator_accepts_valid_token() {
-        let config = JwtConfig {
-            hs256_secret: Some("test-secret".to_string()),
-            ..JwtConfig::default()
-        };
+        let mut config = JwtConfig::default();
+        config.hs256_secret = Some("test-secret".to_string());
+        config.issuer = Some("https://issuer.example".to_string());
+        config.audience = Some("arco-api".to_string());
 
         let validator = JwtTaskTokenValidator::new(&config, "tenant-1", "workspace-1", false)
             .expect("validator");
@@ -1299,10 +1299,10 @@ mod tests {
 
     #[test]
     fn test_jwt_task_token_validator_rejects_task_id_mismatch() {
-        let config = JwtConfig {
-            hs256_secret: Some("test-secret".to_string()),
-            ..JwtConfig::default()
-        };
+        let mut config = JwtConfig::default();
+        config.hs256_secret = Some("test-secret".to_string());
+        config.issuer = Some("https://issuer.example".to_string());
+        config.audience = Some("arco-api".to_string());
 
         let validator = JwtTaskTokenValidator::new(&config, "tenant-1", "workspace-1", false)
             .expect("validator");
@@ -1483,14 +1483,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_auth_middleware_accepts_valid_token() -> Result<()> {
-        let config = crate::config::Config {
-            debug: false,
-            jwt: JwtConfig {
-                hs256_secret: Some("test-secret".to_string()),
-                ..JwtConfig::default()
-            },
-            ..crate::config::Config::default()
-        };
+        let mut config = crate::config::Config::default();
+        config.debug = false;
+        config.jwt.hs256_secret = Some("test-secret".to_string());
+        config.jwt.issuer = Some("https://issuer.example".to_string());
+        config.jwt.audience = Some("arco-api".to_string());
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let app = Router::new()

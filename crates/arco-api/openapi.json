@@ -2285,7 +2285,7 @@
         "tags": [
           "Orchestration"
         ],
-        "summary": "Create a new backfill.",
+        "summary": "Create a backfill.",
         "operationId": "create_backfill",
         "parameters": [
           {
@@ -2310,7 +2310,7 @@
         },
         "responses": {
           "200": {
-            "description": "Existing backfill returned",
+            "description": "Idempotent backfill replay",
             "content": {
               "application/json": {
                 "schema": {
@@ -2320,7 +2320,7 @@
             }
           },
           "202": {
-            "description": "Backfill accepted",
+            "description": "Backfill created",
             "content": {
               "application/json": {
                 "schema": {
@@ -2350,7 +2350,7 @@
             }
           },
           "409": {
-            "description": "Idempotency conflict",
+            "description": "Idempotency key conflict",
             "content": {
               "application/json": {
                 "schema": {
@@ -2360,11 +2360,11 @@
             }
           },
           "422": {
-            "description": "Partition selector not supported",
+            "description": "Unsupported partition selector",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UnprocessableEntityResponse"
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }
@@ -2402,6 +2402,26 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "waitForEventId",
+            "in": "query",
+            "description": "Wait until this event ID is processed",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "timeoutMs",
+            "in": "query",
+            "description": "Timeout in milliseconds (defaults to 5000)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
           }
         ],
         "responses": {
@@ -2417,6 +2437,16 @@
           },
           "404": {
             "description": "Backfill not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "Timed out waiting for event",
             "content": {
               "application/json": {
                 "schema": {
@@ -3583,6 +3613,26 @@
             }
           },
           {
+            "name": "since",
+            "in": "query",
+            "description": "Filter ticks after this timestamp (inclusive)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "description": "Filter ticks before this timestamp (inclusive)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
             "name": "status",
             "in": "query",
             "description": "Filter by status",
@@ -3769,6 +3819,35 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "Filter evaluations after this timestamp (inclusive)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "description": "Filter evaluations before this timestamp (inclusive)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Filter by status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SensorEvalStatusFilter"
+            }
           }
         ],
         "responses": {
@@ -3910,6 +3989,13 @@
           "code": {
             "type": "string",
             "description": "Stable machine-readable error code."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional error category (e.g., `unprocessable_entity`)."
           },
           "message": {
             "type": "string",
@@ -4488,6 +4574,7 @@
         "type": "object",
         "description": "Request to create a backfill.",
         "required": [
+          "assetSelection",
           "partitionSelector"
         ],
         "properties": {
@@ -4498,13 +4585,20 @@
             },
             "description": "Assets to backfill."
           },
+          "backfillId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional backfill identifier (ULID)."
+          },
           "chunkSize": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int32",
-            "description": "Number of partitions per chunk (0 uses default).",
+            "description": "Number of partitions per chunk (defaults to 10).",
             "minimum": 0
           },
           "clientRequestId": {
@@ -4512,7 +4606,7 @@
               "string",
               "null"
             ],
-            "description": "Client request ID for idempotency."
+            "description": "Optional client request ID (for idempotency)."
           },
           "maxConcurrentRuns": {
             "type": [
@@ -4520,12 +4614,12 @@
               "null"
             ],
             "format": "int32",
-            "description": "Maximum concurrent chunk runs (0 uses default).",
+            "description": "Maximum concurrent chunk runs (defaults to 2).",
             "minimum": 0
           },
           "partitionSelector": {
             "$ref": "#/components/schemas/PartitionSelectorRequest",
-            "description": "Partition selector."
+            "description": "Partition selector (explicit only; range/filter planned once `PartitionResolver` is implemented)."
           }
         }
       },
@@ -4541,15 +4635,22 @@
           "acceptedAt": {
             "type": "string",
             "format": "date-time",
-            "description": "Time the event was accepted."
+            "description": "When the event was accepted."
           },
           "acceptedEventId": {
             "type": "string",
-            "description": "Event ID that was accepted."
+            "description": "Event identifier accepted by the ledger."
           },
           "backfillId": {
             "type": "string",
             "description": "Backfill identifier."
+          },
+          "correlationId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional correlation ID for request tracing."
           }
         }
       },
@@ -5270,6 +5371,55 @@
           }
         }
       },
+      "ListSensorEvalsQuery": {
+        "type": "object",
+        "description": "Query parameters for listing sensor evaluations.",
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cursor for pagination."
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Maximum evaluations to return.",
+            "minimum": 0
+          },
+          "since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Filter evaluations after this timestamp (inclusive)."
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SensorEvalStatusFilter",
+                "description": "Filter by evaluation status."
+              }
+            ]
+          },
+          "until": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Filter evaluations before this timestamp (inclusive)."
+          }
+        }
+      },
       "ListSensorEvalsResponse": {
         "type": "object",
         "description": "Response for listing sensor evaluations.",
@@ -5352,6 +5502,14 @@
             "description": "Maximum ticks to return.",
             "minimum": 0
           },
+          "since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Filter ticks after this timestamp (inclusive)."
+          },
           "status": {
             "oneOf": [
               {
@@ -5362,6 +5520,14 @@
                 "description": "Filter by tick status."
               }
             ]
+          },
+          "until": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Filter ticks before this timestamp (inclusive)."
           }
         }
       },
@@ -6401,7 +6567,6 @@
           "timezone",
           "catchupWindowMinutes",
           "maxCatchupTicks",
-          "assetSelection",
           "enabled",
           "definitionVersion"
         ],
@@ -6411,12 +6576,12 @@
             "items": {
               "type": "string"
             },
-            "description": "Asset selection snapshot stored with the definition."
+            "description": "Asset selection captured on the definition."
           },
           "catchupWindowMinutes": {
             "type": "integer",
             "format": "int32",
-            "description": "Maximum time window for catchup.",
+            "description": "Maximum catchup window (minutes).",
             "minimum": 0
           },
           "cronExpression": {
@@ -6425,7 +6590,7 @@
           },
           "definitionVersion": {
             "type": "string",
-            "description": "Current definition version."
+            "description": "Definition row version."
           },
           "enabled": {
             "type": "boolean",
@@ -6456,7 +6621,7 @@
           "maxCatchupTicks": {
             "type": "integer",
             "format": "int32",
-            "description": "Maximum number of ticks to catch up per evaluation.",
+            "description": "Maximum catchup ticks per evaluation.",
             "minimum": 0
           },
           "scheduleId": {
@@ -6682,6 +6847,16 @@
             "description": "Evaluation status."
           }
         }
+      },
+      "SensorEvalStatusFilter": {
+        "type": "string",
+        "description": "Sensor evaluation status filter (query parameter).",
+        "enum": [
+          "TRIGGERED",
+          "NO_NEW_DATA",
+          "ERROR",
+          "SKIPPED_STALE_CURSOR"
+        ]
       },
       "SensorEvalStatusResponse": {
         "oneOf": [
@@ -7546,9 +7721,27 @@
           "planId",
           "state",
           "created",
-          "createdAt"
+          "createdAt",
+          "acceptedEventId",
+          "acceptedAt"
         ],
         "properties": {
+          "acceptedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the event was accepted."
+          },
+          "acceptedEventId": {
+            "type": "string",
+            "description": "Event identifier accepted by the ledger."
+          },
+          "correlationId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional correlation ID for request tracing."
+          },
           "created": {
             "type": "boolean",
             "description": "Whether this is a new run or an existing one (`run_key` deduplication)."
@@ -7569,29 +7762,6 @@
           "state": {
             "$ref": "#/components/schemas/RunStateResponse",
             "description": "Current run state."
-          }
-        }
-      },
-      "UnprocessableEntityResponse": {
-        "type": "object",
-        "description": "Error response for unsupported partition selectors.",
-        "required": [
-          "error",
-          "message",
-          "code"
-        ],
-        "properties": {
-          "code": {
-            "type": "string",
-            "description": "Stable error code."
-          },
-          "error": {
-            "type": "string",
-            "description": "Error category."
-          },
-          "message": {
-            "type": "string",
-            "description": "Human-readable error message."
           }
         }
       },
@@ -7647,18 +7817,6 @@
     {
       "name": "tables",
       "description": "Table operations"
-    },
-    {
-      "name": "catalogs",
-      "description": "Catalog operations"
-    },
-    {
-      "name": "schemas",
-      "description": "Schema operations"
-    },
-    {
-      "name": "delta",
-      "description": "Delta commit coordination"
     },
     {
       "name": "lineage",

@@ -177,11 +177,11 @@ pub(crate) async fn commit_staged(
 impl From<arco_delta::DeltaError> for ApiError {
     fn from(value: arco_delta::DeltaError) -> Self {
         match value {
-            arco_delta::DeltaError::BadRequest { message } => ApiError::bad_request(message),
-            arco_delta::DeltaError::Conflict { message } => ApiError::conflict(message),
-            arco_delta::DeltaError::NotFound { message } => ApiError::not_found(message),
-            arco_delta::DeltaError::Storage(e) => ApiError::from(e),
-            arco_delta::DeltaError::Serialization { message } => ApiError::internal(message),
+            arco_delta::DeltaError::BadRequest { message } => Self::bad_request(message),
+            arco_delta::DeltaError::Conflict { message } => Self::conflict(message),
+            arco_delta::DeltaError::NotFound { message } => Self::not_found(message),
+            arco_delta::DeltaError::Storage(e) => Self::from(e),
+            arco_delta::DeltaError::Serialization { message } => Self::internal(message),
         }
     }
 }

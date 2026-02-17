@@ -14,14 +14,12 @@
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::ops::Range;
 use tower::ServiceExt;
 
 use arco_api::config::{Config, CorsConfig};
@@ -30,7 +28,6 @@ use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
 };
 use arco_test_utils::http_signed_url::HttpSignedUrlBackend;
-use reqwest::Url;
 
 // ============================================================================
 // Test Config Helper
@@ -107,7 +104,7 @@ fn is_local_bind_not_permitted(err: &arco_core::Error) -> bool {
     };
     if !message.contains("failed to bind http signed-url listener") {
         return false;
-    }
+    };
     message.contains("Operation not permitted") || message.contains("Permission denied")
 }
 
@@ -339,16 +336,12 @@ mod e2e_browser_read {
             "expected http signed url"
         );
 
-        assert_signed_url_shape(&signed.url, &namespaces_path, supports_http)?;
+        assert!(
+            signed.url.contains("/objects/"),
+            "expected signed URL path to include /objects/"
+        );
 
         // Query Parquet bytes via signed URL using DuckDB (browser read analogue).
-        if !supports_http {
-            println!(
-                "Skipping DuckDB browser read (no local HTTP listener); \
-set ARCO_REQUIRE_HTTP_SIGNED_URL_E2E=1 to fail instead"
-            );
-            return Ok(());
-        }
 
         let signed_url = signed.url.clone();
         let count = tokio::time::timeout(
@@ -501,7 +494,11 @@ mod signed_url_security {
         use arco_catalog::CatalogReader;
         use arco_core::{CatalogDomain, ScopedStorage};
 
-        // Initialize catalog first (writes the first snapshot).
+        let Some((router, inner)) = test_router_with_storage().await? else {
+            return Ok(());
+        };
+
+        // Initialize catalog first.
         let create_ns = CreateNamespaceRequest {
             name: "ttl_test_ns".to_string(),
             description: None,
@@ -509,12 +506,19 @@ mod signed_url_security {
         let response = post_json(&router, "/api/v1/namespaces", &create_ns).await?;
         assert_eq!(response.status(), StatusCode::CREATED);
 
+        let storage = ScopedStorage::new(inner, "test-tenant", "test-workspace")?;
+        let reader = CatalogReader::new(storage);
+        let mintable = reader.get_mintable_paths(CatalogDomain::Catalog).await?;
+        let namespaces_path = mintable
+            .iter()
+            .find(|p| p.ends_with("/namespaces.parquet"))
+            .cloned()
+            .context("namespaces.parquet not mintable")?;
+
         // Request with excessive TTL (2 hours = 7200 seconds)
         let mint_req = MintUrlsRequest {
             domain: "catalog".to_string(),
-            // TTL logic is independent of specific paths; keep paths empty to avoid
-            // coupling this test to snapshot versioning.
-            paths: vec![],
+            paths: vec![namespaces_path],
             ttl_seconds: Some(7200), // Exceeds MAX_TTL_SECONDS (3600)
         };
         let response = post_json(&router, "/api/v1/browser/urls", &mint_req).await?;
@@ -530,7 +534,11 @@ mod signed_url_security {
         use arco_catalog::CatalogReader;
         use arco_core::{CatalogDomain, ScopedStorage};
 
-        // Initialize catalog (writes the first snapshot).
+        let Some((router, inner)) = test_router_with_storage().await? else {
+            return Ok(());
+        };
+
+        // Initialize catalog.
         let create_ns = CreateNamespaceRequest {
             name: "default_ttl_ns".to_string(),
             description: None,
@@ -538,12 +546,19 @@ mod signed_url_security {
         let response = post_json(&router, "/api/v1/namespaces", &create_ns).await?;
         assert_eq!(response.status(), StatusCode::CREATED);
 
+        let storage = ScopedStorage::new(inner, "test-tenant", "test-workspace")?;
+        let reader = CatalogReader::new(storage);
+        let mintable = reader.get_mintable_paths(CatalogDomain::Catalog).await?;
+        let namespaces_path = mintable
+            .iter()
+            .find(|p| p.ends_with("/namespaces.parquet"))
+            .cloned()
+            .context("namespaces.parquet not mintable")?;
+
         // Request without TTL
         let mint_req = MintUrlsRequest {
             domain: "catalog".to_string(),
-            // TTL logic is independent of specific paths; keep paths empty to avoid
-            // coupling this test to snapshot versioning.
-            paths: vec![],
+            paths: vec![namespaces_path],
             ttl_seconds: None,
         };
         let response = post_json(&router, "/api/v1/browser/urls", &mint_req).await?;

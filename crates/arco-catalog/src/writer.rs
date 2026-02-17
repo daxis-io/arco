@@ -1276,6 +1276,7 @@ impl CatalogWriter {
     /// - Schema doesn't exist within the catalog
     /// - Table name already exists in schema
     /// - Lock acquisition or storage operations fail
+    #[allow(clippy::too_many_lines)]
     pub async fn register_table_in_schema(
         &self,
         catalog: &str,

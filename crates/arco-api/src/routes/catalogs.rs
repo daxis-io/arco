@@ -188,6 +188,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         ("bearerAuth" = [])
     )
 )]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn create_catalog(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
@@ -452,6 +453,7 @@ pub(crate) async fn get_catalog(
         ("bearerAuth" = [])
     )
 )]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn create_schema(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
@@ -680,6 +682,7 @@ pub(crate) async fn list_schemas(
         ("bearerAuth" = [])
     )
 )]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn register_table_in_schema(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,

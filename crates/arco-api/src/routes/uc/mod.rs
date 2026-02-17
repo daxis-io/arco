@@ -204,6 +204,7 @@ pub(crate) async fn list_catalogs(
         ("bearerAuth" = [])
     )
 )]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn create_catalog(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
@@ -404,6 +405,7 @@ pub(crate) async fn list_schemas(
         ("bearerAuth" = [])
     )
 )]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn create_schema(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,

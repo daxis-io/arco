@@ -264,14 +264,18 @@ async fn register_referenced_tables(
     let mut schema_tables: HashMap<(String, String), Vec<Table>> = HashMap::new();
 
     for table_ref in referenced_tables {
-        let catalog_provider = if let Some(provider) = catalog_providers.get(&table_ref.catalog) {
-            provider.clone()
-        } else {
-            let provider = Arc::new(MemoryCatalogProvider::new());
-            session.register_catalog(&table_ref.catalog, provider.clone());
-            catalog_providers.insert(table_ref.catalog.clone(), provider.clone());
-            provider
-        };
+        let catalog_provider = catalog_providers
+            .get(&table_ref.catalog)
+            .cloned()
+            .map_or_else(
+                || {
+                    let provider = Arc::new(MemoryCatalogProvider::new());
+                    session.register_catalog(&table_ref.catalog, provider.clone());
+                    catalog_providers.insert(table_ref.catalog.clone(), provider.clone());
+                    provider
+                },
+                |provider| provider,
+            );
 
         let schema_key = (table_ref.catalog.clone(), table_ref.schema.clone());
         let schema_provider = if let Some(provider) = schema_providers.get(&schema_key) {

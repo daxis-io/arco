@@ -45,6 +45,7 @@ bash tools/check-release-tag-discipline.sh --tag vX.Y.Z
 6. Pushing `vX.Y.Z` triggers:
    - `.github/workflows/ci.yml` release-tag discipline enforcement
    - `.github/workflows/release-sbom.yml` (which waits for successful release-tag CI discipline before SBOM publication, provenance attestation, release asset upload, and immutable evidence pack archive)
+7. Ensure the SSH public key used for release-tag signing is present in `.github/release-signers.allowed` so CI can verify `git verify-tag`.
 
 ## Immutable Evidence Collector
 
@@ -67,7 +68,7 @@ If `--allow-existing` is used, the collector only verifies an existing pack mani
 
 - Workflow artifact retention: 90 days (`actions/upload-artifact retention-days`).
 - Published release assets: attached to GitHub release for the same tag.
-- Release workflow validates signed-tag material plus GitHub verification status before publishing artifacts.
+- Release workflow validates signed-tag material and verifies tag signatures with `.github/release-signers.allowed` before publishing artifacts.
 - Artifacts produced per release tag:
   - `arco-vX.Y.Z.spdx.json`
   - `arco-vX.Y.Z.cyclonedx.json`

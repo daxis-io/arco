@@ -1,26 +1,24 @@
 # G1-003 Evidence - Release-Tag CI Enforcement for Changelog and Release Notes
 
 - Signal: `G1-003`
-- Ledger criterion: `Release-tag CI fails when changelog/release notes are incomplete.` (`docs/audits/2026-02-12-prod-readiness/signal-ledger.md:24`)
-- Status in this batch: `GO`
+- Ledger criterion: `Release-tag CI fails when changelog/release notes are incomplete.` (`docs/audits/2026-02-12-prod-readiness/signal-ledger.md`)
+- Status: `GO`
 
 ## Implementation Evidence
 
-1. CI now triggers on release tags and has a dedicated release-tag discipline job.
-   - `.github/workflows/ci.yml:3-8`
-   - `.github/workflows/ci.yml:38-47`
-2. Enforcement script validates changelog section/date, release-note structure, and absence of stub tokens.
-   - `tools/check-release-tag-discipline.sh:50-53`
-   - `tools/check-release-tag-discipline.sh:70-87`
-   - `tools/check-release-tag-discipline.sh:89-114`
-3. Release docs require running this check before tagging.
-   - `RELEASE.md:22-35`
+1. CI workflow runs release-tag discipline on `refs/tags/v*` pushes.
+   - `.github/workflows/ci.yml`
+2. Discipline script fail-closes on missing/incomplete changelog or release-notes content.
+   - `tools/check-release-tag-discipline.sh`
+3. Release process requires discipline checks before signing/pushing release tags.
+   - `RELEASE.md`
 
-## Verification Evidence
+## Verification Evidence (`v0.1.4`)
 
-1. Positive path passes on `v0.1.0` with complete release notes/changelog:
-   - `release_evidence/2026-02-12-prod-readiness/gate-1/command-logs/2026-02-16T024416Z-targeted-release-tag-discipline-pass.log`
-2. Negative path fails on intentionally incomplete release notes (missing required section), demonstrating fail-closed behavior:
-   - `release_evidence/2026-02-12-prod-readiness/gate-1/command-logs/2026-02-16T024416Z-targeted-release-tag-discipline-expected-fail.log`
-3. Workflow wiring proof for CI release-tag enforcement:
-   - `release_evidence/2026-02-12-prod-readiness/gate-1/command-logs/2026-02-16T024416Z-full-ci-release-tag-enforcement-present.log`
+1. Positive path passes for complete release artifacts.
+   - `release_evidence/2026-02-12-prod-readiness/gate-1/verification-notes.md` (`discipline_pass_v0_1_4`)
+2. Negative path fails as expected with intentionally incomplete release notes.
+   - `release_evidence/2026-02-12-prod-readiness/gate-1/verification-notes.md` (`discipline_expected_fail_v0_1_4`)
+3. CI `Release Tag Discipline` check-run is successful for the `v0.1.4` commit.
+   - <https://github.com/daxis-io/arco/actions/runs/22153366241/job/64050488799>
+   - `release_evidence/2026-02-12-prod-readiness/gate-1/verification-notes.md` (`release_tag_discipline_check_run`)

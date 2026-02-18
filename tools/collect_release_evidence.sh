@@ -86,7 +86,13 @@ fi
 
 SIGNATURE_VERIFIED="false"
 SIGNATURE_VERIFICATION_METHOD="signature-material-only"
-if git verify-tag "${TAG}" >/dev/null 2>&1; then
+SIGNERS_FILE="${REPO_ROOT}/.github/release-signers.allowed"
+GIT_VERIFY_ARGS=()
+if [[ -f "${SIGNERS_FILE}" ]]; then
+  GIT_VERIFY_ARGS=(-c gpg.format=ssh -c gpg.ssh.allowedSignersFile="${SIGNERS_FILE}")
+fi
+
+if git "${GIT_VERIFY_ARGS[@]}" verify-tag "${TAG}" >/dev/null 2>&1; then
   SIGNATURE_VERIFIED="true"
   SIGNATURE_VERIFICATION_METHOD="git-verify-tag"
 elif [[ -n "${GITHUB_TOKEN:-}" && -n "${GITHUB_REPOSITORY:-}" ]]; then
@@ -167,6 +173,9 @@ cp "release_notes/${TAG}.md" "${PACK_DIR}/release-notes.md"
 cp "RELEASE.md" "${PACK_DIR}/release-process.md"
 cp ".github/workflows/ci.yml" "${PACK_DIR}/workflow-ci.yml"
 cp ".github/workflows/release-sbom.yml" "${PACK_DIR}/workflow-release-sbom.yml"
+if [[ -f ".github/release-signers.allowed" ]]; then
+  cp ".github/release-signers.allowed" "${PACK_DIR}/release-signers.allowed"
+fi
 
 {
   echo "expected_release_tag=${TAG}"

@@ -1,7 +1,7 @@
 # Production Readiness Audit - Arco Daxis Prod GO
 
 - Audit date: 2026-02-12
-- Evidence refresh UTC: 2026-02-16T02:41:23Z
+- Evidence refresh UTC: 2026-02-18T19:36:10Z
 - Baseline commit: `e896506f3c936c266a21fe556a107d37bd7075b5`
 - Scope: all currently identified closure signals in the "Arco Daxis Production GO Closure Plan"
 - Definition of Done (locked): `ALL GATES GO`
@@ -12,7 +12,7 @@
 | Gate | Area | Status | Closed Signals | Open Signals | Primary Evidence |
 |---:|---|---|---:|---:|---|
 | 0 | Re-baseline / tracker integrity | GO | 4 | 0 | `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-matrix-status.tsv` |
-| 1 | Release discipline / provenance | PARTIAL | 2 | 2 | `release_evidence/2026-02-12-prod-readiness/gate-1/README.md` |
+| 1 | Release discipline / provenance | GO | 4 | 0 | `release_evidence/2026-02-12-prod-readiness/gate-1/README.md` |
 | 2 | Storage / manifest / schema / invariants | GO | 7 | 0 | `docs/audits/2026-02-12-prod-readiness/findings/gate-2-findings.md` |
 | 3 | Layer-2 production blockers | GO | 7 | 0 | `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_projection_restart.log`, `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_timer_callback_oidc.log`, `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/promtool_g3_orch_alert_drill.log` |
 | 4 | Deployment / observability / operations | PARTIAL | 0 | 6 | `release_evidence/2026-02-12-prod-readiness/gate-4/README.md` |
@@ -29,16 +29,17 @@ Result: all required command-matrix commands exited `0`.
 
 ## Gate 1 Status
 
-Gate 1 is now `PARTIAL` with local/code closure for two signals and external execution pending for two signals:
+Gate 1 is now `GO`; all four signals are closed with concrete `v0.1.4` release-tag evidence:
 
-- `G1-002`: GO (deterministic, immutable collector script with manifest integrity proof)
-- `G1-003`: GO (release-tag CI fail-closed checks for changelog + release notes)
-- `G1-001`: PARTIAL (signed tag evidence + provenance pipeline wiring complete; remote attestation run pending)
-- `G1-004`: PARTIAL (SBOM retention/publication wiring complete; remote release publication evidence pending)
+- `G1-001`: GO (signed-tag verification + provenance attestation succeeded in tag-triggered SBOM workflow)
+- `G1-002`: GO (deterministic immutable collector pack produced and manifest-verified for `v0.1.4`)
+- `G1-003`: GO (release-tag discipline checks pass on complete inputs and fail on incomplete fixtures)
+- `G1-004`: GO (SBOM assets published to release and retained artifact packs captured with retention metadata)
 
 Primary artifacts:
 - `release_evidence/2026-02-12-prod-readiness/gate-1/README.md`
-- `release_evidence/2026-02-12-prod-readiness/gate-1/external-handoff-checklist.md`
+- `release_evidence/2026-02-12-prod-readiness/gate-1/verification-notes.md`
+- `release_evidence/2026-02-12-prod-readiness/gate-1/g1-004-sbom-retention-evidence.md`
 
 ## Signals Closed In Batch 3
 

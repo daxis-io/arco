@@ -1,32 +1,26 @@
 # G1-002 Evidence - Immutable Release Evidence Collector Script
 
 - Signal: `G1-002`
-- Ledger criterion: `Script produces deterministic evidence pack per tag.` (`docs/audits/2026-02-12-prod-readiness/signal-ledger.md:23`)
-- Status in this batch: `GO`
+- Ledger criterion: `Script produces deterministic evidence pack per tag.` (`docs/audits/2026-02-12-prod-readiness/signal-ledger.md`)
+- Status: `GO`
 
 ## Implementation Evidence
 
-1. Collector script added with deterministic path derivation and immutable default behavior.
-   - `tools/collect_release_evidence.sh:6-16`
-   - `tools/collect_release_evidence.sh:67-70`
-   - `tools/collect_release_evidence.sh:87-93`
-2. Collector writes a deterministic manifest over collected evidence files.
-   - `tools/collect_release_evidence.sh:139-147`
-3. Release process documents deterministic output naming and overwrite refusal.
-   - `RELEASE.md:49-63`
+1. Collector path is deterministic: `<tag-object-sha>-<commit-sha>` under `collector-packs/<tag>/`.
+   - `tools/collect_release_evidence.sh`
+2. Collector blocks mutable overwrite unless `--allow-existing` is used.
+   - `tools/collect_release_evidence.sh`
+3. Collector writes a manifest and metadata for integrity verification.
+   - `tools/collect_release_evidence.sh`
 
-## Verification Evidence
+## Verification Evidence (`v0.1.4`)
 
-1. Collector generated a deterministic pack path for `v0.1.0`:
-   - `release_evidence/2026-02-12-prod-readiness/gate-1/command-logs/2026-02-16T024416Z-targeted-collector-create-pack.log`
-   - `release_evidence/2026-02-12-prod-readiness/gate-1/command-logs/2026-02-16T024416Z-full-collector-path-determinism.log`
-2. Immutable overwrite protection is enforced:
-   - `release_evidence/2026-02-12-prod-readiness/gate-1/command-logs/2026-02-16T024416Z-targeted-collector-immutable-expected-fail.log`
-3. Manifest integrity validates all collected files:
-   - `release_evidence/2026-02-12-prod-readiness/gate-1/command-logs/2026-02-16T024416Z-full-collector-manifest-verifies.log`
-   - `release_evidence/2026-02-12-prod-readiness/gate-1/collector-packs/v0.1.0/352cba80c843fd9cf54b1ab169bd0ac081c51bde-dc3072977aef3b0572c58498bea6ceddab26fd22/manifest.sha256`
-
-## Deterministic Artifact
-
-- Collector pack root:
-  - `release_evidence/2026-02-12-prod-readiness/gate-1/collector-packs/v0.1.0/352cba80c843fd9cf54b1ab169bd0ac081c51bde-dc3072977aef3b0572c58498bea6ceddab26fd22/`
+1. Collector generated the deterministic path matching tag object + commit identity.
+   - `release_evidence/2026-02-12-prod-readiness/gate-1/verification-notes.md` (`collector_create_pack`, `collector_expected_path`)
+2. Manifest verification succeeded (`sha256sum -c manifest.sha256`).
+   - `release_evidence/2026-02-12-prod-readiness/gate-1/verification-notes.md` (`collector_manifest_verify`)
+3. `--allow-existing` verification mode succeeded without mutable overwrite.
+   - `release_evidence/2026-02-12-prod-readiness/gate-1/verification-notes.md` (`collector_allow_existing`)
+4. Release workflow also archived a retained release-evidence artifact for this tag.
+   - <https://github.com/daxis-io/arco/actions/runs/22153366267>
+   - `release_evidence/2026-02-12-prod-readiness/gate-1/verification-notes.md` (`release_sbom_artifacts`)

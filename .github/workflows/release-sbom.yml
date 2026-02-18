@@ -123,8 +123,6 @@ jobs:
         run: bash tools/check-release-tag-discipline.sh --tag "${RELEASE_TAG}"
 
       - name: Validate annotated signed release tag
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           git cat-file -e "${RELEASE_TAG}^{tag}"
           TAG_OBJECT_SHA="$(git rev-parse "${RELEASE_TAG}^{tag}")"
@@ -135,15 +133,10 @@ jobs:
             exit 1
           fi
 
-          verification_payload="$(curl -fsSL \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT_SHA}")"
-          verified="$(jq -r '.verification.verified // false' <<<"${verification_payload}")"
-          reason="$(jq -r '.verification.reason // "unknown"' <<<"${verification_payload}")"
-
-          if [ "${verified}" != "true" ]; then
-            echo "release tag signature verification failed for ${RELEASE_TAG}: ${reason}" >&2
+          if ! git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=".github/release-signers.allowed" \
+            verify-tag "${RELEASE_TAG}" > "arco-${RELEASE_TAG}.tag-verify.txt" 2>&1; then
+            echo "release tag signature verification failed against .github/release-signers.allowed for ${RELEASE_TAG}" >&2
+            cat "arco-${RELEASE_TAG}.tag-verify.txt" >&2
             exit 1
           fi
 
@@ -177,6 +170,7 @@ jobs:
             ${{ env.SBOM_CYCLONEDX_FILE }}
             ${{ env.SBOM_SHA256_FILE }}
             arco-${{ env.RELEASE_TAG }}.tag-object.txt
+            arco-${{ env.RELEASE_TAG }}.tag-verify.txt
 
       - name: Publish build provenance attestation for SBOM artifacts
         uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0

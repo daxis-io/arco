@@ -1,7 +1,7 @@
 # Signal Ledger - 2026-02-12 Prod Readiness
 
 - Ledger date: 2026-02-12
-- Evidence refresh UTC: 2026-02-16T02:41:23Z
+- Evidence refresh UTC: 2026-02-18T19:36:10Z
 - Baseline commit: `e896506f3c936c266a21fe556a107d37bd7075b5`
 - Definition of Done: every signal below is `GO`, and every gate is `GO`.
 
@@ -19,10 +19,10 @@ Status values:
 | G0-002 | 0 | Re-run readiness checks at current HEAD and replace stale findings | Release Engineering | GO | `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/` | `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-matrix-status.tsv` | Required command matrix completed with archived logs and exit codes |
 | G0-003 | 0 | Freeze DoD as "all gates GO" | Product + Engineering | GO | `docs/audits/2026-02-12-prod-readiness/summary.md` | `docs/audits/2026-02-12-prod-readiness/summary.md` | DoD is explicitly documented and referenced by gate tracker |
 | G0-004 | 0 | Publish machine-checkable gate tracker | Release Engineering | GO | `docs/audits/2026-02-12-prod-readiness/gate-tracker.json` | `docs/audits/2026-02-12-prod-readiness/gate-tracker.json` | Tracker has gate-level pass/fail criteria and signal mapping |
-| G1-001 | 1 | Signed release tags and provenance pipeline | Release Engineering | PARTIAL | `RELEASE.md`, `.github/workflows/release-sbom.yml`, `tools/collect_release_evidence.sh` | `release_evidence/2026-02-12-prod-readiness/gate-1/g1-001-signed-tag-provenance-evidence.md` | Signed tag and provenance evidence generated for a release tag |
+| G1-001 | 1 | Signed release tags and provenance pipeline | Release Engineering | GO | `RELEASE.md`, `.github/workflows/release-sbom.yml`, `.github/release-signers.allowed`, `tools/collect_release_evidence.sh` | `release_evidence/2026-02-12-prod-readiness/gate-1/g1-001-signed-tag-provenance-evidence.md` | Signed tag and provenance evidence generated for a release tag |
 | G1-002 | 1 | Immutable release evidence collector script | Release Engineering | GO | `tools/collect_release_evidence.sh`, `RELEASE.md` | `release_evidence/2026-02-12-prod-readiness/gate-1/g1-002-immutable-collector-evidence.md` | Script produces deterministic evidence pack per tag |
 | G1-003 | 1 | CI enforces changelog + release note completeness on release tags | Release Engineering | GO | `.github/workflows/ci.yml`, `tools/check-release-tag-discipline.sh`, `CHANGELOG.md` | `release_evidence/2026-02-12-prod-readiness/gate-1/g1-003-release-tag-ci-enforcement-evidence.md` | Release-tag CI fails when changelog/release notes are incomplete |
-| G1-004 | 1 | SBOM publication tied to release artifact retention | Security Engineering | PARTIAL | `.github/workflows/release-sbom.yml`, `RELEASE.md` | `release_evidence/2026-02-12-prod-readiness/gate-1/g1-004-sbom-retention-evidence.md` | Published SBOM linked to release artifact and retained per policy |
+| G1-004 | 1 | SBOM publication tied to release artifact retention | Security Engineering | GO | `.github/workflows/release-sbom.yml`, `RELEASE.md`, `tools/collect_release_evidence.sh` | `release_evidence/2026-02-12-prod-readiness/gate-1/g1-004-sbom-retention-evidence.md` | Published SBOM linked to release artifact and retained per policy |
 | G2-001 | 2 | Unified typed path builders for non-catalog domains | Core Platform | GO | `crates/arco-core/src/flow_paths.rs`, `crates/arco-api/src/paths.rs`, `crates/arco-iceberg/src/paths.rs` | `crates/arco-core/tests/flow_paths_contracts.rs` | Flow/API/Iceberg path callsites migrated; hardcoded path debt removed |
 | G2-002 | 2 | Replace hardcoded path literals in flow/api/iceberg modules | Core Platform | GO | `crates/arco-flow/src/orchestration/ledger.rs`, `crates/arco-flow/src/outbox.rs`, `crates/arco-iceberg/src/pointer.rs` | `docs/audits/2026-02-12-prod-readiness/findings/gate-2-findings.md` | No hardcoded path literals remain in targeted modules |
 | G2-003 | 2 | Search anti-entropy as first-class bounded scan path | Compaction Team | GO | `crates/arco-compactor/src/anti_entropy.rs` | `crates/arco-compactor/src/anti_entropy.rs:824` | Search domain scan uses bounded listing + cursor progression test |

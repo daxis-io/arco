@@ -177,6 +177,22 @@ resource "google_project_iam_custom_role" "storage_object_reader_no_list" {
   project     = var.project_id
 }
 
+# Flow dispatcher runs with the API service account and must enqueue to Cloud Tasks.
+# This enables both worker dispatch and timer callback task creation.
+resource "google_project_iam_member" "api_cloud_tasks_enqueuer" {
+  project = var.project_id
+  role    = "roles/cloudtasks.enqueuer"
+  member  = "serviceAccount:${google_service_account.api.email}"
+}
+
+# Flow dispatcher (running as API SA) must be able to attach the invoker SA to
+# Cloud Tasks OIDC HTTP targets (`iam.serviceAccounts.actAs`).
+resource "google_service_account_iam_member" "api_can_act_as_invoker_for_cloud_tasks_oidc" {
+  service_account_id = google_service_account.invoker.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.api.email}"
+}
+
 # Invoker can trigger Cloud Run services
 resource "google_cloud_run_v2_service_iam_member" "invoker_compactor" {
   count    = var.environment != "" ? 1 : 0

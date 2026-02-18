@@ -1,44 +1,215 @@
 name: Release SBOM
 
 on:
-  release:
-    types: [published]
+  push:
+    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Annotated signed release tag (for example: v1.2.3)"
+        required: true
+        type: string
 
 permissions:
   contents: write
+  attestations: write
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  SBOM_RETENTION_DAYS: 90
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
 jobs:
   sbom:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Resolve and validate release tag context
+        run: |
+          if [ -z "${RELEASE_TAG}" ]; then
+            echo "release tag is required for SBOM workflow" >&2
+            exit 1
+          fi
+
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "release tag must match vMAJOR.MINOR.PATCH (optionally suffixed): ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          git fetch --force --tags origin
+          git cat-file -e "${RELEASE_TAG}^{tag}"
+
+          TAG_COMMIT_SHA="$(git rev-list -n 1 "${RELEASE_TAG}^{commit}")"
+          HEAD_SHA="$(git rev-parse HEAD)"
+          if [ "${HEAD_SHA}" != "${TAG_COMMIT_SHA}" ]; then
+            echo "checked out commit (${HEAD_SHA}) does not match tag commit (${TAG_COMMIT_SHA}) for ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          echo "TAG_COMMIT_SHA=${TAG_COMMIT_SHA}" >> "${GITHUB_ENV}"
+          echo "SBOM_SPDX_FILE=arco-${RELEASE_TAG}.spdx.json" >> "${GITHUB_ENV}"
+          echo "SBOM_CYCLONEDX_FILE=arco-${RELEASE_TAG}.cyclonedx.json" >> "${GITHUB_ENV}"
+          echo "SBOM_SHA256_FILE=arco-${RELEASE_TAG}.sbom.sha256" >> "${GITHUB_ENV}"
+          echo "EVIDENCE_ARCHIVE=arco-${RELEASE_TAG}.release-evidence.tgz" >> "${GITHUB_ENV}"
+
+      - name: Wait for release-tag CI success
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ci_runs_api="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?event=push&per_page=100"
+          max_attempts=40
+          sleep_seconds=15
+
+          for attempt in $(seq 1 "${max_attempts}"); do
+            runs_payload="$(curl -fsSL \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${ci_runs_api}")"
+
+            mapfile -t run_ids < <(
+              jq -r --arg sha "${TAG_COMMIT_SHA}" '
+                .workflow_runs
+                | map(select(.head_sha == $sha))
+                | sort_by(.run_started_at // .created_at)
+                | reverse
+                | .[].id
+              ' <<<"${runs_payload}"
+            )
+
+            found_success="false"
+            for run_id in "${run_ids[@]}"; do
+              jobs_payload="$(curl -fsSL \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100")"
+
+              discipline_conclusion="$(
+                jq -r '.jobs[] | select(.name == "Release Tag Discipline") | .conclusion // empty' <<<"${jobs_payload}" \
+                  | head -n 1
+              )"
+
+              if [ "${discipline_conclusion}" = "success" ]; then
+                echo "release-tag discipline passed in CI run ${run_id}"
+                found_success="true"
+                break
+              fi
+
+              if [ "${discipline_conclusion}" = "failure" ] || [ "${discipline_conclusion}" = "cancelled" ] || [ "${discipline_conclusion}" = "timed_out" ] || [ "${discipline_conclusion}" = "action_required" ]; then
+                echo "release-tag discipline failed in CI run ${run_id} (${discipline_conclusion})" >&2
+                exit 1
+              fi
+            done
+
+            if [ "${found_success}" = "true" ]; then
+              break
+            fi
+
+            if [ "${attempt}" -eq "${max_attempts}" ]; then
+              echo "timed out waiting for successful release-tag discipline CI run for commit ${TAG_COMMIT_SHA}" >&2
+              exit 1
+            fi
+
+            echo "attempt ${attempt}/${max_attempts}: waiting for release-tag discipline CI success..."
+            sleep "${sleep_seconds}"
+          done
+
+      - name: Validate changelog + release notes completeness
+        run: bash tools/check-release-tag-discipline.sh --tag "${RELEASE_TAG}"
+
+      - name: Validate annotated signed release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git cat-file -e "${RELEASE_TAG}^{tag}"
+          TAG_OBJECT_SHA="$(git rev-parse "${RELEASE_TAG}^{tag}")"
+          git cat-file -p "${RELEASE_TAG}^{tag}" > "arco-${RELEASE_TAG}.tag-object.txt"
+
+          if ! rg -q '^-----BEGIN (PGP|SSH) SIGNATURE-----$' "arco-${RELEASE_TAG}.tag-object.txt"; then
+            echo "release tag must include a PGP or SSH signature block: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          verification_payload="$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT_SHA}")"
+          verified="$(jq -r '.verification.verified // false' <<<"${verification_payload}")"
+          reason="$(jq -r '.verification.reason // "unknown"' <<<"${verification_payload}")"
+
+          if [ "${verified}" != "true" ]; then
+            echo "release tag signature verification failed for ${RELEASE_TAG}: ${reason}" >&2
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
           toolchain: 1.85
+
       - name: Install cargo-sbom
-        uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131 # v2
+        uses: taiki-e/install-action@cede0bb282aae847dfa8aacca3a41c86d973d4d7 # v2
         with:
           tool: cargo-sbom@0.10.0
+
       - name: Generate SBOM (SPDX JSON)
-        run: cargo sbom --output-format spdx_json_2_3 > arco.spdx.json
+        run: cargo sbom --output-format spdx_json_2_3 > "${SBOM_SPDX_FILE}"
+
       - name: Generate SBOM (CycloneDX JSON)
-        run: cargo sbom --output-format cyclone_dx_json_1_6 > arco.cyclonedx.json
-      - name: Upload SBOM artifacts
+        run: cargo sbom --output-format cyclone_dx_json_1_6 > "${SBOM_CYCLONEDX_FILE}"
+
+      - name: Generate SBOM checksum manifest
+        run: |
+          sha256sum "${SBOM_SPDX_FILE}" "${SBOM_CYCLONEDX_FILE}" > "${SBOM_SHA256_FILE}"
+
+      - name: Upload release SBOM artifact pack (retained)
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: sbom
+          name: release-sbom-${{ env.RELEASE_TAG }}
+          retention-days: ${{ env.SBOM_RETENTION_DAYS }}
+          if-no-files-found: error
           path: |
-            arco.spdx.json
-            arco.cyclonedx.json
-      - name: Attach SBOMs to GitHub Release
-        if: github.event_name == 'release'
+            ${{ env.SBOM_SPDX_FILE }}
+            ${{ env.SBOM_CYCLONEDX_FILE }}
+            ${{ env.SBOM_SHA256_FILE }}
+            arco-${{ env.RELEASE_TAG }}.tag-object.txt
+
+      - name: Publish build provenance attestation for SBOM artifacts
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: |
+            ${{ env.SBOM_SPDX_FILE }}
+            ${{ env.SBOM_CYCLONEDX_FILE }}
+            ${{ env.SBOM_SHA256_FILE }}
+
+      - name: Attach SBOM files to GitHub release
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
-            arco.spdx.json
-            arco.cyclonedx.json
+            ${{ env.SBOM_SPDX_FILE }}
+            ${{ env.SBOM_CYCLONEDX_FILE }}
+            ${{ env.SBOM_SHA256_FILE }}
+
+      - name: Build immutable release evidence pack
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          PACK_DIR="$(bash tools/collect_release_evidence.sh --tag "${RELEASE_TAG}" --output-root ".gate1-collector")"
+          echo "PACK_DIR=${PACK_DIR}" >> "${GITHUB_ENV}"
+
+      - name: Archive release evidence pack
+        run: |
+          tar -C "$(dirname "${PACK_DIR}")" -czf "${EVIDENCE_ARCHIVE}" "$(basename "${PACK_DIR}")"
+
+      - name: Upload release evidence pack artifact (retained)
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-evidence-${{ env.RELEASE_TAG }}
+          retention-days: ${{ env.SBOM_RETENTION_DAYS }}
+          if-no-files-found: error
+          path: ${{ env.EVIDENCE_ARCHIVE }}

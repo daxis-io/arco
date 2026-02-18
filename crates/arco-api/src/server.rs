@@ -132,8 +132,10 @@ impl AppState {
         }
 
         let rate_limit = Arc::new(RateLimitState::new(config.rate_limit.clone()));
+        let compactor_auth = config.compactor_auth.clone();
         let sync_compactor = config.compactor_url.as_ref().map(|url| {
-            let client: Arc<dyn SyncCompactor> = Arc::new(CompactorClient::new(url.clone()));
+            let client: Arc<dyn SyncCompactor> =
+                Arc::new(CompactorClient::new(url.clone(), compactor_auth.clone()));
             client
         });
         let audit = audit_emitter.unwrap_or_else(|| Arc::new(AuditEmitter::with_tracing()));
@@ -167,8 +169,10 @@ impl AppState {
             );
         }
 
+        let compactor_auth = config.compactor_auth.clone();
         let sync_compactor = config.compactor_url.as_ref().map(|url| {
-            let client: Arc<dyn SyncCompactor> = Arc::new(CompactorClient::new(url.clone()));
+            let client: Arc<dyn SyncCompactor> =
+                Arc::new(CompactorClient::new(url.clone(), compactor_auth.clone()));
             client
         });
         Self {
@@ -325,31 +329,19 @@ async fn unity_catalog_auth_middleware(
     }
 
     let (mut parts, body) = req.into_parts();
-    let resource = parts.uri.path().to_string();
     let request_id = crate::context::request_id_from_headers(&parts.headers)
         .unwrap_or_else(|| ulid::Ulid::new().to_string());
 
     let ctx = match RequestContext::from_request_parts(&mut parts, &state).await {
         Ok(ctx) => ctx,
         Err(err) => {
-            let reason = if err.code() == "MISSING_AUTH" {
-                crate::audit::REASON_MISSING_TOKEN
-            } else {
-                crate::audit::REASON_INVALID_TOKEN
-            };
-            let audit_request_id = err.request_id().unwrap_or(&request_id);
-            crate::audit::emit_auth_deny(&state, audit_request_id, &resource, reason);
             return api_error_to_unity_catalog_response(&err, Some(&request_id));
         }
     };
 
-    crate::audit::emit_auth_allow(&state, &ctx, &resource);
-
     let uc_ctx = UnityCatalogRequestContext {
         tenant: ctx.tenant.clone(),
         workspace: ctx.workspace.clone(),
-        user_id: ctx.user_id.clone(),
-        groups: ctx.groups.clone(),
         request_id: ctx.request_id.clone(),
         idempotency_key: ctx.idempotency_key.clone(),
     };
@@ -416,9 +408,9 @@ fn api_error_to_unity_catalog_response(
         StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
             UnityCatalogError::Conflict { message }
         }
-        StatusCode::TOO_MANY_REQUESTS => UnityCatalogError::TooManyRequests { message },
         StatusCode::NOT_IMPLEMENTED => UnityCatalogError::NotImplemented { message },
         StatusCode::SERVICE_UNAVAILABLE => UnityCatalogError::ServiceUnavailable { message },
+        StatusCode::TOO_MANY_REQUESTS => UnityCatalogError::TooManyRequests { message },
         _ => UnityCatalogError::Internal { message },
     };
 
@@ -513,11 +505,17 @@ impl Server {
 
         let auth_layer =
             middleware::from_fn_with_state(Arc::clone(&state), crate::context::auth_middleware);
+        let uc_auth_layer =
+            middleware::from_fn_with_state(Arc::clone(&state), crate::context::auth_middleware);
         let task_auth_layer = middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::routes::tasks::task_auth_middleware,
         );
         let rate_limit_layer = middleware::from_fn_with_state(
+            Arc::clone(&state.rate_limit),
+            crate::rate_limit::rate_limit_middleware,
+        );
+        let uc_rate_limit_layer = middleware::from_fn_with_state(
             Arc::clone(&state.rate_limit),
             crate::rate_limit::rate_limit_middleware,
         );
@@ -550,6 +548,13 @@ impl Server {
                     .route_layer(task_rate_limit_layer)
                     .layer(task_auth_layer),
             );
+
+        router = router.nest(
+            "/_uc/api/2.1/unity-catalog",
+            crate::routes::uc::routes()
+                .route_layer(uc_rate_limit_layer)
+                .layer(uc_auth_layer),
+        );
 
         // Mount Iceberg REST Catalog if enabled
         // Uses nest_service since Iceberg router has its own state type
@@ -597,8 +602,7 @@ impl Server {
 
         // Mount Unity Catalog facade if enabled
         if state.config.unity_catalog.enabled {
-            let uc_state = UnityCatalogState::new(Arc::clone(&state.storage))
-                .with_audit_emitter(Arc::new(state.audit().clone()));
+            let uc_state = UnityCatalogState::new(Arc::clone(&state.storage));
 
             let uc_service = ServiceBuilder::new()
                 .layer(middleware::from_fn_with_state(
@@ -838,6 +842,10 @@ impl Server {
             ));
         }
 
+        if self.config.compactor_url.is_some() {
+            self.config.compactor_auth.validate(self.config.debug)?;
+        }
+
         if self.config.iceberg.enabled
             && (self.config.iceberg.allow_namespace_crud || self.config.iceberg.allow_table_crud)
             && !self.config.debug
@@ -1026,7 +1034,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    use crate::config::Posture;
+    use crate::config::{CompactorAuthMode, Posture};
 
     #[test]
     fn test_posture_allows_debug_in_dev() -> Result<()> {
@@ -1135,6 +1143,41 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_static_bearer_mode_requires_token() {
+        let mut builder = ServerBuilder::new();
+        configure_non_dev_jwt(&mut builder);
+        builder.config.jwt.issuer = Some("test-issuer".to_string());
+        builder.config.jwt.audience = Some("test-audience".to_string());
+        builder.config.compactor_auth.mode = CompactorAuthMode::StaticBearer;
+        builder.config.compactor_auth.static_bearer_token = None;
+
+        let server = builder.build();
+        let err = server.validate_config().unwrap_err();
+        let arco_core::Error::InvalidInput(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("ARCO_COMPACTOR_AUTH_STATIC_BEARER_TOKEN"));
+    }
+
+    #[test]
+    fn test_metadata_override_requires_debug_mode() {
+        let mut builder = ServerBuilder::new();
+        configure_non_dev_jwt(&mut builder);
+        builder.config.jwt.issuer = Some("test-issuer".to_string());
+        builder.config.jwt.audience = Some("test-audience".to_string());
+        builder.config.compactor_auth.mode = CompactorAuthMode::GcpIdToken;
+        builder.config.compactor_auth.metadata_url =
+            Some("http://127.0.0.1:8181/token".to_string());
+
+        let server = builder.build();
+        let err = server.validate_config().unwrap_err();
+        let arco_core::Error::InvalidInput(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("ARCO_COMPACTOR_GCP_METADATA_URL"));
+    }
+
     #[tokio::test]
     async fn test_health_endpoint() -> Result<()> {
         let server = ServerBuilder::new().build();
@@ -1221,7 +1264,7 @@ mod tests {
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok());
-        assert!(content_type.map_or(false, |value| value.starts_with("application/json")));
+        assert!(content_type.is_some_and(|value| value.starts_with("application/json")));
 
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await

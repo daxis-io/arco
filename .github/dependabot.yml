@@ -17,6 +17,11 @@ updates:
       - dependency-name: "*"
         update-types:
           - "version-update:semver-major"
+      # time >= 0.3.46 requires Rust 1.88+, while workspace/CI is pinned to 1.85.
+      # Remove this ignore after the Rust toolchain is upgraded.
+      - dependency-name: "time"
+        versions:
+          - ">=0.3.46"
     commit-message:
       prefix: "deps(rust)"
 

@@ -54,6 +54,7 @@ pub mod metrics;
 pub mod openapi;
 pub(crate) mod paths;
 pub mod pointer;
+pub mod pointer_store;
 pub mod reconciler;
 pub mod router;
 pub mod schema_projection;
@@ -75,6 +76,7 @@ pub mod prelude {
         EffectivePointer, IcebergTablePointer, PendingPointerUpdate, PointerStore,
         resolve_effective_metadata_location,
     };
+    pub use crate::pointer_store::IcebergPointerStore;
 
     // Router and state
     pub use crate::router::iceberg_router;
@@ -113,6 +115,7 @@ pub use pointer::{
     EffectivePointer, IcebergTablePointer, PendingPointerUpdate,
     resolve_effective_metadata_location,
 };
+pub use pointer_store::IcebergPointerStore;
 pub use router::iceberg_router;
 pub use state::{
     CredentialProvider, IcebergConfig, IcebergState, SharedCompactorFactory, SyncCompactorFactory,

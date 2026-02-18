@@ -998,9 +998,7 @@ mod tests {
     fn fresh_watermarks() -> Watermarks {
         Watermarks {
             last_committed_event_id: Some("01HQ123".into()),
-            committed_event_count: Some(1),
             last_visible_event_id: Some("01HQ123".into()),
-            visible_event_count: Some(1),
             events_processed_through: Some("01HQ123".into()),
             last_processed_file: Some(orchestration_event_path("2025-01-15", "01HQ123")),
             last_processed_at: Utc::now() - Duration::seconds(5),
@@ -1010,9 +1008,7 @@ mod tests {
     fn stale_watermarks() -> Watermarks {
         Watermarks {
             last_committed_event_id: Some("01HQ100".into()),
-            committed_event_count: Some(1),
             last_visible_event_id: Some("01HQ100".into()),
-            visible_event_count: Some(1),
             events_processed_through: Some("01HQ100".into()),
             last_processed_file: Some(orchestration_event_path("2025-01-15", "01HQ100")),
             last_processed_at: Utc::now() - Duration::seconds(120), // 2 minutes stale

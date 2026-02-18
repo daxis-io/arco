@@ -162,17 +162,9 @@ pub struct Watermarks {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_committed_event_id: Option<String>,
 
-    /// Total number of events durably committed by compaction bookkeeping.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub committed_event_count: Option<u64>,
-
     /// Last event currently visible to readers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_visible_event_id: Option<String>,
-
-    /// Total number of events currently visible to readers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub visible_event_count: Option<u64>,
 
     /// ULID of last processed event.
     #[serde(skip_serializing_if = "Option::is_none")]

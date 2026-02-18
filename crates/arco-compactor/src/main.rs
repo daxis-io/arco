@@ -42,10 +42,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -55,9 +53,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use arco_catalog::Compactor;
+use arco_core::CatalogDomain;
 use arco_core::scoped_storage::ScopedStorage;
 use arco_core::storage::{ObjectStoreBackend, StorageBackend};
-use arco_core::{CatalogDomain, InternalOidcConfig, InternalOidcError, InternalOidcVerifier};
 
 use crate::notification_consumer::{
     EventNotification, NotificationConsumer, NotificationConsumerConfig,
@@ -380,12 +378,6 @@ struct AutoAntiEntropyConfig {
     max_objects_per_run: usize,
     reprocess_batch_size: usize,
     reprocess_timeout_secs: u64,
-}
-
-#[derive(Clone)]
-struct InternalAuthState {
-    verifier: Arc<InternalOidcVerifier>,
-    enforce: bool,
 }
 
 #[derive(Debug, Deserialize)]

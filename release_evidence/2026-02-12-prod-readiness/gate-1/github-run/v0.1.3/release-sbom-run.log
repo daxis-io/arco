@@ -1,0 +1,439 @@
+sbom	Set up job	﻿2026-02-18T18:53:44.6250068Z Current runner version: '2.331.0'
+sbom	Set up job	2026-02-18T18:53:44.6276412Z ##[group]Runner Image Provisioner
+sbom	Set up job	2026-02-18T18:53:44.6277355Z Hosted Compute Agent
+sbom	Set up job	2026-02-18T18:53:44.6277998Z Version: 20260123.484
+sbom	Set up job	2026-02-18T18:53:44.6278627Z Commit: 6bd6555ca37d84114959e1c76d2c01448ff61c5d
+sbom	Set up job	2026-02-18T18:53:44.6279313Z Build Date: 2026-01-23T19:41:17Z
+sbom	Set up job	2026-02-18T18:53:44.6280027Z Worker ID: {d44de106-1dc2-4a94-af03-fdb31c6257fd}
+sbom	Set up job	2026-02-18T18:53:44.6280749Z Azure Region: westus
+sbom	Set up job	2026-02-18T18:53:44.6281426Z ##[endgroup]
+sbom	Set up job	2026-02-18T18:53:44.6283347Z ##[group]Operating System
+sbom	Set up job	2026-02-18T18:53:44.6283938Z Ubuntu
+sbom	Set up job	2026-02-18T18:53:44.6284418Z 24.04.3
+sbom	Set up job	2026-02-18T18:53:44.6285316Z LTS
+sbom	Set up job	2026-02-18T18:53:44.6285860Z ##[endgroup]
+sbom	Set up job	2026-02-18T18:53:44.6286321Z ##[group]Runner Image
+sbom	Set up job	2026-02-18T18:53:44.6286902Z Image: ubuntu-24.04
+sbom	Set up job	2026-02-18T18:53:44.6287440Z Version: 20260209.23.1
+sbom	Set up job	2026-02-18T18:53:44.6288400Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260209.23/images/ubuntu/Ubuntu2404-Readme.md
+sbom	Set up job	2026-02-18T18:53:44.6290145Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260209.23
+sbom	Set up job	2026-02-18T18:53:44.6291054Z ##[endgroup]
+sbom	Set up job	2026-02-18T18:53:44.6292383Z ##[group]GITHUB_TOKEN Permissions
+sbom	Set up job	2026-02-18T18:53:44.6294506Z Attestations: write
+sbom	Set up job	2026-02-18T18:53:44.6295048Z Contents: write
+sbom	Set up job	2026-02-18T18:53:44.6295704Z Metadata: read
+sbom	Set up job	2026-02-18T18:53:44.6296224Z ##[endgroup]
+sbom	Set up job	2026-02-18T18:53:44.6298344Z Secret source: Actions
+sbom	Set up job	2026-02-18T18:53:44.6299502Z Prepare workflow directory
+sbom	Set up job	2026-02-18T18:53:44.6867603Z Prepare all required actions
+sbom	Set up job	2026-02-18T18:53:44.6905650Z Getting action download info
+sbom	Set up job	2026-02-18T18:53:45.2863834Z Download action repository 'actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd' (SHA:de0fac2e4500dabe0009e67214ff5f5447ce83dd)
+sbom	Set up job	2026-02-18T18:53:45.4313375Z Download action repository 'dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7' (SHA:4be9e76fd7c4901c61fb841f559994984270fce7)
+sbom	Set up job	2026-02-18T18:53:45.9895786Z Download action repository 'taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131' (SHA:288875dd3d64326724fa6d9593062d9f8ba0b131)
+sbom	Set up job	2026-02-18T18:53:46.9743668Z Download action repository 'actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f' (SHA:b7c566a772e6b6bfb58ed0dc250532a479d7789f)
+sbom	Set up job	2026-02-18T18:53:47.1112238Z Download action repository 'actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a' (SHA:977bb373ede98d70efdf65b84cb5f73e068dcc2a)
+sbom	Set up job	2026-02-18T18:53:48.1596746Z Download action repository 'softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b' (SHA:a06a81a03ee405af7f2048a818ed3f03bbf83c7b)
+sbom	Set up job	2026-02-18T18:53:49.1605907Z Getting action download info
+sbom	Set up job	2026-02-18T18:53:49.3791442Z Download action repository 'actions/attest-build-provenance@864457a58d4733d7f1574bd8821fa24e02cf7538' (SHA:864457a58d4733d7f1574bd8821fa24e02cf7538)
+sbom	Set up job	2026-02-18T18:53:50.3252558Z Download action repository 'actions/attest@daf44fb950173508f38bd2406030372c1d1162b1' (SHA:daf44fb950173508f38bd2406030372c1d1162b1)
+sbom	Set up job	2026-02-18T18:53:51.3840032Z Complete job name: sbom
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	﻿2026-02-18T18:53:51.4494246Z ##[group]Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4494968Z with:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4495165Z   fetch-depth: 0
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4495357Z   ref: v0.1.3
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4495562Z   repository: daxis-io/arco
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4495960Z   token: ***
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4496146Z   ssh-strict: true
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4496362Z   ssh-user: git
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4496556Z   persist-credentials: true
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4496786Z   clean: true
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4496983Z   sparse-checkout-cone-mode: true
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4497218Z   fetch-tags: false
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4497409Z   show-progress: true
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4497602Z   lfs: false
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4497774Z   submodules: false
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4497963Z   set-safe-directory: true
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4498356Z env:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4498537Z   CARGO_TERM_COLOR: always
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4498746Z   RUST_BACKTRACE: 1
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4499181Z   SBOM_RETENTION_DAYS: 90
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4499416Z   RELEASE_TAG: v0.1.3
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.4499682Z ##[endgroup]
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5475226Z Syncing repository: daxis-io/arco
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5477113Z ##[group]Getting Git version info
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5477859Z Working directory is '/home/runner/work/arco/arco'
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5478474Z [command]/usr/bin/git version
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5478729Z git version 2.52.0
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5489015Z ##[endgroup]
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5505024Z Temporarily overriding HOME='/home/runner/work/_temp/db551b07-7eab-4317-b114-eea7e14e2c79' before making global git config changes
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5506051Z Adding repository directory to the temporary git global config as a safe directory
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5510825Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/arco/arco
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5556844Z Deleting the contents of '/home/runner/work/arco/arco'
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5560928Z ##[group]Initializing the repository
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5566016Z [command]/usr/bin/git init /home/runner/work/arco/arco
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5839669Z hint: Using 'master' as the name for the initial branch. This default branch name
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5840917Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5842163Z hint: to use in all of your new repositories, which will suppress this warning,
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5842841Z hint: call:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5843124Z hint:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5843585Z hint: 	git config --global init.defaultBranch <name>
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5844068Z hint:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5844580Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5845469Z hint: 'development'. The just-created branch can be renamed via this command:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5846125Z hint:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5846425Z hint: 	git branch -m <name>
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5846762Z hint:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5847268Z hint: Disable this message with "git config set advice.defaultBranchName false"
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5847977Z Initialized empty Git repository in /home/runner/work/arco/arco/.git/
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5860256Z [command]/usr/bin/git remote add origin https://github.com/daxis-io/arco
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5907849Z ##[endgroup]
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5909219Z ##[group]Disabling automatic garbage collection
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5911752Z [command]/usr/bin/git config --local gc.auto 0
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5946513Z ##[endgroup]
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5946944Z ##[group]Setting up auth
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5949097Z Removing SSH command configuration
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.5957500Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.6008399Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.6421856Z Removing HTTP extra header
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.6429089Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.6469114Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.6716751Z Removing includeIf entries pointing to credentials config files
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.6723966Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.6760519Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.7017240Z [command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-2bf45477-dd09-4398-aaa1-be806efed728.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.7062420Z [command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/arco/arco/.git.path /home/runner/work/_temp/git-credentials-2bf45477-dd09-4398-aaa1-be806efed728.config
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.7099963Z [command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/arco/arco/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-2bf45477-dd09-4398-aaa1-be806efed728.config
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.7151758Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-2bf45477-dd09-4398-aaa1-be806efed728.config
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.7187417Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-2bf45477-dd09-4398-aaa1-be806efed728.config
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.7221983Z ##[endgroup]
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.7222581Z ##[group]Fetching the repository
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:51.7235846Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0793445Z From https://github.com/daxis-io/arco
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0794780Z  * [new branch]      codex/pr5-flow-observability-queue-depth -> origin/codex/pr5-flow-observability-queue-depth
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0796163Z  * [new branch]      codex/prod-go-closure-batch3 -> origin/codex/prod-go-closure-batch3
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0797032Z  * [new branch]      main                -> origin/main
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0797759Z  * [new branch]      orch-read-api-fixes -> origin/orch-read-api-fixes
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0798409Z  * [new tag]         v0.1.0              -> v0.1.0
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0798949Z  * [new tag]         v0.1.0-alpha.1      -> v0.1.0-alpha.1
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0799484Z  * [new tag]         v0.1.1              -> v0.1.1
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0799967Z  * [new tag]         v0.1.2              -> v0.1.2
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0800449Z  * [new tag]         v0.1.3              -> v0.1.3
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0846503Z ##[endgroup]
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0847201Z ##[group]Determining the checkout info
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0853579Z [command]/usr/bin/git branch --list --remote origin/v0.1.3
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0891239Z [command]/usr/bin/git tag --list v0.1.3
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0922800Z v0.1.3
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0927681Z ##[endgroup]
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0932907Z [command]/usr/bin/git sparse-checkout disable
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.0986576Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1015782Z ##[group]Checking out the ref
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1020727Z [command]/usr/bin/git checkout --progress --force refs/tags/v0.1.3
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1848718Z Note: switching to 'refs/tags/v0.1.3'.
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1849144Z 
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1849479Z You are in 'detached HEAD' state. You can look around, make experimental
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1850087Z changes and commit them, and you can discard any commits you make in this
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1850676Z state without impacting any branches by switching back to a branch.
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1851038Z 
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1851515Z If you want to create a new branch to retain commits you create, you may
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1852112Z do so (now or later) by using -c with the switch command. Example:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1852690Z 
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1852858Z   git switch -c <new-branch-name>
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1853100Z 
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1853225Z Or undo this operation with:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1853419Z 
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1853594Z   git switch -
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1853744Z 
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1854005Z Turn off this advice by setting config variable advice.detachedHead to false
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1854440Z 
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1854733Z HEAD is now at e47a966 release(gate1): align signed tag identity for v0.1.3 verification
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1903249Z ##[endgroup]
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1908415Z [command]/usr/bin/git log -1 --format=%H
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:53:53.1935978Z e47a966b728411be9e1545f7b326400470eb73ac
+sbom	Install ripgrep	﻿2026-02-18T18:53:53.2116712Z ##[group]Run sudo apt-get update && sudo apt-get install -y ripgrep
+sbom	Install ripgrep	2026-02-18T18:53:53.2117279Z [36;1msudo apt-get update && sudo apt-get install -y ripgrep[0m
+sbom	Install ripgrep	2026-02-18T18:53:53.2170229Z shell: /usr/bin/bash -e {0}
+sbom	Install ripgrep	2026-02-18T18:53:53.2170537Z env:
+sbom	Install ripgrep	2026-02-18T18:53:53.2170729Z   CARGO_TERM_COLOR: always
+sbom	Install ripgrep	2026-02-18T18:53:53.2170954Z   RUST_BACKTRACE: 1
+sbom	Install ripgrep	2026-02-18T18:53:53.2171158Z   SBOM_RETENTION_DAYS: 90
+sbom	Install ripgrep	2026-02-18T18:53:53.2199527Z   RELEASE_TAG: v0.1.3
+sbom	Install ripgrep	2026-02-18T18:53:53.2199872Z ##[endgroup]
+sbom	Install ripgrep	2026-02-18T18:53:53.3184646Z Get:1 file:/etc/apt/apt-mirrors.txt Mirrorlist [144 B]
+sbom	Install ripgrep	2026-02-18T18:53:53.3506530Z Hit:2 http://azure.archive.ubuntu.com/ubuntu noble InRelease
+sbom	Install ripgrep	2026-02-18T18:53:53.3510383Z Get:6 https://packages.microsoft.com/repos/azure-cli noble InRelease [3564 B]
+sbom	Install ripgrep	2026-02-18T18:53:53.3511561Z Get:7 https://packages.microsoft.com/ubuntu/24.04/prod noble InRelease [3600 B]
+sbom	Install ripgrep	2026-02-18T18:53:53.3539429Z Get:3 http://azure.archive.ubuntu.com/ubuntu noble-updates InRelease [126 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.3606491Z Get:4 http://azure.archive.ubuntu.com/ubuntu noble-backports InRelease [126 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.3610342Z Get:5 http://azure.archive.ubuntu.com/ubuntu noble-security InRelease [126 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.4994956Z Get:8 https://packages.microsoft.com/repos/azure-cli noble/main amd64 Packages [2129 B]
+sbom	Install ripgrep	2026-02-18T18:53:53.5483691Z Get:9 https://packages.microsoft.com/ubuntu/24.04/prod noble/main all Packages [643 B]
+sbom	Install ripgrep	2026-02-18T18:53:53.5517317Z Get:10 https://packages.microsoft.com/ubuntu/24.04/prod noble/main amd64 Packages [90.4 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.5564417Z Get:11 https://packages.microsoft.com/ubuntu/24.04/prod noble/main armhf Packages [11.4 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.5617462Z Get:12 https://packages.microsoft.com/ubuntu/24.04/prod noble/main arm64 Packages [69.9 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.6039692Z Get:13 http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages [1766 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.6443352Z Get:14 http://azure.archive.ubuntu.com/ubuntu noble-updates/main Translation-en [328 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.6486739Z Get:15 http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Components [175 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.6513467Z Get:16 http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 c-n-f Metadata [16.5 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.6526250Z Get:17 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe amd64 Packages [1555 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.6690900Z Get:18 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe Translation-en [315 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.6725921Z Get:19 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe amd64 Components [386 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.6760792Z Get:20 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe amd64 c-n-f Metadata [32.5 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.6776293Z Get:21 http://azure.archive.ubuntu.com/ubuntu noble-updates/restricted amd64 Packages [2646 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.7100667Z Get:22 http://azure.archive.ubuntu.com/ubuntu noble-updates/restricted Translation-en [611 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.7567645Z Get:23 http://azure.archive.ubuntu.com/ubuntu noble-updates/restricted amd64 Components [212 B]
+sbom	Install ripgrep	2026-02-18T18:53:53.7580306Z Get:24 http://azure.archive.ubuntu.com/ubuntu noble-updates/multiverse amd64 Components [940 B]
+sbom	Install ripgrep	2026-02-18T18:53:53.7588639Z Get:25 http://azure.archive.ubuntu.com/ubuntu noble-backports/main amd64 Components [7300 B]
+sbom	Install ripgrep	2026-02-18T18:53:53.7599155Z Get:26 http://azure.archive.ubuntu.com/ubuntu noble-backports/universe amd64 Components [10.5 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.7610348Z Get:27 http://azure.archive.ubuntu.com/ubuntu noble-backports/restricted amd64 Components [216 B]
+sbom	Install ripgrep	2026-02-18T18:53:53.7621594Z Get:28 http://azure.archive.ubuntu.com/ubuntu noble-backports/multiverse amd64 Components [212 B]
+sbom	Install ripgrep	2026-02-18T18:53:53.7645138Z Get:29 http://azure.archive.ubuntu.com/ubuntu noble-security/main amd64 Packages [1472 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.7870074Z Get:30 http://azure.archive.ubuntu.com/ubuntu noble-security/main Translation-en [237 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.7920870Z Get:31 http://azure.archive.ubuntu.com/ubuntu noble-security/main amd64 Components [21.5 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.7937345Z Get:32 http://azure.archive.ubuntu.com/ubuntu noble-security/main amd64 c-n-f Metadata [9892 B]
+sbom	Install ripgrep	2026-02-18T18:53:53.7964519Z Get:33 http://azure.archive.ubuntu.com/ubuntu noble-security/universe amd64 Packages [935 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.8120500Z Get:34 http://azure.archive.ubuntu.com/ubuntu noble-security/universe Translation-en [214 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.8170839Z Get:35 http://azure.archive.ubuntu.com/ubuntu noble-security/universe amd64 Components [74.2 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.8188267Z Get:36 http://azure.archive.ubuntu.com/ubuntu noble-security/universe amd64 c-n-f Metadata [19.9 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.8683750Z Get:37 http://azure.archive.ubuntu.com/ubuntu noble-security/restricted amd64 Packages [2510 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.8847748Z Get:38 http://azure.archive.ubuntu.com/ubuntu noble-security/restricted Translation-en [581 kB]
+sbom	Install ripgrep	2026-02-18T18:53:53.8889459Z Get:39 http://azure.archive.ubuntu.com/ubuntu noble-security/restricted amd64 Components [212 B]
+sbom	Install ripgrep	2026-02-18T18:53:53.8901190Z Get:40 http://azure.archive.ubuntu.com/ubuntu noble-security/multiverse amd64 Components [212 B]
+sbom	Install ripgrep	2026-02-18T18:54:00.9702116Z Fetched 14.5 MB in 2s (8135 kB/s)
+sbom	Install ripgrep	2026-02-18T18:54:01.8733628Z Reading package lists...
+sbom	Install ripgrep	2026-02-18T18:54:01.9100900Z Reading package lists...
+sbom	Install ripgrep	2026-02-18T18:54:02.1575281Z Building dependency tree...
+sbom	Install ripgrep	2026-02-18T18:54:02.1583727Z Reading state information...
+sbom	Install ripgrep	2026-02-18T18:54:02.5132406Z The following NEW packages will be installed:
+sbom	Install ripgrep	2026-02-18T18:54:02.5133586Z   ripgrep
+sbom	Install ripgrep	2026-02-18T18:54:02.5422558Z 0 upgraded, 1 newly installed, 0 to remove and 75 not upgraded.
+sbom	Install ripgrep	2026-02-18T18:54:02.5423265Z Need to get 1551 kB of archives.
+sbom	Install ripgrep	2026-02-18T18:54:02.5423797Z After this operation, 5335 kB of additional disk space will be used.
+sbom	Install ripgrep	2026-02-18T18:54:02.5424446Z Get:1 file:/etc/apt/apt-mirrors.txt Mirrorlist [144 B]
+sbom	Install ripgrep	2026-02-18T18:54:02.6363784Z Get:2 http://azure.archive.ubuntu.com/ubuntu noble/universe amd64 ripgrep amd64 14.1.0-1 [1551 kB]
+sbom	Install ripgrep	2026-02-18T18:54:03.0103644Z Fetched 1551 kB in 0s (8720 kB/s)
+sbom	Install ripgrep	2026-02-18T18:54:03.0369856Z Selecting previously unselected package ripgrep.
+sbom	Install ripgrep	2026-02-18T18:54:03.0886051Z (Reading database ... 
+sbom	Install ripgrep	2026-02-18T18:54:03.0887014Z (Reading database ... 5%
+sbom	Install ripgrep	2026-02-18T18:54:03.0887464Z (Reading database ... 10%
+sbom	Install ripgrep	2026-02-18T18:54:03.0887733Z (Reading database ... 15%
+sbom	Install ripgrep	2026-02-18T18:54:03.0887986Z (Reading database ... 20%
+sbom	Install ripgrep	2026-02-18T18:54:03.0888221Z (Reading database ... 25%
+sbom	Install ripgrep	2026-02-18T18:54:03.0888460Z (Reading database ... 30%
+sbom	Install ripgrep	2026-02-18T18:54:03.0888690Z (Reading database ... 35%
+sbom	Install ripgrep	2026-02-18T18:54:03.0888933Z (Reading database ... 40%
+sbom	Install ripgrep	2026-02-18T18:54:03.0889164Z (Reading database ... 45%
+sbom	Install ripgrep	2026-02-18T18:54:03.0889404Z (Reading database ... 50%
+sbom	Install ripgrep	2026-02-18T18:54:03.1020361Z (Reading database ... 55%
+sbom	Install ripgrep	2026-02-18T18:54:03.2000217Z (Reading database ... 60%
+sbom	Install ripgrep	2026-02-18T18:54:03.2660805Z (Reading database ... 65%
+sbom	Install ripgrep	2026-02-18T18:54:03.3313827Z (Reading database ... 70%
+sbom	Install ripgrep	2026-02-18T18:54:03.3860116Z (Reading database ... 75%
+sbom	Install ripgrep	2026-02-18T18:54:03.4597139Z (Reading database ... 80%
+sbom	Install ripgrep	2026-02-18T18:54:03.5991130Z (Reading database ... 85%
+sbom	Install ripgrep	2026-02-18T18:54:03.7043557Z (Reading database ... 90%
+sbom	Install ripgrep	2026-02-18T18:54:03.8202017Z (Reading database ... 95%
+sbom	Install ripgrep	2026-02-18T18:54:03.8202525Z (Reading database ... 100%
+sbom	Install ripgrep	2026-02-18T18:54:03.8203136Z (Reading database ... 218331 files and directories currently installed.)
+sbom	Install ripgrep	2026-02-18T18:54:03.8249865Z Preparing to unpack .../ripgrep_14.1.0-1_amd64.deb ...
+sbom	Install ripgrep	2026-02-18T18:54:03.8294697Z Unpacking ripgrep (14.1.0-1) ...
+sbom	Install ripgrep	2026-02-18T18:54:03.9149265Z Setting up ripgrep (14.1.0-1) ...
+sbom	Install ripgrep	2026-02-18T18:54:03.9198018Z Processing triggers for man-db (2.12.0-4build2) ...
+sbom	Install ripgrep	2026-02-18T18:54:03.9241921Z Not building database; man-db/auto-update is not 'true'.
+sbom	Install ripgrep	2026-02-18T18:54:04.6534538Z 
+sbom	Install ripgrep	2026-02-18T18:54:04.6535284Z Running kernel seems to be up-to-date.
+sbom	Install ripgrep	2026-02-18T18:54:04.6535730Z 
+sbom	Install ripgrep	2026-02-18T18:54:04.6535919Z No services need to be restarted.
+sbom	Install ripgrep	2026-02-18T18:54:04.6536231Z 
+sbom	Install ripgrep	2026-02-18T18:54:04.6536358Z No containers need to be restarted.
+sbom	Install ripgrep	2026-02-18T18:54:04.6536940Z 
+sbom	Install ripgrep	2026-02-18T18:54:04.6537086Z No user sessions are running outdated binaries.
+sbom	Install ripgrep	2026-02-18T18:54:04.6537495Z 
+sbom	Install ripgrep	2026-02-18T18:54:04.6537739Z No VM guests are running outdated hypervisor (qemu) binaries on this host.
+sbom	Resolve and validate release tag context	﻿2026-02-18T18:54:07.1799876Z ##[group]Run if [ -z "${RELEASE_TAG}" ]; then
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1800282Z [36;1mif [ -z "${RELEASE_TAG}" ]; then[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1800663Z [36;1m  echo "release tag is required for SBOM workflow" >&2[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1800979Z [36;1m  exit 1[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1801160Z [36;1mfi[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1801538Z [36;1m[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1801870Z [36;1mif [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1802450Z [36;1m  echo "release tag must match vMAJOR.MINOR.PATCH (optionally suffixed): ${RELEASE_TAG}" >&2[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1802904Z [36;1m  exit 1[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1803070Z [36;1mfi[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1803231Z [36;1m[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1803403Z [36;1mgit fetch --force --tags origin[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1803689Z [36;1mgit cat-file -e "${RELEASE_TAG}^{tag}"[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1803961Z [36;1m[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1804232Z [36;1mTAG_COMMIT_SHA="$(git rev-list -n 1 "${RELEASE_TAG}^{commit}")"[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1804634Z [36;1mHEAD_SHA="$(git rev-parse HEAD)"[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1804935Z [36;1mif [ "${HEAD_SHA}" != "${TAG_COMMIT_SHA}" ]; then[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1805452Z [36;1m  echo "checked out commit (${HEAD_SHA}) does not match tag commit (${TAG_COMMIT_SHA}) for ${RELEASE_TAG}" >&2[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1805933Z [36;1m  exit 1[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1806096Z [36;1mfi[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1806254Z [36;1m[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1806495Z [36;1mecho "TAG_COMMIT_SHA=${TAG_COMMIT_SHA}" >> "${GITHUB_ENV}"[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1806942Z [36;1mecho "SBOM_SPDX_FILE=arco-${RELEASE_TAG}.spdx.json" >> "${GITHUB_ENV}"[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1807465Z [36;1mecho "SBOM_CYCLONEDX_FILE=arco-${RELEASE_TAG}.cyclonedx.json" >> "${GITHUB_ENV}"[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1807992Z [36;1mecho "SBOM_SHA256_FILE=arco-${RELEASE_TAG}.sbom.sha256" >> "${GITHUB_ENV}"[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1808547Z [36;1mecho "EVIDENCE_ARCHIVE=arco-${RELEASE_TAG}.release-evidence.tgz" >> "${GITHUB_ENV}"[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1858272Z shell: /usr/bin/bash -e {0}
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1858523Z env:
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1858705Z   CARGO_TERM_COLOR: always
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1858924Z   RUST_BACKTRACE: 1
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1859120Z   SBOM_RETENTION_DAYS: 90
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1859326Z   RELEASE_TAG: v0.1.3
+sbom	Resolve and validate release tag context	2026-02-18T18:54:07.1859520Z ##[endgroup]
+sbom	Wait for release-tag CI success	﻿2026-02-18T18:54:07.6142336Z ##[group]Run check_runs_api="https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${TAG_COMMIT_SHA}/check-runs?per_page=100"
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6143511Z [36;1mcheck_runs_api="https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${TAG_COMMIT_SHA}/check-runs?per_page=100"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6144196Z [36;1mmax_attempts=40[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6144423Z [36;1msleep_seconds=15[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6144621Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6144947Z [36;1mfor attempt in $(seq 1 "${max_attempts}"); do[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6145283Z [36;1m  checks_payload="$(curl -fsSL \[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6145839Z [36;1m    -H "Authorization: ***" \[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6146346Z [36;1m    -H "Accept: application/vnd.github+json" \[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6146814Z [36;1m    "${check_runs_api}")"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6147188Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6147478Z [36;1m  discipline_status="$([0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6147853Z [36;1m    jq -r '[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6148192Z [36;1m      .check_runs[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6148528Z [36;1m      | map(select(.name == "Release Tag Discipline"))[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6148914Z [36;1m      | sort_by(.started_at // .completed_at // .created_at)[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6149224Z [36;1m      | reverse[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6149428Z [36;1m      | (.[0].status // "")[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6149659Z [36;1m    ' <<<"${checks_payload}"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6149894Z [36;1m  )"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6150071Z [36;1m  discipline_conclusion="$([0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6150502Z [36;1m    jq -r '[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6150686Z [36;1m      .check_runs[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6150954Z [36;1m      | map(select(.name == "Release Tag Discipline"))[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6152308Z [36;1m      | sort_by(.started_at // .completed_at // .created_at)[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6152649Z [36;1m      | reverse[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6152878Z [36;1m      | (.[0].conclusion // "")[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6153126Z [36;1m    ' <<<"${checks_payload}"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6153364Z [36;1m  )"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6153539Z [36;1m  discipline_url="$([0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6153762Z [36;1m    jq -r '[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6153944Z [36;1m      .check_runs[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6154207Z [36;1m      | map(select(.name == "Release Tag Discipline"))[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6154592Z [36;1m      | sort_by(.started_at // .completed_at // .created_at)[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6154900Z [36;1m      | reverse[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6155111Z [36;1m      | (.[0].details_url // "")[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6155361Z [36;1m    ' <<<"${checks_payload}"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6155579Z [36;1m  )"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6155734Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6156077Z [36;1m  if [ "${discipline_status}" = "completed" ] && [ "${discipline_conclusion}" = "success" ]; then[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6156589Z [36;1m    echo "release-tag discipline passed: ${discipline_url}"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6156901Z [36;1m    break[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6157078Z [36;1m  fi[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6157236Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6157680Z [36;1m  if [ "${discipline_status}" = "completed" ] && [ -n "${discipline_conclusion}" ] && [ "${discipline_conclusion}" != "success" ]; then[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6158415Z [36;1m    echo "release-tag discipline check failed (${discipline_conclusion}): ${discipline_url}" >&2[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6158867Z [36;1m    exit 1[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6159043Z [36;1m  fi[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6159196Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6159407Z [36;1m  if [ "${attempt}" -eq "${max_attempts}" ]; then[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6159936Z [36;1m    echo "timed out waiting for successful release-tag discipline check-run for commit ${TAG_COMMIT_SHA}" >&2[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6160440Z [36;1m    exit 1[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6160607Z [36;1m  fi[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6160771Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6161149Z [36;1m  echo "attempt ${attempt}/${max_attempts}: waiting for release-tag discipline check-run success..."[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6162117Z [36;1m  sleep "${sleep_seconds}"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6162356Z [36;1mdone[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6211756Z shell: /usr/bin/bash -e {0}
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6212003Z env:
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6212223Z   CARGO_TERM_COLOR: always
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6212455Z   RUST_BACKTRACE: 1
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6212649Z   SBOM_RETENTION_DAYS: 90
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6212850Z   RELEASE_TAG: v0.1.3
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6213115Z   TAG_COMMIT_SHA: e47a966b728411be9e1545f7b326400470eb73ac
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6213438Z   SBOM_SPDX_FILE: arco-v0.1.3.spdx.json
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6213879Z   SBOM_CYCLONEDX_FILE: arco-v0.1.3.cyclonedx.json
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6214201Z   SBOM_SHA256_FILE: arco-v0.1.3.sbom.sha256
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6214495Z   EVIDENCE_ARCHIVE: arco-v0.1.3.release-evidence.tgz
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6214994Z   GH_TOKEN: ***
+sbom	Wait for release-tag CI success	2026-02-18T18:54:07.6215172Z ##[endgroup]
+sbom	Wait for release-tag CI success	2026-02-18T18:54:08.3463258Z release-tag discipline passed: https://github.com/daxis-io/arco/actions/runs/22153266672/job/64050137664
+sbom	Validate changelog + release notes completeness	﻿2026-02-18T18:54:08.3490269Z ##[group]Run bash tools/check-release-tag-discipline.sh --tag "${RELEASE_TAG}"
+sbom	Validate changelog + release notes completeness	2026-02-18T18:54:08.3490858Z [36;1mbash tools/check-release-tag-discipline.sh --tag "${RELEASE_TAG}"[0m
+sbom	Validate changelog + release notes completeness	2026-02-18T18:54:08.3541179Z shell: /usr/bin/bash -e {0}
+sbom	Validate changelog + release notes completeness	2026-02-18T18:54:08.3541757Z env:
+sbom	Validate changelog + release notes completeness	2026-02-18T18:54:08.3541940Z   CARGO_TERM_COLOR: always
+sbom	Validate changelog + release notes completeness	2026-02-18T18:54:08.3542165Z   RUST_BACKTRACE: 1
+sbom	Validate changelog + release notes completeness	2026-02-18T18:54:08.3542360Z   SBOM_RETENTION_DAYS: 90
+sbom	Validate changelog + release notes completeness	2026-02-18T18:54:08.3542562Z   RELEASE_TAG: v0.1.3
+sbom	Validate changelog + release notes completeness	2026-02-18T18:54:08.3543030Z   TAG_COMMIT_SHA: e47a966b728411be9e1545f7b326400470eb73ac
+sbom	Validate changelog + release notes completeness	2026-02-18T18:54:08.3543351Z   SBOM_SPDX_FILE: arco-v0.1.3.spdx.json
+sbom	Validate changelog + release notes completeness	2026-02-18T18:54:08.3543665Z   SBOM_CYCLONEDX_FILE: arco-v0.1.3.cyclonedx.json
+sbom	Validate changelog + release notes completeness	2026-02-18T18:54:08.3543975Z   SBOM_SHA256_FILE: arco-v0.1.3.sbom.sha256
+sbom	Validate changelog + release notes completeness	2026-02-18T18:54:08.3544294Z   EVIDENCE_ARCHIVE: arco-v0.1.3.release-evidence.tgz
+sbom	Validate changelog + release notes completeness	2026-02-18T18:54:08.3544589Z ##[endgroup]
+sbom	Validate changelog + release notes completeness	2026-02-18T18:54:08.3916581Z release-tag discipline checks passed for v0.1.3
+sbom	Validate annotated signed release tag	﻿2026-02-18T18:54:08.3948201Z ##[group]Run git cat-file -e "${RELEASE_TAG}^{tag}"
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3948621Z [36;1mgit cat-file -e "${RELEASE_TAG}^{tag}"[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3948970Z [36;1mTAG_OBJECT_SHA="$(git rev-parse "${RELEASE_TAG}^{tag}")"[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3949435Z [36;1mgit cat-file -p "${RELEASE_TAG}^{tag}" > "arco-${RELEASE_TAG}.tag-object.txt"[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3949817Z [36;1m[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3950159Z [36;1mif ! rg -q '^-----BEGIN (PGP|SSH) SIGNATURE-----$' "arco-${RELEASE_TAG}.tag-object.txt"; then[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3950757Z [36;1m  echo "release tag must include a PGP or SSH signature block: ${RELEASE_TAG}" >&2[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3951154Z [36;1m  exit 1[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3951611Z [36;1mfi[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3951790Z [36;1m[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3951985Z [36;1mverification_payload="$(curl -fsSL \[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3952773Z [36;1m  -H "Authorization: ***" \[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3953079Z [36;1m  -H "Accept: application/vnd.github+json" \[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3953563Z [36;1m  "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT_SHA}")"[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3954144Z [36;1mverified="$(jq -r '.verification.verified // false' <<<"${verification_payload}")"[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3954713Z [36;1mreason="$(jq -r '.verification.reason // "unknown"' <<<"${verification_payload}")"[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3955103Z [36;1m[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3955291Z [36;1mif [ "${verified}" != "true" ]; then[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3955716Z [36;1m  echo "release tag signature verification failed for ${RELEASE_TAG}: ${reason}" >&2[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3956127Z [36;1m  exit 1[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.3956292Z [36;1mfi[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.4005491Z shell: /usr/bin/bash -e {0}
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.4005740Z env:
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.4005913Z   CARGO_TERM_COLOR: always
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.4006132Z   RUST_BACKTRACE: 1
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.4006321Z   SBOM_RETENTION_DAYS: 90
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.4006529Z   RELEASE_TAG: v0.1.3
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.4006779Z   TAG_COMMIT_SHA: e47a966b728411be9e1545f7b326400470eb73ac
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.4007115Z   SBOM_SPDX_FILE: arco-v0.1.3.spdx.json
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.4007404Z   SBOM_CYCLONEDX_FILE: arco-v0.1.3.cyclonedx.json
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.4007693Z   SBOM_SHA256_FILE: arco-v0.1.3.sbom.sha256
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.4007996Z   EVIDENCE_ARCHIVE: arco-v0.1.3.release-evidence.tgz
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.4008449Z   GH_TOKEN: ***
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.4008634Z ##[endgroup]
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.8259256Z release tag signature verification failed for v0.1.3: unknown_key
+sbom	Validate annotated signed release tag	2026-02-18T18:54:08.8271055Z ##[error]Process completed with exit code 1.
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	﻿2026-02-18T18:54:08.8404766Z Post job cleanup.
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:08.9227397Z [command]/usr/bin/git version
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:08.9267032Z git version 2.52.0
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:08.9310518Z Temporarily overriding HOME='/home/runner/work/_temp/426df668-d99f-482a-b079-4f73d0a5665d' before making global git config changes
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:08.9312149Z Adding repository directory to the temporary git global config as a safe directory
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:08.9317305Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/arco/arco
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:08.9354351Z Removing SSH command configuration
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:08.9362867Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:08.9401833Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:08.9660472Z Removing HTTP extra header
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:08.9666806Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:08.9707089Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:08.9964250Z Removing includeIf entries pointing to credentials config files
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:08.9970718Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:08.9998752Z includeif.gitdir:/home/runner/work/arco/arco/.git.path
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0013602Z includeif.gitdir:/home/runner/work/arco/arco/.git/worktrees/*.path
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0014305Z includeif.gitdir:/github/workspace/.git.path
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0014788Z includeif.gitdir:/github/workspace/.git/worktrees/*.path
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0015952Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/arco/arco/.git.path
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0036395Z /home/runner/work/_temp/git-credentials-2bf45477-dd09-4398-aaa1-be806efed728.config
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0049094Z [command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/arco/arco/.git.path /home/runner/work/_temp/git-credentials-2bf45477-dd09-4398-aaa1-be806efed728.config
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0089569Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/arco/arco/.git/worktrees/*.path
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0116100Z /home/runner/work/_temp/git-credentials-2bf45477-dd09-4398-aaa1-be806efed728.config
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0127336Z [command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/arco/arco/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-2bf45477-dd09-4398-aaa1-be806efed728.config
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0165493Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0192807Z /github/runner_temp/git-credentials-2bf45477-dd09-4398-aaa1-be806efed728.config
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0203044Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-2bf45477-dd09-4398-aaa1-be806efed728.config
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0240801Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0265977Z /github/runner_temp/git-credentials-2bf45477-dd09-4398-aaa1-be806efed728.config
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0277325Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-2bf45477-dd09-4398-aaa1-be806efed728.config
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0316643Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:54:09.0564511Z Removing credentials config '/home/runner/work/_temp/git-credentials-2bf45477-dd09-4398-aaa1-be806efed728.config'
+sbom	Complete job	﻿2026-02-18T18:54:09.0692920Z Cleaning up orphan processes

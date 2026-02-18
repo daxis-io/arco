@@ -1,0 +1,13 @@
+Deleted tag 'v0.1.0' (was 352cba8)
+-----BEGIN SSH SIGNATURE-----
+tag v0.1.0
+Tagger: Gate1 Automation <gate1@local>
+
+v0.1.0
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgyKwt0k2k0u4m/ypDadSfZIldst
+ASdiJVnUnpmTofr84AAAADZ2l0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5
+AAAAQDU+65QhawmZ0JZNqFg180Crp7izxaDncnK3GXSbDTUgVeMon/VutfK3nOfCsea3RN
+3h2leyIEVjKkcxjvQfDwE=
+-----END SSH SIGNATURE-----
+4bd8a98128f5f579c06cbd58a15340a844a746cc docs(evidence): replace Gate 1 wildcard log references

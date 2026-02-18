@@ -1,0 +1,72 @@
+sbom	Wait for release-tag CI success	﻿2026-02-18T18:29:59.2165183Z ##[group]Run ci_runs_api="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?event=push&per_page=100"
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2166499Z [36;1mci_runs_api="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?event=push&per_page=100"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2167220Z [36;1mmax_attempts=40[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2167487Z [36;1msleep_seconds=15[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2167754Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2168094Z [36;1mfor attempt in $(seq 1 "${max_attempts}"); do[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2168447Z [36;1m  runs_payload="$(curl -fsSL \[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2169133Z [36;1m    -H "Authorization: ***" \[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2169622Z [36;1m    -H "Accept: application/vnd.github+json" \[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2169974Z [36;1m    "${ci_runs_api}")"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2170464Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2170866Z [36;1m  mapfile -t run_ids < <([0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2171384Z [36;1m    jq -r --arg sha "${TAG_COMMIT_SHA}" '[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2171949Z [36;1m      .workflow_runs[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2172445Z [36;1m      | map(select(.head_sha == $sha))[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2173012Z [36;1m      | sort_by(.run_started_at // .created_at)[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2173408Z [36;1m      | reverse[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2173651Z [36;1m      | .[].id[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2173886Z [36;1m    ' <<<"${runs_payload}"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2174152Z [36;1m  )[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2174349Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2174631Z [36;1m  found_success="false"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2174914Z [36;1m  for run_id in "${run_ids[@]}"; do[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2175224Z [36;1m    jobs_payload="$(curl -fsSL \[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2175631Z [36;1m      -H "Authorization: ***" \[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2175969Z [36;1m      -H "Accept: application/vnd.github+json" \[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2176534Z [36;1m      "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100")"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2177045Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2177458Z [36;1m    discipline_conclusion="$([0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2177971Z [36;1m      jq -r '.jobs[] | select(.name == "Release Tag Discipline") | .conclusion // empty' <<<"${jobs_payload}" \[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2178479Z [36;1m        | head -n 1[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2178726Z [36;1m    )"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2178929Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2179193Z [36;1m    if [ "${discipline_conclusion}" = "success" ]; then[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2179615Z [36;1m      echo "release-tag discipline passed in CI run ${run_id}"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2179998Z [36;1m      found_success="true"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2180474Z [36;1m      break[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2180697Z [36;1m    fi[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2180898Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2181558Z [36;1m    if [ "${discipline_conclusion}" = "failure" ] || [ "${discipline_conclusion}" = "cancelled" ] || [ "${discipline_conclusion}" = "timed_out" ] || [ "${discipline_conclusion}" = "action_required" ]; then[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2182502Z [36;1m      echo "release-tag discipline failed in CI run ${run_id} (${discipline_conclusion})" >&2[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2182955Z [36;1m      exit 1[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2183180Z [36;1m    fi[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2183381Z [36;1m  done[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2183575Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2183812Z [36;1m  if [ "${found_success}" = "true" ]; then[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2184103Z [36;1m    break[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2184314Z [36;1m  fi[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2184508Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2184754Z [36;1m  if [ "${attempt}" -eq "${max_attempts}" ]; then[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2185301Z [36;1m    echo "timed out waiting for successful release-tag discipline CI run for commit ${TAG_COMMIT_SHA}" >&2[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2185812Z [36;1m    exit 1[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2186028Z [36;1m  fi[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2186225Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2186612Z [36;1m  echo "attempt ${attempt}/${max_attempts}: waiting for release-tag discipline CI success..."[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2187286Z [36;1m  sleep "${sleep_seconds}"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2187552Z [36;1mdone[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2239513Z shell: /usr/bin/bash -e {0}
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2239800Z env:
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2240015Z   CARGO_TERM_COLOR: always
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2240501Z   RUST_BACKTRACE: 1
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2240739Z   SBOM_RETENTION_DAYS: 90
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2240979Z   RELEASE_TAG: v0.1.0
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2241277Z   TAG_COMMIT_SHA: 4bd8a98128f5f579c06cbd58a15340a844a746cc
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2241628Z   SBOM_SPDX_FILE: arco-v0.1.0.spdx.json
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2242024Z   SBOM_CYCLONEDX_FILE: arco-v0.1.0.cyclonedx.json
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2242355Z   SBOM_SHA256_FILE: arco-v0.1.0.sbom.sha256
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2242684Z   EVIDENCE_ARCHIVE: arco-v0.1.0.release-evidence.tgz
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2243168Z   GH_TOKEN: ***
+sbom	Wait for release-tag CI success	2026-02-18T18:29:59.2243394Z ##[endgroup]
+sbom	Wait for release-tag CI success	2026-02-18T18:30:02.5123080Z release-tag discipline failed in CI run 22152465142 (failure)
+sbom	Wait for release-tag CI success	2026-02-18T18:30:02.5137141Z ##[error]Process completed with exit code 1.

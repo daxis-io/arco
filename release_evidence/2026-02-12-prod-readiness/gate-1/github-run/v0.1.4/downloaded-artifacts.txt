@@ -1,0 +1,6 @@
+/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/release_evidence/2026-02-12-prod-readiness/gate-1/release-assets/v0.1.4/release-evidence-v0.1.4/arco-v0.1.4.release-evidence.tgz
+/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/release_evidence/2026-02-12-prod-readiness/gate-1/release-assets/v0.1.4/release-sbom-v0.1.4/arco-v0.1.4.cyclonedx.json
+/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/release_evidence/2026-02-12-prod-readiness/gate-1/release-assets/v0.1.4/release-sbom-v0.1.4/arco-v0.1.4.sbom.sha256
+/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/release_evidence/2026-02-12-prod-readiness/gate-1/release-assets/v0.1.4/release-sbom-v0.1.4/arco-v0.1.4.spdx.json
+/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/release_evidence/2026-02-12-prod-readiness/gate-1/release-assets/v0.1.4/release-sbom-v0.1.4/arco-v0.1.4.tag-object.txt
+/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/release_evidence/2026-02-12-prod-readiness/gate-1/release-assets/v0.1.4/release-sbom-v0.1.4/arco-v0.1.4.tag-verify.txt

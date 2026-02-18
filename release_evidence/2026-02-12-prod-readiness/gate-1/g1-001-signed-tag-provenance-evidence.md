@@ -2,30 +2,32 @@
 
 - Signal: `G1-001`
 - Ledger criterion: `Signed tag and provenance evidence generated for a release tag.` (`docs/audits/2026-02-12-prod-readiness/signal-ledger.md:22`)
-- Status in this batch: `PARTIAL`
+- Status in this batch: `GO`
 
 ## Implementation Evidence
 
-1. Release SBOM/provenance workflow is now release-tag driven and validates signed annotated tags.
-   - `.github/workflows/release-sbom.yml:4-6`
-   - `.github/workflows/release-sbom.yml:52-61`
-2. Provenance attestation pipeline is wired with GitHub attestations + OIDC permissions.
-   - `.github/workflows/release-sbom.yml:13-16`
-   - `.github/workflows/release-sbom.yml:94-100`
-3. Release process explicitly requires signed tags and documents the provenance workflow trigger.
-   - `RELEASE.md:36-47`
+1. Release SBOM workflow enforces signed-tag verification before publication and includes provenance attestation.
+   - `.github/workflows/release-sbom.yml:128-145`
+   - `.github/workflows/release-sbom.yml:184-191`
+2. Release-tag CI discipline success is explicitly required before SBOM/provenance steps proceed.
+   - `.github/workflows/release-sbom.yml:64-123`
+3. Trust root for SSH tag verification is repository-pinned and immutable in source control.
+   - `.github/release-signers.allowed:1`
+4. Collector captures signature metadata and verification method in immutable pack metadata.
+   - `tools/collect_release_evidence.sh:87-110`
+   - `tools/collect_release_evidence.sh:152-163`
 
-## Verification Evidence
+## Verification Evidence (v0.1.4)
 
-1. Local signed release tag material for `v0.1.0` (SSH signature block present):
-   - `release_evidence/2026-02-12-prod-readiness/gate-1/command-logs/2026-02-16T024416Z-targeted-signed-tag-prepared.log`
-   - `release_evidence/2026-02-12-prod-readiness/gate-1/command-logs/2026-02-16T024416Z-targeted-signed-tag-has-signature-material.log`
-2. Immutable collector metadata captures signed tag identity and signature type:
-   - `release_evidence/2026-02-12-prod-readiness/gate-1/collector-packs/v0.1.0/352cba80c843fd9cf54b1ab169bd0ac081c51bde-dc3072977aef3b0572c58498bea6ceddab26fd22/metadata.env`
-   - `release_evidence/2026-02-12-prod-readiness/gate-1/collector-packs/v0.1.0/352cba80c843fd9cf54b1ab169bd0ac081c51bde-dc3072977aef3b0572c58498bea6ceddab26fd22/tag-object.txt`
-3. Workflow provenance controls are present in committed workflow:
-   - `release_evidence/2026-02-12-prod-readiness/gate-1/command-logs/2026-02-16T024416Z-full-sbom-retention-and-provenance-present.log`
-
-## Remaining Closure Gap
-
-Local workspace cannot execute GitHub-hosted `actions/attest-build-provenance` for an origin-pushed release tag. Final `GO` for `G1-001` requires one successful remote run of `.github/workflows/release-sbom.yml` on a pushed signed tag, with run URL and attestation reference captured in Gate 1 evidence.
+1. Successful release SBOM/provenance run for signed tag `v0.1.4`:
+   - `release_evidence/2026-02-12-prod-readiness/gate-1/github-run/v0.1.4/release-sbom-run.json`
+   - `release_evidence/2026-02-12-prod-readiness/gate-1/github-run/v0.1.4/release-sbom-run.log`
+2. Commit check-run shows `Release Tag Discipline` completed successfully for the same tag commit:
+   - `release_evidence/2026-02-12-prod-readiness/gate-1/github-run/v0.1.4/check-runs.json`
+3. SBOM job step conclusions include both signed-tag verification and provenance attestation as `success`:
+   - `release_evidence/2026-02-12-prod-readiness/gate-1/github-run/v0.1.4/release-sbom-run-jobs.json`
+4. Downloaded retained artifact contains signed tag object and verification transcript:
+   - `release_evidence/2026-02-12-prod-readiness/gate-1/release-assets/v0.1.4/release-sbom-v0.1.4/arco-v0.1.4.tag-object.txt`
+   - `release_evidence/2026-02-12-prod-readiness/gate-1/release-assets/v0.1.4/release-sbom-v0.1.4/arco-v0.1.4.tag-verify.txt`
+5. Immutable collector metadata for `v0.1.4` records `SIGNATURE_VERIFIED=true` with `git-verify-tag` method:
+   - `release_evidence/2026-02-12-prod-readiness/gate-1/collector-packs/v0.1.4/24f2e2c0eb1f0c899ac4cb379292a14d5d0b4d3a-b26c3d872f82d4cee3252a0d373f0cc56e13997c/metadata.env`

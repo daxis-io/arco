@@ -1,0 +1,4 @@
+Watching SBOM run 22153266669 and Release Tag Discipline check-run for v0.1.3
+2026-02-18T18:54:03Z	attempt=1	SBOM=in_progress/	Discipline=completed/success
+2026-02-18T18:54:19Z	attempt=2	SBOM=completed/failure	Discipline=completed/success
+SBOM run failed with conclusion failure

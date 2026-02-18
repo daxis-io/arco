@@ -152,7 +152,7 @@ jobs:
           toolchain: 1.85
 
       - name: Install cargo-sbom
-        uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131 # v2
+        uses: taiki-e/install-action@cede0bb282aae847dfa8aacca3a41c86d973d4d7 # v2
         with:
           tool: cargo-sbom@0.10.0
 
@@ -179,7 +179,7 @@ jobs:
             arco-${{ env.RELEASE_TAG }}.tag-object.txt
 
       - name: Publish build provenance attestation for SBOM artifacts
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-path: |
             ${{ env.SBOM_SPDX_FILE }}

@@ -1,5 +1,0 @@
-expected_release_tag=v0.1.4
-sbom_spdx_asset=arco-v0.1.4.spdx.json
-sbom_cyclonedx_asset=arco-v0.1.4.cyclonedx.json
-sbom_manifest_asset=arco-v0.1.4.sbom.sha256
-retention_field=retention-days

@@ -1,7 +1,7 @@
 # Production Readiness Audit - Arco Daxis Prod GO
 
 - Audit date: 2026-02-12
-- Evidence refresh UTC: 2026-02-18T19:04:52Z
+- Evidence refresh UTC: 2026-02-18T19:36:10Z
 - Baseline commit: `e896506f3c936c266a21fe556a107d37bd7075b5`
 - Scope: all currently identified closure signals in the "Arco Daxis Production GO Closure Plan"
 - Definition of Done (locked): `ALL GATES GO`
@@ -38,8 +38,8 @@ Gate 1 is now `GO`; all four signals are closed with concrete `v0.1.4` release-t
 
 Primary artifacts:
 - `release_evidence/2026-02-12-prod-readiness/gate-1/README.md`
-- `release_evidence/2026-02-12-prod-readiness/gate-1/github-run/v0.1.4/release-sbom-run.json`
-- `release_evidence/2026-02-12-prod-readiness/gate-1/github-run/v0.1.4/release-view.json`
+- `release_evidence/2026-02-12-prod-readiness/gate-1/verification-notes.md`
+- `release_evidence/2026-02-12-prod-readiness/gate-1/g1-004-sbom-retention-evidence.md`
 
 ## Signals Closed In Batch 3
 

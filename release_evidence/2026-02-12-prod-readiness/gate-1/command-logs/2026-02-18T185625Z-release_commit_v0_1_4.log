@@ -1,4 +1,0 @@
-[codex/prod-go-closure-batch3 b26c3d8] release(gate1): verify signed tags with repo-pinned signers for v0.1.4
- 7 files changed, 39 insertions(+), 13 deletions(-)
- create mode 100644 .github/release-signers.allowed
- create mode 100644 release_notes/v0.1.4.md

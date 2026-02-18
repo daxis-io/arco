@@ -1,7 +1,7 @@
 # Signal Ledger - 2026-02-12 Prod Readiness
 
 - Ledger date: 2026-02-12
-- Evidence refresh UTC: 2026-02-18T19:04:52Z
+- Evidence refresh UTC: 2026-02-18T19:36:10Z
 - Baseline commit: `e896506f3c936c266a21fe556a107d37bd7075b5`
 - Definition of Done: every signal below is `GO`, and every gate is `GO`.
 

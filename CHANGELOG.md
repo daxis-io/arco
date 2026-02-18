@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Server-side SQL query endpoint at `/api/v1/query` backed by DataFusion (Arrow IPC or JSON output).
 
+## [0.1.1] - 2026-02-18
+### Added
+- Gate 1 release-discipline hardening: signed-tag checks, immutable release-evidence collection, and release-tag CI/SBOM enforcement artifacts.
+
 ## [0.1.0] - 2025-12-31
 ### Added
 - Initial published baseline for the catalog MVP audit.

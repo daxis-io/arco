@@ -141,37 +141,89 @@ groups:
             Phase: {{ $labels.phase }}
           runbook_url: "https://docs.arco.dev/runbooks/gc-failure"
 
-  - name: arco.flow-go-live
+  - name: arco.orchestration
     rules:
-      - alert: ArcoOrchCallback5xxRateHigh
-        expr: |
-          (
-            sum(rate(arco_orch_callbacks_total{result=~"5.."}[5m]))
-            /
-            clamp_min(sum(rate(arco_orch_callbacks_total[5m])), 1)
-          ) > 0.01
-          and
-          sum(rate(arco_orch_callbacks_total[5m])) > 0.2
+      - alert: ArcoOrchBacklogDepthHigh
+        expr: max by (lane) (arco_orch_backlog_depth) > 200
         for: 5m
         labels:
-          severity: critical
+          severity: warning
           service: arco-flow
         annotations:
-          summary: "Orchestration callback 5xx rate > 1%"
+          summary: "Orchestration backlog depth high (lane={{ $labels.lane }})"
           description: |
-            Callback 5xx rate is above 1% for 5 minutes with sufficient volume.
-            Investigate callback auth/validation and downstream ledger writes.
-          runbook_url: "https://docs.arco.dev/runbooks/high-task-failure-rate"
+            The orchestration backlog depth exceeded 200 in lane {{ $labels.lane }}.
+            Current depth: {{ $value | printf "%.0f" }}
+          runbook_url: "https://docs.arco.dev/runbooks/scheduler-not-progressing"
 
-      - alert: ArcoOrchCompactorStaleFenceRejects
-        expr: increase(arco_flow_orch_compactor_stale_fence_rejects_total[5m]) > 0
+      - alert: ArcoOrchCompactionLagHigh
+        expr: max(arco_orch_compaction_lag_seconds) > 30
         for: 5m
+        labels:
+          severity: warning
+          service: arco-flow
+        annotations:
+          summary: "Orchestration compaction lag high"
+          description: |
+            Compaction lag exceeded 30 seconds.
+            Current lag: {{ $value | printf "%.2f" }}s
+          runbook_url: "https://docs.arco.dev/runbooks/compactor-stuck"
+
+      - alert: ArcoOrchRunKeyConflictsDetected
+        expr: max(arco_orch_run_key_conflicts) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: arco-flow
+        annotations:
+          summary: "Run-key conflicts detected"
+          description: |
+            Durable run-key conflict rows are present.
+            Current count: {{ $value | printf "%.0f" }}
+          runbook_url: "https://docs.arco.dev/runbooks/scheduler-not-progressing"
+
+      - alert: ArcoOrchControllerReconcileP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(arco_orch_controller_reconcile_seconds_bucket[5m])) by (le, controller)
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+          service: arco-flow
+        annotations:
+          summary: "Controller reconcile p95 latency high (controller={{ $labels.controller }})"
+          description: |
+            Reconcile p95 latency exceeded 2s for controller {{ $labels.controller }}.
+            Current p95: {{ $value | printf "%.3f" }}s
+          runbook_url: "https://docs.arco.dev/runbooks/scheduler-not-progressing"
+
+      - alert: ArcoOrchSloObservedAboveTarget
+        expr: |
+          max by (slo) (arco_orch_slo_observed_seconds)
+          > on (slo)
+          max by (slo) (arco_orch_slo_target_seconds)
+        for: 5m
+        labels:
+          severity: warning
+          service: arco-flow
+        annotations:
+          summary: "Observed orchestration SLO exceeded target (slo={{ $labels.slo }})"
+          description: |
+            Observed SLO value is above target for {{ $labels.slo }}.
+            Current observed: {{ $value | printf "%.3f" }}s
+          runbook_url: "https://docs.arco.dev/runbooks/scheduler-not-progressing"
+
+      - alert: ArcoOrchSloBreachesIncreasing
+        expr: sum by (slo) (increase(arco_orch_slo_breaches_total[5m])) > 0
+        for: 1m
         labels:
           severity: critical
           service: arco-flow
         annotations:
-          summary: "Stale fence rejects detected in orchestration compactor"
+          summary: "Orchestration SLO breaches are increasing (slo={{ $labels.slo }})"
           description: |
-            Stale fencing rejects should be zero outside controlled game days.
-            Review lock ownership and competing compactor writers immediately.
-          runbook_url: "https://docs.arco.dev/runbooks/storage-integrity-verification"
+            Runtime SLO breach counter increased in the last 5 minutes for {{ $labels.slo }}.
+            Increase: {{ $value | printf "%.0f" }}
+          runbook_url: "https://docs.arco.dev/runbooks/scheduler-not-progressing"

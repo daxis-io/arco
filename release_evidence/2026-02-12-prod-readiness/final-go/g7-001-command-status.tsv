@@ -1,0 +1,8 @@
+signal	command	start_utc	end_utc	exit_code	log_path
+G7-001	bash -n scripts/deploy.sh	2026-02-15T18:25:08Z	2026-02-15T18:25:08Z	0	release_evidence/2026-02-12-prod-readiness/final-go/command-logs/20260215T182508Z_deploy_script_syntax.log
+G7-001	rg -n "update-traffic|TRAFFIC_TARGET|percent = 100|compactor-first|deploy" scripts/deploy.sh infra/terraform/cloud_run.tf	2026-02-15T18:25:08Z	2026-02-15T18:25:08Z	0	release_evidence/2026-02-12-prod-readiness/final-go/command-logs/20260215T182508Z_canary_hooks_scan.log
+G7-001	for t in gcloud terraform jq; do if command -v "$t" >/dev/null 2>&1; then echo "$t:present"; else echo "$t:missing"; fi; done	2026-02-15T18:25:09Z	2026-02-15T18:25:09Z	0	release_evidence/2026-02-12-prod-readiness/final-go/command-logs/20260215T182509Z_gcloud_terraform_tool_presence.log
+G7-001	test -f release_evidence/2026-02-12-prod-readiness/final-go/README.md	2026-02-15T18:25:09Z	2026-02-15T18:25:09Z	0	release_evidence/2026-02-12-prod-readiness/final-go/command-logs/20260215T182509Z_final_go_readme_presence.log
+G7-001	bash -n scripts/deploy.sh	2026-02-15T19:28:09Z	2026-02-15T19:28:09Z	0	release_evidence/2026-02-12-prod-readiness/final-go/command-logs/20260215T192809Z_deploy_script_syntax_refresh.log
+G7-001	gcloud auth print-access-token >/dev/null	2026-02-15T19:28:09Z	2026-02-15T19:28:11Z	1	release_evidence/2026-02-12-prod-readiness/final-go/command-logs/20260215T192809Z_gcloud_access_token_preflight.log
+G7-001	missing=0; for v in PROD_PROJECT_ID CANARY_SERVICE NEW_REVISION OLD_REVISION; do if [ -z "${!v:-}" ]; then echo "missing:$v"; missing=1; fi; done; exit $missing	2026-02-15T19:28:11Z	2026-02-15T19:28:11Z	1	release_evidence/2026-02-12-prod-readiness/final-go/command-logs/20260215T192811Z_canary_env_requirements_check.log

@@ -1,0 +1,6 @@
+# command: rg -n "credentials_json|secrets.GCP_SA_KEY_API|google-github-actions/auth" .github/workflows/ci.yml
+# start_utc: 2026-02-15T18:23:51Z
+277:          if [ -z "${{ secrets.GCP_SA_KEY_API }}" ] || [ -z "${{ vars.ARCO_BUCKET_DEV }}" ]; then
+285:        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v2
+287:          credentials_json: ${{ secrets.GCP_SA_KEY_API }}
+301:          echo "Skipping IAM smoke tests: missing secrets.GCP_SA_KEY_API or vars.ARCO_BUCKET_DEV"

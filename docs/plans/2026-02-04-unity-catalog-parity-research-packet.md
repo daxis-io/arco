@@ -294,15 +294,6 @@ This section turns the packet into an execution-ready program: lock the UC contr
 
 ### Milestones (recommended ordering)
 
-### Milestone status (2026-02-06)
-
-- ✅ M0 complete: pinned UC OSS `all.yaml` fixture + generated endpoint inventory committed.
-- ✅ M3 complete: `arco-uc` crate, router wiring, request context, UC error envelope, server mount config.
-- ✅ M4 complete: read-only discovery endpoints for catalogs/schemas/tables with pagination.
-- ✅ M5 complete (Scope-A): permissions endpoint + temporary table/path credentials + audit decisions.
-- ✅ M6 complete (Scope-A): `/delta/preview/commits` GET/POST with managed-table gates and coordinator-backed versioning.
-- ✅ M7 contract gate active: OpenAPI compliance test un-ignored and passing against pinned fixture.
-
 #### M0 — Pin the UC contract (prerequisite gate)
 
 **Deliverables**

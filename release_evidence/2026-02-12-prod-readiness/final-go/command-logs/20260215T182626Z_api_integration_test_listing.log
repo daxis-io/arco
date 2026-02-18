@@ -1,0 +1,45 @@
+# command: cargo test -p arco-api --test api_integration -- --list
+# start_utc: 2026-02-15T18:26:26Z
+   Compiling arco-api v0.1.0 (/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/crates/arco-api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.98s
+     Running tests/api_integration.rs (target/debug/deps/api_integration-b036dbdc414bbd84)
+browser::test_mint_urls_rejects_path_traversal: test
+browser::test_mint_urls_rejects_unknown_domain: test
+browser::test_mint_urls_ttl_bounded: test
+cross_cutting::test_cors_disabled_by_default: test
+cross_cutting::test_cors_headers_on_response: test
+cross_cutting::test_cors_preflight_request: test
+cross_cutting::test_cors_specific_origin_allows_matching_origin: test
+cross_cutting::test_cors_specific_origin_rejects_non_matching_origin: test
+cross_cutting::test_idempotency_key_accepted: test
+cross_cutting::test_missing_tenant_header_returns_401: test
+cross_cutting::test_missing_workspace_header_returns_401: test
+cross_cutting::test_production_mode_accepts_bearer_jwt: test
+cross_cutting::test_production_mode_accepts_rs256_jwt: test
+cross_cutting::test_production_mode_rejects_missing_audience_claim: test
+cross_cutting::test_production_mode_rejects_missing_issuer_claim: test
+cross_cutting::test_production_mode_rejects_missing_user_claim: test
+cross_cutting::test_production_mode_requires_authorization_header: test
+idempotency::test_create_namespace_conflict_on_different_payload: test
+idempotency::test_create_namespace_idempotent_replay: test
+idempotency::test_invalid_idempotency_key_rejected: test
+idempotency::test_register_table_idempotent_replay: test
+idempotency::test_uuidv4_idempotency_key_rejected: test
+lineage::test_lineage_edge_lifecycle: test
+lineage::test_lineage_edge_with_default_type: test
+manifests::test_manifest_deploy_get_list_idempotent: test
+namespaces::test_get_nonexistent_namespace_returns_404: test
+namespaces::test_namespace_crud_lifecycle: test
+orchestration::test_arco_flow_deploy_run_callbacks_and_logs: test
+orchestration::test_manual_sensor_evaluate_endpoint: test
+query::test_audit_emits_auth_allow_on_success: test
+query::test_audit_emits_auth_deny_on_missing_auth: test
+query::test_query_rejects_non_select: test
+query::test_query_returns_arrow_stream: test
+query::test_query_returns_json_format: test
+tables::test_register_table_in_nonexistent_namespace_returns_error: test
+tables::test_table_crud_lifecycle: test
+test_public_posture_blocks_metrics: test
+test_server_uses_provided_storage_backend: test
+
+38 tests, 0 benchmarks

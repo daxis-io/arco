@@ -27,7 +27,8 @@ use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
 use crate::orchestration_compaction::compact_orchestration_events;
 use crate::paths::{
-    MANIFEST_IDEMPOTENCY_PREFIX, MANIFEST_PREFIX, manifest_idempotency_path, manifest_path,
+    MANIFEST_IDEMPOTENCY_PREFIX, MANIFEST_LATEST_INDEX_PATH, MANIFEST_PREFIX,
+    manifest_idempotency_path, manifest_path,
 };
 use crate::server::AppState;
 use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
@@ -251,7 +252,6 @@ pub struct ListManifestsResponse {
 }
 
 const MAX_MANIFEST_BYTES: usize = 10 * 1024 * 1024;
-const MANIFEST_LATEST_INDEX_PATH: &str = "manifests/_index.json";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

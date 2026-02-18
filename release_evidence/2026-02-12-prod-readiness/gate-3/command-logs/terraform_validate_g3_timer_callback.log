@@ -1,0 +1,7 @@
+# command: terraform -chdir=infra/terraform validate
+# start_utc: 2026-02-14T04:43:16Z
+[32m[1mSuccess![0m The configuration is valid.
+[0m
+
+# exit_code: 0
+# end_utc: 2026-02-14T04:43:16Z

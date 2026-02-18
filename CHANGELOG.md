@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Server-side SQL query endpoint at `/api/v1/query` backed by DataFusion (Arrow IPC or JSON output).
 
+## [0.1.4] - 2026-02-18
+### Fixed
+- Release SBOM now verifies signed release tags against repository-pinned SSH allowed signers (`.github/release-signers.allowed`) to avoid external GitHub-key registration dependency.
+
 ## [0.1.3] - 2026-02-18
 ### Fixed
 - Release-tag signature verification now succeeds in GitHub-hosted SBOM workflow by using a verified tagger identity for signed release tags.

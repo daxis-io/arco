@@ -312,8 +312,7 @@ impl TaskTokenScopeMode {
     fn from_env() -> Self {
         let configured = std::env::var("ARCO_TASK_TOKEN_SCOPE_MODE")
             .ok()
-            .map(|v| v.to_ascii_lowercase())
-            .unwrap_or_else(|| "dual".to_string());
+            .map_or_else(|| "dual".to_string(), |v| v.to_ascii_lowercase());
 
         match configured.as_str() {
             "strict" => Self::Strict,
@@ -465,7 +464,7 @@ impl TaskTokenValidator for JwtTaskTokenValidator {
             if strict_scope && data.claims.iss.as_deref().is_none_or(str::is_empty) {
                 return Err("missing_iss_claim".to_string());
             }
-            if strict_scope && !aud_claim_present(&data.claims.aud) {
+            if strict_scope && !aud_claim_present(data.claims.aud.as_ref()) {
                 return Err("missing_aud_claim".to_string());
             }
 
@@ -654,7 +653,7 @@ fn header_value_to_string(value: &HeaderValue) -> Option<String> {
     value.to_str().ok().map(str::to_string)
 }
 
-fn aud_claim_present(aud: &Option<Value>) -> bool {
+fn aud_claim_present(aud: Option<&Value>) -> bool {
     match aud {
         Some(Value::String(value)) => !value.trim().is_empty(),
         Some(Value::Array(values)) => values
@@ -700,7 +699,7 @@ fn decode_task_claims(config: &JwtConfig, token: &str) -> Result<TaskTokenClaims
     if config.issuer.is_some() && claims.iss.as_deref().is_none_or(str::is_empty) {
         return Err("missing iss claim".to_string());
     }
-    if config.audience.is_some() && !aud_claim_present(&claims.aud) {
+    if config.audience.is_some() && !aud_claim_present(claims.aud.as_ref()) {
         return Err("missing aud claim".to_string());
     }
 

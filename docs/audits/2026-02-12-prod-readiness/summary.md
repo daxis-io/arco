@@ -1,7 +1,7 @@
 # Production Readiness Audit - Arco Daxis Prod GO
 
 - Audit date: 2026-02-12
-- Evidence refresh UTC: 2026-02-18T19:36:10Z
+- Evidence refresh UTC: 2026-02-18T20:17:17Z
 - Baseline commit: `e896506f3c936c266a21fe556a107d37bd7075b5`
 - Scope: all currently identified closure signals in the "Arco Daxis Production GO Closure Plan"
 - Definition of Done (locked): `ALL GATES GO`
@@ -13,7 +13,7 @@
 |---:|---|---|---:|---:|---|
 | 0 | Re-baseline / tracker integrity | GO | 4 | 0 | `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-matrix-status.tsv` |
 | 1 | Release discipline / provenance | GO | 4 | 0 | `release_evidence/2026-02-12-prod-readiness/gate-1/README.md` |
-| 2 | Storage / manifest / schema / invariants | GO | 7 | 0 | `docs/audits/2026-02-12-prod-readiness/findings/gate-2-findings.md` |
+| 2 | Storage / manifest / schema / invariants | GO | 7 | 0 | `release_evidence/2026-02-12-prod-readiness/gate-2/README.md` |
 | 3 | Layer-2 production blockers | GO | 7 | 0 | `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_projection_restart.log`, `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/test_g3_timer_callback_oidc.log`, `release_evidence/2026-02-12-prod-readiness/gate-3/command-logs/promtool_g3_orch_alert_drill.log` |
 | 4 | Deployment / observability / operations | PARTIAL | 0 | 6 | `release_evidence/2026-02-12-prod-readiness/gate-4/README.md` |
 | 5 | Performance / security / release readiness | NO-GO | 0 | 6 | `release_evidence/2026-02-12-prod-readiness/gate-5/README.md` |
@@ -40,6 +40,16 @@ Primary artifacts:
 - `release_evidence/2026-02-12-prod-readiness/gate-1/README.md`
 - `release_evidence/2026-02-12-prod-readiness/gate-1/verification-notes.md`
 - `release_evidence/2026-02-12-prod-readiness/gate-1/g1-004-sbom-retention-evidence.md`
+
+## Gate 2 Status
+
+Gate 2 remains `GO`; all seven signals (`G2-001..G2-007`) were re-verified with a dedicated lean evidence pack.
+
+Primary artifacts:
+- `release_evidence/2026-02-12-prod-readiness/gate-2/README.md`
+- `release_evidence/2026-02-12-prod-readiness/gate-2/g2-scope-checklist.md`
+- `release_evidence/2026-02-12-prod-readiness/gate-2/verification-notes.md`
+- `release_evidence/2026-02-12-prod-readiness/gate-2/command-matrix-status.tsv`
 
 ## Signals Closed In Batch 3
 
@@ -123,4 +133,5 @@ Primary artifacts:
 
 - Signal ledger: `docs/audits/2026-02-12-prod-readiness/signal-ledger.md`
 - Machine-checkable gate tracker: `docs/audits/2026-02-12-prod-readiness/gate-tracker.json`
+- Gate 2 evidence pack: `release_evidence/2026-02-12-prod-readiness/gate-2/README.md`
 - Gate 2 findings refresh: `docs/audits/2026-02-12-prod-readiness/findings/gate-2-findings.md`

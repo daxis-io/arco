@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
   "audit_date": "2026-02-12",
-  "generated_at_utc": "2026-02-18T19:36:10Z",
+  "generated_at_utc": "2026-02-18T20:17:17Z",
   "baseline_commit": "e896506f3c936c266a21fe556a107d37bd7075b5",
   "definition_of_done": "ALL_GATES_GO",
   "evidence_root": "release_evidence/2026-02-12-prod-readiness",
@@ -66,7 +66,7 @@
       "id": 2,
       "name": "Storage / manifest / schema / invariants",
       "status": "GO",
-      "status_reason": "All local/code-only Gate 2 signals are closed: non-catalog typed paths unified, hardcoded literals removed, deterministic/property invariants covered, failure-injection coverage expanded, and runbook checks refreshed.",
+      "status_reason": "All local/code-only Gate 2 signals are closed with refreshed lean evidence pack: typed paths are unified, hardcoded literals are absent in scoped modules, bounded search anti-entropy is enforced, schema/invariant/failure-injection tests pass, and runbook checks are current.",
       "required_signal_ids": [
         "G2-001",
         "G2-002",
@@ -77,8 +77,17 @@
         "G2-007"
       ],
       "evidence": [
-        "docs/audits/2026-02-12-prod-readiness/findings/gate-2-findings.md",
-        "release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-matrix-status.tsv"
+        "release_evidence/2026-02-12-prod-readiness/gate-2/README.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-2/g2-scope-checklist.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-2/g2-001-typed-path-builders-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-2/g2-002-hardcoded-path-literals-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-2/g2-003-search-anti-entropy-bounded-scan-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-2/g2-004-orchestration-golden-schema-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-2/g2-005-deterministic-property-invariants-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-2/g2-006-failure-injection-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-2/g2-007-runbook-operator-checks-evidence.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-2/verification-notes.md",
+        "release_evidence/2026-02-12-prod-readiness/gate-2/command-matrix-status.tsv"
       ]
     },
     {

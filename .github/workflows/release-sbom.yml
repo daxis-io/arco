@@ -65,60 +65,60 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ci_runs_api="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?event=push&per_page=100"
+          check_runs_api="https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${TAG_COMMIT_SHA}/check-runs?per_page=100"
           max_attempts=40
           sleep_seconds=15
 
           for attempt in $(seq 1 "${max_attempts}"); do
-            runs_payload="$(curl -fsSL \
+            checks_payload="$(curl -fsSL \
               -H "Authorization: Bearer ${GH_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
-              "${ci_runs_api}")"
+              "${check_runs_api}")"
 
-            mapfile -t run_ids < <(
-              jq -r --arg sha "${TAG_COMMIT_SHA}" '
-                .workflow_runs
-                | map(select(.head_sha == $sha))
-                | sort_by(.run_started_at // .created_at)
+            discipline_status="$(
+              jq -r '
+                .check_runs
+                | map(select(.name == "Release Tag Discipline"))
+                | sort_by(.started_at // .completed_at // .created_at)
                 | reverse
-                | .[].id
-              ' <<<"${runs_payload}"
-            )
+                | (.[0].status // "")
+              ' <<<"${checks_payload}"
+            )"
+            discipline_conclusion="$(
+              jq -r '
+                .check_runs
+                | map(select(.name == "Release Tag Discipline"))
+                | sort_by(.started_at // .completed_at // .created_at)
+                | reverse
+                | (.[0].conclusion // "")
+              ' <<<"${checks_payload}"
+            )"
+            discipline_url="$(
+              jq -r '
+                .check_runs
+                | map(select(.name == "Release Tag Discipline"))
+                | sort_by(.started_at // .completed_at // .created_at)
+                | reverse
+                | (.[0].details_url // "")
+              ' <<<"${checks_payload}"
+            )"
 
-            found_success="false"
-            for run_id in "${run_ids[@]}"; do
-              jobs_payload="$(curl -fsSL \
-                -H "Authorization: Bearer ${GH_TOKEN}" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?per_page=100")"
-
-              discipline_conclusion="$(
-                jq -r '.jobs[] | select(.name == "Release Tag Discipline") | .conclusion // empty' <<<"${jobs_payload}" \
-                  | head -n 1
-              )"
-
-              if [ "${discipline_conclusion}" = "success" ]; then
-                echo "release-tag discipline passed in CI run ${run_id}"
-                found_success="true"
-                break
-              fi
-
-              if [ "${discipline_conclusion}" = "failure" ] || [ "${discipline_conclusion}" = "cancelled" ] || [ "${discipline_conclusion}" = "timed_out" ] || [ "${discipline_conclusion}" = "action_required" ]; then
-                echo "release-tag discipline failed in CI run ${run_id} (${discipline_conclusion})" >&2
-                exit 1
-              fi
-            done
-
-            if [ "${found_success}" = "true" ]; then
+            if [ "${discipline_status}" = "completed" ] && [ "${discipline_conclusion}" = "success" ]; then
+              echo "release-tag discipline passed: ${discipline_url}"
               break
             fi
 
-            if [ "${attempt}" -eq "${max_attempts}" ]; then
-              echo "timed out waiting for successful release-tag discipline CI run for commit ${TAG_COMMIT_SHA}" >&2
+            if [ "${discipline_status}" = "completed" ] && [ -n "${discipline_conclusion}" ] && [ "${discipline_conclusion}" != "success" ]; then
+              echo "release-tag discipline check failed (${discipline_conclusion}): ${discipline_url}" >&2
               exit 1
             fi
 
-            echo "attempt ${attempt}/${max_attempts}: waiting for release-tag discipline CI success..."
+            if [ "${attempt}" -eq "${max_attempts}" ]; then
+              echo "timed out waiting for successful release-tag discipline check-run for commit ${TAG_COMMIT_SHA}" >&2
+              exit 1
+            fi
+
+            echo "attempt ${attempt}/${max_attempts}: waiting for release-tag discipline check-run success..."
             sleep "${sleep_seconds}"
           done
 

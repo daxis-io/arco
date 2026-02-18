@@ -1,0 +1,3 @@
+59:- No credentials in code or configuration files
+60:- Secrets managed through environment variables or secret managers
+77:3. Rotate credentials regularly

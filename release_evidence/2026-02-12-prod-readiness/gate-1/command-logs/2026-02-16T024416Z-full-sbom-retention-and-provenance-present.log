@@ -1,0 +1,7 @@
+21:  SBOM_RETENTION_DAYS: 90
+50:        run: bash tools/check-release-tag-discipline.sh --tag "${RELEASE_TAG}"
+52:      - name: Validate annotated signed release tag
+86:          retention-days: ${{ env.SBOM_RETENTION_DAYS }}
+95:        uses: actions/attest-build-provenance@v3
+103:        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+124:          retention-days: ${{ env.SBOM_RETENTION_DAYS }}

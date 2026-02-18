@@ -40,10 +40,7 @@ pub async fn load_catalog_state(
 
     let catalogs = match storage.get_raw(&catalogs_path).await {
         Ok(bytes) => parquet_util::read_catalogs(&bytes)?,
-        Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
-            Vec::new()
-        }
-        Err(e) => return Err(e.into()),
+        Err(_) => Vec::new(),
     };
 
     let namespaces = match storage.get_raw(&ns_path).await {

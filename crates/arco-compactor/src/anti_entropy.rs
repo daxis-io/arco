@@ -355,10 +355,6 @@ impl AntiEntropyJob {
 
         self.load_cursor().await?;
 
-        if domain == CatalogDomain::Search {
-            return self.run_search_rebuild(start).await;
-        }
-
         let watermark = self.read_domain_watermark(domain).await?;
 
         let prefix = CatalogPaths::ledger_dir(domain);
@@ -499,68 +495,25 @@ impl AntiEntropyJob {
                     last_compaction_at: Some(manifest.updated_at),
                 })
             }
-            CatalogDomain::Search => Err(AntiEntropyError::NotImplemented {
-                message: "search anti-entropy is derived from catalog compaction".to_string(),
-            }),
-        }
-    }
-
-    async fn run_search_rebuild(
-        &mut self,
-        start: Instant,
-    ) -> Result<AntiEntropyResult, AntiEntropyError> {
-        let root = self.read_root_manifest().await?;
-
-        let catalog_bytes = self
-            .storage
-            .get_raw(&root.catalog_manifest_path)
-            .await
-            .map_err(|e| AntiEntropyError::WatermarkError {
-                message: format!("failed to read catalog manifest: {e}"),
-            })?;
-        let catalog_manifest: CatalogDomainManifest = serde_json::from_slice(&catalog_bytes)
-            .map_err(|e| AntiEntropyError::WatermarkError {
-                message: format!("failed to parse catalog manifest: {e}"),
-            })?;
-
-        let search_bytes = self
-            .storage
-            .get_raw(&root.search_manifest_path)
-            .await
-            .map_err(|e| AntiEntropyError::WatermarkError {
-                message: format!("failed to read search manifest: {e}"),
-            })?;
-        let search_manifest: SearchManifest =
-            serde_json::from_slice(&search_bytes).map_err(|e| {
-                AntiEntropyError::WatermarkError {
-                    message: format!("failed to parse search manifest: {e}"),
-                }
-            })?;
-
-        let mut missed_paths = Vec::new();
-
-        if let Some(catalog_watermark) = catalog_manifest.watermark_event_id.as_ref() {
-            if search_manifest.watermark_event_id.as_deref() != Some(catalog_watermark) {
-                missed_paths.push(CatalogPaths::ledger_event(
-                    CatalogDomain::Search,
-                    catalog_watermark,
-                ));
-                self.enqueue_for_reprocessing(&missed_paths).await?;
+            CatalogDomain::Search => {
+                let data = self
+                    .storage
+                    .get_raw(&root.search_manifest_path)
+                    .await
+                    .map_err(|e| AntiEntropyError::WatermarkError {
+                        message: format!("failed to read search manifest: {e}"),
+                    })?;
+                let manifest: SearchManifest = serde_json::from_slice(&data).map_err(|e| {
+                    AntiEntropyError::WatermarkError {
+                        message: format!("failed to parse search manifest: {e}"),
+                    }
+                })?;
+                Ok(DomainWatermark {
+                    watermark_event_id: manifest.watermark_event_id.clone(),
+                    last_compaction_at: Some(manifest.updated_at),
+                })
             }
         }
-
-        self.cursor.complete_scan();
-        self.save_cursor().await?;
-
-        let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-        Ok(AntiEntropyResult {
-            objects_scanned: 0,
-            missed_events: missed_paths.len(),
-            scan_complete: true,
-            missed_paths,
-            duration_ms,
-        })
     }
 
     async fn read_root_manifest(&self) -> Result<RootManifest, AntiEntropyError> {
@@ -863,6 +816,64 @@ mod tests {
         assert_eq!(result.objects_scanned, 0);
         assert_eq!(result.missed_events, 0);
         assert!(result.scan_complete);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_search_anti_entropy_uses_bounded_scan_cursor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let storage = test_storage();
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await?;
+
+        storage
+            .put_raw(
+                "ledger/search/2025-01-01/evt-a.json",
+                Bytes::from_static(br#"{"event":"a"}"#),
+                WritePrecondition::None,
+            )
+            .await?;
+        storage
+            .put_raw(
+                "ledger/search/2025-01-01/evt-b.json",
+                Bytes::from_static(br#"{"event":"b"}"#),
+                WritePrecondition::None,
+            )
+            .await?;
+
+        let search_manifest_path = CatalogPaths::domain_manifest(CatalogDomain::Search);
+        let search_manifest_bytes = storage.get_raw(&search_manifest_path).await?;
+        let mut search_manifest: SearchManifest = serde_json::from_slice(&search_manifest_bytes)?;
+        search_manifest.watermark_event_id = Some("zzzz".to_string());
+        search_manifest.updated_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        storage
+            .put_raw(
+                &search_manifest_path,
+                Bytes::from(serde_json::to_vec(&search_manifest)?),
+                WritePrecondition::None,
+            )
+            .await?;
+
+        let config = AntiEntropyConfig {
+            domain: "search".to_string(),
+            tenant_id: "acme".to_string(),
+            workspace_id: "prod".to_string(),
+            max_objects_per_run: 1,
+            ..Default::default()
+        };
+
+        let mut job = AntiEntropyJob::new(storage, config);
+
+        let first = job.run_pass().await?;
+        assert_eq!(first.objects_scanned, 1);
+        assert_eq!(first.missed_events, 0);
+        assert!(!first.scan_complete);
+
+        let second = job.run_pass().await?;
+        assert_eq!(second.objects_scanned, 1);
+        assert_eq!(second.missed_events, 0);
+        assert!(second.scan_complete);
 
         Ok(())
     }

@@ -1,0 +1,80 @@
+[2026-02-15T20:19:18Z] STEP=matrix-namespaces-suite
+COMMAND: cargo test -p arco-iceberg routes::namespaces::tests
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/lib.rs (target/debug/deps/arco_iceberg-e8ba795044fcb37d)
+
+running 23 tests
+test routes::namespaces::tests::test_delete_namespace_disabled ... ok
+test routes::namespaces::tests::test_delete_namespace_not_found ... ok
+test routes::namespaces::tests::test_head_namespace_not_found ... ok
+test routes::namespaces::tests::test_get_namespace_non_existent_returns_404 ... ok
+test routes::namespaces::tests::test_create_namespace_disabled ... ok
+test routes::namespaces::tests::test_list_namespaces_empty_catalog_returns_empty_list ... ok
+test routes::namespaces::tests::test_list_namespaces_invalid_page_token_returns_400 ... ok
+test routes::namespaces::tests::test_create_namespace ... ok
+test routes::namespaces::tests::test_head_namespace_exists_returns_no_content_without_body ... ok
+test routes::namespaces::tests::test_get_namespace_existing_returns_properties ... ok
+test routes::namespaces::tests::test_list_namespaces_parent_not_found_returns_404 ... ok
+test routes::namespaces::tests::test_get_namespace_identifier_is_url_decoded ... ok
+test routes::namespaces::tests::test_get_namespace_nested_identifier_decodes_separator ... ok
+test routes::namespaces::tests::test_list_namespaces_page_token_out_of_range_returns_400 ... ok
+test routes::namespaces::tests::test_list_namespaces_page_size_zero_returns_400 ... ok
+test routes::namespaces::tests::test_create_namespace_already_exists ... ok
+test routes::namespaces::tests::test_update_properties_overlap_returns_422 ... ok
+test routes::namespaces::tests::test_update_properties_unknown_keys_in_missing ... ok
+test routes::namespaces::tests::test_delete_namespace ... ok
+test routes::namespaces::tests::test_list_namespaces_returns_namespaces_from_catalog ... ok
+test routes::namespaces::tests::test_list_namespaces_pagination_with_page_token_and_size ... ok
+test routes::namespaces::tests::test_update_properties_persists_comment ... ok
+test routes::namespaces::tests::test_list_namespaces_parent_filtering ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 270 filtered out; finished in 0.02s
+
+     Running tests/audit_wiring.rs (target/debug/deps/audit_wiring-1969b3328aeb0790)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/commit_flow.rs (target/debug/deps/commit_flow-3d39c5baa77b9e4a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+     Running tests/config_integration.rs (target/debug/deps/config_integration-ddc875d8ecd2f3b4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/crate_structure.rs (target/debug/deps/crate_structure-2c24619802f607c7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/credential_vending.rs (target/debug/deps/credential_vending-24742a3f5c670352)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/openapi_compliance.rs (target/debug/deps/openapi_compliance-a888dad97dcdd014)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/reconciliation_tests.rs (target/debug/deps/reconciliation_tests-c04d884ca55d43b8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/roundtrip.rs (target/debug/deps/roundtrip-1f261952e6343c4e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+

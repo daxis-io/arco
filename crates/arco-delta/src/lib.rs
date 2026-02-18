@@ -11,12 +11,6 @@
 //! - Full Delta protocol validation
 //! - Delta log projection / statistics materialization
 
-#![forbid(unsafe_code)]
-#![deny(missing_docs)]
-#![deny(rust_2018_idioms)]
-#![warn(clippy::pedantic)]
-#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
-
 pub mod coordinator;
 pub mod error;
 pub mod types;

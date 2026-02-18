@@ -6,9 +6,19 @@
 #![cfg(feature = "test-utils")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use proptest::prelude::*;
+use std::collections::HashMap;
+use std::sync::Arc;
 
-use arco_core::{AssetId, TaskId};
+use bytes::Bytes;
+use chrono::{TimeZone, Utc};
+use proptest::prelude::*;
+use tokio_test::block_on;
+
+use arco_core::{AssetId, FlowPaths, MemoryBackend, ScopedStorage, TaskId, WritePrecondition};
+use arco_flow::orchestration::compactor::MicroCompactor;
+use arco_flow::orchestration::events::{
+    OrchestrationEvent, OrchestrationEventData, TaskDef, TaskOutcome, TriggerInfo,
+};
 use arco_flow::plan::{AssetKey, PlanBuilder, ResourceRequirements, TaskSpec};
 use arco_flow::run::RunState;
 use arco_flow::task::TaskState;
@@ -65,6 +75,178 @@ fn arb_materialization_event() -> impl Strategy<Value = (String, String, i64, i6
         "[A-Z0-9]{26}",    // ULID-like asset_id
         0i64..1_000_000,   // row_count
         0i64..100_000_000, // byte_size
+    )
+}
+
+fn orchestration_invariant_events() -> Vec<OrchestrationEvent> {
+    let run_id = "run-prop-01";
+    let plan_id = "plan-prop-01";
+    let timestamp = Utc.with_ymd_and_hms(2025, 1, 15, 0, 0, 0).unwrap();
+
+    let mut run_triggered = OrchestrationEvent::new_with_timestamp(
+        "tenant",
+        "workspace",
+        OrchestrationEventData::RunTriggered {
+            run_id: run_id.to_string(),
+            plan_id: plan_id.to_string(),
+            trigger: TriggerInfo::Manual {
+                user_id: "tester@example.com".to_string(),
+            },
+            root_assets: vec!["analytics.daily".to_string()],
+            run_key: None,
+            labels: HashMap::new(),
+            code_version: None,
+        },
+        timestamp,
+    );
+    run_triggered.event_id = "01HX0000000000000000000001".to_string();
+
+    let mut plan_created = OrchestrationEvent::new_with_timestamp(
+        "tenant",
+        "workspace",
+        OrchestrationEventData::PlanCreated {
+            run_id: run_id.to_string(),
+            plan_id: plan_id.to_string(),
+            tasks: vec![TaskDef {
+                key: "extract".to_string(),
+                depends_on: vec![],
+                asset_key: None,
+                partition_key: None,
+                max_attempts: 3,
+                heartbeat_timeout_sec: 60,
+            }],
+        },
+        timestamp,
+    );
+    plan_created.event_id = "01HX0000000000000000000002".to_string();
+
+    let mut task_started = OrchestrationEvent::new_with_timestamp(
+        "tenant",
+        "workspace",
+        OrchestrationEventData::TaskStarted {
+            run_id: run_id.to_string(),
+            task_key: "extract".to_string(),
+            attempt: 1,
+            attempt_id: "attempt-01".to_string(),
+            worker_id: "worker-1".to_string(),
+        },
+        timestamp,
+    );
+    task_started.event_id = "01HX0000000000000000000003".to_string();
+
+    let mut task_finished = OrchestrationEvent::new_with_timestamp(
+        "tenant",
+        "workspace",
+        OrchestrationEventData::TaskFinished {
+            run_id: run_id.to_string(),
+            task_key: "extract".to_string(),
+            attempt: 1,
+            attempt_id: "attempt-01".to_string(),
+            worker_id: "worker-1".to_string(),
+            outcome: TaskOutcome::Succeeded,
+            materialization_id: None,
+            error_message: None,
+            output: None,
+            error: None,
+            metrics: None,
+            cancelled_during_phase: None,
+            partial_progress: None,
+            asset_key: None,
+            partition_key: None,
+            code_version: None,
+        },
+        timestamp,
+    );
+    task_finished.event_id = "01HX0000000000000000000004".to_string();
+
+    vec![run_triggered, plan_created, task_started, task_finished]
+}
+
+async fn compact_signature_for_path_order(path_order: &[usize]) -> (usize, usize, usize, usize) {
+    let events = orchestration_invariant_events();
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("scoped storage");
+
+    let mut paths = Vec::with_capacity(events.len());
+    for event in &events {
+        let path = FlowPaths::orchestration_event_path("2025-01-15", &event.event_id);
+        storage
+            .put_raw(
+                &path,
+                Bytes::from(serde_json::to_string(event).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("persist event");
+        paths.push(path);
+    }
+
+    let ordered_paths: Vec<String> = path_order
+        .iter()
+        .map(|index| paths[*index].clone())
+        .collect();
+
+    MicroCompactor::new(storage.clone())
+        .compact_events(ordered_paths)
+        .await
+        .expect("compact events");
+
+    let (_, state) = MicroCompactor::new(storage)
+        .load_state()
+        .await
+        .expect("load state");
+    (
+        state.runs.len(),
+        state.tasks.len(),
+        state.dep_satisfaction.len(),
+        state.idempotency_keys.len(),
+    )
+}
+
+async fn crash_replay_signature(split_index: usize) -> (usize, usize, usize, usize) {
+    let events = orchestration_invariant_events();
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("scoped storage");
+
+    let mut paths = Vec::with_capacity(events.len());
+    for event in &events {
+        let path = FlowPaths::orchestration_event_path("2025-01-15", &event.event_id);
+        storage
+            .put_raw(
+                &path,
+                Bytes::from(serde_json::to_string(event).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("persist event");
+        paths.push(path);
+    }
+
+    let split = split_index.min(paths.len());
+    let prefix = paths[..split].to_vec();
+    let full_replay = paths.clone();
+
+    if !prefix.is_empty() {
+        MicroCompactor::new(storage.clone())
+            .compact_events(prefix)
+            .await
+            .expect("prefix compact");
+    }
+
+    MicroCompactor::new(storage.clone())
+        .compact_events(full_replay)
+        .await
+        .expect("full replay compact");
+
+    let (_, state) = MicroCompactor::new(storage)
+        .load_state()
+        .await
+        .expect("load state");
+    (
+        state.runs.len(),
+        state.tasks.len(),
+        state.dep_satisfaction.len(),
+        state.idempotency_keys.len(),
     )
 }
 
@@ -368,5 +550,34 @@ proptest! {
                 ts1, ts2
             );
         }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    #[test]
+    fn compaction_is_out_of_order_and_duplicate_invariant(
+        mut replay_order in proptest::collection::vec(0usize..4, 4..12)
+    ) {
+        for index in 0..4 {
+            if !replay_order.contains(&index) {
+                replay_order.push(index);
+            }
+        }
+
+        let canonical_order = vec![0, 1, 2, 3];
+        let canonical = block_on(compact_signature_for_path_order(&canonical_order));
+        let replayed = block_on(compact_signature_for_path_order(&replay_order));
+
+        prop_assert_eq!(canonical, replayed);
+    }
+
+    #[test]
+    fn compaction_crash_replay_converges_to_single_pass_state(split_index in 0usize..4) {
+        let canonical = block_on(compact_signature_for_path_order(&[0, 1, 2, 3]));
+        let recovered = block_on(crash_replay_signature(split_index));
+
+        prop_assert_eq!(canonical, recovered);
     }
 }

@@ -1,0 +1,56 @@
+{
+  "name": "timers",
+  "version": 1,
+  "fields": [
+    {
+      "name": "timer_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "cloud_task_id",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "timer_type",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "run_id",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "task_key",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "attempt",
+      "data_type": "UInt32",
+      "nullable": true
+    },
+    {
+      "name": "fire_at",
+      "data_type": "Int64",
+      "nullable": false
+    },
+    {
+      "name": "state",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "payload",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "row_version",
+      "data_type": "Utf8",
+      "nullable": false
+    }
+  ]
+}

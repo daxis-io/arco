@@ -1,0 +1,38 @@
+rule_files:
+  - /Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/infra/monitoring/alerts.yaml
+evaluation_interval: 1m
+tests:
+  - name: g3_orch_alerts_fire_with_controlled_signal
+    interval: 1m
+    input_series:
+      - series: 'arco_orch_backlog_depth{lane="timers"}'
+        values: '10 210 210 210 210 210 210 210 210 210'
+      - series: 'arco_orch_slo_breaches_total{slo="compaction_lag_p95"}'
+        values: '0 0 0 0 0 1 2 3 4 5'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: ArcoOrchBacklogDepthHigh
+        exp_alerts:
+          - exp_labels:
+              lane: timers
+              severity: warning
+              service: arco-flow
+            exp_annotations:
+              summary: "Orchestration backlog depth high (lane=timers)"
+              description: |
+                The orchestration backlog depth exceeded 200 in lane timers.
+                Current depth: 210
+              runbook_url: "https://docs.arco.dev/runbooks/scheduler-not-progressing"
+      - eval_time: 8m
+        alertname: ArcoOrchSloBreachesIncreasing
+        exp_alerts:
+          - exp_labels:
+              slo: compaction_lag_p95
+              severity: critical
+              service: arco-flow
+            exp_annotations:
+              summary: "Orchestration SLO breaches are increasing (slo=compaction_lag_p95)"
+              description: |
+                Runtime SLO breach counter increased in the last 5 minutes for compaction_lag_p95.
+                Increase: 4
+              runbook_url: "https://docs.arco.dev/runbooks/scheduler-not-progressing"

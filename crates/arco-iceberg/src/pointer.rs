@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use arco_core::IcebergPaths;
 use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
 
 use crate::error::{IcebergError, IcebergResult};
@@ -579,13 +580,8 @@ impl<S: StorageBackend> PointerStore for PointerStoreImpl<S> {
 
         let mut uuids = Vec::new();
         for entry in entries {
-            // Extract UUID from path like "_catalog/iceberg_pointers/{uuid}.json"
-            if let Some(filename) = entry.path.strip_prefix(&prefix) {
-                if let Some(uuid_str) = filename.strip_suffix(".json") {
-                    if let Ok(uuid) = Uuid::parse_str(uuid_str) {
-                        uuids.push(uuid);
-                    }
-                }
+            if let Some(uuid) = IcebergPaths::pointer_uuid_from_path(&entry.path) {
+                uuids.push(uuid);
             }
         }
 
@@ -791,6 +787,72 @@ mod tests {
             .await
             .expect("cas");
         assert!(matches!(result, CasResult::Conflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_pointer_store_cas_race_has_single_winner() {
+        use arco_core::storage::MemoryBackend;
+        use tokio::sync::Barrier;
+
+        let storage = Arc::new(MemoryBackend::new());
+        let store = Arc::new(PointerStoreImpl::new(storage));
+
+        let table_uuid = Uuid::new_v4();
+        let pointer =
+            IcebergTablePointer::new(table_uuid, "gs://bucket/metadata/00000.json".to_string());
+
+        let created = store.create(&table_uuid, &pointer).await.expect("create");
+        let CasResult::Success { new_version } = created else {
+            panic!("expected initial create success");
+        };
+
+        let mut update_a = pointer.clone();
+        update_a.current_metadata_location = "gs://bucket/metadata/00001-a.json".to_string();
+
+        let mut update_b = pointer.clone();
+        update_b.current_metadata_location = "gs://bucket/metadata/00001-b.json".to_string();
+
+        let barrier = Arc::new(Barrier::new(3));
+
+        let store_a = Arc::clone(&store);
+        let barrier_a = Arc::clone(&barrier);
+        let table_uuid_a = table_uuid;
+        let version_a = new_version.clone();
+        let handle_a = tokio::spawn(async move {
+            barrier_a.wait().await;
+            store_a
+                .compare_and_swap(&table_uuid_a, &version_a, &update_a)
+                .await
+        });
+
+        let store_b = Arc::clone(&store);
+        let barrier_b = Arc::clone(&barrier);
+        let table_uuid_b = table_uuid;
+        let version_b = new_version.clone();
+        let handle_b = tokio::spawn(async move {
+            barrier_b.wait().await;
+            store_b
+                .compare_and_swap(&table_uuid_b, &version_b, &update_b)
+                .await
+        });
+
+        barrier.wait().await;
+
+        let result_a = handle_a.await.expect("join a").expect("cas a");
+        let result_b = handle_b.await.expect("join b").expect("cas b");
+
+        let outcomes = [result_a, result_b];
+        let success_count = outcomes
+            .iter()
+            .filter(|result| matches!(result, CasResult::Success { .. }))
+            .count();
+        let conflict_count = outcomes
+            .iter()
+            .filter(|result| matches!(result, CasResult::Conflict { .. }))
+            .count();
+
+        assert_eq!(success_count, 1, "exactly one CAS winner is required");
+        assert_eq!(conflict_count, 1, "losing CAS attempt must conflict");
     }
 
     #[tokio::test]

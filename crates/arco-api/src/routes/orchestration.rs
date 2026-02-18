@@ -37,7 +37,10 @@ use utoipa::{IntoParams, ToSchema};
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
 use crate::orchestration_compaction::compact_orchestration_events;
-use crate::paths::{MANIFEST_IDEMPOTENCY_PREFIX, MANIFEST_PREFIX, backfill_idempotency_path};
+use crate::paths::{
+    MANIFEST_IDEMPOTENCY_PREFIX, MANIFEST_LATEST_INDEX_PATH, MANIFEST_PREFIX,
+    backfill_idempotency_path,
+};
 use crate::routes::manifests::StoredManifest;
 use crate::server::AppState;
 use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
@@ -602,6 +605,20 @@ pub enum SensorEvalStatusResponse {
     SkippedStaleCursor,
 }
 
+/// Sensor evaluation status filter (query parameter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SensorEvalStatusFilter {
+    /// Sensor triggered one or more runs.
+    Triggered,
+    /// Sensor evaluated but no new data found.
+    NoNewData,
+    /// Sensor evaluation failed.
+    Error,
+    /// Sensor evaluation was skipped due to stale cursor (CAS failed).
+    SkippedStaleCursor,
+}
+
 /// Run request returned from sensor evaluation.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -745,6 +762,22 @@ pub struct ListTicksQuery {
     pub status: Option<TickStatusResponse>,
 }
 
+/// Query parameters for listing sensor evaluations.
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSensorEvalsQuery {
+    /// Maximum evaluations to return.
+    pub limit: Option<u32>,
+    /// Cursor for pagination.
+    pub cursor: Option<String>,
+    /// Filter evaluations after this timestamp (inclusive).
+    pub since: Option<DateTime<Utc>>,
+    /// Filter evaluations before this timestamp (inclusive).
+    pub until: Option<DateTime<Utc>>,
+    /// Filter by evaluation status.
+    pub status: Option<SensorEvalStatusFilter>,
+}
+
 // ============================================================================
 // Sensor API Types
 // ============================================================================
@@ -880,21 +913,9 @@ pub enum PartitionSelectorRequest {
     },
     /// Filter-based selection.
     Filter {
-        /// Filter expressions.
+        /// Filter bounds. Supported keys: `start`, `end`, `partition_start`, `partition_end`.
         filters: HashMap<String, String>,
     },
-}
-
-/// Error response for unsupported partition selectors.
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct UnprocessableEntityResponse {
-    /// Error category.
-    pub error: String,
-    /// Human-readable error message.
-    pub message: String,
-    /// Stable error code.
-    pub code: String,
 }
 
 /// Backfill response.
@@ -939,7 +960,7 @@ pub enum PartitionSelectorResponse {
     },
     /// Filter-based selection.
     Filter {
-        /// Filter expressions.
+        /// Filter bounds (`start`/`end`) captured on the backfill.
         filters: HashMap<String, String>,
     },
 }
@@ -1154,8 +1175,6 @@ fn ensure_workspace(ctx: &RequestContext, workspace_id: &str) -> Result<(), ApiE
     }
     Ok(())
 }
-
-const MANIFEST_LATEST_INDEX_PATH: &str = "manifests/_index.json";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1812,6 +1831,43 @@ struct BackfillIdempotencyRecord {
 #[serde(rename_all = "camelCase")]
 struct BackfillFingerprintPayload {
     asset_selection: Vec<String>,
+    partition_selector: BackfillFingerprintPartitionSelector,
+    chunk_size: u32,
+    max_concurrent_runs: u32,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum BackfillFingerprintPartitionSelector {
+    Range { start: String, end: String },
+    Explicit { partition_keys: Vec<String> },
+    Filter { filters: BTreeMap<String, String> },
+}
+
+impl From<&PartitionSelector> for BackfillFingerprintPartitionSelector {
+    fn from(selector: &PartitionSelector) -> Self {
+        match selector {
+            PartitionSelector::Range { start, end } => Self::Range {
+                start: start.clone(),
+                end: end.clone(),
+            },
+            PartitionSelector::Explicit { partition_keys } => Self::Explicit {
+                partition_keys: partition_keys.clone(),
+            },
+            PartitionSelector::Filter { filters } => Self::Filter {
+                filters: filters
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyBackfillFingerprintPayload {
+    asset_selection: Vec<String>,
     partitions: Vec<String>,
     chunk_size: u32,
     max_concurrent_runs: u32,
@@ -1820,20 +1876,20 @@ struct BackfillFingerprintPayload {
 struct BackfillCreateInput {
     asset_selection: Vec<String>,
     partition_selector: PartitionSelector,
-    partition_keys: Vec<String>,
+    total_partitions: u32,
     chunk_size: u32,
     max_concurrent_runs: u32,
 }
 
 fn compute_backfill_fingerprint(
     asset_selection: &[String],
-    partitions: &[String],
+    partition_selector: &PartitionSelector,
     chunk_size: u32,
     max_concurrent_runs: u32,
 ) -> Result<String, ApiError> {
     let payload = BackfillFingerprintPayload {
         asset_selection: asset_selection.to_vec(),
-        partitions: partitions.to_vec(),
+        partition_selector: partition_selector.into(),
         chunk_size,
         max_concurrent_runs,
     };
@@ -1842,6 +1898,30 @@ fn compute_backfill_fingerprint(
     })?;
     let hash = Sha256::digest(&json);
     Ok(hex::encode(hash))
+}
+
+fn compute_legacy_backfill_fingerprint(
+    asset_selection: &[String],
+    partition_selector: &PartitionSelector,
+    chunk_size: u32,
+    max_concurrent_runs: u32,
+) -> Result<Option<String>, ApiError> {
+    let PartitionSelector::Explicit { partition_keys } = partition_selector else {
+        return Ok(None);
+    };
+    let payload = LegacyBackfillFingerprintPayload {
+        asset_selection: asset_selection.to_vec(),
+        partitions: partition_keys.clone(),
+        chunk_size,
+        max_concurrent_runs,
+    };
+    let json = serde_json::to_vec(&payload).map_err(|e| {
+        ApiError::internal(format!(
+            "failed to serialize legacy backfill fingerprint: {e}"
+        ))
+    })?;
+    let hash = Sha256::digest(&json);
+    Ok(Some(hex::encode(hash)))
 }
 
 async fn load_backfill_idempotency_record(
@@ -1867,7 +1947,7 @@ async fn load_backfill_idempotency_record(
 async fn store_backfill_idempotency_record(
     storage: &ScopedStorage,
     record: &BackfillIdempotencyRecord,
-) -> Result<(), ApiError> {
+) -> Result<WriteResult, ApiError> {
     let record_json = serde_json::to_string(record).map_err(|e| {
         ApiError::internal(format!(
             "failed to serialize backfill idempotency record: {e}"
@@ -1893,32 +1973,117 @@ async fn store_backfill_idempotency_record(
         );
     }
 
-    Ok(())
+    Ok(result)
 }
 
-fn explicit_partition_selector(
-    partitions: Vec<String>,
-) -> Result<(PartitionSelector, Vec<String>), ApiError> {
-    if partitions.is_empty() {
-        return Err(ApiError::bad_request("partition selector cannot be empty"));
-    }
-    if partitions.iter().any(String::is_empty) {
-        return Err(ApiError::bad_request("partition key cannot be empty"));
-    }
+fn parse_partition_bound_date(raw: &str) -> Result<NaiveDate, ApiError> {
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .map_err(|_| ApiError::bad_request("partition selector bounds must use YYYY-MM-DD"))
+}
 
+fn normalize_partition_bounds(start: &str, end: &str) -> Result<(String, String), ApiError> {
+    let start_date = parse_partition_bound_date(start)?;
+    let end_date = parse_partition_bound_date(end)?;
+    if start_date > end_date {
+        return Err(ApiError::bad_request(
+            "partition selector start must be less than or equal to end",
+        ));
+    }
     Ok((
-        PartitionSelector::Explicit {
-            partition_keys: partitions.clone(),
-        },
-        partitions,
+        start_date.format("%Y-%m-%d").to_string(),
+        end_date.format("%Y-%m-%d").to_string(),
     ))
 }
 
-fn unsupported_partition_selector_response() -> UnprocessableEntityResponse {
-    UnprocessableEntityResponse {
-        error: "unprocessable_entity".to_string(),
-        code: "PARTITION_SELECTOR_NOT_SUPPORTED".to_string(),
-        message: "Only explicit partition lists are supported. Range and filter selectors require a PartitionResolver (not yet implemented).".to_string(),
+fn normalize_filter_bounds(
+    filters: &HashMap<String, String>,
+) -> Result<(String, String), ApiError> {
+    const START: &str = "start";
+    const END: &str = "end";
+    const PARTITION_START: &str = "partition_start";
+    const PARTITION_END: &str = "partition_end";
+
+    if filters
+        .keys()
+        .any(|key| !matches!(key.as_str(), START | END | PARTITION_START | PARTITION_END))
+    {
+        return Err(ApiError::bad_request(
+            "filter selector supports only start/end bounds",
+        ));
+    }
+
+    let start = filters.get(START).map(|value| value.trim());
+    let start_alias = filters.get(PARTITION_START).map(|value| value.trim());
+    let end = filters.get(END).map(|value| value.trim());
+    let end_alias = filters.get(PARTITION_END).map(|value| value.trim());
+
+    if let (Some(primary), Some(alias)) = (start, start_alias) {
+        if primary != alias {
+            return Err(ApiError::bad_request(
+                "filter selector start bounds are conflicting",
+            ));
+        }
+    }
+    if let (Some(primary), Some(alias)) = (end, end_alias) {
+        if primary != alias {
+            return Err(ApiError::bad_request(
+                "filter selector end bounds are conflicting",
+            ));
+        }
+    }
+
+    let start = start
+        .or(start_alias)
+        .ok_or_else(|| ApiError::bad_request("filter selector requires start/end bounds"))?;
+    let end = end
+        .or(end_alias)
+        .ok_or_else(|| ApiError::bad_request("filter selector requires start/end bounds"))?;
+    normalize_partition_bounds(start, end)
+}
+
+fn parse_partition_selector(
+    selector: PartitionSelectorRequest,
+) -> Result<(PartitionSelector, u32), ApiError> {
+    match selector {
+        PartitionSelectorRequest::Explicit { partitions } => {
+            if partitions.is_empty() {
+                return Err(ApiError::bad_request("partition selector cannot be empty"));
+            }
+            if partitions.iter().any(String::is_empty) {
+                return Err(ApiError::bad_request("partition key cannot be empty"));
+            }
+            Ok((
+                PartitionSelector::Explicit {
+                    partition_keys: partitions.clone(),
+                },
+                u32::try_from(partitions.len()).unwrap_or(u32::MAX),
+            ))
+        }
+        PartitionSelectorRequest::Range { start, end } => {
+            if start.trim().is_empty() || end.trim().is_empty() {
+                return Err(ApiError::bad_request(
+                    "range selector requires start and end",
+                ));
+            }
+            let (start, end) = normalize_partition_bounds(start.trim(), end.trim())?;
+            Ok((PartitionSelector::Range { start, end }, 0))
+        }
+        PartitionSelectorRequest::Filter { filters } => {
+            if filters.is_empty() {
+                return Err(ApiError::bad_request("filter selector cannot be empty"));
+            }
+            if filters
+                .iter()
+                .any(|(key, value)| key.trim().is_empty() || value.trim().is_empty())
+            {
+                return Err(ApiError::bad_request(
+                    "filter selector keys and values must be non-empty",
+                ));
+            }
+            let (start, end) = normalize_filter_bounds(&filters)?;
+            let filters = HashMap::from([("start".to_string(), start), ("end".to_string(), end)]);
+            Ok((PartitionSelector::Filter { filters }, 0))
+        }
     }
 }
 
@@ -1926,9 +2091,14 @@ async fn resolve_backfill_idempotency(
     storage: &ScopedStorage,
     idempotency_key: &str,
     fingerprint: &str,
+    compatibility_fingerprints: &[String],
 ) -> Result<Option<CreateBackfillResponse>, ApiError> {
     if let Some(existing) = load_backfill_idempotency_record(storage, idempotency_key).await? {
-        if existing.fingerprint == fingerprint {
+        if existing.fingerprint == fingerprint
+            || compatibility_fingerprints
+                .iter()
+                .any(|value| value == &existing.fingerprint)
+        {
             return Ok(Some(CreateBackfillResponse {
                 backfill_id: existing.backfill_id,
                 accepted_event_id: existing.accepted_event_id,
@@ -1954,7 +2124,6 @@ async fn append_backfill_created_event(
     fingerprint: String,
 ) -> Result<CreateBackfillResponse, ApiError> {
     let backfill_id = Ulid::new().to_string();
-    let total_partitions = u32::try_from(input.partition_keys.len()).unwrap_or(u32::MAX);
     let event = OrchestrationEvent::new(
         &ctx.tenant,
         workspace_id,
@@ -1963,7 +2132,7 @@ async fn append_backfill_created_event(
             client_request_id: idempotency_key.to_string(),
             asset_selection: input.asset_selection,
             partition_selector: input.partition_selector,
-            total_partitions,
+            total_partitions: input.total_partitions,
             chunk_size: input.chunk_size,
             max_concurrent_runs: input.max_concurrent_runs,
             parent_backfill_id: None,
@@ -1989,7 +2158,18 @@ async fn append_backfill_created_event(
         accepted_at,
         fingerprint,
     };
-    store_backfill_idempotency_record(storage, &record).await?;
+
+    let store_result = store_backfill_idempotency_record(storage, &record).await?;
+    if matches!(store_result, WriteResult::PreconditionFailed { .. }) {
+        if let Some(existing) =
+            resolve_backfill_idempotency(storage, idempotency_key, &record.fingerprint, &[]).await?
+        {
+            return Ok(existing);
+        }
+        return Err(ApiError::conflict(
+            "idempotency key was claimed concurrently; retry request",
+        ));
+    }
 
     Ok(CreateBackfillResponse {
         backfill_id,
@@ -3310,6 +3490,50 @@ fn filter_ticks_by_status(
     if let Some(filter) = status {
         ticks.retain(|tick| tick.status == filter);
     }
+}
+
+fn filter_sensor_evals_by_status(
+    evals: &mut Vec<SensorEvalResponse>,
+    status: Option<SensorEvalStatusFilter>,
+) {
+    let Some(filter) = status else {
+        return;
+    };
+
+    evals.retain(|eval| {
+        matches!(
+            (&eval.status, filter),
+            (
+                SensorEvalStatusResponse::Triggered,
+                SensorEvalStatusFilter::Triggered
+            ) | (
+                SensorEvalStatusResponse::NoNewData,
+                SensorEvalStatusFilter::NoNewData
+            ) | (
+                SensorEvalStatusResponse::Error { .. },
+                SensorEvalStatusFilter::Error
+            ) | (
+                SensorEvalStatusResponse::SkippedStaleCursor,
+                SensorEvalStatusFilter::SkippedStaleCursor
+            )
+        )
+    });
+}
+
+fn filter_sensor_evals_by_time_range(
+    evals: &mut Vec<SensorEvalResponse>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) {
+    if since.is_none() && until.is_none() {
+        return;
+    }
+
+    evals.retain(|eval| {
+        let after_since = since.is_none_or(|since| eval.evaluated_at >= since);
+        let before_until = until.is_none_or(|until| eval.evaluated_at <= until);
+        after_since && before_until
+    });
 }
 
 // ============================================================================
@@ -5186,6 +5410,9 @@ pub(crate) async fn get_sensor(
         ("sensor_id" = String, Path, description = "Sensor ID"),
         ("limit" = Option<u32>, Query, description = "Maximum evaluations to return"),
         ("cursor" = Option<String>, Query, description = "Pagination cursor"),
+        ("since" = Option<DateTime<Utc>>, Query, description = "Filter evaluations after this timestamp (inclusive)"),
+        ("until" = Option<DateTime<Utc>>, Query, description = "Filter evaluations before this timestamp (inclusive)"),
+        ("status" = Option<SensorEvalStatusFilter>, Query, description = "Filter by status"),
     ),
     responses(
         (status = 200, description = "List of evaluations", body = ListSensorEvalsResponse),
@@ -5197,7 +5424,7 @@ pub(crate) async fn list_sensor_evals(
     State(state): State<Arc<AppState>>,
     ctx: RequestContext,
     Path((workspace_id, sensor_id)): Path<(String, String)>,
-    AxumQuery(query): AxumQuery<ListQuery>,
+    AxumQuery(query): AxumQuery<ListSensorEvalsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
     let (limit, offset) = parse_pagination(
@@ -5212,6 +5439,8 @@ pub(crate) async fn list_sensor_evals(
         .filter(|e| e.sensor_id == sensor_id)
         .map(map_sensor_eval)
         .collect();
+    filter_sensor_evals_by_status(&mut evals, query.status);
+    filter_sensor_evals_by_time_range(&mut evals, query.since, query.until);
     evals.sort_by(|a, b| b.evaluated_at.cmp(&a.evaluated_at));
 
     let (page, next_cursor) = paginate(&evals, limit, offset);
@@ -5239,7 +5468,6 @@ pub(crate) async fn list_sensor_evals(
         (status = 200, description = "Existing backfill returned", body = CreateBackfillResponse),
         (status = 400, description = "Invalid request", body = ApiErrorBody),
         (status = 409, description = "Idempotency conflict", body = ApiErrorBody),
-        (status = 422, description = "Partition selector not supported", body = UnprocessableEntityResponse),
         (status = 404, description = "Workspace not found", body = ApiErrorBody),
     ),
     tag = "Orchestration",
@@ -5275,15 +5503,7 @@ pub(crate) async fn create_backfill(
         .or_else(|| ctx.idempotency_key.clone())
         .ok_or_else(|| ApiError::bad_request("clientRequestId or Idempotency-Key is required"))?;
 
-    let (partition_selector, partition_keys) = match partition_selector {
-        PartitionSelectorRequest::Explicit { partitions } => {
-            explicit_partition_selector(partitions)?
-        }
-        PartitionSelectorRequest::Range { .. } | PartitionSelectorRequest::Filter { .. } => {
-            let response = unsupported_partition_selector_response();
-            return Ok((StatusCode::UNPROCESSABLE_ENTITY, Json(response)).into_response());
-        }
-    };
+    let (partition_selector, total_partitions) = parse_partition_selector(partition_selector)?;
 
     let chunk_size = match chunk_size {
         Some(0) | None => DEFAULT_BACKFILL_CHUNK_SIZE,
@@ -5296,23 +5516,36 @@ pub(crate) async fn create_backfill(
     let input = BackfillCreateInput {
         asset_selection,
         partition_selector,
-        partition_keys,
+        total_partitions,
         chunk_size,
         max_concurrent_runs,
     };
 
     let fingerprint = compute_backfill_fingerprint(
         &input.asset_selection,
-        &input.partition_keys,
+        &input.partition_selector,
         input.chunk_size,
         input.max_concurrent_runs,
     )?;
+    let compatibility_fingerprints = compute_legacy_backfill_fingerprint(
+        &input.asset_selection,
+        &input.partition_selector,
+        input.chunk_size,
+        input.max_concurrent_runs,
+    )?
+    .into_iter()
+    .collect::<Vec<_>>();
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
 
-    if let Some(existing) =
-        resolve_backfill_idempotency(&storage, &idempotency_key, &fingerprint).await?
+    if let Some(existing) = resolve_backfill_idempotency(
+        &storage,
+        &idempotency_key,
+        &fingerprint,
+        &compatibility_fingerprints,
+    )
+    .await?
     {
         return Ok((StatusCode::OK, Json(existing)).into_response());
     }
@@ -6305,6 +6538,338 @@ mod tests {
 
         assert_eq!(json["type"], "filter");
         assert_eq!(json["filters"]["region"], "us-*");
+    }
+
+    #[test]
+    fn test_parse_partition_selector_rejects_filter_without_bounds() {
+        let mut filters = HashMap::new();
+        filters.insert("start".to_string(), "2025-01-01".to_string());
+
+        let err = parse_partition_selector(PartitionSelectorRequest::Filter { filters })
+            .expect_err("expected bounds validation error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.message(), "filter selector requires start/end bounds");
+    }
+
+    #[test]
+    fn test_parse_partition_selector_rejects_filter_with_unsupported_keys() {
+        let mut filters = HashMap::new();
+        filters.insert("start".to_string(), "2025-01-01".to_string());
+        filters.insert("end".to_string(), "2025-01-03".to_string());
+        filters.insert("region".to_string(), "us-*".to_string());
+
+        let err = parse_partition_selector(PartitionSelectorRequest::Filter { filters })
+            .expect_err("expected unsupported filter key error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.message(),
+            "filter selector supports only start/end bounds"
+        );
+    }
+
+    #[test]
+    fn test_parse_partition_selector_rejects_invalid_range_date_format() {
+        let err = parse_partition_selector(PartitionSelectorRequest::Range {
+            start: "2025/01/01".to_string(),
+            end: "2025-01-03".to_string(),
+        })
+        .expect_err("expected invalid date format");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.message(),
+            "partition selector bounds must use YYYY-MM-DD"
+        );
+    }
+
+    #[test]
+    fn test_parse_partition_selector_rejects_range_with_start_after_end() {
+        let err = parse_partition_selector(PartitionSelectorRequest::Range {
+            start: "2025-01-10".to_string(),
+            end: "2025-01-03".to_string(),
+        })
+        .expect_err("expected start/end ordering error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.message(),
+            "partition selector start must be less than or equal to end"
+        );
+    }
+
+    #[test]
+    fn test_parse_partition_selector_canonicalizes_filter_alias_bounds() -> Result<()> {
+        let mut filters = HashMap::new();
+        filters.insert("partition_start".to_string(), "2025-01-01".to_string());
+        filters.insert("partition_end".to_string(), "2025-01-03".to_string());
+
+        let (selector, _) = parse_partition_selector(PartitionSelectorRequest::Filter { filters })
+            .map_err(|err| anyhow!("{err:?}"))?;
+
+        let PartitionSelector::Filter { filters } = selector else {
+            panic!("expected filter selector");
+        };
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters.get("start"), Some(&"2025-01-01".to_string()));
+        assert_eq!(filters.get("end"), Some(&"2025-01-03".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_compute_backfill_fingerprint_is_deterministic_for_filter_selector() -> Result<()> {
+        let mut first = HashMap::new();
+        first.insert("partition_end".to_string(), "2025-01-10".to_string());
+        first.insert("region".to_string(), "us-*".to_string());
+        first.insert("partition_start".to_string(), "2025-01-01".to_string());
+
+        let mut second = HashMap::new();
+        second.insert("partition_start".to_string(), "2025-01-01".to_string());
+        second.insert("region".to_string(), "us-*".to_string());
+        second.insert("partition_end".to_string(), "2025-01-10".to_string());
+
+        let selector_a = PartitionSelector::Filter { filters: first };
+        let selector_b = PartitionSelector::Filter { filters: second };
+        let asset_selection = vec!["analytics.daily".to_string()];
+
+        let fingerprint_a = compute_backfill_fingerprint(&asset_selection, &selector_a, 10, 2)
+            .map_err(|err| anyhow!("{err:?}"))?;
+        let fingerprint_b = compute_backfill_fingerprint(&asset_selection, &selector_b, 10, 2)
+            .map_err(|err| anyhow!("{err:?}"))?;
+
+        assert_eq!(
+            fingerprint_a, fingerprint_b,
+            "fingerprint must be stable across equivalent filter map orderings"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_backfill_accepts_legacy_explicit_idempotency_fingerprint() -> Result<()> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct LegacyBackfillFingerprintPayload {
+            asset_selection: Vec<String>,
+            partitions: Vec<String>,
+            chunk_size: u32,
+            max_concurrent_runs: u32,
+        }
+
+        fn legacy_backfill_fingerprint(
+            asset_selection: &[String],
+            partitions: &[String],
+            chunk_size: u32,
+            max_concurrent_runs: u32,
+        ) -> Result<String> {
+            let payload = LegacyBackfillFingerprintPayload {
+                asset_selection: asset_selection.to_vec(),
+                partitions: partitions.to_vec(),
+                chunk_size,
+                max_concurrent_runs,
+            };
+            let json = serde_json::to_vec(&payload)?;
+            Ok(hex::encode(Sha256::digest(&json)))
+        }
+
+        let mut config = crate::config::Config::default();
+        config.debug = true;
+        let state = Arc::new(AppState::with_memory_storage(config));
+
+        let ctx = RequestContext {
+            tenant: "tenant".to_string(),
+            workspace: "workspace".to_string(),
+            user_id: Some("user@example.com".to_string()),
+            groups: vec![],
+            request_id: "req_legacy_01".to_string(),
+            idempotency_key: None,
+        };
+
+        let asset_selection = vec!["analytics.daily".to_string()];
+        let partitions = vec!["2025-01-01".to_string(), "2025-01-02".to_string()];
+        let legacy_fingerprint = legacy_backfill_fingerprint(&asset_selection, &partitions, 10, 2)?;
+        let accepted_at = Utc::now();
+
+        let record = BackfillIdempotencyRecord {
+            idempotency_key: "legacy_idem_01".to_string(),
+            backfill_id: "bf_legacy_existing".to_string(),
+            accepted_event_id: "evt_legacy_existing".to_string(),
+            accepted_at,
+            fingerprint: legacy_fingerprint,
+        };
+
+        let backend = state.storage_backend().map_err(|err| anyhow!("{err:?}"))?;
+        let storage = ctx
+            .scoped_storage(backend)
+            .map_err(|err| anyhow!("{err:?}"))?;
+        store_backfill_idempotency_record(&storage, &record)
+            .await
+            .map_err(|err| anyhow!("{err:?}"))?;
+
+        let request = CreateBackfillRequest {
+            asset_selection,
+            partition_selector: PartitionSelectorRequest::Explicit { partitions },
+            client_request_id: Some("legacy_idem_01".to_string()),
+            chunk_size: None,
+            max_concurrent_runs: None,
+        };
+
+        let response = create_backfill(
+            State(state),
+            ctx.clone(),
+            Path(ctx.workspace.clone()),
+            Json(request),
+        )
+        .await
+        .map_err(|err| anyhow!("{err:?}"))?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await?;
+        let payload: CreateBackfillResponse = serde_json::from_slice(&body)?;
+        assert_eq!(payload.backfill_id, "bf_legacy_existing");
+        assert_eq!(payload.accepted_event_id, "evt_legacy_existing");
+        assert_eq!(payload.accepted_at, accepted_at);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_backfill_accepts_range_selector() -> Result<()> {
+        let mut config = crate::config::Config::default();
+        config.debug = true;
+        let state = Arc::new(AppState::with_memory_storage(config));
+
+        let ctx = RequestContext {
+            tenant: "tenant".to_string(),
+            workspace: "workspace".to_string(),
+            user_id: Some("user@example.com".to_string()),
+            groups: vec![],
+            request_id: "req_01".to_string(),
+            idempotency_key: None,
+        };
+
+        let request = CreateBackfillRequest {
+            asset_selection: vec!["analytics.daily".to_string()],
+            partition_selector: PartitionSelectorRequest::Range {
+                start: "2025-01-01".to_string(),
+                end: "2025-01-03".to_string(),
+            },
+            client_request_id: Some("bf_range_001".to_string()),
+            chunk_size: Some(2),
+            max_concurrent_runs: Some(1),
+        };
+
+        let response = create_backfill(
+            State(state),
+            ctx.clone(),
+            Path(ctx.workspace.clone()),
+            Json(request),
+        )
+        .await
+        .map_err(|err| anyhow!("{err:?}"))?;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_backfill_accepts_filter_selector() -> Result<()> {
+        let mut config = crate::config::Config::default();
+        config.debug = true;
+        let state = Arc::new(AppState::with_memory_storage(config));
+
+        let ctx = RequestContext {
+            tenant: "tenant".to_string(),
+            workspace: "workspace".to_string(),
+            user_id: Some("user@example.com".to_string()),
+            groups: vec![],
+            request_id: "req_01".to_string(),
+            idempotency_key: None,
+        };
+
+        let mut filters = HashMap::new();
+        filters.insert("start".to_string(), "2025-01-01".to_string());
+        filters.insert("end".to_string(), "2025-01-03".to_string());
+
+        let request = CreateBackfillRequest {
+            asset_selection: vec!["analytics.daily".to_string()],
+            partition_selector: PartitionSelectorRequest::Filter { filters },
+            client_request_id: Some("bf_filter_001".to_string()),
+            chunk_size: Some(2),
+            max_concurrent_runs: Some(1),
+        };
+
+        let response = create_backfill(
+            State(state),
+            ctx.clone(),
+            Path(ctx.workspace.clone()),
+            Json(request),
+        )
+        .await
+        .map_err(|err| anyhow!("{err:?}"))?;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_append_backfill_created_event_replays_existing_after_claim_race() -> Result<()> {
+        let mut config = crate::config::Config::default();
+        config.debug = true;
+        let state = Arc::new(AppState::with_memory_storage(config));
+
+        let ctx = RequestContext {
+            tenant: "tenant".to_string(),
+            workspace: "workspace".to_string(),
+            user_id: Some("user@example.com".to_string()),
+            groups: vec![],
+            request_id: "req_race_01".to_string(),
+            idempotency_key: None,
+        };
+
+        let backend = state.storage_backend().map_err(|err| anyhow!("{err:?}"))?;
+        let storage = ctx
+            .scoped_storage(backend)
+            .map_err(|err| anyhow!("{err:?}"))?;
+
+        let partition_selector = PartitionSelector::Range {
+            start: "2025-01-01".to_string(),
+            end: "2025-01-03".to_string(),
+        };
+        let input = BackfillCreateInput {
+            asset_selection: vec!["analytics.daily".to_string()],
+            partition_selector: partition_selector.clone(),
+            total_partitions: 3,
+            chunk_size: 2,
+            max_concurrent_runs: 1,
+        };
+        let fingerprint =
+            compute_backfill_fingerprint(&input.asset_selection, &partition_selector, 2, 1)
+                .map_err(|err| anyhow!("{err:?}"))?;
+        let accepted_at = Utc::now();
+
+        let existing_record = BackfillIdempotencyRecord {
+            idempotency_key: "bf_race_idem_01".to_string(),
+            backfill_id: "bf_existing".to_string(),
+            accepted_event_id: "evt_existing".to_string(),
+            accepted_at,
+            fingerprint: fingerprint.clone(),
+        };
+        store_backfill_idempotency_record(&storage, &existing_record)
+            .await
+            .map_err(|err| anyhow!("{err:?}"))?;
+
+        let replay = append_backfill_created_event(
+            state.as_ref(),
+            &ctx,
+            &ctx.workspace,
+            input,
+            "bf_race_idem_01",
+            &storage,
+            fingerprint,
+        )
+        .await
+        .map_err(|err| anyhow!("{err:?}"))?;
+
+        assert_eq!(replay.backfill_id, "bf_existing");
+        assert_eq!(replay.accepted_event_id, "evt_existing");
+        assert_eq!(replay.accepted_at, accepted_at);
+        Ok(())
     }
 
     #[test]

@@ -1001,7 +1001,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reader_prefers_pointer_manifest_over_legacy_manifest() {
+    async fn test_catalog_mintable_paths_include_catalogs_parquet() {
         let backend = Arc::new(MemoryBackend::new());
         let storage =
             ScopedStorage::new(backend, "test-tenant", "test-workspace").expect("storage");
@@ -1015,63 +1015,41 @@ mod tests {
         let mut root: RootManifest = serde_json::from_slice(&root_bytes).expect("root parse");
         root.normalize_paths();
 
-        // Legacy manifest says version 1.
-        let legacy_bytes = storage
+        let catalog_bytes = storage
             .get_raw(&root.catalog_manifest_path)
             .await
-            .expect("legacy");
-        let mut legacy: CatalogDomainManifest =
-            serde_json::from_slice(&legacy_bytes).expect("legacy parse");
-        legacy.snapshot_version = 1;
-        legacy.snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1);
+            .expect("catalog manifest");
+        let mut catalog: CatalogDomainManifest =
+            serde_json::from_slice(&catalog_bytes).expect("catalog parse");
+        catalog.snapshot_version = 1;
+        catalog.snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1);
+        catalog.snapshot = None;
+        catalog.updated_at = Utc::now();
+
+        let catalog_payload = serde_json::to_vec(&catalog).expect("serialize");
         storage
             .put_raw(
                 &root.catalog_manifest_path,
-                Bytes::from(serde_json::to_vec(&legacy).expect("legacy serialize")),
+                Bytes::from(catalog_payload),
                 WritePrecondition::None,
             )
             .await
-            .expect("write legacy");
-
-        // Pointer points to immutable snapshot manifest at version 2.
-        let pointer_manifest_path =
-            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, "00000000000000000002");
-        let mut pointed = legacy.clone();
-        pointed.manifest_id = "00000000000000000002".to_string();
-        pointed.snapshot_version = 2;
-        pointed.snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 2);
-        storage
-            .put_raw(
-                &pointer_manifest_path,
-                Bytes::from(serde_json::to_vec(&pointed).expect("pointed serialize")),
-                WritePrecondition::DoesNotExist,
-            )
-            .await
-            .expect("write pointed");
-
-        let pointer = DomainManifestPointer {
-            manifest_id: "00000000000000000002".to_string(),
-            manifest_path: pointer_manifest_path,
-            epoch: 7,
-            parent_pointer_hash: None,
-            updated_at: Utc::now(),
-        };
-        storage
-            .put_raw(
-                &CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
-                Bytes::from(serde_json::to_vec(&pointer).expect("pointer serialize")),
-                WritePrecondition::DoesNotExist,
-            )
-            .await
-            .expect("write pointer");
+            .expect("write catalog manifest");
 
         let reader = CatalogReader::new(storage);
-        let freshness = reader
-            .get_freshness(CatalogDomain::Catalog)
+        let paths = reader
+            .get_mintable_paths(CatalogDomain::Catalog)
             .await
-            .expect("freshness");
-
-        assert_eq!(freshness.version.as_u64(), 2);
+            .expect("paths");
+        assert_eq!(
+            paths,
+            vec![
+                CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "catalogs.parquet"),
+                CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "namespaces.parquet"),
+                CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "tables.parquet"),
+                CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "columns.parquet"),
+            ]
+        );
     }
 
     #[tokio::test]

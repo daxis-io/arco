@@ -1,0 +1,35 @@
+[2026-02-15T20:19:20Z] STEP=integrity-scope-checklist
+COMMAND: cat release_evidence/2026-02-12-prod-readiness/phase-4/batch-4-head/batch4-scope-checklist.md
+# Batch 4 Scope Checklist (Locked)
+
+- Source plan: `/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/docs/plans/2025-12-22-iceberg-rest-phase-a-implementation.md`
+- Source section: `Batch 4: Namespace Read Operations` (lines 165-210)
+- Locked at (UTC): 2026-02-15T19:24:05Z
+- Executed at (UTC): 2026-02-15T20:14:48Z
+
+## Acceptance Criteria Extracted from Plan
+
+| ID | Criterion | Source lines | Status | Implementation Evidence |
+|---|---|---|---|---|
+| B4-AC1 | Implement list namespaces handler for `GET /v1/{prefix}/namespaces`. | 167-171, 177 | COVERED | `/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/crates/arco-iceberg/src/routes/namespaces.rs` |
+| B4-AC2 | Test list returns namespaces from catalog. | 173 | COVERED | `test_list_namespaces_returns_namespaces_from_catalog` in `/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/crates/arco-iceberg/src/routes/namespaces.rs` |
+| B4-AC3 | Test pagination with `pageToken` and `pageSize`. | 174 | COVERED | `test_list_namespaces_pagination_with_page_token_and_size` in `/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/crates/arco-iceberg/src/routes/namespaces.rs` |
+| B4-AC4 | Test parent namespace filtering (if supported). | 175 | COVERED | `test_list_namespaces_parent_filtering` in `/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/crates/arco-iceberg/src/routes/namespaces.rs` |
+| B4-AC5 | Test empty catalog returns empty list. | 176 | COVERED | `test_list_namespaces_empty_catalog_returns_empty_list` in `/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/crates/arco-iceberg/src/routes/namespaces.rs` |
+| B4-AC6 | Implement get namespace handler for `GET /v1/{prefix}/namespaces/{namespace}`. | 182-186, 192 | COVERED | `/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/crates/arco-iceberg/src/routes/namespaces.rs` |
+| B4-AC7 | Test get existing namespace returns properties. | 188 | COVERED | `test_get_namespace_existing_returns_properties` in `/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/crates/arco-iceberg/src/routes/namespaces.rs` |
+| B4-AC8 | Test get non-existent namespace returns 404. | 189 | COVERED | `test_get_namespace_non_existent_returns_404` in `/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/crates/arco-iceberg/src/routes/namespaces.rs` |
+| B4-AC9 | Test namespace identifier is URL-decoded correctly. | 190 | COVERED | `test_get_namespace_identifier_is_url_decoded` in `/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/crates/arco-iceberg/src/routes/namespaces.rs` |
+| B4-AC10 | Test nested namespaces decode separator correctly (`%1F`). | 191 | COVERED | `test_get_namespace_nested_identifier_decodes_separator` in `/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/crates/arco-iceberg/src/routes/namespaces.rs` |
+| B4-AC11 | Implement HEAD namespace handler for `HEAD /v1/{prefix}/namespaces/{namespace}` with tests for existing/not-found/no-body. | 197-206 | COVERED | Handler + tests in `/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/crates/arco-iceberg/src/routes/namespaces.rs` |
+
+## Scope Conflict Resolution (Recorded)
+
+- Conflict detected during scope lock: plan requires HEAD success `200` while existing branch/spec fixture used `204`.
+- Resolution after principal review: restored spec-aligned `204` runtime + OpenAPI contract for namespace HEAD, matching official Iceberg fixture and table HEAD semantics.
+
+## Verification Evidence
+
+- Targeted tests and full relevant matrix commands are archived under:
+  - `/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/release_evidence/2026-02-12-prod-readiness/phase-4/batch-4-head/command-logs/`
+  - `/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/release_evidence/2026-02-12-prod-readiness/phase-4/batch-4-head/command-matrix-status.tsv`

@@ -1,0 +1,5 @@
+step	command	exit_code	utc
+jq_dashboard	jq . "/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/infra/monitoring/dashboard.json"	0	2026-02-15T16:24:07Z
+rg_otel_wiring	rg -n '(arco-api|arco-compactor|prometheus|otlp|scrape|metrics)' "/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/infra/monitoring/otel-collector.yaml"	0	2026-02-15T16:24:07Z
+promtool_check_rules	promtool check rules "/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/infra/monitoring/alerts.yaml"	0	2026-02-15T16:24:07Z
+promtool_test_drill	promtool test rules "/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/release_evidence/2026-02-12-prod-readiness/gate-4/observability/observability_gate4_alert_drill.test.yaml"	0	2026-02-15T16:24:07Z

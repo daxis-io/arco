@@ -1255,7 +1255,6 @@ fn validate_expected_epoch(
 
     Ok(())
 }
-
 fn retention_reference_time_for_events(events: &[(String, OrchestrationEvent)]) -> DateTime<Utc> {
     events
         .iter()
@@ -1401,12 +1400,11 @@ mod tests {
         OrchestrationEventData, PartitionSelector, RunRequest, SensorEvalStatus, SourceRef,
         TaskDef, TickStatus, TimerType, TriggerInfo, TriggerSource,
     };
-    use crate::paths::{orchestration_compaction_lock_path, orchestration_event_path};
-    use arco_core::{DistributedLock, MemoryBackend};
+    use crate::paths::orchestration_event_path;
+    use arco_core::MemoryBackend;
     use chrono::DateTime;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::Duration;
     use ulid::Ulid;
 
     async fn create_test_compactor() -> Result<(MicroCompactor, ScopedStorage)> {

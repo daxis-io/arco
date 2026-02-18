@@ -1,0 +1,3 @@
+6:    tags: ['v*']
+38:  release-tag-discipline:
+47:        run: bash tools/check-release-tag-discipline.sh --tag "${GITHUB_REF_NAME}"

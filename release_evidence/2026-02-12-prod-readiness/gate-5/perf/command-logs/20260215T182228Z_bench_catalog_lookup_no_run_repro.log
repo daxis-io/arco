@@ -1,0 +1,11 @@
+# command: cargo bench -p arco-catalog --bench catalog_lookup --no-run
+# start_utc: 2026-02-15T18:22:28Z
+   Compiling arco-catalog v0.1.0 (/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/crates/arco-catalog)
+error[E0063]: missing field `catalog_id` in initializer of `NamespaceRecord`
+  --> crates/arco-catalog/benches/catalog_lookup.rs:39:18
+   |
+39 |         .map(|i| parquet_util::NamespaceRecord {
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `catalog_id`
+
+For more information about this error, try `rustc --explain E0063`.
+error: could not compile `arco-catalog` (bench "catalog_lookup") due to 1 previous error

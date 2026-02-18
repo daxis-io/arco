@@ -1,0 +1,66 @@
+{
+  "name": "sensor_evals",
+  "version": 1,
+  "fields": [
+    {
+      "name": "tenant_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "workspace_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "eval_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "sensor_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "cursor_before",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "cursor_after",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "expected_state_version",
+      "data_type": "UInt32",
+      "nullable": true
+    },
+    {
+      "name": "trigger_source",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "run_requests",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "status",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "evaluated_at",
+      "data_type": "Int64",
+      "nullable": false
+    },
+    {
+      "name": "row_version",
+      "data_type": "Utf8",
+      "nullable": false
+    }
+  ]
+}

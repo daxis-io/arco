@@ -705,16 +705,6 @@ async fn main() -> Result<()> {
         },
     );
 
-    let run_route = internal_auth.map_or_else(
-        || post(run_handler),
-        |auth| {
-            post(run_handler).route_layer(middleware::from_fn_with_state(
-                auth,
-                internal_auth_middleware,
-            ))
-        },
-    );
-
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/run", run_route)

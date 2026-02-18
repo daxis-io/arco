@@ -1,0 +1,7 @@
+0	GO	Signal ledger, fresh command matrix, DoD freeze, and machine-checkable tracker all present.
+1	NO-GO	Signed release tag provenance and SBOM/release-note enforcement evidence not yet produced.
+2	GO	All local/code-only Gate 2 signals are closed: non-catalog typed paths unified, hardcoded literals removed, deterministic/property invariants covered, failure-injection coverage expanded, and runbook checks refreshed.
+3	GO	All Gate 3 signals are closed with refreshed evidence: projection durability, callback ingestion with fail-closed OIDC audience/issuer validation and actAs IAM wiring, run bridge convergence, selector parity, runtime SLO enforcement, operator metrics dashboard/alerts with drill proof, and auth mode hardening.
+4	PARTIAL	Fresh 2026-02-15 execution reran Terraform, Cloud Run/IAM, and observability command matrices with archived logs. Local Terraform + observability checks remain reproducible, but authenticated staging apply, Cloud Run/IAM data capture, live staging observability evidence, and human drill signoff are still externally blocked.
+5	NO-GO	Benchmark compile regression is fixed and CI OIDC/WIF migration is implemented, but 10x load/24h soak execution, pen-test execution, live rollback drill, and cross-functional approvals remain externally blocked.
+7	NO-GO	Final readiness report/handoff is refreshed, but canary progression and production integration validation remain externally blocked; messaging update gate remains closed because required gates are not all GO.

@@ -36,6 +36,7 @@ use crate::error::{IcebergError, IcebergResult};
 use crate::idempotency::{IdempotencyMarker, canonical_request_hash};
 use crate::paths::resolve_metadata_path;
 use crate::pointer::{IcebergTablePointer, UpdateSource, resolve_effective_metadata_location};
+use crate::pointer_store::IcebergPointerStore;
 use crate::routes::utils::{
     ensure_prefix, is_iceberg_table, join_namespace, paginate, parse_namespace,
 };
@@ -123,7 +124,7 @@ async fn list_tables(
     let namespace_name = join_namespace(&namespace_ident, &separator)?;
 
     let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let reader = CatalogReader::new(storage);
+    let reader = CatalogReader::new(storage.clone());
 
     let mut tables: Vec<TableIdent> = reader
         .list_tables(&namespace_name)
@@ -580,14 +581,23 @@ async fn head_table(
     let namespace_name = join_namespace(&namespace_ident, &separator)?;
 
     let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let reader = CatalogReader::new(storage);
+    let reader = CatalogReader::new(storage.clone());
 
-    let exists = reader
+    let table = reader
         .get_table(&namespace_name, &path.table)
         .await
         .map_err(IcebergError::from)?
-        .filter(|table| is_iceberg_table(table.format.as_deref()))
-        .is_some();
+        .filter(|table| is_iceberg_table(table.format.as_deref()));
+
+    let exists = if let Some(table) = table {
+        let table_uuid = uuid::Uuid::parse_str(&table.id).map_err(|_| IcebergError::Internal {
+            message: format!("Invalid table UUID: {}", table.id),
+        })?;
+        let pointer_store = IcebergPointerStore::new(Arc::new(storage.clone()));
+        pointer_store.exists(&table_uuid).await?
+    } else {
+        false
+    };
 
     let status = if exists {
         StatusCode::NO_CONTENT
@@ -1546,6 +1556,38 @@ mod tests {
         table.id
     }
 
+    async fn register_table_with_format(
+        state: &IcebergState,
+        namespace: &str,
+        table: &str,
+        format: &str,
+    ) -> String {
+        let storage = ScopedStorage::new(Arc::clone(&state.storage), "acme", "analytics")
+            .expect("scoped storage");
+        let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+        let writer = CatalogWriter::new(storage).with_sync_compactor(compactor);
+        writer.initialize().await.expect("init");
+
+        let table = writer
+            .register_table(
+                arco_catalog::RegisterTableRequest {
+                    namespace: namespace.to_string(),
+                    name: table.to_string(),
+                    description: None,
+                    location: Some(format!(
+                        "tenant=acme/workspace=analytics/warehouse/{namespace}/{table}"
+                    )),
+                    format: Some(format.to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+
+        table.id
+    }
+
     fn app(state: IcebergState) -> Router {
         Router::new()
             .nest("/v1/:prefix", routes())
@@ -1556,15 +1598,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_tables() {
+    async fn test_list_tables_filters_non_iceberg_and_supports_pagination() {
         let state = build_state();
-        seed_table(&state, "sales", "orders").await;
+        seed_namespace_only(&state, "sales").await;
+        register_table_with_format(&state, "sales", "orders", "iceberg").await;
+        register_table_with_format(&state, "sales", "customers", "ICEBERG").await;
+        register_table_with_format(&state, "sales", "legacy", "parquet").await;
 
-        let app = app(state);
-        let response = app
+        let first_page = app(state.clone())
             .oneshot(
                 Request::builder()
-                    .uri("/v1/arco/namespaces/sales/tables")
+                    .uri("/v1/arco/namespaces/sales/tables?pageSize=1")
                     .header("X-Tenant-Id", "acme")
                     .header("X-Workspace-Id", "analytics")
                     .body(Body::empty())
@@ -1573,11 +1617,69 @@ mod tests {
             .await
             .expect("response");
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(first_page.status(), StatusCode::OK);
+        let first_page_body = axum::body::to_bytes(first_page.into_body(), 65536)
+            .await
+            .expect("read body");
+        let first_page_json: serde_json::Value =
+            serde_json::from_slice(&first_page_body).expect("parse json");
+        let first_identifiers = first_page_json["identifiers"]
+            .as_array()
+            .expect("identifiers array");
+        assert_eq!(first_identifiers.len(), 1);
+        assert_eq!(first_identifiers[0]["name"], "customers");
+        assert_eq!(first_page_json["next-page-token"], "1");
+
+        let second_page = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces/sales/tables?pageToken=1&pageSize=2")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(second_page.status(), StatusCode::OK);
+        let second_page_body = axum::body::to_bytes(second_page.into_body(), 65536)
+            .await
+            .expect("read body");
+        let second_page_json: serde_json::Value =
+            serde_json::from_slice(&second_page_body).expect("parse json");
+        let second_identifiers = second_page_json["identifiers"]
+            .as_array()
+            .expect("identifiers array");
+        assert_eq!(second_identifiers.len(), 1);
+        assert_eq!(second_identifiers[0]["name"], "orders");
+        assert!(
+            second_page_json.get("next-page-token").is_none(),
+            "last page should not include next-page-token"
+        );
     }
 
     #[tokio::test]
-    async fn test_load_table() {
+    async fn test_list_tables_namespace_not_found_returns_404() {
+        let state = build_state();
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces/missing/tables")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_load_table_returns_metadata_location_and_etag() {
         let state = build_state();
         seed_table(&state, "sales", "orders").await;
 
@@ -1595,6 +1697,20 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers().get("ETag").is_some(),
+            "load-table should return ETag header"
+        );
+
+        let response_body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .expect("read body");
+        let payload: serde_json::Value = serde_json::from_slice(&response_body).expect("json");
+        let metadata_location = payload
+            .get("metadata-location")
+            .and_then(serde_json::Value::as_str)
+            .expect("metadata-location");
+        assert!(metadata_location.contains("/metadata/00000.metadata.json"));
     }
 
     #[tokio::test]
@@ -1620,6 +1736,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_table_if_none_match_etag_returns_not_modified() {
+        let state = build_state();
+        seed_table(&state, "sales", "orders").await;
+
+        let initial = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces/sales/tables/orders")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(initial.status(), StatusCode::OK);
+        let etag = initial
+            .headers()
+            .get("ETag")
+            .expect("etag")
+            .to_str()
+            .expect("etag utf8")
+            .to_string();
+
+        let not_modified = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces/sales/tables/orders")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("If-None-Match", etag)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        let body = axum::body::to_bytes(not_modified.into_body(), 65536)
+            .await
+            .expect("read body");
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_load_table_missing_returns_404() {
+        let state = build_state();
+        seed_namespace_only(&state, "sales").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces/sales/tables/missing")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn test_head_table_exists_returns_no_content() {
         let state = build_state();
         seed_table(&state, "sales", "orders").await;
@@ -1639,6 +1821,59 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .expect("body");
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_head_table_missing_returns_not_found_and_no_body() {
+        let state = build_state();
+        seed_namespace_only(&state, "sales").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/v1/arco/namespaces/sales/tables/missing")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .expect("body");
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_head_table_without_pointer_returns_not_found() {
+        let state = build_state();
+        seed_namespace_only(&state, "sales").await;
+        register_table_with_format(&state, "sales", "orders", "iceberg").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri("/v1/arco/namespaces/sales/tables/orders")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

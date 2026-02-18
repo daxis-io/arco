@@ -45,5 +45,5 @@ Each ADR follows this structure:
 | [029](adr-029-iceberg-multi-table-transactions.md) | Iceberg multi-table transactions (ICE-7) | Accepted |
 | [030](adr-030-delta-uc-metastore.md) | Delta Lake + UC-Like Metastore/Catalog (Arco-Native) | Proposed |
 | [031](adr-031-unity-catalog-api-facade.md) | Unity Catalog OSS API Facade (UC Parity) | Proposed |
-| [032](adr-032-immutable-manifest-pointers.md) | Immutable Manifest Snapshots + Pointer CAS | Accepted |
-| [033](adr-033-internal-durability-modes.md) | Internal Durability Modes for Orchestration Compaction | Accepted |
+| [032](adr-032-immutable-manifest-pointers.md) | Immutable Manifest Snapshots + Pointer CAS | Proposed |
+| [033](adr-033-internal-durability-modes.md) | Internal Durability Modes for Orchestration Compaction | Proposed |

@@ -1,0 +1,329 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+# Explicit permissions - principle of least privilege
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same branch/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ==========================================================================
+  # Dependency Review (PR-only vulnerability gating)
+  # ==========================================================================
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/dependency-review-action@3c4e3dcb1aa7874d2c16be7d79418e9b7efd6261 # v4
+        with:
+          fail-on-severity: high
+          deny-licenses: GPL-3.0, AGPL-3.0
+
+  release-tag-discipline:
+    name: Release Tag Discipline
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Validate changelog + release notes for release tag
+        run: bash tools/check-release-tag-discipline.sh --tag "${GITHUB_REF_NAME}"
+
+  gates:
+    name: Gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.85
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@887bc4e03483810873d617344dd5189cd82e7b8b # v2
+        with:
+          tool: cargo-deny@0.18.9
+      - name: Setup Buf
+        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1
+        with:
+          version: '1.47.2'
+          github_token: ${{ github.token }}
+      - run: cargo xtask doctor
+      - run: cargo xtask adr-check
+      - run: cargo xtask verify-integrity
+      - run: cargo xtask parity-matrix-check
+
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.85
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo check --workspace --all-features
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.85
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.85
+          components: clippy
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo clippy --workspace --all-features -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    env:
+      # Prevent ENOSPC during large debug/test links by moving artifacts off /
+      CARGO_TARGET_DIR: /mnt/target
+      # Reduce disk usage (debuginfo is a major contributor)
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.85
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-targets: "false"
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Free disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          df -h
+      - name: Prepare cargo target dir
+        run: |
+          sudo mkdir -p /mnt/target
+          sudo chown -R "$(id -u):$(id -g)" /mnt/target
+      - run: cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
+      - run: cargo test -p arco-api --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_
+      - run: cargo test -p arco-api --all-features --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_
+      - run: cargo test -p arco-api --all-features --test orchestration_parity_gates_m1
+      - run: cargo test -p arco-flow --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_
+      - run: cargo test -p arco-flow --features test-utils --no-run
+      - run: cargo test -p arco-flow --features test-utils --lib
+      - run: cargo test -p arco-flow --features test-utils --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_
+      - run: cargo test -p arco-flow --all-features --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_
+      - run: cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m1
+      - run: cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m2
+      - run: cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m3
+
+  python-tests:
+    name: Python Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: python/arco/pyproject.toml
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+        working-directory: python/arco
+      - name: Run Python unit tests
+        run: python -m pytest tests/unit -v
+        working-directory: python/arco
+      - name: Run Python CLI API tests
+        run: python -m pytest tests/integration/test_cli_api.py -v
+        working-directory: python/arco
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.85
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  doc-tests:
+    name: Doc Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.85
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-targets: "false"
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Free disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          df -h
+      - run: cargo test --doc --workspace
+
+  deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.85
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@887bc4e03483810873d617344dd5189cd82e7b8b # v2
+        with:
+          tool: cargo-deny@0.18.9
+      - run: cargo deny check bans licenses sources
+
+  deny-advisories:
+    name: Cargo Deny (Advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.85
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@887bc4e03483810873d617344dd5189cd82e7b8b # v2
+        with:
+          tool: cargo-deny@0.18.9
+      - name: cargo-deny advisories
+        # SECURITY: No continue-on-error - PRs with known vulnerabilities must not merge
+        run: cargo deny check advisories
+
+  proto-check:
+    name: Proto Compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.85
+
+      - name: Setup Buf
+        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1
+        with:
+          version: '1.47.2'
+          github_token: ${{ github.token }}
+
+      - name: Lint protos
+        run: buf lint proto/
+
+      - name: Check breaking changes
+        if: github.event_name == 'pull_request'
+        run: |
+          buf breaking proto/ \
+            --against 'https://github.com/${{ github.repository }}.git#branch=main,subdir=proto'
+
+  # ==========================================================================
+  # Gate 5: IAM Smoke Tests (deployed environment)
+  # ==========================================================================
+  iam-smoke:
+    name: IAM Smoke Tests
+    runs-on: ubuntu-latest
+    # Only run on main branch pushes, not PRs (requires deployed infrastructure)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: dev
+    needs: [check, test]
+    permissions:
+      contents: read
+      id-token: write  # Required for OIDC authentication
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.85
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Check IAM smoke prerequisites
+        id: iam_smoke_prereq
+        run: |
+          if [ -z "${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}" ] || [ -z "${{ vars.GCP_SERVICE_ACCOUNT }}" ] || [ -z "${{ vars.ARCO_BUCKET_DEV }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authenticate to GCP (API SA)
+        if: steps.iam_smoke_prereq.outputs.skip != 'true'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Run API IAM smoke tests
+        if: steps.iam_smoke_prereq.outputs.skip != 'true'
+        env:
+          ARCO_TEST_BUCKET: ${{ vars.ARCO_BUCKET_DEV }}
+        run: |
+          cargo test --package arco-integration-tests \
+            --features iam-smoke \
+            -- --ignored --test-threads=1
+
+      - name: Skip IAM smoke tests (missing config)
+        if: steps.iam_smoke_prereq.outputs.skip == 'true'
+        run: |
+          echo "Skipping IAM smoke tests: missing vars.GCP_WORKLOAD_IDENTITY_PROVIDER, vars.GCP_SERVICE_ACCOUNT, or vars.ARCO_BUCKET_DEV"
+
+  # ==========================================================================
+  # Compile-Negative Tests (Gate 5 trait separation)
+  # ==========================================================================
+  compile-negative:
+    name: Compile-Negative Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.85
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Run UI/compile-fail tests
+        run: cargo test -p arco-core --test ui

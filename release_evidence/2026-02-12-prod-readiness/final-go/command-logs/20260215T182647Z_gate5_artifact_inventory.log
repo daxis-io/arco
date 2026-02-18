@@ -1,0 +1,34 @@
+# command: find release_evidence/2026-02-12-prod-readiness/gate-5 -maxdepth 3 -type f | sort
+# start_utc: 2026-02-15T18:26:47Z
+release_evidence/2026-02-12-prod-readiness/gate-5/README.md
+release_evidence/2026-02-12-prod-readiness/gate-5/command-logs/20260215T182310Z_retention_policy_default_test.log
+release_evidence/2026-02-12-prod-readiness/gate-5/command-logs/20260215T182327Z_retention_policy_reference_scan.log
+release_evidence/2026-02-12-prod-readiness/gate-5/command-logs/20260215T182327Z_retention_policy_valid_test.log
+release_evidence/2026-02-12-prod-readiness/gate-5/g5-002-command-status.tsv
+release_evidence/2026-02-12-prod-readiness/gate-5/perf/command-logs/20260215T182028Z_bench_catalog_lookup_no_run.log
+release_evidence/2026-02-12-prod-readiness/gate-5/perf/command-logs/20260215T182028Z_runbook_presence.log
+release_evidence/2026-02-12-prod-readiness/gate-5/perf/command-logs/20260215T182217Z_bench_catalog_lookup_no_run_repro.log
+release_evidence/2026-02-12-prod-readiness/gate-5/perf/command-logs/20260215T182218Z_load_tooling_preflight.log
+release_evidence/2026-02-12-prod-readiness/gate-5/perf/command-logs/20260215T182228Z_bench_catalog_lookup_no_run_repro.log
+release_evidence/2026-02-12-prod-readiness/gate-5/perf/command-logs/20260215T182228Z_load_tooling_preflight.log
+release_evidence/2026-02-12-prod-readiness/gate-5/perf/g5-001-command-status.tsv
+release_evidence/2026-02-12-prod-readiness/gate-5/rollback/command-logs/20260215T182401Z_rollback_runbook_presence.log
+release_evidence/2026-02-12-prod-readiness/gate-5/rollback/command-logs/20260215T182401Z_rollback_script_dry_run_attempt.log
+release_evidence/2026-02-12-prod-readiness/gate-5/rollback/command-logs/20260215T182401Z_rollback_script_syntax.log
+release_evidence/2026-02-12-prod-readiness/gate-5/rollback/command-logs/20260215T182404Z_integrity_verifier_dry_run.log
+release_evidence/2026-02-12-prod-readiness/gate-5/rollback/g5-005-command-status.tsv
+release_evidence/2026-02-12-prod-readiness/gate-5/security/command-logs/20260215T182338Z_cargo_deny_advisories.log
+release_evidence/2026-02-12-prod-readiness/gate-5/security/command-logs/20260215T182338Z_pen_test_runbook_presence.log
+release_evidence/2026-02-12-prod-readiness/gate-5/security/command-logs/20260215T182339Z_pen_test_scope_extract.log
+release_evidence/2026-02-12-prod-readiness/gate-5/security/command-logs/20260215T182339Z_security_findings_extract.log
+release_evidence/2026-02-12-prod-readiness/gate-5/security/command-logs/20260215T182351Z_ci_key_usage_scan.log
+release_evidence/2026-02-12-prod-readiness/gate-5/security/command-logs/20260215T182351Z_oidc_rotation_path_scan.log
+release_evidence/2026-02-12-prod-readiness/gate-5/security/command-logs/20260215T182351Z_secret_manager_wiring_scan.log
+release_evidence/2026-02-12-prod-readiness/gate-5/security/command-logs/20260215T182351Z_security_policy_requirements_scan.log
+release_evidence/2026-02-12-prod-readiness/gate-5/security/g5-003-command-status.tsv
+release_evidence/2026-02-12-prod-readiness/gate-5/security/g5-004-command-status.tsv
+release_evidence/2026-02-12-prod-readiness/gate-5/signoff/command-logs/20260215T182451Z_changelog_sections.log
+release_evidence/2026-02-12-prod-readiness/gate-5/signoff/command-logs/20260215T182451Z_existing_signoff_artifacts.log
+release_evidence/2026-02-12-prod-readiness/gate-5/signoff/command-logs/20260215T182451Z_release_docs_presence.log
+release_evidence/2026-02-12-prod-readiness/gate-5/signoff/command-logs/20260215T182451Z_release_gate_snapshot.log
+release_evidence/2026-02-12-prod-readiness/gate-5/signoff/g5-006-command-status.tsv

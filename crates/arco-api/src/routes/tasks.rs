@@ -1451,9 +1451,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_auth_middleware_rejects_missing_token() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = false;
-        config.jwt.hs256_secret = Some("test-secret".to_string());
+        let config = crate::config::Config {
+            debug: false,
+            jwt: JwtConfig {
+                hs256_secret: Some("test-secret".to_string()),
+                ..JwtConfig::default()
+            },
+            ..crate::config::Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let app = Router::new()
@@ -1535,9 +1540,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_auth_middleware_accepts_debug_headers_in_dev() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
-        config.posture = Posture::Dev;
+        let config = crate::config::Config {
+            debug: true,
+            posture: Posture::Dev,
+            ..crate::config::Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let app = Router::new()
@@ -1574,10 +1581,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_auth_middleware_rejects_debug_headers_outside_dev() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
-        config.posture = Posture::Private;
-        config.jwt.hs256_secret = Some("test-secret".to_string());
+        let config = crate::config::Config {
+            debug: true,
+            posture: Posture::Private,
+            jwt: JwtConfig {
+                hs256_secret: Some("test-secret".to_string()),
+                ..JwtConfig::default()
+            },
+            ..crate::config::Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let app = Router::new()

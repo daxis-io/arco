@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
   "audit_date": "2026-02-12",
-  "generated_at_utc": "2026-02-16T02:41:23Z",
+  "generated_at_utc": "2026-02-18T19:04:52Z",
   "baseline_commit": "e896506f3c936c266a21fe556a107d37bd7075b5",
   "definition_of_done": "ALL_GATES_GO",
   "evidence_root": "release_evidence/2026-02-12-prod-readiness",
@@ -43,8 +43,8 @@
     {
       "id": 1,
       "name": "Release discipline / provenance",
-      "status": "PARTIAL",
-      "status_reason": "Release-tag CI enforcement and immutable collector are closed with local evidence; signed-tag provenance and SBOM publication/retention are implemented but still require a remote GitHub release-tag workflow run to capture attestation and published asset evidence.",
+      "status": "GO",
+      "status_reason": "All Gate 1 signals are now closed on release tag v0.1.4: release-tag discipline check-run succeeded, signed-tag verification + provenance attestation succeeded, immutable collector pack is manifest-verified, and SBOM assets are published with retained artifact packs.",
       "required_signal_ids": [
         "G1-001",
         "G1-002",
@@ -57,7 +57,9 @@
         "release_evidence/2026-02-12-prod-readiness/gate-1/g1-002-immutable-collector-evidence.md",
         "release_evidence/2026-02-12-prod-readiness/gate-1/g1-003-release-tag-ci-enforcement-evidence.md",
         "release_evidence/2026-02-12-prod-readiness/gate-1/g1-004-sbom-retention-evidence.md",
-        "release_evidence/2026-02-12-prod-readiness/gate-1/external-handoff-checklist.md"
+        "release_evidence/2026-02-12-prod-readiness/gate-1/github-run/v0.1.4/release-sbom-run.json",
+        "release_evidence/2026-02-12-prod-readiness/gate-1/github-run/v0.1.4/release-view.json",
+        "release_evidence/2026-02-12-prod-readiness/gate-1/github-run/v0.1.4/release-sbom-run-artifacts.json"
       ]
     },
     {
@@ -196,7 +198,7 @@
     {
       "id": "G1-001",
       "owner": "Release Engineering",
-      "status": "PARTIAL"
+      "status": "GO"
     },
     {
       "id": "G1-002",
@@ -211,7 +213,7 @@
     {
       "id": "G1-004",
       "owner": "Security Engineering",
-      "status": "PARTIAL"
+      "status": "GO"
     },
     {
       "id": "G2-001",

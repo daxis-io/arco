@@ -1,0 +1,3 @@
+[codex/prod-go-closure-batch3 d67b9e3] release(gate1): harden tag discipline and sbom workflow for v0.1.1
+ 4 files changed, 23 insertions(+)
+ create mode 100644 release_notes/v0.1.1.md

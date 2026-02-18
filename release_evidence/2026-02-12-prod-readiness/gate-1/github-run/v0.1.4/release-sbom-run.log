@@ -1,0 +1,1084 @@
+sbom	Set up job	﻿2026-02-18T18:56:34.5100622Z Current runner version: '2.331.0'
+sbom	Set up job	2026-02-18T18:56:34.5132421Z ##[group]Runner Image Provisioner
+sbom	Set up job	2026-02-18T18:56:34.5133695Z Hosted Compute Agent
+sbom	Set up job	2026-02-18T18:56:34.5134495Z Version: 20260123.484
+sbom	Set up job	2026-02-18T18:56:34.5135458Z Commit: 6bd6555ca37d84114959e1c76d2c01448ff61c5d
+sbom	Set up job	2026-02-18T18:56:34.5136853Z Build Date: 2026-01-23T19:41:17Z
+sbom	Set up job	2026-02-18T18:56:34.5137945Z Worker ID: {9eb363bf-5bf5-43b0-827c-f2bde1b423b5}
+sbom	Set up job	2026-02-18T18:56:34.5139031Z Azure Region: eastus2
+sbom	Set up job	2026-02-18T18:56:34.5140013Z ##[endgroup]
+sbom	Set up job	2026-02-18T18:56:34.5142175Z ##[group]Operating System
+sbom	Set up job	2026-02-18T18:56:34.5143499Z Ubuntu
+sbom	Set up job	2026-02-18T18:56:34.5144417Z 24.04.3
+sbom	Set up job	2026-02-18T18:56:34.5145089Z LTS
+sbom	Set up job	2026-02-18T18:56:34.5146039Z ##[endgroup]
+sbom	Set up job	2026-02-18T18:56:34.5146945Z ##[group]Runner Image
+sbom	Set up job	2026-02-18T18:56:34.5147811Z Image: ubuntu-24.04
+sbom	Set up job	2026-02-18T18:56:34.5148574Z Version: 20260209.23.1
+sbom	Set up job	2026-02-18T18:56:34.5150365Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260209.23/images/ubuntu/Ubuntu2404-Readme.md
+sbom	Set up job	2026-02-18T18:56:34.5153135Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260209.23
+sbom	Set up job	2026-02-18T18:56:34.5154692Z ##[endgroup]
+sbom	Set up job	2026-02-18T18:56:34.5156743Z ##[group]GITHUB_TOKEN Permissions
+sbom	Set up job	2026-02-18T18:56:34.5159400Z Attestations: write
+sbom	Set up job	2026-02-18T18:56:34.5160245Z Contents: write
+sbom	Set up job	2026-02-18T18:56:34.5161053Z Metadata: read
+sbom	Set up job	2026-02-18T18:56:34.5161907Z ##[endgroup]
+sbom	Set up job	2026-02-18T18:56:34.5164684Z Secret source: Actions
+sbom	Set up job	2026-02-18T18:56:34.5165624Z Prepare workflow directory
+sbom	Set up job	2026-02-18T18:56:34.5919581Z Prepare all required actions
+sbom	Set up job	2026-02-18T18:56:34.5973965Z Getting action download info
+sbom	Set up job	2026-02-18T18:56:35.0223299Z Download action repository 'actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd' (SHA:de0fac2e4500dabe0009e67214ff5f5447ce83dd)
+sbom	Set up job	2026-02-18T18:56:35.1961366Z Download action repository 'dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7' (SHA:4be9e76fd7c4901c61fb841f559994984270fce7)
+sbom	Set up job	2026-02-18T18:56:35.3744007Z Download action repository 'taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131' (SHA:288875dd3d64326724fa6d9593062d9f8ba0b131)
+sbom	Set up job	2026-02-18T18:56:35.6343602Z Download action repository 'actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f' (SHA:b7c566a772e6b6bfb58ed0dc250532a479d7789f)
+sbom	Set up job	2026-02-18T18:56:35.7891697Z Download action repository 'actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a' (SHA:977bb373ede98d70efdf65b84cb5f73e068dcc2a)
+sbom	Set up job	2026-02-18T18:56:36.0413200Z Download action repository 'softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b' (SHA:a06a81a03ee405af7f2048a818ed3f03bbf83c7b)
+sbom	Set up job	2026-02-18T18:56:36.4350131Z Getting action download info
+sbom	Set up job	2026-02-18T18:56:36.6203905Z Download action repository 'actions/attest-build-provenance@864457a58d4733d7f1574bd8821fa24e02cf7538' (SHA:864457a58d4733d7f1574bd8821fa24e02cf7538)
+sbom	Set up job	2026-02-18T18:56:36.8643531Z Download action repository 'actions/attest@daf44fb950173508f38bd2406030372c1d1162b1' (SHA:daf44fb950173508f38bd2406030372c1d1162b1)
+sbom	Set up job	2026-02-18T18:56:37.1356750Z Complete job name: sbom
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	﻿2026-02-18T18:56:37.2188666Z ##[group]Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2190255Z with:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2190933Z   fetch-depth: 0
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2191656Z   ref: v0.1.4
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2192375Z   repository: daxis-io/arco
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2193460Z   token: ***
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2194158Z   ssh-strict: true
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2194888Z   ssh-user: git
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2195622Z   persist-credentials: true
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2196637Z   clean: true
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2197398Z   sparse-checkout-cone-mode: true
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2198293Z   fetch-tags: false
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2199036Z   show-progress: true
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2199781Z   lfs: false
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2200477Z   submodules: false
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2201228Z   set-safe-directory: true
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2202284Z env:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2202968Z   CARGO_TERM_COLOR: always
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2203797Z   RUST_BACKTRACE: 1
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2204823Z   SBOM_RETENTION_DAYS: 90
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2205798Z   RELEASE_TAG: v0.1.4
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.2206606Z ##[endgroup]
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3208561Z Syncing repository: daxis-io/arco
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3212372Z ##[group]Getting Git version info
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3214185Z Working directory is '/home/runner/work/arco/arco'
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3217393Z [command]/usr/bin/git version
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3218974Z git version 2.52.0
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3223720Z ##[endgroup]
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3232478Z Temporarily overriding HOME='/home/runner/work/_temp/937f43bc-e5e1-423a-a6cb-abd47d08c0a6' before making global git config changes
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3235074Z Adding repository directory to the temporary git global config as a safe directory
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3237262Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/arco/arco
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3301612Z Deleting the contents of '/home/runner/work/arco/arco'
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3306140Z ##[group]Initializing the repository
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3310978Z [command]/usr/bin/git init /home/runner/work/arco/arco
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3677133Z hint: Using 'master' as the name for the initial branch. This default branch name
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3679487Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3681579Z hint: to use in all of your new repositories, which will suppress this warning,
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3683189Z hint: call:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3683930Z hint:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3684868Z hint: 	git config --global init.defaultBranch <name>
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3686341Z hint:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3687476Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3689362Z hint: 'development'. The just-created branch can be renamed via this command:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3690852Z hint:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3691622Z hint: 	git branch -m <name>
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3692535Z hint:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3693651Z hint: Disable this message with "git config set advice.defaultBranchName false"
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3710081Z Initialized empty Git repository in /home/runner/work/arco/arco/.git/
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3719282Z [command]/usr/bin/git remote add origin https://github.com/daxis-io/arco
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3801660Z ##[endgroup]
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3803161Z ##[group]Disabling automatic garbage collection
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3804942Z [command]/usr/bin/git config --local gc.auto 0
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3833744Z ##[endgroup]
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3835307Z ##[group]Setting up auth
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3836560Z Removing SSH command configuration
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3840172Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.3873482Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.5258640Z Removing HTTP extra header
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.5264602Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.5302538Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.5559111Z Removing includeIf entries pointing to credentials config files
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.5563458Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.5600385Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.5852093Z [command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-d6aa5f25-9756-4829-9a2c-cdce2808f8bb.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.5890112Z [command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/arco/arco/.git.path /home/runner/work/_temp/git-credentials-d6aa5f25-9756-4829-9a2c-cdce2808f8bb.config
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.5923373Z [command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/arco/arco/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-d6aa5f25-9756-4829-9a2c-cdce2808f8bb.config
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.5955313Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-d6aa5f25-9756-4829-9a2c-cdce2808f8bb.config
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.5990045Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-d6aa5f25-9756-4829-9a2c-cdce2808f8bb.config
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.6027594Z ##[endgroup]
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.6029752Z ##[group]Fetching the repository
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:37.6037212Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.2986754Z From https://github.com/daxis-io/arco
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.2988982Z  * [new branch]      codex/pr5-flow-observability-queue-depth -> origin/codex/pr5-flow-observability-queue-depth
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.2990466Z  * [new branch]      codex/prod-go-closure-batch3 -> origin/codex/prod-go-closure-batch3
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.2991525Z  * [new branch]      main                -> origin/main
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.2992392Z  * [new branch]      orch-read-api-fixes -> origin/orch-read-api-fixes
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.2993226Z  * [new tag]         v0.1.0              -> v0.1.0
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.2993970Z  * [new tag]         v0.1.0-alpha.1      -> v0.1.0-alpha.1
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.2994679Z  * [new tag]         v0.1.1              -> v0.1.1
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.2995373Z  * [new tag]         v0.1.2              -> v0.1.2
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.2996390Z  * [new tag]         v0.1.3              -> v0.1.3
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.2997099Z  * [new tag]         v0.1.4              -> v0.1.4
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.3071323Z ##[endgroup]
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.3071942Z ##[group]Determining the checkout info
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.3078725Z [command]/usr/bin/git branch --list --remote origin/v0.1.4
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.3113946Z [command]/usr/bin/git tag --list v0.1.4
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.3179917Z v0.1.4
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.3184762Z ##[endgroup]
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.3188735Z [command]/usr/bin/git sparse-checkout disable
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.3273470Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.3300356Z ##[group]Checking out the ref
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.3303988Z [command]/usr/bin/git checkout --progress --force refs/tags/v0.1.4
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4164148Z Note: switching to 'refs/tags/v0.1.4'.
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4164885Z 
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4165434Z You are in 'detached HEAD' state. You can look around, make experimental
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4166910Z changes and commit them, and you can discard any commits you make in this
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4168108Z state without impacting any branches by switching back to a branch.
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4168863Z 
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4169259Z If you want to create a new branch to retain commits you create, you may
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4170360Z do so (now or later) by using -c with the switch command. Example:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4170774Z 
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4170970Z   git switch -c <new-branch-name>
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4171267Z 
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4171451Z Or undo this operation with:
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4171782Z 
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4171978Z   git switch -
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4172334Z 
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4172801Z Turn off this advice by setting config variable advice.detachedHead to false
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4173565Z 
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4174239Z HEAD is now at b26c3d8 release(gate1): verify signed tags with repo-pinned signers for v0.1.4
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4178054Z ##[endgroup]
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4221063Z [command]/usr/bin/git log -1 --format=%H
+sbom	Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:56:38.4245478Z b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Install ripgrep	﻿2026-02-18T18:56:38.4419173Z ##[group]Run sudo apt-get update && sudo apt-get install -y ripgrep
+sbom	Install ripgrep	2026-02-18T18:56:38.4420019Z [36;1msudo apt-get update && sudo apt-get install -y ripgrep[0m
+sbom	Install ripgrep	2026-02-18T18:56:38.4475490Z shell: /usr/bin/bash -e {0}
+sbom	Install ripgrep	2026-02-18T18:56:38.4476243Z env:
+sbom	Install ripgrep	2026-02-18T18:56:38.4501869Z   CARGO_TERM_COLOR: always
+sbom	Install ripgrep	2026-02-18T18:56:38.4502302Z   RUST_BACKTRACE: 1
+sbom	Install ripgrep	2026-02-18T18:56:38.4502615Z   SBOM_RETENTION_DAYS: 90
+sbom	Install ripgrep	2026-02-18T18:56:38.4502927Z   RELEASE_TAG: v0.1.4
+sbom	Install ripgrep	2026-02-18T18:56:38.4503235Z ##[endgroup]
+sbom	Install ripgrep	2026-02-18T18:56:38.5550549Z Get:1 file:/etc/apt/apt-mirrors.txt Mirrorlist [144 B]
+sbom	Install ripgrep	2026-02-18T18:56:38.5886871Z Hit:2 http://azure.archive.ubuntu.com/ubuntu noble InRelease
+sbom	Install ripgrep	2026-02-18T18:56:38.5905438Z Get:3 http://azure.archive.ubuntu.com/ubuntu noble-updates InRelease [126 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.5941956Z Get:4 http://azure.archive.ubuntu.com/ubuntu noble-backports InRelease [126 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.5986562Z Get:5 http://azure.archive.ubuntu.com/ubuntu noble-security InRelease [126 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.6314605Z Get:6 https://packages.microsoft.com/repos/azure-cli noble InRelease [3564 B]
+sbom	Install ripgrep	2026-02-18T18:56:38.6402070Z Get:7 https://packages.microsoft.com/ubuntu/24.04/prod noble InRelease [3600 B]
+sbom	Install ripgrep	2026-02-18T18:56:38.7664018Z Get:8 http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages [1766 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.7849399Z Get:9 http://azure.archive.ubuntu.com/ubuntu noble-updates/main Translation-en [328 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.7886636Z Get:10 http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Components [175 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.7907775Z Get:11 http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 c-n-f Metadata [16.5 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.7912180Z Get:12 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe amd64 Packages [1555 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.8014294Z Get:13 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe Translation-en [315 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.8047456Z Get:14 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe amd64 Components [386 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.8075853Z Get:15 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe amd64 c-n-f Metadata [32.5 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.8090138Z Get:16 http://azure.archive.ubuntu.com/ubuntu noble-updates/restricted amd64 Packages [2646 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.8228431Z Get:17 http://azure.archive.ubuntu.com/ubuntu noble-updates/restricted Translation-en [611 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.8720156Z Get:18 http://azure.archive.ubuntu.com/ubuntu noble-updates/restricted amd64 Components [212 B]
+sbom	Install ripgrep	2026-02-18T18:56:38.8728807Z Get:19 http://azure.archive.ubuntu.com/ubuntu noble-updates/multiverse amd64 Components [940 B]
+sbom	Install ripgrep	2026-02-18T18:56:38.8741242Z Get:20 http://azure.archive.ubuntu.com/ubuntu noble-backports/main amd64 Components [7300 B]
+sbom	Install ripgrep	2026-02-18T18:56:38.8751390Z Get:21 http://azure.archive.ubuntu.com/ubuntu noble-backports/universe amd64 Components [10.5 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.8763265Z Get:22 http://azure.archive.ubuntu.com/ubuntu noble-backports/restricted amd64 Components [216 B]
+sbom	Install ripgrep	2026-02-18T18:56:38.8772421Z Get:23 http://azure.archive.ubuntu.com/ubuntu noble-backports/multiverse amd64 Components [212 B]
+sbom	Install ripgrep	2026-02-18T18:56:38.8917549Z Get:24 http://azure.archive.ubuntu.com/ubuntu noble-security/main amd64 Packages [1472 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.9036896Z Get:25 http://azure.archive.ubuntu.com/ubuntu noble-security/main Translation-en [237 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.9043263Z Get:26 http://azure.archive.ubuntu.com/ubuntu noble-security/main amd64 Components [21.5 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.9057906Z Get:27 http://azure.archive.ubuntu.com/ubuntu noble-security/main amd64 c-n-f Metadata [9892 B]
+sbom	Install ripgrep	2026-02-18T18:56:38.9072002Z Get:28 http://azure.archive.ubuntu.com/ubuntu noble-security/universe amd64 Packages [935 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.9146463Z Get:29 http://azure.archive.ubuntu.com/ubuntu noble-security/universe Translation-en [214 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.9171823Z Get:30 http://azure.archive.ubuntu.com/ubuntu noble-security/universe amd64 Components [74.2 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.9179774Z Get:31 http://azure.archive.ubuntu.com/ubuntu noble-security/universe amd64 c-n-f Metadata [19.9 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.9644972Z Get:32 http://azure.archive.ubuntu.com/ubuntu noble-security/restricted amd64 Packages [2510 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.9658242Z Get:36 https://packages.microsoft.com/repos/azure-cli noble/main amd64 Packages [2129 B]
+sbom	Install ripgrep	2026-02-18T18:56:38.9819742Z Get:33 http://azure.archive.ubuntu.com/ubuntu noble-security/restricted Translation-en [581 kB]
+sbom	Install ripgrep	2026-02-18T18:56:38.9887679Z Get:34 http://azure.archive.ubuntu.com/ubuntu noble-security/restricted amd64 Components [212 B]
+sbom	Install ripgrep	2026-02-18T18:56:38.9900167Z Get:35 http://azure.archive.ubuntu.com/ubuntu noble-security/multiverse amd64 Components [212 B]
+sbom	Install ripgrep	2026-02-18T18:56:39.0492865Z Get:37 https://packages.microsoft.com/ubuntu/24.04/prod noble/main armhf Packages [11.4 kB]
+sbom	Install ripgrep	2026-02-18T18:56:39.0592286Z Get:38 https://packages.microsoft.com/ubuntu/24.04/prod noble/main arm64 Packages [69.9 kB]
+sbom	Install ripgrep	2026-02-18T18:56:39.0739926Z Get:39 https://packages.microsoft.com/ubuntu/24.04/prod noble/main amd64 Packages [90.4 kB]
+sbom	Install ripgrep	2026-02-18T18:56:39.0892105Z Get:40 https://packages.microsoft.com/ubuntu/24.04/prod noble/main all Packages [643 B]
+sbom	Install ripgrep	2026-02-18T18:56:44.8962714Z Fetched 14.5 MB in 2s (8516 kB/s)
+sbom	Install ripgrep	2026-02-18T18:56:45.6414856Z Reading package lists...
+sbom	Install ripgrep	2026-02-18T18:56:45.6753000Z Reading package lists...
+sbom	Install ripgrep	2026-02-18T18:56:45.8337172Z Building dependency tree...
+sbom	Install ripgrep	2026-02-18T18:56:45.8344959Z Reading state information...
+sbom	Install ripgrep	2026-02-18T18:56:46.0083678Z The following NEW packages will be installed:
+sbom	Install ripgrep	2026-02-18T18:56:46.0084498Z   ripgrep
+sbom	Install ripgrep	2026-02-18T18:56:46.0254345Z 0 upgraded, 1 newly installed, 0 to remove and 75 not upgraded.
+sbom	Install ripgrep	2026-02-18T18:56:46.0255012Z Need to get 1551 kB of archives.
+sbom	Install ripgrep	2026-02-18T18:56:46.0255626Z After this operation, 5335 kB of additional disk space will be used.
+sbom	Install ripgrep	2026-02-18T18:56:46.0256571Z Get:1 file:/etc/apt/apt-mirrors.txt Mirrorlist [144 B]
+sbom	Install ripgrep	2026-02-18T18:56:46.0446657Z Get:2 http://azure.archive.ubuntu.com/ubuntu noble/universe amd64 ripgrep amd64 14.1.0-1 [1551 kB]
+sbom	Install ripgrep	2026-02-18T18:56:46.3123710Z Fetched 1551 kB in 0s (30.6 MB/s)
+sbom	Install ripgrep	2026-02-18T18:56:46.3462016Z Selecting previously unselected package ripgrep.
+sbom	Install ripgrep	2026-02-18T18:56:46.4539218Z (Reading database ... 
+sbom	Install ripgrep	2026-02-18T18:56:46.4540062Z (Reading database ... 5%
+sbom	Install ripgrep	2026-02-18T18:56:46.4540401Z (Reading database ... 10%
+sbom	Install ripgrep	2026-02-18T18:56:46.4540695Z (Reading database ... 15%
+sbom	Install ripgrep	2026-02-18T18:56:46.4540984Z (Reading database ... 20%
+sbom	Install ripgrep	2026-02-18T18:56:46.4541275Z (Reading database ... 25%
+sbom	Install ripgrep	2026-02-18T18:56:46.4541555Z (Reading database ... 30%
+sbom	Install ripgrep	2026-02-18T18:56:46.4541835Z (Reading database ... 35%
+sbom	Install ripgrep	2026-02-18T18:56:46.4542112Z (Reading database ... 40%
+sbom	Install ripgrep	2026-02-18T18:56:46.4542389Z (Reading database ... 45%
+sbom	Install ripgrep	2026-02-18T18:56:46.4542678Z (Reading database ... 50%
+sbom	Install ripgrep	2026-02-18T18:56:46.5050434Z (Reading database ... 55%
+sbom	Install ripgrep	2026-02-18T18:56:46.6814156Z (Reading database ... 60%
+sbom	Install ripgrep	2026-02-18T18:56:46.7560819Z (Reading database ... 65%
+sbom	Install ripgrep	2026-02-18T18:56:46.8319908Z (Reading database ... 70%
+sbom	Install ripgrep	2026-02-18T18:56:46.9529533Z (Reading database ... 75%
+sbom	Install ripgrep	2026-02-18T18:56:47.3331974Z (Reading database ... 80%
+sbom	Install ripgrep	2026-02-18T18:56:47.8849773Z (Reading database ... 85%
+sbom	Install ripgrep	2026-02-18T18:56:48.4319014Z (Reading database ... 90%
+sbom	Install ripgrep	2026-02-18T18:56:48.9454028Z (Reading database ... 95%
+sbom	Install ripgrep	2026-02-18T18:56:48.9454549Z (Reading database ... 100%
+sbom	Install ripgrep	2026-02-18T18:56:48.9455065Z (Reading database ... 218331 files and directories currently installed.)
+sbom	Install ripgrep	2026-02-18T18:56:48.9501431Z Preparing to unpack .../ripgrep_14.1.0-1_amd64.deb ...
+sbom	Install ripgrep	2026-02-18T18:56:48.9526445Z Unpacking ripgrep (14.1.0-1) ...
+sbom	Install ripgrep	2026-02-18T18:56:49.0344147Z Setting up ripgrep (14.1.0-1) ...
+sbom	Install ripgrep	2026-02-18T18:56:49.0383878Z Processing triggers for man-db (2.12.0-4build2) ...
+sbom	Install ripgrep	2026-02-18T18:56:49.0517936Z Not building database; man-db/auto-update is not 'true'.
+sbom	Install ripgrep	2026-02-18T18:56:50.1212075Z 
+sbom	Install ripgrep	2026-02-18T18:56:50.1212727Z Running kernel seems to be up-to-date.
+sbom	Install ripgrep	2026-02-18T18:56:50.1213106Z 
+sbom	Install ripgrep	2026-02-18T18:56:50.1213266Z No services need to be restarted.
+sbom	Install ripgrep	2026-02-18T18:56:50.1213552Z 
+sbom	Install ripgrep	2026-02-18T18:56:50.1213705Z No containers need to be restarted.
+sbom	Install ripgrep	2026-02-18T18:56:50.1214282Z 
+sbom	Install ripgrep	2026-02-18T18:56:50.1214548Z No user sessions are running outdated binaries.
+sbom	Install ripgrep	2026-02-18T18:56:50.1214775Z 
+sbom	Install ripgrep	2026-02-18T18:56:51.3227977Z No VM guests are running outdated hypervisor (qemu) binaries on this host.
+sbom	Resolve and validate release tag context	﻿2026-02-18T18:56:51.3264155Z ##[group]Run if [ -z "${RELEASE_TAG}" ]; then
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3264530Z [36;1mif [ -z "${RELEASE_TAG}" ]; then[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3264863Z [36;1m  echo "release tag is required for SBOM workflow" >&2[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3265166Z [36;1m  exit 1[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3265343Z [36;1mfi[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3265505Z [36;1m[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3266116Z [36;1mif [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3266708Z [36;1m  echo "release tag must match vMAJOR.MINOR.PATCH (optionally suffixed): ${RELEASE_TAG}" >&2[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3267135Z [36;1m  exit 1[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3267312Z [36;1mfi[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3267473Z [36;1m[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3267661Z [36;1mgit fetch --force --tags origin[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3267957Z [36;1mgit cat-file -e "${RELEASE_TAG}^{tag}"[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3268233Z [36;1m[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3268497Z [36;1mTAG_COMMIT_SHA="$(git rev-list -n 1 "${RELEASE_TAG}^{commit}")"[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3268886Z [36;1mHEAD_SHA="$(git rev-parse HEAD)"[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3269190Z [36;1mif [ "${HEAD_SHA}" != "${TAG_COMMIT_SHA}" ]; then[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3269692Z [36;1m  echo "checked out commit (${HEAD_SHA}) does not match tag commit (${TAG_COMMIT_SHA}) for ${RELEASE_TAG}" >&2[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3270150Z [36;1m  exit 1[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3270323Z [36;1mfi[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3270480Z [36;1m[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3270724Z [36;1mecho "TAG_COMMIT_SHA=${TAG_COMMIT_SHA}" >> "${GITHUB_ENV}"[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3271158Z [36;1mecho "SBOM_SPDX_FILE=arco-${RELEASE_TAG}.spdx.json" >> "${GITHUB_ENV}"[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3271663Z [36;1mecho "SBOM_CYCLONEDX_FILE=arco-${RELEASE_TAG}.cyclonedx.json" >> "${GITHUB_ENV}"[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3272189Z [36;1mecho "SBOM_SHA256_FILE=arco-${RELEASE_TAG}.sbom.sha256" >> "${GITHUB_ENV}"[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3272708Z [36;1mecho "EVIDENCE_ARCHIVE=arco-${RELEASE_TAG}.release-evidence.tgz" >> "${GITHUB_ENV}"[0m
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3321677Z shell: /usr/bin/bash -e {0}
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3321912Z env:
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3322093Z   CARGO_TERM_COLOR: always
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3322306Z   RUST_BACKTRACE: 1
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3322493Z   SBOM_RETENTION_DAYS: 90
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3322702Z   RELEASE_TAG: v0.1.4
+sbom	Resolve and validate release tag context	2026-02-18T18:56:51.3322890Z ##[endgroup]
+sbom	Wait for release-tag CI success	﻿2026-02-18T18:56:51.5014062Z ##[group]Run check_runs_api="https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${TAG_COMMIT_SHA}/check-runs?per_page=100"
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5014970Z [36;1mcheck_runs_api="https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${TAG_COMMIT_SHA}/check-runs?per_page=100"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5015505Z [36;1mmax_attempts=40[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5016011Z [36;1msleep_seconds=15[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5016229Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5016447Z [36;1mfor attempt in $(seq 1 "${max_attempts}"); do[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5016745Z [36;1m  checks_payload="$(curl -fsSL \[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5017328Z [36;1m    -H "Authorization: ***" \[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5017658Z [36;1m    -H "Accept: application/vnd.github+json" \[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5017953Z [36;1m    "${check_runs_api}")"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5018179Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5018350Z [36;1m  discipline_status="$([0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5018581Z [36;1m    jq -r '[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5018772Z [36;1m      .check_runs[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5019066Z [36;1m      | map(select(.name == "Release Tag Discipline"))[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5019434Z [36;1m      | sort_by(.started_at // .completed_at // .created_at)[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5019742Z [36;1m      | reverse[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5019954Z [36;1m      | (.[0].status // "")[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5020193Z [36;1m    ' <<<"${checks_payload}"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5020592Z [36;1m  )"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5020780Z [36;1m  discipline_conclusion="$([0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5021009Z [36;1m    jq -r '[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5021205Z [36;1m      .check_runs[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5021465Z [36;1m      | map(select(.name == "Release Tag Discipline"))[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5021830Z [36;1m      | sort_by(.started_at // .completed_at // .created_at)[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5022137Z [36;1m      | reverse[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5022349Z [36;1m      | (.[0].conclusion // "")[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5022595Z [36;1m    ' <<<"${checks_payload}"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5022820Z [36;1m  )"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5023002Z [36;1m  discipline_url="$([0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5023210Z [36;1m    jq -r '[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5023399Z [36;1m      .check_runs[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5023654Z [36;1m      | map(select(.name == "Release Tag Discipline"))[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5024009Z [36;1m      | sort_by(.started_at // .completed_at // .created_at)[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5024318Z [36;1m      | reverse[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5024524Z [36;1m      | (.[0].details_url // "")[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5024772Z [36;1m    ' <<<"${checks_payload}"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5024990Z [36;1m  )"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5025156Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5025490Z [36;1m  if [ "${discipline_status}" = "completed" ] && [ "${discipline_conclusion}" = "success" ]; then[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5026283Z [36;1m    echo "release-tag discipline passed: ${discipline_url}"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5026610Z [36;1m    break[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5026790Z [36;1m  fi[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5026966Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5027403Z [36;1m  if [ "${discipline_status}" = "completed" ] && [ -n "${discipline_conclusion}" ] && [ "${discipline_conclusion}" != "success" ]; then[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5028114Z [36;1m    echo "release-tag discipline check failed (${discipline_conclusion}): ${discipline_url}" >&2[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5028544Z [36;1m    exit 1[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5028735Z [36;1m  fi[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5028895Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5029112Z [36;1m  if [ "${attempt}" -eq "${max_attempts}" ]; then[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5029637Z [36;1m    echo "timed out waiting for successful release-tag discipline check-run for commit ${TAG_COMMIT_SHA}" >&2[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5030112Z [36;1m    exit 1[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5030294Z [36;1m  fi[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5030453Z [36;1m[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5030825Z [36;1m  echo "attempt ${attempt}/${max_attempts}: waiting for release-tag discipline check-run success..."[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5031458Z [36;1m  sleep "${sleep_seconds}"[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5031728Z [36;1mdone[0m
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5078796Z shell: /usr/bin/bash -e {0}
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5079027Z env:
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5079207Z   CARGO_TERM_COLOR: always
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5079414Z   RUST_BACKTRACE: 1
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5079607Z   SBOM_RETENTION_DAYS: 90
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5079811Z   RELEASE_TAG: v0.1.4
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5080073Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5080393Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5080743Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5081058Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5081359Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5081771Z   GH_TOKEN: ***
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.5081956Z ##[endgroup]
+sbom	Wait for release-tag CI success	2026-02-18T18:56:51.9926511Z release-tag discipline passed: https://github.com/daxis-io/arco/actions/runs/22153366241/job/64050488799
+sbom	Validate changelog + release notes completeness	﻿2026-02-18T18:56:51.9952775Z ##[group]Run bash tools/check-release-tag-discipline.sh --tag "${RELEASE_TAG}"
+sbom	Validate changelog + release notes completeness	2026-02-18T18:56:51.9953323Z [36;1mbash tools/check-release-tag-discipline.sh --tag "${RELEASE_TAG}"[0m
+sbom	Validate changelog + release notes completeness	2026-02-18T18:56:52.0001798Z shell: /usr/bin/bash -e {0}
+sbom	Validate changelog + release notes completeness	2026-02-18T18:56:52.0002169Z env:
+sbom	Validate changelog + release notes completeness	2026-02-18T18:56:52.0002465Z   CARGO_TERM_COLOR: always
+sbom	Validate changelog + release notes completeness	2026-02-18T18:56:52.0002813Z   RUST_BACKTRACE: 1
+sbom	Validate changelog + release notes completeness	2026-02-18T18:56:52.0003361Z   SBOM_RETENTION_DAYS: 90
+sbom	Validate changelog + release notes completeness	2026-02-18T18:56:52.0003642Z   RELEASE_TAG: v0.1.4
+sbom	Validate changelog + release notes completeness	2026-02-18T18:56:52.0003904Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Validate changelog + release notes completeness	2026-02-18T18:56:52.0004225Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Validate changelog + release notes completeness	2026-02-18T18:56:52.0004513Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Validate changelog + release notes completeness	2026-02-18T18:56:52.0004801Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Validate changelog + release notes completeness	2026-02-18T18:56:52.0005098Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Validate changelog + release notes completeness	2026-02-18T18:56:52.0005374Z ##[endgroup]
+sbom	Validate changelog + release notes completeness	2026-02-18T18:56:52.0349052Z release-tag discipline checks passed for v0.1.4
+sbom	Validate annotated signed release tag	﻿2026-02-18T18:56:52.0374350Z ##[group]Run git cat-file -e "${RELEASE_TAG}^{tag}"
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0374737Z [36;1mgit cat-file -e "${RELEASE_TAG}^{tag}"[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0375089Z [36;1mTAG_OBJECT_SHA="$(git rev-parse "${RELEASE_TAG}^{tag}")"[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0375546Z [36;1mgit cat-file -p "${RELEASE_TAG}^{tag}" > "arco-${RELEASE_TAG}.tag-object.txt"[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0376184Z [36;1m[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0376541Z [36;1mif ! rg -q '^-----BEGIN (PGP|SSH) SIGNATURE-----$' "arco-${RELEASE_TAG}.tag-object.txt"; then[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0377111Z [36;1m  echo "release tag must include a PGP or SSH signature block: ${RELEASE_TAG}" >&2[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0377492Z [36;1m  exit 1[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0377671Z [36;1mfi[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0377841Z [36;1m[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0378199Z [36;1mif ! git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=".github/release-signers.allowed" \[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0378765Z [36;1m  verify-tag "${RELEASE_TAG}" > "arco-${RELEASE_TAG}.tag-verify.txt" 2>&1; then[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0379429Z [36;1m  echo "release tag signature verification failed against .github/release-signers.allowed for ${RELEASE_TAG}" >&2[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0379984Z [36;1m  cat "arco-${RELEASE_TAG}.tag-verify.txt" >&2[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0380256Z [36;1m  exit 1[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0380433Z [36;1mfi[0m
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0423438Z shell: /usr/bin/bash -e {0}
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0423670Z env:
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0423845Z   CARGO_TERM_COLOR: always
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0424055Z   RUST_BACKTRACE: 1
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0424247Z   SBOM_RETENTION_DAYS: 90
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0424446Z   RELEASE_TAG: v0.1.4
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0424699Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0425002Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0425286Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0425576Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0426096Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Validate annotated signed release tag	2026-02-18T18:56:52.0426382Z ##[endgroup]
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	﻿2026-02-18T18:56:52.0825016Z ##[group]Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0825418Z with:
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0825592Z   toolchain: 1.85
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0826014Z env:
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0826188Z   CARGO_TERM_COLOR: always
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0826393Z   RUST_BACKTRACE: 1
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0826595Z   SBOM_RETENTION_DAYS: 90
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0826792Z   RELEASE_TAG: v0.1.4
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0827042Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0827345Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0827630Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0827924Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0828216Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0828494Z ##[endgroup]
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0917976Z ##[group]Run : parse toolchain version
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0918301Z [36;1m: parse toolchain version[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0918553Z [36;1mif [[ -z $toolchain ]]; then[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0919067Z [36;1m  # GitHub does not enforce `required: true` inputs itself. https://github.com/actions/runner/issues/1070[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0919611Z [36;1m  echo "'toolchain' is a required input" >&2[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0919881Z [36;1m  exit 1[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0920341Z [36;1melif [[ $toolchain =~ ^stable' '[0-9]+' '(year|month|week|day)s?' 'ago$ ]]; then[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0920736Z [36;1m  if [[ Linux == macOS ]]; then[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0921241Z [36;1m    echo "toolchain=1.$((($(date -v-$(sed 's/stable \([0-9]*\) \(.\).*/\1\2/' <<< $toolchain) +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0921747Z [36;1m  else[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0922130Z [36;1m    echo "toolchain=1.$((($(date --date "${toolchain#stable }" +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0922566Z [36;1m  fi[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0922839Z [36;1melif [[ $toolchain =~ ^stable' 'minus' '[0-9]+' 'releases?$ ]]; then[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0923349Z [36;1m  echo "toolchain=1.$((($(date +%s)/60/60/24-16569)/7/6-${toolchain//[^0-9]/}))" >> $GITHUB_OUTPUT[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0923787Z [36;1melif [[ $toolchain =~ ^1\.[0-9]+$ ]]; then[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0924283Z [36;1m  echo "toolchain=1.$((i=${toolchain#1.}, c=($(date +%s)/60/60/24-16569)/7/6, i+9*i*(10*i<=c)+90*i*(100*i<=c)))" >> $GITHUB_OUTPUT[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0924759Z [36;1melse[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0924988Z [36;1m  echo "toolchain=$toolchain" >> $GITHUB_OUTPUT[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0925260Z [36;1mfi[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0973728Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0974055Z env:
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0974226Z   CARGO_TERM_COLOR: always
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0974443Z   RUST_BACKTRACE: 1
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0974638Z   SBOM_RETENTION_DAYS: 90
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0974849Z   RELEASE_TAG: v0.1.4
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0975101Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0975416Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0975879Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0976191Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0976491Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0976762Z   toolchain: 1.85
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.0976947Z ##[endgroup]
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1110739Z ##[group]Run : construct rustup command line
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1111049Z [36;1m: construct rustup command line[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1111477Z [36;1mecho "targets=$(for t in ${targets//,/ }; do echo -n ' --target' $t; done)" >> $GITHUB_OUTPUT[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1112084Z [36;1mecho "components=$(for c in ${components//,/ }; do echo -n ' --component' $c; done)" >> $GITHUB_OUTPUT[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1112541Z [36;1mecho "downgrade=" >> $GITHUB_OUTPUT[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1155300Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1155626Z env:
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1156107Z   CARGO_TERM_COLOR: always
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1156549Z   RUST_BACKTRACE: 1
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1156742Z   SBOM_RETENTION_DAYS: 90
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1156951Z   RELEASE_TAG: v0.1.4
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1157202Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1157513Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1157796Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1158082Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1158378Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1158653Z   targets: 
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1158824Z   components: 
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1158992Z ##[endgroup]
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1249016Z ##[group]Run : set $CARGO_HOME
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1249278Z [36;1m: set $CARGO_HOME[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1249582Z [36;1mecho CARGO_HOME=${CARGO_HOME:-"$HOME/.cargo"} >> $GITHUB_ENV[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1291968Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1292285Z env:
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1292466Z   CARGO_TERM_COLOR: always
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1292678Z   RUST_BACKTRACE: 1
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1292869Z   SBOM_RETENTION_DAYS: 90
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1293079Z   RELEASE_TAG: v0.1.4
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1293331Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1293798Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1294085Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1294370Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1294667Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1294938Z ##[endgroup]
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1379241Z ##[group]Run : install rustup if needed
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1379537Z [36;1m: install rustup if needed[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1379822Z [36;1mif ! command -v rustup &>/dev/null; then[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1380540Z [36;1m  curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs | sh -s -- --default-toolchain none -y[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1381268Z [36;1m  echo "$CARGO_HOME/bin" >> $GITHUB_PATH[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1381525Z [36;1mfi[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1424213Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1424533Z env:
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1424742Z   CARGO_TERM_COLOR: always
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1424962Z   RUST_BACKTRACE: 1
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1425151Z   SBOM_RETENTION_DAYS: 90
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1425350Z   RELEASE_TAG: v0.1.4
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1425605Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1426140Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1426422Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1426719Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1427020Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1427318Z   CARGO_HOME: /home/runner/.cargo
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1427545Z ##[endgroup]
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1512502Z ##[group]Run rustup toolchain install 1.85 --profile minimal --no-self-update
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1513014Z [36;1mrustup toolchain install 1.85 --profile minimal --no-self-update[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1555410Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1555923Z env:
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1556127Z   CARGO_TERM_COLOR: always
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1556335Z   RUST_BACKTRACE: 1
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1556522Z   SBOM_RETENTION_DAYS: 90
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1556720Z   RELEASE_TAG: v0.1.4
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1556967Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1557279Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1557556Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1557842Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1558127Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1558416Z   CARGO_HOME: /home/runner/.cargo
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1558644Z   RUSTUP_PERMIT_COPY_RENAME: 1
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.1559023Z ##[endgroup]
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.5528515Z info: syncing channel updates for '1.85-x86_64-unknown-linux-gnu'
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.7727394Z info: latest update on 2025-03-18, rust version 1.85.1 (4eb161250 2025-03-15)
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.7728213Z info: downloading component 'cargo'
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:52.8769870Z info: downloading component 'rust-std'
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:53.1208747Z info: downloading component 'rustc'
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:53.9938692Z info: installing component 'cargo'
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:54.6042164Z info: installing component 'rust-std'
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:56:56.5561941Z info: installing component 'rustc'
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7655000Z 
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7749257Z   1.85-x86_64-unknown-linux-gnu installed - rustc 1.85.1 (4eb161250 2025-03-15)
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7749803Z 
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7807030Z ##[group]Run rustup default 1.85
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7807495Z [36;1mrustup default 1.85[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7877456Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7878011Z env:
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7878297Z   CARGO_TERM_COLOR: always
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7878677Z   RUST_BACKTRACE: 1
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7878996Z   SBOM_RETENTION_DAYS: 90
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7879335Z   RELEASE_TAG: v0.1.4
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7879767Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7880566Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7881054Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7881560Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7882072Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7882575Z   CARGO_HOME: /home/runner/.cargo
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.7882953Z ##[endgroup]
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8018177Z info: using existing install for '1.85-x86_64-unknown-linux-gnu'
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8329911Z info: default toolchain set to '1.85-x86_64-unknown-linux-gnu'
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8330406Z 
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8420530Z   1.85-x86_64-unknown-linux-gnu unchanged - rustc 1.85.1 (4eb161250 2025-03-15)
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8420944Z 
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8421842Z info: note that the toolchain '1.85-x86_64-unknown-linux-gnu' is currently in use (overridden by '/home/runner/work/arco/arco/rust-toolchain.toml')
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8463418Z ##[group]Run : create cachekey
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8463700Z [36;1m: create cachekey[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8464170Z [36;1mDATE=$(rustc +1.85 --version --verbose | sed -ne 's/^commit-date: \(20[0-9][0-9]\)-\([01][0-9]\)-\([0-3][0-9]\)$/\1\2\3/p')[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8464795Z [36;1mHASH=$(rustc +1.85 --version --verbose | sed -ne 's/^commit-hash: //p')[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8465271Z [36;1mecho "cachekey=$(echo $DATE$HASH | head -c12)" >> $GITHUB_OUTPUT[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8513812Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8514131Z env:
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8514314Z   CARGO_TERM_COLOR: always
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8514533Z   RUST_BACKTRACE: 1
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8514720Z   SBOM_RETENTION_DAYS: 90
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8514938Z   RELEASE_TAG: v0.1.4
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8515189Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8515501Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8516014Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8516313Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8516604Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8516895Z   CARGO_HOME: /home/runner/.cargo
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8517118Z ##[endgroup]
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8916718Z ##[group]Run : disable incremental compilation
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8917072Z [36;1m: disable incremental compilation[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8917390Z [36;1mif [ -z "${CARGO_INCREMENTAL+set}" ]; then[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8917710Z [36;1m  echo CARGO_INCREMENTAL=0 >> $GITHUB_ENV[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8917975Z [36;1mfi[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8965121Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8965446Z env:
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8966091Z   CARGO_TERM_COLOR: always
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8966311Z   RUST_BACKTRACE: 1
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8966507Z   SBOM_RETENTION_DAYS: 90
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8966713Z   RELEASE_TAG: v0.1.4
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8966972Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8967286Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8967572Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8967859Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8968156Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8968442Z   CARGO_HOME: /home/runner/.cargo
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.8968670Z ##[endgroup]
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9047506Z ##[group]Run : enable colors in Cargo output
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9047819Z [36;1m: enable colors in Cargo output[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9048116Z [36;1mif [ -z "${CARGO_TERM_COLOR+set}" ]; then[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9048426Z [36;1m  echo CARGO_TERM_COLOR=always >> $GITHUB_ENV[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9048706Z [36;1mfi[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9090455Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9090774Z env:
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9090947Z   CARGO_TERM_COLOR: always
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9091160Z   RUST_BACKTRACE: 1
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9091354Z   SBOM_RETENTION_DAYS: 90
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9091697Z   RELEASE_TAG: v0.1.4
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9091957Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9092271Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9092556Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9092844Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9093142Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9093436Z   CARGO_HOME: /home/runner/.cargo
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9093661Z   CARGO_INCREMENTAL: 0
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9093853Z ##[endgroup]
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9170988Z ##[group]Run : enable Cargo sparse registry
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9171313Z [36;1m: enable Cargo sparse registry[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9171663Z [36;1m# implemented in 1.66, stabilized in 1.68, made default in 1.70[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9172349Z [36;1mif [ -z "${CARGO_REGISTRIES_CRATES_IO_PROTOCOL+set}" -o -f "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol ]; then[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9173045Z [36;1m  if rustc +1.85 --version --verbose | grep -q '^release: 1\.6[89]\.'; then[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9173573Z [36;1m    touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9174090Z [36;1m    echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse >> $GITHUB_ENV[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9174556Z [36;1m  elif rustc +1.85 --version --verbose | grep -q '^release: 1\.6[67]\.'; then[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9175081Z [36;1m    touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9175585Z [36;1m    echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git >> $GITHUB_ENV[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9176199Z [36;1m  fi[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9176379Z [36;1mfi[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9218098Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9218411Z env:
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9218591Z   CARGO_TERM_COLOR: always
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9218799Z   RUST_BACKTRACE: 1
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9218998Z   SBOM_RETENTION_DAYS: 90
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9219202Z   RELEASE_TAG: v0.1.4
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9219450Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9219762Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9220043Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9220330Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9220618Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9220906Z   CARGO_HOME: /home/runner/.cargo
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9221127Z   CARGO_INCREMENTAL: 0
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9221317Z ##[endgroup]
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9598126Z ##[group]Run : work around spurious network errors in curl 8.0
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9598706Z [36;1m: work around spurious network errors in curl 8.0[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9599237Z [36;1m# https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/timeout.20investigation[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9599818Z [36;1mif rustc +1.85 --version --verbose | grep -q '^release: 1\.7[01]\.'; then[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9600260Z [36;1m  echo CARGO_HTTP_MULTIPLEXING=false >> $GITHUB_ENV[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9600550Z [36;1mfi[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9648681Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9649003Z env:
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9649177Z   CARGO_TERM_COLOR: always
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9649388Z   RUST_BACKTRACE: 1
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9649572Z   SBOM_RETENTION_DAYS: 90
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9649776Z   RELEASE_TAG: v0.1.4
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9650030Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9650342Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9650640Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9650925Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9651220Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9651505Z   CARGO_HOME: /home/runner/.cargo
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9651731Z   CARGO_INCREMENTAL: 0
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9652080Z ##[endgroup]
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9911538Z ##[group]Run rustc +1.85 --version --verbose
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9911860Z [36;1mrustc +1.85 --version --verbose[0m
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9963465Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9963786Z env:
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9963956Z   CARGO_TERM_COLOR: always
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9964174Z   RUST_BACKTRACE: 1
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9964357Z   SBOM_RETENTION_DAYS: 90
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9964556Z   RELEASE_TAG: v0.1.4
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9964805Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9965110Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9965406Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9965867Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9966163Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9966458Z   CARGO_HOME: /home/runner/.cargo
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9966678Z   CARGO_INCREMENTAL: 0
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:00.9966874Z ##[endgroup]
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:01.0161377Z rustc 1.85.1 (4eb161250 2025-03-15)
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:01.0161968Z binary: rustc
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:01.0165164Z commit-hash: 4eb161250e340c8f48f66e2b929ef4a5bed7c181
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:01.0166041Z commit-date: 2025-03-15
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:01.0166410Z host: x86_64-unknown-linux-gnu
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:01.0166774Z release: 1.85.1
+sbom	Run dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7	2026-02-18T18:57:01.0167073Z LLVM version: 19.1.7
+sbom	Install cargo-sbom	﻿2026-02-18T18:57:01.0261510Z ##[group]Run taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0261895Z with:
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0262078Z   tool: cargo-sbom@0.10.0
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0262285Z   checksum: true
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0262477Z   fallback: cargo-binstall
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0262677Z env:
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0262844Z   CARGO_TERM_COLOR: always
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0263055Z   RUST_BACKTRACE: 1
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0263240Z   SBOM_RETENTION_DAYS: 90
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0263453Z   RELEASE_TAG: v0.1.4
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0263712Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0264023Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0264301Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0264596Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0264897Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0265186Z   CARGO_HOME: /home/runner/.cargo
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0265421Z   CARGO_INCREMENTAL: 0
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0265636Z ##[endgroup]
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0280874Z ##[group]Run set -eu
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0281118Z [36;1mset -eu[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0281336Z [36;1mif ! command -v bash >/dev/null; then[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0281713Z [36;1m  if grep -Eq '^ID=alpine' /etc/os-release; then[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0282138Z [36;1m    printf '::group::Install packages required for install-action (bash)\n'[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0282556Z [36;1m    # NB: sync with apk_install in main.sh[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0282848Z [36;1m    if command -v sudo >/dev/null; then[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0283144Z [36;1m      sudo apk --no-cache add bash[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0283429Z [36;1m    elif command -v doas >/dev/null; then[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0283714Z [36;1m      doas apk --no-cache add bash[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0283972Z [36;1m    else[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0284161Z [36;1m      apk --no-cache add bash[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0284398Z [36;1m    fi[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0284587Z [36;1m    printf '::endgroup::\n'[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0284823Z [36;1m  else[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0285054Z [36;1m    printf '::error::install-action requires bash\n'[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0285350Z [36;1m    exit 1[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0285530Z [36;1m  fi[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0285954Z [36;1mfi[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0325471Z shell: /usr/bin/sh -e {0}
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0325965Z env:
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0326215Z   CARGO_TERM_COLOR: always
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0326430Z   RUST_BACKTRACE: 1
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0326623Z   SBOM_RETENTION_DAYS: 90
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0326994Z   RELEASE_TAG: v0.1.4
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0327255Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0327574Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0327857Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0328150Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0328437Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0328730Z   CARGO_HOME: /home/runner/.cargo
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0328958Z   CARGO_INCREMENTAL: 0
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0329149Z ##[endgroup]
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0397468Z ##[group]Run bash --noprofile --norc "${GITHUB_ACTION_PATH:?}/main.sh"
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0397916Z [36;1mbash --noprofile --norc "${GITHUB_ACTION_PATH:?}/main.sh"[0m
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0441178Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0441497Z env:
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0441677Z   CARGO_TERM_COLOR: always
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0441886Z   RUST_BACKTRACE: 1
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0442088Z   SBOM_RETENTION_DAYS: 90
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0442290Z   RELEASE_TAG: v0.1.4
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0442551Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0442871Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0443152Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0443453Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0443747Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0444222Z   CARGO_HOME: /home/runner/.cargo
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0444466Z   CARGO_INCREMENTAL: 0
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0444692Z   INPUT_TOOL: cargo-sbom@0.10.0
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0444913Z   INPUT_CHECKSUM: true
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0445119Z   INPUT_FALLBACK: cargo-binstall
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0445560Z   DEFAULT_GITHUB_TOKEN: ***
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0446129Z   ACTION_USER_AGENT: taiki-e/install-action (288875dd3d64326724fa6d9593062d9f8ba0b131)
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0446526Z ##[endgroup]
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0692845Z info: host platform: x86_64_linux
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0709094Z info: install-action does not support cargo-sbom@0.10.0; fallback to cargo-binstall
+sbom	Install cargo-sbom	2026-02-18T18:57:01.0752086Z info: installing cargo-binstall@latest (1.17.5)
+sbom	Install cargo-sbom	2026-02-18T18:57:01.1100916Z info: downloading https://github.com/cargo-bins/cargo-binstall/releases/download/v1.17.5/cargo-binstall-x86_64-unknown-linux-musl.tgz
+sbom	Install cargo-sbom	2026-02-18T18:57:01.3548277Z info: verifying sha256 checksum for cargo-binstall-x86_64-unknown-linux-musl.tgz
+sbom	Install cargo-sbom	2026-02-18T18:57:01.5113530Z info: cargo-binstall installed at /home/runner/.cargo/bin/cargo-binstall
+sbom	Install cargo-sbom	2026-02-18T18:57:01.5117568Z + cargo-binstall binstall -V
+sbom	Install cargo-sbom	2026-02-18T18:57:01.5127732Z 1.17.5
+sbom	Install cargo-sbom	2026-02-18T18:57:01.5276182Z  INFO resolve: Resolving package: 'cargo-sbom@=0.10.0'
+sbom	Install cargo-sbom	2026-02-18T18:57:05.7689177Z  WARN The package cargo-sbom v0.10.0 (x86_64-unknown-linux-gnu) has been downloaded from github.com
+sbom	Install cargo-sbom	2026-02-18T18:57:05.7690197Z  INFO This will install the following binaries:
+sbom	Install cargo-sbom	2026-02-18T18:57:05.7690834Z  INFO   - cargo-sbom => /home/runner/.cargo/bin/cargo-sbom
+sbom	Install cargo-sbom	2026-02-18T18:57:05.7691412Z  INFO Installing binaries...
+sbom	Install cargo-sbom	2026-02-18T18:57:05.7702495Z  INFO Done in 4.255936508s
+sbom	Generate SBOM (SPDX JSON)	﻿2026-02-18T18:57:05.7744494Z ##[group]Run cargo sbom --output-format spdx_json_2_3 > "${SBOM_SPDX_FILE}"
+sbom	Generate SBOM (SPDX JSON)	2026-02-18T18:57:05.7745409Z [36;1mcargo sbom --output-format spdx_json_2_3 > "${SBOM_SPDX_FILE}"[0m
+sbom	Generate SBOM (SPDX JSON)	2026-02-18T18:57:05.7795104Z shell: /usr/bin/bash -e {0}
+sbom	Generate SBOM (SPDX JSON)	2026-02-18T18:57:05.7795344Z env:
+sbom	Generate SBOM (SPDX JSON)	2026-02-18T18:57:05.7795528Z   CARGO_TERM_COLOR: always
+sbom	Generate SBOM (SPDX JSON)	2026-02-18T18:57:05.7795974Z   RUST_BACKTRACE: 1
+sbom	Generate SBOM (SPDX JSON)	2026-02-18T18:57:05.7796175Z   SBOM_RETENTION_DAYS: 90
+sbom	Generate SBOM (SPDX JSON)	2026-02-18T18:57:05.7796376Z   RELEASE_TAG: v0.1.4
+sbom	Generate SBOM (SPDX JSON)	2026-02-18T18:57:05.7796638Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Generate SBOM (SPDX JSON)	2026-02-18T18:57:05.7796965Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Generate SBOM (SPDX JSON)	2026-02-18T18:57:05.7797247Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Generate SBOM (SPDX JSON)	2026-02-18T18:57:05.7797543Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Generate SBOM (SPDX JSON)	2026-02-18T18:57:05.7798034Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Generate SBOM (SPDX JSON)	2026-02-18T18:57:05.7798331Z   CARGO_HOME: /home/runner/.cargo
+sbom	Generate SBOM (SPDX JSON)	2026-02-18T18:57:05.7798557Z   CARGO_INCREMENTAL: 0
+sbom	Generate SBOM (SPDX JSON)	2026-02-18T18:57:05.7798748Z ##[endgroup]
+sbom	Generate SBOM (CycloneDX JSON)	﻿2026-02-18T18:57:12.4544064Z ##[group]Run cargo sbom --output-format cyclone_dx_json_1_6 > "${SBOM_CYCLONEDX_FILE}"
+sbom	Generate SBOM (CycloneDX JSON)	2026-02-18T18:57:12.4544648Z [36;1mcargo sbom --output-format cyclone_dx_json_1_6 > "${SBOM_CYCLONEDX_FILE}"[0m
+sbom	Generate SBOM (CycloneDX JSON)	2026-02-18T18:57:12.4592716Z shell: /usr/bin/bash -e {0}
+sbom	Generate SBOM (CycloneDX JSON)	2026-02-18T18:57:12.4592950Z env:
+sbom	Generate SBOM (CycloneDX JSON)	2026-02-18T18:57:12.4593123Z   CARGO_TERM_COLOR: always
+sbom	Generate SBOM (CycloneDX JSON)	2026-02-18T18:57:12.4593339Z   RUST_BACKTRACE: 1
+sbom	Generate SBOM (CycloneDX JSON)	2026-02-18T18:57:12.4593531Z   SBOM_RETENTION_DAYS: 90
+sbom	Generate SBOM (CycloneDX JSON)	2026-02-18T18:57:12.4593729Z   RELEASE_TAG: v0.1.4
+sbom	Generate SBOM (CycloneDX JSON)	2026-02-18T18:57:12.4593983Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Generate SBOM (CycloneDX JSON)	2026-02-18T18:57:12.4594290Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Generate SBOM (CycloneDX JSON)	2026-02-18T18:57:12.4594573Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Generate SBOM (CycloneDX JSON)	2026-02-18T18:57:12.4594858Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Generate SBOM (CycloneDX JSON)	2026-02-18T18:57:12.4595165Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Generate SBOM (CycloneDX JSON)	2026-02-18T18:57:12.4595453Z   CARGO_HOME: /home/runner/.cargo
+sbom	Generate SBOM (CycloneDX JSON)	2026-02-18T18:57:12.4595906Z   CARGO_INCREMENTAL: 0
+sbom	Generate SBOM (CycloneDX JSON)	2026-02-18T18:57:12.4596150Z ##[endgroup]
+sbom	Generate SBOM checksum manifest	﻿2026-02-18T18:57:12.9554460Z ##[group]Run sha256sum "${SBOM_SPDX_FILE}" "${SBOM_CYCLONEDX_FILE}" > "${SBOM_SHA256_FILE}"
+sbom	Generate SBOM checksum manifest	2026-02-18T18:57:12.9555062Z [36;1msha256sum "${SBOM_SPDX_FILE}" "${SBOM_CYCLONEDX_FILE}" > "${SBOM_SHA256_FILE}"[0m
+sbom	Generate SBOM checksum manifest	2026-02-18T18:57:12.9603336Z shell: /usr/bin/bash -e {0}
+sbom	Generate SBOM checksum manifest	2026-02-18T18:57:12.9603570Z env:
+sbom	Generate SBOM checksum manifest	2026-02-18T18:57:12.9603745Z   CARGO_TERM_COLOR: always
+sbom	Generate SBOM checksum manifest	2026-02-18T18:57:12.9603961Z   RUST_BACKTRACE: 1
+sbom	Generate SBOM checksum manifest	2026-02-18T18:57:12.9604155Z   SBOM_RETENTION_DAYS: 90
+sbom	Generate SBOM checksum manifest	2026-02-18T18:57:12.9604359Z   RELEASE_TAG: v0.1.4
+sbom	Generate SBOM checksum manifest	2026-02-18T18:57:12.9604625Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Generate SBOM checksum manifest	2026-02-18T18:57:12.9604938Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Generate SBOM checksum manifest	2026-02-18T18:57:12.9605225Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Generate SBOM checksum manifest	2026-02-18T18:57:12.9605528Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Generate SBOM checksum manifest	2026-02-18T18:57:12.9605953Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Generate SBOM checksum manifest	2026-02-18T18:57:12.9606247Z   CARGO_HOME: /home/runner/.cargo
+sbom	Generate SBOM checksum manifest	2026-02-18T18:57:12.9606473Z   CARGO_INCREMENTAL: 0
+sbom	Generate SBOM checksum manifest	2026-02-18T18:57:12.9606695Z ##[endgroup]
+sbom	Upload release SBOM artifact pack (retained)	﻿2026-02-18T18:57:12.9759593Z ##[group]Run actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9760260Z with:
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9760565Z   name: release-sbom-v0.1.4
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9760950Z   retention-days: 90
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9761293Z   if-no-files-found: error
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9762199Z   path: arco-v0.1.4.spdx.json
+sbom	Upload release SBOM artifact pack (retained)	arco-v0.1.4.cyclonedx.json
+sbom	Upload release SBOM artifact pack (retained)	arco-v0.1.4.sbom.sha256
+sbom	Upload release SBOM artifact pack (retained)	arco-v0.1.4.tag-object.txt
+sbom	Upload release SBOM artifact pack (retained)	arco-v0.1.4.tag-verify.txt
+sbom	Upload release SBOM artifact pack (retained)	
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9763208Z   compression-level: 6
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9763565Z   overwrite: false
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9763912Z   include-hidden-files: false
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9764283Z env:
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9764584Z   CARGO_TERM_COLOR: always
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9764939Z   RUST_BACKTRACE: 1
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9765272Z   SBOM_RETENTION_DAYS: 90
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9765621Z   RELEASE_TAG: v0.1.4
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9766251Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9766777Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9767286Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9767791Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9768297Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9768801Z   CARGO_HOME: /home/runner/.cargo
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9769196Z   CARGO_INCREMENTAL: 0
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:12.9769514Z ##[endgroup]
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:13.1287297Z Multiple search paths detected. Calculating the least common ancestor of all paths
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:13.1291263Z The least common ancestor is /home/runner/work/arco/arco. This will be the root directory of the artifact
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:13.1292329Z With the provided path, there will be 5 files uploaded
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:13.1299181Z Artifact name is valid!
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:13.1299883Z Root directory input is valid!
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:13.2084310Z Beginning upload of artifact content to blob storage
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:13.3208108Z Uploaded bytes 128662
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:13.3371220Z Finished uploading artifact content to blob storage!
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:13.3372096Z SHA256 digest of uploaded artifact zip is 7df60e5035ae46432638792cabad7957f4c18c62e390644d846981c7377acfa2
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:13.3374734Z Finalizing artifact upload
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:13.7166141Z Artifact release-sbom-v0.1.4.zip successfully finalized. Artifact ID 5561078714
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:13.7167296Z Artifact release-sbom-v0.1.4 has been successfully uploaded! Final size is 128662 bytes. Artifact ID is 5561078714
+sbom	Upload release SBOM artifact pack (retained)	2026-02-18T18:57:13.7170860Z Artifact download URL: https://github.com/daxis-io/arco/actions/runs/22153366267/artifacts/5561078714
+sbom	Publish build provenance attestation for SBOM artifacts	﻿2026-02-18T18:57:13.7346219Z ##[group]Run actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7346685Z with:
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7347030Z   subject-path: arco-v0.1.4.spdx.json
+sbom	Publish build provenance attestation for SBOM artifacts	arco-v0.1.4.cyclonedx.json
+sbom	Publish build provenance attestation for SBOM artifacts	arco-v0.1.4.sbom.sha256
+sbom	Publish build provenance attestation for SBOM artifacts	
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7347451Z   push-to-registry: false
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7347677Z   show-summary: true
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7347998Z   github-token: ***
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7348184Z env:
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7348359Z   CARGO_TERM_COLOR: always
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7348571Z   RUST_BACKTRACE: 1
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7348755Z   SBOM_RETENTION_DAYS: 90
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7348966Z   RELEASE_TAG: v0.1.4
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7349219Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7349537Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7349829Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7350128Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7350433Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7350756Z   CARGO_HOME: /home/runner/.cargo
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7350996Z   CARGO_INCREMENTAL: 0
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7351194Z ##[endgroup]
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7370340Z ##[group]Run actions/attest-build-provenance/predicate@864457a58d4733d7f1574bd8821fa24e02cf7538
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7370774Z env:
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7370951Z   CARGO_TERM_COLOR: always
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7371167Z   RUST_BACKTRACE: 1
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7371354Z   SBOM_RETENTION_DAYS: 90
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7371562Z   RELEASE_TAG: v0.1.4
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7371814Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7372122Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7372410Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7372703Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7373006Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7373305Z   CARGO_HOME: /home/runner/.cargo
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7373546Z   CARGO_INCREMENTAL: 0
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:13.7373759Z ##[endgroup]
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0344231Z ##[group]Run actions/attest@daf44fb950173508f38bd2406030372c1d1162b1
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0344581Z with:
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0344917Z   subject-path: arco-v0.1.4.spdx.json
+sbom	Publish build provenance attestation for SBOM artifacts	arco-v0.1.4.cyclonedx.json
+sbom	Publish build provenance attestation for SBOM artifacts	arco-v0.1.4.sbom.sha256
+sbom	Publish build provenance attestation for SBOM artifacts	
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0345411Z   predicate-type: https://slsa.dev/provenance/v1
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0348927Z   predicate: {"buildDefinition":{"buildType":"https://actions.github.io/buildtypes/workflow/v1","externalParameters":{"workflow":{"ref":"refs/tags/v0.1.4","repository":"https://github.com/daxis-io/arco","path":".github/workflows/release-sbom.yml"}},"internalParameters":{"github":{"event_name":"push","repository_id":"1115582178","repository_owner_id":"247424475","runner_environment":"github-hosted"}},"resolvedDependencies":[{"uri":"git+https://github.com/daxis-io/arco@refs/tags/v0.1.4","digest":{"gitCommit":"b26c3d872f82d4cee3252a0d373f0cc56e13997c"}}]},"runDetails":{"builder":{"id":"https://github.com/daxis-io/arco/.github/workflows/release-sbom.yml@refs/tags/v0.1.4"},"metadata":{"invocationId":"https://github.com/daxis-io/arco/actions/runs/22153366267/attempts/1"}}}
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0351705Z   push-to-registry: false
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0351933Z   show-summary: true
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0352331Z   github-token: ***
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0352524Z env:
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0352701Z   CARGO_TERM_COLOR: always
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0352922Z   RUST_BACKTRACE: 1
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0353117Z   SBOM_RETENTION_DAYS: 90
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0353323Z   RELEASE_TAG: v0.1.4
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0353579Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0353905Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0354194Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0354489Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0354791Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0355093Z   CARGO_HOME: /home/runner/.cargo
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0355507Z   CARGO_INCREMENTAL: 0
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0355973Z   NODE_OPTIONS: --max-http-header-size=32768
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:14.0356250Z ##[endgroup]
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2102981Z Attestation created for 3 subjects
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2104756Z ##[group][36mAttestation signed using certificate from Public Good Sigstore instance[39m
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2105964Z -----BEGIN CERTIFICATE-----
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2106800Z MIIGpzCCBiygAwIBAgIUUDmZzLPe50MydIYOwj4Lj6SAjRMwCgYIKoZIzj0EAwMw
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2107947Z NzEVMBMGA1UEChMMc2lnc3RvcmUuZGV2MR4wHAYDVQQDExVzaWdzdG9yZS1pbnRl
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2109071Z cm1lZGlhdGUwHhcNMjYwMjE4MTg1NzE0WhcNMjYwMjE4MTkwNzE0WjAAMFkwEwYH
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2110004Z KoZIzj0CAQYIKoZIzj0DAQcDQgAEOxdDYjtDC7wZL5Tyy22FTcdW5mKFJMr0TMv4
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2110813Z wAV/K8BVUL0ff7LltNzoVeau4jq/La7tm6+qF2IdhmVsKF8Rk6OCBUswggVHMA4G
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2111623Z A1UdDwEB/wQEAwIHgDATBgNVHSUEDDAKBggrBgEFBQcDAzAdBgNVHQ4EFgQUG0lO
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2112478Z +3EsmX/TGZHm6KeNNZg5QykwHwYDVR0jBBgwFoAU39Ppz1YkEZb5qNjpKFWixi4Y
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2113348Z ZD8wYgYDVR0RAQH/BFgwVoZUaHR0cHM6Ly9naXRodWIuY29tL2RheGlzLWlvL2Fy
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2113935Z Y28vLmdpdGh1Yi93b3JrZmxvd3MvcmVsZWFzZS1zYm9tLnltbEByZWZzL3RhZ3Mv
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2114416Z djAuMS40MDkGCisGAQQBg78wAQEEK2h0dHBzOi8vdG9rZW4uYWN0aW9ucy5naXRo
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2114911Z dWJ1c2VyY29udGVudC5jb20wEgYKKwYBBAGDvzABAgQEcHVzaDA2BgorBgEEAYO/
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2115408Z MAEDBChiMjZjM2Q4NzJmODJkNGNlZTMyNTJhMGQzNzNmMGNjNTZlMTM5OTdjMBoG
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2116117Z CisGAQQBg78wAQQEDFJlbGVhc2UgU0JPTTAbBgorBgEEAYO/MAEFBA1kYXhpcy1p
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2116789Z by9hcmNvMB4GCisGAQQBg78wAQYEEHJlZnMvdGFncy92MC4xLjQwOwYKKwYBBAGD
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2117274Z vzABCAQtDCtodHRwczovL3Rva2VuLmFjdGlvbnMuZ2l0aHVidXNlcmNvbnRlbnQu
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2117751Z Y29tMGQGCisGAQQBg78wAQkEVgxUaHR0cHM6Ly9naXRodWIuY29tL2RheGlzLWlv
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2118218Z L2FyY28vLmdpdGh1Yi93b3JrZmxvd3MvcmVsZWFzZS1zYm9tLnltbEByZWZzL3Rh
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2118679Z Z3MvdjAuMS40MDgGCisGAQQBg78wAQoEKgwoYjI2YzNkODcyZjgyZDRjZWUzMjUy
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2119173Z YTBkMzczZjBjYzU2ZTEzOTk3YzAdBgorBgEEAYO/MAELBA8MDWdpdGh1Yi1ob3N0
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2119654Z ZWQwMAYKKwYBBAGDvzABDAQiDCBodHRwczovL2dpdGh1Yi5jb20vZGF4aXMtaW8v
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2120324Z YXJjbzA4BgorBgEEAYO/MAENBCoMKGIyNmMzZDg3MmY4MmQ0Y2VlMzI1MmEwZDM3
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2120814Z M2YwY2M1NmUxMzk5N2MwIAYKKwYBBAGDvzABDgQSDBByZWZzL3RhZ3MvdjAuMS40
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2121284Z MBoGCisGAQQBg78wAQ8EDAwKMTExNTU4MjE3ODArBgorBgEEAYO/MAEQBB0MG2h0
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2121899Z dHBzOi8vZ2l0aHViLmNvbS9kYXhpcy1pbzAZBgorBgEEAYO/MAERBAsMCTI0NzQy
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2122356Z NDQ3NTBkBgorBgEEAYO/MAESBFYMVGh0dHBzOi8vZ2l0aHViLmNvbS9kYXhpcy1p
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2122815Z by9hcmNvLy5naXRodWIvd29ya2Zsb3dzL3JlbGVhc2Utc2JvbS55bWxAcmVmcy90
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2123264Z YWdzL3YwLjEuNDA4BgorBgEEAYO/MAETBCoMKGIyNmMzZDg3MmY4MmQ0Y2VlMzI1
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2123722Z MmEwZDM3M2YwY2M1NmUxMzk5N2MwFAYKKwYBBAGDvzABFAQGDARwdXNoMFQGCisG
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2124193Z AQQBg78wARUERgxEaHR0cHM6Ly9naXRodWIuY29tL2RheGlzLWlvL2FyY28vYWN0
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2124943Z aW9ucy9ydW5zLzIyMTUzMzY2MjY3L2F0dGVtcHRzLzEwFgYKKwYBBAGDvzABFgQI
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2125417Z DAZwdWJsaWMwgYkGCisGAQQB1nkCBAIEewR5AHcAdQDdPTBqxscRMmMZHhyZZzcC
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2126219Z okpeuN48rf+HinKALynujgAAAZxyHRT8AAAEAwBGMEQCIFdfIipEPp2Wl80efvgj
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2126706Z rhaupTiPDtObHgqbqZYhimWlAiBzPwANJPN4CdloY85MC5oRb4lsvcu8Cl7wZ2Xt
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2127210Z s/UoyjAKBggqhkjOPQQDAwNpADBmAjEAiM4YmnpCexapBObFz7mS7Ds1LxyvDYv4
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2127703Z 86LmWApLFBeuJcAnXvrqEOy9WocCRBp6AjEAwJZW7FZwvwPOoDqA82MCcmvKBbxB
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2128114Z bYWSpz+A6YPOMQcgF1POZSa4JrMFZ86BqHW+
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2128385Z -----END CERTIFICATE-----
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2128529Z 
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2128779Z ##[endgroup]
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2129169Z [36mAttestation signature uploaded to Rekor transparency log[39m
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2129602Z https://search.sigstore.dev?logIndex=963073651
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2129959Z [36mAttestation uploaded to repository[39m
+sbom	Publish build provenance attestation for SBOM artifacts	2026-02-18T18:57:15.2130541Z https://github.com/daxis-io/arco/attestations/19233880
+sbom	Attach SBOM files to GitHub release	﻿2026-02-18T18:57:15.2489545Z ##[group]Run softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2489986Z with:
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2490171Z   tag_name: v0.1.4
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2490513Z   files: arco-v0.1.4.spdx.json
+sbom	Attach SBOM files to GitHub release	arco-v0.1.4.cyclonedx.json
+sbom	Attach SBOM files to GitHub release	arco-v0.1.4.sbom.sha256
+sbom	Attach SBOM files to GitHub release	
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2490912Z   overwrite_files: true
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2491238Z   token: ***
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2491424Z env:
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2491602Z   CARGO_TERM_COLOR: always
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2491819Z   RUST_BACKTRACE: 1
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2492016Z   SBOM_RETENTION_DAYS: 90
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2492231Z   RELEASE_TAG: v0.1.4
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2492486Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2492796Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2493089Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2493386Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2493706Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2494032Z   CARGO_HOME: /home/runner/.cargo
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2494273Z   CARGO_INCREMENTAL: 0
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.2494479Z ##[endgroup]
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:15.6090354Z 👩‍🏭 Creating new GitHub release for tag v0.1.4...
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:16.0152672Z ⬆️ Uploading arco-v0.1.4.spdx.json...
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:16.0157567Z ⬆️ Uploading arco-v0.1.4.cyclonedx.json...
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:16.0159645Z ⬆️ Uploading arco-v0.1.4.sbom.sha256...
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:16.5976571Z ✅ Uploaded arco-v0.1.4.cyclonedx.json
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:16.6664718Z ✅ Uploaded arco-v0.1.4.sbom.sha256
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:16.7057533Z ✅ Uploaded arco-v0.1.4.spdx.json
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:16.7065233Z Finalizing release...
+sbom	Attach SBOM files to GitHub release	2026-02-18T18:57:17.1594663Z 🎉 Release ready at https://github.com/daxis-io/arco/releases/tag/v0.1.4
+sbom	Build immutable release evidence pack	﻿2026-02-18T18:57:17.1681448Z ##[group]Run PACK_DIR="$(bash tools/collect_release_evidence.sh --tag "${RELEASE_TAG}" --output-root ".gate1-collector")"
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1682325Z [36;1mPACK_DIR="$(bash tools/collect_release_evidence.sh --tag "${RELEASE_TAG}" --output-root ".gate1-collector")"[0m
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1682872Z [36;1mecho "PACK_DIR=${PACK_DIR}" >> "${GITHUB_ENV}"[0m
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1731608Z shell: /usr/bin/bash -e {0}
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1731860Z env:
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1732040Z   CARGO_TERM_COLOR: always
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1732267Z   RUST_BACKTRACE: 1
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1732468Z   SBOM_RETENTION_DAYS: 90
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1732693Z   RELEASE_TAG: v0.1.4
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1732954Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1733282Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1733581Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1733881Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1734186Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1734517Z   CARGO_HOME: /home/runner/.cargo
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1734920Z   CARGO_INCREMENTAL: 0
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1735338Z   GITHUB_TOKEN: ***
+sbom	Build immutable release evidence pack	2026-02-18T18:57:17.1735543Z ##[endgroup]
+sbom	Archive release evidence pack	﻿2026-02-18T18:57:17.2773517Z ##[group]Run tar -C "$(dirname "${PACK_DIR}")" -czf "${EVIDENCE_ARCHIVE}" "$(basename "${PACK_DIR}")"
+sbom	Archive release evidence pack	2026-02-18T18:57:17.2774663Z [36;1mtar -C "$(dirname "${PACK_DIR}")" -czf "${EVIDENCE_ARCHIVE}" "$(basename "${PACK_DIR}")"[0m
+sbom	Archive release evidence pack	2026-02-18T18:57:17.2828532Z shell: /usr/bin/bash -e {0}
+sbom	Archive release evidence pack	2026-02-18T18:57:17.2828791Z env:
+sbom	Archive release evidence pack	2026-02-18T18:57:17.2828974Z   CARGO_TERM_COLOR: always
+sbom	Archive release evidence pack	2026-02-18T18:57:17.2829213Z   RUST_BACKTRACE: 1
+sbom	Archive release evidence pack	2026-02-18T18:57:17.2829415Z   SBOM_RETENTION_DAYS: 90
+sbom	Archive release evidence pack	2026-02-18T18:57:17.2829636Z   RELEASE_TAG: v0.1.4
+sbom	Archive release evidence pack	2026-02-18T18:57:17.2829904Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Archive release evidence pack	2026-02-18T18:57:17.2830235Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Archive release evidence pack	2026-02-18T18:57:17.2830536Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Archive release evidence pack	2026-02-18T18:57:17.2830845Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Archive release evidence pack	2026-02-18T18:57:17.2831167Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Archive release evidence pack	2026-02-18T18:57:17.2831465Z   CARGO_HOME: /home/runner/.cargo
+sbom	Archive release evidence pack	2026-02-18T18:57:17.2831705Z   CARGO_INCREMENTAL: 0
+sbom	Archive release evidence pack	2026-02-18T18:57:17.2832223Z   PACK_DIR: .gate1-collector/v0.1.4/24f2e2c0eb1f0c899ac4cb379292a14d5d0b4d3a-b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Archive release evidence pack	2026-02-18T18:57:17.2832746Z ##[endgroup]
+sbom	Upload release evidence pack artifact (retained)	﻿2026-02-18T18:57:17.3007553Z ##[group]Run actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3007945Z with:
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3008144Z   name: release-evidence-v0.1.4
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3008390Z   retention-days: 90
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3008607Z   if-no-files-found: error
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3008843Z   path: arco-v0.1.4.release-evidence.tgz
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3009112Z   compression-level: 6
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3009318Z   overwrite: false
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3009519Z   include-hidden-files: false
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3009733Z env:
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3009904Z   CARGO_TERM_COLOR: always
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3010112Z   RUST_BACKTRACE: 1
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3010317Z   SBOM_RETENTION_DAYS: 90
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3010519Z   RELEASE_TAG: v0.1.4
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3010769Z   TAG_COMMIT_SHA: b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3011092Z   SBOM_SPDX_FILE: arco-v0.1.4.spdx.json
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3011390Z   SBOM_CYCLONEDX_FILE: arco-v0.1.4.cyclonedx.json
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3011693Z   SBOM_SHA256_FILE: arco-v0.1.4.sbom.sha256
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3012025Z   EVIDENCE_ARCHIVE: arco-v0.1.4.release-evidence.tgz
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3012323Z   CARGO_HOME: /home/runner/.cargo
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3012564Z   CARGO_INCREMENTAL: 0
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3013050Z   PACK_DIR: .gate1-collector/v0.1.4/24f2e2c0eb1f0c899ac4cb379292a14d5d0b4d3a-b26c3d872f82d4cee3252a0d373f0cc56e13997c
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.3013565Z ##[endgroup]
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.4619751Z With the provided path, there will be 1 file uploaded
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.4624868Z Artifact name is valid!
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.4626063Z Root directory input is valid!
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.5391416Z Beginning upload of artifact content to blob storage
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.6132041Z Uploaded bytes 8173
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.6307671Z Finished uploading artifact content to blob storage!
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.6308741Z SHA256 digest of uploaded artifact zip is cfe3315b1b262c333223e67cfc7937f3c4fd7d97428e0ed1868dbb7e45524f96
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.6310857Z Finalizing artifact upload
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.8104995Z Artifact release-evidence-v0.1.4.zip successfully finalized. Artifact ID 5561079754
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.8106643Z Artifact release-evidence-v0.1.4 has been successfully uploaded! Final size is 8173 bytes. Artifact ID is 5561079754
+sbom	Upload release evidence pack artifact (retained)	2026-02-18T18:57:17.8110753Z Artifact download URL: https://github.com/daxis-io/arco/actions/runs/22153366267/artifacts/5561079754
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	﻿2026-02-18T18:57:17.8245573Z Post job cleanup.
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9027032Z [command]/usr/bin/git version
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9063325Z git version 2.52.0
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9103433Z Temporarily overriding HOME='/home/runner/work/_temp/e5521648-8b94-44bd-bf41-8fc2eac19d95' before making global git config changes
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9105112Z Adding repository directory to the temporary git global config as a safe directory
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9109935Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/arco/arco
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9142203Z Removing SSH command configuration
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9148764Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9208441Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9496857Z Removing HTTP extra header
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9501031Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9533672Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9765513Z Removing includeIf entries pointing to credentials config files
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9771423Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9793896Z includeif.gitdir:/home/runner/work/arco/arco/.git.path
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9794658Z includeif.gitdir:/home/runner/work/arco/arco/.git/worktrees/*.path
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9795123Z includeif.gitdir:/github/workspace/.git.path
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9795496Z includeif.gitdir:/github/workspace/.git/worktrees/*.path
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9803805Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/arco/arco/.git.path
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9826243Z /home/runner/work/_temp/git-credentials-d6aa5f25-9756-4829-9a2c-cdce2808f8bb.config
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9837898Z [command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/arco/arco/.git.path /home/runner/work/_temp/git-credentials-d6aa5f25-9756-4829-9a2c-cdce2808f8bb.config
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9876052Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/arco/arco/.git/worktrees/*.path
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9900844Z /home/runner/work/_temp/git-credentials-d6aa5f25-9756-4829-9a2c-cdce2808f8bb.config
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9914134Z [command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/arco/arco/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-d6aa5f25-9756-4829-9a2c-cdce2808f8bb.config
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9950710Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9975381Z /github/runner_temp/git-credentials-d6aa5f25-9756-4829-9a2c-cdce2808f8bb.config
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:17.9985927Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-d6aa5f25-9756-4829-9a2c-cdce2808f8bb.config
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:18.0022206Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:18.0046180Z /github/runner_temp/git-credentials-d6aa5f25-9756-4829-9a2c-cdce2808f8bb.config
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:18.0059246Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-d6aa5f25-9756-4829-9a2c-cdce2808f8bb.config
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:18.0096508Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+sbom	Post Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd	2026-02-18T18:57:18.0348260Z Removing credentials config '/home/runner/work/_temp/git-credentials-d6aa5f25-9756-4829-9a2c-cdce2808f8bb.config'
+sbom	Complete job	﻿2026-02-18T18:57:18.0459835Z Cleaning up orphan processes

@@ -1,0 +1,3 @@
+[codex/prod-go-closure-batch3 f10927a] release(gate1): fix sbom wait check-run lookup for v0.1.2
+ 4 files changed, 58 insertions(+), 40 deletions(-)
+ create mode 100644 release_notes/v0.1.2.md

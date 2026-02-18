@@ -1,0 +1,10 @@
+changelog-section.md: OK
+metadata.env: OK
+release-notes.md: OK
+release-process.md: OK
+release-signers.allowed: OK
+sbom-artifact-linkage.txt: OK
+tag-object.txt: OK
+tag-ref.txt: OK
+workflow-ci.yml: OK
+workflow-release-sbom.yml: OK

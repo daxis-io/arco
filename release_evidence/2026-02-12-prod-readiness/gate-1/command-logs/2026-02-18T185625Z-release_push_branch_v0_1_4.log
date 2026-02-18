@@ -1,0 +1,6 @@
+remote: 
+remote: GitHub found 1 vulnerability on daxis-io/arco's default branch (1 moderate). To find out more, visit:        
+remote:      https://github.com/daxis-io/arco/security/dependabot/4        
+remote: 
+To github.com:daxis-io/arco.git
+   e47a966..b26c3d8  codex/prod-go-closure-batch3 -> codex/prod-go-closure-batch3

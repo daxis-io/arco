@@ -176,6 +176,12 @@ fn validate_version_range(
     Ok(())
 }
 
+fn expected_file_name_for_version(version: i64) -> Option<String> {
+    u64::try_from(version)
+        .ok()
+        .map(|version| format!("{version:020}.json"))
+}
+
 fn validate_commit_info(commit_info: &DeltaCommitInfo) -> UnityCatalogResult<()> {
     if commit_info.version < 0 {
         return Err(UnityCatalogError::BadRequest {
@@ -188,7 +194,12 @@ fn validate_commit_info(commit_info: &DeltaCommitInfo) -> UnityCatalogResult<()>
         });
     }
 
-    let expected_file_name = format!("{:020}.json", commit_info.version as u64);
+    let expected_file_name =
+        expected_file_name_for_version(commit_info.version).ok_or_else(|| {
+            UnityCatalogError::BadRequest {
+                message: "commit_info.version must be >= 0".to_string(),
+            }
+        })?;
     if commit_info.file_name != expected_file_name {
         return Err(UnityCatalogError::BadRequest {
             message: format!(
@@ -451,7 +462,8 @@ fn default_commit_info_for_payload(version: i64, payload_len: usize) -> DeltaCom
     DeltaCommitInfo {
         version,
         timestamp: 0,
-        file_name: format!("{:020}.json", version as u64),
+        file_name: expected_file_name_for_version(version)
+            .unwrap_or_else(|| "00000000000000000000.json".to_string()),
         file_size: i64::try_from(payload_len).unwrap_or(i64::MAX),
         file_modification_timestamp: 0,
     }
@@ -467,7 +479,8 @@ fn parse_commit_info_from_payload(version: i64, payload: &[u8]) -> DeltaCommitIn
 
     info.version = version;
     if info.file_name.trim().is_empty() {
-        info.file_name = format!("{:020}.json", version as u64);
+        info.file_name = expected_file_name_for_version(version)
+            .unwrap_or_else(|| "00000000000000000000.json".to_string());
     }
     if info.file_size < 0 {
         info.file_size = i64::try_from(payload.len()).unwrap_or(i64::MAX);
@@ -641,9 +654,7 @@ pub(crate) async fn get_delta_preview_commits(
         expected_table_uri(&storage, backfill_state.as_ref(), &log_objects).await?;
     ensure_table_uri_matches(table_id, &table_uri, expected_table_uri.as_deref())?;
 
-    let coordinator_latest = coordinator_state
-        .map(|state| state.latest_version)
-        .unwrap_or(-1);
+    let coordinator_latest = coordinator_state.map_or(-1, |state| state.latest_version);
     let logs_latest = latest_version_from_log_objects(&log_objects).unwrap_or(-1);
     let latest_table_version = coordinator_latest.max(logs_latest);
 
@@ -668,6 +679,152 @@ pub(crate) async fn get_delta_preview_commits(
     });
 
     Ok((StatusCode::OK, Json(payload)))
+}
+
+async fn handle_commit_registration(
+    storage: &ScopedStorage,
+    ctx: &UnityCatalogRequestContext,
+    table_id: Uuid,
+    table_uri: &str,
+    commit_info: DeltaCommitInfo,
+    metadata: Option<&Value>,
+    uniform: Option<&Value>,
+) -> UnityCatalogResult<()> {
+    validate_commit_info(&commit_info)?;
+
+    let idempotency_key =
+        ctx.idempotency_key
+            .clone()
+            .ok_or_else(|| UnityCatalogError::BadRequest {
+                message: "Idempotency-Key is required".to_string(),
+            })?;
+    validate_idempotency_key(&idempotency_key)?;
+
+    let backfill_state = load_backfill_state(storage, table_id).await?;
+    let log_objects = load_delta_log_objects(storage, table_id).await?;
+    let existing_table_uri =
+        expected_table_uri(storage, backfill_state.as_ref(), &log_objects).await?;
+    ensure_table_uri_matches(table_id, table_uri, existing_table_uri.as_deref())?;
+
+    let coordinator_latest = load_coordinator_state(storage, table_id)
+        .await?
+        .map_or(-1, |state| state.latest_version);
+    let logs_latest = latest_version_from_log_objects(&log_objects).unwrap_or(-1);
+    let latest_table_version = coordinator_latest.max(logs_latest);
+    let latest_backfilled = backfill_state
+        .as_ref()
+        .and_then(|state| state.latest_backfilled_version)
+        .unwrap_or(-1);
+    let unbackfilled_count = latest_table_version
+        .saturating_sub(latest_backfilled)
+        .max(0);
+    if unbackfilled_count >= MAX_UNBACKFILLED_COMMITS_PER_TABLE {
+        return Err(UnityCatalogError::TooManyRequests {
+            message: "maximum number of unbackfilled commits per table has been reached"
+                .to_string(),
+        });
+    }
+
+    let payload = build_commit_payload(table_uri, &commit_info, metadata, uniform)?;
+    let staged =
+        stage_payload_for_idempotency(storage, table_id, &idempotency_key, payload).await?;
+    let staged_path = staged.staged_path.clone();
+    let staged_version = staged.staged_version.clone();
+
+    let coordinator = DeltaCommitCoordinator::new(storage.clone(), table_id);
+    let committed = coordinator
+        .commit(
+            CommitDeltaRequest {
+                read_version: commit_info.version - 1,
+                staged_path,
+                staged_version,
+                idempotency_key,
+            },
+            Utc::now(),
+        )
+        .await
+        .map_err(map_delta_error)?;
+
+    if committed.version != commit_info.version {
+        return Err(UnityCatalogError::Conflict {
+            message: format!(
+                "stale read_version: expected {}, got {}",
+                committed.version,
+                commit_info.version - 1
+            ),
+        });
+    }
+
+    store_backfill_state(
+        storage,
+        table_id,
+        &DeltaPreviewBackfillState {
+            latest_backfilled_version: None,
+            table_uri: Some(table_uri.to_string()),
+        },
+    )
+    .await?;
+
+    if let Err(err) = storage.delete(&staged.staged_path).await {
+        warn!(
+            %table_id,
+            staged_path = %staged.staged_path,
+            error = %err,
+            "failed to delete staged delta payload after successful commit"
+        );
+    }
+
+    Ok(())
+}
+
+async fn handle_backfill_registration(
+    storage: &ScopedStorage,
+    table_id: Uuid,
+    table_uri: &str,
+    backfilled: i64,
+) -> UnityCatalogResult<()> {
+    if backfilled < -1 {
+        return Err(UnityCatalogError::BadRequest {
+            message: "latest_backfilled_version must be >= -1".to_string(),
+        });
+    }
+
+    let coordinator_state = load_coordinator_state(storage, table_id).await?;
+    let backfill_state = load_backfill_state(storage, table_id).await?;
+    let log_objects = load_delta_log_objects(storage, table_id).await?;
+
+    if coordinator_state.is_none() && backfill_state.is_none() && log_objects.is_empty() {
+        return Err(UnityCatalogError::NotFound {
+            message: format!("table not found: {table_id}"),
+        });
+    }
+
+    let existing_table_uri =
+        expected_table_uri(storage, backfill_state.as_ref(), &log_objects).await?;
+    ensure_table_uri_matches(table_id, table_uri, existing_table_uri.as_deref())?;
+
+    let coordinator_latest = coordinator_state.map_or(-1, |state| state.latest_version);
+    let logs_latest = latest_version_from_log_objects(&log_objects).unwrap_or(-1);
+    let latest_table_version = coordinator_latest.max(logs_latest);
+    if backfilled > latest_table_version {
+        return Err(UnityCatalogError::BadRequest {
+            message: format!(
+                "latest_backfilled_version {backfilled} exceeds latest_table_version {latest_table_version}"
+            ),
+        });
+    }
+
+    store_backfill_state(
+        storage,
+        table_id,
+        &DeltaPreviewBackfillState {
+            latest_backfilled_version: Some(backfilled),
+            table_uri: Some(table_uri.to_string()),
+        },
+    )
+    .await?;
+
+    Ok(())
 }
 
 /// Commits changes to a Delta table.
@@ -726,143 +883,22 @@ pub(crate) async fn post_delta_preview_commits(
     }
 
     if let Some(commit_info) = commit_info {
-        validate_commit_info(&commit_info)?;
-
-        let idempotency_key =
-            ctx.idempotency_key
-                .clone()
-                .ok_or_else(|| UnityCatalogError::BadRequest {
-                    message: "Idempotency-Key is required".to_string(),
-                })?;
-        validate_idempotency_key(&idempotency_key)?;
-
-        let backfill_state = load_backfill_state(&storage, table_id).await?;
-        let log_objects = load_delta_log_objects(&storage, table_id).await?;
-        let existing_table_uri =
-            expected_table_uri(&storage, backfill_state.as_ref(), &log_objects).await?;
-        ensure_table_uri_matches(table_id, &table_uri, existing_table_uri.as_deref())?;
-
-        let coordinator_latest = load_coordinator_state(&storage, table_id)
-            .await?
-            .map(|state| state.latest_version)
-            .unwrap_or(-1);
-        let logs_latest = latest_version_from_log_objects(&log_objects).unwrap_or(-1);
-        let latest_table_version = coordinator_latest.max(logs_latest);
-        let latest_backfilled = backfill_state
-            .as_ref()
-            .and_then(|state| state.latest_backfilled_version)
-            .unwrap_or(-1);
-        let unbackfilled_count = latest_table_version
-            .saturating_sub(latest_backfilled)
-            .max(0);
-        if unbackfilled_count >= MAX_UNBACKFILLED_COMMITS_PER_TABLE {
-            return Err(UnityCatalogError::TooManyRequests {
-                message: "maximum number of unbackfilled commits per table has been reached"
-                    .to_string(),
-            });
-        }
-
-        let payload = build_commit_payload(
+        handle_commit_registration(
+            &storage,
+            &ctx,
+            table_id,
             &table_uri,
-            &commit_info,
+            commit_info,
             metadata.as_ref(),
             uniform.as_ref(),
-        )?;
-
-        let staged =
-            stage_payload_for_idempotency(&storage, table_id, &idempotency_key, payload).await?;
-        let staged_path = staged.staged_path.clone();
-        let staged_version = staged.staged_version.clone();
-
-        let coordinator = DeltaCommitCoordinator::new(storage.clone(), table_id);
-        let committed = coordinator
-            .commit(
-                CommitDeltaRequest {
-                    read_version: commit_info.version - 1,
-                    staged_path,
-                    staged_version,
-                    idempotency_key,
-                },
-                Utc::now(),
-            )
-            .await
-            .map_err(map_delta_error)?;
-
-        if committed.version != commit_info.version {
-            return Err(UnityCatalogError::Conflict {
-                message: format!(
-                    "stale read_version: expected {}, got {}",
-                    committed.version,
-                    commit_info.version - 1
-                ),
-            });
-        }
-
-        store_backfill_state(
-            &storage,
-            table_id,
-            &DeltaPreviewBackfillState {
-                latest_backfilled_version: None,
-                table_uri: Some(table_uri.clone()),
-            },
         )
         .await?;
-
-        if let Err(err) = storage.delete(&staged.staged_path).await {
-            warn!(
-                %table_id,
-                staged_path = %staged.staged_path,
-                error = %err,
-                "failed to delete staged delta payload after successful commit"
-            );
-        }
 
         return Ok((StatusCode::OK, Json(json!({}))));
     }
 
     if let Some(backfilled) = latest_backfilled_version {
-        if backfilled < -1 {
-            return Err(UnityCatalogError::BadRequest {
-                message: "latest_backfilled_version must be >= -1".to_string(),
-            });
-        }
-
-        let coordinator_state = load_coordinator_state(&storage, table_id).await?;
-        let backfill_state = load_backfill_state(&storage, table_id).await?;
-        let log_objects = load_delta_log_objects(&storage, table_id).await?;
-
-        if coordinator_state.is_none() && backfill_state.is_none() && log_objects.is_empty() {
-            return Err(UnityCatalogError::NotFound {
-                message: format!("table not found: {table_id}"),
-            });
-        }
-
-        let existing_table_uri =
-            expected_table_uri(&storage, backfill_state.as_ref(), &log_objects).await?;
-        ensure_table_uri_matches(table_id, &table_uri, existing_table_uri.as_deref())?;
-
-        let coordinator_latest = coordinator_state
-            .map(|state| state.latest_version)
-            .unwrap_or(-1);
-        let logs_latest = latest_version_from_log_objects(&log_objects).unwrap_or(-1);
-        let latest_table_version = coordinator_latest.max(logs_latest);
-        if backfilled > latest_table_version {
-            return Err(UnityCatalogError::BadRequest {
-                message: format!(
-                    "latest_backfilled_version {backfilled} exceeds latest_table_version {latest_table_version}"
-                ),
-            });
-        }
-
-        store_backfill_state(
-            &storage,
-            table_id,
-            &DeltaPreviewBackfillState {
-                latest_backfilled_version: Some(backfilled),
-                table_uri: Some(table_uri),
-            },
-        )
-        .await?;
+        handle_backfill_registration(&storage, table_id, &table_uri, backfilled).await?;
 
         return Ok((StatusCode::OK, Json(json!({}))));
     }

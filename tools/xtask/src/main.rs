@@ -339,7 +339,9 @@ fn run_repo_hygiene_check() -> Result<()> {
     println!("Running repository hygiene checks...\n");
 
     let mut errors = Vec::new();
-    errors.extend(check_mdbook_summary_refs(Path::new("docs/guide/src/SUMMARY.md"))?);
+    errors.extend(check_mdbook_summary_refs(Path::new(
+        "docs/guide/src/SUMMARY.md",
+    ))?);
 
     let forbidden_paths = forbidden_path_markers();
     for path in tracked_files()? {
@@ -390,7 +392,8 @@ fn tracked_files() -> Result<Vec<String>> {
         anyhow::bail!("`git ls-files` failed while enumerating tracked files");
     }
 
-    let stdout = String::from_utf8(output.stdout).context("parse `git ls-files` output as UTF-8")?;
+    let stdout =
+        String::from_utf8(output.stdout).context("parse `git ls-files` output as UTF-8")?;
     Ok(stdout
         .lines()
         .map(str::trim)
@@ -524,8 +527,7 @@ fn contains_standalone_ai(text: &str) -> bool {
     }
 
     for idx in 0..(bytes.len() - 1) {
-        if !bytes[idx].eq_ignore_ascii_case(&b'a') || !bytes[idx + 1].eq_ignore_ascii_case(&b'i')
-        {
+        if !bytes[idx].eq_ignore_ascii_case(&b'a') || !bytes[idx + 1].eq_ignore_ascii_case(&b'i') {
             continue;
         }
 
@@ -2144,7 +2146,10 @@ mod tests {
     fn summary_link_parser_extracts_md_links() {
         let summary = "- [Intro](./intro.md)\n- [API](reference/api.md)\n";
         let links = extract_summary_links(summary);
-        assert_eq!(links, vec!["./intro.md".to_string(), "reference/api.md".to_string()]);
+        assert_eq!(
+            links,
+            vec!["./intro.md".to_string(), "reference/api.md".to_string()]
+        );
     }
 
     #[test]

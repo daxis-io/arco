@@ -17,3 +17,4 @@
 
 - [Configuration](./reference/configuration.md)
 - [API](./reference/api.md)
+- [Evidence Policy](./reference/evidence-policy.md)

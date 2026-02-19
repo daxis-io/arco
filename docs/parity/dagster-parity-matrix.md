@@ -6,7 +6,7 @@ Governed by:
 
 **Evidence rules**
 - “Implemented” rows MUST include: code path(s) + CI-gated proving test(s) + CI job/command from `.github/workflows/ci.yml`.
-- Do not use `docs/plans/**` as evidence.
+- Do not use removed legacy planning docs as evidence.
 
 **CI anchors (most common)**
 - Rust (non-`arco-flow`) tests: `.github/workflows/ci.yml` (job `test`: `cargo test --workspace --all-features --exclude arco-flow`)

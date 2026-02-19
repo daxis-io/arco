@@ -52,6 +52,3 @@ coverage/
 *.tfstate
 *.tfstate.backup
 *.tfplan
-
-# Local tooling
-/.worktrees/

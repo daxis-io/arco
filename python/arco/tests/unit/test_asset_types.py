@@ -6,7 +6,7 @@ from typing import get_type_hints
 
 import pytest
 
-from arco_flow.types.asset import AssetIn, AssetKey, DependencyMapping
+from arco_flow.types.asset import AssetIn, AssetKey, DependencyMapping, IoConfig
 
 
 class TestAssetKey:
@@ -112,3 +112,11 @@ class TestDependencyMapping:
         assert DependencyMapping.ALL_UPSTREAM.value == "all"
         assert DependencyMapping.LATEST.value == "latest"
         assert DependencyMapping.WINDOW.value == "window"
+
+
+class TestIoConfig:
+    """Tests for IoConfig defaults."""
+
+    def test_default_format_is_delta(self) -> None:
+        """Default output format should be delta."""
+        assert IoConfig().format == "delta"

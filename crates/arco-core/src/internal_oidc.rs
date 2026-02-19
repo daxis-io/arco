@@ -71,7 +71,7 @@ impl InternalOidcConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidInput`] when required configuration is missing or malformed.
+    /// Returns an error when required variables are missing or malformed.
     pub fn from_env() -> Result<Option<Self>, Error> {
         let enforce = parse_env_bool("ARCO_INTERNAL_AUTH_ENFORCE", false)?;
         let issuer = env_string("ARCO_INTERNAL_AUTH_ISSUER");
@@ -188,8 +188,8 @@ impl InternalOidcVerifier {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidInput`] when issuer/audience/allowlists are invalid, and
-    /// [`Error::Internal`] when the HTTP client cannot be created.
+    /// Returns an error when required config fields are invalid or the HTTP client cannot be
+    /// constructed.
     pub fn new(config: InternalOidcConfig) -> Result<Self, Error> {
         if config.issuer.trim().is_empty() {
             return Err(Error::InvalidInput(
@@ -231,8 +231,7 @@ impl InternalOidcVerifier {
     ///
     /// # Errors
     ///
-    /// Returns [`InternalOidcError::MissingBearerToken`] when the header is absent or malformed,
-    /// or any error returned by [`Self::verify_token`].
+    /// Returns an error when the header is missing, malformed, or token verification fails.
     pub async fn verify_headers(
         &self,
         headers: &HeaderMap,
@@ -245,9 +244,7 @@ impl InternalOidcVerifier {
     ///
     /// # Errors
     ///
-    /// Returns [`InternalOidcError::InvalidToken`] for invalid signatures/claims,
-    /// [`InternalOidcError::JwksRefresh`] when JWKS retrieval fails, or
-    /// [`InternalOidcError::PrincipalNotAllowlisted`] when principal checks fail.
+    /// Returns an error when decoding fails or the resulting principal is not allowlisted.
     pub async fn verify_token(&self, token: &str) -> Result<VerifiedPrincipal, InternalOidcError> {
         let claims = if let Some(secret) = self.config.hs256_secret.as_deref() {
             self.decode_hs256(token, secret)?

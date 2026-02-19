@@ -2,7 +2,6 @@ use arco_core::FlowPaths;
 
 const ORCHESTRATION_MANIFEST_POINTER_PATH: &str = "state/orchestration/manifest.pointer.json";
 const ORCHESTRATION_MANIFEST_SNAPSHOT_PREFIX: &str = "state/orchestration/manifests";
-const ORCHESTRATION_COMPACTION_LOCK_PATH: &str = "locks/orchestration.compaction.lock.json";
 
 pub fn orchestration_event_path(date: &str, event_id: &str) -> String {
     FlowPaths::orchestration_event_path(date, event_id)
@@ -24,10 +23,6 @@ pub fn orchestration_manifest_snapshot_path(manifest_id: &str) -> String {
     format!("{ORCHESTRATION_MANIFEST_SNAPSHOT_PREFIX}/{manifest_id}.json")
 }
 
-pub fn orchestration_compaction_lock_path() -> &'static str {
-    ORCHESTRATION_COMPACTION_LOCK_PATH
-}
-
 pub fn orchestration_l0_dir(delta_id: &str) -> String {
     FlowPaths::orchestration_l0_dir(delta_id)
 }
@@ -45,10 +40,6 @@ mod tests {
         assert_eq!(
             orchestration_manifest_snapshot_path("00000000000000000001"),
             "state/orchestration/manifests/00000000000000000001.json"
-        );
-        assert_eq!(
-            orchestration_compaction_lock_path(),
-            "locks/orchestration.compaction.lock.json"
         );
     }
 }

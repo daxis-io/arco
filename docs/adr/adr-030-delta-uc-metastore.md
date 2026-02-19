@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted (2026-02-18, Delta-primary cutover release train)
 
 ## Context
 

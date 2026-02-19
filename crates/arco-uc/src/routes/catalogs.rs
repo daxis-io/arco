@@ -2,11 +2,11 @@
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Extension, OriginalUri, Query, State};
-use axum::http::Method;
+use axum::extract::{Extension, OriginalUri, Path, Query, State};
+use axum::http::{Method, StatusCode};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 use arco_core::storage::WriteResult;
@@ -46,6 +46,14 @@ pub(crate) struct CreateCatalogPayload {
     storage_root: Option<String>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
+#[serde(default)]
+pub(crate) struct DeleteCatalogQuery {
+    force: Option<bool>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
@@ -210,7 +218,7 @@ pub(crate) async fn post_catalogs(
     }
 }
 
-/// `GET /catalogs/{name}` (known UC operation; currently unsupported).
+/// Gets a catalog by name.
 #[utoipa::path(
     get,
     path = "/catalogs/{name}",
@@ -219,11 +227,40 @@ pub(crate) async fn post_catalogs(
         ("name" = String, Path, description = "Catalog name"),
     ),
     responses(
-        (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
+        (status = 200, description = "The catalog was successfully retrieved.", body = CatalogInfo),
+        (status = 400, description = "Bad request.", body = UnityCatalogErrorResponse),
+        (status = 401, description = "Unauthorized.", body = UnityCatalogErrorResponse),
+        (status = 403, description = "Forbidden.", body = UnityCatalogErrorResponse),
+        (status = 404, description = "Not found.", body = UnityCatalogErrorResponse),
+        (status = 500, description = "Internal server error.", body = UnityCatalogErrorResponse),
     )
 )]
-pub async fn get_catalog(method: Method, uri: OriginalUri) -> UnityCatalogError {
-    super::common::known_but_unsupported(&method, &uri)
+pub(crate) async fn get_catalog(
+    State(state): State<UnityCatalogState>,
+    Extension(ctx): Extension<UnityCatalogRequestContext>,
+    Path(name): Path<String>,
+) -> UnityCatalogResult<Json<CatalogInfo>> {
+    let name = preview::require_identifier(Some(name), "name")?;
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalog_name = %name,
+        "unity catalog preview get catalog"
+    );
+
+    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
+    let path = catalog_path(&name);
+    let exists = preview::object_exists(&scoped_storage, &path, "check catalog").await?;
+    if !exists {
+        return Err(UnityCatalogError::NotFound {
+            message: format!("catalog not found: {name}"),
+        });
+    }
+
+    let catalog =
+        preview::read_json_object::<CatalogInfo>(&scoped_storage, &path, "get catalog").await?;
+    Ok(Json(catalog))
 }
 
 /// `PATCH /catalogs/{name}` (known UC operation; currently unsupported).
@@ -238,22 +275,85 @@ pub async fn get_catalog(method: Method, uri: OriginalUri) -> UnityCatalogError 
         (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
     )
 )]
-pub async fn update_catalog(method: Method, uri: OriginalUri) -> UnityCatalogError {
+pub(crate) async fn update_catalog(method: Method, uri: OriginalUri) -> UnityCatalogError {
     super::common::known_but_unsupported(&method, &uri)
 }
 
-/// `DELETE /catalogs/{name}` (known UC operation; currently unsupported).
+/// Deletes a catalog.
 #[utoipa::path(
     delete,
     path = "/catalogs/{name}",
     tag = "Catalogs",
     params(
         ("name" = String, Path, description = "Catalog name"),
+        ("force" = Option<bool>, Query, description = "Force deletion even if the catalog is not empty."),
     ),
     responses(
-        (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
+        (status = 200, description = "The catalog was successfully deleted."),
+        (status = 400, description = "Bad request.", body = UnityCatalogErrorResponse),
+        (status = 401, description = "Unauthorized.", body = UnityCatalogErrorResponse),
+        (status = 403, description = "Forbidden.", body = UnityCatalogErrorResponse),
+        (status = 404, description = "Not found.", body = UnityCatalogErrorResponse),
+        (status = 409, description = "Conflict.", body = UnityCatalogErrorResponse),
+        (status = 500, description = "Internal server error.", body = UnityCatalogErrorResponse),
     )
 )]
-pub async fn delete_catalog(method: Method, uri: OriginalUri) -> UnityCatalogError {
-    super::common::known_but_unsupported(&method, &uri)
+pub(crate) async fn delete_catalog(
+    State(state): State<UnityCatalogState>,
+    Extension(ctx): Extension<UnityCatalogRequestContext>,
+    Path(name): Path<String>,
+    query: Query<DeleteCatalogQuery>,
+) -> UnityCatalogResult<(StatusCode, Json<Value>)> {
+    let name = preview::require_identifier(Some(name), "name")?;
+    let Query(query) = query;
+    let _ = query.extra;
+    let force = query.force.unwrap_or(false);
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalog_name = %name,
+        force,
+        "unity catalog preview delete catalog"
+    );
+
+    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
+    let catalog = catalog_path(&name);
+    let exists = preview::object_exists(&scoped_storage, &catalog, "check catalog").await?;
+    if !exists {
+        return Err(UnityCatalogError::NotFound {
+            message: format!("catalog not found: {name}"),
+        });
+    }
+
+    let schemas = preview::list_paths(
+        &scoped_storage,
+        &preview::schema_prefix(&name),
+        "list catalog schemas",
+    )
+    .await?;
+    if !schemas.is_empty() && !force {
+        return Err(UnityCatalogError::Conflict {
+            message: format!("catalog is not empty: {name}"),
+        });
+    }
+
+    if force {
+        let tables = preview::list_paths(
+            &scoped_storage,
+            &format!("{}/{name}/", preview::TABLES_PREFIX),
+            "list catalog tables",
+        )
+        .await?;
+        for table_path in tables {
+            preview::delete_path(&scoped_storage, &table_path, "delete catalog table").await?;
+        }
+
+        for schema_path in schemas {
+            preview::delete_path(&scoped_storage, &schema_path, "delete catalog schema").await?;
+        }
+    }
+
+    preview::delete_path(&scoped_storage, &catalog, "delete catalog").await?;
+    Ok((StatusCode::OK, Json(json!({}))))
 }

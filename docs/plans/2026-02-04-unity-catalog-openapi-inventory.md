@@ -128,14 +128,17 @@ WARNING: This API is experimental and will change in future versions.
 Status classification is maintained in:
 `docs/plans/2026-02-19-unity-catalog-support-matrix.md`
 
-### V1 preview focus endpoints
+### Q2 interoperability core focus endpoints
 
-These are the current v1 preview targets tracked by conformance tests:
+These are the current Q2 core targets tracked by conformance and smoke tests:
 
 **Catalog objects**
 - `/catalogs`
+- `/catalogs/{name}`
 - `/schemas`
+- `/schemas/{full_name}`
 - `/tables`
+- `/tables/{full_name}`
 
 **Permissions**
 - `/permissions/{securable_type}/{full_name}`
@@ -147,4 +150,8 @@ These are the current v1 preview targets tracked by conformance tests:
 **Delta commit coordination**
 - `GET /delta/preview/commits`
 - `POST /delta/preview/commits`
+
+### Engine smoke runbook
+
+`docs/runbooks/unity-catalog-delta-engine-smokes.md`
 <!-- END MANUAL -->

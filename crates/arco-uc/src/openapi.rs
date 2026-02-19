@@ -14,10 +14,16 @@ use utoipa::OpenApi;
         crate::routes::openapi::get_openapi_json,
         crate::routes::catalogs::get_catalogs,
         crate::routes::catalogs::post_catalogs,
+        crate::routes::catalogs::get_catalog,
+        crate::routes::catalogs::delete_catalog,
         crate::routes::schemas::get_schemas,
         crate::routes::schemas::post_schemas,
+        crate::routes::schemas::get_schema,
+        crate::routes::schemas::delete_schema,
         crate::routes::tables::get_tables,
         crate::routes::tables::post_tables,
+        crate::routes::tables::get_table,
+        crate::routes::tables::delete_table,
         crate::routes::delta_commits::get_delta_preview_commits,
         crate::routes::delta_commits::post_delta_preview_commits,
         crate::routes::credentials::post_temporary_table_credentials,
@@ -93,6 +99,23 @@ mod tests {
             .get("$ref")?
             .as_str()
             .map(str::to_string)
+    }
+
+    fn operation_parameter_names(spec: &Value, path: &str, method: &str) -> BTreeSet<String> {
+        spec.get("paths")
+            .and_then(Value::as_object)
+            .and_then(|paths| paths.get(path))
+            .and_then(|path_item| path_item.get(method))
+            .and_then(|operation| operation.get("parameters"))
+            .and_then(Value::as_array)
+            .map(|parameters| {
+                parameters
+                    .iter()
+                    .filter_map(|param| param.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn component_schema<'a>(spec: &'a Value, name: &str) -> &'a Value {
@@ -251,6 +274,16 @@ mod tests {
                 "unexpected response schema for {method} {path} ({status}): {schema_ref}"
             );
         }
+    }
+
+    #[test]
+    fn test_openapi_documents_delta_commit_idempotency_header() {
+        let spec = serde_json::to_value(openapi()).expect("serialize openapi");
+        let parameter_names = operation_parameter_names(&spec, "/delta/preview/commits", "post");
+        assert!(
+            parameter_names.contains("Idempotency-Key"),
+            "delta commit endpoint must document Idempotency-Key header"
+        );
     }
 
     #[test]

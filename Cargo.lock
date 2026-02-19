@@ -496,8 +496,10 @@ version = "0.1.0"
 dependencies = [
  "arco-catalog",
  "arco-core",
+ "arco-delta",
  "axum 0.7.9",
  "bytes",
+ "chrono",
  "gcp_auth",
  "http",
  "serde",

@@ -43,12 +43,13 @@ async fn mount_path_auth_and_fallback_semantics() {
     let known_path = Request::builder()
         .method("POST")
         .uri("/api/2.1/unity-catalog/catalogs")
+        .header("content-type", "application/json")
         .header("X-Tenant-Id", "acme")
         .header("X-Workspace-Id", "analytics")
-        .body(Body::empty())
+        .body(Body::from(r#"{"name":"smoke_catalog"}"#))
         .expect("request");
     let known_response = router.clone().oneshot(known_path).await.expect("response");
-    assert_eq!(known_response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(known_response.status(), StatusCode::OK);
 
     let unknown_path = Request::builder()
         .method("GET")

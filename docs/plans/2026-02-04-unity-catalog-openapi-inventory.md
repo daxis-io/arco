@@ -1,6 +1,6 @@
 # Unity Catalog OSS OpenAPI Endpoint Inventory (Pinned)
 
-**Generated:** 2026-02-19  
+**Spec SHA256:** `129c4155257f89d599e03833fffc9d2534432307a3497df3921ecdebfe5d7f15`  
 **Spec fixture:** `crates/arco-uc/tests/fixtures/unitycatalog-openapi.yaml`  
 **Spec title:** Unity Catalog API  
 **Spec version:** 0.1  
@@ -123,9 +123,14 @@ WARNING: This API is experimental and will change in future versions.
 ## Manual annotations
 
 <!-- BEGIN MANUAL -->
-### Starter set (from parity research packet Appendix A)
+### Support-status source of truth
 
-This list is intentionally a starter set until the pinned OpenAPI spec fixture is populated.
+Status classification is maintained in:
+`docs/plans/2026-02-19-unity-catalog-support-matrix.md`
+
+### V1 preview focus endpoints
+
+These are the current v1 preview targets tracked by conformance tests:
 
 **Catalog objects**
 - `/catalogs`

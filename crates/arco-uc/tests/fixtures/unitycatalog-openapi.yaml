@@ -1,8 +1,15 @@
 # Unity Catalog OSS OpenAPI (PINNED COPY)
 #
+# Upstream repo: https://github.com/unitycatalog/unitycatalog
 # Upstream commit: 18137bcffc33e8f6ed5dcb50f8c80801de4b276d
-# Retrieved: 2026-02-18
+# Retrieved: 2026-02-19
 # Source: https://raw.githubusercontent.com/unitycatalog/unitycatalog/18137bcffc33e8f6ed5dcb50f8c80801de4b276d/api/all.yaml
+#
+# NOTE:
+# - This file is intentionally vendored to make conformance deterministic.
+# - Update via a deliberate commit bump, then rerun:
+#   - cargo xtask uc-openapi-inventory
+#   - cargo test -p arco-uc --test openapi_compliance
 openapi: 3.0.0
 servers:
   - url: http://localhost:8080/api/2.1/unity-catalog

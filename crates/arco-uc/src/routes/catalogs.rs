@@ -22,16 +22,24 @@ pub(crate) struct ListCatalogsQuery {
     extra: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
-#[schema(title = "CreateCatalogRequestBody")]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
-pub(crate) struct CreateCatalogRequestBody {
+pub(crate) struct CreateCatalogPayload {
     name: Option<String>,
     comment: Option<String>,
     properties: Option<BTreeMap<String, String>>,
     storage_root: Option<String>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+#[schema(title = "CreateCatalogRequestBody")]
+pub(crate) struct CreateCatalogRequestBody {
+    name: String,
+    comment: Option<String>,
+    properties: Option<BTreeMap<String, String>>,
+    storage_root: Option<String>,
 }
 
 /// Response payload for a catalog object.
@@ -79,21 +87,38 @@ pub(crate) async fn get_catalogs(
 ) -> UnityCatalogResult<Json<ListCatalogsResponse>> {
     let Query(query) = query;
     let _ = &query.extra;
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        page_token = ?query.page_token,
+        max_results = ?query.max_results,
+        "unity catalog preview list catalogs"
+    );
 
-    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
-    let catalogs = preview::read_json_list::<CatalogInfo>(
-        &scoped_storage,
-        preview::CATALOGS_PREFIX,
-        "list catalogs",
-    )
-    .await?;
-    let (catalogs, next_page_token) = preview::paginate(
-        catalogs,
+    let pagination = preview::parse_pagination(
         query.page_token.as_deref(),
         query.max_results,
         preview::DEFAULT_PAGE_SIZE,
         1000,
     )?;
+
+    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
+    let (catalogs, next_page_token) = preview::read_json_page::<CatalogInfo>(
+        &scoped_storage,
+        preview::CATALOGS_PREFIX,
+        "list catalogs",
+        &pagination,
+    )
+    .await?;
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalogs = catalogs.len(),
+        next_page_token = ?next_page_token,
+        "unity catalog preview listed catalogs"
+    );
 
     Ok(Json(ListCatalogsResponse {
         catalogs,
@@ -124,12 +149,19 @@ pub(crate) async fn get_catalogs(
 pub(crate) async fn post_catalogs(
     State(state): State<UnityCatalogState>,
     Extension(ctx): Extension<UnityCatalogRequestContext>,
-    payload: Json<CreateCatalogRequestBody>,
+    payload: Json<CreateCatalogPayload>,
 ) -> UnityCatalogResult<Json<CatalogInfo>> {
     let Json(payload) = payload;
     let _ = payload.extra;
 
     let name = preview::require_identifier(payload.name, "name")?;
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalog_name = %name,
+        "unity catalog preview create catalog"
+    );
     let catalog = CatalogInfo {
         name: name.clone(),
         comment: payload.comment,
@@ -147,7 +179,16 @@ pub(crate) async fn post_catalogs(
     .await?;
 
     match write_result {
-        WriteResult::Success { .. } => Ok(Json(catalog)),
+        WriteResult::Success { .. } => {
+            tracing::debug!(
+                tenant = %ctx.tenant,
+                workspace = %ctx.workspace,
+                request_id = %ctx.request_id,
+                catalog_name = %name,
+                "unity catalog preview catalog created"
+            );
+            Ok(Json(catalog))
+        }
         WriteResult::PreconditionFailed { .. } => Err(UnityCatalogError::Conflict {
             message: format!("catalog already exists: {name}"),
         }),

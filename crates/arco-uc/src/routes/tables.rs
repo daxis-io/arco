@@ -24,10 +24,9 @@ pub(crate) struct ListTablesQuery {
     extra: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
-#[schema(title = "CreateTableRequestBody")]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
-pub(crate) struct CreateTableRequestBody {
+pub(crate) struct CreateTablePayload {
     name: Option<String>,
     catalog_name: Option<String>,
     schema_name: Option<String>,
@@ -39,6 +38,50 @@ pub(crate) struct CreateTableRequestBody {
     properties: Option<BTreeMap<String, String>>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum TableTypeValue {
+    Managed,
+    External,
+    StreamingTable,
+    MaterializedView,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "UPPERCASE")]
+enum DataSourceFormatValue {
+    Delta,
+    Csv,
+    Json,
+    Avro,
+    Parquet,
+    Orc,
+    Text,
+}
+
+const VALID_TABLE_TYPES: &[&str] = &[
+    "MANAGED",
+    "EXTERNAL",
+    "STREAMING_TABLE",
+    "MATERIALIZED_VIEW",
+];
+const VALID_DATA_SOURCE_FORMATS: &[&str] =
+    &["DELTA", "CSV", "JSON", "AVRO", "PARQUET", "ORC", "TEXT"];
+
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+#[schema(title = "CreateTableRequestBody")]
+pub(crate) struct CreateTableRequestBody {
+    name: String,
+    catalog_name: String,
+    schema_name: String,
+    table_type: TableTypeValue,
+    data_source_format: DataSourceFormatValue,
+    columns: Vec<Value>,
+    storage_location: String,
+    comment: Option<String>,
+    properties: Option<BTreeMap<String, String>>,
 }
 
 /// Response payload for a table object.
@@ -99,6 +142,23 @@ pub(crate) async fn get_tables(
 
     let catalog_name = preview::require_identifier(query.catalog_name, "catalog_name")?;
     let schema_name = preview::require_identifier(query.schema_name, "schema_name")?;
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalog_name = %catalog_name,
+        schema_name = %schema_name,
+        page_token = ?query.page_token,
+        max_results = ?query.max_results,
+        "unity catalog preview list tables"
+    );
+    let pagination = preview::parse_pagination(
+        query.page_token.as_deref(),
+        query.max_results,
+        preview::DEFAULT_PAGE_SIZE,
+        50,
+    )?;
+
     let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
 
     let catalog_exists = preview::object_exists(
@@ -125,19 +185,23 @@ pub(crate) async fn get_tables(
         });
     }
 
-    let tables = preview::read_json_list::<TableInfo>(
+    let (tables, next_page_token) = preview::read_json_page::<TableInfo>(
         &scoped_storage,
         &table_prefix(&catalog_name, &schema_name),
         "list tables",
+        &pagination,
     )
     .await?;
-    let (tables, next_page_token) = preview::paginate(
-        tables,
-        query.page_token.as_deref(),
-        query.max_results,
-        preview::DEFAULT_PAGE_SIZE,
-        50,
-    )?;
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalog_name = %catalog_name,
+        schema_name = %schema_name,
+        tables = tables.len(),
+        next_page_token = ?next_page_token,
+        "unity catalog preview listed tables"
+    );
 
     Ok(Json(ListTablesResponse {
         tables,
@@ -169,7 +233,7 @@ pub(crate) async fn get_tables(
 pub(crate) async fn post_tables(
     State(state): State<UnityCatalogState>,
     Extension(ctx): Extension<UnityCatalogRequestContext>,
-    payload: Json<CreateTableRequestBody>,
+    payload: Json<CreateTablePayload>,
 ) -> UnityCatalogResult<Json<TableInfo>> {
     let Json(payload) = payload;
     let _ = payload.extra;
@@ -177,12 +241,30 @@ pub(crate) async fn post_tables(
     let name = preview::require_identifier(payload.name, "name")?;
     let catalog_name = preview::require_identifier(payload.catalog_name, "catalog_name")?;
     let schema_name = preview::require_identifier(payload.schema_name, "schema_name")?;
-    let table_type = preview::require_non_empty_string(payload.table_type, "table_type")?;
-    let data_source_format =
-        preview::require_non_empty_string(payload.data_source_format, "data_source_format")?;
-    let columns = preview::require_present(payload.columns, "columns")?;
+    let table_type = validate_enum_value(
+        preview::require_non_empty_string(payload.table_type, "table_type")?,
+        "table_type",
+        VALID_TABLE_TYPES,
+    )?;
+    let data_source_format = validate_enum_value(
+        preview::require_non_empty_string(payload.data_source_format, "data_source_format")?,
+        "data_source_format",
+        VALID_DATA_SOURCE_FORMATS,
+    )?;
+    let columns = validate_columns(preview::require_present(payload.columns, "columns")?)?;
     let storage_location =
         preview::require_non_empty_string(payload.storage_location, "storage_location")?;
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalog_name = %catalog_name,
+        schema_name = %schema_name,
+        table_name = %name,
+        table_type = %table_type,
+        data_source_format = %data_source_format,
+        "unity catalog preview create table"
+    );
     let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
 
     let catalog_exists = preview::object_exists(
@@ -231,9 +313,48 @@ pub(crate) async fn post_tables(
     .await?;
 
     match write_result {
-        WriteResult::Success { .. } => Ok(Json(table)),
+        WriteResult::Success { .. } => {
+            tracing::debug!(
+                tenant = %ctx.tenant,
+                workspace = %ctx.workspace,
+                request_id = %ctx.request_id,
+                catalog_name = %catalog_name,
+                schema_name = %schema_name,
+                table_name = %name,
+                "unity catalog preview table created"
+            );
+            Ok(Json(table))
+        }
         WriteResult::PreconditionFailed { .. } => Err(UnityCatalogError::Conflict {
             message: format!("table already exists: {catalog_name}.{schema_name}.{name}"),
         }),
     }
+}
+
+fn validate_enum_value(
+    value: String,
+    field: &str,
+    valid_values: &[&str],
+) -> UnityCatalogResult<String> {
+    if valid_values.contains(&value.as_str()) {
+        return Ok(value);
+    }
+
+    Err(UnityCatalogError::BadRequest {
+        message: format!(
+            "invalid {field}: expected one of {}",
+            valid_values.join(", ")
+        ),
+    })
+}
+
+fn validate_columns(columns: Vec<Value>) -> UnityCatalogResult<Vec<Value>> {
+    for (index, column) in columns.iter().enumerate() {
+        if !column.is_object() {
+            return Err(UnityCatalogError::BadRequest {
+                message: format!("invalid columns[{index}]: expected object"),
+            });
+        }
+    }
+    Ok(columns)
 }

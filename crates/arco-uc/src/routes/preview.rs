@@ -13,6 +13,11 @@ pub(crate) const SCHEMAS_PREFIX: &str = "unity-catalog-preview/schemas";
 pub(crate) const TABLES_PREFIX: &str = "unity-catalog-preview/tables";
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 100;
 
+pub(crate) struct Pagination {
+    pub(crate) start: usize,
+    pub(crate) limit: usize,
+}
+
 pub(crate) fn catalog_path(name: &str) -> String {
     format!("{CATALOGS_PREFIX}/{name}.json")
 }
@@ -104,19 +109,28 @@ pub(crate) async fn write_json_if_absent<T: Serialize>(
         .map_err(|err| storage_error(operation_name, err))
 }
 
-pub(crate) async fn read_json_list<T: DeserializeOwned>(
+pub(crate) async fn read_json_page<T: DeserializeOwned>(
     storage: &ScopedStorage,
     prefix: &str,
     operation_name: &str,
-) -> UnityCatalogResult<Vec<T>> {
+    pagination: &Pagination,
+) -> UnityCatalogResult<(Vec<T>, Option<String>)> {
     let mut object_paths = storage
         .list(prefix)
         .await
         .map_err(|err| storage_error(operation_name, err))?;
     object_paths.sort_by(|left, right| left.as_str().cmp(right.as_str()));
 
-    let mut parsed = Vec::with_capacity(object_paths.len());
-    for object_path in object_paths {
+    if pagination.start >= object_paths.len() {
+        return Ok((Vec::new(), None));
+    }
+
+    let end = pagination
+        .start
+        .saturating_add(pagination.limit)
+        .min(object_paths.len());
+    let mut parsed = Vec::with_capacity(end.saturating_sub(pagination.start));
+    for object_path in &object_paths[pagination.start..end] {
         let body = storage
             .get_raw(object_path.as_str())
             .await
@@ -130,7 +144,9 @@ pub(crate) async fn read_json_list<T: DeserializeOwned>(
             })?;
         parsed.push(value);
     }
-    Ok(parsed)
+
+    let next_page_token = (end < object_paths.len()).then(|| end.to_string());
+    Ok((parsed, next_page_token))
 }
 
 pub(crate) async fn object_exists(
@@ -145,30 +161,15 @@ pub(crate) async fn object_exists(
         .map_err(|err| storage_error(operation_name, err))
 }
 
-pub(crate) fn paginate<T>(
-    values: Vec<T>,
+pub(crate) fn parse_pagination(
     page_token: Option<&str>,
     max_results: Option<i32>,
     default_page_size: usize,
     max_page_size: usize,
-) -> UnityCatalogResult<(Vec<T>, Option<String>)> {
-    let total = values.len();
+) -> UnityCatalogResult<Pagination> {
     let start = parse_page_token(page_token)?;
-    let Some(remaining) = total.checked_sub(start) else {
-        return Ok((Vec::new(), None));
-    };
-
-    let take_count =
-        parse_max_results(max_results, default_page_size, max_page_size)?.min(remaining);
-    let end = start.saturating_add(take_count);
-
-    let paged = values
-        .into_iter()
-        .skip(start)
-        .take(take_count)
-        .collect::<Vec<_>>();
-    let next_page_token = (end < total).then(|| end.to_string());
-    Ok((paged, next_page_token))
+    let limit = parse_max_results(max_results, default_page_size, max_page_size)?;
+    Ok(Pagination { start, limit })
 }
 
 fn parse_page_token(page_token: Option<&str>) -> UnityCatalogResult<usize> {

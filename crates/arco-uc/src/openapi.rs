@@ -67,6 +67,8 @@ pub fn openapi_json() -> Result<String, serde_json::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
     use serde_json::Value;
 
     fn operation_request_schema_ref(spec: &Value, path: &str, method: &str) -> Option<String> {
@@ -101,6 +103,67 @@ mod tests {
             .get("$ref")?
             .as_str()
             .map(str::to_string)
+    }
+
+    fn component_schema<'a>(spec: &'a Value, name: &str) -> &'a Value {
+        spec.get("components")
+            .and_then(Value::as_object)
+            .and_then(|components| components.get("schemas"))
+            .and_then(Value::as_object)
+            .and_then(|schemas| schemas.get(name))
+            .unwrap_or_else(|| panic!("missing schema component: {name}"))
+    }
+
+    fn required_fields(spec: &Value, name: &str) -> BTreeSet<String> {
+        component_schema(spec, name)
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|required| {
+                required
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn property_enum_values(spec: &Value, component: &str, property: &str) -> BTreeSet<String> {
+        let property_schema = component_schema(spec, component)
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get(property))
+            .unwrap_or_else(|| panic!("missing property {property} on {component}"));
+
+        if let Some(values) = property_schema.get("enum").and_then(Value::as_array) {
+            return values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+        }
+
+        let reference = property_schema
+            .get("$ref")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!("expected enum or $ref schema for property {property} on {component}")
+            });
+        let component_name = reference
+            .strip_prefix("#/components/schemas/")
+            .unwrap_or_else(|| panic!("unexpected schema ref {reference}"));
+
+        component_schema(spec, component_name)
+            .get("enum")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[test]
@@ -198,5 +261,64 @@ mod tests {
                 "unexpected response schema for {method} {path} ({status}): {schema_ref}"
             );
         }
+    }
+
+    #[test]
+    fn test_openapi_marks_required_fields_for_create_requests() {
+        let spec = serde_json::to_value(openapi()).expect("serialize openapi");
+
+        let required_catalog = required_fields(&spec, "CreateCatalogRequestBody");
+        assert_eq!(required_catalog, BTreeSet::from(["name".to_string()]));
+
+        let required_schema = required_fields(&spec, "CreateSchemaRequestBody");
+        assert_eq!(
+            required_schema,
+            BTreeSet::from(["catalog_name".to_string(), "name".to_string()])
+        );
+
+        let required_table = required_fields(&spec, "CreateTableRequestBody");
+        assert_eq!(
+            required_table,
+            BTreeSet::from([
+                "name".to_string(),
+                "catalog_name".to_string(),
+                "schema_name".to_string(),
+                "table_type".to_string(),
+                "data_source_format".to_string(),
+                "columns".to_string(),
+                "storage_location".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_openapi_models_table_and_format_enums_for_create_table() {
+        let spec = serde_json::to_value(openapi()).expect("serialize openapi");
+
+        let table_type_values = property_enum_values(&spec, "CreateTableRequestBody", "table_type");
+        assert_eq!(
+            table_type_values,
+            BTreeSet::from([
+                "MANAGED".to_string(),
+                "EXTERNAL".to_string(),
+                "STREAMING_TABLE".to_string(),
+                "MATERIALIZED_VIEW".to_string(),
+            ])
+        );
+
+        let format_values =
+            property_enum_values(&spec, "CreateTableRequestBody", "data_source_format");
+        assert_eq!(
+            format_values,
+            BTreeSet::from([
+                "DELTA".to_string(),
+                "CSV".to_string(),
+                "JSON".to_string(),
+                "AVRO".to_string(),
+                "PARQUET".to_string(),
+                "ORC".to_string(),
+                "TEXT".to_string(),
+            ])
+        );
     }
 }

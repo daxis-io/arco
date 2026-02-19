@@ -23,10 +23,9 @@ pub(crate) struct ListSchemasQuery {
     extra: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
-#[schema(title = "CreateSchemaRequestBody")]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
-pub(crate) struct CreateSchemaRequestBody {
+pub(crate) struct CreateSchemaPayload {
     name: Option<String>,
     catalog_name: Option<String>,
     comment: Option<String>,
@@ -34,6 +33,16 @@ pub(crate) struct CreateSchemaRequestBody {
     storage_root: Option<String>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+#[schema(title = "CreateSchemaRequestBody")]
+pub(crate) struct CreateSchemaRequestBody {
+    name: String,
+    catalog_name: String,
+    comment: Option<String>,
+    properties: Option<BTreeMap<String, String>>,
+    storage_root: Option<String>,
 }
 
 /// Response payload for a schema object.
@@ -88,6 +97,22 @@ pub(crate) async fn get_schemas(
     let _ = &query.extra;
 
     let catalog_name = preview::require_identifier(query.catalog_name, "catalog_name")?;
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalog_name = %catalog_name,
+        page_token = ?query.page_token,
+        max_results = ?query.max_results,
+        "unity catalog preview list schemas"
+    );
+    let pagination = preview::parse_pagination(
+        query.page_token.as_deref(),
+        query.max_results,
+        preview::DEFAULT_PAGE_SIZE,
+        1000,
+    )?;
+
     let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
     let catalog_exists = preview::object_exists(
         &scoped_storage,
@@ -101,19 +126,22 @@ pub(crate) async fn get_schemas(
         });
     }
 
-    let schemas = preview::read_json_list::<SchemaInfo>(
+    let (schemas, next_page_token) = preview::read_json_page::<SchemaInfo>(
         &scoped_storage,
         &schema_prefix(&catalog_name),
         "list schemas",
+        &pagination,
     )
     .await?;
-    let (schemas, next_page_token) = preview::paginate(
-        schemas,
-        query.page_token.as_deref(),
-        query.max_results,
-        preview::DEFAULT_PAGE_SIZE,
-        1000,
-    )?;
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalog_name = %catalog_name,
+        schemas = schemas.len(),
+        next_page_token = ?next_page_token,
+        "unity catalog preview listed schemas"
+    );
 
     Ok(Json(ListSchemasResponse {
         schemas,
@@ -145,13 +173,21 @@ pub(crate) async fn get_schemas(
 pub(crate) async fn post_schemas(
     State(state): State<UnityCatalogState>,
     Extension(ctx): Extension<UnityCatalogRequestContext>,
-    payload: Json<CreateSchemaRequestBody>,
+    payload: Json<CreateSchemaPayload>,
 ) -> UnityCatalogResult<Json<SchemaInfo>> {
     let Json(payload) = payload;
     let _ = payload.extra;
 
     let name = preview::require_identifier(payload.name, "name")?;
     let catalog_name = preview::require_identifier(payload.catalog_name, "catalog_name")?;
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalog_name = %catalog_name,
+        schema_name = %name,
+        "unity catalog preview create schema"
+    );
     let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
 
     let catalog_exists = preview::object_exists(
@@ -184,7 +220,17 @@ pub(crate) async fn post_schemas(
     .await?;
 
     match write_result {
-        WriteResult::Success { .. } => Ok(Json(schema)),
+        WriteResult::Success { .. } => {
+            tracing::debug!(
+                tenant = %ctx.tenant,
+                workspace = %ctx.workspace,
+                request_id = %ctx.request_id,
+                catalog_name = %catalog_name,
+                schema_name = %name,
+                "unity catalog preview schema created"
+            );
+            Ok(Json(schema))
+        }
         WriteResult::PreconditionFailed { .. } => Err(UnityCatalogError::Conflict {
             message: format!("schema already exists: {catalog_name}.{name}"),
         }),

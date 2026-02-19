@@ -632,3 +632,228 @@ async fn list_catalogs_omits_next_page_token_when_no_more_results() -> Result<()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn list_catalogs_rejects_negative_max_results() -> Result<(), String> {
+    let router = test_router();
+
+    let (status, body) = uc_request(
+        &router,
+        Method::GET,
+        "/catalogs?max_results=-1",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("BAD_REQUEST")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_schemas_rejects_invalid_page_token_before_catalog_lookup() -> Result<(), String> {
+    let router = test_router();
+
+    let (status, body) = uc_request(
+        &router,
+        Method::GET,
+        "/schemas?catalog_name=missing&page_token=not-a-number",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("BAD_REQUEST")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_tables_rejects_invalid_max_results_before_parent_lookup() -> Result<(), String> {
+    let router = test_router();
+
+    let (status, body) = uc_request(
+        &router,
+        Method::GET,
+        "/tables?catalog_name=missing&schema_name=missing&max_results=-1",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("BAD_REQUEST")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_table_rejects_invalid_table_type_value() -> Result<(), String> {
+    let router = test_router();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "analytics",
+            "catalog_name": "main"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = uc_request(
+        &router,
+        Method::POST,
+        "/tables",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "events",
+            "catalog_name": "main",
+            "schema_name": "analytics",
+            "table_type": "INVALID",
+            "data_source_format": "DELTA",
+            "columns": [],
+            "storage_location": "s3://bucket/main/analytics/events"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("BAD_REQUEST")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_table_rejects_invalid_data_source_format_value() -> Result<(), String> {
+    let router = test_router();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "analytics",
+            "catalog_name": "main"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = uc_request(
+        &router,
+        Method::POST,
+        "/tables",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "events",
+            "catalog_name": "main",
+            "schema_name": "analytics",
+            "table_type": "EXTERNAL",
+            "data_source_format": "TSV",
+            "columns": [],
+            "storage_location": "s3://bucket/main/analytics/events"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("BAD_REQUEST")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_table_rejects_non_object_columns() -> Result<(), String> {
+    let router = test_router();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "analytics",
+            "catalog_name": "main"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = uc_request(
+        &router,
+        Method::POST,
+        "/tables",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "events",
+            "catalog_name": "main",
+            "schema_name": "analytics",
+            "table_type": "EXTERNAL",
+            "data_source_format": "DELTA",
+            "columns": [1, {"name": "good"}],
+            "storage_location": "s3://bucket/main/analytics/events"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("BAD_REQUEST")
+    );
+    Ok(())
+}

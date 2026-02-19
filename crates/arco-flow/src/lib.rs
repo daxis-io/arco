@@ -89,6 +89,9 @@ pub mod store;
 pub mod task;
 pub mod task_key;
 
+/// Canonical orchestration compaction lock path used by flow/api components.
+pub use paths::orchestration_compaction_lock_path;
+
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::dispatch::{EnqueueResult, TaskEnvelope, TaskQueue};

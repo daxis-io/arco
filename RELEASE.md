@@ -1,45 +1,49 @@
 # Release Process
 
-This project follows semantic versioning and keeps a public changelog.
+Arco follows semantic versioning and publishes release notes for every tag.
 
 ## Versioning
 
-- Use SemVer: `MAJOR.MINOR.PATCH`
-- Pre-release tags allowed (e.g., `0.1.0-alpha.1`)
+- Use `MAJOR.MINOR.PATCH`.
+- Pre-release tags are allowed when needed.
 
-## Pre-Release Checklist
+## Pre-Release Verification
 
-1. Ensure CI is green on `main`.
-2. Update `CHANGELOG.md` under `[Unreleased]` and cut a new version section.
-3. Update version numbers:
-   - `Cargo.toml`
-   - `python/arco/pyproject.toml`
-   - Any docs that mention versions
-4. Verify docs build: `cargo doc --workspace --all-features --no-deps`
-5. Run tests:
-   - `cargo test --workspace --all-features`
-   - Python tests in `python/arco/`
-6. Generate SBOM (CI workflow `release-sbom.yml`).
+Run from repository root unless noted:
+
+```bash
+cargo xtask repo-hygiene-check
+cargo xtask adr-check
+cargo xtask parity-matrix-check
+cargo check --workspace --all-features
+cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
+cd docs/guide && mdbook build
+```
+
+Also run targeted parity/API gates that mirror CI for `arco-api` and `arco-flow` before final tagging.
 
 ## Release Steps
 
-1. Create a release branch (optional): `release/vX.Y.Z`.
-2. Commit version bumps + changelog.
-3. Tag the release:
+1. Update `CHANGELOG.md`.
+2. Update version metadata as needed.
+3. Ensure CI is green on the release commit.
+4. Create and push signed tag:
    ```bash
    git tag -s vX.Y.Z -m "vX.Y.Z"
-   ```
-4. Push branch + tag:
-   ```bash
-   git push origin release/vX.Y.Z
    git push origin vX.Y.Z
    ```
-5. Create a GitHub Release with:
-   - Changelog section for the version
-   - SBOM artifact
-   - Build/test evidence if needed
+5. Publish GitHub release notes with verification summary and relevant artifacts.
 
 ## Post-Release
 
-- Verify published artifacts (if any) are accessible.
-- Open a new `[Unreleased]` section in `CHANGELOG.md`.
+1. Confirm release artifacts are accessible.
+2. Re-open `[Unreleased]` in the changelog.
+3. If this is the first clean release after OSS hard-cleanup, retire the temporary archive branch:
+   ```bash
+   git branch -D <archive-branch-name>
+   git push origin --delete <archive-branch-name>
+   ```
+
+## Evidence Policy
+
+Transient verification evidence belongs in CI artifacts and release assets, not long-lived tracked directories. See `docs/guide/src/reference/evidence-policy.md`.

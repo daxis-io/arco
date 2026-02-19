@@ -1,7 +1,0 @@
-Command: terraform -chdir=/Users/ethanurbanski/arco/infra/terraform plan -input=false -no-color -var-file=environments/dev.tfvars.example
-
-Error: No value for required variable
-  variable "compactor_tenant_id" is not set (variables.tf:51)
-
-Error: No value for required variable
-  variable "compactor_workspace_id" is not set (variables.tf:56)

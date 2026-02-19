@@ -11,17 +11,16 @@
 
 ## Gate Snapshot
 - Gate: `delta-primary-cutover`
-- Status: Blocked (2 signals blocked after full verification rerun on 2026-02-19)
+- Status: Blocked (1 required signal blocked; workspace clippy gate also blocked on 2026-02-19)
 - Tracker: `docs/audits/2026-02-12-prod-readiness/gate-tracker.json`
 - Signals: `docs/audits/2026-02-12-prod-readiness/signal-ledger.md`
 
 ## Signal Outcome
-- Passed: `delta-default-api`, `delta-commit-gating`, `delta-location-log-path`, `uc-openapi-pinned`, `iceberg-secondary-compat`, `policy-docs-updated`.
-- Blocked: `delta-format-canonicalization` (`cargo clippy --workspace --all-targets --all-features -- -D warnings` failed with existing lint debt; see `release_evidence/2026-02-18-delta-primary-cutover/ci/delta-format-validation.txt`).
+- Passed: `delta-default-api`, `delta-format-canonicalization`, `delta-commit-gating`, `delta-location-log-path`, `uc-openapi-pinned`, `iceberg-secondary-compat`, `policy-docs-updated`.
 - Blocked: `sdk-delta-default` (Python SDK runtime tests cannot run in this environment, `Python 3.9.6` vs `python/arco` requirement `>=3.11`; see `release_evidence/2026-02-18-delta-primary-cutover/sdk/python-default-format.txt`).
 
 ## Residual Risk
-- Workspace-level lint gate is red (`clippy -D warnings`), so the release train is not CI-clean despite functional tests passing.
+- Workspace-level lint gate is red (`clippy -D warnings`), so the release train is not CI-clean despite requirement-specific canonicalization checks passing.
 - SDK runtime verification remains incomplete until rerun under Python 3.11+.
 
 ## Evidence Pack

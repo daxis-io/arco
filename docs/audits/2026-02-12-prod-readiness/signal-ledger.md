@@ -8,7 +8,7 @@
 | Signal ID | Requirement | Evidence Path | Status |
 |---|---|---|---|
 | `delta-default-api` | New tables default to `delta` on namespace + schema routes | `release_evidence/2026-02-18-delta-primary-cutover/ci/delta-default-api.txt` | Passed (2026-02-19) |
-| `delta-format-canonicalization` | `delta|iceberg|parquet` canonicalization + unknown format rejection | `release_evidence/2026-02-18-delta-primary-cutover/ci/delta-format-validation.txt` | Blocked (2026-02-19: `cargo clippy --workspace --all-targets --all-features -- -D warnings` exits 101 due pre-existing workspace lint debt) |
+| `delta-format-canonicalization` | `delta|iceberg|parquet` canonicalization + unknown format rejection | `release_evidence/2026-02-18-delta-primary-cutover/ci/delta-format-validation.txt` | Passed (2026-02-19: requirement checks pass; workspace clippy blocker tracked at gate level) |
 | `delta-commit-gating` | Delta commit endpoints enforce table existence + effective delta format | `release_evidence/2026-02-18-delta-primary-cutover/ci/delta-commit-gating.txt` | Passed (2026-02-19) |
 | `delta-location-log-path` | `_delta_log` writes derive from table location root | `release_evidence/2026-02-18-delta-primary-cutover/ci/delta-location-paths.txt` | Passed (2026-02-19) |
 | `uc-openapi-pinned` | Vendored Unity Catalog OpenAPI fixture is pinned and compliance checks enabled | `release_evidence/2026-02-18-delta-primary-cutover/uc/openapi-parity.txt` | Passed (2026-02-19) |

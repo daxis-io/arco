@@ -70,3 +70,20 @@ Command: buf breaking --against '.git#branch=main'
 
 Exit code: 0
 
+============================================================
+Date (UTC): 2026-02-19T04:34:35Z
+Command: cargo test -p arco-uc --test openapi_compliance
+------------------------------------------------------------
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.29s
+     Running tests/openapi_compliance.rs (target/debug/deps/openapi_compliance-2f5b5199f5d2cd6a)
+
+running 2 tests
+test test_vendored_uc_spec_is_parseable ... ok
+test test_openapi_paths_align_with_vendored_spec ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+
+Exit code: 0
+
+Note (2026-02-19T04:34:35Z): the earlier `-- --ignored` invocation executed 0 tests because `openapi_compliance` cases are no longer ignored. The non-ignored invocation above is the authoritative compliance execution for this pass.

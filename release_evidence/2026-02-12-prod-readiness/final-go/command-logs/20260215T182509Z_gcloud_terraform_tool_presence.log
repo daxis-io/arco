@@ -1,5 +1,0 @@
-# command: for t in gcloud terraform jq; do if command -v "$t" >/dev/null 2>&1; then echo "$t:present"; else echo "$t:missing"; fi; done
-# start_utc: 2026-02-15T18:25:09Z
-gcloud:present
-terraform:present
-jq:present

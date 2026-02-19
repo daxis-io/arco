@@ -14,7 +14,7 @@ USAGE
 }
 
 TAG=""
-OUTPUT_ROOT="release_evidence/2026-02-12-prod-readiness/gate-1/collector-packs"
+OUTPUT_ROOT=".release-artifacts/gate-1/collector-packs"
 ALLOW_EXISTING="false"
 
 while [[ $# -gt 0 ]]; do

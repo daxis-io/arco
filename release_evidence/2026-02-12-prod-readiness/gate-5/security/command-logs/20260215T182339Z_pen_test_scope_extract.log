@@ -1,7 +1,0 @@
-# command: rg -n "In-scope APIs|In-scope storage paths|Out-of-scope|Procedure|Evidence to capture" docs/runbooks/pen-test-scope.md
-# start_utc: 2026-02-15T18:23:39Z
-15:- In-scope APIs: `/api/v1/*`, `/iceberg/v1/*`
-16:- In-scope storage paths: tenant/workspace-scoped buckets
-17:- Out-of-scope: production systems, customer data, third-party integrations
-19:## Procedure
-25:## Evidence to capture

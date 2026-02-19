@@ -1,3 +1,0 @@
-   Compiling arco-catalog v0.1.0 (/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/crates/arco-catalog)
-    Finished `bench` profile [optimized + debuginfo] target(s) in 30.28s
-  Executable benches/catalog_lookup.rs (target/release/deps/catalog_lookup-c0f361ced6824d1f)

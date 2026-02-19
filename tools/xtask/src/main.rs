@@ -451,10 +451,11 @@ fn extract_summary_links(text: &str) -> Vec<String> {
     links
 }
 
-fn forbidden_path_markers() -> [String; 2] {
+fn forbidden_path_markers() -> [String; 3] {
     [
         format!("{}/{}/", "docs", "plans"),
         format!("{}_{}/", "release", "evidence"),
+        format!("{}/{}/{}/", "docs", "catalog-metastore", "evidence"),
     ]
 }
 
@@ -2145,5 +2146,25 @@ mod tests {
         let summary = "- [Intro](./intro.md)\n- [API](reference/api.md)\n";
         let links = extract_summary_links(summary);
         assert_eq!(links, vec!["./intro.md".to_string(), "reference/api.md".to_string()]);
+    }
+
+    #[test]
+    fn forbidden_path_markers_include_removed_evidence_tree() {
+        let markers = forbidden_path_markers();
+        let catalog_evidence = format!("{}/{}/{}/", "docs", "catalog-metastore", "evidence");
+        let plans = format!("{}/{}/", "docs", "plans");
+        let release_evidence = format!("{}_{}/", "release", "evidence");
+        assert!(
+            markers.iter().any(|marker| marker == &catalog_evidence),
+            "expected removed catalog evidence tree to be blocked"
+        );
+        assert!(
+            markers.iter().any(|marker| marker == &plans),
+            "expected removed planning tree to be blocked"
+        );
+        assert!(
+            markers.iter().any(|marker| marker == &release_evidence),
+            "expected removed release evidence tree to be blocked"
+        );
     }
 }

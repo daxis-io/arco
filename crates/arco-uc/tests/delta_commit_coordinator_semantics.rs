@@ -217,6 +217,206 @@ async fn stale_read_rejected_as_conflict() -> Result<(), String> {
 }
 
 #[tokio::test]
+async fn invalid_idempotency_key_is_rejected_without_staging_side_effects() -> Result<(), String> {
+    let harness = make_harness();
+    let table_id = Uuid::now_v7();
+
+    let response = uc_request(
+        &harness.router,
+        Method::POST,
+        "/delta/preview/commits",
+        json!({
+            "table_id": table_id,
+            "table_uri": "gs://bucket/path",
+            "commit_info": commit_info(0)
+        }),
+        Some("not-a-uuid"),
+        Some("req-uc-bad-idempotency"),
+    )
+    .await?;
+
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .body
+            .pointer("/error/error_code")
+            .and_then(Value::as_str),
+        Some("BAD_REQUEST")
+    );
+
+    let staged_paths = harness
+        .storage
+        .list(&format!("delta/staging/{table_id}/"))
+        .await
+        .map_err(|err| format!("list staged payloads: {err}"))?;
+    assert!(
+        staged_paths.is_empty(),
+        "invalid idempotency key should not write staged payloads"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_uri_mismatch_is_rejected_for_get_and_backfill() -> Result<(), String> {
+    let harness = make_harness();
+    let table_id = Uuid::now_v7();
+
+    let commit = uc_request(
+        &harness.router,
+        Method::POST,
+        "/delta/preview/commits",
+        json!({
+            "table_id": table_id,
+            "table_uri": "gs://bucket/path-a",
+            "commit_info": commit_info(0)
+        }),
+        Some(&Uuid::now_v7().to_string()),
+        Some("req-uc-uri-commit"),
+    )
+    .await?;
+    assert_eq!(commit.status, StatusCode::OK);
+
+    let get_mismatch = uc_request(
+        &harness.router,
+        Method::GET,
+        "/delta/preview/commits",
+        json!({
+            "table_id": table_id,
+            "table_uri": "gs://bucket/path-b",
+            "start_version": 0
+        }),
+        None,
+        Some("req-uc-uri-get"),
+    )
+    .await?;
+    assert_eq!(get_mismatch.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        get_mismatch
+            .body
+            .pointer("/error/error_code")
+            .and_then(Value::as_str),
+        Some("BAD_REQUEST")
+    );
+
+    let backfill_mismatch = uc_request(
+        &harness.router,
+        Method::POST,
+        "/delta/preview/commits",
+        json!({
+            "table_id": table_id,
+            "table_uri": "gs://bucket/path-b",
+            "latest_backfilled_version": 0
+        }),
+        None,
+        Some("req-uc-uri-backfill"),
+    )
+    .await?;
+    assert_eq!(backfill_mismatch.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        backfill_mismatch
+            .body
+            .pointer("/error/error_code")
+            .and_then(Value::as_str),
+        Some("BAD_REQUEST")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn unbackfilled_commit_limit_returns_too_many_requests() -> Result<(), String> {
+    let harness = make_harness();
+    let table_id = Uuid::now_v7();
+    let coordinator_path = format!("delta/coordinator/{table_id}.json");
+    let state = arco_delta::DeltaCoordinatorState {
+        latest_version: 999,
+        inflight: None,
+    };
+    harness
+        .storage
+        .put_raw(
+            &coordinator_path,
+            Bytes::from(
+                serde_json::to_vec(&state)
+                    .map_err(|err| format!("serialize seeded coordinator state: {err}"))?,
+            ),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .map_err(|err| format!("seed coordinator state: {err}"))?;
+
+    let response = uc_request(
+        &harness.router,
+        Method::POST,
+        "/delta/preview/commits",
+        json!({
+            "table_id": table_id,
+            "table_uri": "gs://bucket/path",
+            "commit_info": commit_info(1000)
+        }),
+        Some(&Uuid::now_v7().to_string()),
+        Some("req-uc-cap"),
+    )
+    .await?;
+
+    assert_eq!(response.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .body
+            .pointer("/error/error_code")
+            .and_then(Value::as_str),
+        Some("TOO_MANY_REQUESTS")
+    );
+
+    let staged_paths = harness
+        .storage
+        .list(&format!("delta/staging/{table_id}/"))
+        .await
+        .map_err(|err| format!("list staged payloads: {err}"))?;
+    assert!(
+        staged_paths.is_empty(),
+        "rejected commit should not leave staged payloads"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn successful_commit_cleans_staged_payload() -> Result<(), String> {
+    let harness = make_harness();
+    let table_id = Uuid::now_v7();
+    let idempotency_key = Uuid::now_v7().to_string();
+
+    let response = uc_request(
+        &harness.router,
+        Method::POST,
+        "/delta/preview/commits",
+        json!({
+            "table_id": table_id,
+            "table_uri": "gs://bucket/path",
+            "commit_info": commit_info(0)
+        }),
+        Some(&idempotency_key),
+        Some("req-uc-cleanup"),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+
+    let staged_paths = harness
+        .storage
+        .list(&format!("delta/staging/{table_id}/"))
+        .await
+        .map_err(|err| format!("list staged payloads: {err}"))?;
+    assert!(
+        staged_paths.is_empty(),
+        "successful commit should remove staged payload"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn expired_inflight_is_recovered_and_unrelated_key_is_conflict() -> Result<(), String> {
     let harness = make_harness();
     let table_id = Uuid::now_v7();

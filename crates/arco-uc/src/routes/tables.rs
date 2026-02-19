@@ -429,6 +429,7 @@ pub(crate) async fn get_table(
         (status = 401, description = "Unauthorized.", body = UnityCatalogErrorResponse),
         (status = 403, description = "Forbidden.", body = UnityCatalogErrorResponse),
         (status = 404, description = "Not found.", body = UnityCatalogErrorResponse),
+        (status = 501, description = "Not implemented.", body = UnityCatalogErrorResponse),
         (status = 500, description = "Internal server error.", body = UnityCatalogErrorResponse),
     )
 )]
@@ -452,6 +453,19 @@ pub(crate) async fn delete_table(
     let path = table_path(&catalog_name, &schema_name, &table_name);
     let exists = preview::object_exists(&scoped_storage, &path, "check table").await?;
     if !exists {
+        let reader = CatalogReader::new(scoped_storage.clone());
+        let native = reader
+            .get_table_in_schema(&catalog_name, &schema_name, &table_name)
+            .await
+            .map_err(map_catalog_error)?;
+        if native.is_some() {
+            return Err(UnityCatalogError::NotImplemented {
+                message: format!(
+                    "operation not supported: delete catalog-native table {catalog_name}.{schema_name}.{table_name}"
+                ),
+            });
+        }
+
         return Err(UnityCatalogError::NotFound {
             message: format!("table not found: {catalog_name}.{schema_name}.{table_name}"),
         });

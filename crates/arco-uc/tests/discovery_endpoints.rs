@@ -130,6 +130,36 @@ async fn test_get_table_by_full_name_returns_success() {
 }
 
 #[tokio::test]
+async fn test_delete_catalog_native_table_returns_not_supported() {
+    let seeded = seeded_router().await;
+    let app = seeded.app;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/tables/analytics.sales.orders")
+                .header("X-Tenant-Id", "tenant1")
+                .header("X-Workspace-Id", "workspace1")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body bytes");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json payload");
+    assert_eq!(
+        payload
+            .pointer("/error/error_code")
+            .and_then(serde_json::Value::as_str),
+        Some("NOT_SUPPORTED")
+    );
+}
+
+#[tokio::test]
 async fn test_get_permissions_returns_success() {
     let seeded = seeded_router().await;
     let app = seeded.app;

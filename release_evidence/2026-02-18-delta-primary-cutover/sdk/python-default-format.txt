@@ -117,3 +117,19 @@ python/arco/tests/unit/test_asset_types.py:122:        assert IoConfig().format 
 
 Exit code: 0
 
+
+============================================================
+Date (UTC): 2026-02-19T17:03:19Z
+Command: cd python/arco && uv run --python 3.11 --extra dev pytest tests/unit/test_asset_types.py tests/unit/test_decorator.py -q
+------------------------------------------------------------
+........................                                                 [100%]
+
+Exit code: 0
+
+============================================================
+Date (UTC): 2026-02-19T17:03:19Z
+Command: cd python/arco && uv run --python 3.11 --extra dev pytest tests/unit/test_asset_types.py tests/unit/test_decorator.py tests/unit/test_manifest_model.py -q
+------------------------------------------------------------
+..................................                                       [100%]
+
+Exit code: 0

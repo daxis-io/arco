@@ -1,0 +1,16 @@
+release_evidence/2026-02-18-delta-primary-cutover/ci/delta-format-validation.txt	cargo test -p arco-core --test table_format_contracts	0
+release_evidence/2026-02-18-delta-primary-cutover/ci/delta-location-paths.txt	cargo test -p arco-core --test flow_paths_contracts	0
+release_evidence/2026-02-18-delta-primary-cutover/ci/delta-default-api.txt	cargo test -p arco-catalog	0
+release_evidence/2026-02-18-delta-primary-cutover/ci/delta-default-api.txt	cargo test -p arco-api	0
+release_evidence/2026-02-18-delta-primary-cutover/ci/delta-commit-gating.txt	cargo test -p arco-delta	0
+release_evidence/2026-02-18-delta-primary-cutover/ci/delta-commit-gating.txt	cargo test -p arco-integration-tests --test delta_commit_coordinator	0
+release_evidence/2026-02-18-delta-primary-cutover/uc/openapi-parity.txt	cargo test -p arco-uc --tests	0
+release_evidence/2026-02-18-delta-primary-cutover/uc/openapi-parity.txt	cargo xtask uc-openapi-inventory	0
+release_evidence/2026-02-18-delta-primary-cutover/uc/openapi-parity.txt	cargo test -p arco-uc --test openapi_compliance -- --ignored	0
+release_evidence/2026-02-18-delta-primary-cutover/ci/delta-format-validation.txt	cargo fmt --all -- --check	0
+release_evidence/2026-02-18-delta-primary-cutover/ci/delta-format-validation.txt	cargo clippy --workspace --all-targets --all-features -- -D warnings	101
+release_evidence/2026-02-18-delta-primary-cutover/ci/delta-commit-gating.txt	cargo test --workspace	0
+release_evidence/2026-02-18-delta-primary-cutover/ci/delta-commit-gating.txt	cargo deny check	0
+release_evidence/2026-02-18-delta-primary-cutover/uc/openapi-parity.txt	buf lint	0
+release_evidence/2026-02-18-delta-primary-cutover/uc/openapi-parity.txt	buf breaking --against '.git#branch=main'	0
+release_evidence/2026-02-18-delta-primary-cutover/ci/iceberg-secondary.txt	cargo test -p arco-iceberg	0

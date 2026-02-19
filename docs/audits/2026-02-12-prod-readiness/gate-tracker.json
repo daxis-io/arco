@@ -1,7 +1,8 @@
 {
   "audit_id": "2026-02-12-prod-readiness",
   "release_train": "delta-primary-cutover",
-  "status": "IN_PROGRESS",
+  "status": "BLOCKED",
+  "status_updated_utc": "2026-02-19T04:22:21Z",
   "gates": [
     {
       "id": "delta-primary-cutover",
@@ -16,6 +17,18 @@
         "sdk-delta-default",
         "policy-docs-updated"
       ]
+    }
+  ],
+  "blocked_signals": [
+    {
+      "id": "delta-format-canonicalization",
+      "reason": "cargo clippy --workspace --all-targets --all-features -- -D warnings exited 101 due pre-existing workspace lint violations",
+      "evidence_path": "release_evidence/2026-02-18-delta-primary-cutover/ci/delta-format-validation.txt"
+    },
+    {
+      "id": "sdk-delta-default",
+      "reason": "Python SDK runtime tests cannot execute in this environment: python3=3.9.6 while python/arco requires >=3.11",
+      "evidence_path": "release_evidence/2026-02-18-delta-primary-cutover/sdk/python-default-format.txt"
     }
   ],
   "verification_commands": [
@@ -33,6 +46,7 @@
     "cargo test --workspace",
     "cargo deny check",
     "buf lint",
-    "buf breaking --against '.git#branch=main'"
+    "buf breaking --against '.git#branch=main'",
+    "cargo test -p arco-iceberg"
   ]
 }

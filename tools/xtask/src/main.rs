@@ -117,6 +117,7 @@ fn run_uc_openapi_inventory() -> Result<()> {
         serde_yaml::from_str(&yaml).context("parse UC OpenAPI fixture YAML")?;
     let spec: serde_json::Value =
         serde_json::to_value(spec_yaml).context("convert UC OpenAPI spec to JSON")?;
+    let spec_sha256 = format!("{:x}", Sha256::digest(yaml.as_bytes()));
 
     let title = spec
         .get("info")
@@ -208,7 +209,7 @@ fn run_uc_openapi_inventory() -> Result<()> {
 
     let mut md = String::new();
     md.push_str("# Unity Catalog OSS OpenAPI Endpoint Inventory (Pinned)\n\n");
-    md.push_str(&format!("**Generated:** {}  \n", Utc::now().date_naive()));
+    md.push_str(&format!("**Spec SHA256:** `{spec_sha256}`  \n"));
     md.push_str(&format!("**Spec fixture:** `{}`  \n", spec_path.display()));
     md.push_str(&format!("**Spec title:** {title}  \n"));
     md.push_str(&format!("**Spec version:** {version}  \n"));

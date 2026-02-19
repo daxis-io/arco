@@ -198,7 +198,9 @@ async fn create_and_list_tables_scoped_to_catalog_and_schema() -> Result<(), Str
             "catalog_name": "main",
             "schema_name": "analytics",
             "table_type": "EXTERNAL",
-            "data_source_format": "DELTA"
+            "data_source_format": "DELTA",
+            "columns": [],
+            "storage_location": "s3://bucket/main/analytics/events"
         })),
     )
     .await?;
@@ -301,7 +303,11 @@ async fn duplicate_creates_return_conflict() -> Result<(), String> {
         Some(json!({
             "name": "events",
             "catalog_name": "main",
-            "schema_name": "analytics"
+            "schema_name": "analytics",
+            "table_type": "EXTERNAL",
+            "data_source_format": "DELTA",
+            "columns": [],
+            "storage_location": "s3://bucket/main/analytics/events"
         })),
     )
     .await?;
@@ -316,7 +322,11 @@ async fn duplicate_creates_return_conflict() -> Result<(), String> {
         Some(json!({
             "name": "events",
             "catalog_name": "main",
-            "schema_name": "analytics"
+            "schema_name": "analytics",
+            "table_type": "EXTERNAL",
+            "data_source_format": "DELTA",
+            "columns": [],
+            "storage_location": "s3://bucket/main/analytics/events"
         })),
     )
     .await?;
@@ -406,6 +416,219 @@ async fn tenant_workspace_isolation() -> Result<(), String> {
             .and_then(Value::as_array)
             .map(Vec::len),
         Some(0)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_schemas_does_not_leak_prefix_collisions() -> Result<(), String> {
+    let router = test_router();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main2"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "analytics",
+            "catalog_name": "main2"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, listed) = uc_request(
+        &router,
+        Method::GET,
+        "/schemas?catalog_name=main",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let schemas = listed
+        .get("schemas")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "schemas should be an array".to_string())?;
+    assert!(schemas.is_empty(), "unexpected schema leak: {schemas:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_table_requires_all_uc_required_fields() -> Result<(), String> {
+    let router = test_router();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "analytics",
+            "catalog_name": "main"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = uc_request(
+        &router,
+        Method::POST,
+        "/tables",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "events",
+            "catalog_name": "main",
+            "schema_name": "analytics"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("BAD_REQUEST")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_tables_caps_max_results() -> Result<(), String> {
+    let router = test_router();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "analytics",
+            "catalog_name": "main"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    for index in 0..60 {
+        let table_name = format!("events_{index:02}");
+        let (status, _) = uc_request(
+            &router,
+            Method::POST,
+            "/tables",
+            "tenant_a",
+            "workspace_a",
+            Some(json!({
+                "name": table_name,
+                "catalog_name": "main",
+                "schema_name": "analytics",
+                "table_type": "EXTERNAL",
+                "data_source_format": "DELTA",
+                "columns": [],
+                "storage_location": format!("s3://bucket/main/analytics/{table_name}")
+            })),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let (status, listed) = uc_request(
+        &router,
+        Method::GET,
+        "/tables?catalog_name=main&schema_name=analytics&max_results=1000",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let tables = listed
+        .get("tables")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "tables should be an array".to_string())?;
+    assert_eq!(tables.len(), 50);
+    assert_eq!(
+        listed.get("next_page_token").and_then(Value::as_str),
+        Some("50")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_catalogs_omits_next_page_token_when_no_more_results() -> Result<(), String> {
+    let router = test_router();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, listed) = uc_request(
+        &router,
+        Method::GET,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        listed.get("next_page_token").is_none(),
+        "next_page_token should be omitted when no more results: {listed:?}"
     );
     Ok(())
 }

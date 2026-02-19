@@ -11,26 +11,27 @@ use crate::error::{UnityCatalogError, UnityCatalogResult};
 pub(crate) const CATALOGS_PREFIX: &str = "unity-catalog-preview/catalogs";
 pub(crate) const SCHEMAS_PREFIX: &str = "unity-catalog-preview/schemas";
 pub(crate) const TABLES_PREFIX: &str = "unity-catalog-preview/tables";
+pub(crate) const DEFAULT_PAGE_SIZE: usize = 100;
 
 pub(crate) fn catalog_path(name: &str) -> String {
     format!("{CATALOGS_PREFIX}/{name}.json")
 }
 
 pub(crate) fn schema_prefix(catalog_name: &str) -> String {
-    format!("{SCHEMAS_PREFIX}/{catalog_name}")
+    format!("{SCHEMAS_PREFIX}/{catalog_name}/")
 }
 
 pub(crate) fn schema_path(catalog_name: &str, schema_name: &str) -> String {
-    format!("{}/{schema_name}.json", schema_prefix(catalog_name))
+    format!("{}{schema_name}.json", schema_prefix(catalog_name))
 }
 
 pub(crate) fn table_prefix(catalog_name: &str, schema_name: &str) -> String {
-    format!("{TABLES_PREFIX}/{catalog_name}/{schema_name}")
+    format!("{TABLES_PREFIX}/{catalog_name}/{schema_name}/")
 }
 
 pub(crate) fn table_path(catalog_name: &str, schema_name: &str, table_name: &str) -> String {
     format!(
-        "{}/{table_name}.json",
+        "{}{table_name}.json",
         table_prefix(catalog_name, schema_name)
     )
 }
@@ -49,6 +50,30 @@ pub(crate) fn require_identifier(value: Option<String>, field: &str) -> UnityCat
     }
     validate_identifier(value, field)?;
     Ok(value.to_string())
+}
+
+pub(crate) fn require_non_empty_string(
+    value: Option<String>,
+    field: &str,
+) -> UnityCatalogResult<String> {
+    let Some(value) = value else {
+        return Err(UnityCatalogError::BadRequest {
+            message: format!("missing required field: {field}"),
+        });
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(UnityCatalogError::BadRequest {
+            message: format!("missing required field: {field}"),
+        });
+    }
+    Ok(value.to_string())
+}
+
+pub(crate) fn require_present<T>(value: Option<T>, field: &str) -> UnityCatalogResult<T> {
+    value.ok_or_else(|| UnityCatalogError::BadRequest {
+        message: format!("missing required field: {field}"),
+    })
 }
 
 fn validate_identifier(value: &str, field: &str) -> UnityCatalogResult<()> {
@@ -124,6 +149,8 @@ pub(crate) fn paginate<T>(
     values: Vec<T>,
     page_token: Option<&str>,
     max_results: Option<i32>,
+    default_page_size: usize,
+    max_page_size: usize,
 ) -> UnityCatalogResult<(Vec<T>, Option<String>)> {
     let total = values.len();
     let start = parse_page_token(page_token)?;
@@ -131,11 +158,8 @@ pub(crate) fn paginate<T>(
         return Ok((Vec::new(), None));
     };
 
-    let max_results = parse_max_results(max_results)?;
-    let take_count = match max_results {
-        Some(0) | None => remaining,
-        Some(limit) => limit.min(remaining),
-    };
+    let take_count =
+        parse_max_results(max_results, default_page_size, max_page_size)?.min(remaining);
     let end = start.saturating_add(take_count);
 
     let paged = values
@@ -159,13 +183,18 @@ fn parse_page_token(page_token: Option<&str>) -> UnityCatalogResult<usize> {
         })
 }
 
-fn parse_max_results(max_results: Option<i32>) -> UnityCatalogResult<Option<usize>> {
+fn parse_max_results(
+    max_results: Option<i32>,
+    default_page_size: usize,
+    max_page_size: usize,
+) -> UnityCatalogResult<usize> {
+    let effective_default = default_page_size.min(max_page_size).max(1);
     match max_results {
         Some(value) if value < 0 => Err(UnityCatalogError::BadRequest {
             message: "invalid max_results: must be greater than or equal to 0".to_string(),
         }),
-        Some(value) => Ok(Some(value as usize)),
-        None => Ok(None),
+        Some(0) | None => Ok(effective_default),
+        Some(value) => Ok((value as usize).min(max_page_size)),
     }
 }
 

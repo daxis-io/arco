@@ -47,6 +47,7 @@ pub(crate) struct CatalogInfo {
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub(crate) struct ListCatalogsResponse {
     catalogs: Vec<CatalogInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     next_page_token: Option<String>,
 }
 
@@ -86,8 +87,13 @@ pub(crate) async fn get_catalogs(
         "list catalogs",
     )
     .await?;
-    let (catalogs, next_page_token) =
-        preview::paginate(catalogs, query.page_token.as_deref(), query.max_results)?;
+    let (catalogs, next_page_token) = preview::paginate(
+        catalogs,
+        query.page_token.as_deref(),
+        query.max_results,
+        preview::DEFAULT_PAGE_SIZE,
+        1000,
+    )?;
 
     Ok(Json(ListCatalogsResponse {
         catalogs,

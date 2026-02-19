@@ -51,6 +51,7 @@ pub(crate) struct SchemaInfo {
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub(crate) struct ListSchemasResponse {
     schemas: Vec<SchemaInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     next_page_token: Option<String>,
 }
 
@@ -106,8 +107,13 @@ pub(crate) async fn get_schemas(
         "list schemas",
     )
     .await?;
-    let (schemas, next_page_token) =
-        preview::paginate(schemas, query.page_token.as_deref(), query.max_results)?;
+    let (schemas, next_page_token) = preview::paginate(
+        schemas,
+        query.page_token.as_deref(),
+        query.max_results,
+        preview::DEFAULT_PAGE_SIZE,
+        1000,
+    )?;
 
     Ok(Json(ListSchemasResponse {
         schemas,

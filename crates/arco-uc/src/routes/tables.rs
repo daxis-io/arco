@@ -60,6 +60,7 @@ pub(crate) struct TableInfo {
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub(crate) struct ListTablesResponse {
     tables: Vec<TableInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     next_page_token: Option<String>,
 }
 
@@ -130,8 +131,13 @@ pub(crate) async fn get_tables(
         "list tables",
     )
     .await?;
-    let (tables, next_page_token) =
-        preview::paginate(tables, query.page_token.as_deref(), query.max_results)?;
+    let (tables, next_page_token) = preview::paginate(
+        tables,
+        query.page_token.as_deref(),
+        query.max_results,
+        preview::DEFAULT_PAGE_SIZE,
+        50,
+    )?;
 
     Ok(Json(ListTablesResponse {
         tables,
@@ -171,6 +177,12 @@ pub(crate) async fn post_tables(
     let name = preview::require_identifier(payload.name, "name")?;
     let catalog_name = preview::require_identifier(payload.catalog_name, "catalog_name")?;
     let schema_name = preview::require_identifier(payload.schema_name, "schema_name")?;
+    let table_type = preview::require_non_empty_string(payload.table_type, "table_type")?;
+    let data_source_format =
+        preview::require_non_empty_string(payload.data_source_format, "data_source_format")?;
+    let columns = preview::require_present(payload.columns, "columns")?;
+    let storage_location =
+        preview::require_non_empty_string(payload.storage_location, "storage_location")?;
     let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
 
     let catalog_exists = preview::object_exists(
@@ -202,10 +214,10 @@ pub(crate) async fn post_tables(
         catalog_name: catalog_name.clone(),
         schema_name: schema_name.clone(),
         full_name: format!("{catalog_name}.{schema_name}.{name}"),
-        table_type: payload.table_type,
-        data_source_format: payload.data_source_format,
-        columns: payload.columns,
-        storage_location: payload.storage_location,
+        table_type: Some(table_type),
+        data_source_format: Some(data_source_format),
+        columns: Some(columns),
+        storage_location: Some(storage_location),
         comment: payload.comment,
         properties: payload.properties,
     };

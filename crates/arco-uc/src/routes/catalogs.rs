@@ -1,7 +1,10 @@
 //! Catalog routes for the Unity Catalog facade.
 
 use axum::Json;
-use axum::extract::{Extension, Query, State};
+use axum::Router;
+use axum::extract::{Extension, OriginalUri, Query, State};
+use axum::http::Method;
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -12,6 +15,18 @@ use crate::context::UnityCatalogRequestContext;
 use crate::error::{UnityCatalogError, UnityCatalogErrorResponse, UnityCatalogResult};
 use crate::routes::preview::{self, catalog_path};
 use crate::state::UnityCatalogState;
+
+/// Catalog route group.
+pub fn routes() -> Router<UnityCatalogState> {
+    Router::new()
+        .route("/catalogs", post(post_catalogs).get(get_catalogs))
+        .route(
+            "/catalogs/:name",
+            get(get_catalog)
+                .patch(update_catalog)
+                .delete(delete_catalog),
+        )
+}
 
 #[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
@@ -193,4 +208,52 @@ pub(crate) async fn post_catalogs(
             message: format!("catalog already exists: {name}"),
         }),
     }
+}
+
+/// `GET /catalogs/{name}` (known UC operation; currently unsupported).
+#[utoipa::path(
+    get,
+    path = "/catalogs/{name}",
+    tag = "Catalogs",
+    params(
+        ("name" = String, Path, description = "Catalog name"),
+    ),
+    responses(
+        (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
+    )
+)]
+pub async fn get_catalog(method: Method, uri: OriginalUri) -> UnityCatalogError {
+    super::common::known_but_unsupported(&method, &uri)
+}
+
+/// `PATCH /catalogs/{name}` (known UC operation; currently unsupported).
+#[utoipa::path(
+    patch,
+    path = "/catalogs/{name}",
+    tag = "Catalogs",
+    params(
+        ("name" = String, Path, description = "Catalog name"),
+    ),
+    responses(
+        (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
+    )
+)]
+pub async fn update_catalog(method: Method, uri: OriginalUri) -> UnityCatalogError {
+    super::common::known_but_unsupported(&method, &uri)
+}
+
+/// `DELETE /catalogs/{name}` (known UC operation; currently unsupported).
+#[utoipa::path(
+    delete,
+    path = "/catalogs/{name}",
+    tag = "Catalogs",
+    params(
+        ("name" = String, Path, description = "Catalog name"),
+    ),
+    responses(
+        (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
+    )
+)]
+pub async fn delete_catalog(method: Method, uri: OriginalUri) -> UnityCatalogError {
+    super::common::known_but_unsupported(&method, &uri)
 }

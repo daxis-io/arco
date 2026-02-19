@@ -16,4 +16,4 @@ pub mod service;
 pub use fold::*;
 pub use manifest::*;
 pub use parquet_util::*;
-pub use service::{CompactionResult, MicroCompactor};
+pub use service::{CompactionResult, CompactionVisibility, DurabilityMode, MicroCompactor};

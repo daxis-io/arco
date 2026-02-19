@@ -66,6 +66,12 @@ pub enum UnityCatalogError {
         /// Human readable message.
         message: String,
     },
+    /// Request rate was limited.
+    #[error("{message}")]
+    TooManyRequests {
+        /// Human readable message.
+        message: String,
+    },
     /// Internal error.
     #[error("{message}")]
     Internal {
@@ -136,6 +142,15 @@ impl UnityCatalogError {
                 UnityCatalogErrorResponse {
                     error: UnityCatalogErrorDetail {
                         error_code: "SERVICE_UNAVAILABLE".to_string(),
+                        message: message.clone(),
+                    },
+                },
+            ),
+            Self::TooManyRequests { message } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                UnityCatalogErrorResponse {
+                    error: UnityCatalogErrorDetail {
+                        error_code: "TOO_MANY_REQUESTS".to_string(),
                         message: message.clone(),
                     },
                 },

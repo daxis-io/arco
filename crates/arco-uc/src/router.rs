@@ -25,32 +25,12 @@ pub fn unity_catalog_router(state: UnityCatalogState) -> Router {
             "/openapi.json",
             axum::routing::get(routes::openapi::get_openapi_json),
         )
-        .route(
-            "/catalogs",
-            axum::routing::get(routes::catalogs::get_catalogs)
-                .post(routes::catalogs::post_catalogs),
-        )
-        .route(
-            "/schemas",
-            axum::routing::get(routes::schemas::get_schemas).post(routes::schemas::post_schemas),
-        )
-        .route(
-            "/tables",
-            axum::routing::get(routes::tables::get_tables).post(routes::tables::post_tables),
-        )
-        .route(
-            "/delta/preview/commits",
-            axum::routing::get(routes::delta_commits::get_delta_preview_commits)
-                .post(routes::delta_commits::post_delta_preview_commits),
-        )
-        .route(
-            "/temporary-table-credentials",
-            axum::routing::post(routes::credentials::post_temporary_table_credentials),
-        )
-        .route(
-            "/temporary-path-credentials",
-            axum::routing::post(routes::credentials::post_temporary_path_credentials),
-        )
+        .merge(routes::catalogs::routes())
+        .merge(routes::schemas::routes())
+        .merge(routes::tables::routes())
+        .merge(routes::permissions::routes())
+        .merge(routes::credentials::routes())
+        .merge(routes::delta_commits::routes())
         .fallback(not_found)
         .layer(middleware::from_fn(context_middleware))
         .layer(TraceLayer::new_for_http());
@@ -74,7 +54,7 @@ pub fn unity_catalog_router(state: UnityCatalogState) -> Router {
 
 async fn not_found(uri: OriginalUri) -> UnityCatalogError {
     UnityCatalogError::NotFound {
-        message: format!("not found: {}", uri.0.path()),
+        message: format!("route not found: {}", uri.0.path()),
     }
 }
 

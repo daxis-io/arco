@@ -1,0 +1,91 @@
+{
+  "name": "tasks",
+  "version": 1,
+  "fields": [
+    {
+      "name": "run_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "task_key",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "state",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "attempt",
+      "data_type": "UInt32",
+      "nullable": false
+    },
+    {
+      "name": "attempt_id",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "started_at",
+      "data_type": "Int64",
+      "nullable": true
+    },
+    {
+      "name": "completed_at",
+      "data_type": "Int64",
+      "nullable": true
+    },
+    {
+      "name": "error_message",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "deps_total",
+      "data_type": "UInt32",
+      "nullable": false
+    },
+    {
+      "name": "deps_satisfied_count",
+      "data_type": "UInt32",
+      "nullable": false
+    },
+    {
+      "name": "max_attempts",
+      "data_type": "UInt32",
+      "nullable": false
+    },
+    {
+      "name": "heartbeat_timeout_sec",
+      "data_type": "UInt32",
+      "nullable": false
+    },
+    {
+      "name": "last_heartbeat_at",
+      "data_type": "Int64",
+      "nullable": true
+    },
+    {
+      "name": "ready_at",
+      "data_type": "Int64",
+      "nullable": true
+    },
+    {
+      "name": "asset_key",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "partition_key",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "row_version",
+      "data_type": "Utf8",
+      "nullable": false
+    }
+  ]
+}

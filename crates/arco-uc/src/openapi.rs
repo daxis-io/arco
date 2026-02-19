@@ -1,7 +1,5 @@
 //! `OpenAPI` (3.1) specification generation for the Unity Catalog facade.
 
-use std::sync::OnceLock;
-
 use utoipa::OpenApi;
 
 /// `OpenAPI` documentation for the Unity Catalog OSS parity facade.
@@ -47,21 +45,13 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
     UnityCatalogApiDoc::openapi()
 }
 
-static OPENAPI_JSON_CACHE: OnceLock<String> = OnceLock::new();
-
 /// Returns the generated `OpenAPI` spec serialized as pretty JSON.
 ///
 /// # Errors
 ///
 /// Returns an error if JSON serialization fails (should not happen).
 pub fn openapi_json() -> Result<String, serde_json::Error> {
-    if let Some(spec) = OPENAPI_JSON_CACHE.get() {
-        return Ok(spec.clone());
-    }
-
-    let spec = serde_json::to_string_pretty(&openapi())?;
-    let _ = OPENAPI_JSON_CACHE.set(spec.clone());
-    Ok(spec)
+    serde_json::to_string_pretty(&openapi())
 }
 
 #[cfg(test)]

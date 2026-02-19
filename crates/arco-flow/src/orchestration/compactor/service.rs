@@ -12,13 +12,19 @@
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use std::cmp::Ordering;
+use std::time::{Duration, Instant};
 use ulid::Ulid;
 
 use arco_core::{ScopedStorage, WritePrecondition, WriteResult};
+use metrics::{counter, gauge, histogram};
 
 use crate::error::{Error, Result};
+use crate::metrics::{labels as metric_labels, names as metric_names};
 use crate::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
-use crate::paths::{orchestration_l0_dir, orchestration_manifest_path};
+use crate::paths::{
+    orchestration_l0_dir, orchestration_manifest_path, orchestration_manifest_pointer_path,
+    orchestration_manifest_snapshot_path,
+};
 
 use super::fold::{
     FoldState, merge_backfill_chunk_rows, merge_backfill_rows, merge_dep_satisfaction_rows,
@@ -28,7 +34,8 @@ use super::fold::{
     merge_timer_rows,
 };
 use super::manifest::{
-    EventRange, L0Delta, OrchestrationManifest, RowCounts, TablePaths, Watermarks,
+    EventRange, L0Delta, OrchestrationManifest, OrchestrationManifestPointer, RowCounts,
+    TablePaths, Watermarks, next_manifest_id,
 };
 use super::parquet_util::{
     read_partition_status, write_backfill_chunks, write_backfills, write_dep_satisfaction,
@@ -40,6 +47,37 @@ use super::parquet_util::{
 const SENSOR_EVAL_RETENTION_DAYS: i64 = 30;
 const IDEMPOTENCY_KEY_RETENTION_DAYS: i64 = 30;
 
+/// Internal durability mode for orchestration compaction acknowledgements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurabilityMode {
+    /// Acknowledge after pointer CAS publish (state is read-visible).
+    Visible,
+    /// Acknowledge after immutable manifest snapshot write (may not be visible yet).
+    Persisted,
+}
+
+/// Visibility outcome for a compaction publish attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionVisibility {
+    /// Pointer CAS publish succeeded; state is visible to readers.
+    Visible,
+    /// Immutable snapshot persisted but pointer CAS lost; state is not visible.
+    PersistedNotVisible,
+}
+
+impl CompactionVisibility {
+    /// Returns a stable string label for API responses and metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::PersistedNotVisible => "persisted_not_visible",
+        }
+    }
+}
+
+type PublishOutcome = CompactionVisibility;
+
 /// Micro-compactor for orchestration events.
 ///
 /// Processes events from the ledger and writes L0 delta Parquet files.
@@ -48,6 +86,7 @@ const IDEMPOTENCY_KEY_RETENTION_DAYS: i64 = 30;
 pub struct MicroCompactor {
     storage: ScopedStorage,
     tenant_secret: Vec<u8>,
+    durability_mode: DurabilityMode,
 }
 
 /// Result of a micro-compaction run.
@@ -59,6 +98,8 @@ pub struct CompactionResult {
     pub delta_id: Option<String>,
     /// New manifest revision.
     pub manifest_revision: String,
+    /// Visibility outcome for this compaction acknowledgement.
+    pub visibility_status: CompactionVisibility,
 }
 
 impl MicroCompactor {
@@ -68,6 +109,7 @@ impl MicroCompactor {
         Self {
             storage,
             tenant_secret: Vec::new(),
+            durability_mode: DurabilityMode::Visible,
         }
     }
 
@@ -77,7 +119,15 @@ impl MicroCompactor {
         Self {
             storage,
             tenant_secret,
+            durability_mode: DurabilityMode::Visible,
         }
+    }
+
+    /// Sets internal durability mode for compaction acknowledgements.
+    #[must_use]
+    pub const fn with_durability_mode(mut self, durability_mode: DurabilityMode) -> Self {
+        self.durability_mode = durability_mode;
+        self
     }
 
     /// Loads the current manifest and fold state (base snapshot + L0 deltas).
@@ -89,7 +139,7 @@ impl MicroCompactor {
     ///
     /// Returns an error if the manifest or Parquet files cannot be read.
     pub async fn load_state(&self) -> Result<(OrchestrationManifest, FoldState)> {
-        let (manifest, _) = self.read_manifest_with_version().await?;
+        let (manifest, _, _) = self.read_manifest_with_version().await?;
         let mut state = self.load_current_state(&manifest).await?;
         state.tenant_secret.clone_from(&self.tenant_secret);
         Ok((manifest, state))
@@ -109,20 +159,85 @@ impl MicroCompactor {
     /// # Errors
     ///
     /// Returns an error if storage reads/writes or Parquet encoding fail.
+    pub async fn compact_events(&self, event_paths: Vec<String>) -> Result<CompactionResult> {
+        self.compact_events_with_epoch(event_paths, None).await
+    }
+
+    /// Compatibility wrapper for callers that provide an explicit lock path.
+    ///
+    /// This branch validates epoch freshness against the pointer epoch only, so
+    /// `lock_path` is currently accepted for API compatibility and ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if storage reads/writes fail, Parquet encoding fails,
+    /// or the supplied fencing token is stale.
+    pub async fn compact_events_fenced(
+        &self,
+        event_paths: Vec<String>,
+        fencing_token: u64,
+        _lock_path: &str,
+    ) -> Result<CompactionResult> {
+        self.compact_events_with_epoch(event_paths, Some(fencing_token))
+            .await
+    }
+
+    /// Runs micro-compaction and validates the caller's lock epoch when supplied.
+    ///
+    /// # Arguments
+    /// * `event_paths` - Explicit paths to event files to process
+    /// * `expected_epoch` - Optional lock epoch associated with this write attempt
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if storage reads/writes fail, Parquet encoding fails,
+    /// or the supplied epoch is stale relative to the current pointer epoch.
     #[tracing::instrument(skip(self, event_paths), fields(event_count = event_paths.len()))]
     #[allow(clippy::too_many_lines)]
-    pub async fn compact_events(&self, event_paths: Vec<String>) -> Result<CompactionResult> {
+    pub async fn compact_events_with_epoch(
+        &self,
+        event_paths: Vec<String>,
+        expected_epoch: Option<u64>,
+    ) -> Result<CompactionResult> {
+        let ack_started = Instant::now();
+
         // Load current manifest + version for CAS
-        let (mut manifest, manifest_version) = self.read_manifest_with_version().await?;
+        let (mut manifest, pointer_version, previous_pointer) =
+            self.read_manifest_with_version().await?;
+        validate_expected_epoch(expected_epoch, previous_pointer.as_ref())?;
 
         if event_paths.is_empty() {
-            if manifest_version.is_none() {
-                self.publish_manifest(&manifest, None).await?;
+            let mut visibility_status = CompactionVisibility::Visible;
+            if pointer_version.is_none() {
+                match self
+                    .publish_manifest(&manifest, None, previous_pointer.as_ref())
+                    .await
+                {
+                    Ok(outcome) => visibility_status = outcome,
+                    Err(error) => {
+                        record_compaction_metrics(
+                            self.durability_mode,
+                            ack_started.elapsed(),
+                            &manifest,
+                            CompactionVisibility::Visible,
+                            "error",
+                        );
+                        return Err(error);
+                    }
+                }
             }
+            record_compaction_metrics(
+                self.durability_mode,
+                ack_started.elapsed(),
+                &manifest,
+                visibility_status,
+                "success",
+            );
             return Ok(CompactionResult {
                 events_processed: 0,
                 delta_id: None,
                 manifest_revision: manifest.revision_ulid,
+                visibility_status,
             });
         }
 
@@ -233,47 +348,125 @@ impl MicroCompactor {
             false
         };
 
-        let watermark_changed = update_watermarks(&mut manifest, &events, &last_event);
+        let watermark_changed =
+            update_watermarks(&mut manifest, &events, &last_event, self.durability_mode);
         let manifest_changed = delta_changed || watermark_changed;
 
+        let mut visibility_status = CompactionVisibility::Visible;
         let manifest_revision = if manifest_changed {
+            let previous_manifest_path = previous_pointer.as_ref().map_or_else(
+                || orchestration_manifest_path().to_string(),
+                |p| p.manifest_path.clone(),
+            );
+
+            manifest.manifest_id =
+                next_manifest_id(&manifest.manifest_id).map_err(Error::serialization)?;
+            manifest.previous_manifest_path = Some(previous_manifest_path);
+            let pointer_epoch = previous_pointer.as_ref().map_or(0, |p| p.epoch);
+            manifest.epoch = manifest.epoch.max(pointer_epoch);
+            if let Some(expected_epoch) = expected_epoch {
+                manifest.epoch = manifest.epoch.max(expected_epoch);
+            }
+
             let new_revision = Ulid::new().to_string();
             manifest.revision_ulid.clone_from(&new_revision);
             manifest.published_at = Utc::now();
-            self.publish_manifest(&manifest, manifest_version.as_deref())
-                .await?;
+            match self
+                .publish_manifest(
+                    &manifest,
+                    pointer_version.as_deref(),
+                    previous_pointer.as_ref(),
+                )
+                .await
+            {
+                Ok(outcome) => visibility_status = outcome,
+                Err(error) => {
+                    record_compaction_metrics(
+                        self.durability_mode,
+                        ack_started.elapsed(),
+                        &manifest,
+                        CompactionVisibility::Visible,
+                        "error",
+                    );
+                    return Err(error);
+                }
+            }
             new_revision
         } else {
             manifest.revision_ulid.clone()
         };
 
+        record_compaction_metrics(
+            self.durability_mode,
+            ack_started.elapsed(),
+            &manifest,
+            visibility_status,
+            "success",
+        );
+
         Ok(CompactionResult {
             events_processed: u32::try_from(events.len()).unwrap_or(u32::MAX),
             delta_id,
             manifest_revision,
+            visibility_status,
         })
     }
 
-    /// Reads the current manifest and version for CAS publishing.
-    async fn read_manifest_with_version(&self) -> Result<(OrchestrationManifest, Option<String>)> {
-        let manifest_path = orchestration_manifest_path();
+    /// Reads the current manifest and pointer CAS version.
+    async fn read_manifest_with_version(
+        &self,
+    ) -> Result<(
+        OrchestrationManifest,
+        Option<String>,
+        Option<OrchestrationManifestPointer>,
+    )> {
+        let pointer_path = orchestration_manifest_pointer_path();
+        if let Some(meta) = self.storage.head_raw(pointer_path).await? {
+            let pointer_data = self.storage.get_raw(pointer_path).await?;
+            let pointer: OrchestrationManifestPointer = serde_json::from_slice(&pointer_data)
+                .map_err(|e| Error::Serialization {
+                    message: format!("failed to parse manifest pointer: {e}"),
+                })?;
 
+            let manifest_data = match self.storage.get_raw(&pointer.manifest_path).await {
+                Ok(data) => data,
+                Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+                    self.storage.get_raw(orchestration_manifest_path()).await?
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let mut manifest: OrchestrationManifest = serde_json::from_slice(&manifest_data)
+                .map_err(|e| Error::Serialization {
+                    message: format!("failed to parse manifest: {e}"),
+                })?;
+
+            manifest.manifest_id.clone_from(&pointer.manifest_id);
+            manifest.epoch = manifest.epoch.max(pointer.epoch);
+
+            return Ok((manifest, Some(meta.version), Some(pointer)));
+        }
+
+        let manifest_path = orchestration_manifest_path();
         match self.storage.head_raw(manifest_path).await? {
-            Some(meta) => {
+            Some(_) => {
                 let data = self.storage.get_raw(manifest_path).await?;
                 let manifest: OrchestrationManifest =
                     serde_json::from_slice(&data).map_err(|e| Error::Serialization {
                         message: format!("failed to parse manifest: {e}"),
                     })?;
-                Ok((manifest, Some(meta.version)))
+                Ok((manifest, None, None))
             }
-            None => Ok((OrchestrationManifest::new(Ulid::new().to_string()), None)),
+            None => Ok((
+                OrchestrationManifest::new(Ulid::new().to_string()),
+                None,
+                None,
+            )),
         }
     }
 
     #[cfg(test)]
     async fn get_or_create_manifest(&self) -> Result<OrchestrationManifest> {
-        let (manifest, _) = self.read_manifest_with_version().await?;
+        let (manifest, _, _) = self.read_manifest_with_version().await?;
         Ok(manifest)
     }
 
@@ -621,26 +814,92 @@ impl MicroCompactor {
     async fn publish_manifest(
         &self,
         manifest: &OrchestrationManifest,
-        current_version: Option<&str>,
-    ) -> Result<()> {
-        let manifest_path = orchestration_manifest_path();
+        current_pointer_version: Option<&str>,
+        previous_pointer: Option<&OrchestrationManifestPointer>,
+    ) -> Result<PublishOutcome> {
+        let snapshot_path = orchestration_manifest_snapshot_path(&manifest.manifest_id);
         let json = serde_json::to_string_pretty(manifest).map_err(|e| Error::Serialization {
             message: format!("failed to serialize manifest: {e}"),
         })?;
 
-        let precondition = current_version.map_or(WritePrecondition::DoesNotExist, |version| {
-            WritePrecondition::MatchesVersion(version.to_string())
-        });
-
-        let result = self
+        let snapshot_result = self
             .storage
-            .put_raw(manifest_path, Bytes::from(json), precondition)
+            .put_raw(
+                &snapshot_path,
+                Bytes::from(json),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+        match snapshot_result {
+            WriteResult::Success { .. } => {}
+            WriteResult::PreconditionFailed { .. } => {
+                return Err(Error::storage(format!(
+                    "immutable manifest snapshot already exists: {snapshot_path}"
+                )));
+            }
+        }
+
+        let pointer_path = orchestration_manifest_pointer_path();
+        let parent_pointer_hash = match previous_pointer {
+            Some(_) => match self.storage.get_raw(pointer_path).await {
+                Ok(pointer_bytes) => Some(sha256_prefixed(&pointer_bytes)),
+                Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+                    None
+                }
+                Err(e) => return Err(e.into()),
+            },
+            None => None,
+        };
+
+        let pointer = OrchestrationManifestPointer {
+            manifest_id: manifest.manifest_id.clone(),
+            manifest_path: snapshot_path,
+            epoch: manifest.epoch,
+            parent_pointer_hash,
+            updated_at: Utc::now(),
+        };
+        let pointer_json =
+            serde_json::to_string_pretty(&pointer).map_err(|e| Error::Serialization {
+                message: format!("failed to serialize manifest pointer: {e}"),
+            })?;
+
+        let precondition = current_pointer_version
+            .map_or(WritePrecondition::DoesNotExist, |version| {
+                WritePrecondition::MatchesVersion(version.to_string())
+            });
+
+        let pointer_result = self
+            .storage
+            .put_raw(pointer_path, Bytes::from(pointer_json), precondition)
             .await?;
 
-        match result {
-            WriteResult::Success { .. } => Ok(()),
+        match pointer_result {
+            WriteResult::Success { .. } => {
+                // Legacy compatibility shim for readers still bound to the stable path.
+                let legacy_json =
+                    serde_json::to_string_pretty(manifest).map_err(|e| Error::Serialization {
+                        message: format!("failed to serialize legacy manifest: {e}"),
+                    })?;
+                let _ = self
+                    .storage
+                    .put_raw(
+                        orchestration_manifest_path(),
+                        Bytes::from(legacy_json),
+                        WritePrecondition::None,
+                    )
+                    .await?;
+                Ok(PublishOutcome::Visible)
+            }
             WriteResult::PreconditionFailed { .. } => {
-                Err(Error::storage("manifest publish failed - concurrent write"))
+                if self.durability_mode == DurabilityMode::Persisted {
+                    tracing::warn!(
+                        manifest_id = %manifest.manifest_id,
+                        "pointer CAS lost race in Persisted mode; returning persisted acknowledgement"
+                    );
+                    Ok(PublishOutcome::PersistedNotVisible)
+                } else {
+                    Err(Error::storage("manifest publish failed - concurrent write"))
+                }
             }
         }
     }
@@ -867,6 +1126,12 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
     merged
 }
 
+fn sha256_prefixed(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(bytes);
+    format!("sha256:{}", hex::encode(hash))
+}
+
 fn insert_changed<K, V>(
     delta: &mut std::collections::HashMap<K, V>,
     base: &std::collections::HashMap<K, V>,
@@ -973,6 +1238,23 @@ fn delta_state_is_empty(state: &FoldState) -> bool {
         && state.schedule_ticks.is_empty()
 }
 
+fn validate_expected_epoch(
+    expected_epoch: Option<u64>,
+    pointer: Option<&OrchestrationManifestPointer>,
+) -> Result<()> {
+    let (Some(request_epoch), Some(pointer)) = (expected_epoch, pointer) else {
+        return Ok(());
+    };
+
+    if request_epoch < pointer.epoch {
+        return Err(Error::storage(format!(
+            "stale epoch: request epoch {request_epoch} is behind pointer epoch {}",
+            pointer.epoch
+        )));
+    }
+
+    Ok(())
+}
 fn retention_reference_time_for_events(events: &[(String, OrchestrationEvent)]) -> DateTime<Utc> {
     events
         .iter()
@@ -1019,28 +1301,84 @@ fn update_watermarks(
     manifest: &mut OrchestrationManifest,
     events: &[(String, OrchestrationEvent)],
     last_event_id: &str,
+    durability_mode: DurabilityMode,
 ) -> bool {
     if events.is_empty() {
         return false;
     }
 
-    let should_advance = manifest
+    let should_advance_committed = manifest
         .watermarks
-        .events_processed_through
+        .last_committed_event_id
         .as_deref()
         .is_none_or(|current| last_event_id > current);
-
-    if should_advance {
-        let last_path = events.last().map(|(path, _)| path.clone());
-        manifest.watermarks = Watermarks {
-            events_processed_through: Some(last_event_id.to_string()),
-            last_processed_file: last_path,
-            last_processed_at: Utc::now(),
-        };
-        return true;
+    if !should_advance_committed {
+        return false;
     }
 
-    false
+    let last_path = events.last().map(|(path, _)| path.clone());
+    let previous_visible = manifest.watermarks.last_visible_event_id.clone();
+    let next_visible = if durability_mode == DurabilityMode::Visible {
+        Some(last_event_id.to_string())
+    } else {
+        previous_visible
+    };
+
+    manifest.watermarks = Watermarks {
+        last_committed_event_id: Some(last_event_id.to_string()),
+        last_visible_event_id: next_visible.clone(),
+        events_processed_through: next_visible,
+        last_processed_file: last_path,
+        last_processed_at: Utc::now(),
+    };
+    true
+}
+
+fn durability_mode_label(mode: DurabilityMode) -> &'static str {
+    match mode {
+        DurabilityMode::Visible => "visible",
+        DurabilityMode::Persisted => "persisted",
+    }
+}
+
+fn visibility_lag_events(watermarks: &Watermarks) -> f64 {
+    match (
+        watermarks.last_committed_event_id.as_deref(),
+        watermarks.last_visible_event_id.as_deref(),
+    ) {
+        (Some(committed), Some(visible)) if committed == visible => 0.0,
+        (Some(_), _) => 1.0,
+        (None, _) => 0.0,
+    }
+}
+
+fn record_compaction_metrics(
+    durability_mode: DurabilityMode,
+    ack_latency: Duration,
+    manifest: &OrchestrationManifest,
+    visibility_status: CompactionVisibility,
+    result: &str,
+) {
+    let mode = durability_mode_label(durability_mode).to_string();
+    counter!(
+        metric_names::ORCH_COMPACTIONS_TOTAL,
+        metric_labels::DURABILITY_MODE => mode.clone(),
+        metric_labels::RESULT => result.to_string(),
+    )
+    .increment(1);
+    histogram!(
+        metric_names::ORCH_COMPACTOR_ACK_LATENCY_SECONDS,
+        metric_labels::DURABILITY_MODE => mode.clone(),
+    )
+    .record(ack_latency.as_secs_f64());
+    gauge!(
+        metric_names::ORCH_COMPACTOR_VISIBILITY_LAG_EVENTS,
+        metric_labels::DURABILITY_MODE => mode,
+    )
+    .set(match visibility_status {
+        CompactionVisibility::Visible => visibility_lag_events(&manifest.watermarks),
+        CompactionVisibility::PersistedNotVisible => 1.0,
+    });
 }
 
 fn event_priority(data: &OrchestrationEventData) -> u8 {
@@ -1261,6 +1599,22 @@ mod tests {
         assert_eq!(manifest.l0_count, 1);
         assert_eq!(manifest.l0_deltas.len(), 1);
         assert_eq!(manifest.l0_deltas[0].event_range.event_count, 2);
+
+        let pointer_data = storage
+            .get_raw(orchestration_manifest_pointer_path())
+            .await?;
+        let pointer: OrchestrationManifestPointer =
+            serde_json::from_slice(&pointer_data).expect("parse pointer");
+        assert_eq!(pointer.manifest_id, manifest.manifest_id);
+        assert!(
+            pointer
+                .manifest_path
+                .contains("state/orchestration/manifests/")
+        );
+        let immutable_manifest = storage.get_raw(&pointer.manifest_path).await?;
+        let immutable: OrchestrationManifest =
+            serde_json::from_slice(&immutable_manifest).expect("parse immutable");
+        assert_eq!(immutable.manifest_id, manifest.manifest_id);
 
         Ok(())
     }
@@ -1736,34 +2090,87 @@ mod tests {
 
     #[tokio::test]
     async fn publish_manifest_uses_cas() -> Result<()> {
-        let (compactor, storage) = create_test_compactor().await?;
+        let (compactor, _storage) = create_test_compactor().await?;
 
-        let manifest = OrchestrationManifest::new("01HQXYZ123REV");
-        storage
-            .put_raw(
-                orchestration_manifest_path(),
-                Bytes::from(serde_json::to_string(&manifest).expect("serialize")),
-                WritePrecondition::None,
-            )
+        let mut manifest = OrchestrationManifest::new("01HQXYZ123REV");
+        manifest.manifest_id = "00000000000000000000".to_string();
+        compactor.publish_manifest(&manifest, None, None).await?;
+
+        let (_current, version, pointer) = compactor.read_manifest_with_version().await?;
+        let version = version.expect("pointer version");
+        let pointer = pointer.expect("pointer");
+
+        let mut competing = manifest.clone();
+        competing.manifest_id = "00000000000000000001".to_string();
+        competing.revision_ulid = "01HQXYZ124REV".to_string();
+        compactor
+            .publish_manifest(&competing, Some(&version), Some(&pointer))
             .await?;
 
-        let (_current, version) = compactor.read_manifest_with_version().await?;
-        let version = version.expect("version");
-
-        let bumped = OrchestrationManifest::new("01HQXYZ124REV");
-        storage
-            .put_raw(
-                orchestration_manifest_path(),
-                Bytes::from(serde_json::to_string(&bumped).expect("serialize")),
-                WritePrecondition::None,
-            )
-            .await?;
-
+        let mut stale = manifest;
+        stale.manifest_id = "00000000000000000002".to_string();
         let err = compactor
-            .publish_manifest(&manifest, Some(&version))
+            .publish_manifest(&stale, Some(&version), Some(&pointer))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("manifest publish failed"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compact_with_stale_epoch_is_rejected() -> Result<()> {
+        let (compactor, _storage) = create_test_compactor().await?;
+
+        let mut manifest = OrchestrationManifest::new("01HQXYZ200REV");
+        manifest.manifest_id = "00000000000000000000".to_string();
+        manifest.epoch = 5;
+        compactor.publish_manifest(&manifest, None, None).await?;
+
+        let error = compactor
+            .compact_events_with_epoch(vec![], Some(4))
+            .await
+            .expect_err("stale epoch must be rejected");
+        assert!(error.to_string().contains("stale epoch"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_manifest_reports_persisted_not_visible_on_cas_loss() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+        let persisted_a =
+            MicroCompactor::new(storage.clone()).with_durability_mode(DurabilityMode::Persisted);
+        let persisted_b =
+            MicroCompactor::new(storage.clone()).with_durability_mode(DurabilityMode::Persisted);
+
+        let mut base = OrchestrationManifest::new("01HQXYZ210REV");
+        base.manifest_id = "00000000000000000000".to_string();
+        base.epoch = 5;
+        let base_outcome = persisted_a.publish_manifest(&base, None, None).await?;
+        assert_eq!(base_outcome, PublishOutcome::Visible);
+
+        let (_manifest, stale_version, stale_pointer) =
+            persisted_a.read_manifest_with_version().await?;
+        let stale_version = stale_version.expect("pointer version");
+        let stale_pointer = stale_pointer.expect("pointer");
+
+        let mut winner = OrchestrationManifest::new("01HQXYZ211REV");
+        winner.manifest_id = "00000000000000000001".to_string();
+        winner.epoch = 5;
+        let winner_outcome = persisted_a
+            .publish_manifest(&winner, Some(&stale_version), Some(&stale_pointer))
+            .await?;
+        assert_eq!(winner_outcome, PublishOutcome::Visible);
+
+        let mut stale = OrchestrationManifest::new("01HQXYZ212REV");
+        stale.manifest_id = "00000000000000000002".to_string();
+        stale.epoch = 5;
+        let stale_outcome = persisted_b
+            .publish_manifest(&stale, Some(&stale_version), Some(&stale_pointer))
+            .await?;
+        assert_eq!(stale_outcome, PublishOutcome::PersistedNotVisible);
 
         Ok(())
     }
@@ -1794,5 +2201,67 @@ mod tests {
         };
 
         assert!(event_priority(&tick) < event_priority(&run_requested));
+    }
+
+    #[test]
+    fn persisted_mode_advances_committed_watermark_without_advancing_visible() {
+        let mut manifest = OrchestrationManifest::new("01HQXYZ123REV");
+        manifest.watermarks = Watermarks {
+            last_committed_event_id: Some("evt_01".to_string()),
+            last_visible_event_id: Some("evt_01".to_string()),
+            events_processed_through: Some("evt_01".to_string()),
+            last_processed_file: Some(orchestration_event_path("2025-01-15", "evt_01")),
+            last_processed_at: Utc::now(),
+        };
+
+        let mut event = make_plan_created_event();
+        event.event_id = "evt_02".to_string();
+        let path = orchestration_event_path("2025-01-15", &event.event_id);
+        let events = vec![(path, event.clone())];
+
+        let changed = update_watermarks(
+            &mut manifest,
+            &events,
+            &event.event_id,
+            DurabilityMode::Persisted,
+        );
+
+        assert!(changed);
+        assert_eq!(
+            manifest.watermarks.last_committed_event_id.as_deref(),
+            Some("evt_02")
+        );
+        assert_eq!(
+            manifest.watermarks.last_visible_event_id.as_deref(),
+            Some("evt_01")
+        );
+        assert_eq!(
+            manifest.watermarks.events_processed_through.as_deref(),
+            Some("evt_01")
+        );
+    }
+
+    #[test]
+    fn visibility_lag_reports_zero_when_committed_is_visible() {
+        let watermarks = Watermarks {
+            last_committed_event_id: Some("evt_03".to_string()),
+            last_visible_event_id: Some("evt_03".to_string()),
+            events_processed_through: Some("evt_03".to_string()),
+            last_processed_file: None,
+            last_processed_at: Utc::now(),
+        };
+        assert_eq!(visibility_lag_events(&watermarks), 0.0);
+    }
+
+    #[test]
+    fn visibility_lag_reports_one_when_visibility_trails_commit() {
+        let watermarks = Watermarks {
+            last_committed_event_id: Some("evt_03".to_string()),
+            last_visible_event_id: Some("evt_02".to_string()),
+            events_processed_through: Some("evt_02".to_string()),
+            last_processed_file: None,
+            last_processed_at: Utc::now(),
+        };
+        assert_eq!(visibility_lag_events(&watermarks), 1.0);
     }
 }

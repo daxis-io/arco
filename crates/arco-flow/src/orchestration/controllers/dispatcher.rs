@@ -229,6 +229,12 @@ pub struct DispatchPayload {
     /// Optional W3C traceparent for distributed tracing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub traceparent: Option<String>,
+    /// Optional per-dispatch callback token for worker callbacks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_token: Option<String>,
+    /// Expiration of `task_token` when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_expires_at: Option<DateTime<Utc>>,
     /// When the dispatch was created.
     pub dispatched_at: DateTime<Utc>,
 }
@@ -243,6 +249,8 @@ impl DispatchPayload {
             attempt,
             attempt_id,
             traceparent: None,
+            task_token: None,
+            token_expires_at: None,
             dispatched_at: Utc::now(),
         }
     }
@@ -251,6 +259,14 @@ impl DispatchPayload {
     #[must_use]
     pub fn with_traceparent(mut self, traceparent: impl Into<String>) -> Self {
         self.traceparent = Some(traceparent.into());
+        self
+    }
+
+    /// Attaches a per-dispatch callback token and its expiration.
+    #[must_use]
+    pub fn with_task_token(mut self, token: impl Into<String>, expires_at: DateTime<Utc>) -> Self {
+        self.task_token = Some(token.into());
+        self.token_expires_at = Some(expires_at);
         self
     }
 

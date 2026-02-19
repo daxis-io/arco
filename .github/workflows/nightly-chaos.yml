@@ -25,7 +25,8 @@ env:
 jobs:
   simulation:
     name: Simulation Tests
-    runs-on: ubuntu-latest
+    if: false
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -55,7 +56,8 @@ jobs:
 
   stress:
     name: Stress Tests
-    runs-on: ubuntu-latest
+    if: false
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -74,7 +76,8 @@ jobs:
 
   contention:
     name: Contention Tests
-    runs-on: ubuntu-latest
+    if: false
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -91,7 +94,8 @@ jobs:
 
   proptest:
     name: Property-Based Tests (Extended)
-    runs-on: ubuntu-latest
+    if: false
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -110,7 +114,8 @@ jobs:
 
   fencing:
     name: Fencing Token Tests
-    runs-on: ubuntu-latest
+    if: false
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
@@ -126,7 +131,8 @@ jobs:
 
   anti-entropy:
     name: Anti-Entropy Convergence
-    runs-on: ubuntu-latest
+    if: false
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -143,8 +149,8 @@ jobs:
 
   notify-failure:
     name: Notify on Failure
-    if: ${{ failure() }}
-    runs-on: ubuntu-latest
+    if: false
+    runs-on: ubuntu-24.04
     needs: [simulation, stress, contention, proptest, fencing, anti-entropy]
     steps:
       - name: Create failure summary

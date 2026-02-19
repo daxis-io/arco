@@ -8,40 +8,40 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{UnityCatalogError, UnityCatalogResult};
 
-pub(crate) const CATALOGS_PREFIX: &str = "unity-catalog-preview/catalogs";
-pub(crate) const SCHEMAS_PREFIX: &str = "unity-catalog-preview/schemas";
-pub(crate) const TABLES_PREFIX: &str = "unity-catalog-preview/tables";
-pub(crate) const DEFAULT_PAGE_SIZE: usize = 100;
+pub const CATALOGS_PREFIX: &str = "unity-catalog-preview/catalogs";
+pub const SCHEMAS_PREFIX: &str = "unity-catalog-preview/schemas";
+pub const TABLES_PREFIX: &str = "unity-catalog-preview/tables";
+pub const DEFAULT_PAGE_SIZE: usize = 100;
 
-pub(crate) struct Pagination {
-    pub(crate) start: usize,
-    pub(crate) limit: usize,
+pub struct Pagination {
+    start: usize,
+    limit: usize,
 }
 
-pub(crate) fn catalog_path(name: &str) -> String {
+pub fn catalog_path(name: &str) -> String {
     format!("{CATALOGS_PREFIX}/{name}.json")
 }
 
-pub(crate) fn schema_prefix(catalog_name: &str) -> String {
+pub fn schema_prefix(catalog_name: &str) -> String {
     format!("{SCHEMAS_PREFIX}/{catalog_name}/")
 }
 
-pub(crate) fn schema_path(catalog_name: &str, schema_name: &str) -> String {
+pub fn schema_path(catalog_name: &str, schema_name: &str) -> String {
     format!("{}{schema_name}.json", schema_prefix(catalog_name))
 }
 
-pub(crate) fn table_prefix(catalog_name: &str, schema_name: &str) -> String {
+pub fn table_prefix(catalog_name: &str, schema_name: &str) -> String {
     format!("{TABLES_PREFIX}/{catalog_name}/{schema_name}/")
 }
 
-pub(crate) fn table_path(catalog_name: &str, schema_name: &str, table_name: &str) -> String {
+pub fn table_path(catalog_name: &str, schema_name: &str, table_name: &str) -> String {
     format!(
         "{}{table_name}.json",
         table_prefix(catalog_name, schema_name)
     )
 }
 
-pub(crate) fn require_identifier(value: Option<String>, field: &str) -> UnityCatalogResult<String> {
+pub fn require_identifier(value: Option<String>, field: &str) -> UnityCatalogResult<String> {
     let Some(value) = value else {
         return Err(UnityCatalogError::BadRequest {
             message: format!("missing required field: {field}"),
@@ -57,10 +57,7 @@ pub(crate) fn require_identifier(value: Option<String>, field: &str) -> UnityCat
     Ok(value.to_string())
 }
 
-pub(crate) fn require_non_empty_string(
-    value: Option<String>,
-    field: &str,
-) -> UnityCatalogResult<String> {
+pub fn require_non_empty_string(value: Option<String>, field: &str) -> UnityCatalogResult<String> {
     let Some(value) = value else {
         return Err(UnityCatalogError::BadRequest {
             message: format!("missing required field: {field}"),
@@ -75,7 +72,7 @@ pub(crate) fn require_non_empty_string(
     Ok(value.to_string())
 }
 
-pub(crate) fn require_present<T>(value: Option<T>, field: &str) -> UnityCatalogResult<T> {
+pub fn require_present<T>(value: Option<T>, field: &str) -> UnityCatalogResult<T> {
     value.ok_or_else(|| UnityCatalogError::BadRequest {
         message: format!("missing required field: {field}"),
     })
@@ -94,7 +91,7 @@ fn validate_identifier(value: &str, field: &str) -> UnityCatalogResult<()> {
     })
 }
 
-pub(crate) async fn write_json_if_absent<T: Serialize>(
+pub async fn write_json_if_absent<T: Serialize + Sync>(
     storage: &ScopedStorage,
     path: &str,
     value: &T,
@@ -109,7 +106,7 @@ pub(crate) async fn write_json_if_absent<T: Serialize>(
         .map_err(|err| storage_error(operation_name, err))
 }
 
-pub(crate) async fn read_json_page<T: DeserializeOwned>(
+pub async fn read_json_page<T: DeserializeOwned>(
     storage: &ScopedStorage,
     prefix: &str,
     operation_name: &str,
@@ -129,8 +126,9 @@ pub(crate) async fn read_json_page<T: DeserializeOwned>(
         .start
         .saturating_add(pagination.limit)
         .min(object_paths.len());
-    let mut parsed = Vec::with_capacity(end.saturating_sub(pagination.start));
-    for object_path in &object_paths[pagination.start..end] {
+    let page_len = end.saturating_sub(pagination.start);
+    let mut parsed = Vec::with_capacity(page_len);
+    for object_path in object_paths.iter().skip(pagination.start).take(page_len) {
         let body = storage
             .get_raw(object_path.as_str())
             .await
@@ -149,7 +147,7 @@ pub(crate) async fn read_json_page<T: DeserializeOwned>(
     Ok((parsed, next_page_token))
 }
 
-pub(crate) async fn object_exists(
+pub async fn object_exists(
     storage: &ScopedStorage,
     path: &str,
     operation_name: &str,
@@ -161,7 +159,7 @@ pub(crate) async fn object_exists(
         .map_err(|err| storage_error(operation_name, err))
 }
 
-pub(crate) fn parse_pagination(
+pub fn parse_pagination(
     page_token: Option<&str>,
     max_results: Option<i32>,
     default_page_size: usize,
@@ -195,7 +193,12 @@ fn parse_max_results(
             message: "invalid max_results: must be greater than or equal to 0".to_string(),
         }),
         Some(0) | None => Ok(effective_default),
-        Some(value) => Ok((value as usize).min(max_page_size)),
+        Some(value) => {
+            let value = usize::try_from(value).map_err(|_| UnityCatalogError::BadRequest {
+                message: "invalid max_results: must be greater than or equal to 0".to_string(),
+            })?;
+            Ok(value.min(max_page_size))
+        }
     }
 }
 

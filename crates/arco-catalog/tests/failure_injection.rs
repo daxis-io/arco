@@ -26,7 +26,7 @@ use arco_core::storage::{
 };
 use arco_core::{Error as CoreError, Result as CoreResult, ScopedStorage};
 
-use arco_catalog::manifest::{CatalogDomainManifest, RootManifest};
+use arco_catalog::manifest::{CatalogDomainManifest, DomainManifestPointer, RootManifest};
 use arco_catalog::write_options::WriteOptions;
 use arco_catalog::{CatalogWriter, Tier1Compactor};
 
@@ -189,10 +189,20 @@ async fn read_catalog_manifest_version(storage: &ScopedStorage) -> u64 {
     let mut root: RootManifest = serde_json::from_slice(&root_bytes).expect("parse root manifest");
     root.normalize_paths();
 
-    let catalog_bytes = storage
-        .get_raw(&root.catalog_manifest_path)
-        .await
-        .expect("read catalog manifest");
+    let catalog_bytes = match storage.get_raw("manifests/catalog.pointer.json").await {
+        Ok(pointer_bytes) => {
+            let pointer: DomainManifestPointer =
+                serde_json::from_slice(&pointer_bytes).expect("parse catalog pointer");
+            storage
+                .get_raw(&pointer.manifest_path)
+                .await
+                .expect("read pointed catalog manifest")
+        }
+        Err(_) => storage
+            .get_raw(&root.catalog_manifest_path)
+            .await
+            .expect("read catalog manifest"),
+    };
     let catalog: CatalogDomainManifest =
         serde_json::from_slice(&catalog_bytes).expect("parse catalog manifest");
     catalog.snapshot_version
@@ -246,7 +256,7 @@ async fn tier1_crash_between_snapshot_and_cas() {
     let manifest_path = scoped_path(
         TEST_TENANT,
         TEST_WORKSPACE,
-        "manifests/catalog.manifest.json",
+        "manifests/catalog.pointer.json",
     );
     backend.fail_on_write(&manifest_path);
 
@@ -301,7 +311,7 @@ async fn tier1_reader_sees_only_committed_state() {
     let manifest_path = scoped_path(
         TEST_TENANT,
         TEST_WORKSPACE,
-        "manifests/catalog.manifest.json",
+        "manifests/catalog.pointer.json",
     );
     backend.fail_on_write(&manifest_path);
 

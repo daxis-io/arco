@@ -1,7 +1,10 @@
 //! Schema routes for the Unity Catalog facade.
 
 use axum::Json;
-use axum::extract::{Extension, Query, State};
+use axum::Router;
+use axum::extract::{Extension, OriginalUri, Query, State};
+use axum::http::Method;
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -12,6 +15,16 @@ use crate::context::UnityCatalogRequestContext;
 use crate::error::{UnityCatalogError, UnityCatalogErrorResponse, UnityCatalogResult};
 use crate::routes::preview::{self, catalog_path, schema_path, schema_prefix};
 use crate::state::UnityCatalogState;
+
+/// Schema route group.
+pub fn routes() -> Router<UnityCatalogState> {
+    Router::new()
+        .route("/schemas", post(post_schemas).get(get_schemas))
+        .route(
+            "/schemas/:full_name",
+            get(get_schema).patch(update_schema).delete(delete_schema),
+        )
+}
 
 #[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
@@ -235,4 +248,52 @@ pub(crate) async fn post_schemas(
             message: format!("schema already exists: {catalog_name}.{name}"),
         }),
     }
+}
+
+/// `GET /schemas/{full_name}` (known UC operation; currently unsupported).
+#[utoipa::path(
+    get,
+    path = "/schemas/{full_name}",
+    tag = "Schemas",
+    params(
+        ("full_name" = String, Path, description = "Schema full name"),
+    ),
+    responses(
+        (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
+    )
+)]
+pub async fn get_schema(method: Method, uri: OriginalUri) -> UnityCatalogError {
+    super::common::known_but_unsupported(&method, &uri)
+}
+
+/// `PATCH /schemas/{full_name}` (known UC operation; currently unsupported).
+#[utoipa::path(
+    patch,
+    path = "/schemas/{full_name}",
+    tag = "Schemas",
+    params(
+        ("full_name" = String, Path, description = "Schema full name"),
+    ),
+    responses(
+        (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
+    )
+)]
+pub async fn update_schema(method: Method, uri: OriginalUri) -> UnityCatalogError {
+    super::common::known_but_unsupported(&method, &uri)
+}
+
+/// `DELETE /schemas/{full_name}` (known UC operation; currently unsupported).
+#[utoipa::path(
+    delete,
+    path = "/schemas/{full_name}",
+    tag = "Schemas",
+    params(
+        ("full_name" = String, Path, description = "Schema full name"),
+    ),
+    responses(
+        (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
+    )
+)]
+pub async fn delete_schema(method: Method, uri: OriginalUri) -> UnityCatalogError {
+    super::common::known_but_unsupported(&method, &uri)
 }

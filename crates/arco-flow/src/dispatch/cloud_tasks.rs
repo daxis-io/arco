@@ -517,6 +517,7 @@ mod gcp_impl {
             body: &[u8],
             options: EnqueueOptions,
             audience: Option<&str>,
+            extra_headers: Option<std::collections::HashMap<String, String>>,
         ) -> Result<EnqueueResult> {
             let queue_path = self.queue_path_for_routing(options.routing_key.as_deref());
             let task_name = format!("{queue_path}/tasks/{task_id}");
@@ -544,6 +545,9 @@ mod gcp_impl {
                             let mut headers = std::collections::HashMap::new();
                             headers
                                 .insert("Content-Type".to_string(), "application/json".to_string());
+                            if let Some(additional_headers) = extra_headers {
+                                headers.extend(additional_headers);
+                            }
                             headers
                         }),
                         body: Some(body_base64),
@@ -776,6 +780,7 @@ mod placeholder_impl {
             _body: &[u8],
             _options: EnqueueOptions,
             _audience: Option<&str>,
+            _headers: Option<std::collections::HashMap<String, String>>,
         ) -> Result<EnqueueResult> {
             Err(Error::configuration(
                 "CloudTasksDispatcher requires the 'gcp' feature to be enabled. \

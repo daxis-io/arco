@@ -1,0 +1,24 @@
+# command: cargo test -p arco-flow --all-features --bin arco_flow_dispatcher callback_ -- --nocapture
+# start_utc: 2026-02-14T04:43:14Z
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/bin/arco_flow_dispatcher.rs (target/debug/deps/arco_flow_dispatcher-fa4ab580ff79415d)
+
+running 12 tests
+test tests::timer_callback_contract_allows_disabled_timer_target_without_service_account ... ok
+test tests::timer_callback_contract_requires_service_account_when_timer_target_is_configured ... ok
+test tests::callback_ingestion_rejects_missing_bearer_and_does_not_append ... ok
+test tests::callback_ingestion_rejects_when_auth_disabled ... ok
+test tests::callback_auth_rejects_missing_bearer ... ok
+test tests::callback_ingestion_duplicate_is_idempotent_after_compaction ... ok
+test tests::callback_ingestion_rejects_audience_mismatch_and_does_not_append ... ok
+test tests::callback_auth_accepts_valid_tokeninfo_claims ... ok
+test tests::callback_auth_rejects_audience_mismatch ... ok
+test tests::callback_auth_rejects_issuer_mismatch ... ok
+test tests::callback_ingestion_rejects_issuer_mismatch_and_does_not_append ... ok
+test tests::callback_ingestion_accepts_valid_oidc_and_appends_timer_fired ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.51s
+
+
+# exit_code: 0
+# end_utc: 2026-02-14T04:43:14Z

@@ -129,11 +129,12 @@ impl CompactorClient {
             .saturating_mul(1_u64 << shift)
             .min(RETRY_MAX_BACKOFF_MS);
         let jitter_window_ms = (backoff_ms / 2).max(1);
-        let jitter_seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
-        let jitter_seed = u64::from(jitter_seed);
+        let jitter_seed = u64::from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos(),
+        );
         let jitter_ms = jitter_seed % (jitter_window_ms + 1);
         Duration::from_millis(
             backoff_ms

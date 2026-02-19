@@ -10,6 +10,7 @@ use arco_flow::orchestration::OrchestrationLedgerWriter;
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_flow::orchestration::events::OrchestrationEvent;
 use arco_flow::orchestration::ledger::LedgerWriter;
+use arco_flow::orchestration_compaction_lock_path;
 
 use crate::config::Config;
 use crate::error::ApiError;
@@ -23,7 +24,6 @@ struct CompactRequest {
 
 const COMPACTION_LOCK_TTL: Duration = Duration::from_secs(30);
 const COMPACTION_LOCK_MAX_RETRIES: u32 = 8;
-const ORCHESTRATION_COMPACTION_LOCK_PATH: &str = "locks/orchestration.compaction.lock.json";
 
 /// Compacts orchestration events using a remote compactor or inline micro-compactor.
 pub async fn compact_orchestration_events(
@@ -38,7 +38,7 @@ pub async fn compact_orchestration_events(
         return Ok(());
     }
 
-    let lock_path = ORCHESTRATION_COMPACTION_LOCK_PATH.to_string();
+    let lock_path = orchestration_compaction_lock_path().to_string();
     let lock = DistributedLock::new(storage.backend().clone(), lock_path.clone());
     let guard = lock
         .acquire(COMPACTION_LOCK_TTL, COMPACTION_LOCK_MAX_RETRIES)

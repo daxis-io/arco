@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
 
@@ -34,6 +35,17 @@ jobs:
           fail-on-severity: high
           deny-licenses: GPL-3.0, AGPL-3.0
 
+  release-tag-discipline:
+    name: Release Tag Discipline
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Validate changelog + release notes for release tag
+        run: bash tools/check-release-tag-discipline.sh --tag "${GITHUB_REF_NAME}"
+
   gates:
     name: Gates
     runs-on: ubuntu-latest
@@ -44,7 +56,7 @@ jobs:
           toolchain: 1.85
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install cargo-deny
-        uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131 # v2
+        uses: taiki-e/install-action@cede0bb282aae847dfa8aacca3a41c86d973d4d7 # v2
         with:
           tool: cargo-deny@0.18.9
       - name: Setup Buf
@@ -56,6 +68,9 @@ jobs:
       - run: cargo xtask adr-check
       - run: cargo xtask verify-integrity
       - run: cargo xtask parity-matrix-check
+      - run: cargo xtask uc-openapi-inventory
+      - name: Verify UC inventory is up to date
+        run: git diff --exit-code -- docs/plans/2026-02-04-unity-catalog-openapi-inventory.md
 
   check:
     name: Check
@@ -124,6 +139,7 @@ jobs:
           sudo mkdir -p /mnt/target
           sudo chown -R "$(id -u):$(id -g)" /mnt/target
       - run: cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
+      - run: cargo test -p arco-uc --test openapi_compliance
       - run: cargo test -p arco-api --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_
       - run: cargo test -p arco-api --all-features --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_
       - run: cargo test -p arco-api --all-features --test orchestration_parity_gates_m1
@@ -203,7 +219,7 @@ jobs:
           toolchain: 1.85
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install cargo-deny
-        uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131 # v2
+        uses: taiki-e/install-action@cede0bb282aae847dfa8aacca3a41c86d973d4d7 # v2
         with:
           tool: cargo-deny@0.18.9
       - run: cargo deny check bans licenses sources
@@ -218,7 +234,7 @@ jobs:
           toolchain: 1.85
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install cargo-deny
-        uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131 # v2
+        uses: taiki-e/install-action@cede0bb282aae847dfa8aacca3a41c86d973d4d7 # v2
         with:
           tool: cargo-deny@0.18.9
       - name: cargo-deny advisories
@@ -274,7 +290,7 @@ jobs:
       - name: Check IAM smoke prerequisites
         id: iam_smoke_prereq
         run: |
-          if [ -z "${{ secrets.GCP_SA_KEY_API }}" ] || [ -z "${{ vars.ARCO_BUCKET_DEV }}" ]; then
+          if [ -z "${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}" ] || [ -z "${{ vars.GCP_SERVICE_ACCOUNT }}" ] || [ -z "${{ vars.ARCO_BUCKET_DEV }}" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -284,7 +300,8 @@ jobs:
         if: steps.iam_smoke_prereq.outputs.skip != 'true'
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY_API }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - name: Run API IAM smoke tests
         if: steps.iam_smoke_prereq.outputs.skip != 'true'
@@ -298,7 +315,7 @@ jobs:
       - name: Skip IAM smoke tests (missing config)
         if: steps.iam_smoke_prereq.outputs.skip == 'true'
         run: |
-          echo "Skipping IAM smoke tests: missing secrets.GCP_SA_KEY_API or vars.ARCO_BUCKET_DEV"
+          echo "Skipping IAM smoke tests: missing vars.GCP_WORKLOAD_IDENTITY_PROVIDER, vars.GCP_SERVICE_ACCOUNT, or vars.ARCO_BUCKET_DEV"
 
   # ==========================================================================
   # Compile-Negative Tests (Gate 5 trait separation)

@@ -1,0 +1,13 @@
+{
+  "id": "handoff-usage-real-20260113-114349",
+  "title": "Claude handoff usage record (real run, no-op test)",
+  "status": "noop",
+  "executor": "claude_code",
+  "model": "claude-opus-4-5-20251101",
+  "started_at": "2026-01-13T11:43:49Z",
+  "completed_at": "2026-01-13T11:44:30Z",
+  "tests_run": ["true"],
+  "tests_passed": true,
+  "code_changes": false,
+  "blockers": []
+}

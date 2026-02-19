@@ -154,8 +154,81 @@ impl LedgerWriter {
 mod tests {
     use super::*;
     use crate::events::{EventBuilder, EventEnvelope};
-    use arco_core::{MemoryBackend, RunId, ScopedStorage};
+    use arco_core::storage::{ObjectMeta, StorageBackend};
+    use arco_core::{Error as CoreError, FlowPaths, MemoryBackend, RunId, ScopedStorage};
+    use async_trait::async_trait;
+    use std::ops::Range;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct FailOnceNthPutBackend {
+        inner: MemoryBackend,
+        fail_on_put_call: usize,
+        put_calls: AtomicUsize,
+    }
+
+    impl FailOnceNthPutBackend {
+        fn new(fail_on_put_call: usize) -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                fail_on_put_call,
+                put_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for FailOnceNthPutBackend {
+        async fn get(&self, path: &str) -> arco_core::error::Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(
+            &self,
+            path: &str,
+            range: Range<u64>,
+        ) -> arco_core::error::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::error::Result<WriteResult> {
+            let call = self.put_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.fail_on_put_call {
+                return Err(CoreError::Storage {
+                    message: format!("injected partial-write failure at put call {call} ({path})"),
+                    source: None,
+                });
+            }
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::error::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::error::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::error::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(
+            &self,
+            path: &str,
+            expiry: Duration,
+        ) -> arco_core::error::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
 
     #[tokio::test]
     async fn ledger_writer_writes_events_under_domain_date_prefix() -> Result<()> {
@@ -183,6 +256,54 @@ mod tests {
             })?;
         assert_eq!(parsed.sequence, Some(1));
         assert_eq!(parsed.run_id(), Some(&run_id));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ledger_writer_recovers_after_partial_batch_write_failure() -> Result<()> {
+        let backend = Arc::new(FailOnceNthPutBackend::new(2));
+        let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+        let writer = LedgerWriter::new(storage.clone(), "executions");
+
+        let run_id = RunId::generate();
+
+        let mut event1 =
+            EventBuilder::run_started("tenant", "workspace", run_id, "plan-1").with_sequence(1);
+        event1.id = "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string();
+
+        let mut event2 =
+            EventBuilder::run_started("tenant", "workspace", run_id, "plan-1").with_sequence(2);
+        event2.id = "01ARZ3NDEKTSV4RRFFQ69G5FB0".to_string();
+
+        let batch = vec![event1.clone(), event2.clone()];
+
+        // Injected failure creates a partial-write window for the first append attempt.
+        let first_attempt = writer.append_all(batch.clone()).await;
+        assert!(first_attempt.is_err(), "first append should fail");
+
+        // Replay of the same batch must converge idempotently.
+        writer.append_all(batch).await?;
+
+        let date = "2016-07-30".to_string();
+        let path1 = flow_event_path("executions", &date, &event1.id);
+        let path2 = flow_event_path("executions", &date, &event2.id);
+
+        assert!(storage.get_raw(&path1).await.is_ok());
+        assert!(storage.get_raw(&path2).await.is_ok());
+
+        let entries = storage
+            .list(&format!(
+                "{}/{}/",
+                FlowPaths::FLOW_LEDGER_PREFIX,
+                "executions"
+            ))
+            .await?;
+        assert_eq!(
+            entries.len(),
+            2,
+            "replay must not create duplicate ledger rows"
+        );
 
         Ok(())
     }

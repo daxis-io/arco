@@ -37,8 +37,8 @@ use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
 
 use crate::error::{CatalogError, Result};
 use crate::manifest::{
-    CatalogDomainManifest, CatalogManifest, ExecutionsManifest, LineageManifest, RootManifest,
-    SearchManifest, SnapshotInfo, TailRange,
+    CatalogDomainManifest, CatalogManifest, DomainManifestPointer, ExecutionsManifest,
+    LineageManifest, RootManifest, SearchManifest, SnapshotInfo, TailRange,
 };
 use crate::parquet_util;
 use crate::write_options::SnapshotVersion;
@@ -173,13 +173,18 @@ impl CatalogReader {
             serde_json::from_slice(&root_bytes).map_err(|e| CatalogError::Serialization {
                 message: format!("failed to parse root manifest: {}", e),
             })?;
+        let mut root = root;
+        root.normalize_paths();
 
-        // Read domain manifests in parallel
+        // Read domain manifests in parallel, preferring pointer-resolved immutable snapshots.
         let (catalog_bytes, lineage_bytes, executions_bytes, search_bytes) = tokio::join!(
-            self.storage.get_raw(&root.catalog_manifest_path),
-            self.storage.get_raw(&root.lineage_manifest_path),
-            self.storage.get_raw(&root.executions_manifest_path),
-            self.storage.get_raw(&root.search_manifest_path),
+            self.read_domain_manifest_bytes(CatalogDomain::Catalog, &root.catalog_manifest_path),
+            self.read_domain_manifest_bytes(CatalogDomain::Lineage, &root.lineage_manifest_path),
+            self.read_domain_manifest_bytes(
+                CatalogDomain::Executions,
+                &root.executions_manifest_path
+            ),
+            self.read_domain_manifest_bytes(CatalogDomain::Search, &root.search_manifest_path),
         );
 
         let catalog: CatalogDomainManifest =
@@ -278,6 +283,36 @@ impl CatalogReader {
         Ok(by_id)
     }
 
+    async fn read_domain_manifest_bytes(
+        &self,
+        domain: CatalogDomain,
+        legacy_path: &str,
+    ) -> Result<bytes::Bytes> {
+        let pointer_path = CatalogPaths::domain_manifest_pointer(domain);
+        match self.storage.get_raw(&pointer_path).await {
+            Ok(pointer_bytes) => {
+                let pointer: DomainManifestPointer = serde_json::from_slice(&pointer_bytes)
+                    .map_err(|e| CatalogError::Serialization {
+                        message: format!("failed to parse manifest pointer at {pointer_path}: {e}"),
+                    })?;
+
+                match self.storage.get_raw(&pointer.manifest_path).await {
+                    Ok(bytes) => Ok(bytes),
+                    Err(
+                        arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. },
+                    ) => {
+                        // Migration fallback: pointer exists but immutable snapshot is unavailable.
+                        self.storage.get_raw(legacy_path).await.map_err(Into::into)
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+            Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+                self.storage.get_raw(legacy_path).await.map_err(Into::into)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
     // ========================================================================
     // Catalog Operations (UC-like model)
     // ========================================================================
@@ -1150,6 +1185,58 @@ mod tests {
                 1,
                 "token_postings.parquet"
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_catalog_mintable_paths_include_catalogs_parquet() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage =
+            ScopedStorage::new(backend, "test-tenant", "test-workspace").expect("storage");
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await.expect("init");
+
+        let root_bytes = storage
+            .get_raw(CatalogPaths::ROOT_MANIFEST)
+            .await
+            .expect("root manifest");
+        let mut root: RootManifest = serde_json::from_slice(&root_bytes).expect("root parse");
+        root.normalize_paths();
+
+        let catalog_bytes = storage
+            .get_raw(&root.catalog_manifest_path)
+            .await
+            .expect("catalog manifest");
+        let mut catalog: CatalogDomainManifest =
+            serde_json::from_slice(&catalog_bytes).expect("catalog parse");
+        catalog.snapshot_version = 1;
+        catalog.snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1);
+        catalog.snapshot = None;
+        catalog.updated_at = Utc::now();
+
+        let catalog_payload = serde_json::to_vec(&catalog).expect("serialize");
+        storage
+            .put_raw(
+                &root.catalog_manifest_path,
+                Bytes::from(catalog_payload),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write catalog manifest");
+
+        let reader = CatalogReader::new(storage);
+        let paths = reader
+            .get_mintable_paths(CatalogDomain::Catalog)
+            .await
+            .expect("paths");
+        assert_eq!(
+            paths,
+            vec![
+                CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "catalogs.parquet"),
+                CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "namespaces.parquet"),
+                CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "tables.parquet"),
+                CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "columns.parquet"),
+            ]
         );
     }
 

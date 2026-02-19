@@ -438,7 +438,7 @@ pub(crate) async fn get_catalog(
     path = "/api/v1/catalogs/{catalog}/schemas",
     tag = "schemas",
     params(
-        ("catalog" = String, Path, description = "Catalog name"),
+        ("catalog" = String, Path, description = "Catalog name")
     ),
     request_body = CreateSchemaRequest,
     responses(
@@ -787,6 +787,17 @@ pub(crate) async fn register_table_in_schema(
         options
     };
 
+    let columns = req
+        .columns
+        .into_iter()
+        .map(|c| arco_catalog::ColumnDefinition {
+            name: c.name,
+            data_type: c.data_type,
+            is_nullable: c.nullable,
+            description: c.description,
+        })
+        .collect();
+
     let create_result = writer
         .register_table_in_schema(
             &catalog,
@@ -796,16 +807,7 @@ pub(crate) async fn register_table_in_schema(
                 description: req.description,
                 location: req.location,
                 format: Some(requested_format.clone()),
-                columns: req
-                    .columns
-                    .into_iter()
-                    .map(|col| arco_catalog::ColumnDefinition {
-                        name: col.name,
-                        data_type: col.data_type,
-                        is_nullable: col.nullable,
-                        description: col.description,
-                    })
-                    .collect(),
+                columns,
             },
             options,
         )
@@ -997,9 +999,10 @@ fn effective_table_format(format: Option<&str>) -> Result<String, ApiError> {
 }
 
 fn normalize_requested_format(format: Option<&str>) -> Result<String, ApiError> {
-    match format {
-        Some(value) => TableFormat::normalize(value),
-        None => Ok(TableFormat::Delta.as_str().to_string()),
-    }
-    .map_err(ApiError::from)
+    format
+        .map_or_else(
+            || Ok(TableFormat::Delta.as_str().to_string()),
+            TableFormat::normalize,
+        )
+        .map_err(ApiError::from)
 }

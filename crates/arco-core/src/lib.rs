@@ -41,6 +41,7 @@ pub mod catalog_paths;
 pub mod error;
 pub mod flow_paths;
 pub mod id;
+pub mod internal_oidc;
 pub mod lock;
 pub mod observability;
 pub mod partition;
@@ -64,7 +65,7 @@ pub mod prelude {
     pub use crate::catalog_event::{CatalogEvent, CatalogEventPayload};
     pub use crate::catalog_paths::{CatalogDomain, CatalogPaths};
     pub use crate::error::{Error, Result};
-    pub use crate::flow_paths::DeltaPaths;
+    pub use crate::flow_paths::{ApiPaths, DeltaPaths, FlowPaths, IcebergPaths};
     pub use crate::id::{AssetId, EventId, MaterializationId, RunId, TaskId};
     pub use crate::lock::{DistributedLock, LockGuard, LockInfo};
     pub use crate::partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
@@ -91,8 +92,11 @@ pub mod prelude {
 pub use catalog_event::{CatalogEvent, CatalogEventPayload};
 pub use catalog_paths::{CatalogDomain, CatalogPaths};
 pub use error::{Error, Result};
-pub use flow_paths::DeltaPaths;
+pub use flow_paths::{ApiPaths, DeltaPaths, FlowPaths, IcebergPaths};
 pub use id::{AssetId, EventId, MaterializationId, RunId, TaskId};
+pub use internal_oidc::{
+    InternalOidcConfig, InternalOidcError, InternalOidcVerifier, VerifiedPrincipal,
+};
 pub use lock::{DistributedLock, LockGuard, LockInfo};
 pub use observability::{LogFormat, Redacted, init_logging};
 pub use partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};

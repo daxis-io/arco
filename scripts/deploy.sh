@@ -22,6 +22,7 @@ ENVIRONMENT="${ENVIRONMENT:-dev}"
 REGION="${REGION:-us-central1}"
 DRY_RUN=false
 COMPACTOR_HEALTH_TIMEOUT="${COMPACTOR_HEALTH_TIMEOUT:-300}"
+FLOW_COMPACTOR_HEALTH_TIMEOUT="${FLOW_COMPACTOR_HEALTH_TIMEOUT:-120}"
 API_HEALTH_TIMEOUT="${API_HEALTH_TIMEOUT:-120}"
 HEALTH_CHECK_INTERVAL="${HEALTH_CHECK_INTERVAL:-10}"
 
@@ -39,9 +40,14 @@ Required env vars:
   PROJECT_ID
   API_IMAGE
   COMPACTOR_IMAGE
+  FLOW_COMPACTOR_IMAGE
+  FLOW_DISPATCHER_IMAGE
+  FLOW_SWEEPER_IMAGE
+  FLOW_WORKER_IMAGE
 
 Optional env vars:
   REGION
+  PROJECT_NUMBER
   COMPACTOR_HEALTH_TIMEOUT
   API_HEALTH_TIMEOUT
   HEALTH_CHECK_INTERVAL
@@ -65,6 +71,10 @@ validate_env() {
   [[ -z "${PROJECT_ID:-}" ]] && die "PROJECT_ID is required"
   [[ -z "${API_IMAGE:-}" ]] && die "API_IMAGE is required"
   [[ -z "${COMPACTOR_IMAGE:-}" ]] && die "COMPACTOR_IMAGE is required"
+  [[ -z "${FLOW_COMPACTOR_IMAGE:-}" ]] && die "FLOW_COMPACTOR_IMAGE is required"
+  [[ -z "${FLOW_DISPATCHER_IMAGE:-}" ]] && die "FLOW_DISPATCHER_IMAGE is required"
+  [[ -z "${FLOW_SWEEPER_IMAGE:-}" ]] && die "FLOW_SWEEPER_IMAGE is required"
+  [[ -z "${FLOW_WORKER_IMAGE:-}" ]] && die "FLOW_WORKER_IMAGE is required"
 
   case "$ENVIRONMENT" in
     dev|staging|prod) ;;
@@ -130,6 +140,34 @@ wait_for_compactor_health() {
   die "Compactor health check timed out after ${COMPACTOR_HEALTH_TIMEOUT}s"
 }
 
+wait_for_flow_compactor_health() {
+  local service_name="arco-flow-compactor-${ENVIRONMENT}"
+  local local_port="18082"
+  local pid=""
+
+  log "Waiting for flow compactor health via proxy (timeout: ${FLOW_COMPACTOR_HEALTH_TIMEOUT}s)..."
+
+  pid="$(start_run_proxy "$service_name" "$local_port")"
+  trap 'stop_run_proxy "$pid"' RETURN
+
+  local elapsed=0
+  while [[ "$elapsed" -lt "$FLOW_COMPACTOR_HEALTH_TIMEOUT" ]]; do
+    local status
+    status="$(curl -sf "http://127.0.0.1:${local_port}/health" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")"
+
+    if [[ "$status" == "200" ]]; then
+      log "Flow compactor healthy"
+      return 0
+    fi
+
+    log "Flow compactor not healthy yet (status=$status). Waiting..."
+    sleep "$HEALTH_CHECK_INTERVAL"
+    elapsed=$((elapsed + HEALTH_CHECK_INTERVAL))
+  done
+
+  die "Flow compactor health check timed out after ${FLOW_COMPACTOR_HEALTH_TIMEOUT}s"
+}
+
 wait_for_api_health() {
   local service_name="arco-api-${ENVIRONMENT}"
   local local_port="18080"
@@ -170,18 +208,33 @@ deploy_terraform() {
 
   export TF_VAR_api_image="$API_IMAGE"
   export TF_VAR_compactor_image="$COMPACTOR_IMAGE"
+  export TF_VAR_flow_compactor_image="$FLOW_COMPACTOR_IMAGE"
+  export TF_VAR_flow_dispatcher_image="$FLOW_DISPATCHER_IMAGE"
+  export TF_VAR_flow_sweeper_image="$FLOW_SWEEPER_IMAGE"
+  export TF_VAR_flow_worker_image="$FLOW_WORKER_IMAGE"
+  if [[ -n "${PROJECT_NUMBER:-}" ]]; then
+    export TF_VAR_project_number="$PROJECT_NUMBER"
+  else
+    # Best-effort: avoids Terraform needing Cloud Resource Manager permissions just to read project number.
+    TF_VAR_project_number="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>/dev/null || true)"
+    export TF_VAR_project_number
+  fi
 
   if [[ "$DRY_RUN" == "true" ]]; then
-    log "DRY RUN: Would deploy compactor first (terraform plan -target=google_cloud_run_v2_service.compactor)"
+    log "DRY RUN: Would deploy compactors first (terraform plan -target=google_cloud_run_v2_service.compactor -target=google_cloud_run_v2_service.flow_compactor)"
     terraform init -upgrade
-    terraform plan -var-file="$tfvars_file" -target=google_cloud_run_v2_service.compactor
+    terraform plan -var-file="$tfvars_file" \
+      -target=google_cloud_run_v2_service.compactor \
+      -target=google_cloud_run_v2_service.flow_compactor
     log "DRY RUN: Would deploy remaining resources (terraform plan)"
     terraform plan -var-file="$tfvars_file"
   else
     terraform init -upgrade
     # HARD GATE ENFORCEMENT:
-    # Deploy the compactor revision first, wait for it to become healthy, then deploy API.
-    terraform apply -var-file="$tfvars_file" -auto-approve -target=google_cloud_run_v2_service.compactor
+    # Deploy compactors first, wait for them to become healthy, then deploy API.
+    terraform apply -var-file="$tfvars_file" -auto-approve \
+      -target=google_cloud_run_v2_service.compactor \
+      -target=google_cloud_run_v2_service.flow_compactor
   fi
 
   popd >/dev/null
@@ -193,6 +246,16 @@ deploy_terraform_remaining() {
   local tfvars_file="environments/${ENVIRONMENT}.tfvars"
   export TF_VAR_api_image="$API_IMAGE"
   export TF_VAR_compactor_image="$COMPACTOR_IMAGE"
+  export TF_VAR_flow_compactor_image="$FLOW_COMPACTOR_IMAGE"
+  export TF_VAR_flow_dispatcher_image="$FLOW_DISPATCHER_IMAGE"
+  export TF_VAR_flow_sweeper_image="$FLOW_SWEEPER_IMAGE"
+  export TF_VAR_flow_worker_image="$FLOW_WORKER_IMAGE"
+  if [[ -n "${PROJECT_NUMBER:-}" ]]; then
+    export TF_VAR_project_number="$PROJECT_NUMBER"
+  else
+    TF_VAR_project_number="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>/dev/null || true)"
+    export TF_VAR_project_number
+  fi
 
   terraform apply -var-file="$tfvars_file" -auto-approve
 
@@ -243,6 +306,7 @@ main() {
 
   # HARD GATE: compactor must be healthy before deploy is considered successful.
   wait_for_compactor_health
+  wait_for_flow_compactor_health
 
   # Only after the compactor is healthy do we deploy the API revision / remaining infra.
   deploy_terraform_remaining

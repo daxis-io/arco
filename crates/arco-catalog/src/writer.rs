@@ -1358,7 +1358,6 @@ impl CatalogWriter {
                 });
             }
         }
-
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
@@ -2260,40 +2259,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_register_table_in_schema_uses_catalog_and_schema() {
-        let writer = setup();
-        writer.initialize().await.expect("initialize");
-
-        writer
-            .create_catalog("analytics", None, WriteOptions::default())
-            .await
-            .expect("create analytics catalog");
-        let sales = writer
-            .create_schema("analytics", "sales", None, WriteOptions::default())
-            .await
-            .expect("create sales schema");
-
-        let table = writer
-            .register_table_in_schema(
-                "analytics",
-                "sales",
-                RegisterTableInSchemaRequest {
-                    name: "orders".to_string(),
-                    description: None,
-                    location: Some("gs://bucket/warehouse/sales/orders".to_string()),
-                    format: Some("delta".to_string()),
-                    columns: vec![],
-                },
-                WriteOptions::default(),
-            )
-            .await
-            .expect("register table");
-
-        assert_eq!(table.namespace_id, sales.id);
-        assert_eq!(table.name, "orders");
-    }
-
-    #[tokio::test]
     async fn test_initialize_creates_manifests() {
         let writer = setup();
         writer.initialize().await.expect("initialize");
@@ -2605,6 +2570,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_register_table_in_schema_uses_catalog_and_schema() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_catalog("analytics", None, WriteOptions::default())
+            .await
+            .expect("create analytics catalog");
+        let sales = writer
+            .create_schema("analytics", "sales", None, WriteOptions::default())
+            .await
+            .expect("create sales schema");
+
+        let table = writer
+            .register_table_in_schema(
+                "analytics",
+                "sales",
+                RegisterTableInSchemaRequest {
+                    name: "orders".to_string(),
+                    description: None,
+                    location: Some("gs://bucket/warehouse/sales/orders".to_string()),
+                    format: Some("delta".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+
+        assert_eq!(table.namespace_id, sales.id);
+        assert_eq!(table.name, "orders");
+    }
+
+    #[tokio::test]
     async fn test_register_table_in_schema_defaults_to_delta_and_validates() {
         let writer = setup();
         writer.initialize().await.expect("initialize");
@@ -2761,7 +2760,6 @@ mod tests {
             .expect_err("switching to delta with invalid location must fail");
         assert!(matches!(err, CatalogError::Validation { .. }));
     }
-
     #[tokio::test]
     async fn test_event_writer_returns_owned() {
         let writer = setup();

@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 #![allow(missing_docs)] // Generated code doesn't have docs
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 #[allow(clippy::all, clippy::cargo, clippy::nursery, clippy::pedantic)]
 mod generated {

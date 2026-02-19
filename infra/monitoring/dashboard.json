@@ -1,212 +1,98 @@
 {
   "$schema": "https://grafana.com/schema/dashboard/v0",
-  "title": "Arco Catalog Overview",
-  "description": "Production dashboard for Arco Catalog API and Compactor services",
-  "uid": "arco-catalog-overview",
-  "tags": ["arco", "catalog", "production"],
+  "title": "Arco Orchestration Operator",
+  "description": "Operational dashboard for Layer-2 orchestration backlog, lag, conflicts, controller latency, and SLOs",
+  "uid": "arco-orchestration-operator",
+  "tags": ["arco", "orchestration", "operator"],
   "refresh": "30s",
   "time": {
-    "from": "now-1h",
+    "from": "now-6h",
     "to": "now"
   },
   "panels": [
     {
-      "title": "API Request Rate",
-      "type": "graph",
+      "title": "Backlog Depth by Lane",
+      "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "targets": [
         {
-          "expr": "sum(rate(api_request_total[5m])) by (endpoint)",
-          "legendFormat": "{{endpoint}}"
+          "expr": "sum(arco_orch_backlog_depth) by (lane)",
+          "legendFormat": "{{lane}}"
         }
       ],
-      "description": "Total API request rate per endpoint"
+      "description": "Current actionable backlog depth across orchestration lanes"
     },
     {
-      "title": "API Latency (P50/P95/P99)",
-      "type": "graph",
+      "title": "Compaction Lag (seconds)",
+      "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(api_request_duration_seconds_bucket[5m])) by (le, endpoint))",
-          "legendFormat": "p50 {{endpoint}}"
-        },
-        {
-          "expr": "histogram_quantile(0.95, sum(rate(api_request_duration_seconds_bucket[5m])) by (le, endpoint))",
-          "legendFormat": "p95 {{endpoint}}"
-        },
-        {
-          "expr": "histogram_quantile(0.99, sum(rate(api_request_duration_seconds_bucket[5m])) by (le, endpoint))",
-          "legendFormat": "p99 {{endpoint}}"
+          "expr": "max(arco_orch_compaction_lag_seconds)",
+          "legendFormat": "max"
         }
       ],
-      "description": "API request latency percentiles"
+      "description": "Compaction watermark lag used by guardrail controllers"
     },
     {
-      "title": "API Error Rate",
-      "type": "graph",
+      "title": "Run Key Conflicts",
+      "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "targets": [
         {
-          "expr": "sum(rate(api_request_total{status_class=\"5xx\"}[5m])) / sum(rate(api_request_total[5m]))",
-          "legendFormat": "5xx rate"
-        },
-        {
-          "expr": "sum(rate(api_request_total{status_class=\"4xx\"}[5m])) / sum(rate(api_request_total[5m]))",
-          "legendFormat": "4xx rate"
+          "expr": "max(arco_orch_run_key_conflicts)",
+          "legendFormat": "conflicts"
         }
       ],
-      "description": "Percentage of requests returning 4xx/5xx responses"
+      "description": "Durable run-key conflict row count"
     },
     {
-      "title": "Rate Limit Hits",
-      "type": "graph",
+      "title": "Controller Reconcile p95 (seconds)",
+      "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "targets": [
         {
-          "expr": "sum(increase(rate_limit_hits_total[5m])) by (endpoint)",
-          "legendFormat": "{{endpoint}}"
+          "expr": "histogram_quantile(0.95, sum(rate(arco_orch_controller_reconcile_seconds_bucket[5m])) by (le, controller))",
+          "legendFormat": "p95 {{controller}}"
         }
       ],
-      "description": "Rate limit rejections per endpoint"
+      "description": "Reconcile latency p95 by controller"
     },
     {
-      "title": "Compaction Duration",
-      "type": "graph",
+      "title": "SLO Target (seconds)",
+      "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum(rate(compaction_duration_seconds_bucket[5m])) by (le, domain))",
-          "legendFormat": "p95 {{domain}}"
+          "expr": "max(arco_orch_slo_target_seconds) by (slo)",
+          "legendFormat": "target {{slo}}"
         }
       ],
-      "description": "Compaction duration by domain (p95)"
+      "description": "Configured runtime SLO targets"
     },
     {
-      "title": "Events Processed by Compaction",
-      "type": "graph",
+      "title": "SLO Observed (seconds)",
+      "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
       "targets": [
         {
-          "expr": "sum(rate(compaction_events_processed[5m])) by (domain)",
-          "legendFormat": "{{domain}}"
+          "expr": "max(arco_orch_slo_observed_seconds) by (slo)",
+          "legendFormat": "observed {{slo}}"
         }
       ],
-      "description": "Events processed per compaction cycle"
+      "description": "Observed runtime SLO signals"
     },
     {
-      "title": "Compaction Lag",
-      "type": "graph",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "title": "SLO Breaches (5m increase)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
       "targets": [
         {
-          "expr": "compaction_lag_seconds",
-          "legendFormat": "{{domain}}"
+          "expr": "sum(increase(arco_orch_slo_breaches_total[5m])) by (slo)",
+          "legendFormat": "{{slo}}"
         }
       ],
-      "description": "Seconds since last successful compaction (proxy)",
-      "alert": {
-        "threshold": 600,
-        "message": "Compaction lag > 10 minutes"
-      }
-    },
-    {
-      "title": "GC Objects Deleted",
-      "type": "graph",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
-      "targets": [
-        {
-          "expr": "sum(rate(arco_gc_objects_deleted_total[1h])) by (phase)",
-          "legendFormat": "{{phase}}"
-        }
-      ],
-      "description": "GC objects deleted per hour by phase"
-    },
-    {
-      "title": "GC Bytes Reclaimed",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 32 },
-      "targets": [
-        {
-          "expr": "sum(increase(arco_gc_bytes_reclaimed_total[24h]))",
-          "legendFormat": "Total"
-        }
-      ],
-      "description": "Bytes reclaimed in last 24h",
-      "unit": "bytes"
-    },
-    {
-      "title": "GC Errors",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 32 },
-      "targets": [
-        {
-          "expr": "sum(increase(arco_gc_errors_total[1h]))",
-          "legendFormat": "Errors"
-        }
-      ],
-      "description": "GC errors in last hour"
-    },
-    {
-      "title": "Signed URLs Minted",
-      "type": "graph",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
-      "targets": [
-        {
-          "expr": "sum(rate(signed_url_minted_total[5m]))",
-          "legendFormat": "total"
-        }
-      ],
-      "description": "Signed URL minting rate"
-    },
-    {
-      "title": "CAS Retries",
-      "type": "graph",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
-      "targets": [
-        {
-          "expr": "sum(rate(cas_retry_total[5m])) by (operation)",
-          "legendFormat": "{{operation}}"
-        }
-      ],
-      "description": "CAS retry rate by operation"
-    },
-    {
-      "title": "Compaction Runs (per hour)",
-      "type": "graph",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
-      "targets": [
-        {
-          "expr": "sum(increase(compaction_cycles_total[1h])) by (domain)",
-          "legendFormat": "{{domain}}"
-        }
-      ],
-      "description": "Compaction cycles completed per hour"
-    },
-    {
-      "title": "Storage Objects by Prefix",
-      "type": "graph",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
-      "targets": [
-        {
-          "expr": "arco_storage_objects_total",
-          "legendFormat": "{{prefix}}"
-        }
-      ],
-      "description": "Object count by storage prefix"
-    },
-    {
-      "title": "Storage Bytes by Prefix",
-      "type": "graph",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
-      "targets": [
-        {
-          "expr": "arco_storage_bytes_total",
-          "legendFormat": "{{prefix}}"
-        }
-      ],
-      "description": "Storage bytes by prefix",
-      "unit": "bytes"
+      "description": "Recent SLO breach increments by SLO key"
     }
   ]
 }

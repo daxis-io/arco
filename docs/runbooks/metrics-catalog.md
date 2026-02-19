@@ -27,6 +27,178 @@ All metrics include these labels:
 
 ---
 
+## Gate 2 Batch 3 Invariant Checks (2026-02-12)
+
+These checks are the local/code-only closure checks for Gate 2 Batch 3.
+
+### 1) Typed-path canonicalization (non-catalog flow/api/iceberg)
+
+No hardcoded storage path literals should remain in scoped modules:
+
+```bash
+rg -n '"(ledger|state|events|_catalog|orchestration|manifests|locks|snapshots|commits|sequence|quarantine)/[^"\\n]*"' \
+  crates/arco-flow/src/orchestration/ledger.rs \
+  crates/arco-flow/src/outbox.rs \
+  crates/arco-iceberg/src/pointer.rs \
+  crates/arco-iceberg/src/events.rs \
+  crates/arco-iceberg/src/idempotency.rs \
+  crates/arco-api/src/paths.rs \
+  crates/arco-api/src/routes/manifests.rs \
+  crates/arco-api/src/routes/orchestration.rs
+```
+
+Expected result: no matches.
+
+### 2) Deterministic/property invariants (out-of-order, duplicate, crash replay)
+
+```bash
+cargo test -p arco-flow --features test-utils --test property_tests compaction_is_out_of_order_and_duplicate_invariant -- --nocapture
+cargo test -p arco-flow --features test-utils --test property_tests compaction_crash_replay_converges_to_single_pass_state -- --nocapture
+```
+
+Expected result: all tests pass.
+
+### 3) Failure-injection checks (CAS race, partial writes, compaction replay)
+
+```bash
+cargo test -p arco-iceberg test_pointer_store_cas_race_has_single_winner -- --nocapture
+cargo test -p arco-flow ledger_writer_recovers_after_partial_batch_write_failure -- --nocapture
+cargo test -p arco-flow --test orchestration_correctness_tests test_compaction_replay_recovers_after_manifest_publish_failure -- --nocapture
+```
+
+Expected result: all tests pass.
+
+### 4) Batch matrix evidence (release gate input)
+
+Batch 3 command matrix output is archived at:
+
+- `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-matrix-status.tsv`
+- `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-logs/`
+
+---
+
+## Gate 3 Batch 3 Local Checks (2026-02-12)
+
+These checks cover local/code-only Gate 3 closure work completed in Batch 3.
+
+### 1) Layer-2 projection durability across cold restart (`G3-001`)
+
+```bash
+cargo test -p arco-flow cold_restart_preserves_layer2_backfills_ticks_and_sensors -- --nocapture
+```
+
+Expected result: pass; schedule/sensor/backfill/run-key projection rows survive restart and remain queryable.
+
+### 2) `RunRequested -> RunTriggered/PlanCreated` bridge convergence (`G3-003`)
+
+```bash
+cargo test -p arco-flow --test run_bridge_controller_tests run_bridge_duplicate_and_conflict_requests_converge_after_first_emit -- --nocapture
+cargo test -p arco-flow --test run_bridge_controller_tests run_bridge_uses_matching_fingerprint_when_conflicts_exist -- --nocapture
+```
+
+Expected result: pass; first reconcile emits exactly one run, repeated reconcile converges to deterministic skip (`run_already_exists`), and bridge payload selection matches the canonical `request_fingerprint`.
+
+### 3) Explicit runtime limits + SLO defaults (`G3-005`)
+
+Runtime config vars (seconds):
+- `ARCO_FLOW_ORCH_MAX_COMPACTION_LAG_SECS` (default `30`)
+- `ARCO_FLOW_ORCH_SLO_P95_RUN_REQUESTED_TO_TRIGGERED_SECS` (default `10`)
+- `ARCO_FLOW_ORCH_SLO_P95_COMPACTION_LAG_SECS` (default `30`)
+
+```bash
+cargo test -p arco-flow --test runtime_observability_tests runtime_config_uses_expected_defaults -- --nocapture
+cargo test -p arco-flow --test runtime_observability_tests runtime_config_applies_env_overrides -- --nocapture
+cargo test -p arco-flow --test runtime_observability_tests runtime_config_rejects_non_positive_values -- --nocapture
+cargo test -p arco-flow --test runtime_observability_tests slo_snapshot_detects_compaction_lag_breach -- --nocapture
+cargo test -p arco-flow --test runtime_observability_tests slo_snapshot_detects_run_requested_to_triggered_p95_breach -- --nocapture
+```
+
+Expected result: pass; runtime limits are enforced, SLO defaults/overrides are deterministic, invalid non-positive values are rejected, and SLO breach detection is enforced at runtime.
+
+### 4) Operator metrics emission for backlog/lag/conflicts (`G3-006`)
+
+```bash
+rg -n "arco_orch_backlog_depth|arco_orch_compaction_lag_seconds|arco_orch_run_key_conflicts|arco_orch_controller_reconcile_seconds|arco_orch_slo_target_seconds|arco_orch_slo_observed_seconds|arco_orch_slo_breaches_total" \
+  crates/arco-flow/src/metrics.rs \
+  crates/arco-flow/src/bin/arco_flow_dispatcher.rs \
+  crates/arco-flow/src/orchestration/controllers/
+cargo test -p arco-flow --test runtime_observability_tests backlog_snapshot_reports_pending_counts_conflicts_and_lag -- --nocapture
+cargo test -p arco-flow --test runtime_observability_tests backlog_snapshot_counts_only_actionable_dispatch_and_timer_rows -- --nocapture
+```
+
+Expected result: metric names are present in dispatcher/controller paths and backlog gauges count actionable pending rows only.
+
+Dashboard + alert proof checks:
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+dashboard = json.loads(Path("infra/monitoring/dashboard.json").read_text())
+required = [
+    "arco_orch_backlog_depth",
+    "arco_orch_compaction_lag_seconds",
+    "arco_orch_run_key_conflicts",
+    "arco_orch_controller_reconcile_seconds",
+    "arco_orch_slo_target_seconds",
+    "arco_orch_slo_observed_seconds",
+    "arco_orch_slo_breaches_total",
+]
+exprs = [t.get("expr", "") for p in dashboard.get("panels", []) for t in p.get("targets", [])]
+missing = [m for m in required if not any(m in e for e in exprs)]
+assert not missing, f"missing dashboard metrics: {missing}"
+print("dashboard covers all required G3-006 metrics")
+PY
+
+promtool check rules infra/monitoring/alerts.yaml
+promtool test rules release_evidence/2026-02-12-prod-readiness/gate-3/observability_orch_alert_drill.test.yaml
+```
+
+Expected result: dashboard contains each required metric query, alert rules compile, and controlled-signal drill fires expected alerts.
+
+### 5) Timer callback ingestion + OIDC validation (`G3-002`)
+
+```bash
+cargo test -p arco-flow --bin arco_flow_dispatcher -- --nocapture
+cargo test -p arco-flow --all-features --bin arco_flow_dispatcher callback_auth_ -- --nocapture
+terraform -chdir=infra/terraform init -backend=false
+terraform -chdir=infra/terraform validate
+```
+
+Expected result: callback ingestion path emits `TimerFired` deterministically, missing/invalid auth is rejected, valid OIDC claims are accepted, and Terraform queue/IAM contracts validate cleanly.
+
+---
+
+## Gate 4 Staging SLO + Burn-Rate Threshold Checks (2026-02-14)
+
+These checks document the thresholds currently enforced by
+`infra/monitoring/alerts.yaml` and provide a deterministic drill harness for
+their behavior.
+
+### Threshold Matrix (alerts.yaml contract)
+
+| Alert | Threshold | Window | `for` | Notes |
+|---|---|---|---|---|
+| `ArcoApiErrorRateHigh` | `5xx / total > 0.01` | `rate(...[5m])` | `5m` | API error budget guardrail |
+| `ArcoRateLimitHitsHigh` | `increase(rate_limit_hits_total[1m]) > 100` | `1m` | `1m` | Per-endpoint pressure signal |
+| `ArcoCompactionLagHigh` | `compaction_lag_seconds > 600` | gauge | `5m` | Compactor lag threshold |
+| `ArcoCasRetryRateHigh` | `increase(cas_retry_total[1m]) > 10` | `1m` | `5m` | CAS contention threshold |
+| `ArcoOrchSloObservedAboveTarget` | `observed > target` | gauge | `5m` | Runtime SLO over-target condition |
+| `ArcoOrchSloBreachesIncreasing` | `increase(arco_orch_slo_breaches_total[5m]) > 0` | `5m` | `1m` | Short-window burn-rate proxy |
+
+### Controlled Drill (local rule test)
+
+```bash
+promtool check rules infra/monitoring/alerts.yaml
+promtool test rules \
+  release_evidence/2026-02-12-prod-readiness/gate-4/observability/observability_gate4_alert_drill.test.yaml
+```
+
+Expected result: rule check passes and controlled series fire all threshold
+alerts in the matrix.
+
+---
+
 ## Gate 5 Critical Metrics
 
 These metrics are essential for Gate 5 invariant monitoring.
@@ -266,6 +438,33 @@ Request latency distribution.
 **Labels:** `domain`
 
 Pending compaction work items.
+
+### Flow Orchestration
+
+#### `arco_orch_callbacks_total`
+**Type:** Counter
+**Labels:** `handler`, `result`
+
+Worker callback outcomes by HTTP-style result code (`200`, `401`, `409`, `500`, ...).
+
+#### `arco_orch_callback_errors_total`
+**Type:** Counter
+**Labels:** `handler`, `result`
+
+Subset counter for non-2xx callback outcomes.
+
+#### `arco_orch_callback_duration_seconds`
+**Type:** Histogram
+**Labels:** `handler`
+
+End-to-end callback handler latency.
+
+#### `arco_flow_dispatch_queue_depth`
+**Type:** Gauge
+**Labels:** `queue`
+
+Dispatch queue depth from queue implementations that expose reliable depth.
+Cloud Tasks backends no longer emit a sentinel `0` for unknown depth; use provider backlog metrics instead.
 
 #### `arco_compactor_last_run_timestamp`
 **Type:** Gauge

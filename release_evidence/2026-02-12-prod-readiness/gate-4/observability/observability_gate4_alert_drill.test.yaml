@@ -1,0 +1,105 @@
+rule_files:
+  - ../../../../infra/monitoring/alerts.yaml
+evaluation_interval: 1m
+tests:
+  - name: g4_core_threshold_alerts_fire_with_controlled_signal
+    interval: 1m
+    input_series:
+      - series: 'api_request_total{status_class="5xx"}'
+        values: "0 5 10 15 20 25 30 35 40 45 50"
+      - series: "api_request_total"
+        values: "0 100 200 300 400 500 600 700 800 900 1000"
+      - series: 'compaction_lag_seconds{domain="catalog"}'
+        values: "700 700 700 700 700 700 700 700 700 700 700"
+      - series: 'arco_orch_slo_observed_seconds{slo="compaction_lag_p95"}'
+        values: "45 45 45 45 45 45 45 45 45 45 45"
+      - series: 'arco_orch_slo_target_seconds{slo="compaction_lag_p95"}'
+        values: "30 30 30 30 30 30 30 30 30 30 30"
+      - series: 'arco_orch_slo_breaches_total{slo="compaction_lag_p95"}'
+        values: "0 0 0 1 2 3 4 5 6 7 8"
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: ArcoApiErrorRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: arco-api
+            exp_annotations:
+              summary: "API 5xx error rate > 1%"
+              description: |
+                The Arco API 5xx error rate has exceeded 1% for 5 minutes.
+                Current rate: 0.05%
+              runbook_url: "https://docs.arco.dev/runbooks/api-errors"
+      - eval_time: 9m
+        alertname: ArcoCompactionLagHigh
+        exp_alerts:
+          - exp_labels:
+              domain: catalog
+              severity: warning
+              service: arco-compactor
+            exp_annotations:
+              summary: "Compaction lag > 10 minutes for domain catalog"
+              description: |
+                Compaction for domain catalog has not completed recently.
+                Current lag proxy: 700 seconds
+              runbook_url: "https://docs.arco.dev/runbooks/compactor-stuck"
+      - eval_time: 9m
+        alertname: ArcoOrchSloObservedAboveTarget
+        exp_alerts:
+          - exp_labels:
+              slo: compaction_lag_p95
+              severity: warning
+              service: arco-flow
+            exp_annotations:
+              summary: "Observed orchestration SLO exceeded target (slo=compaction_lag_p95)"
+              description: |
+                Observed SLO value is above target for compaction_lag_p95.
+                Current observed: 45.000s
+              runbook_url: "https://docs.arco.dev/runbooks/scheduler-not-progressing"
+      - eval_time: 9m
+        alertname: ArcoOrchSloBreachesIncreasing
+        exp_alerts:
+          - exp_labels:
+              slo: compaction_lag_p95
+              severity: critical
+              service: arco-flow
+            exp_annotations:
+              summary: "Orchestration SLO breaches are increasing (slo=compaction_lag_p95)"
+              description: |
+                Runtime SLO breach counter increased in the last 5 minutes for compaction_lag_p95.
+                Increase: 5
+              runbook_url: "https://docs.arco.dev/runbooks/scheduler-not-progressing"
+  - name: g4_rate_and_cas_threshold_alerts_fire
+    interval: 30s
+    input_series:
+      - series: 'rate_limit_hits_total{endpoint="/v1/query"}'
+        values: "0 60 120 180 240 300 360 420 480 540 600 660 720 780 840 900 960 1020 1080 1140 1200 1260 1320 1380 1440"
+      - series: 'cas_retry_total{operation="cas_manifest"}'
+        values: "0 10 20 30 40 50 60 70 80 90 100 110 120 130 140 150 160 170 180 190 200 210 220 230 240"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: ArcoRateLimitHitsHigh
+        exp_alerts:
+          - exp_labels:
+              endpoint: /v1/query
+              severity: warning
+              service: arco-api
+            exp_annotations:
+              summary: "Rate limit hits > 100/min for endpoint /v1/query"
+              description: |
+                Endpoint /v1/query is hitting rate limits frequently.
+                Rate: 120 hits/min
+              runbook_url: "https://docs.arco.dev/runbooks/rate-limiting"
+      - eval_time: 8m
+        alertname: ArcoCasRetryRateHigh
+        exp_alerts:
+          - exp_labels:
+              operation: cas_manifest
+              severity: warning
+              service: arco-catalog
+            exp_annotations:
+              summary: "CAS retry rate > 10/min for cas_manifest"
+              description: |
+                High CAS retry rate indicates contention on catalog writes.
+                Current rate: 20.0 retries/min
+              runbook_url: "https://docs.arco.dev/runbooks/cas-contention"

@@ -2,10 +2,12 @@
 //!
 //! The catalog uses separate manifest files to reduce contention:
 //! - `root.manifest.json`: Pointers to domain manifests
-//! - `catalog.manifest.json`: Tier 1 (namespaces, tables, columns) - locked writes
-//! - `lineage.manifest.json`: Tier 1 (dependency edges) - locked writes
-//! - `executions.manifest.json`: Tier 2 (execution state) - compactor writes
-//! - `search.manifest.json`: Tier 1 (token postings) - locked writes
+//! - `catalog.manifest.json`: Legacy compatibility path for catalog domain
+//! - `lineage.manifest.json`: Legacy compatibility path for lineage domain
+//! - `executions.manifest.json`: Legacy compatibility path for executions domain
+//! - `search.manifest.json`: Legacy compatibility path for search domain
+//! - `{domain}.pointer.json`: CAS-updated visibility pointer per domain
+//! - `{domain}/{manifest_id}.json`: Immutable manifest snapshots
 //!
 //! Each domain manifest is a separate file that can be updated independently.
 //!
@@ -14,10 +16,15 @@
 //! ```text
 //! tenant={tenant}/workspace={workspace}/manifests/
 //! ├── root.manifest.json        # Root pointer to domain manifests
-//! ├── catalog.manifest.json     # Tier 1: Catalog state (locked writes)
-//! ├── lineage.manifest.json     # Tier 1: Lineage state (locked writes)
-//! ├── executions.manifest.json  # Tier 2: Execution state (compactor writes)
-//! └── search.manifest.json      # Tier 1: Search state (locked writes)
+//! ├── catalog.manifest.json     # Legacy compatibility mirror
+//! ├── lineage.manifest.json     # Legacy compatibility mirror
+//! ├── executions.manifest.json  # Legacy compatibility mirror
+//! ├── search.manifest.json      # Legacy compatibility mirror
+//! ├── catalog.pointer.json      # Visibility pointer
+//! ├── lineage.pointer.json      # Visibility pointer
+//! ├── executions.pointer.json   # Visibility pointer
+//! ├── search.pointer.json       # Visibility pointer
+//! └── {domain}/{manifest_id}.json # Immutable snapshots
 //! ```
 
 use arco_core::{CatalogDomain, CatalogPaths};
@@ -57,6 +64,129 @@ use sha2::{Digest, Sha256};
 pub fn compute_manifest_hash(raw_bytes: &[u8]) -> String {
     let hash = Sha256::digest(raw_bytes);
     format!("sha256:{}", hex::encode(hash))
+}
+
+/// Fixed width for immutable manifest identifiers.
+pub const MANIFEST_ID_WIDTH: usize = 20;
+
+/// The initial manifest identifier used for bootstrapped manifests.
+pub const INITIAL_MANIFEST_ID: &str = "00000000000000000000";
+
+fn default_manifest_id() -> String {
+    INITIAL_MANIFEST_ID.to_string()
+}
+
+/// Formats a manifest identifier as a fixed-width, zero-padded decimal string.
+#[must_use]
+pub fn format_manifest_id(value: u64) -> String {
+    format!("{value:0MANIFEST_ID_WIDTH$}")
+}
+
+/// Parses a fixed-width decimal manifest identifier.
+///
+/// # Errors
+///
+/// Returns an error when `manifest_id` is not exactly 20 digits or overflows `u64`.
+pub fn parse_manifest_id(manifest_id: &str) -> Result<u64, String> {
+    if manifest_id.len() != MANIFEST_ID_WIDTH || !manifest_id.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "invalid manifest_id '{manifest_id}': expected {MANIFEST_ID_WIDTH} decimal digits"
+        ));
+    }
+
+    manifest_id
+        .parse::<u64>()
+        .map_err(|e| format!("invalid manifest_id '{manifest_id}': cannot parse as u64 ({e})"))
+}
+
+/// Computes the next fixed-width manifest identifier.
+///
+/// # Errors
+///
+/// Returns an error when the previous ID is invalid or cannot be incremented.
+pub fn next_manifest_id(previous: &str) -> Result<String, String> {
+    let previous = parse_manifest_id(previous)?;
+    let next = previous
+        .checked_add(1)
+        .ok_or_else(|| "manifest_id overflow while generating successor".to_string())?;
+    Ok(format_manifest_id(next))
+}
+
+/// Domain manifest pointer written via CAS.
+///
+/// The pointer is the visibility gate for immutable manifest snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DomainManifestPointer {
+    /// Current manifest ID (fixed-width decimal).
+    #[serde(default = "default_manifest_id")]
+    pub manifest_id: String,
+
+    /// Path to the immutable manifest snapshot.
+    pub manifest_path: String,
+
+    /// Lock epoch that published this pointer.
+    #[serde(default)]
+    pub epoch: u64,
+
+    /// Hash of the previous pointer raw bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_pointer_hash: Option<String>,
+
+    /// Last update timestamp.
+    pub updated_at: DateTime<Utc>,
+}
+
+impl DomainManifestPointer {
+    /// Creates a default pointer for a domain at manifest ID 0.
+    #[must_use]
+    pub fn new(domain: CatalogDomain) -> Self {
+        let manifest_id = default_manifest_id();
+        Self {
+            manifest_path: CatalogPaths::domain_manifest_snapshot(domain, &manifest_id),
+            manifest_id,
+            epoch: 0,
+            parent_pointer_hash: None,
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Validates that this pointer can succeed the previous pointer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when manifest IDs regress, parent hashes mismatch, or epoch regresses.
+    pub fn validate_succession(
+        &self,
+        previous: &Self,
+        previous_raw_hash: &str,
+    ) -> Result<(), String> {
+        let prev_id = parse_manifest_id(&previous.manifest_id)?;
+        let next_id = parse_manifest_id(&self.manifest_id)?;
+        if next_id < prev_id {
+            return Err(format!(
+                "pointer manifest_id regression: {} -> {}",
+                previous.manifest_id, self.manifest_id
+            ));
+        }
+
+        if let Some(ref parent_hash) = self.parent_pointer_hash {
+            if parent_hash != previous_raw_hash {
+                return Err(format!(
+                    "pointer parent hash mismatch: expected {previous_raw_hash}, got {parent_hash}"
+                ));
+            }
+        }
+
+        if self.epoch < previous.epoch {
+            return Err(format!(
+                "pointer epoch regression: {} -> {} (stale holder)",
+                previous.epoch, self.epoch
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -158,6 +288,22 @@ impl Default for RootManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogDomainManifest {
+    /// Immutable manifest snapshot ID (fixed-width decimal).
+    #[serde(default = "default_manifest_id")]
+    pub manifest_id: String,
+
+    /// Lock epoch that produced this manifest.
+    #[serde(default)]
+    pub epoch: u64,
+
+    /// Path to previous immutable manifest snapshot (for audit/recovery).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_manifest_path: Option<String>,
+
+    /// Writer session identifier for forensic tracing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_session_id: Option<String>,
+
     /// Current snapshot version (monotonically increasing).
     pub snapshot_version: u64,
 
@@ -208,6 +354,10 @@ impl CatalogDomainManifest {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            manifest_id: default_manifest_id(),
+            epoch: 0,
+            previous_manifest_path: None,
+            writer_session_id: None,
             snapshot_version: 0,
             snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 0),
             snapshot: None,
@@ -247,6 +397,15 @@ impl CatalogDomainManifest {
         previous: &Self,
         previous_raw_hash: &str,
     ) -> Result<(), String> {
+        let prev_manifest_id = parse_manifest_id(&previous.manifest_id)?;
+        let next_manifest_id = parse_manifest_id(&self.manifest_id)?;
+        if next_manifest_id < prev_manifest_id {
+            return Err(format!(
+                "manifest_id regression: {} -> {} (rollback not allowed)",
+                previous.manifest_id, self.manifest_id
+            ));
+        }
+
         // Version must not decrease (rollback detection)
         if self.snapshot_version < previous.snapshot_version {
             return Err(format!(
@@ -270,6 +429,13 @@ impl CatalogDomainManifest {
                     "fencing token regression: {prev} -> {next} (stale holder)"
                 ));
             }
+        }
+
+        if self.epoch < previous.epoch {
+            return Err(format!(
+                "epoch regression: {} -> {} (stale holder)",
+                previous.epoch, self.epoch
+            ));
         }
 
         if let (Some(prev), Some(next)) =
@@ -425,6 +591,22 @@ impl SnapshotInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionsManifest {
+    /// Immutable manifest snapshot ID (fixed-width decimal).
+    #[serde(default = "default_manifest_id")]
+    pub manifest_id: String,
+
+    /// Lock epoch that produced this manifest.
+    #[serde(default)]
+    pub epoch: u64,
+
+    /// Path to previous immutable manifest snapshot (for audit/recovery).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_manifest_path: Option<String>,
+
+    /// Writer session identifier for forensic tracing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_session_id: Option<String>,
+
     /// Watermark version (last compacted event).
     pub watermark_version: u64,
 
@@ -481,6 +663,10 @@ impl ExecutionsManifest {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            manifest_id: default_manifest_id(),
+            epoch: 0,
+            previous_manifest_path: None,
+            writer_session_id: None,
             watermark_version: 0,
             checkpoint_path: format!(
                 "{}checkpoint.json",
@@ -514,6 +700,22 @@ pub type ExecutionManifest = ExecutionsManifest;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LineageManifest {
+    /// Immutable manifest snapshot ID (fixed-width decimal).
+    #[serde(default = "default_manifest_id")]
+    pub manifest_id: String,
+
+    /// Lock epoch that produced this manifest.
+    #[serde(default)]
+    pub epoch: u64,
+
+    /// Path to previous immutable manifest snapshot (for audit/recovery).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_manifest_path: Option<String>,
+
+    /// Writer session identifier for forensic tracing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_session_id: Option<String>,
+
     /// Snapshot version.
     pub snapshot_version: u64,
 
@@ -553,6 +755,10 @@ impl LineageManifest {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            manifest_id: default_manifest_id(),
+            epoch: 0,
+            previous_manifest_path: None,
+            writer_session_id: None,
             snapshot_version: 0,
             edges_path: CatalogPaths::snapshot_dir(CatalogDomain::Lineage, 0),
             snapshot: None,
@@ -579,6 +785,15 @@ impl LineageManifest {
         previous: &Self,
         previous_raw_hash: &str,
     ) -> Result<(), String> {
+        let prev_manifest_id = parse_manifest_id(&previous.manifest_id)?;
+        let next_manifest_id = parse_manifest_id(&self.manifest_id)?;
+        if next_manifest_id < prev_manifest_id {
+            return Err(format!(
+                "manifest_id regression: {} -> {} (rollback not allowed)",
+                previous.manifest_id, self.manifest_id
+            ));
+        }
+
         if self.snapshot_version < previous.snapshot_version {
             return Err(format!(
                 "version regression: {} -> {} (rollback not allowed)",
@@ -600,6 +815,13 @@ impl LineageManifest {
                     "fencing token regression: {prev} -> {next} (stale holder)"
                 ));
             }
+        }
+
+        if self.epoch < previous.epoch {
+            return Err(format!(
+                "epoch regression: {} -> {} (stale holder)",
+                previous.epoch, self.epoch
+            ));
         }
 
         if let (Some(prev), Some(next)) =
@@ -628,6 +850,22 @@ impl Default for LineageManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchManifest {
+    /// Immutable manifest snapshot ID (fixed-width decimal).
+    #[serde(default = "default_manifest_id")]
+    pub manifest_id: String,
+
+    /// Lock epoch that produced this manifest.
+    #[serde(default)]
+    pub epoch: u64,
+
+    /// Path to previous immutable manifest snapshot (for audit/recovery).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_manifest_path: Option<String>,
+
+    /// Writer session identifier for forensic tracing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_session_id: Option<String>,
+
     /// Snapshot version.
     pub snapshot_version: u64,
 
@@ -667,6 +905,10 @@ impl SearchManifest {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            manifest_id: default_manifest_id(),
+            epoch: 0,
+            previous_manifest_path: None,
+            writer_session_id: None,
             snapshot_version: 0,
             base_path: CatalogPaths::snapshot_dir(CatalogDomain::Search, 0),
             snapshot: None,
@@ -688,6 +930,15 @@ impl SearchManifest {
         previous: &Self,
         previous_raw_hash: &str,
     ) -> Result<(), String> {
+        let prev_manifest_id = parse_manifest_id(&previous.manifest_id)?;
+        let next_manifest_id = parse_manifest_id(&self.manifest_id)?;
+        if next_manifest_id < prev_manifest_id {
+            return Err(format!(
+                "manifest_id regression: {} -> {} (rollback not allowed)",
+                previous.manifest_id, self.manifest_id
+            ));
+        }
+
         if self.snapshot_version < previous.snapshot_version {
             return Err(format!(
                 "version regression: {} -> {} (rollback not allowed)",
@@ -709,6 +960,13 @@ impl SearchManifest {
                     "fencing token regression: {prev} -> {next} (stale holder)"
                 ));
             }
+        }
+
+        if self.epoch < previous.epoch {
+            return Err(format!(
+                "epoch regression: {} -> {} (stale holder)",
+                previous.epoch, self.epoch
+            ));
         }
 
         if let (Some(prev), Some(next)) =
@@ -984,6 +1242,9 @@ mod tests {
         let core = CoreManifest::new();
 
         assert_eq!(core.snapshot_version, 0);
+        assert_eq!(core.manifest_id, "00000000000000000000");
+        assert_eq!(core.epoch, 0);
+        assert!(core.previous_manifest_path.is_none());
         assert!(core.last_commit_id.is_none());
     }
 
@@ -992,7 +1253,27 @@ mod tests {
         let exec = ExecutionManifest::new();
 
         assert_eq!(exec.watermark_version, 0);
+        assert_eq!(exec.manifest_id, "00000000000000000000");
+        assert_eq!(exec.epoch, 0);
+        assert!(exec.previous_manifest_path.is_none());
         assert!(exec.last_compaction_at.is_none());
+    }
+
+    #[test]
+    fn test_domain_manifest_pointer_roundtrip() {
+        let pointer = DomainManifestPointer {
+            manifest_id: "00000000000000000042".to_string(),
+            manifest_path: "manifests/catalog/00000000000000000042.json".to_string(),
+            epoch: 7,
+            parent_pointer_hash: Some("sha256:abc".to_string()),
+            updated_at: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&pointer).expect("serialize pointer");
+        let parsed: DomainManifestPointer = serde_json::from_str(&json).expect("parse pointer");
+
+        assert_eq!(parsed.manifest_id, "00000000000000000042");
+        assert_eq!(parsed.epoch, 7);
     }
 
     #[test]
@@ -1000,6 +1281,13 @@ mod tests {
         // Each domain manifest serializes independently
         let now = Utc::now();
         let core = CoreManifest {
+            manifest_id: format_manifest_id(42),
+            epoch: 0,
+            previous_manifest_path: Some(CatalogPaths::domain_manifest_snapshot(
+                CatalogDomain::Catalog,
+                &format_manifest_id(41),
+            )),
+            writer_session_id: Some("writer-session-test".into()),
             snapshot_version: 42,
             snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 42),
             snapshot: None,
@@ -1012,6 +1300,13 @@ mod tests {
         };
 
         let exec = ExecutionManifest {
+            manifest_id: format_manifest_id(5),
+            epoch: 0,
+            previous_manifest_path: Some(CatalogPaths::domain_manifest_snapshot(
+                CatalogDomain::Executions,
+                &format_manifest_id(4),
+            )),
+            writer_session_id: Some("writer-session-test".into()),
             watermark_version: 100,
             checkpoint_path: format!(
                 "{}checkpoint.json",
@@ -1189,6 +1484,10 @@ mod tests {
     fn test_validate_succession_version_regression_rejected() {
         let now = Utc::now();
         let previous = CatalogDomainManifest {
+            manifest_id: format_manifest_id(5),
+            epoch: 5,
+            previous_manifest_path: None,
+            writer_session_id: None,
             snapshot_version: 5,
             snapshot_path: "state/catalog/v5/".into(),
             snapshot: None,
@@ -1202,6 +1501,10 @@ mod tests {
 
         // Attempt to regress version from 5 to 3
         let regressed = CatalogDomainManifest {
+            manifest_id: format_manifest_id(3),
+            epoch: 5,
+            previous_manifest_path: Some("manifests/catalog/00000000000000000005.json".into()),
+            writer_session_id: None,
             snapshot_version: 3,
             snapshot_path: "state/catalog/v3/".into(),
             snapshot: None,
@@ -1224,6 +1527,10 @@ mod tests {
     fn test_validate_succession_parent_hash_mismatch_rejected() {
         let now = Utc::now();
         let previous = CatalogDomainManifest {
+            manifest_id: format_manifest_id(5),
+            epoch: 5,
+            previous_manifest_path: None,
+            writer_session_id: None,
             snapshot_version: 5,
             snapshot_path: "state/catalog/v5/".into(),
             snapshot: None,
@@ -1237,6 +1544,10 @@ mod tests {
 
         // Attempt with wrong parent hash (concurrent modification)
         let concurrent_modified = CatalogDomainManifest {
+            manifest_id: format_manifest_id(6),
+            epoch: 5,
+            previous_manifest_path: Some("manifests/catalog/00000000000000000005.json".into()),
+            writer_session_id: None,
             snapshot_version: 6,
             snapshot_path: "state/catalog/v6/".into(),
             snapshot: None,
@@ -1259,6 +1570,10 @@ mod tests {
     fn test_validate_succession_fencing_token_regression_rejected() {
         let now = Utc::now();
         let previous = CatalogDomainManifest {
+            manifest_id: format_manifest_id(5),
+            epoch: 5,
+            previous_manifest_path: None,
+            writer_session_id: None,
             snapshot_version: 5,
             snapshot_path: "state/catalog/v5/".into(),
             snapshot: None,
@@ -1271,6 +1586,10 @@ mod tests {
         };
 
         let stale = CatalogDomainManifest {
+            manifest_id: format_manifest_id(6),
+            epoch: 6,
+            previous_manifest_path: Some("manifests/catalog/00000000000000000005.json".into()),
+            writer_session_id: None,
             snapshot_version: 6,
             snapshot_path: "state/catalog/v6/".into(),
             snapshot: None,
@@ -1291,6 +1610,10 @@ mod tests {
     fn test_validate_succession_commit_ulid_regression_rejected() {
         let now = Utc::now();
         let previous = CatalogDomainManifest {
+            manifest_id: format_manifest_id(5),
+            epoch: 5,
+            previous_manifest_path: None,
+            writer_session_id: None,
             snapshot_version: 5,
             snapshot_path: "state/catalog/v5/".into(),
             snapshot: None,
@@ -1303,6 +1626,10 @@ mod tests {
         };
 
         let stale = CatalogDomainManifest {
+            manifest_id: format_manifest_id(6),
+            epoch: 6,
+            previous_manifest_path: Some("manifests/catalog/00000000000000000005.json".into()),
+            writer_session_id: None,
             snapshot_version: 6,
             snapshot_path: "state/catalog/v6/".into(),
             snapshot: None,
@@ -1323,6 +1650,10 @@ mod tests {
     fn test_validate_succession_valid() {
         let now = Utc::now();
         let previous = CatalogDomainManifest {
+            manifest_id: format_manifest_id(5),
+            epoch: 5,
+            previous_manifest_path: None,
+            writer_session_id: None,
             snapshot_version: 5,
             snapshot_path: "state/catalog/v5/".into(),
             snapshot: None,
@@ -1336,6 +1667,10 @@ mod tests {
 
         // Valid succession: version increases, parent hash matches
         let valid_successor = CatalogDomainManifest {
+            manifest_id: format_manifest_id(6),
+            epoch: 6,
+            previous_manifest_path: Some("manifests/catalog/00000000000000000005.json".into()),
+            writer_session_id: None,
             snapshot_version: 6,
             snapshot_path: "state/catalog/v6/".into(),
             snapshot: None,
@@ -1357,6 +1692,10 @@ mod tests {
     fn test_validate_succession_same_version_allowed() {
         let now = Utc::now();
         let previous = CatalogDomainManifest {
+            manifest_id: format_manifest_id(5),
+            epoch: 5,
+            previous_manifest_path: None,
+            writer_session_id: None,
             snapshot_version: 5,
             snapshot_path: "state/catalog/v5/".into(),
             snapshot: None,
@@ -1370,6 +1709,10 @@ mod tests {
 
         // Same version is allowed (idempotent retry)
         let same_version = CatalogDomainManifest {
+            manifest_id: format_manifest_id(5),
+            epoch: 5,
+            previous_manifest_path: Some("manifests/catalog/00000000000000000005.json".into()),
+            writer_session_id: None,
             snapshot_version: 5,
             snapshot_path: "state/catalog/v5/".into(),
             snapshot: None,
@@ -1391,6 +1734,10 @@ mod tests {
     fn test_validate_succession_no_parent_hash_allowed() {
         let now = Utc::now();
         let previous = CatalogDomainManifest {
+            manifest_id: format_manifest_id(5),
+            epoch: 5,
+            previous_manifest_path: None,
+            writer_session_id: None,
             snapshot_version: 5,
             snapshot_path: "state/catalog/v5/".into(),
             snapshot: None,
@@ -1404,6 +1751,10 @@ mod tests {
 
         // No parent hash (backwards compatibility with old manifests)
         let no_parent_hash = CatalogDomainManifest {
+            manifest_id: format_manifest_id(6),
+            epoch: 6,
+            previous_manifest_path: Some("manifests/catalog/00000000000000000005.json".into()),
+            writer_session_id: None,
             snapshot_version: 6,
             snapshot_path: "state/catalog/v6/".into(),
             snapshot: None,
@@ -1426,6 +1777,10 @@ mod tests {
     fn test_catalog_manifest_has_parent_hash_field() {
         // Verify the field exists and is serializable
         let manifest = CatalogDomainManifest {
+            manifest_id: format_manifest_id(1),
+            epoch: 1,
+            previous_manifest_path: Some("manifests/catalog/00000000000000000000.json".into()),
+            writer_session_id: Some("writer-session-test".into()),
             snapshot_version: 1,
             snapshot_path: "state/catalog/v1/".into(),
             snapshot: None,

@@ -1,0 +1,6 @@
+step	command	exit_code	utc
+init	terraform -chdir="/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/infra/terraform" init -backend=false -no-color	0	2026-02-15T16:23:55Z
+validate	terraform -chdir="/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/infra/terraform" validate -no-color	0	2026-02-15T16:23:55Z
+plan	terraform -chdir="/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/infra/terraform" plan -var-file=environments/staging.tfvars -lock=false -input=false -no-color -out="/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/release_evidence/2026-02-12-prod-readiness/gate-4/terraform/staging.tfplan"	1	2026-02-15T16:23:56Z
+apply	SKIPPED(plan failed)	NA	2026-02-15T16:23:56Z
+replan	SKIPPED(apply not executed)	NA	2026-02-15T16:23:56Z

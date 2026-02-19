@@ -1,21 +1,17 @@
-use base64::Engine;
+use arco_core::ApiPaths;
 
-pub const MANIFEST_PREFIX: &str = "manifests/";
-pub const MANIFEST_IDEMPOTENCY_PREFIX: &str = "manifests/idempotency/";
-pub const BACKFILL_IDEMPOTENCY_PREFIX: &str = "orchestration/backfills/idempotency/";
+pub const MANIFEST_PREFIX: &str = ApiPaths::MANIFEST_PREFIX;
+pub const MANIFEST_IDEMPOTENCY_PREFIX: &str = ApiPaths::MANIFEST_IDEMPOTENCY_PREFIX;
+pub const MANIFEST_LATEST_INDEX_PATH: &str = ApiPaths::MANIFEST_LATEST_INDEX_PATH;
 
 pub fn manifest_path(manifest_id: &str) -> String {
-    format!("{MANIFEST_PREFIX}{manifest_id}.json")
+    ApiPaths::manifest_path(manifest_id)
 }
 
 pub fn manifest_idempotency_path(idempotency_key: &str) -> String {
-    let encoded =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(idempotency_key.as_bytes());
-    format!("{MANIFEST_IDEMPOTENCY_PREFIX}{encoded}.json")
+    ApiPaths::manifest_idempotency_path(idempotency_key)
 }
 
 pub fn backfill_idempotency_path(idempotency_key: &str) -> String {
-    let encoded =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(idempotency_key.as_bytes());
-    format!("{BACKFILL_IDEMPOTENCY_PREFIX}{encoded}.json")
+    ApiPaths::backfill_idempotency_path(idempotency_key)
 }

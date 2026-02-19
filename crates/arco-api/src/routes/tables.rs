@@ -685,9 +685,10 @@ fn effective_table_format(format: Option<&str>) -> Result<String, ApiError> {
 }
 
 fn normalize_requested_format(format: Option<&str>) -> Result<String, ApiError> {
-    match format {
-        Some(value) => TableFormat::normalize(value),
-        None => Ok(TableFormat::Delta.as_str().to_string()),
-    }
-    .map_err(ApiError::from)
+    format
+        .map_or_else(
+            || Ok(TableFormat::Delta.as_str().to_string()),
+            TableFormat::normalize,
+        )
+        .map_err(ApiError::from)
 }

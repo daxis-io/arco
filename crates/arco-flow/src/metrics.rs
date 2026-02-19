@@ -79,12 +79,32 @@ pub mod names {
     pub const ORCH_CONTROLLER_ACTIONS_TOTAL: &str = "arco_orch_controller_actions_total";
     /// Histogram: Orchestration controller reconcile duration in seconds.
     pub const ORCH_CONTROLLER_RECONCILE_SECONDS: &str = "arco_orch_controller_reconcile_seconds";
+    /// Gauge: Orchestration backlog depth by lane.
+    pub const ORCH_BACKLOG_DEPTH: &str = "arco_orch_backlog_depth";
+    /// Gauge: Orchestration compaction watermark lag in seconds.
+    pub const ORCH_COMPACTION_LAG_SECONDS: &str = "arco_orch_compaction_lag_seconds";
+    /// Gauge: Durable run-key conflict row count.
+    pub const ORCH_RUN_KEY_CONFLICTS: &str = "arco_orch_run_key_conflicts";
+    /// Gauge: Runtime SLO target value in seconds.
+    pub const ORCH_SLO_TARGET_SECONDS: &str = "arco_orch_slo_target_seconds";
+    /// Gauge: Runtime observed SLO value in seconds.
+    pub const ORCH_SLO_OBSERVED_SECONDS: &str = "arco_orch_slo_observed_seconds";
+    /// Counter: Runtime SLO breaches detected.
+    pub const ORCH_SLO_BREACHES_TOTAL: &str = "arco_orch_slo_breaches_total";
     /// Counter: Schedule ticks by outcome.
     pub const SCHEDULE_TICKS_TOTAL: &str = "arco_flow_schedule_ticks_total";
     /// Counter: Run requests by source.
     pub const RUN_REQUESTS_TOTAL: &str = "arco_flow_run_requests_total";
     /// Counter: Sensor evaluations by type and status.
     pub const SENSOR_EVALS_TOTAL: &str = "arco_flow_sensor_evals_total";
+    /// Counter: Orchestration compaction acknowledgements.
+    pub const ORCH_COMPACTIONS_TOTAL: &str = "arco_flow_orch_compactions_total";
+    /// Histogram: End-to-end compaction acknowledgement latency in seconds.
+    pub const ORCH_COMPACTOR_ACK_LATENCY_SECONDS: &str =
+        "arco_flow_orch_compactor_ack_latency_seconds";
+    /// Gauge: Visibility lag measured as committed-vs-visible event skew.
+    pub const ORCH_COMPACTOR_VISIBILITY_LAG_EVENTS: &str =
+        "arco_flow_orch_compactor_visibility_lag_events";
 }
 
 /// Label keys used across metrics.
@@ -105,12 +125,18 @@ pub mod labels {
     pub const HANDLER: &str = "handler";
     /// Controller name.
     pub const CONTROLLER: &str = "controller";
+    /// Backlog lane name.
+    pub const LANE: &str = "lane";
+    /// SLO identifier.
+    pub const SLO: &str = "slo";
     /// Outcome status (triggered, skipped, failed).
     pub const STATUS: &str = "status";
     /// Trigger source (schedule, sensor, backfill, manual).
     pub const SOURCE: &str = "source";
     /// Sensor type (push, poll).
     pub const SENSOR_TYPE: &str = "sensor_type";
+    /// Durability mode label.
+    pub const DURABILITY_MODE: &str = "durability_mode";
 }
 
 /// High-level interface for recording orchestration metrics.

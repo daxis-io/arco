@@ -505,17 +505,11 @@ impl Server {
 
         let auth_layer =
             middleware::from_fn_with_state(Arc::clone(&state), crate::context::auth_middleware);
-        let uc_auth_layer =
-            middleware::from_fn_with_state(Arc::clone(&state), crate::context::auth_middleware);
         let task_auth_layer = middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::routes::tasks::task_auth_middleware,
         );
         let rate_limit_layer = middleware::from_fn_with_state(
-            Arc::clone(&state.rate_limit),
-            crate::rate_limit::rate_limit_middleware,
-        );
-        let uc_rate_limit_layer = middleware::from_fn_with_state(
             Arc::clone(&state.rate_limit),
             crate::rate_limit::rate_limit_middleware,
         );
@@ -548,13 +542,6 @@ impl Server {
                     .route_layer(task_rate_limit_layer)
                     .layer(task_auth_layer),
             );
-
-        router = router.nest(
-            "/_uc/api/2.1/unity-catalog",
-            crate::routes::uc::routes()
-                .route_layer(uc_rate_limit_layer)
-                .layer(uc_auth_layer),
-        );
 
         // Mount Iceberg REST Catalog if enabled
         // Uses nest_service since Iceberg router has its own state type
@@ -1371,6 +1358,82 @@ mod tests {
             return builder.body(Body::from("{}")).context("build request");
         }
         builder.body(Body::empty()).context("build request")
+    }
+
+    #[tokio::test]
+    async fn test_unity_catalog_mount_gating_and_legacy_path_hidden() -> Result<()> {
+        let mut disabled_builder = ServerBuilder::new();
+        disabled_builder.config.debug = true;
+        disabled_builder.config.unity_catalog.enabled = false;
+        let disabled_router = disabled_builder.build().test_router();
+
+        for path in [
+            "/api/2.1/unity-catalog/openapi.json",
+            "/api/2.1/unity-catalog/catalogs",
+            "/_uc/api/2.1/unity-catalog/catalogs",
+        ] {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .header("X-Tenant-Id", "t1")
+                .header("X-Workspace-Id", "w1")
+                .body(Body::empty())
+                .context("build request")?;
+            let response = disabled_router
+                .clone()
+                .oneshot(request)
+                .await
+                .map_err(|err| match err {})?;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "unity catalog route should be hidden when disabled: {path}"
+            );
+        }
+
+        let mut enabled_builder = ServerBuilder::new();
+        enabled_builder.config.posture = Posture::Dev;
+        enabled_builder.config.debug = true;
+        enabled_builder.config.unity_catalog.enabled = true;
+        let enabled_router = enabled_builder.build().test_router();
+
+        let primary_request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/2.1/unity-catalog/catalogs")
+            .header("X-Tenant-Id", "t1")
+            .header("X-Workspace-Id", "w1")
+            .body(Body::empty())
+            .context("build request")?;
+        let primary_response = enabled_router
+            .clone()
+            .oneshot(primary_request)
+            .await
+            .map_err(|err| match err {})?;
+        assert_ne!(
+            primary_response.status(),
+            StatusCode::NOT_FOUND,
+            "primary UC mount should be reachable when enabled"
+        );
+
+        let legacy_request = Request::builder()
+            .method(Method::GET)
+            .uri("/_uc/api/2.1/unity-catalog/catalogs")
+            .header("X-Tenant-Id", "t1")
+            .header("X-Workspace-Id", "w1")
+            .body(Body::empty())
+            .context("build request")?;
+        let legacy_response = enabled_router
+            .clone()
+            .oneshot(legacy_request)
+            .await
+            .map_err(|err| match err {})?;
+        assert_eq!(
+            legacy_response.status(),
+            StatusCode::NOT_FOUND,
+            "legacy internal UC path should remain hidden"
+        );
+
+        Ok(())
     }
 
     #[tokio::test]

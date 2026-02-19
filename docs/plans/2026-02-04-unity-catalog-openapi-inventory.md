@@ -128,6 +128,9 @@ WARNING: This API is experimental and will change in future versions.
 Status classification is maintained in:
 `docs/plans/2026-02-19-unity-catalog-support-matrix.md`
 
+Only the configured public UC mount (`/api/2.1/unity-catalog/*`) is exposed when
+`unity_catalog.enabled=true`; legacy internal aliases are intentionally hidden.
+
 ### Q2 interoperability core focus endpoints
 
 These are the current Q2 core targets tracked by conformance and smoke tests:

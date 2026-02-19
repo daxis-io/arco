@@ -6,6 +6,7 @@ Last updated: 2026-02-19
 
 - Mount prefix: `/api/2.1/unity-catalog`
 - Feature gate: `unity_catalog.enabled` (`ARCO_UNITY_CATALOG_ENABLED`)
+- Legacy internal mount `/_uc/api/2.1/unity-catalog/*` is intentionally hidden; only the configured mount prefix is exposed.
 - Pinned contract source:
   `crates/arco-uc/tests/fixtures/unitycatalog-openapi.yaml`
 
@@ -54,6 +55,7 @@ Reference inventory:
   `cargo test -p arco-uc --test openapi_compliance`
 - API mount/auth wiring:
   `cargo test -p arco-api test_unity_catalog_`
+  `cargo test -p arco-api test_unity_catalog_mount_gating_and_legacy_path_hidden`
 - Delta coordinator invariants:
   `cargo test -p arco-delta`
 - Engine smoke suites:

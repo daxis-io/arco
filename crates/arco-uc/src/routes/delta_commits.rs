@@ -1,4 +1,4 @@
-//! Delta commit coordinator endpoints for the UC facade.
+//! Delta commit coordination routes for the Unity Catalog facade.
 
 use axum::Json;
 use axum::Router;
@@ -9,34 +9,56 @@ use axum::routing::get;
 use arco_core::storage::WritePrecondition;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use utoipa::ToSchema;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::context::UnityCatalogRequestContext;
-use crate::error::UnityCatalogError;
-use crate::error::UnityCatalogErrorResponse;
-use crate::error::UnityCatalogResult;
+use crate::error::{UnityCatalogError, UnityCatalogErrorResponse, UnityCatalogResult};
 use crate::state::UnityCatalogState;
 
-#[derive(Debug, Deserialize, ToSchema)]
-/// Request payload for `GET/POST /delta/preview/commits`.
-pub struct DeltaPreviewCommitsRequest {
+/// Delta commit route group.
+pub fn routes() -> Router<UnityCatalogState> {
+    Router::new().route(
+        "/delta/preview/commits",
+        get(get_delta_preview_commits).post(post_delta_preview_commits),
+    )
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[schema(title = "DeltaGetCommitsRequestBody")]
+/// Request payload for `GET /delta/preview/commits`.
+pub(crate) struct DeltaGetCommitsRequestBody {
     /// Target table identifier (UUID string).
     pub table_id: String,
     /// Target table URI (opaque storage location).
     pub table_uri: String,
     /// Starting version for listing commits.
     pub start_version: Option<i64>,
-    /// Commit metadata to register (Mode B preview surface).
+    /// Ending version for listing commits.
+    pub end_version: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[schema(title = "DeltaCommitRequestBody")]
+/// Request payload for `POST /delta/preview/commits`.
+pub(crate) struct DeltaCommitRequestBody {
+    /// Target table identifier (UUID string).
+    pub table_id: String,
+    /// Target table URI (opaque storage location).
+    pub table_uri: String,
+    /// Commit metadata to register.
     pub commit_info: Option<DeltaCommitInfo>,
     /// Latest version that has been backfilled into the Delta log.
     pub latest_backfilled_version: Option<i64>,
+    /// Optional metadata envelope.
+    pub metadata: Option<Value>,
+    /// Optional uniform settings envelope.
+    pub uniform: Option<Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 /// Metadata about a coordinated Delta commit.
-pub struct DeltaCommitInfo {
+pub(crate) struct DeltaCommitInfo {
     /// Delta log version.
     pub version: i64,
     /// Commit timestamp (milliseconds since epoch).
@@ -56,16 +78,17 @@ struct DeltaPreviewCommitState {
     commits: Vec<DeltaCommitInfo>,
 }
 
-/// Delta commit route group.
-pub fn routes() -> Router<UnityCatalogState> {
-    Router::new().route(
-        "/delta/preview/commits",
-        get(list_unbackfilled_commits).post(register_commit),
-    )
-}
-
 fn delta_preview_state_path(table_id: Uuid) -> String {
     format!("uc/delta_preview/{table_id}.json")
+}
+
+fn validate_table_uri(table_uri: &str) -> UnityCatalogResult<()> {
+    if table_uri.trim().is_empty() {
+        return Err(UnityCatalogError::BadRequest {
+            message: "table_uri must not be empty".to_string(),
+        });
+    }
+    Ok(())
 }
 
 async fn load_state(
@@ -114,7 +137,7 @@ async fn store_state(
     Ok(())
 }
 
-/// `GET /delta/preview/commits` (Scope A).
+/// Lists unbackfilled Delta commits.
 ///
 /// # Errors
 ///
@@ -124,34 +147,48 @@ async fn store_state(
     get,
     path = "/delta/preview/commits",
     tag = "DeltaCommits",
+    request_body = DeltaGetCommitsRequestBody,
     responses(
-        (status = 200, description = "List unbackfilled commits"),
-        (status = 400, description = "Bad request", body = UnityCatalogErrorResponse),
-        (status = 404, description = "Not found", body = UnityCatalogErrorResponse),
+        (status = 200, description = "Successful response."),
+        (status = 400, description = "Bad request.", body = UnityCatalogErrorResponse),
+        (status = 401, description = "Unauthorized.", body = UnityCatalogErrorResponse),
+        (status = 403, description = "Forbidden.", body = UnityCatalogErrorResponse),
+        (status = 404, description = "Not found.", body = UnityCatalogErrorResponse),
+        (status = 500, description = "Internal server error.", body = UnityCatalogErrorResponse),
     )
 )]
-pub async fn list_unbackfilled_commits(
+pub(crate) async fn get_delta_preview_commits(
     State(state): State<UnityCatalogState>,
     Extension(ctx): Extension<UnityCatalogRequestContext>,
-    Json(request): Json<DeltaPreviewCommitsRequest>,
-) -> UnityCatalogResult<(StatusCode, Json<serde_json::Value>)> {
-    let table_id =
-        Uuid::parse_str(&request.table_id).map_err(|_| UnityCatalogError::BadRequest {
-            message: "table_id must be a UUID".to_string(),
-        })?;
+    Json(request): Json<DeltaGetCommitsRequestBody>,
+) -> UnityCatalogResult<(StatusCode, Json<Value>)> {
+    let DeltaGetCommitsRequestBody {
+        table_id,
+        table_uri,
+        start_version,
+        end_version,
+    } = request;
+
+    validate_table_uri(&table_uri)?;
+    let table_id = Uuid::parse_str(&table_id).map_err(|_| UnityCatalogError::BadRequest {
+        message: "table_id must be a UUID".to_string(),
+    })?;
 
     let storage = ctx.scoped_storage(state.storage.clone())?;
     let Some(state) = load_state(&storage, table_id).await? else {
         return Err(UnityCatalogError::NotFound {
-            message: format!("table not found: {}", request.table_id),
+            message: format!("table not found: {table_id}"),
         });
     };
 
-    let start_version = request.start_version.unwrap_or(0);
+    let start_version = start_version.unwrap_or(0);
     let commits: Vec<DeltaCommitInfo> = state
         .commits
         .iter()
-        .filter(|commit| commit.version >= start_version)
+        .filter(|commit| {
+            commit.version >= start_version
+                && end_version.is_none_or(|version| commit.version <= version)
+        })
         .cloned()
         .collect();
 
@@ -163,7 +200,7 @@ pub async fn list_unbackfilled_commits(
     Ok((StatusCode::OK, Json(payload)))
 }
 
-/// `POST /delta/preview/commits` (Scope A).
+/// Commits changes to a Delta table.
 ///
 /// # Errors
 ///
@@ -173,24 +210,41 @@ pub async fn list_unbackfilled_commits(
     post,
     path = "/delta/preview/commits",
     tag = "DeltaCommits",
+    request_body = DeltaCommitRequestBody,
     responses(
-        (status = 200, description = "Register commit or backfill"),
-        (status = 400, description = "Bad request", body = UnityCatalogErrorResponse),
-        (status = 404, description = "Not found", body = UnityCatalogErrorResponse),
+        (status = 200, description = "Successful response."),
+        (status = 400, description = "Bad request.", body = UnityCatalogErrorResponse),
+        (status = 401, description = "Unauthorized.", body = UnityCatalogErrorResponse),
+        (status = 403, description = "Forbidden.", body = UnityCatalogErrorResponse),
+        (status = 404, description = "Not found.", body = UnityCatalogErrorResponse),
+        (status = 409, description = "Conflict.", body = UnityCatalogErrorResponse),
+        (status = 429, description = "Too many requests.", body = UnityCatalogErrorResponse),
+        (status = 500, description = "Internal server error.", body = UnityCatalogErrorResponse),
+        (status = 501, description = "Not implemented.", body = UnityCatalogErrorResponse),
     )
 )]
-pub async fn register_commit(
+pub(crate) async fn post_delta_preview_commits(
     State(state): State<UnityCatalogState>,
     Extension(ctx): Extension<UnityCatalogRequestContext>,
-    Json(request): Json<DeltaPreviewCommitsRequest>,
-) -> UnityCatalogResult<(StatusCode, Json<serde_json::Value>)> {
-    let table_id =
-        Uuid::parse_str(&request.table_id).map_err(|_| UnityCatalogError::BadRequest {
-            message: "table_id must be a UUID".to_string(),
-        })?;
+    Json(request): Json<DeltaCommitRequestBody>,
+) -> UnityCatalogResult<(StatusCode, Json<Value>)> {
+    let DeltaCommitRequestBody {
+        table_id,
+        table_uri,
+        commit_info,
+        latest_backfilled_version,
+        metadata,
+        uniform,
+    } = request;
+    let _ = (metadata, uniform);
+
+    validate_table_uri(&table_uri)?;
+    let table_id = Uuid::parse_str(&table_id).map_err(|_| UnityCatalogError::BadRequest {
+        message: "table_id must be a UUID".to_string(),
+    })?;
     let storage = ctx.scoped_storage(state.storage.clone())?;
 
-    if let Some(commit) = request.commit_info {
+    if let Some(commit) = commit_info {
         let mut state = load_state(&storage, table_id)
             .await?
             .unwrap_or(DeltaPreviewCommitState {
@@ -207,12 +261,12 @@ pub async fn register_commit(
         return Ok((StatusCode::OK, Json(json!({}))));
     }
 
-    if let Some(backfilled) = request.latest_backfilled_version {
+    if let Some(backfilled) = latest_backfilled_version {
         let mut state =
             load_state(&storage, table_id)
                 .await?
                 .ok_or_else(|| UnityCatalogError::NotFound {
-                    message: format!("table not found: {}", request.table_id),
+                    message: format!("table not found: {table_id}"),
                 })?;
 
         state.latest_backfilled_version = Some(backfilled);

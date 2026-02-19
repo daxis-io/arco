@@ -9,8 +9,7 @@
 *.swo
 *~
 
-# Codex / agents
-.claude/
+# Local agent directories
 .worktrees/
 
 # OS
@@ -55,5 +54,4 @@ coverage/
 *.tfplan
 
 # Local tooling
-/.claude/
 /.worktrees/

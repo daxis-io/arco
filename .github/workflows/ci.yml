@@ -56,6 +56,7 @@ jobs:
       - run: cargo xtask adr-check
       - run: cargo xtask verify-integrity
       - run: cargo xtask parity-matrix-check
+      - run: cargo xtask repo-hygiene-check
 
   check:
     name: Check
@@ -166,9 +167,12 @@ jobs:
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install mdBook
+        run: cargo install mdbook --version 0.4.52 --locked
       - run: cargo doc --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      - run: cd docs/guide && mdbook build
 
   doc-tests:
     name: Doc Tests

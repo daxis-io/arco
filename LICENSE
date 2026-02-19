@@ -1,5 +1,6 @@
-This project is dual-licensed under Apache-2.0 OR MIT.
+Arco is licensed under the Apache License, Version 2.0.
 
-See LICENSE-APACHE and LICENSE-MIT for the full license texts.
+See `LICENSE-APACHE` for the full license text.
+See `NOTICE` for attribution notices required by the Apache License.
 
-SPDX-License-Identifier: Apache-2.0 OR MIT
+SPDX-License-Identifier: Apache-2.0

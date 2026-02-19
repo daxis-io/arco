@@ -2291,4 +2291,24 @@ mod tests {
             "expected removed release evidence tree to be blocked"
         );
     }
+
+    #[test]
+    fn forbidden_path_markers_include_removed_evidence_tree() {
+        let markers = forbidden_path_markers();
+        let catalog_evidence = format!("{}/{}/{}/", "docs", "catalog-metastore", "evidence");
+        let plans = format!("{}/{}/", "docs", "plans");
+        let release_evidence = format!("{}_{}/", "release", "evidence");
+        assert!(
+            markers.iter().any(|marker| marker == &catalog_evidence),
+            "expected removed catalog evidence tree to be blocked"
+        );
+        assert!(
+            markers.iter().any(|marker| marker == &plans),
+            "expected removed planning tree to be blocked"
+        );
+        assert!(
+            markers.iter().any(|marker| marker == &release_evidence),
+            "expected removed release evidence tree to be blocked"
+        );
+    }
 }

@@ -2,11 +2,11 @@
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Extension, OriginalUri, Query, State};
-use axum::http::Method;
+use axum::extract::{Extension, OriginalUri, Path, Query, State};
+use axum::http::{Method, StatusCode};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 use arco_core::storage::WriteResult;
@@ -46,6 +46,14 @@ pub(crate) struct CreateSchemaPayload {
     storage_root: Option<String>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
+#[serde(default)]
+pub(crate) struct DeleteSchemaQuery {
+    force: Option<bool>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
@@ -250,7 +258,7 @@ pub(crate) async fn post_schemas(
     }
 }
 
-/// `GET /schemas/{full_name}` (known UC operation; currently unsupported).
+/// Gets a schema by full name (`catalog.schema`).
 #[utoipa::path(
     get,
     path = "/schemas/{full_name}",
@@ -259,11 +267,41 @@ pub(crate) async fn post_schemas(
         ("full_name" = String, Path, description = "Schema full name"),
     ),
     responses(
-        (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
+        (status = 200, description = "The schema was successfully retrieved.", body = SchemaInfo),
+        (status = 400, description = "Bad request.", body = UnityCatalogErrorResponse),
+        (status = 401, description = "Unauthorized.", body = UnityCatalogErrorResponse),
+        (status = 403, description = "Forbidden.", body = UnityCatalogErrorResponse),
+        (status = 404, description = "Not found.", body = UnityCatalogErrorResponse),
+        (status = 500, description = "Internal server error.", body = UnityCatalogErrorResponse),
     )
 )]
-pub async fn get_schema(method: Method, uri: OriginalUri) -> UnityCatalogError {
-    super::common::known_but_unsupported(&method, &uri)
+pub(crate) async fn get_schema(
+    State(state): State<UnityCatalogState>,
+    Extension(ctx): Extension<UnityCatalogRequestContext>,
+    Path(full_name): Path<String>,
+) -> UnityCatalogResult<Json<SchemaInfo>> {
+    let (catalog_name, schema_name) = parse_schema_full_name(&full_name)?;
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalog_name = %catalog_name,
+        schema_name = %schema_name,
+        "unity catalog preview get schema"
+    );
+
+    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
+    let path = schema_path(&catalog_name, &schema_name);
+    let exists = preview::object_exists(&scoped_storage, &path, "check schema").await?;
+    if !exists {
+        return Err(UnityCatalogError::NotFound {
+            message: format!("schema not found: {catalog_name}.{schema_name}"),
+        });
+    }
+
+    let schema =
+        preview::read_json_object::<SchemaInfo>(&scoped_storage, &path, "get schema").await?;
+    Ok(Json(schema))
 }
 
 /// `PATCH /schemas/{full_name}` (known UC operation; currently unsupported).
@@ -278,22 +316,93 @@ pub async fn get_schema(method: Method, uri: OriginalUri) -> UnityCatalogError {
         (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
     )
 )]
-pub async fn update_schema(method: Method, uri: OriginalUri) -> UnityCatalogError {
+pub(crate) async fn update_schema(method: Method, uri: OriginalUri) -> UnityCatalogError {
     super::common::known_but_unsupported(&method, &uri)
 }
 
-/// `DELETE /schemas/{full_name}` (known UC operation; currently unsupported).
+/// Deletes a schema.
 #[utoipa::path(
     delete,
     path = "/schemas/{full_name}",
     tag = "Schemas",
     params(
         ("full_name" = String, Path, description = "Schema full name"),
+        ("force" = Option<bool>, Query, description = "Force deletion even if the schema is not empty."),
     ),
     responses(
-        (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
+        (status = 200, description = "The schema was successfully deleted."),
+        (status = 400, description = "Bad request.", body = UnityCatalogErrorResponse),
+        (status = 401, description = "Unauthorized.", body = UnityCatalogErrorResponse),
+        (status = 403, description = "Forbidden.", body = UnityCatalogErrorResponse),
+        (status = 404, description = "Not found.", body = UnityCatalogErrorResponse),
+        (status = 409, description = "Conflict.", body = UnityCatalogErrorResponse),
+        (status = 500, description = "Internal server error.", body = UnityCatalogErrorResponse),
     )
 )]
-pub async fn delete_schema(method: Method, uri: OriginalUri) -> UnityCatalogError {
-    super::common::known_but_unsupported(&method, &uri)
+pub(crate) async fn delete_schema(
+    State(state): State<UnityCatalogState>,
+    Extension(ctx): Extension<UnityCatalogRequestContext>,
+    Path(full_name): Path<String>,
+    query: Query<DeleteSchemaQuery>,
+) -> UnityCatalogResult<(StatusCode, Json<Value>)> {
+    let (catalog_name, schema_name) = parse_schema_full_name(&full_name)?;
+    let Query(query) = query;
+    let _ = query.extra;
+    let force = query.force.unwrap_or(false);
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalog_name = %catalog_name,
+        schema_name = %schema_name,
+        force,
+        "unity catalog preview delete schema"
+    );
+
+    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
+    let path = schema_path(&catalog_name, &schema_name);
+    let exists = preview::object_exists(&scoped_storage, &path, "check schema").await?;
+    if !exists {
+        return Err(UnityCatalogError::NotFound {
+            message: format!("schema not found: {catalog_name}.{schema_name}"),
+        });
+    }
+
+    let tables = preview::list_paths(
+        &scoped_storage,
+        &preview::table_prefix(&catalog_name, &schema_name),
+        "list schema tables",
+    )
+    .await?;
+    if !tables.is_empty() && !force {
+        return Err(UnityCatalogError::Conflict {
+            message: format!("schema is not empty: {catalog_name}.{schema_name}"),
+        });
+    }
+
+    if force {
+        for table_path in tables {
+            preview::delete_path(&scoped_storage, &table_path, "delete schema table").await?;
+        }
+    }
+
+    preview::delete_path(&scoped_storage, &path, "delete schema").await?;
+    Ok((StatusCode::OK, Json(json!({}))))
+}
+
+fn parse_schema_full_name(full_name: &str) -> UnityCatalogResult<(String, String)> {
+    let mut parts = full_name.split('.');
+    let catalog_name = parts.next();
+    let schema_name = parts.next();
+    let extra = parts.next();
+
+    let (Some(catalog_name), Some(schema_name), None) = (catalog_name, schema_name, extra) else {
+        return Err(UnityCatalogError::BadRequest {
+            message: format!("invalid schema full name: {full_name}"),
+        });
+    };
+
+    let catalog_name = preview::require_identifier(Some(catalog_name.to_string()), "catalog_name")?;
+    let schema_name = preview::require_identifier(Some(schema_name.to_string()), "schema_name")?;
+    Ok((catalog_name, schema_name))
 }

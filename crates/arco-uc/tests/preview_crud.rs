@@ -61,6 +61,45 @@ async fn uc_request(
     Ok((status, parsed))
 }
 
+async fn uc_request_without_scope(
+    router: &Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+) -> Result<(StatusCode, Value), String> {
+    let mut builder = Request::builder().method(method).uri(uri);
+
+    let req = if let Some(payload) = body {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+        let bytes =
+            serde_json::to_vec(&payload).map_err(|err| format!("serialize request body: {err}"))?;
+        builder
+            .body(Body::from(bytes))
+            .map_err(|err| format!("build request: {err}"))?
+    } else {
+        builder
+            .body(Body::empty())
+            .map_err(|err| format!("build request: {err}"))?
+    };
+
+    let response = router
+        .clone()
+        .oneshot(req)
+        .await
+        .map_err(|err| format!("route request: {err}"))?;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .map_err(|err| format!("read response body: {err}"))?;
+
+    let parsed = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).map_err(|err| format!("parse response body: {err}"))?
+    };
+    Ok((status, parsed))
+}
+
 #[tokio::test]
 async fn create_and_list_catalogs() -> Result<(), String> {
     let router = test_router();
@@ -228,6 +267,361 @@ async fn create_and_list_tables_scoped_to_catalog_and_schema() -> Result<(), Str
     assert_eq!(
         tables[0].get("full_name").and_then(Value::as_str),
         Some("main.analytics.events")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_get_delete_and_not_found() -> Result<(), String> {
+    let router = test_router();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = uc_request(
+        &router,
+        Method::GET,
+        "/catalogs/main",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.get("name").and_then(Value::as_str), Some("main"));
+
+    let (status, body) = uc_request(
+        &router,
+        Method::DELETE,
+        "/catalogs/main",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, Value::Object(serde_json::Map::new()));
+
+    let (status, body) = uc_request(
+        &router,
+        Method::GET,
+        "/catalogs/main",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("NOT_FOUND")
+    );
+
+    let (status, body) = uc_request(
+        &router,
+        Method::DELETE,
+        "/catalogs/main",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("NOT_FOUND")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn schema_get_delete_and_not_found() -> Result<(), String> {
+    let router = test_router();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "analytics",
+            "catalog_name": "main"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = uc_request(
+        &router,
+        Method::GET,
+        "/schemas/main.analytics",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.get("full_name").and_then(Value::as_str),
+        Some("main.analytics")
+    );
+
+    let (status, body) = uc_request(
+        &router,
+        Method::DELETE,
+        "/schemas/main.analytics",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, Value::Object(serde_json::Map::new()));
+
+    let (status, body) = uc_request(
+        &router,
+        Method::GET,
+        "/schemas/main.analytics",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("NOT_FOUND")
+    );
+
+    let (status, body) = uc_request(
+        &router,
+        Method::DELETE,
+        "/schemas/main.analytics",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("NOT_FOUND")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_get_delete_and_not_found() -> Result<(), String> {
+    let router = test_router();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "analytics",
+            "catalog_name": "main"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/tables",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "events",
+            "catalog_name": "main",
+            "schema_name": "analytics",
+            "table_type": "EXTERNAL",
+            "data_source_format": "DELTA",
+            "columns": [],
+            "storage_location": "s3://bucket/main/analytics/events"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = uc_request(
+        &router,
+        Method::GET,
+        "/tables/main.analytics.events",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.get("full_name").and_then(Value::as_str),
+        Some("main.analytics.events")
+    );
+
+    let (status, body) = uc_request(
+        &router,
+        Method::DELETE,
+        "/tables/main.analytics.events",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, Value::Object(serde_json::Map::new()));
+
+    let (status, body) = uc_request(
+        &router,
+        Method::GET,
+        "/tables/main.analytics.events",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("NOT_FOUND")
+    );
+
+    let (status, body) = uc_request(
+        &router,
+        Method::DELETE,
+        "/tables/main.analytics.events",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("NOT_FOUND")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn object_get_delete_is_tenant_workspace_isolated() -> Result<(), String> {
+    let router = test_router();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = uc_request(
+        &router,
+        Method::GET,
+        "/catalogs/main",
+        "tenant_b",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("NOT_FOUND")
+    );
+
+    let (status, body) = uc_request(
+        &router,
+        Method::DELETE,
+        "/catalogs/main",
+        "tenant_a",
+        "workspace_b",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("NOT_FOUND")
+    );
+
+    let (status, body) = uc_request(
+        &router,
+        Method::GET,
+        "/catalogs/main",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.get("name").and_then(Value::as_str), Some("main"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn deny_by_default_without_scope_headers() -> Result<(), String> {
+    let router = test_router();
+
+    let (status, body) = uc_request_without_scope(&router, Method::GET, "/catalogs", None).await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("UNAUTHORIZED")
+    );
+
+    let (status, body) = uc_request_without_scope(
+        &router,
+        Method::POST,
+        "/delta/preview/commits",
+        Some(json!({
+            "table_id": "018f8c4b-a1de-7d57-b0d8-d98f1ef2443a",
+            "table_uri": "gs://bucket/path",
+            "latest_backfilled_version": 0
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        body.pointer("/error/error_code").and_then(Value::as_str),
+        Some("UNAUTHORIZED")
     );
     Ok(())
 }

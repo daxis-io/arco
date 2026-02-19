@@ -147,6 +147,20 @@ pub async fn read_json_page<T: DeserializeOwned>(
     Ok((parsed, next_page_token))
 }
 
+pub async fn read_json_object<T: DeserializeOwned>(
+    storage: &ScopedStorage,
+    path: &str,
+    operation_name: &str,
+) -> UnityCatalogResult<T> {
+    let body = storage
+        .get_raw(path)
+        .await
+        .map_err(|err| storage_error(operation_name, err))?;
+    serde_json::from_slice::<T>(&body).map_err(|err| UnityCatalogError::Internal {
+        message: format!("failed to parse {operation_name} payload at {path}: {err}"),
+    })
+}
+
 pub async fn object_exists(
     storage: &ScopedStorage,
     path: &str,
@@ -156,6 +170,32 @@ pub async fn object_exists(
         .head_raw(path)
         .await
         .map(|meta| meta.is_some())
+        .map_err(|err| storage_error(operation_name, err))
+}
+
+pub async fn list_paths(
+    storage: &ScopedStorage,
+    prefix: &str,
+    operation_name: &str,
+) -> UnityCatalogResult<Vec<String>> {
+    let scoped = storage
+        .list(prefix)
+        .await
+        .map_err(|err| storage_error(operation_name, err))?;
+    Ok(scoped
+        .into_iter()
+        .map(|path| path.as_str().to_string())
+        .collect())
+}
+
+pub async fn delete_path(
+    storage: &ScopedStorage,
+    path: &str,
+    operation_name: &str,
+) -> UnityCatalogResult<()> {
+    storage
+        .delete(path)
+        .await
         .map_err(|err| storage_error(operation_name, err))
 }
 

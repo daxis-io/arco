@@ -153,6 +153,7 @@ jobs:
       - run: cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m1
       - run: cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m2
       - run: cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m3
+      - run: cargo test -p arco-integration-tests --test delta_engine_smoke
 
   python-tests:
     name: Python Tests

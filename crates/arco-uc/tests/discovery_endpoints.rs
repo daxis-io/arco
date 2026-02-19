@@ -12,6 +12,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 struct SeededRouter {
     app: axum::Router,
@@ -218,6 +219,7 @@ async fn test_delta_commit_invalid_table_id_is_bad_request() {
                 .header("content-type", "application/json")
                 .header("X-Tenant-Id", "tenant1")
                 .header("X-Workspace-Id", "workspace1")
+                .header("Idempotency-Key", Uuid::now_v7().to_string())
                 .body(Body::from(
                     json!({
                         "table_id": "not-a-uuid",
@@ -290,6 +292,7 @@ async fn test_delta_commit_and_get_commits_roundtrip() {
                 .header("content-type", "application/json")
                 .header("X-Tenant-Id", "tenant1")
                 .header("X-Workspace-Id", "workspace1")
+                .header("Idempotency-Key", Uuid::now_v7().to_string())
                 .body(Body::from(
                     json!({
                         "table_id": table_id,

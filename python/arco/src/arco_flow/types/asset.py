@@ -218,7 +218,7 @@ class IoConfig:
     are written to storage.
     """
 
-    format: Literal["parquet", "delta", "iceberg", "json", "csv"] = "parquet"
+    format: Literal["parquet", "delta", "iceberg", "json", "csv"] = "delta"
     compression: Literal["none", "snappy", "gzip", "zstd", "lz4"] = "snappy"
     partition_by: tuple[str, ...] = field(default_factory=tuple)
     row_group_size: int | None = None

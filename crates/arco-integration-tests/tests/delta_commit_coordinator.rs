@@ -40,6 +40,12 @@ struct CommitResponse {
     delta_log_path: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct CreatedTableResponse {
+    id: String,
+    format: String,
+}
+
 fn make_test_state() -> Arc<AppState> {
     let config = Config {
         debug: true,
@@ -49,6 +55,76 @@ fn make_test_state() -> Arc<AppState> {
     Arc::new(AppState::with_memory_storage(config))
 }
 
+async fn create_catalog_and_schema(
+    app: &axum::Router,
+    tenant: &str,
+    workspace: &str,
+    catalog: &str,
+    schema: &str,
+) {
+    let create_catalog = Request::builder()
+        .method("POST")
+        .uri("/catalogs")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("X-Tenant-Id", tenant)
+        .header("X-Workspace-Id", workspace)
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({ "name": catalog })).unwrap(),
+        ))
+        .unwrap();
+    let catalog_resp = app.clone().oneshot(create_catalog).await.unwrap();
+    assert_eq!(catalog_resp.status(), StatusCode::CREATED);
+
+    let create_schema = Request::builder()
+        .method("POST")
+        .uri(format!("/catalogs/{catalog}/schemas"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("X-Tenant-Id", tenant)
+        .header("X-Workspace-Id", workspace)
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({ "name": schema })).unwrap(),
+        ))
+        .unwrap();
+    let schema_resp = app.clone().oneshot(create_schema).await.unwrap();
+    assert_eq!(schema_resp.status(), StatusCode::CREATED);
+}
+
+async fn create_table_in_schema(
+    app: &axum::Router,
+    tenant: &str,
+    workspace: &str,
+    catalog: &str,
+    schema: &str,
+    table_name: &str,
+    format: Option<&str>,
+    location: &str,
+) -> CreatedTableResponse {
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/catalogs/{catalog}/schemas/{schema}/tables"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("X-Tenant-Id", tenant)
+        .header("X-Workspace-Id", workspace)
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "name": table_name,
+                "format": format,
+                "columns": [],
+                "description": null,
+                "location": location,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
 #[tokio::test]
 async fn delta_commit_writes_delta_log_enforces_occ_and_replays_idempotency() {
     let state = make_test_state();
@@ -56,7 +132,20 @@ async fn delta_commit_writes_delta_log_enforces_occ_and_replays_idempotency() {
 
     let tenant = "acme";
     let workspace = "analytics";
-    let table_id = Uuid::now_v7();
+    create_catalog_and_schema(&app, tenant, workspace, "analytics", "sales").await;
+    let created = create_table_in_schema(
+        &app,
+        tenant,
+        workspace,
+        "analytics",
+        "sales",
+        "orders_delta",
+        Some("delta"),
+        "warehouse/sales/orders_delta",
+    )
+    .await;
+    assert_eq!(created.format, "delta");
+    let table_id = Uuid::parse_str(&created.id).unwrap();
 
     let payload_v0 = "{\"commitInfo\":{\"timestamp\":1}}\n".to_string();
     let stage_body = serde_json::to_vec(&StageCommitRequest {
@@ -107,7 +196,7 @@ async fn delta_commit_writes_delta_log_enforces_occ_and_replays_idempotency() {
     assert_eq!(committed.version, 0);
     assert_eq!(
         committed.delta_log_path,
-        format!("tables/{table_id}/_delta_log/00000000000000000000.json")
+        "warehouse/sales/orders_delta/_delta_log/00000000000000000000.json"
     );
 
     let backend = state.storage_backend().expect("backend");
@@ -173,7 +262,7 @@ async fn delta_commit_writes_delta_log_enforces_occ_and_replays_idempotency() {
     assert_eq!(replayed.version, 0);
     assert_eq!(
         replayed.delta_log_path,
-        format!("tables/{table_id}/_delta_log/00000000000000000000.json")
+        "warehouse/sales/orders_delta/_delta_log/00000000000000000000.json"
     );
 }
 
@@ -184,7 +273,20 @@ async fn expired_inflight_commit_is_recovered_but_not_acked_for_unrelated_idempo
 
     let tenant = "acme";
     let workspace = "analytics";
-    let table_id = Uuid::now_v7();
+    create_catalog_and_schema(&app, tenant, workspace, "analytics", "sales").await;
+    let created = create_table_in_schema(
+        &app,
+        tenant,
+        workspace,
+        "analytics",
+        "sales",
+        "recovery_delta",
+        Some("delta"),
+        "warehouse/sales/recovery_delta",
+    )
+    .await;
+    assert_eq!(created.format, "delta");
+    let table_id = Uuid::parse_str(&created.id).unwrap();
 
     // Stage a payload.
     let payload = "{\"commitInfo\":{\"timestamp\":3}}\n".to_string();
@@ -258,8 +360,8 @@ async fn expired_inflight_commit_is_recovered_but_not_acked_for_unrelated_idempo
     assert_eq!(commit_resp.status(), StatusCode::CONFLICT);
 
     // Delta log file exists and matches the staged payload.
-    let delta_log_path = format!("tables/{table_id}/_delta_log/00000000000000000000.json");
-    let written = storage.get_raw(&delta_log_path).await.unwrap();
+    let delta_log_path = "warehouse/sales/recovery_delta/_delta_log/00000000000000000000.json";
+    let written = storage.get_raw(delta_log_path).await.unwrap();
     assert_eq!(written, Bytes::from(payload));
 
     // Coordinator state cleared inflight and advanced latest_version.
@@ -286,4 +388,67 @@ fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(data);
     hex::encode(hasher.finalize())
+}
+
+#[tokio::test]
+async fn delta_commit_stage_rejects_missing_table() {
+    let state = make_test_state();
+    let app = routes::api_v1_routes().with_state(Arc::clone(&state));
+
+    let stage_req = Request::builder()
+        .method("POST")
+        .uri(format!("/delta/tables/{}/commits/stage", Uuid::now_v7()))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("X-Tenant-Id", "acme")
+        .header("X-Workspace-Id", "analytics")
+        .body(Body::from(
+            serde_json::to_vec(&StageCommitRequest {
+                payload: "{\"commitInfo\":{\"timestamp\":1}}\n".to_string(),
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(stage_req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delta_commit_stage_rejects_non_delta_table() {
+    let state = make_test_state();
+    let app = routes::api_v1_routes().with_state(Arc::clone(&state));
+
+    let tenant = "acme";
+    let workspace = "analytics";
+    create_catalog_and_schema(&app, tenant, workspace, "analytics", "sales").await;
+    let created = create_table_in_schema(
+        &app,
+        tenant,
+        workspace,
+        "analytics",
+        "sales",
+        "orders_iceberg",
+        Some("iceberg"),
+        "warehouse/sales/orders_iceberg",
+    )
+    .await;
+    assert_eq!(created.format, "iceberg");
+    let table_id = Uuid::parse_str(&created.id).unwrap();
+
+    let stage_req = Request::builder()
+        .method("POST")
+        .uri(format!("/delta/tables/{table_id}/commits/stage"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("X-Tenant-Id", tenant)
+        .header("X-Workspace-Id", workspace)
+        .body(Body::from(
+            serde_json::to_vec(&StageCommitRequest {
+                payload: "{\"commitInfo\":{\"timestamp\":1}}\n".to_string(),
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(stage_req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 }

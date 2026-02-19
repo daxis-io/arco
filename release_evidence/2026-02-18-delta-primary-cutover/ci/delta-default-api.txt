@@ -1,0 +1,501 @@
+Delta-primary cutover verification evidence
+Generated (UTC): 2026-02-19T04:17:21Z
+Worktree: /Users/ethanurbanski/arco/.worktrees/codex-delta-primary-cutover
+
+============================================================
+Date (UTC): 2026-02-19T04:17:45Z
+Command: cargo test -p arco-catalog
+------------------------------------------------------------
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.26s
+     Running unittests src/lib.rs (target/debug/deps/arco_catalog-0a8319d075b78e95)
+
+running 141 tests
+test asset::tests::test_asset_format_extension ... ok
+test asset::tests::test_asset_key_empty_group ... ok
+test asset::tests::test_asset_key_parse_invalid ... ok
+test asset::tests::test_asset_key_invalid_start ... ok
+test asset::tests::test_asset_key_empty_name ... ok
+test asset::tests::test_asset_key_invalid_characters ... ok
+test asset::tests::test_asset_key_parse ... ok
+test asset::tests::test_asset_key_valid ... ok
+test asset::tests::test_asset_key_with_underscores ... ok
+test asset::tests::test_asset_key_with_digits ... ok
+test asset::tests::test_create_asset_request ... ok
+test asset::tests::test_asset_creation ... ok
+test gc::collector::tests::test_extract_version_number ... ok
+test gc::collector::tests::test_extract_snapshot_version_dir ... ok
+test asset::tests::test_asset_serialization ... ok
+test compactor::tests::unknown_event_version_is_rejected_by_default ... ok
+test compactor::tests::compact_empty_ledger_is_noop ... ok
+test compactor::tests::unknown_event_version_can_be_quarantined ... ok
+test gc::policy::tests::test_aggressive_policy ... ok
+test gc::policy::tests::test_conservative_policy ... ok
+test gc::policy::tests::test_default_policy ... ok
+test gc::policy::tests::test_development_policy ... ok
+test gc::policy::tests::test_serde_roundtrip ... ok
+test gc::collector::tests::test_gc_dry_run ... ok
+test event_writer::tests::append_is_truly_append_only ... ok
+test gc::policy::tests::test_valid_policy ... ok
+test gc::policy::tests::test_validation_delay_hours ... ok
+test event_writer::tests::append_event_creates_ledger_file ... ok
+test gc::policy::tests::test_validation_keep_snapshots ... ok
+test gc::policy::tests::test_validation_ledger_exceeds_max ... ok
+test event_writer::tests::events_are_ordered_chronologically ... ok
+test gc::collector::tests::test_gc_result_merge ... ok
+test gc::collector::tests::test_gc_empty_storage ... ok
+test idempotency::tests::test_check_idempotency_new_request ... ok
+test idempotency::tests::test_check_idempotency_in_progress_not_stale ... ok
+test idempotency::tests::test_check_idempotency_conflict ... ok
+test idempotency::tests::test_canonical_hash_different_content ... ok
+test idempotency::tests::test_canonical_hash_deterministic ... ok
+test idempotency::tests::test_check_idempotency_no_key ... ok
+test idempotency::tests::test_check_idempotency_replay ... ok
+test idempotency::tests::test_check_idempotency_stale_takeover ... ok
+test idempotency::tests::test_hash_key_deterministic ... ok
+test idempotency::tests::test_idempotency_store_claim ... ok
+test idempotency::tests::test_marker_finalize_failed ... ok
+test idempotency::tests::test_idempotency_store_finalize ... ok
+test idempotency::tests::test_marker_state_transitions ... ok
+test idempotency::tests::test_marker_serialization_roundtrip ... ok
+test idempotency::tests::test_idempotency_store_finalize_conflict ... ok
+test event_writer::tests::concurrent_appends_allocate_unique_sequence_positions ... ok
+test idempotency::tests::test_storage_path_format ... ok
+test idempotency::tests::test_calculate_retry_after_bounds ... ok
+test event_writer::tests::sequence_positions_are_monotonic ... ok
+test idempotency::tests::test_calculate_retry_after_jitter_range ... ok
+test idempotency::tests::test_takeover_cas_preserves_finalized_state ... ok
+test idempotency::tests::test_validate_uuidv7_invalid_format ... ok
+test idempotency::tests::test_validate_uuidv7_invalid_version ... ok
+test idempotency::tests::test_takeover_race_returns_replay_when_finalized ... ok
+test idempotency::tests::test_validate_uuidv7_valid ... ok
+test manifest::tests::test_catalog_manifest_has_parent_hash_field ... ok
+test manifest::tests::test_commit_record_hash_chain ... ok
+test manifest::tests::test_commit_record_hash_includes_prev ... ok
+test manifest::tests::test_compute_manifest_hash_deterministic ... ok
+test manifest::tests::test_commit_successor ... ok
+test manifest::tests::test_core_manifest_structure ... ok
+test manifest::tests::test_compute_manifest_hash_different_bytes ... ok
+test manifest::tests::test_execution_manifest_structure ... ok
+test manifest::tests::test_domain_manifests_independent_serialization ... ok
+test manifest::tests::test_governance_manifest_structure ... ok
+test manifest::tests::test_lineage_manifest_structure ... ok
+test manifest::tests::test_next_version ... ok
+test manifest::tests::test_root_manifest_accepts_legacy_fields ... ok
+test manifest::tests::test_root_manifest_contains_only_pointers ... ok
+test manifest::tests::test_validate_succession_commit_ulid_regression_rejected ... ok
+test manifest::tests::test_root_manifest_roundtrip ... ok
+test manifest::tests::test_validate_succession_fencing_token_regression_rejected ... ok
+test manifest::tests::test_validate_succession_no_parent_hash_allowed ... ok
+test manifest::tests::test_validate_succession_parent_hash_mismatch_rejected ... ok
+test manifest::tests::test_validate_succession_same_version_allowed ... ok
+test manifest::tests::test_validate_succession_valid ... ok
+test manifest::tests::test_validate_succession_version_regression_rejected ... ok
+test reader::tests::test_lineage_graph_default ... ok
+test reader::tests::test_reader_new ... ok
+test reader::tests::test_list_namespaces_no_manifest ... ok
+test reader::tests::test_get_freshness_requires_manifest ... ok
+test reader::tests::test_get_mintable_paths_requires_manifest ... ok
+test reader::tests::test_mint_signed_urls_validates_paths ... ok
+test reconciler::tests::extract_snapshot_version_parses_tier1_and_tier2 ... ok
+test reader::tests::test_search_mintable_paths_from_snapshot ... ok
+test search_tombstone::tests::test_archived_tombstone ... ok
+test search_tombstone::tests::test_deleted_tombstone ... ok
+test reconciler::tests::check_uses_scope_relative_paths_and_joins_snapshot_files ... ok
+test search_tombstone::tests::test_moved_tombstone ... ok
+test search_tombstone::tests::test_renamed_tombstone ... ok
+test search_tombstone::tests::test_tombstone_batch ... ok
+test search_tombstone::tests::test_tombstone_expiry ... ok
+test search_tombstone::tests::test_tombstone_reason_variants ... ok
+test search_tombstone::tests::test_tombstone_serialization ... ok
+test tier1_writer::tests::test_initialize_catalog_creates_required_files ... ok
+test tier1_writer::tests::test_cas_conflict_retries_and_succeeds ... ok
+test tier1_writer::tests::test_commit_chain_has_prev_hash ... ok
+test tier1_writer::tests::test_initialize_idempotent ... ok
+test tier1_writer::tests::test_update_with_cas ... ok
+test search_tombstone::tests::test_hot_token_skew_handling ... ok
+test compactor::tests::compact_processes_ledger_events ... ok
+test compactor::tests::parquet_write_is_deterministic ... ok
+test compactor::tests::late_event_is_quarantined ... ok
+test compactor::tests::concurrent_compactors_retry_on_cas_conflict ... ok
+test parquet_util::tests::read_lineage_edges_tolerates_missing_optional_columns ... ok
+test parquet_util::tests::read_namespaces_tolerates_missing_optional_columns ... ok
+test parquet_util::tests::read_tables_tolerates_missing_optional_columns ... ok
+test parquet_util::tests::read_columns_tolerates_missing_optional_columns ... ok
+test writer::tests::test_event_writer_returns_owned ... ok
+test writer::tests::test_create_catalog ... ok
+test writer::tests::test_create_duplicate_catalog_fails ... ok
+test writer::tests::test_initialize_creates_manifests ... ok
+test tier1_compactor::tests::sync_compact_search_writes_snapshot ... ok
+test writer::tests::test_create_duplicate_namespace_fails ... ok
+test writer::tests::test_create_namespace ... ok
+test writer::tests::test_create_schema_sets_catalog_id ... ok
+test writer::tests::test_lineage_writes_publish_and_increment_manifest ... ok
+test compactor::tests::second_compaction_only_processes_new_events ... ok
+test writer::tests::test_domain_split_separate_locks ... ok
+test writer::tests::test_create_namespace_creates_default_catalog_once ... ok
+test writer::tests::test_delete_namespace ... ok
+test reader::tests::test_get_table_by_id_reads_tables_snapshot_once_per_version ... ok
+test writer::tests::test_register_table ... ok
+test writer::tests::test_register_table_defaults_to_delta_format ... ok
+test writer::tests::test_create_schema_allows_same_name_in_different_catalogs ... ok
+test writer::tests::test_rename_table_not_found_fails ... ok
+test writer::tests::test_register_table_in_schema_uses_catalog_and_schema ... ok
+test reader::tests::test_get_table_by_id_cache_refreshes_on_new_snapshot ... ok
+test writer::tests::test_register_table_validates_and_canonicalizes_format ... ok
+test writer::tests::test_register_table_in_schema_defaults_to_delta_and_validates ... ok
+test writer::tests::test_update_table_rejects_invalid_location_when_switching_to_delta ... ok
+test writer::tests::test_rename_table_conflict_fails ... ok
+test writer::tests::test_rename_table ... ok
+test writer::tests::test_rename_table_same_name_noop ... ok
+test writer::tests::test_register_table_resolves_namespace_in_default_catalog ... ok
+test writer::tests::test_rename_table_cross_namespace_fails ... ok
+test writer::tests::test_register_table_rejects_invalid_delta_location ... ok
+test writer::tests::test_register_table_in_schema_rejects_invalid_delta_location ... ok
+
+test result: ok. 141 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/concurrent_writers.rs (target/debug/deps/concurrent_writers-94c847c46383ad22)
+
+running 3 tests
+test test_two_writers_initialize_race ... ok
+test test_loser_can_retry ... ok
+test test_many_concurrent_updates ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/failure_injection.rs (target/debug/deps/failure_injection-b7b9ecc794da80f6)
+
+running 6 tests
+test failing_backend_fail_all_mode ... ok
+test failing_backend_single_shot_failure ... ok
+test tier1_lock_failure_does_not_corrupt_state ... ok
+test tier1_initialize_idempotent_after_failure ... ok
+test tier1_crash_between_snapshot_and_cas ... ok
+test tier1_reader_sees_only_committed_state ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/path_contracts.rs (target/debug/deps/path_contracts-863e072eba336c8b)
+
+running 8 tests
+test contract_manifest_paths_canonical_naming ... ok
+test contract_root_manifest_is_entry_point ... ok
+test contract_lock_paths_canonical_naming ... ok
+test contract_ledger_paths_canonical_structure ... ok
+test contract_legacy_name_normalization ... ok
+test contract_state_paths_canonical_structure ... ok
+test contract_snapshot_paths_canonical_structure ... ok
+test contract_event_writer_path_format ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/schema_contracts.rs (target/debug/deps/schema_contracts-86ec5a9cbb3160e5)
+
+running 25 tests
+test contract_namespaces_required_fields ... ok
+test contract_id_fields_are_strings ... ok
+test contract_lineage_edges_required_fields ... ok
+test contract_columns_required_fields ... ok
+test contract_catalogs_required_fields ... ok
+test contract_tables_required_fields ... ok
+test contract_timestamp_fields_use_milliseconds ... ok
+test contract_namespaces_parquet_schema_backward_compatible ... ok
+test contract_tables_parquet_schema_backward_compatible ... ok
+test contract_catalogs_parquet_schema_backward_compatible ... ok
+test contract_columns_parquet_schema_backward_compatible ... ok
+test contract_lineage_edges_parquet_schema_backward_compatible ... ok
+test current_schemas_match_golden_field_count ... ok
+test generate_golden_schemas ... ignored
+test golden_schemas_are_valid_and_parseable ... ok
+test contract_catalogs_parquet_write_is_deterministic ... ok
+test contract_lineage_edges_parquet_write_is_deterministic ... ok
+test contract_columns_parquet_write_is_deterministic ... ok
+test contract_tables_parquet_write_is_deterministic ... ok
+test contract_namespaces_parquet_write_is_deterministic ... ok
+test contract_catalogs_roundtrip_preserves_schema ... ok
+test contract_tables_roundtrip_preserves_schema ... ok
+test contract_namespaces_roundtrip_preserves_schema ... ok
+test contract_lineage_edges_roundtrip_preserves_schema ... ok
+test contract_columns_roundtrip_preserves_schema ... ok
+
+test result: ok. 24 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+   Doc-tests arco_catalog
+
+running 8 tests
+test crates/arco-catalog/src/gc/collector.rs - gc::collector::GarbageCollector (line 92) ... ignored
+test crates/arco-catalog/src/gc/mod.rs - gc (line 23) ... ignored
+test crates/arco-catalog/src/lib.rs - (line 49) ... ignored
+test crates/arco-catalog/src/reader.rs - reader::CatalogReader (line 108) ... ignored
+test crates/arco-catalog/src/writer.rs - writer::CatalogWriter::new (line 445) ... ignored
+test crates/arco-catalog/src/gc/policy.rs - gc::policy::RetentionPolicy (line 19) ... ok
+test crates/arco-catalog/src/manifest.rs - manifest::compute_manifest_hash (line 49) ... ok
+test crates/arco-catalog/src/search_tombstone.rs - search_tombstone::SearchTombstone (line 41) ... ok
+
+test result: ok. 3 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+Exit code: 0
+
+============================================================
+Date (UTC): 2026-02-19T04:17:50Z
+Command: cargo test -p arco-api
+------------------------------------------------------------
+   Compiling arco-api v0.1.0 (/Users/ethanurbanski/arco/.worktrees/codex-delta-primary-cutover/crates/arco-api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.05s
+     Running unittests src/lib.rs (target/debug/deps/arco_api-d7d787bbe004aeec)
+
+running 97 tests
+test config::tests::iceberg_credential_vending_default_is_false ... ok
+test config::tests::iceberg_multi_table_transactions_default_is_false ... ok
+test audit::tests::test_anonymous_actor ... ok
+test config::tests::parse_bool_accepts_false_values ... ok
+test config::tests::parse_bool_accepts_true_values ... ok
+test config::tests::posture_env_values_require_api_public ... ok
+test config::tests::posture_env_values_require_environment ... ok
+test config::tests::parse_bool_rejects_invalid_values ... ok
+test config::tests::posture_env_values_reject_invalid_api_public ... ok
+test config::tests::posture_maps_environment_and_public_flag ... ok
+test config::tests::posture_rejects_invalid_environment ... ok
+test audit::tests::test_hash_actor_different_inputs ... ok
+test audit::tests::test_hash_actor_is_stable ... ok
+test audit::tests::test_hash_actor_hmac_differs_from_plain ... ok
+test audit::tests::test_hash_actor_with_hmac_key ... ok
+test metrics::tests::test_status_class ... ok
+test audit::tests::test_emit_url_mint_deny ... ok
+test metrics::tests::test_endpoint_label_unmatched ... ok
+test audit::tests::test_emit_url_mint_allow ... ok
+test redaction::tests::redact_url_no_query_is_unchanged ... ok
+test rate_limit::tests::test_rate_limit_disabled ... ok
+test error::tests::test_regular_conflict_has_no_retry_after ... ok
+test error::tests::test_conflict_in_progress_has_retry_after ... ok
+test error::tests::test_with_retry_after_sets_header ... ok
+test redaction::tests::redact_url_redacts_sig_token_signature ... ok
+test redaction::tests::redacted_url_display_is_redacted ... ok
+test context::tests::test_request_context_requires_jwt_outside_dev ... ok
+test routes::orchestration::tests::test_build_chunk_counts_index_groups_by_backfill ... ok
+test routes::orchestration::tests::test_build_partition_key_rejects_invalid_partition_key ... ok
+test routes::orchestration::tests::test_filter_ticks_by_status ... ok
+test routes::orchestration::tests::test_parse_pagination_parses_cursor ... ok
+test routes::orchestration::tests::test_parse_pagination_rejects_invalid_cursor ... ok
+test context::tests::test_request_context_accepts_debug_headers_in_dev ... ok
+test routes::manifests::tests::test_deploy_request_deserialization ... ok
+test routes::orchestration::tests::test_parse_pagination_rejects_zero_limit ... ok
+test routes::manifests::tests::test_stored_manifest_serialization ... ok
+test routes::orchestration::tests::test_build_partition_key_rejects_canonical_string_too_long ... ok
+test routes::orchestration::tests::test_build_partition_key_canonical_string ... ok
+test routes::orchestration::tests::test_derive_run_partitioning_spec_rejects_mismatched_root_partitioning ... ok
+test routes::orchestration::tests::test_resolve_partition_key_normalizes_hour_time_string ... ok
+test routes::orchestration::tests::test_resolve_partition_key_normalizes_day_time_string ... ok
+test routes::orchestration::tests::test_resolve_partition_key_accepts_canonical_partition_key ... ok
+test routes::orchestration::tests::test_partition_selector_filter_maps_to_response ... ok
+test routes::orchestration::tests::test_resolve_partition_key_rejects_both_partition_key_and_partitions ... ok
+test routes::orchestration::tests::test_request_fingerprint_equivalent_for_partition_key_and_partitions ... ok
+test routes::orchestration::tests::test_request_fingerprint_variants_include_legacy_time_string_partition_key ... ok
+test routes::orchestration::tests::test_request_fingerprint_is_order_independent ... ok
+test routes::orchestration::tests::test_request_fingerprint_variants_include_legacy_hour_time_string_partition_key ... ok
+test routes::orchestration::tests::test_resolve_partition_key_rejects_empty_partition_key ... ok
+test routes::orchestration::tests::test_resolve_partition_key_rejects_disallowed_static_value ... ok
+test routes::orchestration::tests::test_resolve_partition_key_rejects_missing_dimension ... ok
+test routes::orchestration::tests::test_backfill_run_key_conflicts_on_mismatch ... ok
+test routes::orchestration::tests::test_resolve_partition_key_rejects_extra_dimension ... ok
+test routes::orchestration::tests::test_resolve_partition_key_rejects_noncanonical_partition_key ... ok
+test routes::orchestration::tests::test_resolve_partition_key_rejects_partitions_time_string_after_cutoff ... ok
+test routes::orchestration::tests::test_resolve_partition_key_rejects_time_string_after_cutoff ... ok
+test routes::orchestration::tests::test_trigger_request_limits_rejects_too_long_partition_key ... ok
+test routes::orchestration::tests::test_backfill_run_key_updates_missing_fingerprint ... ok
+test routes::orchestration::tests::test_trigger_request_deserialization ... ok
+test routes::orchestration::tests::test_trigger_request_deserialization_partition_key ... ok
+test routes::orchestration::tests::test_run_response_serialization ... ok
+test routes::orchestration::tests::test_trigger_request_limits_rejects_too_many_selection_items ... ok
+test routes::orchestration::tests::test_trigger_run_conflicts_on_fingerprint_mismatch ... ok
+test routes::orchestration::tests::test_trigger_run_normalizes_reserve_run_key_fingerprint_mismatch_for_equivalent_variants ... ok
+test routes::tasks::tests::test_completed_request_failure ... ok
+test routes::tasks::tests::test_extract_bearer_token ... ok
+test routes::tasks::tests::test_extract_bearer_token_missing ... ok
+test routes::tasks::tests::test_completed_request_success ... ok
+test routes::tasks::tests::test_extract_bearer_token_wrong_scheme ... ok
+test routes::tasks::tests::test_heartbeat_request_deserialization ... ok
+test routes::tasks::tests::test_started_request_deserialization ... ok
+test server::tests::test_compactor_url_required_when_debug_false ... ok
+test routes::tasks::tests::test_jwt_task_token_validator_accepts_valid_token ... ok
+test routes::tasks::tests::test_jwt_task_token_validator_rejects_task_id_mismatch ... ok
+test routes::tasks::tests::test_task_auth_middleware_rejects_missing_token ... ok
+test routes::tasks::tests::test_task_auth_middleware_rejects_debug_headers_outside_dev ... ok
+test server::tests::test_posture_accepts_jwt_claims_outside_dev ... ok
+test server::tests::test_posture_allows_debug_in_dev ... ok
+test routes::tasks::tests::test_task_auth_middleware_accepts_valid_token ... ok
+test routes::tasks::tests::test_task_auth_middleware_accepts_debug_headers_in_dev ... ok
+test server::tests::test_posture_blocks_debug_outside_dev ... ok
+test server::tests::test_posture_rejects_empty_jwt_claims_outside_dev ... ok
+test server::tests::test_posture_requires_jwt_audience_outside_dev ... ok
+test server::tests::test_posture_requires_jwt_issuer_outside_dev ... ok
+test server::tests::test_ready_endpoint ... ok
+test server::tests::test_health_endpoint ... ok
+test server::tests::test_iceberg_disabled_by_default ... ok
+test server::tests::test_iceberg_auth_uses_iceberg_error_schema ... ok
+test server::tests::test_iceberg_config_endpoint ... ok
+test routes::orchestration::tests::test_trigger_run_falls_back_to_scan_when_index_points_to_missing_manifest ... ok
+test routes::orchestration::tests::test_trigger_run_reemits_when_reservation_exists ... ok
+test server::tests::test_iceberg_openapi_endpoint ... ok
+test rate_limit::tests::test_rate_limit_different_tenants ... ok
+test rate_limit::tests::test_url_minting_lower_limit ... ok
+test rate_limit::tests::test_rate_limit_allows_within_quota ... ok
+test metrics::tests::test_counters_without_tenant_labels ... ok
+test metrics::tests::test_request_metrics_labels ... ok
+
+test result: ok. 97 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running unittests src/main.rs (target/debug/deps/arco_api-4a81fa89672536a1)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/gen_openapi.rs (target/debug/deps/gen_openapi-0e02ed0dd2b89b39)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/api_integration.rs (target/debug/deps/api_integration-b036dbdc414bbd84)
+
+running 48 tests
+test cross_cutting::test_cors_specific_origin_allows_matching_origin ... ok
+test cross_cutting::test_cors_disabled_by_default ... ok
+test cross_cutting::test_cors_specific_origin_rejects_non_matching_origin ... ok
+test cross_cutting::test_cors_headers_on_response ... ok
+test cross_cutting::test_cors_preflight_request ... ok
+test cross_cutting::test_missing_workspace_header_returns_401 ... ok
+test cross_cutting::test_missing_tenant_header_returns_401 ... ok
+test cross_cutting::test_production_mode_requires_authorization_header ... ok
+test cross_cutting::test_production_mode_rejects_missing_issuer_claim ... ok
+test cross_cutting::test_production_mode_rejects_missing_audience_claim ... ok
+test cross_cutting::test_production_mode_rejects_missing_user_claim ... ok
+test browser::test_mint_urls_rejects_path_traversal ... ok
+test browser::test_mint_urls_rejects_unknown_domain ... ok
+test delta::test_delta_stage_rejects_missing_table ... ok
+test delta::test_delta_commit_rejects_missing_table ... ok
+test idempotency::test_invalid_idempotency_key_rejected ... ok
+test idempotency::test_uuidv4_idempotency_key_rejected ... ok
+test lineage::test_lineage_edge_with_default_type ... ok
+test lineage::test_lineage_edge_lifecycle ... ok
+test manifests::test_manifest_deploy_get_list_idempotent ... ok
+test cross_cutting::test_idempotency_key_accepted ... ok
+test cross_cutting::test_production_mode_accepts_rs256_jwt ... ok
+test namespaces::test_get_nonexistent_namespace_returns_404 ... ok
+test idempotency::test_create_namespace_conflict_on_different_payload ... ok
+test catalogs::test_register_table_in_schema_rejects_unknown_format ... ok
+test idempotency::test_create_namespace_idempotent_replay ... ok
+test cross_cutting::test_production_mode_accepts_bearer_jwt ... ok
+test catalogs::test_register_table_in_schema_defaults_to_delta ... ok
+test delta::test_delta_commit_rejects_non_delta_table ... ok
+test query::test_audit_emits_auth_deny_on_missing_auth ... ok
+test browser::test_mint_urls_ttl_bounded ... ok
+test query::test_audit_emits_auth_allow_on_success ... ok
+test delta::test_delta_stage_rejects_non_delta_table ... ok
+test idempotency::test_register_table_idempotent_replay ... ok
+test orchestration::test_manual_sensor_evaluate_endpoint ... ok
+test tables::test_register_table_in_nonexistent_namespace_returns_error ... ok
+test test_public_posture_blocks_metrics ... ok
+test namespaces::test_namespace_crud_lifecycle ... ok
+test query::test_query_rejects_non_select ... ok
+test delta::test_delta_commit_replay_succeeds_after_table_drop ... ok
+test tables::test_register_table_rejects_unknown_format ... ok
+test test_server_uses_provided_storage_backend ... ok
+test tables::test_register_table_canonicalizes_explicit_format ... ok
+test tables::test_table_crud_lifecycle ... ok
+test orchestration::test_arco_flow_deploy_run_callbacks_and_logs ... ok
+test query::test_query_returns_arrow_stream ... ok
+test query::test_query_returns_json_format ... ok
+test catalogs::test_register_delta_table_in_schema_rejects_invalid_location ... ok
+
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+     Running tests/browser_e2e.rs (target/debug/deps/browser_e2e-4bff700c9c16cc00)
+
+running 15 tests
+test cors::test_cors_preflight ... ok
+test signed_url_security::test_missing_tenant_header_rejected ... ok
+test signed_url_security::test_missing_workspace_header_rejected ... ok
+test signed_url_security::test_path_traversal_rejected ... ok
+test signed_url_security::test_unknown_domain_rejected ... ok
+test e2e_browser_read::test_browser_read_empty_catalog ... ok
+test signed_url_security::test_path_traversal_various_patterns ... ok
+test cors::test_cors_headers_on_response ... ok
+test signed_url_security::test_non_allowlist_path_rejected ... ok
+test signed_url_security::test_manifest_paths_not_mintable ... ok
+test signed_url_security::test_cross_tenant_paths_not_mintable ... ok
+test signed_url_security::test_ttl_default_applied ... ok
+test signed_url_security::test_ttl_bounded_to_maximum ... ok
+test e2e_browser_read::test_browser_read_different_domains ... ok
+test e2e_browser_read::test_browser_read_full_lifecycle ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.45s
+
+     Running tests/openapi_contract.rs (target/debug/deps/openapi_contract-eea611fde0ecdace)
+
+running 1 test
+test contract_openapi_matches_implementation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/openapi_orchestration_routes.rs (target/debug/deps/openapi_orchestration_routes-e6671f985ad43ce6)
+
+running 2 tests
+test orchestration_read_endpoints_are_documented ... ok
+test list_history_endpoints_do_not_document_404 ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/orchestration_api_tests.rs (target/debug/deps/orchestration_api_tests-56a855e82ea0d5fe)
+
+running 3 tests
+test test_create_backfill_rejects_non_explicit_selector ... ok
+test test_create_backfill_idempotent_on_key ... ok
+test test_create_backfill_conflicts_on_payload_mismatch ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/orchestration_parity_gates_m1.rs (target/debug/deps/orchestration_parity_gates_m1-7094ebd969dada67)
+
+running 12 tests
+test parity_m1_rerun_from_failure_rejects_succeeded_parent ... ok
+test parity_m1_rerun_subset_respects_include_downstream ... ok
+test parity_m1_rerun_from_failure_plans_only_unsucceeded_tasks ... ok
+test parity_m1_deploy_rejects_invalid_manifest_asset_key ... ok
+test parity_m1_rejects_invalid_asset_keys ... ok
+test parity_m1_trigger_rejects_reserved_lineage_labels ... ok
+test parity_m1_rejects_unknown_assets ... ok
+test parity_m1_run_key_is_not_reserved_on_bad_request ... ok
+test parity_m1_run_key_conflicts_on_payload_mismatch ... ok
+test parity_m1_selection_does_not_autofill_tasks ... ok
+test parity_m1_run_key_idempotency_is_order_insensitive_for_selection ... ok
+test parity_m1_selection_include_downstream_uses_manifest_graph ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/orchestration_schedule_e2e_tests.rs (target/debug/deps/orchestration_schedule_e2e_tests-871e20a30e9dcaaf)
+
+running 8 tests
+test list_schedule_ticks_missing_schedule_returns_empty_list ... ok
+test schedule_upsert_validates_cron_timezone_and_assets ... ok
+test deploy_manifest_idempotency_does_not_duplicate_schedule_events ... ok
+test manifest_redeploy_does_not_override_operator_disabled_schedules ... ok
+test schedule_definitions_flow_from_manifest_to_tick_history ... ok
+test schedule_tick_detail_exposes_run_key_and_run_id_linkage ... ok
+test schedule_tick_detail_surfaces_skip_reason_and_error_message ... ok
+test schedule_crud_enable_disable_roundtrips_and_appears_in_list ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+   Doc-tests arco_api
+
+running 1 test
+test crates/arco-api/src/lib.rs - (line 36) ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+Exit code: 0
+

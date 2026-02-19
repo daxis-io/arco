@@ -12,7 +12,10 @@ Define the scope and rules of engagement for an external penetration test.
 - Contact list for incident response
 
 ## Scope
-- In-scope APIs: `/api/v1/*`, `/iceberg/v1/*`
+- In-scope APIs: `/api/v1/*`, `/iceberg/v1/*`, `/api/2.1/unity-catalog/*`
+- In-scope Delta control-plane endpoints:
+  - `/api/v1/delta/tables/{table_id}/commits/stage`
+  - `/api/v1/delta/tables/{table_id}/commits`
 - In-scope storage paths: tenant/workspace-scoped buckets
 - Out-of-scope: production systems, customer data, third-party integrations
 

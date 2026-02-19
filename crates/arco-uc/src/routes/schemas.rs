@@ -1,13 +1,17 @@
 //! Schema routes for the Unity Catalog facade.
 
 use axum::Json;
-use axum::extract::{Extension, Query};
-use serde::Deserialize;
+use axum::extract::{Extension, Query, State};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+use arco_core::storage::WriteResult;
+
 use crate::context::UnityCatalogRequestContext;
 use crate::error::{UnityCatalogError, UnityCatalogErrorResponse, UnityCatalogResult};
+use crate::routes::preview::{self, catalog_path, schema_path, schema_prefix};
+use crate::state::UnityCatalogState;
 
 #[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
 #[serde(default)]
@@ -32,11 +36,30 @@ pub(crate) struct CreateSchemaRequestBody {
     extra: BTreeMap<String, Value>,
 }
 
-/// Lists schemas (preview scaffolding).
+/// Response payload for a schema object.
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+pub(crate) struct SchemaInfo {
+    name: String,
+    catalog_name: String,
+    full_name: String,
+    comment: Option<String>,
+    properties: Option<BTreeMap<String, String>>,
+    storage_root: Option<String>,
+}
+
+/// Response payload for listing schemas.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub(crate) struct ListSchemasResponse {
+    schemas: Vec<SchemaInfo>,
+    next_page_token: Option<String>,
+}
+
+/// Lists schemas.
 ///
 /// # Errors
 ///
-/// Returns [`UnityCatalogError::NotImplemented`] while preview scaffolding is active.
+/// Returns [`UnityCatalogError`] when request validation fails, parent catalog is missing,
+/// or storage access fails.
 #[utoipa::path(
     get,
     path = "/schemas",
@@ -47,55 +70,117 @@ pub(crate) struct CreateSchemaRequestBody {
         ("page_token" = Option<String>, Query, description = "Opaque pagination token to go to next page based on previous query.")
     ),
     responses(
-        (status = 200, description = "The schemas list was successfully retrieved.", body = Value),
-        (status = 501, description = "Endpoint is scaffolded but not yet implemented.", body = UnityCatalogErrorResponse),
+        (status = 200, description = "The schemas list was successfully retrieved.", body = ListSchemasResponse),
+        (status = 400, description = "Bad request.", body = UnityCatalogErrorResponse),
+        (status = 401, description = "Unauthorized.", body = UnityCatalogErrorResponse),
+        (status = 403, description = "Forbidden.", body = UnityCatalogErrorResponse),
+        (status = 404, description = "Not found.", body = UnityCatalogErrorResponse),
+        (status = 500, description = "Internal server error.", body = UnityCatalogErrorResponse),
     )
 )]
 pub(crate) async fn get_schemas(
-    _ctx: Extension<UnityCatalogRequestContext>,
+    State(state): State<UnityCatalogState>,
+    Extension(ctx): Extension<UnityCatalogRequestContext>,
     query: Query<ListSchemasQuery>,
-) -> UnityCatalogResult<Json<Value>> {
+) -> UnityCatalogResult<Json<ListSchemasResponse>> {
     let Query(query) = query;
-    let _ = (
-        query.catalog_name,
-        query.max_results,
-        query.page_token,
-        query.extra,
-    );
-    Err(UnityCatalogError::NotImplemented {
-        message: "GET /schemas is scaffolded in preview; implementation is pending.".to_string(),
-    })
+    let _ = &query.extra;
+
+    let catalog_name = preview::require_identifier(query.catalog_name, "catalog_name")?;
+    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
+    let catalog_exists = preview::object_exists(
+        &scoped_storage,
+        &catalog_path(&catalog_name),
+        "check catalog",
+    )
+    .await?;
+    if !catalog_exists {
+        return Err(UnityCatalogError::NotFound {
+            message: format!("catalog not found: {catalog_name}"),
+        });
+    }
+
+    let schemas = preview::read_json_list::<SchemaInfo>(
+        &scoped_storage,
+        &schema_prefix(&catalog_name),
+        "list schemas",
+    )
+    .await?;
+    let (schemas, next_page_token) =
+        preview::paginate(schemas, query.page_token.as_deref(), query.max_results)?;
+
+    Ok(Json(ListSchemasResponse {
+        schemas,
+        next_page_token,
+    }))
 }
 
-/// Creates a schema (preview scaffolding).
+/// Creates a schema.
 ///
 /// # Errors
 ///
-/// Returns [`UnityCatalogError::NotImplemented`] while preview scaffolding is active.
+/// Returns [`UnityCatalogError`] when request validation fails, parent catalog is missing,
+/// schema already exists, or storage access fails.
 #[utoipa::path(
     post,
     path = "/schemas",
     tag = "Schemas",
     request_body = CreateSchemaRequestBody,
     responses(
-        (status = 200, description = "The new schema was successfully created.", body = Value),
-        (status = 501, description = "Endpoint is scaffolded but not yet implemented.", body = UnityCatalogErrorResponse),
+        (status = 200, description = "The new schema was successfully created.", body = SchemaInfo),
+        (status = 400, description = "Bad request.", body = UnityCatalogErrorResponse),
+        (status = 401, description = "Unauthorized.", body = UnityCatalogErrorResponse),
+        (status = 403, description = "Forbidden.", body = UnityCatalogErrorResponse),
+        (status = 404, description = "Not found.", body = UnityCatalogErrorResponse),
+        (status = 409, description = "Conflict.", body = UnityCatalogErrorResponse),
+        (status = 500, description = "Internal server error.", body = UnityCatalogErrorResponse),
     )
 )]
 pub(crate) async fn post_schemas(
-    _ctx: Extension<UnityCatalogRequestContext>,
+    State(state): State<UnityCatalogState>,
+    Extension(ctx): Extension<UnityCatalogRequestContext>,
     payload: Json<CreateSchemaRequestBody>,
-) -> UnityCatalogResult<Json<Value>> {
+) -> UnityCatalogResult<Json<SchemaInfo>> {
     let Json(payload) = payload;
-    let _ = (
-        payload.name,
-        payload.catalog_name,
-        payload.comment,
-        payload.properties,
-        payload.storage_root,
-        payload.extra,
-    );
-    Err(UnityCatalogError::NotImplemented {
-        message: "POST /schemas is scaffolded in preview; implementation is pending.".to_string(),
-    })
+    let _ = payload.extra;
+
+    let name = preview::require_identifier(payload.name, "name")?;
+    let catalog_name = preview::require_identifier(payload.catalog_name, "catalog_name")?;
+    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
+
+    let catalog_exists = preview::object_exists(
+        &scoped_storage,
+        &catalog_path(&catalog_name),
+        "check catalog",
+    )
+    .await?;
+    if !catalog_exists {
+        return Err(UnityCatalogError::NotFound {
+            message: format!("catalog not found: {catalog_name}"),
+        });
+    }
+
+    let schema = SchemaInfo {
+        name: name.clone(),
+        catalog_name: catalog_name.clone(),
+        full_name: format!("{catalog_name}.{name}"),
+        comment: payload.comment,
+        properties: payload.properties,
+        storage_root: payload.storage_root,
+    };
+
+    let write_result = preview::write_json_if_absent(
+        &scoped_storage,
+        &schema_path(&catalog_name, &name),
+        &schema,
+        "create schema",
+    )
+    .await?;
+
+    match write_result {
+        WriteResult::Success { .. } => Ok(Json(schema)),
+        WriteResult::PreconditionFailed { .. } => Err(UnityCatalogError::Conflict {
+            message: format!("schema already exists: {catalog_name}.{name}"),
+        }),
+    }
 }

@@ -83,6 +83,26 @@ mod tests {
             .map(str::to_string)
     }
 
+    fn operation_response_schema_ref(
+        spec: &Value,
+        path: &str,
+        method: &str,
+        status_code: &str,
+    ) -> Option<String> {
+        spec.get("paths")
+            .and_then(Value::as_object)?
+            .get(path)?
+            .get(method)?
+            .get("responses")?
+            .get(status_code)?
+            .get("content")?
+            .get("application/json")?
+            .get("schema")?
+            .get("$ref")?
+            .as_str()
+            .map(str::to_string)
+    }
+
     #[test]
     fn test_openapi_generation() {
         let spec = openapi();
@@ -149,6 +169,33 @@ mod tests {
             assert!(
                 schema_ref.contains(expected_component),
                 "unexpected request schema for {method} {path}: {schema_ref}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_openapi_uses_typed_response_schemas_for_interop_crud_subset() {
+        let spec = serde_json::to_value(openapi()).expect("serialize openapi");
+
+        let expectations = [
+            ("/catalogs", "get", "200", "ListCatalogsResponse"),
+            ("/catalogs", "post", "200", "CatalogInfo"),
+            ("/schemas", "get", "200", "ListSchemasResponse"),
+            ("/schemas", "post", "200", "SchemaInfo"),
+            ("/tables", "get", "200", "ListTablesResponse"),
+            ("/tables", "post", "200", "TableInfo"),
+        ];
+
+        for (path, method, status, expected_component) in expectations {
+            let schema_ref = operation_response_schema_ref(&spec, path, method, status);
+            assert!(
+                schema_ref.is_some(),
+                "missing response schema for {method} {path} ({status})"
+            );
+            let schema_ref = schema_ref.unwrap_or_default();
+            assert!(
+                schema_ref.contains(expected_component),
+                "unexpected response schema for {method} {path} ({status}): {schema_ref}"
             );
         }
     }

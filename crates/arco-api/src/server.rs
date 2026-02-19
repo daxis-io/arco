@@ -1262,13 +1262,46 @@ mod tests {
         Ok(())
     }
 
-    const UC_PREVIEW_OPERATIONS: &[(&str, &str)] = &[
-        ("GET", "/api/2.1/unity-catalog/catalogs"),
-        ("POST", "/api/2.1/unity-catalog/catalogs"),
-        ("GET", "/api/2.1/unity-catalog/schemas"),
-        ("POST", "/api/2.1/unity-catalog/schemas"),
-        ("GET", "/api/2.1/unity-catalog/tables"),
-        ("POST", "/api/2.1/unity-catalog/tables"),
+    const UC_IMPLEMENTED_OPERATIONS: &[(&str, &str, StatusCode, Option<&str>)] = &[
+        (
+            "GET",
+            "/api/2.1/unity-catalog/catalogs",
+            StatusCode::OK,
+            None,
+        ),
+        (
+            "POST",
+            "/api/2.1/unity-catalog/catalogs",
+            StatusCode::BAD_REQUEST,
+            Some("BAD_REQUEST"),
+        ),
+        (
+            "GET",
+            "/api/2.1/unity-catalog/schemas",
+            StatusCode::BAD_REQUEST,
+            Some("BAD_REQUEST"),
+        ),
+        (
+            "POST",
+            "/api/2.1/unity-catalog/schemas",
+            StatusCode::BAD_REQUEST,
+            Some("BAD_REQUEST"),
+        ),
+        (
+            "GET",
+            "/api/2.1/unity-catalog/tables",
+            StatusCode::BAD_REQUEST,
+            Some("BAD_REQUEST"),
+        ),
+        (
+            "POST",
+            "/api/2.1/unity-catalog/tables",
+            StatusCode::BAD_REQUEST,
+            Some("BAD_REQUEST"),
+        ),
+    ];
+
+    const UC_SCAFFOLDED_OPERATIONS: &[(&str, &str)] = &[
         ("GET", "/api/2.1/unity-catalog/delta/preview/commits"),
         ("POST", "/api/2.1/unity-catalog/delta/preview/commits"),
         ("POST", "/api/2.1/unity-catalog/temporary-table-credentials"),
@@ -1319,7 +1352,33 @@ mod tests {
         let server = builder.build();
         let router = server.test_router();
 
-        for &(method, uri) in UC_PREVIEW_OPERATIONS {
+        for &(method, uri, _, _) in UC_IMPLEMENTED_OPERATIONS {
+            let request = build_uc_request(method, uri, false)?;
+            let response = router
+                .clone()
+                .oneshot(request)
+                .await
+                .map_err(|err| match err {})?;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "expected unauthorized for {method} {uri}"
+            );
+
+            let body = axum::body::to_bytes(response.into_body(), 2048)
+                .await
+                .context("read response body")?;
+            let payload: serde_json::Value =
+                serde_json::from_slice(&body).context("parse JSON body")?;
+            let error = payload.get("error").context("missing error field")?;
+            assert_eq!(
+                error.get("error_code").and_then(|value| value.as_str()),
+                Some("UNAUTHORIZED"),
+                "expected UNAUTHORIZED for {method} {uri}"
+            );
+        }
+
+        for &(method, uri) in UC_SCAFFOLDED_OPERATIONS {
             let request = build_uc_request(method, uri, false)?;
             let response = router
                 .clone()
@@ -1355,7 +1414,35 @@ mod tests {
         let server = builder.build();
         let router = server.test_router();
 
-        for &(method, uri) in UC_PREVIEW_OPERATIONS {
+        for &(method, uri, expected_status, expected_error_code) in UC_IMPLEMENTED_OPERATIONS {
+            let request = build_uc_request(method, uri, true)?;
+            let response = router
+                .clone()
+                .oneshot(request)
+                .await
+                .map_err(|err| match err {})?;
+            assert_eq!(
+                response.status(),
+                expected_status,
+                "unexpected status for {method} {uri}"
+            );
+
+            let body = axum::body::to_bytes(response.into_body(), 2048)
+                .await
+                .context("read response body")?;
+            let payload: serde_json::Value =
+                serde_json::from_slice(&body).context("parse JSON body")?;
+            if let Some(expected_error_code) = expected_error_code {
+                let error = payload.get("error").context("missing error field")?;
+                assert_eq!(
+                    error.get("error_code").and_then(|value| value.as_str()),
+                    Some(expected_error_code),
+                    "unexpected error code for {method} {uri}"
+                );
+            }
+        }
+
+        for &(method, uri) in UC_SCAFFOLDED_OPERATIONS {
             let request = build_uc_request(method, uri, true)?;
             let response = router
                 .clone()

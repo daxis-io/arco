@@ -81,6 +81,11 @@ struct NativeCommit {
     version: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct NativeTable {
+    id: String,
+}
+
 async fn run_engine_flow(engine: &str) {
     let server = ServerBuilder::new().config(test_config()).build();
     let router = server.test_router();
@@ -207,11 +212,46 @@ async fn run_engine_flow(engine: &str) {
         Some(1)
     );
 
-    let native_table_id = Uuid::now_v7();
+    let native_namespace = format!("{engine}_ns");
+    let native_create_namespace = send_json(
+        &router,
+        Method::POST,
+        &format!("{native_prefix}/namespaces"),
+        tenant,
+        workspace,
+        json!({
+            "name": &native_namespace
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(native_create_namespace.status, StatusCode::CREATED);
+
+    let native_table_name = format!("{engine}_native_events");
+    let native_create_table = send_json(
+        &router,
+        Method::POST,
+        &format!("{native_prefix}/namespaces/{native_namespace}/tables"),
+        tenant,
+        workspace,
+        json!({
+            "name": &native_table_name,
+            "columns": []
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(native_create_table.status, StatusCode::CREATED);
+    let native_table: NativeTable =
+        serde_json::from_value(native_create_table.body).expect("native table response");
+
     let native_stage = send_json(
         &router,
         Method::POST,
-        &format!("{native_prefix}/delta/tables/{native_table_id}/commits/stage"),
+        &format!(
+            "{native_prefix}/delta/tables/{}/commits/stage",
+            native_table.id
+        ),
         tenant,
         workspace,
         json!({
@@ -229,7 +269,7 @@ async fn run_engine_flow(engine: &str) {
     let native_commit = send_json(
         &router,
         Method::POST,
-        &format!("{native_prefix}/delta/tables/{native_table_id}/commits"),
+        &format!("{native_prefix}/delta/tables/{}/commits", native_table.id),
         tenant,
         workspace,
         json!({

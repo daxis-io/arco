@@ -1,0 +1,38 @@
+{
+  "audit_id": "2026-02-12-prod-readiness",
+  "release_train": "delta-primary-cutover",
+  "status": "IN_PROGRESS",
+  "gates": [
+    {
+      "id": "delta-primary-cutover",
+      "description": "Delta is primary default while preserving Iceberg secondary compatibility",
+      "required_signals": [
+        "delta-default-api",
+        "delta-format-canonicalization",
+        "delta-commit-gating",
+        "delta-location-log-path",
+        "uc-openapi-pinned",
+        "iceberg-secondary-compat",
+        "sdk-delta-default",
+        "policy-docs-updated"
+      ]
+    }
+  ],
+  "verification_commands": [
+    "cargo test -p arco-core --test table_format_contracts",
+    "cargo test -p arco-core --test flow_paths_contracts",
+    "cargo test -p arco-catalog",
+    "cargo test -p arco-api",
+    "cargo test -p arco-delta",
+    "cargo test -p arco-integration-tests --test delta_commit_coordinator",
+    "cargo test -p arco-uc --tests",
+    "cargo xtask uc-openapi-inventory",
+    "cargo test -p arco-uc --test openapi_compliance -- --ignored",
+    "cargo fmt --all -- --check",
+    "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+    "cargo test --workspace",
+    "cargo deny check",
+    "buf lint",
+    "buf breaking --against '.git#branch=main'"
+  ]
+}

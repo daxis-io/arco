@@ -136,6 +136,22 @@ class TestAssetDecorator:
         assert registered.definition.checks[0].check_type == "row_count"
         assert registered.definition.checks[1].check_type == "not_null"
 
+    def test_default_io_format_is_delta(self) -> None:
+        """Decorator should use delta as the default IO format."""
+        from arco_flow.asset import asset
+        from arco_flow.context import AssetContext
+
+        get_registry().clear()
+
+        @asset(namespace="raw")
+        def daily_events(ctx: AssetContext) -> None:
+            pass
+
+        reg = get_registry()
+        registered = reg.get(AssetKey("raw", "daily_events"))
+        assert registered is not None
+        assert registered.definition.io.format == "delta"
+
     def test_validates_signature(self) -> None:
         """Decorator validates function signature."""
         from arco_flow.asset import asset

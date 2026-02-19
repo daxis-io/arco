@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use arco_catalog::CatalogReader;
+use arco_core::{DeltaPaths, TableFormat};
+
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
 use crate::server::AppState;
@@ -79,8 +82,10 @@ pub(crate) async fn stage_commit_payload(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
+    let paths =
+        resolve_delta_table_paths(storage.clone(), &ctx.tenant, &ctx.workspace, table_id).await?;
 
-    let coordinator = arco_delta::DeltaCommitCoordinator::new(storage, table_id);
+    let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths);
     let staged = coordinator
         .stage_commit_payload(Bytes::from(req.payload))
         .await
@@ -150,18 +155,34 @@ pub(crate) async fn commit_staged(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
-    let coordinator = arco_delta::DeltaCommitCoordinator::new(storage, table_id);
+    let commit_request = arco_delta::CommitDeltaRequest {
+        read_version: req.read_version,
+        staged_path: req.staged_path,
+        staged_version: req.staged_version,
+        idempotency_key,
+    };
+
+    let replay_coordinator = arco_delta::DeltaCommitCoordinator::new(storage.clone(), table_id);
+    if let Some(replayed) = replay_coordinator
+        .replay_committed(&commit_request)
+        .await
+        .map_err(ApiError::from)?
+    {
+        return Ok((
+            StatusCode::OK,
+            Json(CommitResponse {
+                version: replayed.version,
+                delta_log_path: replayed.delta_log_path,
+            }),
+        ));
+    }
+
+    let paths =
+        resolve_delta_table_paths(storage.clone(), &ctx.tenant, &ctx.workspace, table_id).await?;
+    let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths);
 
     let committed = coordinator
-        .commit(
-            arco_delta::CommitDeltaRequest {
-                read_version: req.read_version,
-                staged_path: req.staged_path,
-                staged_version: req.staged_version,
-                idempotency_key,
-            },
-            Utc::now(),
-        )
+        .commit(commit_request, Utc::now())
         .await
         .map_err(ApiError::from)?;
 
@@ -172,6 +193,35 @@ pub(crate) async fn commit_staged(
             delta_log_path: committed.delta_log_path,
         }),
     ))
+}
+
+async fn resolve_delta_table_paths(
+    storage: arco_core::ScopedStorage,
+    tenant: &str,
+    workspace: &str,
+    table_id: Uuid,
+) -> Result<DeltaPaths, ApiError> {
+    let reader = CatalogReader::new(storage);
+    let table = reader
+        .get_table_by_id(&table_id.to_string())
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found(format!("table not found: {table_id}")))?;
+
+    let format = TableFormat::effective(table.format.as_deref()).map_err(|err| {
+        ApiError::internal(format!(
+            "invalid persisted table format for {table_id}: {err}"
+        ))
+    })?;
+
+    if format != TableFormat::Delta {
+        return Err(ApiError::conflict(format!(
+            "table {table_id} is format '{format}', expected 'delta'"
+        )));
+    }
+
+    DeltaPaths::from_table_location(table_id, table.location.as_deref(), tenant, workspace)
+        .map_err(ApiError::from)
 }
 
 impl From<arco_delta::DeltaError> for ApiError {

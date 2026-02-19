@@ -5892,6 +5892,13 @@
             ],
             "description": "Optional description."
           },
+          "format": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional table format (`delta`, `iceberg`, `parquet`), defaults to `delta`."
+          },
           "name": {
             "type": "string",
             "description": "Table name (must be unique within namespace)."
@@ -6582,6 +6589,7 @@
           "catalog",
           "schema",
           "name",
+          "format",
           "created_at",
           "updated_at"
         ],
@@ -6602,11 +6610,8 @@
             "description": "Optional description."
           },
           "format": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Table format."
+            "type": "string",
+            "description": "Effective table format."
           },
           "id": {
             "type": "string",
@@ -6928,6 +6933,7 @@
           "id",
           "namespace",
           "name",
+          "format",
           "columns",
           "created_at",
           "updated_at"
@@ -6950,6 +6956,10 @@
               "null"
             ],
             "description": "Optional description."
+          },
+          "format": {
+            "type": "string",
+            "description": "Effective table format."
           },
           "id": {
             "type": "string",

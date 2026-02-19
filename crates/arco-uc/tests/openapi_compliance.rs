@@ -16,6 +16,12 @@ fn assert_uc_spec_is_pinned(yaml: &str) {
             "unitycatalog-openapi.yaml is a placeholder; replace it with a pinned upstream api/all.yaml and record the commit hash"
         );
     }
+    if !yaml
+        .lines()
+        .any(|line| line.starts_with("# Upstream commit: "))
+    {
+        panic!("unitycatalog-openapi.yaml must include a '# Upstream commit: <hash>' header");
+    }
 }
 
 fn resolve_ref<'a>(spec: &'a serde_json::Value, reference: &str) -> Option<&'a serde_json::Value> {
@@ -81,7 +87,6 @@ fn test_vendored_uc_spec_is_parseable() {
 }
 
 #[test]
-#[ignore = "Requires pinned Unity Catalog OSS OpenAPI spec fixture (replace placeholder)."]
 fn test_openapi_paths_align_with_vendored_spec() {
     let ours = serde_json::to_value(openapi()).expect("serialize openapi");
 
@@ -98,10 +103,15 @@ fn test_openapi_paths_align_with_vendored_spec() {
         .and_then(serde_json::Value::as_object)
         .expect("paths");
 
-    for (path, spec_path_item) in spec_paths {
-        let ours_path_item = ours_paths
+    for (path, ours_path_item) in ours_paths {
+        if path == "/openapi.json" {
+            // Arco-local endpoint; not part of Unity Catalog upstream contract.
+            continue;
+        }
+
+        let spec_path_item = spec_paths
             .get(path)
-            .unwrap_or_else(|| panic!("missing {path} in generated spec"));
+            .unwrap_or_else(|| panic!("generated path {path} is missing from UC vendored spec"));
 
         let spec_path_item = spec_path_item
             .as_object()
@@ -110,13 +120,14 @@ fn test_openapi_paths_align_with_vendored_spec() {
             .as_object()
             .unwrap_or_else(|| panic!("expected object for generated path item {path}"));
 
-        for (method, spec_op) in spec_path_item {
+        for (method, ours_op) in ours_path_item {
             if !is_http_method(method.as_str()) {
                 continue;
             }
-            let ours_op = ours_path_item
+
+            let spec_op = spec_path_item
                 .get(method)
-                .unwrap_or_else(|| panic!("missing {method} {path} operation"));
+                .unwrap_or_else(|| panic!("missing {method} {path} operation in UC vendored spec"));
 
             let ours_params = collect_param_names(
                 &ours,
@@ -129,18 +140,18 @@ fn test_openapi_paths_align_with_vendored_spec() {
                 spec_op,
             );
             assert!(
-                spec_params.is_subset(&ours_params),
-                "parameter mismatch for {method} {path}: missing {:?}",
-                spec_params.difference(&ours_params).collect::<Vec<_>>()
+                ours_params.is_subset(&spec_params),
+                "parameter mismatch for {method} {path}: generated params not in upstream spec: {:?}",
+                ours_params.difference(&spec_params).collect::<Vec<_>>()
             );
 
             let ours_responses = collect_response_codes(ours_op);
             let spec_responses = collect_response_codes(spec_op);
             assert!(
-                spec_responses.is_subset(&ours_responses),
-                "response mismatch for {method} {path}: missing {:?}",
-                spec_responses
-                    .difference(&ours_responses)
+                ours_responses.is_subset(&spec_responses),
+                "response mismatch for {method} {path}: generated responses not in upstream spec: {:?}",
+                ours_responses
+                    .difference(&spec_responses)
                     .collect::<Vec<_>>()
             );
         }

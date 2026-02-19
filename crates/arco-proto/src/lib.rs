@@ -28,7 +28,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partition_key_serialization() {
+    fn test_partition_key_serialization() -> Result<(), prost::DecodeError> {
         use prost::Message;
 
         let mut dimensions = std::collections::BTreeMap::new();
@@ -41,9 +41,10 @@ mod tests {
 
         let pk = PartitionKey { dimensions };
         let encoded = pk.encode_to_vec();
-        let decoded = PartitionKey::decode(encoded.as_slice()).expect("decode should succeed");
+        let decoded = PartitionKey::decode(encoded.as_slice())?;
 
         assert_eq!(decoded.dimensions.len(), 1);
+        Ok(())
     }
 
     #[test]

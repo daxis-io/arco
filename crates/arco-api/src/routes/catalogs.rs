@@ -29,6 +29,7 @@ use arco_catalog::idempotency::{
     calculate_retry_after, canonical_request_hash, check_idempotency,
 };
 use arco_catalog::{CatalogReader, CatalogWriter, Tier1Compactor};
+use arco_core::TableFormat;
 
 use super::tables::ColumnDefinition;
 use crate::context::RequestContext;
@@ -133,9 +134,8 @@ pub struct SchemaTableResponse {
     /// Storage location.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
-    /// Table format.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub format: Option<String>,
+    /// Effective table format.
+    pub format: String,
     /// Creation timestamp (ISO 8601).
     pub created_at: String,
     /// Last update timestamp (ISO 8601).
@@ -700,6 +700,7 @@ pub(crate) async fn register_table_in_schema(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
+    let requested_format = normalize_requested_format(req.format.as_deref())?;
 
     let request_json = serde_json::json!({
         "catalog": &catalog,
@@ -707,7 +708,7 @@ pub(crate) async fn register_table_in_schema(
         "name": &req.name,
         "description": &req.description,
         "location": &req.location,
-        "format": &req.format,
+        "format": &requested_format,
         "columns": &req.columns,
     });
     let request_hash = canonical_request_hash(&request_json)
@@ -745,7 +746,7 @@ pub(crate) async fn register_table_in_schema(
                 name: table.name,
                 description: table.description,
                 location: table.location,
-                format: table.format,
+                format: effective_table_format(table.format.as_deref())?,
                 created_at: format_timestamp(table.created_at),
                 updated_at: format_timestamp(table.updated_at),
             };
@@ -794,7 +795,7 @@ pub(crate) async fn register_table_in_schema(
                 name: req.name,
                 description: req.description,
                 location: req.location,
-                format: req.format,
+                format: Some(requested_format.clone()),
                 columns: req
                     .columns
                     .into_iter()
@@ -855,7 +856,7 @@ pub(crate) async fn register_table_in_schema(
             name: created.name,
             description: created.description,
             location: created.location,
-            format: created.format,
+            format: effective_table_format(created.format.as_deref())?,
             created_at: format_timestamp(created.created_at),
             updated_at: format_timestamp(created.updated_at),
         }),
@@ -900,23 +901,24 @@ pub(crate) async fn list_tables_in_schema(
     let storage = ctx.scoped_storage(backend)?;
     let reader = CatalogReader::new(storage);
 
-    let tables = reader
+    let mut tables = Vec::new();
+    for table in reader
         .list_tables_in_schema(&catalog, &schema)
         .await
         .map_err(ApiError::from)?
-        .into_iter()
-        .map(|t| SchemaTableResponse {
-            id: t.id,
+    {
+        tables.push(SchemaTableResponse {
+            id: table.id,
             catalog: catalog.clone(),
             schema: schema.clone(),
-            name: t.name,
-            description: t.description,
-            location: t.location,
-            format: t.format,
-            created_at: format_timestamp(t.created_at),
-            updated_at: format_timestamp(t.updated_at),
-        })
-        .collect();
+            name: table.name,
+            description: table.description,
+            location: table.location,
+            format: effective_table_format(table.format.as_deref())?,
+            created_at: format_timestamp(table.created_at),
+            updated_at: format_timestamp(table.updated_at),
+        });
+    }
 
     Ok(Json(ListSchemaTablesResponse { tables }))
 }
@@ -976,7 +978,7 @@ pub(crate) async fn get_table_in_schema(
         name: table.name,
         description: table.description,
         location: table.location,
-        format: table.format,
+        format: effective_table_format(table.format.as_deref())?,
         created_at: format_timestamp(table.created_at),
         updated_at: format_timestamp(table.updated_at),
     }))
@@ -986,4 +988,18 @@ fn format_timestamp(millis: i64) -> String {
     chrono::DateTime::from_timestamp_millis(millis)
         .unwrap_or_else(chrono::Utc::now)
         .to_rfc3339()
+}
+
+fn effective_table_format(format: Option<&str>) -> Result<String, ApiError> {
+    TableFormat::effective(format)
+        .map(|value| value.as_str().to_string())
+        .map_err(|err| ApiError::internal(format!("invalid persisted table format: {err}")))
+}
+
+fn normalize_requested_format(format: Option<&str>) -> Result<String, ApiError> {
+    match format {
+        Some(value) => TableFormat::normalize(value),
+        None => Ok(TableFormat::Delta.as_str().to_string()),
+    }
+    .map_err(ApiError::from)
 }

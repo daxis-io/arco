@@ -15,6 +15,7 @@
 
 # Reference
 
+- [Documentation Map](./reference/documentation-map.md)
 - [Configuration](./reference/configuration.md)
 - [API](./reference/api.md)
 - [Evidence Policy](./reference/evidence-policy.md)

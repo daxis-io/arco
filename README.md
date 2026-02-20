@@ -26,14 +26,10 @@ Arco unifies a **file-native catalog** and an **execution-first orchestration** 
 
 ## Documentation
 
-- User/developer docs (mdBook): `docs/guide/src/` (build with `cd docs/guide && mdbook build`)
-- Architectural decisions (ADRs): `docs/adr/`
-- Governance and contribution process:
-  - `CONTRIBUTING.md`
-  - `GOVERNANCE.md`
-  - `COMMUNITY.md`
-  - `SUPPORT.md`
-  - `ROADMAP.md`
+- Documentation map: `docs/README.md`
+- Canonical guide/reference docs (mdBook): `docs/guide/src/`
+- Architecture decisions: `docs/adr/README.md`
+- Operations runbooks: `docs/runbooks/`
 - Release process: `RELEASE.md`
 - Evidence policy: `docs/guide/src/reference/evidence-policy.md`
 

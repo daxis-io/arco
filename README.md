@@ -126,3 +126,7 @@ Licensed under the Apache License, Version 2.0.
 - License text: [LICENSE-APACHE](LICENSE-APACHE)
 - Project license notice: [LICENSE](LICENSE)
 - Attribution notice: [NOTICE](NOTICE)
+
+## Acknowledgments
+
+Arco is developed by [Daxis](https://daxis.io) and open sourced to advance the data ecosystem.

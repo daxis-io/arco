@@ -25,6 +25,8 @@
 //! ## Example
 //!
 //! ```rust,no_run
+//! # #[cfg(feature = "legacy-scheduler")]
+//! # {
 //! use arco_core::{AssetId, TaskId};
 //! use arco_flow::error::Result;
 //! use arco_flow::outbox::InMemoryOutbox;
@@ -57,6 +59,7 @@
 //! let _run = scheduler.create_run(RunTrigger::manual("user@example.com"), &mut outbox);
 //! # Ok(())
 //! # }
+//! # }
 //! ```
 
 #![forbid(unsafe_code)]
@@ -83,8 +86,11 @@ pub mod outbox;
 pub mod plan;
 pub mod quota;
 pub mod run;
+#[cfg(feature = "legacy-scheduler")]
 pub mod runner;
+#[cfg(feature = "legacy-scheduler")]
 pub mod scheduler;
+#[cfg(feature = "legacy-scheduler")]
 pub mod store;
 pub mod task;
 pub mod task_key;
@@ -102,8 +108,11 @@ pub mod prelude {
     pub use crate::plan::{Plan, PlanBuilder, TaskSpec};
     pub use crate::quota::{QuotaDecision, QuotaManager, TenantQuota};
     pub use crate::run::{Run, RunState};
+    #[cfg(feature = "legacy-scheduler")]
     pub use crate::runner::{RunContext, Runner, TaskResult};
+    #[cfg(feature = "legacy-scheduler")]
     pub use crate::scheduler::Scheduler;
+    #[cfg(feature = "legacy-scheduler")]
     pub use crate::store::{CasResult, Store};
     pub use crate::task::{TaskExecution, TaskState};
     pub use crate::task_key::{TaskKey, TaskOperation};

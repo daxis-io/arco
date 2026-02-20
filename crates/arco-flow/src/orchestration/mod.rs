@@ -44,6 +44,7 @@ pub mod ledger;
 pub mod run_key;
 pub mod runtime;
 pub mod selection;
+pub mod worker_contract;
 
 pub use callbacks::{
     CallbackError, CallbackResult, ErrorCategory, HeartbeatRequest, HeartbeatResponse,
@@ -59,3 +60,4 @@ pub use selection::{
     AssetGraph, SelectionOptions, build_task_defs_for_selection, canonicalize_asset_key,
     compute_selection_fingerprint,
 };
+pub use worker_contract::WorkerDispatchEnvelope;

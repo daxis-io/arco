@@ -2,7 +2,8 @@
 
 This directory contains Architecture Decision Records (ADRs) for Arco.
 
-ADRs are the source of record for architectural decisions.
+Design documents under `docs/plans/` are internal and may contain illustrative
+pseudocode. ADRs are the source of record for architectural decisions.
 
 ## Format
 
@@ -44,5 +45,4 @@ Each ADR follows this structure:
 | [029](adr-029-iceberg-multi-table-transactions.md) | Iceberg multi-table transactions (ICE-7) | Accepted |
 | [030](adr-030-delta-uc-metastore.md) | Delta Lake + UC-Like Metastore/Catalog (Arco-Native) | Proposed |
 | [031](adr-031-unity-catalog-api-facade.md) | Unity Catalog OSS API Facade (UC Parity) | Proposed |
-| [032](adr-032-immutable-manifest-pointers.md) | Immutable Manifest Snapshots + Pointer CAS | Proposed |
-| [033](adr-033-internal-durability-modes.md) | Internal Durability Modes for Orchestration Compaction | Proposed |
+| [032](adr-032-engine-boundaries.md) | Engine Boundaries and Split-Service Topology | Accepted |

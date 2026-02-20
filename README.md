@@ -40,6 +40,21 @@ arco/
 └── docs/                # Documentation and ADRs
 ```
 
+## Engine Boundaries (ADR-032)
+
+Arco enforces explicit engine responsibilities in split-services deployments:
+
+- `arco-api` and `arco-flow` are control-plane services.
+- DataFusion endpoints (`/api/v1/query`, `/api/v1/query-data`) are read-only (`SELECT`/`CTE`).
+- Compactors are sole writers for state/snapshot Parquet projections.
+- Browser query path uses DuckDB-WASM via signed URLs only.
+- ETL compute runs in external workers via canonical `WorkerDispatchEnvelope`.
+
+Current cycle non-goals:
+
+- No in-process ETL engine.
+- No Spark/dbt/Flink adapter implementation.
+
 ## Quick Start
 
 ### Prerequisites

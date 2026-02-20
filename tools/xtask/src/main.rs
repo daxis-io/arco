@@ -73,6 +73,8 @@ enum Commands {
         #[arg(long, value_name = "BUCKET")]
         bucket: Option<String>,
     },
+    /// Enforce engine dependency and query-read boundaries.
+    EngineBoundaryCheck,
     ParityMatrixCheck,
     /// Generate endpoint inventory from vendored Unity Catalog OSS OpenAPI fixture
     UcOpenapiInventory,
@@ -90,6 +92,7 @@ fn main() -> Result<()> {
         Commands::RepoHygieneCheck => run_repo_hygiene_check(),
         Commands::ParityMatrixCheck => run_parity_matrix_check(),
         Commands::UcOpenapiInventory => run_uc_openapi_inventory(),
+        Commands::EngineBoundaryCheck => run_engine_boundary_check(),
         Commands::VerifyIntegrity {
             verbose,
             dry_run,
@@ -290,6 +293,7 @@ fn run_ci() -> Result<()> {
 
     run_doctor()?;
     run_adr_check()?;
+    run_engine_boundary_check()?;
     run_parity_matrix_check()?;
     run_repo_hygiene_check()?;
 
@@ -747,6 +751,123 @@ fn run_adr_check() -> Result<()> {
 
     println!("All ADRs present and indexed!");
     Ok(())
+}
+
+fn run_engine_boundary_check() -> Result<()> {
+    println!("Validating engine boundaries...\n");
+
+    let allowed_datafusion_crates: HashSet<&str> =
+        HashSet::from(["arco-api", "arco-test-utils", "arco-integration-tests"]);
+    let mut errors = Vec::new();
+
+    for entry in std::fs::read_dir("crates").context("read crates directory")? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        let crate_name = entry.file_name().to_string_lossy().to_string();
+        let manifest_path = entry.path().join("Cargo.toml");
+        if !manifest_path.exists() {
+            continue;
+        }
+
+        let manifest = std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("read {}", manifest_path.display()))?;
+        let manifest_value: toml::Value = toml::from_str(&manifest)
+            .with_context(|| format!("parse {}", manifest_path.display()))?;
+
+        for (section, deps) in collect_dependency_tables(&manifest_value) {
+            for dep_name in deps.keys() {
+                if dep_name == "datafusion"
+                    && !allowed_datafusion_crates.contains(crate_name.as_str())
+                {
+                    errors.push(format!(
+                        "{} [{}]: datafusion dependency is only allowed in arco-api/test utility crates",
+                        manifest_path.display(),
+                        section
+                    ));
+                }
+
+                if dep_name == "duckdb" && !section.ends_with("dev-dependencies") {
+                    errors.push(format!(
+                        "{} [{}]: duckdb must be declared only under dev-dependencies",
+                        manifest_path.display(),
+                        section
+                    ));
+                }
+            }
+        }
+    }
+
+    let query_route = std::fs::read_to_string("crates/arco-api/src/routes/query.rs")
+        .context("read crates/arco-api/src/routes/query.rs")?;
+    if !query_route.contains("fn validate_query")
+        || !query_route.contains("DFParser::parse_sql")
+        || !query_route.contains("Only SELECT/CTE queries are supported")
+    {
+        errors.push(
+            "crates/arco-api/src/routes/query.rs: expected explicit SELECT/CTE-only guard"
+                .to_string(),
+        );
+    }
+
+    let query_data_route = std::fs::read_to_string("crates/arco-api/src/routes/query_data.rs")
+        .context("read crates/arco-api/src/routes/query_data.rs")?;
+    if !query_data_route.contains("fn extract_referenced_tables")
+        || !query_data_route.contains("DFParser::parse_sql")
+        || !query_data_route.contains("Only SELECT/CTE queries are supported")
+    {
+        errors.push(
+            "crates/arco-api/src/routes/query_data.rs: expected explicit SELECT/CTE-only guard"
+                .to_string(),
+        );
+    }
+
+    if !errors.is_empty() {
+        println!("Engine boundary errors:");
+        for err in &errors {
+            println!("  - {err}");
+        }
+        anyhow::bail!(
+            "engine-boundary-check failed with {} error(s)",
+            errors.len()
+        );
+    }
+
+    println!("Engine boundaries look good!");
+    Ok(())
+}
+
+fn collect_dependency_tables<'a>(
+    manifest: &'a toml::Value,
+) -> Vec<(String, &'a toml::value::Table)> {
+    let mut sections = Vec::new();
+    let Some(root) = manifest.as_table() else {
+        return sections;
+    };
+
+    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if let Some(table) = root.get(key).and_then(toml::Value::as_table) {
+            sections.push((key.to_string(), table));
+        }
+    }
+
+    if let Some(targets) = root.get("target").and_then(toml::Value::as_table) {
+        for (target_name, target_value) in targets {
+            let Some(target_table) = target_value.as_table() else {
+                continue;
+            };
+
+            for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                if let Some(table) = target_table.get(key).and_then(toml::Value::as_table) {
+                    sections.push((format!("target.{target_name}.{key}"), table));
+                }
+            }
+        }
+    }
+
+    sections
 }
 
 fn run_parity_matrix_check() -> Result<()> {

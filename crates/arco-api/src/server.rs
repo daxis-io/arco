@@ -801,6 +801,7 @@ impl Server {
         self.create_router(None)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate_config(&self) -> Result<()> {
         if !self.config.posture.is_dev() && self.config.debug {
             return Err(arco_core::Error::InvalidInput(

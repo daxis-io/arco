@@ -198,6 +198,15 @@ pub struct TaskOutput {
     /// Output path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_path: Option<String>,
+    /// Delta table identifier for lineage correlation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_table: Option<String>,
+    /// Delta version for lineage correlation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_version: Option<i64>,
+    /// Delta partition for lineage correlation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_partition: Option<String>,
 }
 
 /// Error details from a failed task.
@@ -812,6 +821,9 @@ impl From<TaskOutput> for FlowTaskOutput {
             row_count: output.row_count,
             byte_size: output.byte_size,
             output_path: output.output_path,
+            delta_table: output.delta_table,
+            delta_version: output.delta_version,
+            delta_partition: output.delta_partition,
         }
     }
 }

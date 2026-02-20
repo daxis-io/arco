@@ -43,8 +43,8 @@ use crate::server::AppState;
 use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::{
-    BackfillChunkRow, BackfillRow, FoldState, MicroCompactor, PartitionStatusRow, RunRow,
-    RunState as FoldRunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
+    BackfillChunkRow, BackfillRow, DepResolution, FoldState, MicroCompactor, PartitionStatusRow,
+    RunRow, RunState as FoldRunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
     SensorEvalRow, SensorStateRow, TaskRow, TaskState as FoldTaskState,
 };
 use arco_flow::orchestration::controllers::{PubSubMessage, PushSensorHandler};
@@ -232,6 +232,8 @@ pub struct RerunRunResponse {
     pub parent_run_id: String,
     /// Rerun kind.
     pub rerun_kind: RerunKindResponse,
+    /// Deterministic operator-facing reason for this rerun.
+    pub rerun_reason: String,
 }
 
 /// Request to backfill a `run_key` reservation fingerprint.
@@ -356,6 +358,9 @@ pub struct RunResponse {
     /// Rerun kind (for reruns).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rerun_kind: Option<RerunKindResponse>,
+    /// Deterministic operator-facing reason for rerun creation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerun_reason: Option<String>,
 }
 
 /// Task execution summary.
@@ -380,6 +385,44 @@ pub struct TaskSummary {
     /// Error message (if failed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Deterministic execution lineage reference for successful materializations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_lineage_ref: Option<String>,
+    /// Delta table recorded for this materialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_table: Option<String>,
+    /// Delta version recorded for this materialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_version: Option<i64>,
+    /// Delta partition recorded for this materialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_partition: Option<String>,
+    /// Retry attribution for tasks that consumed retries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_attribution: Option<TaskRetryAttributionResponse>,
+    /// Skip attribution for tasks skipped due to upstream outcomes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_attribution: Option<TaskSkipAttributionResponse>,
+}
+
+/// Retry attribution details for a task.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRetryAttributionResponse {
+    /// Number of retries consumed before current attempt.
+    pub retries: u32,
+    /// Deterministic reason code.
+    pub reason: String,
+}
+
+/// Skip attribution details for a task.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSkipAttributionResponse {
+    /// Upstream task that caused this skip.
+    pub upstream_task_key: String,
+    /// Upstream resolution that propagated the skip.
+    pub upstream_resolution: String,
 }
 
 /// Task state values.
@@ -1063,6 +1106,18 @@ pub struct PartitionStatusApiResponse {
     /// Dimension key-values for the partition.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub partition_values: HashMap<String, String>,
+    /// Delta table recorded for the latest successful materialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_table: Option<String>,
+    /// Delta version recorded for the latest successful materialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_version: Option<i64>,
+    /// Delta partition recorded for the latest successful materialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_partition: Option<String>,
+    /// Deterministic execution lineage reference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_lineage_ref: Option<String>,
 }
 
 /// Response for listing partitions.
@@ -2144,6 +2199,69 @@ fn lineage_from_labels(
     (parent, kind)
 }
 
+fn rerun_reason_for_kind(kind: RerunKindResponse) -> &'static str {
+    match kind {
+        RerunKindResponse::FromFailure => "from_failure_unsucceeded_tasks",
+        RerunKindResponse::Subset => "subset_selection",
+    }
+}
+
+fn task_retry_attribution(task: &TaskRow) -> Option<TaskRetryAttributionResponse> {
+    if task.attempt <= 1 {
+        return None;
+    }
+
+    Some(TaskRetryAttributionResponse {
+        retries: task.attempt.saturating_sub(1),
+        reason: "prior_attempt_failed".to_string(),
+    })
+}
+
+fn dep_resolution_str(resolution: DepResolution) -> &'static str {
+    match resolution {
+        DepResolution::Success => "SUCCESS",
+        DepResolution::Failed => "FAILED",
+        DepResolution::Skipped => "SKIPPED",
+        DepResolution::Cancelled => "CANCELLED",
+    }
+}
+
+fn task_skip_attribution(
+    fold_state: &FoldState,
+    run_id: &str,
+    task: &TaskRow,
+) -> Option<TaskSkipAttributionResponse> {
+    if task.state != FoldTaskState::Skipped {
+        return None;
+    }
+
+    let mut causes: Vec<_> = fold_state
+        .dep_satisfaction
+        .values()
+        .filter(|edge| edge.run_id == run_id && edge.downstream_task_key == task.task_key)
+        .filter_map(|edge| {
+            let resolution = edge.resolution?;
+            if matches!(resolution, DepResolution::Success) {
+                return None;
+            }
+            Some((
+                edge.satisfied_at.map(|t| t.timestamp_millis()).unwrap_or(0),
+                edge.upstream_task_key.clone(),
+                edge.row_version.clone(),
+                resolution,
+            ))
+        })
+        .collect();
+
+    causes.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+
+    let (_, upstream_task_key, _, resolution) = causes.into_iter().next()?;
+    Some(TaskSkipAttributionResponse {
+        upstream_task_key,
+        upstream_resolution: dep_resolution_str(resolution).to_string(),
+    })
+}
+
 fn reject_reserved_lineage_labels(labels: &HashMap<String, String>) -> Result<(), ApiError> {
     let forbidden = [LABEL_PARENT_RUN_ID, LABEL_RERUN_KIND]
         .into_iter()
@@ -2991,6 +3109,32 @@ fn normalize_trigger_run_reservation_result(
     }
 }
 
+fn run_key_conflict_details(
+    existing: &RunKeyReservation,
+    requested_fingerprint: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "conflictType": "RUN_KEY_FINGERPRINT_MISMATCH",
+        "runKey": existing.run_key,
+        "existingRunId": existing.run_id,
+        "existingPlanId": existing.plan_id,
+        "existingFingerprint": existing.request_fingerprint,
+        "requestedFingerprint": requested_fingerprint,
+        "existingCreatedAt": existing.created_at.to_rfc3339(),
+    })
+}
+
+fn run_key_conflict_error(
+    existing: &RunKeyReservation,
+    requested_fingerprint: Option<&str>,
+) -> ApiError {
+    ApiError::conflict(format!(
+        "run_key '{}' already reserved with different trigger payload",
+        existing.run_key
+    ))
+    .with_details(run_key_conflict_details(existing, requested_fingerprint))
+}
+
 fn apply_event_metadata(event: &mut OrchestrationEvent, event_id: &str, timestamp: DateTime<Utc>) {
     event.event_id = event_id.to_string();
     event.timestamp = timestamp;
@@ -3289,6 +3433,10 @@ fn map_partition_status(row: &PartitionStatusRow) -> PartitionStatusApiResponse 
         is_stale: row.stale_since.is_some(),
         stale_reason: row.stale_reason_code.clone(),
         partition_values: row.partition_values.clone(),
+        delta_table: row.delta_table.clone(),
+        delta_version: row.delta_version,
+        delta_partition: row.delta_partition.clone(),
+        execution_lineage_ref: row.execution_lineage_ref.clone(),
     }
 }
 
@@ -3435,10 +3583,10 @@ pub(crate) async fn trigger_run(
                     "run_key reused with different trigger payload (fingerprint mismatch)"
                 );
 
-                return Err(ApiError::conflict(format!(
-                    "run_key '{}' already reserved with different trigger payload",
-                    existing.run_key
-                )));
+                return Err(run_key_conflict_error(
+                    &existing,
+                    request_fingerprint.as_deref(),
+                ));
             }
 
             let mut run_state = RunStateResponse::Pending;
@@ -3582,10 +3730,10 @@ pub(crate) async fn trigger_run(
                             run_id = %existing.run_id,
                             "run_key reused with different trigger payload"
                         );
-                        return Err(ApiError::conflict(format!(
-                            "run_key already reserved with different trigger payload: {}",
-                            existing.run_key
-                        )));
+                        return Err(run_key_conflict_error(
+                            &existing,
+                            request_fingerprint.as_deref(),
+                        ));
                     }
                 } else if existing.request_fingerprint.is_none() && request_fingerprint.is_some() {
                     tracing::warn!(
@@ -3694,10 +3842,10 @@ pub(crate) async fn trigger_run(
                     requested_fingerprint = ?requested_fingerprint,
                     "run_key reused with different trigger payload (fingerprint mismatch)"
                 );
-                return Err(ApiError::conflict(format!(
-                    "run_key '{}' already reserved with different trigger payload",
-                    existing.run_key
-                )));
+                return Err(run_key_conflict_error(
+                    &existing,
+                    requested_fingerprint.as_deref(),
+                ));
             }
         }
     }
@@ -4003,14 +4151,18 @@ pub(crate) async fn rerun_run(
                     created_at: existing.created_at,
                     parent_run_id,
                     rerun_kind,
+                    rerun_reason: rerun_reason_for_kind(rerun_kind).to_string(),
                 }),
             ));
         }
-        ReservationResult::FingerprintMismatch { existing, .. } => {
-            return Err(ApiError::conflict(format!(
-                "run_key '{}' already reserved with different trigger payload",
-                existing.run_key
-            )));
+        ReservationResult::FingerprintMismatch {
+            existing,
+            requested_fingerprint,
+        } => {
+            return Err(run_key_conflict_error(
+                &existing,
+                requested_fingerprint.as_deref(),
+            ));
         }
     };
 
@@ -4044,6 +4196,7 @@ pub(crate) async fn rerun_run(
             created_at: now,
             parent_run_id,
             rerun_kind,
+            rerun_reason: rerun_reason_for_kind(rerun_kind).to_string(),
         }),
     ))
 }
@@ -4371,10 +4524,17 @@ pub(crate) async fn get_run(
             started_at: row.started_at,
             completed_at: row.completed_at,
             error_message: row.error_message.clone(),
+            execution_lineage_ref: row.execution_lineage_ref.clone(),
+            delta_table: row.delta_table.clone(),
+            delta_version: row.delta_version,
+            delta_partition: row.delta_partition.clone(),
+            retry_attribution: task_retry_attribution(row),
+            skip_attribution: task_skip_attribution(&fold_state, &run_id, row),
         })
         .collect::<Vec<_>>();
 
     let (parent_run_id, rerun_kind) = lineage_from_labels(&run.labels);
+    let rerun_reason = rerun_kind.map(|kind| rerun_reason_for_kind(kind).to_string());
 
     let response = RunResponse {
         run_id: run.run_id.clone(),
@@ -4389,6 +4549,7 @@ pub(crate) async fn get_run(
         labels: run.labels.clone(),
         parent_run_id,
         rerun_kind,
+        rerun_reason,
     };
 
     Ok(Json(response))

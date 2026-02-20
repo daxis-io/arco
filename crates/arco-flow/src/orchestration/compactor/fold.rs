@@ -16,6 +16,7 @@ use std::collections::{HashMap, VecDeque};
 
 use chrono::{DateTime, Utc};
 use metrics::counter;
+use serde_json::Value;
 
 use crate::metrics::{labels as metrics_labels, names as metrics_names};
 use crate::orchestration::events::{
@@ -84,6 +85,34 @@ impl TaskState {
 }
 
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Default)]
+struct ExecutionMetadata {
+    materialization_id: Option<String>,
+    delta_table: Option<String>,
+    delta_version: Option<i64>,
+    delta_partition: Option<String>,
+}
+
+fn json_string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    let obj = value.as_object()?;
+    keys.iter()
+        .find_map(|key| obj.get(*key))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn json_i64_field(value: &Value, keys: &[&str]) -> Option<i64> {
+    let obj = value.as_object()?;
+    let raw = keys.iter().find_map(|key| obj.get(*key))?;
+    match raw {
+        Value::Number(num) => num
+            .as_i64()
+            .or_else(|| num.as_u64().and_then(|v| i64::try_from(v).ok())),
+        Value::String(text) => text.parse::<i64>().ok(),
+        _ => None,
+    }
+}
 
 /// Dependency edge resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,6 +392,21 @@ pub struct TaskRow {
     /// Partition key (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partition_key: Option<String>,
+    /// Materialization identifier from worker output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub materialization_id: Option<String>,
+    /// Delta table identifier from execution output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_table: Option<String>,
+    /// Delta version for the successful materialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_version: Option<i64>,
+    /// Delta partition (canonical string) for the successful materialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_partition: Option<String>,
+    /// Deterministic execution lineage reference for operator/API correlation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_lineage_ref: Option<String>,
     /// ULID of last event that modified this row.
     pub row_version: String,
 }
@@ -813,6 +857,18 @@ pub struct PartitionStatusRow {
     /// Dimension key-values for the partition.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub partition_values: HashMap<String, String>,
+    /// Delta table identifier for the latest successful materialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_table: Option<String>,
+    /// Delta version for the latest successful materialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_version: Option<i64>,
+    /// Delta partition for the latest successful materialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_partition: Option<String>,
+    /// Deterministic execution lineage reference for the latest successful materialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_lineage_ref: Option<String>,
     /// ULID of last event that modified this row.
     pub row_version: String,
 }
@@ -1116,7 +1172,9 @@ impl FoldState {
                 attempt,
                 attempt_id,
                 outcome,
+                materialization_id,
                 error_message,
+                output,
                 asset_key,
                 partition_key,
                 code_version,
@@ -1128,7 +1186,9 @@ impl FoldState {
                     *attempt,
                     attempt_id,
                     *outcome,
+                    materialization_id.as_deref(),
                     error_message.clone(),
+                    output.as_ref(),
                     asset_key.as_deref(),
                     partition_key.as_deref(),
                     code_version.as_deref(),
@@ -1546,6 +1606,11 @@ impl FoldState {
                 },
                 asset_key: task_def.asset_key.clone(),
                 partition_key: task_def.partition_key.clone(),
+                materialization_id: None,
+                delta_table: None,
+                delta_version: None,
+                delta_partition: None,
+                execution_lineage_ref: None,
                 row_version: event_id.to_string(),
             };
 
@@ -1636,7 +1701,9 @@ impl FoldState {
         attempt: u32,
         attempt_id: &str,
         outcome: TaskOutcome,
+        materialization_id: Option<&str>,
         error_message: Option<String>,
+        output: Option<&Value>,
         asset_key: Option<&str>,
         partition_key: Option<&str>,
         code_version: Option<&str>,
@@ -1695,6 +1762,19 @@ impl FoldState {
                 }
             }
 
+            if outcome == TaskOutcome::Succeeded {
+                let metadata =
+                    Self::extract_execution_metadata(materialization_id, output, partition_key);
+                let lineage_ref =
+                    Self::build_execution_lineage_ref(run_id, task_key, attempt, &metadata);
+
+                task.materialization_id = metadata.materialization_id.clone();
+                task.delta_table = metadata.delta_table.clone();
+                task.delta_version = metadata.delta_version;
+                task.delta_partition = metadata.delta_partition.clone();
+                task.execution_lineage_ref = Some(lineage_ref.clone());
+            }
+
             // Update run counters
             if new_state.is_terminal() {
                 if let Some(run) = self.runs.get_mut(run_id) {
@@ -1735,6 +1815,13 @@ impl FoldState {
 
                 // Update partition status (P0-5: only on success)
                 if let (Some(asset_key), Some(partition_key)) = (asset_key, partition_key) {
+                    let metadata = Self::extract_execution_metadata(
+                        materialization_id,
+                        output,
+                        Some(partition_key),
+                    );
+                    let lineage_ref =
+                        Self::build_execution_lineage_ref(run_id, task_key, attempt, &metadata);
                     self.update_partition_materialization(
                         tenant_id,
                         workspace_id,
@@ -1742,6 +1829,10 @@ impl FoldState {
                         partition_key,
                         run_id,
                         code_version,
+                        metadata.delta_table.as_deref(),
+                        metadata.delta_version,
+                        metadata.delta_partition.as_deref(),
+                        Some(lineage_ref.as_str()),
                         &timestamp,
                         event_id,
                     );
@@ -2552,6 +2643,83 @@ impl FoldState {
     // Partition Status Tracking (P0-5)
     // ========================================================================
 
+    fn extract_execution_metadata(
+        materialization_id: Option<&str>,
+        output: Option<&Value>,
+        partition_key: Option<&str>,
+    ) -> ExecutionMetadata {
+        let mut metadata = ExecutionMetadata {
+            materialization_id: materialization_id.map(ToString::to_string),
+            ..ExecutionMetadata::default()
+        };
+
+        if let Some(output) = output {
+            if metadata.materialization_id.is_none() {
+                metadata.materialization_id = json_string_field(output, &[
+                    "materializationId",
+                    "materialization_id",
+                ]);
+            }
+
+            metadata.delta_table = json_string_field(output, &["deltaTable", "delta_table"]);
+            metadata.delta_version = json_i64_field(output, &["deltaVersion", "delta_version"]);
+            metadata.delta_partition = json_string_field(
+                output,
+                &["deltaPartition", "delta_partition", "partitionKey", "partition_key"],
+            );
+        }
+
+        if metadata.delta_partition.is_none() {
+            metadata.delta_partition = partition_key.map(ToString::to_string);
+        }
+
+        metadata
+    }
+
+    fn build_execution_lineage_ref(
+        run_id: &str,
+        task_key: &str,
+        attempt: u32,
+        metadata: &ExecutionMetadata,
+    ) -> String {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ExecutionLineageRef<'a> {
+            run_id: &'a str,
+            task_key: &'a str,
+            attempt: u32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            materialization_id: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            delta_table: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            delta_version: Option<i64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            delta_partition: Option<&'a str>,
+        }
+
+        let ref_payload = ExecutionLineageRef {
+            run_id,
+            task_key,
+            attempt,
+            materialization_id: metadata.materialization_id.as_deref(),
+            delta_table: metadata.delta_table.as_deref(),
+            delta_version: metadata.delta_version,
+            delta_partition: metadata.delta_partition.as_deref(),
+        };
+
+        match serde_json::to_string(&ref_payload) {
+            Ok(payload) => payload,
+            Err(_) => format!(
+                "run={run_id};task={task_key};attempt={attempt};delta_version={};delta_partition={}",
+                metadata
+                    .delta_version
+                    .map_or_else(|| "null".to_string(), |v| v.to_string()),
+                metadata.delta_partition.as_deref().unwrap_or("null")
+            ),
+        }
+    }
+
     /// Update partition materialization status on successful task completion.
     /// Per P0-5: Only updates `last_materialization_*` on SUCCESS.
     #[allow(clippy::too_many_arguments)]
@@ -2563,6 +2731,10 @@ impl FoldState {
         partition_key: &str,
         run_id: &str,
         code_version: Option<&str>,
+        delta_table: Option<&str>,
+        delta_version: Option<i64>,
+        delta_partition: Option<&str>,
+        execution_lineage_ref: Option<&str>,
         materialized_at: &DateTime<Utc>,
         event_id: &str,
     ) {
@@ -2583,6 +2755,10 @@ impl FoldState {
                 stale_since: None,
                 stale_reason_code: None,
                 partition_values: HashMap::new(),
+                delta_table: None,
+                delta_version: None,
+                delta_partition: None,
+                execution_lineage_ref: None,
                 // Use empty string so first event always wins
                 row_version: String::new(),
             }
@@ -2598,6 +2774,10 @@ impl FoldState {
         row.last_materialization_run_id = Some(run_id.to_string());
         row.last_materialization_at = Some(*materialized_at);
         row.last_materialization_code_version = code_version.map(ToString::to_string);
+        row.delta_table = delta_table.map(ToString::to_string);
+        row.delta_version = delta_version;
+        row.delta_partition = delta_partition.map(ToString::to_string);
+        row.execution_lineage_ref = execution_lineage_ref.map(ToString::to_string);
         // Clear staleness since we just materialized
         row.stale_since = None;
         row.stale_reason_code = None;
@@ -2635,6 +2815,10 @@ impl FoldState {
                 stale_since: None,
                 stale_reason_code: None,
                 partition_values: HashMap::new(),
+                delta_table: None,
+                delta_version: None,
+                delta_partition: None,
+                execution_lineage_ref: None,
                 // Use empty string so first event always wins
                 row_version: String::new(),
             }
@@ -3650,6 +3834,11 @@ mod tests {
             ready_at: None,
             asset_key: None,
             partition_key: None,
+            materialization_id: None,
+            delta_table: None,
+            delta_version: None,
+            delta_partition: None,
+            execution_lineage_ref: None,
             row_version: row_version.into(),
         }
     }

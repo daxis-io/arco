@@ -89,6 +89,11 @@ fn tasks_schema() -> Arc<Schema> {
         Field::new("ready_at", DataType::Int64, true),
         Field::new("asset_key", DataType::Utf8, true),
         Field::new("partition_key", DataType::Utf8, true),
+        Field::new("materialization_id", DataType::Utf8, true),
+        Field::new("delta_table", DataType::Utf8, true),
+        Field::new("delta_version", DataType::Int64, true),
+        Field::new("delta_partition", DataType::Utf8, true),
+        Field::new("execution_lineage_ref", DataType::Utf8, true),
         Field::new("row_version", DataType::Utf8, false),
     ]))
 }
@@ -206,6 +211,10 @@ fn partition_status_schema() -> Arc<Schema> {
         Field::new("stale_since", DataType::Int64, true),
         Field::new("stale_reason_code", DataType::Utf8, true),
         Field::new("partition_values", DataType::Utf8, true),
+        Field::new("delta_table", DataType::Utf8, true),
+        Field::new("delta_version", DataType::Int64, true),
+        Field::new("delta_partition", DataType::Utf8, true),
+        Field::new("execution_lineage_ref", DataType::Utf8, true),
         Field::new("row_version", DataType::Utf8, false),
     ]))
 }
@@ -580,6 +589,27 @@ pub fn write_tasks(rows: &[TaskRow]) -> Result<Bytes> {
             .map(|r| r.partition_key.as_deref())
             .collect::<Vec<_>>(),
     );
+    let materialization_ids = StringArray::from(
+        rows.iter()
+            .map(|r| r.materialization_id.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let delta_tables = StringArray::from(
+        rows.iter()
+            .map(|r| r.delta_table.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let delta_versions = Int64Array::from(rows.iter().map(|r| r.delta_version).collect::<Vec<_>>());
+    let delta_partitions = StringArray::from(
+        rows.iter()
+            .map(|r| r.delta_partition.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let execution_lineage_refs = StringArray::from(
+        rows.iter()
+            .map(|r| r.execution_lineage_ref.as_deref())
+            .collect::<Vec<_>>(),
+    );
     let row_versions = StringArray::from(
         rows.iter()
             .map(|r| Some(r.row_version.as_str()))
@@ -605,6 +635,11 @@ pub fn write_tasks(rows: &[TaskRow]) -> Result<Bytes> {
             Arc::new(ready_at),
             Arc::new(asset_keys),
             Arc::new(partition_keys),
+            Arc::new(materialization_ids),
+            Arc::new(delta_tables),
+            Arc::new(delta_versions),
+            Arc::new(delta_partitions),
+            Arc::new(execution_lineage_refs),
             Arc::new(row_versions),
         ],
     )
@@ -1188,6 +1223,22 @@ pub fn write_partition_status(rows: &[PartitionStatusRow]) -> Result<Bytes> {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::parquet(format!("failed to serialize partition values: {e}")))?;
     let partition_values = StringArray::from(partition_values);
+    let delta_tables = StringArray::from(
+        rows.iter()
+            .map(|r| r.delta_table.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let delta_versions = Int64Array::from(rows.iter().map(|r| r.delta_version).collect::<Vec<_>>());
+    let delta_partitions = StringArray::from(
+        rows.iter()
+            .map(|r| r.delta_partition.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let execution_lineage_refs = StringArray::from(
+        rows.iter()
+            .map(|r| r.execution_lineage_ref.as_deref())
+            .collect::<Vec<_>>(),
+    );
     let row_versions = StringArray::from(
         rows.iter()
             .map(|r| Some(r.row_version.as_str()))
@@ -1210,6 +1261,10 @@ pub fn write_partition_status(rows: &[PartitionStatusRow]) -> Result<Bytes> {
             Arc::new(stale_since),
             Arc::new(stale_reason_codes),
             Arc::new(partition_values),
+            Arc::new(delta_tables),
+            Arc::new(delta_versions),
+            Arc::new(delta_partitions),
+            Arc::new(execution_lineage_refs),
             Arc::new(row_versions),
         ],
     )
@@ -1908,6 +1963,11 @@ pub fn read_tasks(bytes: &Bytes) -> Result<Vec<TaskRow>> {
         let ready_at = col_i64(&batch, "ready_at")?;
         let asset_key = col_string_opt(&batch, "asset_key");
         let partition_key = col_string_opt(&batch, "partition_key");
+        let materialization_id = col_string_opt(&batch, "materialization_id");
+        let delta_table = col_string_opt(&batch, "delta_table");
+        let delta_version = col_i64_opt(&batch, "delta_version");
+        let delta_partition = col_string_opt(&batch, "delta_partition");
+        let execution_lineage_ref = col_string_opt(&batch, "execution_lineage_ref");
         let row_version = col_string(&batch, "row_version")?;
 
         for row in 0..batch.num_rows() {
@@ -1964,6 +2024,41 @@ pub fn read_tasks(bytes: &Bytes) -> Result<Vec<TaskRow>> {
                     }
                 }),
                 partition_key: partition_key.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                materialization_id: materialization_id.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                delta_table: delta_table.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                delta_version: delta_version.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row))
+                    }
+                }),
+                delta_partition: delta_partition.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                execution_lineage_ref: execution_lineage_ref.as_ref().and_then(|col| {
                     if col.is_null(row) {
                         None
                     } else {
@@ -2335,6 +2430,10 @@ pub fn read_partition_status(bytes: &Bytes) -> Result<Vec<PartitionStatusRow>> {
         let stale_since = col_i64_opt(&batch, "stale_since");
         let stale_reason_code = col_string_opt(&batch, "stale_reason_code");
         let partition_values = col_string_opt(&batch, "partition_values");
+        let delta_table = col_string_opt(&batch, "delta_table");
+        let delta_version = col_i64_opt(&batch, "delta_version");
+        let delta_partition = col_string_opt(&batch, "delta_partition");
+        let execution_lineage_ref = col_string_opt(&batch, "execution_lineage_ref");
         let row_version = col_string(&batch, "row_version")?;
 
         for row in 0..batch.num_rows() {
@@ -2418,6 +2517,34 @@ pub fn read_partition_status(bytes: &Bytes) -> Result<Vec<PartitionStatusRow>> {
                     }
                 }),
                 partition_values,
+                delta_table: delta_table.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                delta_version: delta_version.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row))
+                    }
+                }),
+                delta_partition: delta_partition.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                execution_lineage_ref: execution_lineage_ref.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
                 row_version: row_version.value(row).to_string(),
             });
         }
@@ -3032,6 +3159,12 @@ mod tests {
             stale_since: None,
             stale_reason_code: None,
             partition_values,
+            delta_table: Some("analytics.daily".to_string()),
+            delta_version: Some(42),
+            delta_partition: Some("date=2025-01-15".to_string()),
+            execution_lineage_ref: Some(
+                "{\"runId\":\"run_01\",\"taskKey\":\"analytics.daily\",\"attempt\":1}".to_string(),
+            ),
             row_version: "01HQXYZ789".to_string(),
         }];
 
@@ -3042,6 +3175,8 @@ mod tests {
         assert_eq!(parsed[0].asset_key, "analytics.daily");
         assert_eq!(parsed[0].partition_key, "2025-01-15");
         assert_eq!(parsed[0].last_attempt_outcome, Some(TaskOutcome::Failed));
+        assert_eq!(parsed[0].delta_version, Some(42));
+        assert_eq!(parsed[0].delta_partition.as_deref(), Some("date=2025-01-15"));
         assert_eq!(
             parsed[0].partition_values.get("date").map(String::as_str),
             Some("2025-01-15")
@@ -3168,6 +3303,11 @@ mod tests {
             ready_at: Some(Utc::now()),
             asset_key: Some("analytics.extract".to_string()),
             partition_key: None,
+            materialization_id: Some("mat_01".to_string()),
+            delta_table: Some("analytics.extract".to_string()),
+            delta_version: Some(9),
+            delta_partition: Some("date=2025-01-15".to_string()),
+            execution_lineage_ref: Some("{\"runId\":\"run_01HQXYZ123\"}".to_string()),
             row_version: "01HQXYZ789".to_string(),
         }];
 
@@ -3178,6 +3318,8 @@ mod tests {
         assert_eq!(parsed[0].task_key, "extract");
         assert_eq!(parsed[0].state, TaskState::Ready);
         assert_eq!(parsed[0].asset_key.as_deref(), Some("analytics.extract"));
+        assert_eq!(parsed[0].delta_version, Some(9));
+        assert_eq!(parsed[0].delta_partition.as_deref(), Some("date=2025-01-15"));
         assert!(parsed[0].started_at.is_some());
     }
 
@@ -3445,6 +3587,11 @@ mod tests {
                 Arc::new(Int64Array::from(vec![None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 Arc::new(StringArray::from(vec![Some("01A")])),
             ],
         )
@@ -3497,5 +3644,10 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert!(parsed[0].asset_key.is_none());
         assert!(parsed[0].partition_key.is_none());
+        assert!(parsed[0].materialization_id.is_none());
+        assert!(parsed[0].delta_table.is_none());
+        assert!(parsed[0].delta_version.is_none());
+        assert!(parsed[0].delta_partition.is_none());
+        assert!(parsed[0].execution_lineage_ref.is_none());
     }
 }

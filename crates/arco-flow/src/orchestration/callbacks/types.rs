@@ -157,6 +157,15 @@ pub struct TaskOutput {
     /// Output path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_path: Option<String>,
+    /// Delta table identifier for lineage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_table: Option<String>,
+    /// Delta version for lineage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_version: Option<i64>,
+    /// Delta partition for lineage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_partition: Option<String>,
 }
 
 /// Error details from a failed task.
@@ -440,6 +449,9 @@ mod tests {
                 row_count: Some(1000),
                 byte_size: Some(52428800),
                 output_path: Some("gs://bucket/path".to_string()),
+                delta_table: None,
+                delta_version: None,
+                delta_partition: None,
             }),
             error: None,
             metrics: Some(TaskMetrics {

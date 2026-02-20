@@ -81,6 +81,12 @@ Suggested locations:
 - Tests: `crates/arco-api/tests/orchestration_parity_gates_m1.rs:1398` (`parity_m1_trigger_rejects_reserved_lineage_labels`)
 - CI: `.github/workflows/ci.yml:118` (job `test`: `cargo test -p arco-api --all-features --test orchestration_parity_gates_m1`)
 
+### Q3 operator diagnostics evidence
+- Code: `crates/arco-api/src/routes/orchestration.rs` (`rerun_reason_for_kind`, `task_retry_attribution`, `task_skip_attribution`, run-key conflict detail helpers)
+- Code: `crates/arco-api/src/error.rs` (`details` payload on API errors)
+- Tests: `crates/arco-api/tests/orchestration_parity_gates_m1.rs` (`parity_m1_rerun_from_failure_plans_only_unsucceeded_tasks`, `parity_m1_rerun_subset_respects_include_downstream`, `parity_m1_run_key_conflicts_on_payload_mismatch`)
+- CI: `.github/workflows/ci.yml` (job `test`: `cargo test -p arco-api --all-features --test orchestration_parity_gates_m1`)
+
 ## Operator surface (implemented)
 
 Rust CLI (`arco`):

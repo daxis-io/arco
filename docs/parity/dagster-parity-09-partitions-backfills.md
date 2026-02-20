@@ -77,6 +77,16 @@ CI hook:
 - Backfill operations are durable, idempotent, and auditable.
 - Retry-failed behaves correctly.
 
+## Q3 parity evidence update
+- Backfill lifecycle semantics (pause/resume/cancel) and retry-failed targeting are parity-gated in:
+  - `crates/arco-flow/tests/orchestration_parity_gates_m2.rs`
+  - `parity_m2_backfill_pause_resume_cancel_transitions_are_monotonic`
+  - `parity_m2_retry_failed_only_targets_failed_partitions_deterministically`
+- Cross-flow consistency (schedule/sensor/backfill/manual reexecution run-key behavior) is covered by:
+  - `parity_m2_schedule_sensor_backfill_and_manual_reexecution_share_run_key_consistency`
+- CI evidence:
+  - `.github/workflows/ci.yml` (job `test`: `cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m2`)
+
 ## Risks / Edge Cases
 - Very large partition ranges (chunking must remain bounded and efficient).
 - Duplicate chunk planning and replay safety.

@@ -52,6 +52,7 @@ pub mod storage_keys;
 pub mod storage_traits;
 pub mod sync_compact;
 pub mod table_format;
+pub mod task_tokens;
 pub mod tenant;
 
 /// Prelude module for convenient imports.
@@ -85,6 +86,11 @@ pub mod prelude {
     };
     pub use crate::sync_compact::{SyncCompactRequest, SyncCompactResponse};
     pub use crate::table_format::TableFormat;
+    pub use crate::task_tokens::{
+        DEFAULT_DISPATCH_TASK_TIMEOUT_SECONDS, DEFAULT_TASK_TOKEN_TTL_SECONDS,
+        MAX_TASK_TOKEN_TTL_SECONDS, MintedTaskToken, TASK_TOKEN_CALLBACK_GRACE_SECONDS,
+        TaskTokenClaims, TaskTokenConfig, decode_task_token, mint_task_token,
+    };
     pub use crate::tenant::TenantId;
 }
 
@@ -106,4 +112,9 @@ pub use storage::{
 };
 pub use sync_compact::{SyncCompactRequest, SyncCompactResponse};
 pub use table_format::TableFormat;
+pub use task_tokens::{
+    DEFAULT_DISPATCH_TASK_TIMEOUT_SECONDS, DEFAULT_TASK_TOKEN_TTL_SECONDS,
+    MAX_TASK_TOKEN_TTL_SECONDS, MintedTaskToken, TASK_TOKEN_CALLBACK_GRACE_SECONDS,
+    TaskTokenClaims, TaskTokenConfig, decode_task_token, mint_task_token,
+};
 pub use tenant::TenantId;

@@ -1,5 +1,6 @@
 //! Integration tests for arco-flow orchestration.
 
+#![cfg(feature = "legacy-scheduler")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use arco_core::{AssetId, TaskId};

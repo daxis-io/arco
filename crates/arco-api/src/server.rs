@@ -132,10 +132,8 @@ impl AppState {
         }
 
         let rate_limit = Arc::new(RateLimitState::new(config.rate_limit.clone()));
-        let compactor_auth = config.compactor_auth.clone();
         let sync_compactor = config.compactor_url.as_ref().map(|url| {
-            let client: Arc<dyn SyncCompactor> =
-                Arc::new(CompactorClient::new(url.clone(), compactor_auth.clone()));
+            let client: Arc<dyn SyncCompactor> = Arc::new(CompactorClient::new(url.clone()));
             client
         });
         let audit = audit_emitter.unwrap_or_else(|| Arc::new(AuditEmitter::with_tracing()));
@@ -169,10 +167,8 @@ impl AppState {
             );
         }
 
-        let compactor_auth = config.compactor_auth.clone();
         let sync_compactor = config.compactor_url.as_ref().map(|url| {
-            let client: Arc<dyn SyncCompactor> =
-                Arc::new(CompactorClient::new(url.clone(), compactor_auth.clone()));
+            let client: Arc<dyn SyncCompactor> = Arc::new(CompactorClient::new(url.clone()));
             client
         });
         Self {
@@ -329,15 +325,25 @@ async fn unity_catalog_auth_middleware(
     }
 
     let (mut parts, body) = req.into_parts();
+    let resource = parts.uri.path().to_string();
     let request_id = crate::context::request_id_from_headers(&parts.headers)
         .unwrap_or_else(|| ulid::Ulid::new().to_string());
 
     let ctx = match RequestContext::from_request_parts(&mut parts, &state).await {
         Ok(ctx) => ctx,
         Err(err) => {
+            let reason = if err.code() == "MISSING_AUTH" {
+                crate::audit::REASON_MISSING_TOKEN
+            } else {
+                crate::audit::REASON_INVALID_TOKEN
+            };
+            let audit_request_id = err.request_id().unwrap_or(&request_id);
+            crate::audit::emit_auth_deny(&state, audit_request_id, &resource, reason);
             return api_error_to_unity_catalog_response(&err, Some(&request_id));
         }
     };
+
+    crate::audit::emit_auth_allow(&state, &ctx, &resource);
 
     let uc_ctx = UnityCatalogRequestContext {
         tenant: ctx.tenant.clone(),
@@ -410,7 +416,6 @@ fn api_error_to_unity_catalog_response(
         }
         StatusCode::NOT_IMPLEMENTED => UnityCatalogError::NotImplemented { message },
         StatusCode::SERVICE_UNAVAILABLE => UnityCatalogError::ServiceUnavailable { message },
-        StatusCode::TOO_MANY_REQUESTS => UnityCatalogError::TooManyRequests { message },
         _ => UnityCatalogError::Internal { message },
     };
 
@@ -505,17 +510,11 @@ impl Server {
 
         let auth_layer =
             middleware::from_fn_with_state(Arc::clone(&state), crate::context::auth_middleware);
-        let uc_auth_layer =
-            middleware::from_fn_with_state(Arc::clone(&state), crate::context::auth_middleware);
         let task_auth_layer = middleware::from_fn_with_state(
             Arc::clone(&state),
             crate::routes::tasks::task_auth_middleware,
         );
         let rate_limit_layer = middleware::from_fn_with_state(
-            Arc::clone(&state.rate_limit),
-            crate::rate_limit::rate_limit_middleware,
-        );
-        let uc_rate_limit_layer = middleware::from_fn_with_state(
             Arc::clone(&state.rate_limit),
             crate::rate_limit::rate_limit_middleware,
         );
@@ -548,13 +547,6 @@ impl Server {
                     .route_layer(task_rate_limit_layer)
                     .layer(task_auth_layer),
             );
-
-        router = router.nest(
-            "/_uc/api/2.1/unity-catalog",
-            crate::routes::uc::routes()
-                .route_layer(uc_rate_limit_layer)
-                .layer(uc_auth_layer),
-        );
 
         // Mount Iceberg REST Catalog if enabled
         // Uses nest_service since Iceberg router has its own state type
@@ -809,6 +801,7 @@ impl Server {
         self.create_router(None)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate_config(&self) -> Result<()> {
         if !self.config.posture.is_dev() && self.config.debug {
             return Err(arco_core::Error::InvalidInput(
@@ -840,10 +833,6 @@ impl Server {
             return Err(arco_core::Error::InvalidInput(
                 "ARCO_COMPACTOR_URL is required when ARCO_DEBUG=false".to_string(),
             ));
-        }
-
-        if self.config.compactor_url.is_some() {
-            self.config.compactor_auth.validate(self.config.debug)?;
         }
 
         if self.config.iceberg.enabled
@@ -895,6 +884,39 @@ impl Server {
                 {
                     return Err(arco_core::Error::InvalidInput(
                         "jwt.audience is required when debug=false and posture!=dev".to_string(),
+                    ));
+                }
+            }
+
+            self.config.task_token.validate().map_err(|err| {
+                arco_core::Error::InvalidInput(format!(
+                    "task token config invalid when debug=false: {err}"
+                ))
+            })?;
+
+            if !self.config.posture.is_dev() {
+                if self
+                    .config
+                    .task_token
+                    .issuer
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    return Err(arco_core::Error::InvalidInput(
+                        "task_token.issuer is required when debug=false and posture!=dev"
+                            .to_string(),
+                    ));
+                }
+                if self
+                    .config
+                    .task_token
+                    .audience
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    return Err(arco_core::Error::InvalidInput(
+                        "task_token.audience is required when debug=false and posture!=dev"
+                            .to_string(),
                     ));
                 }
             }
@@ -1034,7 +1056,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    use crate::config::{CompactorAuthMode, Posture};
+    use crate::config::Posture;
 
     #[test]
     fn test_posture_allows_debug_in_dev() -> Result<()> {
@@ -1066,6 +1088,9 @@ mod tests {
         builder.config.storage.bucket = Some("test-bucket".to_string());
         builder.config.compactor_url = Some("http://compactor:8081".to_string());
         builder.config.jwt.hs256_secret = Some("test-secret".to_string());
+        builder.config.task_token.hs256_secret = "task-secret".to_string();
+        builder.config.task_token.issuer = Some("task-issuer".to_string());
+        builder.config.task_token.audience = Some("task-audience".to_string());
     }
 
     #[test]
@@ -1144,38 +1169,35 @@ mod tests {
     }
 
     #[test]
-    fn test_static_bearer_mode_requires_token() {
+    fn test_posture_requires_task_token_issuer_outside_dev() {
         let mut builder = ServerBuilder::new();
         configure_non_dev_jwt(&mut builder);
         builder.config.jwt.issuer = Some("test-issuer".to_string());
         builder.config.jwt.audience = Some("test-audience".to_string());
-        builder.config.compactor_auth.mode = CompactorAuthMode::StaticBearer;
-        builder.config.compactor_auth.static_bearer_token = None;
+        builder.config.task_token.issuer = None;
 
         let server = builder.build();
         let err = server.validate_config().unwrap_err();
         let arco_core::Error::InvalidInput(message) = err else {
             panic!("unexpected error: {err:?}");
         };
-        assert!(message.contains("ARCO_COMPACTOR_AUTH_STATIC_BEARER_TOKEN"));
+        assert!(message.contains("task_token.issuer"));
     }
 
     #[test]
-    fn test_metadata_override_requires_debug_mode() {
+    fn test_posture_requires_task_token_audience_outside_dev() {
         let mut builder = ServerBuilder::new();
         configure_non_dev_jwt(&mut builder);
         builder.config.jwt.issuer = Some("test-issuer".to_string());
         builder.config.jwt.audience = Some("test-audience".to_string());
-        builder.config.compactor_auth.mode = CompactorAuthMode::GcpIdToken;
-        builder.config.compactor_auth.metadata_url =
-            Some("http://127.0.0.1:8181/token".to_string());
+        builder.config.task_token.audience = None;
 
         let server = builder.build();
         let err = server.validate_config().unwrap_err();
         let arco_core::Error::InvalidInput(message) = err else {
             panic!("unexpected error: {err:?}");
         };
-        assert!(message.contains("ARCO_COMPACTOR_GCP_METADATA_URL"));
+        assert!(message.contains("task_token.audience"));
     }
 
     #[tokio::test]
@@ -1264,7 +1286,7 @@ mod tests {
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok());
-        assert!(content_type.is_some_and(|value| value.starts_with("application/json")));
+        assert!(content_type.map_or(false, |value| value.starts_with("application/json")));
 
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -1309,202 +1331,6 @@ mod tests {
         Ok(())
     }
 
-    const UC_IMPLEMENTED_OPERATIONS: &[(&str, &str, StatusCode, Option<&str>)] = &[
-        (
-            "GET",
-            "/api/2.1/unity-catalog/catalogs",
-            StatusCode::OK,
-            None,
-        ),
-        (
-            "POST",
-            "/api/2.1/unity-catalog/catalogs",
-            StatusCode::BAD_REQUEST,
-            Some("BAD_REQUEST"),
-        ),
-        (
-            "GET",
-            "/api/2.1/unity-catalog/schemas",
-            StatusCode::BAD_REQUEST,
-            Some("BAD_REQUEST"),
-        ),
-        (
-            "POST",
-            "/api/2.1/unity-catalog/schemas",
-            StatusCode::BAD_REQUEST,
-            Some("BAD_REQUEST"),
-        ),
-        (
-            "GET",
-            "/api/2.1/unity-catalog/tables",
-            StatusCode::BAD_REQUEST,
-            Some("BAD_REQUEST"),
-        ),
-        (
-            "POST",
-            "/api/2.1/unity-catalog/tables",
-            StatusCode::BAD_REQUEST,
-            Some("BAD_REQUEST"),
-        ),
-    ];
-
-    const UC_SCAFFOLDED_OPERATIONS: &[(&str, &str)] = &[
-        ("GET", "/api/2.1/unity-catalog/delta/preview/commits"),
-        ("POST", "/api/2.1/unity-catalog/delta/preview/commits"),
-        ("POST", "/api/2.1/unity-catalog/temporary-table-credentials"),
-        ("POST", "/api/2.1/unity-catalog/temporary-path-credentials"),
-    ];
-
-    fn build_uc_request(
-        method: &str,
-        uri: &str,
-        include_scope_headers: bool,
-    ) -> Result<Request<Body>> {
-        let mut builder = Request::builder().method(method).uri(uri);
-        if include_scope_headers {
-            builder = builder
-                .header("X-Tenant-Id", "t1")
-                .header("X-Workspace-Id", "w1");
-        }
-        if method == "POST" {
-            builder = builder.header(header::CONTENT_TYPE, "application/json");
-            return builder.body(Body::from("{}")).context("build request");
-        }
-        builder.body(Body::empty()).context("build request")
-    }
-
-    #[tokio::test]
-    async fn test_unity_catalog_openapi_is_public() -> Result<()> {
-        let mut builder = ServerBuilder::new();
-        builder.config.debug = true;
-        builder.config.unity_catalog.enabled = true;
-        let server = builder.build();
-        let router = server.test_router();
-
-        let request = Request::builder()
-            .uri("/api/2.1/unity-catalog/openapi.json")
-            .body(Body::empty())
-            .context("build request")?;
-
-        let response = router.oneshot(request).await.map_err(|err| match err {})?;
-        assert_eq!(response.status(), StatusCode::OK);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_unity_catalog_requires_tenant_workspace_headers() -> Result<()> {
-        let mut builder = ServerBuilder::new();
-        builder.config.debug = true;
-        builder.config.unity_catalog.enabled = true;
-        let server = builder.build();
-        let router = server.test_router();
-
-        for &(method, uri, _, _) in UC_IMPLEMENTED_OPERATIONS {
-            let request = build_uc_request(method, uri, false)?;
-            let response = router
-                .clone()
-                .oneshot(request)
-                .await
-                .map_err(|err| match err {})?;
-            assert_eq!(
-                response.status(),
-                StatusCode::UNAUTHORIZED,
-                "expected unauthorized for {method} {uri}"
-            );
-
-            let body = axum::body::to_bytes(response.into_body(), 2048)
-                .await
-                .context("read response body")?;
-            let payload: serde_json::Value =
-                serde_json::from_slice(&body).context("parse JSON body")?;
-            let error = payload.get("error").context("missing error field")?;
-            assert_eq!(
-                error.get("error_code").and_then(|value| value.as_str()),
-                Some("UNAUTHORIZED"),
-                "expected UNAUTHORIZED for {method} {uri}"
-            );
-        }
-
-        for &(method, uri) in UC_SCAFFOLDED_OPERATIONS {
-            let request = build_uc_request(method, uri, false)?;
-            let response = router
-                .clone()
-                .oneshot(request)
-                .await
-                .map_err(|err| match err {})?;
-            assert_eq!(
-                response.status(),
-                StatusCode::UNAUTHORIZED,
-                "expected unauthorized for {method} {uri}"
-            );
-
-            let body = axum::body::to_bytes(response.into_body(), 2048)
-                .await
-                .context("read response body")?;
-            let payload: serde_json::Value =
-                serde_json::from_slice(&body).context("parse JSON body")?;
-            let error = payload.get("error").context("missing error field")?;
-            assert_eq!(
-                error.get("error_code").and_then(|value| value.as_str()),
-                Some("UNAUTHORIZED"),
-                "expected UNAUTHORIZED for {method} {uri}"
-            );
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_unity_catalog_preview_routes_are_mounted() -> Result<()> {
-        let mut builder = ServerBuilder::new();
-        builder.config.debug = true;
-        builder.config.unity_catalog.enabled = true;
-        let server = builder.build();
-        let router = server.test_router();
-
-        for &(method, uri, expected_status, expected_error_code) in UC_IMPLEMENTED_OPERATIONS {
-            let request = build_uc_request(method, uri, true)?;
-            let response = router
-                .clone()
-                .oneshot(request)
-                .await
-                .map_err(|err| match err {})?;
-            assert_eq!(
-                response.status(),
-                expected_status,
-                "unexpected status for {method} {uri}"
-            );
-
-            let body = axum::body::to_bytes(response.into_body(), 2048)
-                .await
-                .context("read response body")?;
-            let payload: serde_json::Value =
-                serde_json::from_slice(&body).context("parse JSON body")?;
-            if let Some(expected_error_code) = expected_error_code {
-                let error = payload.get("error").context("missing error field")?;
-                assert_eq!(
-                    error.get("error_code").and_then(|value| value.as_str()),
-                    Some(expected_error_code),
-                    "unexpected error code for {method} {uri}"
-                );
-            }
-        }
-
-        for &(method, uri) in UC_SCAFFOLDED_OPERATIONS {
-            let request = build_uc_request(method, uri, true)?;
-            let response = router
-                .clone()
-                .oneshot(request)
-                .await
-                .map_err(|err| match err {})?;
-            assert_ne!(
-                response.status(),
-                StatusCode::NOT_FOUND,
-                "expected preview route mount for {method} {uri}"
-            );
-        }
-        Ok(())
-    }
-
     #[tokio::test]
     async fn test_iceberg_disabled_by_default() -> Result<()> {
         let server = ServerBuilder::new().build();
@@ -1519,33 +1345,6 @@ mod tests {
 
         // When Iceberg is disabled, the route should not exist (404)
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_unity_catalog_error_mapping_preserves_429() -> Result<()> {
-        let err = ApiError::from_status_and_message(429, "rate limited").with_request_id("req-429");
-        let response = api_error_to_unity_catalog_response(&err, None);
-
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        let request_id = response
-            .headers()
-            .get("x-request-id")
-            .and_then(|value| value.to_str().ok());
-        assert_eq!(request_id, Some("req-429"));
-
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .context("read response body")?;
-        let payload: serde_json::Value =
-            serde_json::from_slice(&body).context("parse JSON body")?;
-        assert_eq!(
-            payload
-                .get("error")
-                .and_then(|error| error.get("error_code"))
-                .and_then(serde_json::Value::as_str),
-            Some("TOO_MANY_REQUESTS")
-        );
         Ok(())
     }
 }

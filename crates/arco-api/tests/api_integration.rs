@@ -2462,3 +2462,71 @@ mod idempotency {
         Ok(())
     }
 }
+
+mod query_read_only {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct QueryError {
+        message: String,
+    }
+
+    #[tokio::test]
+    async fn test_query_endpoint_rejects_write_statements() -> Result<()> {
+        let router = test_router();
+        let statements = [
+            "INSERT INTO catalog.tables VALUES (1)",
+            "UPDATE catalog.tables SET name = 'x'",
+            "DELETE FROM catalog.tables",
+            "CREATE TABLE t(id INT)",
+        ];
+
+        for statement in statements {
+            let (status, error): (_, QueryError) = helpers::post_json(
+                router.clone(),
+                "/api/v1/query?format=json",
+                serde_json::json!({ "sql": statement }),
+            )
+            .await?;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                error
+                    .message
+                    .contains("Only SELECT/CTE queries are supported")
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_query_data_endpoint_rejects_write_statements() -> Result<()> {
+        let router = test_router();
+        let statements = [
+            "INSERT INTO analytics.sales.orders VALUES (1)",
+            "UPDATE analytics.sales.orders SET id = 2",
+            "DELETE FROM analytics.sales.orders",
+            "DROP TABLE analytics.sales.orders",
+        ];
+
+        for statement in statements {
+            let (status, error): (_, QueryError) = helpers::post_json(
+                router.clone(),
+                "/api/v1/query-data?format=json",
+                serde_json::json!({ "sql": statement }),
+            )
+            .await?;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                error
+                    .message
+                    .contains("Only SELECT/CTE queries are supported")
+            );
+        }
+
+        Ok(())
+    }
+}

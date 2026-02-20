@@ -1,5 +1,0 @@
-[UTC] 2026-02-15T16:24:07Z
-[CMD] promtool test rules "/Users/ethanurbanski/arco/.worktrees/codex-prod-go-closure-batch3/release_evidence/2026-02-12-prod-readiness/gate-4/observability/observability_gate4_alert_drill.test.yaml"
-  SUCCESS
-
-[EXIT] 0

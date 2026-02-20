@@ -1,5 +1,0 @@
-# command: missing=0; for t in k6 vegeta locust; do if command -v "$t" >/dev/null 2>&1; then echo "$t:present"; else echo "$t:missing"; missing=1; fi; done; exit $missing
-# start_utc: 2026-02-15T18:22:28Z
-k6:missing
-vegeta:missing
-locust:missing

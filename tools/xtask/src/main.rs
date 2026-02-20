@@ -4,7 +4,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::path::Path;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -49,6 +50,8 @@ enum Commands {
     Doctor,
     /// Check ADR conformance
     AdrCheck,
+    /// Enforce repository hygiene invariants
+    RepoHygieneCheck,
     /// Verify catalog integrity (schemas, golden files, workspace checks)
     VerifyIntegrity {
         /// Show detailed output
@@ -84,6 +87,7 @@ fn main() -> Result<()> {
         Commands::Coverage => run_coverage(),
         Commands::Doctor => run_doctor(),
         Commands::AdrCheck => run_adr_check(),
+        Commands::RepoHygieneCheck => run_repo_hygiene_check(),
         Commands::ParityMatrixCheck => run_parity_matrix_check(),
         Commands::UcOpenapiInventory => run_uc_openapi_inventory(),
         Commands::VerifyIntegrity {
@@ -102,7 +106,7 @@ fn run_uc_openapi_inventory() -> Result<()> {
     type OperationsByTag = HashMap<String, Vec<OperationEntry>>;
 
     let spec_path = Path::new("crates/arco-uc/tests/fixtures/unitycatalog-openapi.yaml");
-    let output_path = Path::new("docs/plans/2026-02-04-unity-catalog-openapi-inventory.md");
+    let output_path = Path::new("docs/guide/src/reference/unity-catalog-openapi-inventory.md");
 
     let yaml = std::fs::read_to_string(spec_path)
         .with_context(|| format!("read UC OpenAPI fixture at {}", spec_path.display()))?;
@@ -287,6 +291,7 @@ fn run_ci() -> Result<()> {
     run_doctor()?;
     run_adr_check()?;
     run_parity_matrix_check()?;
+    run_repo_hygiene_check()?;
 
     run_cmd("cargo", &["check", "--workspace", "--all-features"])?;
     run_cmd("cargo", &["fmt", "--all", "--check"])?;
@@ -329,6 +334,216 @@ fn run_ci() -> Result<()> {
 
     println!("\nAll CI checks passed!");
     Ok(())
+}
+
+fn run_repo_hygiene_check() -> Result<()> {
+    println!("Running repository hygiene checks...\n");
+
+    let mut errors = Vec::new();
+    errors.extend(check_mdbook_summary_refs(Path::new(
+        "docs/guide/src/SUMMARY.md",
+    ))?);
+
+    let forbidden_paths = forbidden_path_markers();
+    for path in tracked_files()? {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("read tracked file at {path}"));
+            }
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+
+        for term in scan_text_for_banned_terms(&text) {
+            errors.push(format!("{path}: banned term '{term}'"));
+        }
+
+        let lower = text.to_ascii_lowercase();
+        for marker in &forbidden_paths {
+            if lower.contains(marker) {
+                errors.push(format!("{path}: forbidden path reference '{marker}'"));
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        println!("Repository hygiene errors:");
+        for err in &errors {
+            println!("  - {err}");
+        }
+        anyhow::bail!(
+            "repository hygiene check failed with {} issue(s)",
+            errors.len()
+        );
+    }
+
+    println!("Repository hygiene checks passed!");
+    Ok(())
+}
+
+fn tracked_files() -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .args(["ls-files"])
+        .output()
+        .context("run `git ls-files` for tracked file enumeration")?;
+    if !output.status.success() {
+        anyhow::bail!("`git ls-files` failed while enumerating tracked files");
+    }
+
+    let stdout =
+        String::from_utf8(output.stdout).context("parse `git ls-files` output as UTF-8")?;
+    Ok(stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn check_mdbook_summary_refs(summary_path: &Path) -> Result<Vec<String>> {
+    let summary = std::fs::read_to_string(summary_path)
+        .with_context(|| format!("read {}", summary_path.display()))?;
+    let summary_dir = summary_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let mut errors = Vec::new();
+    for raw_link in extract_summary_links(&summary) {
+        let link = raw_link.split('#').next().unwrap_or("").trim();
+        if link.is_empty() {
+            continue;
+        }
+        if link.starts_with("http://")
+            || link.starts_with("https://")
+            || link.starts_with("mailto:")
+            || !link.ends_with(".md")
+        {
+            continue;
+        }
+
+        let resolved = summary_dir.join(link);
+        if !resolved.is_file() {
+            errors.push(format!(
+                "{}: broken SUMMARY reference '{}'",
+                summary_path.display(),
+                raw_link
+            ));
+        }
+    }
+
+    Ok(errors)
+}
+
+fn extract_summary_links(text: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    for line in text.lines() {
+        let mut rest = line;
+        while let Some(start) = rest.find("](") {
+            let after = &rest[start + 2..];
+            let Some(end) = after.find(')') else {
+                break;
+            };
+            links.push(after[..end].to_string());
+            rest = &after[end + 1..];
+        }
+    }
+    links
+}
+
+fn forbidden_path_markers() -> [String; 3] {
+    [
+        format!("{}/{}/", "docs", "plans"),
+        format!("{}_{}/", "release", "evidence"),
+        format!("{}/{}/{}/", "docs", "catalog-metastore", "evidence"),
+    ]
+}
+
+fn banned_term_tokens() -> [String; 7] {
+    let ai_suffix: String = ['a', 'i'].into_iter().collect();
+    let legacy_agent_token = ["super", "powers"].concat();
+    [
+        ["co", "dex"].concat(),
+        ["cla", "ude"].concat(),
+        ["g", "pt"].concat(),
+        format!("open{ai_suffix}"),
+        ["anth", "ropic"].concat(),
+        legacy_agent_token.clone(),
+        format!("/{legacy_agent_token}"),
+    ]
+}
+
+fn scan_text_for_banned_terms(text: &str) -> Vec<String> {
+    let mut hits = Vec::new();
+    let lower = text.to_ascii_lowercase();
+    for term in banned_term_tokens() {
+        let contains = if term.starts_with('/') {
+            lower.contains(&term)
+        } else {
+            contains_word_term(&lower, &term)
+        };
+        if contains {
+            hits.push(term);
+        }
+    }
+
+    if contains_standalone_ai(text) {
+        let short_token: String = ['a', 'i'].into_iter().collect();
+        hits.push(short_token);
+    }
+
+    hits
+}
+
+fn contains_word_term(lower_text: &str, term: &str) -> bool {
+    if term.is_empty() {
+        return false;
+    }
+
+    let text_bytes = lower_text.as_bytes();
+    let mut start = 0usize;
+    while let Some(found) = lower_text[start..].find(term) {
+        let idx = start + found;
+        let term_end = idx + term.len();
+
+        let prev_is_word = idx > 0 && is_word_byte(text_bytes[idx - 1]);
+        let next_is_word = term_end < text_bytes.len() && is_word_byte(text_bytes[term_end]);
+        if !prev_is_word && !next_is_word {
+            return true;
+        }
+
+        start = idx + 1;
+    }
+
+    false
+}
+
+fn contains_standalone_ai(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 {
+        return false;
+    }
+
+    for idx in 0..(bytes.len() - 1) {
+        if !bytes[idx].eq_ignore_ascii_case(&b'a') || !bytes[idx + 1].eq_ignore_ascii_case(&b'i') {
+            continue;
+        }
+
+        let prev_is_word = idx > 0 && is_word_byte(bytes[idx - 1]);
+        let next_is_word = idx + 2 < bytes.len() && is_word_byte(bytes[idx + 2]);
+        if !prev_is_word && !next_is_word {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn run_lint() -> Result<()> {
@@ -636,10 +851,11 @@ fn run_parity_matrix_check() -> Result<()> {
             errors.push(format!("{location}: missing Evidence (CI)"));
         }
 
+        let legacy_plans_marker = format!("{}/{}/", "docs", "plans");
         for field in [code, tests, ci] {
-            if field.contains("docs/plans/") {
+            if field.contains(&legacy_plans_marker) {
                 errors.push(format!(
-                    "{location}: contains forbidden docs/plans reference in evidence"
+                    "{location}: contains forbidden legacy planning reference in evidence"
                 ));
             }
         }
@@ -1889,4 +2105,71 @@ fn run_cmd_with_env(cmd: &str, args: &[&str], env: &[(&str, &str)]) -> Result<()
         anyhow::bail!("Command failed: {} {}", cmd, args.join(" "));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standalone_ai_detection_requires_word_boundaries() {
+        let ai_upper: String = ['A', 'I'].into_iter().collect();
+        let ai_lower: String = ['a', 'i'].into_iter().collect();
+
+        assert!(contains_standalone_ai(&format!("{ai_upper} policy")));
+        assert!(contains_standalone_ai(&format!("this is {ai_lower}.")));
+        assert!(!contains_standalone_ai("said"));
+        assert!(!contains_standalone_ai("rail"));
+    }
+
+    #[test]
+    fn banned_term_scan_finds_vendor_tokens_case_insensitively() {
+        let ai_title: String = ['A', 'I'].into_iter().collect();
+        let ai_lower: String = ['a', 'i'].into_iter().collect();
+        let vendor = format!("Open{ai_title}");
+        let model = ["g", "Pt"].concat();
+        let openai_lower = format!("open{ai_lower}");
+        let gpt_lower = ["g", "pt"].concat();
+
+        let hits = scan_text_for_banned_terms(&format!("{vendor} and {model} are forbidden."));
+        assert!(hits.iter().any(|hit| hit.contains(&openai_lower)));
+        assert!(hits.iter().any(|hit| hit.contains(&gpt_lower)));
+    }
+
+    #[test]
+    fn banned_term_scan_avoids_substring_false_positives() {
+        let tag_word = ["ta", "gp", "tr"].concat();
+        let hits = scan_text_for_banned_terms(&format!("dependency name: {tag_word}"));
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn summary_link_parser_extracts_md_links() {
+        let summary = "- [Intro](./intro.md)\n- [API](reference/api.md)\n";
+        let links = extract_summary_links(summary);
+        assert_eq!(
+            links,
+            vec!["./intro.md".to_string(), "reference/api.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn forbidden_path_markers_include_removed_evidence_tree() {
+        let markers = forbidden_path_markers();
+        let catalog_evidence = format!("{}/{}/{}/", "docs", "catalog-metastore", "evidence");
+        let plans = format!("{}/{}/", "docs", "plans");
+        let release_evidence = format!("{}_{}/", "release", "evidence");
+        assert!(
+            markers.iter().any(|marker| marker == &catalog_evidence),
+            "expected removed catalog evidence tree to be blocked"
+        );
+        assert!(
+            markers.iter().any(|marker| marker == &plans),
+            "expected removed planning tree to be blocked"
+        );
+        assert!(
+            markers.iter().any(|marker| marker == &release_evidence),
+            "expected removed release evidence tree to be blocked"
+        );
+    }
 }

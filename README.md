@@ -4,7 +4,7 @@
 
 **Serverless lakehouse infrastructure** - A file-native catalog and execution-first orchestration layer for modern data platforms.
 
-[![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](LICENSE-APACHE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 ![Status](https://img.shields.io/badge/status-incubating-yellow.svg)
 
@@ -123,12 +123,11 @@ For security vulnerabilities, please see [SECURITY.md](SECURITY.md).
 
 ## License
 
-Licensed under either of:
+Licensed under the Apache License, Version 2.0.
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT License ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.
+- License text: [LICENSE-APACHE](LICENSE-APACHE)
+- Project license notice: [LICENSE](LICENSE)
+- Attribution notice: [NOTICE](NOTICE)
 
 ## Acknowledgments
 

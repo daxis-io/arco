@@ -1,9 +1,0 @@
-# command: rg -n "query|mutation|discover|/api/v1/query|admin" crates/arco-api/tests/api_integration.rs crates/arco-api/tests/openapi_contract.rs crates/arco-api/tests/openapi_orchestration_routes.rs | head -n 60
-# start_utc: 2026-02-15T18:26:30Z
-crates/arco-api/tests/api_integration.rs:1650:mod query {
-crates/arco-api/tests/api_integration.rs:1686:    async fn test_query_returns_arrow_stream() -> Result<()> {
-crates/arco-api/tests/api_integration.rs:1691:            "/api/v1/query",
-crates/arco-api/tests/api_integration.rs:1722:    async fn test_query_returns_json_format() -> Result<()> {
-crates/arco-api/tests/api_integration.rs:1727:            "/api/v1/query?format=json",
-crates/arco-api/tests/api_integration.rs:1755:    async fn test_query_rejects_non_select() -> Result<()> {
-crates/arco-api/tests/api_integration.rs:1760:            "/api/v1/query",

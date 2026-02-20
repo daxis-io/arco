@@ -1,5 +1,0 @@
-# command: rg -n "No credentials in code|Rotate credentials regularly|Secrets managed" SECURITY.md
-# start_utc: 2026-02-15T18:23:51Z
-59:- No credentials in code or configuration files
-60:- Secrets managed through environment variables or secret managers
-77:3. Rotate credentials regularly

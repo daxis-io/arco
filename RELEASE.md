@@ -24,9 +24,13 @@ For each release tag `vX.Y.Z`:
 Run from repository root unless noted:
 
 ```bash
+cargo xtask doctor
+cargo xtask verify-integrity
 cargo xtask repo-hygiene-check
 cargo xtask adr-check
 cargo xtask parity-matrix-check
+cargo xtask uc-openapi-inventory
+git diff --exit-code -- docs/guide/src/reference/unity-catalog-openapi-inventory.md
 cargo check --workspace --all-features
 cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
 cd docs/guide && mdbook build
@@ -37,19 +41,20 @@ Also run targeted parity/API gates that mirror CI for `arco-api` and `arco-flow`
 
 ## Release Steps
 
-1. Ensure CI is green on `main`.
-2. Update versioned release notes (`release_notes/vX.Y.Z.md`).
-3. Validate release-tag discipline:
+1. Prepare release docs:
+   - Update `CHANGELOG.md` with `## [X.Y.Z] - YYYY-MM-DD`.
+   - Add/update `release_notes/vX.Y.Z.md` using `release_notes/TEMPLATE.md`.
+2. Open a PR with the release-doc updates and ensure required checks pass.
+3. Merge the PR to `main`, then validate release-tag discipline:
    ```bash
    bash tools/check-release-tag-discipline.sh --tag vX.Y.Z
    ```
-4. Create a signed, annotated tag:
+4. Create a signed, annotated tag on the release commit:
    ```bash
    git tag -s vX.Y.Z -m "vX.Y.Z"
    ```
-5. Push branch and tag:
+5. Push the tag:
    ```bash
-   git push origin main
    git push origin vX.Y.Z
    ```
 6. Pushing `vX.Y.Z` triggers:
@@ -60,7 +65,7 @@ Also run targeted parity/API gates that mirror CI for `arco-api` and `arco-flow`
 ## Post-Release
 
 1. Confirm release artifacts are accessible.
-2. Re-open `[Unreleased]` in the changelog.
+2. Re-open `[Unreleased]` in the changelog for follow-up changes.
 3. If this is the first clean release after OSS hard-cleanup, retire the temporary archive branch:
    ```bash
    git branch -D <archive-branch-name>

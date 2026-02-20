@@ -6,7 +6,7 @@ Last updated: 2026-02-19
 
 - Mount prefix: `/api/2.1/unity-catalog`
 - Feature gate: `unity_catalog.enabled` (`ARCO_UNITY_CATALOG_ENABLED`)
-- Legacy internal mount `/_uc/api/2.1/unity-catalog/*` is intentionally hidden; only the configured mount prefix is exposed.
+- Legacy internal mount `/_uc/api/2.1/unity-catalog/*` is retired (legacy module removed from `arco-api`); only the configured mount prefix is exposed.
 - Pinned contract source:
   `crates/arco-uc/tests/fixtures/unitycatalog-openapi.yaml`
 

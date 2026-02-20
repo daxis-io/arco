@@ -11,7 +11,6 @@ pub mod query;
 pub mod query_data;
 pub mod tables;
 pub mod tasks;
-pub mod uc;
 
 use std::sync::Arc;
 

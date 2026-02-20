@@ -129,7 +129,7 @@ Status classification is maintained in:
 `docs/plans/2026-02-19-unity-catalog-support-matrix.md`
 
 Only the configured public UC mount (`/api/2.1/unity-catalog/*`) is exposed when
-`unity_catalog.enabled=true`; legacy internal aliases are intentionally hidden.
+`unity_catalog.enabled=true`; legacy internal aliases are retired (legacy module removed from `arco-api`).
 
 ### Q2 interoperability core focus endpoints
 

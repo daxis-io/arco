@@ -60,9 +60,6 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 
-# Auth
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
-
 # Optional test utilities
 proptest = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }

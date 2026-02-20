@@ -321,6 +321,8 @@ impl TaskTokenValidator for JwtTaskTokenValidator {
     fn validate_task_token(
         &self,
         task_id: &str,
+        _run_id: &str,
+        _attempt: u32,
         token: &str,
     ) -> impl Future<Output = Result<(), String>> + Send {
         let validator = self.clone();
@@ -1071,7 +1073,8 @@ mod tests {
         )
         .expect("token");
 
-        let result = tokio_test::block_on(validator.validate_task_token("task-123", &token));
+        let result =
+            tokio_test::block_on(validator.validate_task_token("task-123", "run-1", 1, &token));
         assert!(result.is_ok());
     }
 
@@ -1101,7 +1104,8 @@ mod tests {
         )
         .expect("token");
 
-        let result = tokio_test::block_on(validator.validate_task_token("task-999", &token));
+        let result =
+            tokio_test::block_on(validator.validate_task_token("task-999", "run-1", 1, &token));
         assert!(result.is_err());
     }
 

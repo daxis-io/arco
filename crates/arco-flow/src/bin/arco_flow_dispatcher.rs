@@ -219,6 +219,7 @@ async fn run_handler(
                 body.as_bytes(),
                 options,
                 Some(state.dispatch_target_url.as_str()),
+                None,
             )
             .await;
 
@@ -339,6 +340,7 @@ async fn run_handler(
                 &body,
                 options,
                 Some(target_url.as_str()),
+                None,
             )
             .await;
 

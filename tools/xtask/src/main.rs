@@ -839,9 +839,7 @@ fn run_engine_boundary_check() -> Result<()> {
     Ok(())
 }
 
-fn collect_dependency_tables<'a>(
-    manifest: &'a toml::Value,
-) -> Vec<(String, &'a toml::value::Table)> {
+fn collect_dependency_tables(manifest: &toml::Value) -> Vec<(String, &toml::value::Table)> {
     let mut sections = Vec::new();
     let Some(root) = manifest.as_table() else {
         return sections;

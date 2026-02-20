@@ -130,6 +130,8 @@ impl TaskTokenValidator for CoreTaskTokenValidator {
     fn validate_task_token(
         &self,
         task_id: &str,
+        _run_id: &str,
+        _attempt: u32,
         token: &str,
     ) -> impl Future<Output = Result<(), String>> + Send {
         let config = self.config.clone();

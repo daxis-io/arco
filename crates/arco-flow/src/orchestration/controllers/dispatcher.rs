@@ -209,70 +209,6 @@ impl DispatcherController {
     }
 }
 
-/// Builds a dispatch payload for the worker.
-///
-/// This payload is sent to the worker via Cloud Tasks and contains
-/// all information needed to execute the task.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DispatchPayload {
-    /// Run identifier.
-    pub run_id: String,
-    /// Task key within run.
-    pub task_key: String,
-    /// Attempt number (1-indexed).
-    pub attempt: u32,
-    /// Attempt ID - used as concurrency guard.
-    ///
-    /// The worker MUST echo this in `TaskStarted`, `TaskHeartbeat`, and `TaskFinished`
-    /// events. The compactor will reject events with mismatched `attempt_id`.
-    pub attempt_id: String,
-    /// Optional W3C traceparent for distributed tracing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub traceparent: Option<String>,
-    /// When the dispatch was created.
-    pub dispatched_at: DateTime<Utc>,
-}
-
-impl DispatchPayload {
-    /// Creates a new dispatch payload.
-    #[must_use]
-    pub fn new(run_id: String, task_key: String, attempt: u32, attempt_id: String) -> Self {
-        Self {
-            run_id,
-            task_key,
-            attempt,
-            attempt_id,
-            traceparent: None,
-            dispatched_at: Utc::now(),
-        }
-    }
-
-    /// Attaches a traceparent for distributed tracing.
-    #[must_use]
-    pub fn with_traceparent(mut self, traceparent: impl Into<String>) -> Self {
-        self.traceparent = Some(traceparent.into());
-        self
-    }
-
-    /// Serializes the payload to JSON.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if serialization fails.
-    pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string(self)
-    }
-
-    /// Deserializes the payload from JSON.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if deserialization fails.
-    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,27 +357,6 @@ mod tests {
         let key =
             DispatcherController::dispatch_enqueued_idempotency_key("dispatch:run1:extract:1");
         assert_eq!(key, "dispatch_enqueued:dispatch:run1:extract:1");
-    }
-
-    #[test]
-    fn test_dispatch_payload_serialization() {
-        let payload = DispatchPayload::new(
-            "run123".to_string(),
-            "extract".to_string(),
-            1,
-            "01HQ123ATT".to_string(),
-        );
-
-        let json = payload.to_json().unwrap();
-        assert!(json.contains("run123"));
-        assert!(json.contains("extract"));
-        assert!(json.contains("01HQ123ATT"));
-
-        let parsed = DispatchPayload::from_json(&json).unwrap();
-        assert_eq!(parsed.run_id, "run123");
-        assert_eq!(parsed.task_key, "extract");
-        assert_eq!(parsed.attempt, 1);
-        assert_eq!(parsed.attempt_id, "01HQ123ATT");
     }
 
     #[test]

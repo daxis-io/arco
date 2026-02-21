@@ -45,6 +45,8 @@ class DispatchPayload:
     attempt: int
     attempt_id: str
     traceparent: str | None
+    task_token: str | None
+    token_expires_at: str | None
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> DispatchPayload:
@@ -53,6 +55,8 @@ class DispatchPayload:
         attempt = _get_field(payload, "attempt", "attempt")
         attempt_id = _get_field(payload, "attempt_id", "attemptId")
         traceparent = _get_field(payload, "traceparent", "traceparent")
+        task_token = _get_field(payload, "task_token", "taskToken")
+        token_expires_at = _get_field(payload, "token_expires_at", "tokenExpiresAt")
 
         if not run_id or not task_key or not attempt or not attempt_id:
             msg = "dispatch payload missing required fields"
@@ -64,6 +68,82 @@ class DispatchPayload:
             attempt=int(attempt),
             attempt_id=str(attempt_id),
             traceparent=str(traceparent) if traceparent else None,
+            task_token=str(task_token) if task_token else None,
+            token_expires_at=str(token_expires_at) if token_expires_at else None,
+        )
+
+
+def _select_task_token(payload_token: str | None, fallback_token: str) -> str:
+    if payload_token and payload_token.strip():
+        return payload_token
+    return fallback_token
+
+
+@dataclass
+class WorkerDispatchEnvelope:
+    tenant_id: str
+    workspace_id: str
+    run_id: str
+    task_key: str
+    attempt: int
+    attempt_id: str
+    dispatch_id: str
+    worker_queue: str
+    callback_base_url: str
+    task_token: str
+    token_expires_at: str
+    traceparent: str | None
+    payload: Any
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> WorkerDispatchEnvelope:
+        tenant_id = _get_field(payload, "tenant_id", "tenantId")
+        workspace_id = _get_field(payload, "workspace_id", "workspaceId")
+        run_id = _get_field(payload, "run_id", "runId")
+        task_key = _get_field(payload, "task_key", "taskKey")
+        attempt = _get_field(payload, "attempt", "attempt")
+        attempt_id = _get_field(payload, "attempt_id", "attemptId")
+        dispatch_id = _get_field(payload, "dispatch_id", "dispatchId")
+        worker_queue = _get_field(payload, "worker_queue", "workerQueue")
+        callback_base_url = _get_field(payload, "callback_base_url", "callbackBaseUrl")
+        task_token = _get_field(payload, "task_token", "taskToken")
+        token_expires_at = _get_field(payload, "token_expires_at", "tokenExpiresAt")
+        traceparent = _get_field(payload, "traceparent", "traceparent")
+        worker_payload = _get_field(payload, "payload", "payload")
+
+        required = {
+            "tenant_id": tenant_id,
+            "workspace_id": workspace_id,
+            "run_id": run_id,
+            "task_key": task_key,
+            "attempt": attempt,
+            "attempt_id": attempt_id,
+            "dispatch_id": dispatch_id,
+            "worker_queue": worker_queue,
+            "callback_base_url": callback_base_url,
+            "task_token": task_token,
+            "token_expires_at": token_expires_at,
+            "payload": worker_payload,
+        }
+        missing = [key for key, value in required.items() if value is None or value == ""]
+        if missing:
+            msg = "dispatch payload missing required fields"
+            raise ValueError(f"{msg}: {', '.join(missing)}")
+
+        return cls(
+            tenant_id=str(tenant_id),
+            workspace_id=str(workspace_id),
+            run_id=str(run_id),
+            task_key=str(task_key),
+            attempt=int(attempt),
+            attempt_id=str(attempt_id),
+            dispatch_id=str(dispatch_id),
+            worker_queue=str(worker_queue),
+            callback_base_url=str(callback_base_url),
+            task_token=str(task_token),
+            token_expires_at=str(token_expires_at),
+            traceparent=str(traceparent) if traceparent else None,
+            payload=worker_payload,
         )
 
 
@@ -79,7 +159,7 @@ class DispatchWorker:
     ) -> None:
         self.config = config
         self.worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
-        self._task_token = (
+        self._fallback_task_token = (
             config.task_token.get_secret_value() or config.api_key.get_secret_value() or "debug"
         )
         self._client = ArcoFlowApiClient(config)
@@ -101,7 +181,8 @@ class DispatchWorker:
         """Close worker resources."""
         self._client.close()
 
-    def handle_dispatch(self, payload: DispatchPayload) -> None:
+    def handle_dispatch(self, payload: WorkerDispatchEnvelope) -> None:
+        task_token = _select_task_token(payload.task_token, self._fallback_task_token)
         started_at = _now_iso()
         self._client.task_started(
             task_key=payload.task_key,
@@ -110,7 +191,8 @@ class DispatchWorker:
             worker_id=self.worker_id,
             traceparent=payload.traceparent,
             started_at=started_at,
-            task_token=self._task_token,
+            task_token=task_token,
+            callback_base_url=payload.callback_base_url,
         )
 
         stdout_buffer = io.StringIO()
@@ -148,7 +230,8 @@ class DispatchWorker:
                 completed_at=completed_at,
                 output=output_payload,
                 error=error_payload,
-                task_token=self._task_token,
+                task_token=task_token,
+                callback_base_url=payload.callback_base_url,
             )
 
             try:
@@ -163,7 +246,7 @@ class DispatchWorker:
             except ApiError as err:
                 err_console.print(f"[yellow]![/yellow] Log upload failed: {err}")
 
-    def _execute_asset(self, payload: DispatchPayload) -> object:
+    def _execute_asset(self, payload: WorkerDispatchEnvelope) -> object:
         asset_func = self._assets.get(payload.task_key)
         if asset_func is None:
             msg = f"asset not found: {payload.task_key}"
@@ -224,7 +307,7 @@ class DispatchHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             payload = json.loads(body.decode("utf-8"))
-            dispatch = DispatchPayload.from_dict(payload)
+            dispatch = WorkerDispatchEnvelope.from_dict(payload)
         except Exception as exc:  # noqa: BLE001
             self.send_response(400)
             self.end_headers()
@@ -262,14 +345,6 @@ def run_worker(
     if not config.workspace_id:
         err_console.print("[red]✗[/red] Workspace ID not configured. Set ARCO_FLOW_WORKSPACE_ID.")
         raise SystemExit(1)
-    if not config.debug and not (
-        config.api_key.get_secret_value() or config.task_token.get_secret_value()
-    ):
-        err_console.print(
-            "[red]✗[/red] API key or task token required. Set ARCO_FLOW_API_KEY or ARCO_FLOW_TASK_TOKEN."
-        )
-        raise SystemExit(1)
-
     root = root_path or Path.cwd()
 
     console.print(f"[blue]i[/blue] Loading assets from {root}...")

@@ -25,17 +25,16 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
 
-use crate::config::JwtConfig;
 use crate::context::{REQUEST_ID_HEADER, RequestContext};
 use crate::error::{ApiError, ApiErrorBody};
 use crate::orchestration_compaction::CompactingLedgerWriter;
 use crate::server::AppState;
 
+use arco_core::{TaskTokenConfig, decode_task_token};
 use arco_flow::orchestration::callbacks::{
     CallbackContext, CallbackError, CallbackResult, TaskState as CallbackTaskState,
     TaskStateLookup, TaskTokenValidator, handle_heartbeat, handle_task_completed,
@@ -290,23 +289,9 @@ pub struct CallbackErrorResponse {
 // Callback Wiring
 // ============================================================================
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TaskTokenClaims {
-    #[serde(alias = "task_id")]
-    task_id: String,
-    #[serde(alias = "tenant_id", alias = "tenantId")]
-    tenant: Option<String>,
-    #[serde(alias = "workspace_id", alias = "workspaceId")]
-    workspace: Option<String>,
-    #[allow(dead_code)]
-    exp: usize,
-}
-
 #[derive(Clone)]
 struct JwtTaskTokenValidator {
-    decoding_key: Option<Arc<DecodingKey>>,
-    validation: Validation,
+    config: TaskTokenConfig,
     tenant: String,
     workspace: String,
     debug: bool,
@@ -314,35 +299,26 @@ struct JwtTaskTokenValidator {
 
 impl JwtTaskTokenValidator {
     fn new(
-        config: &JwtConfig,
+        config: &TaskTokenConfig,
         tenant: &str,
         workspace: &str,
         debug: bool,
     ) -> Result<Self, ApiError> {
         if debug {
             return Ok(Self {
-                decoding_key: None,
-                validation: Validation::new(Algorithm::HS256),
+                config: config.clone(),
                 tenant: tenant.to_string(),
                 workspace: workspace.to_string(),
                 debug: true,
             });
         }
 
-        let (decoding_key, algorithm) = jwt_decoding_key(config)?;
-        let mut validation = Validation::new(algorithm);
-        validation.validate_nbf = true;
-
-        if let Some(iss) = config.issuer.as_deref() {
-            validation.set_issuer(&[iss]);
-        }
-        if let Some(aud) = config.audience.as_deref() {
-            validation.set_audience(&[aud]);
-        }
+        config
+            .validate()
+            .map_err(|e| ApiError::internal(e.to_string()))?;
 
         Ok(Self {
-            decoding_key: Some(Arc::new(decoding_key)),
-            validation,
+            config: config.clone(),
             tenant: tenant.to_string(),
             workspace: workspace.to_string(),
             debug,
@@ -354,6 +330,8 @@ impl TaskTokenValidator for JwtTaskTokenValidator {
     fn validate_task_token(
         &self,
         task_id: &str,
+        _run_id: &str,
+        _attempt: u32,
         token: &str,
     ) -> impl Future<Output = Result<(), String>> + Send {
         let validator = self.clone();
@@ -369,29 +347,17 @@ impl TaskTokenValidator for JwtTaskTokenValidator {
                 };
             }
 
-            let Some(decoding_key) = validator.decoding_key.as_ref() else {
-                return Err("task token validation not configured".to_string());
-            };
+            let claims = decode_task_token(&validator.config, &token)
+                .map_err(|e| format!("invalid token: {e}"))?;
 
-            let data = jsonwebtoken::decode::<TaskTokenClaims>(
-                &token,
-                decoding_key.as_ref(),
-                &validator.validation,
-            )
-            .map_err(|e| format!("invalid token: {e}"))?;
-
-            if data.claims.task_id != task_id {
+            if claims.task_id != task_id {
                 return Err("task_id_mismatch".to_string());
             }
-            if let Some(tenant) = data.claims.tenant.as_deref() {
-                if tenant != validator.tenant {
-                    return Err("tenant_mismatch".to_string());
-                }
+            if claims.tenant_id != validator.tenant {
+                return Err("tenant_mismatch".to_string());
             }
-            if let Some(workspace) = data.claims.workspace.as_deref() {
-                if workspace != validator.workspace {
-                    return Err("workspace_mismatch".to_string());
-                }
+            if claims.workspace_id != validator.workspace {
+                return Err("workspace_mismatch".to_string());
             }
 
             Ok(())
@@ -474,29 +440,6 @@ fn fold_task_state_label(state: FoldTaskState) -> &'static str {
     }
 }
 
-fn jwt_decoding_key(config: &JwtConfig) -> Result<(DecodingKey, Algorithm), ApiError> {
-    match (
-        config.hs256_secret.as_deref(),
-        config.rs256_public_key_pem.as_deref(),
-    ) {
-        (Some(secret), None) => Ok((
-            DecodingKey::from_secret(secret.as_bytes()),
-            Algorithm::HS256,
-        )),
-        (None, Some(pem)) => DecodingKey::from_rsa_pem(pem.as_bytes())
-            .map(|key| (key, Algorithm::RS256))
-            .map_err(|e| {
-                ApiError::internal(format!("failed to parse jwt.rs256_public_key_pem: {e}"))
-            }),
-        (Some(_), Some(_)) => Err(ApiError::internal(
-            "jwt.hs256_secret and jwt.rs256_public_key_pem are mutually exclusive",
-        )),
-        (None, None) => Err(ApiError::internal(
-            "jwt.hs256_secret or jwt.rs256_public_key_pem is required for task tokens",
-        )),
-    }
-}
-
 fn callback_error_response(error: CallbackError) -> CallbackErrorResponse {
     CallbackErrorResponse {
         error: error.error,
@@ -573,23 +516,6 @@ fn unauthorized_response(request_id: &str, message: &str) -> axum::response::Res
     response
 }
 
-fn decode_task_claims(config: &JwtConfig, token: &str) -> Result<TaskTokenClaims, String> {
-    let (decoding_key, algorithm) = jwt_decoding_key(config).map_err(|err| format!("{err:?}"))?;
-    let mut validation = Validation::new(algorithm);
-    validation.validate_nbf = true;
-
-    if let Some(iss) = config.issuer.as_deref() {
-        validation.set_issuer(&[iss]);
-    }
-    if let Some(aud) = config.audience.as_deref() {
-        validation.set_audience(&[aud]);
-    }
-
-    let data = jsonwebtoken::decode::<TaskTokenClaims>(token, &decoding_key, &validation)
-        .map_err(|e| format!("invalid token: {e}"))?;
-    Ok(data.claims)
-}
-
 /// Task callback auth middleware.
 ///
 /// Validates the task token and injects a `RequestContext` derived from the token claims.
@@ -631,7 +557,7 @@ pub async fn task_auth_middleware(
         }
         (tenant, workspace)
     } else {
-        let claims = match decode_task_claims(&state.config.jwt, &token) {
+        let claims = match decode_task_token(&state.config.task_token, &token) {
             Ok(claims) => claims,
             Err(err) => {
                 crate::audit::emit_auth_deny(
@@ -640,29 +566,10 @@ pub async fn task_auth_middleware(
                     &resource,
                     crate::audit::REASON_INVALID_TOKEN,
                 );
-                return unauthorized_response(&request_id, &err);
+                return unauthorized_response(&request_id, &err.to_string());
             }
         };
-
-        let Some(tenant) = claims.tenant else {
-            crate::audit::emit_auth_deny(
-                &state,
-                &request_id,
-                &resource,
-                crate::audit::REASON_INVALID_TOKEN,
-            );
-            return unauthorized_response(&request_id, "missing tenant claim");
-        };
-        let Some(workspace) = claims.workspace else {
-            crate::audit::emit_auth_deny(
-                &state,
-                &request_id,
-                &resource,
-                crate::audit::REASON_INVALID_TOKEN,
-            );
-            return unauthorized_response(&request_id, "missing workspace claim");
-        };
-        (tenant, workspace)
+        (claims.tenant_id, claims.workspace_id)
     };
 
     let ctx = RequestContext {
@@ -706,7 +613,7 @@ async fn build_callback_dependencies(
     let ledger = Arc::new(CompactingLedgerWriter::new(storage, state.config.clone()));
     let debug_allowed = state.config.debug && state.config.posture.is_dev();
     let validator = Arc::new(JwtTaskTokenValidator::new(
-        &state.config.jwt,
+        &state.config.task_token,
         &ctx.tenant,
         &ctx.workspace,
         debug_allowed,
@@ -1033,10 +940,11 @@ mod tests {
     use super::*;
     use crate::config::Posture;
     use anyhow::Result;
+    use arco_core::TaskTokenClaims;
     use axum::body::Body as AxumBody;
     use axum::http::Request as AxumRequest;
     use axum::routing::get;
-    use jsonwebtoken::{EncodingKey, Header};
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
     use tower::ServiceExt;
 
     #[test]
@@ -1153,8 +1061,12 @@ mod tests {
 
     #[test]
     fn test_jwt_task_token_validator_accepts_valid_token() {
-        let mut config = JwtConfig::default();
-        config.hs256_secret = Some("test-secret".to_string());
+        let config = TaskTokenConfig {
+            hs256_secret: "test-secret".to_string(),
+            issuer: None,
+            audience: None,
+            ttl_seconds: 900,
+        };
 
         let validator = JwtTaskTokenValidator::new(&config, "tenant-1", "workspace-1", false)
             .expect("validator");
@@ -1173,14 +1085,19 @@ mod tests {
         )
         .expect("token");
 
-        let result = tokio_test::block_on(validator.validate_task_token("task-123", &token));
+        let result =
+            tokio_test::block_on(validator.validate_task_token("task-123", "run-1", 1, &token));
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_jwt_task_token_validator_rejects_task_id_mismatch() {
-        let mut config = JwtConfig::default();
-        config.hs256_secret = Some("test-secret".to_string());
+        let config = TaskTokenConfig {
+            hs256_secret: "test-secret".to_string(),
+            issuer: None,
+            audience: None,
+            ttl_seconds: 900,
+        };
 
         let validator = JwtTaskTokenValidator::new(&config, "tenant-1", "workspace-1", false)
             .expect("validator");
@@ -1199,7 +1116,8 @@ mod tests {
         )
         .expect("token");
 
-        let result = tokio_test::block_on(validator.validate_task_token("task-999", &token));
+        let result =
+            tokio_test::block_on(validator.validate_task_token("task-999", "run-1", 1, &token));
         assert!(result.is_err());
     }
 
@@ -1207,7 +1125,7 @@ mod tests {
     async fn test_task_auth_middleware_rejects_missing_token() -> Result<()> {
         let mut config = crate::config::Config::default();
         config.debug = false;
-        config.jwt.hs256_secret = Some("test-secret".to_string());
+        config.task_token.hs256_secret = "test-secret".to_string();
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let app = Router::new()
@@ -1234,7 +1152,7 @@ mod tests {
     async fn test_task_auth_middleware_accepts_valid_token() -> Result<()> {
         let mut config = crate::config::Config::default();
         config.debug = false;
-        config.jwt.hs256_secret = Some("test-secret".to_string());
+        config.task_token.hs256_secret = "test-secret".to_string();
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let app = Router::new()
@@ -1257,9 +1175,13 @@ mod tests {
             &Header::default(),
             &TaskTokenClaims {
                 task_id: "task-123".to_string(),
-                tenant: Some("tenant-1".to_string()),
-                workspace: Some("workspace-1".to_string()),
+                tenant_id: "tenant-1".to_string(),
+                workspace_id: "workspace-1".to_string(),
                 exp: 2_000_000_000,
+                nbf: None,
+                iat: None,
+                iss: None,
+                aud: None,
             },
             &EncodingKey::from_secret("test-secret".as_bytes()),
         )?;
@@ -1322,7 +1244,7 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.debug = true;
         config.posture = Posture::Private;
-        config.jwt.hs256_secret = Some("test-secret".to_string());
+        config.task_token.hs256_secret = "test-secret".to_string();
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let app = Router::new()

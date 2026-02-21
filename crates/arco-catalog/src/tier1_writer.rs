@@ -16,9 +16,11 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
-use arco_core::publish::Publisher;
+use arco_core::publish::{
+    SnapshotPointerDurability, SnapshotPointerPublishOutcome, publish_snapshot_pointer_transaction,
+};
 use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
-use arco_core::storage_keys::{CommitKey, LedgerKey, ManifestKey};
+use arco_core::storage_keys::{CommitKey, LedgerKey};
 use arco_core::storage_traits::{CommitPutStore, LedgerPutStore};
 use arco_core::{
     CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths, EventId, ScopedStorage,
@@ -28,8 +30,9 @@ use crate::error::{CatalogError, Result};
 use crate::lock::LockGuard;
 use crate::lock::{DEFAULT_LOCK_TTL, DEFAULT_MAX_RETRIES, DistributedLock};
 use crate::manifest::{
-    CatalogDomainManifest, CatalogManifest, CommitRecord, ExecutionsManifest, LineageManifest,
-    RootManifest, SearchManifest, compute_manifest_hash,
+    CatalogDomainManifest, CatalogManifest, CommitRecord, DomainManifestPointer,
+    ExecutionsManifest, LineageManifest, RootManifest, SearchManifest, compute_manifest_hash,
+    next_manifest_id,
 };
 
 /// Maximum CAS retries for manifest writes.
@@ -286,6 +289,7 @@ impl Tier1Writer {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn update_inner<F>(
         &self,
         guard: &LockGuard<dyn StorageBackend>,
@@ -294,26 +298,45 @@ impl Tier1Writer {
     where
         F: FnMut(&mut CatalogDomainManifest) -> Result<()>,
     {
-        let issuer = guard.permit_issuer();
-        let publisher = Publisher::new(&self.storage);
+        let writer_epoch = guard.fencing_token().sequence();
 
         for attempt in 1..=self.cas_max_retries {
             let mut root: RootManifest = self.read_json(CatalogPaths::ROOT_MANIFEST).await?;
             root.normalize_paths();
 
-            let meta = self
-                .storage
-                .head_raw(&root.catalog_manifest_path)
-                .await?
-                .ok_or_else(|| CatalogError::NotFound {
-                    entity: "manifest".to_string(),
-                    name: root.catalog_manifest_path.clone(),
-                })?;
+            let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+            let pointer_meta = self.storage.head_raw(&pointer_path).await?;
+            let (pointer_expected_version, pointer_parent_hash, previous_manifest_path, prev_bytes) =
+                if let Some(meta) = pointer_meta {
+                    let pointer_bytes = self.storage.get_raw(&pointer_path).await?;
+                    let pointer: DomainManifestPointer = serde_json::from_slice(&pointer_bytes)
+                        .map_err(|e| CatalogError::Serialization {
+                            message: format!("parse JSON at {pointer_path}: {e}"),
+                        })?;
 
-            let prev_bytes = self.storage.get_raw(&root.catalog_manifest_path).await?;
+                    if writer_epoch < pointer.epoch {
+                        return Err(CatalogError::PreconditionFailed {
+                            message: format!(
+                                "stale epoch: writer epoch {writer_epoch} is behind pointer epoch {}",
+                                pointer.epoch
+                            ),
+                        });
+                    }
+
+                    (
+                        Some(meta.version),
+                        Some(compute_manifest_hash(&pointer_bytes)),
+                        pointer.manifest_path.clone(),
+                        self.storage.get_raw(&pointer.manifest_path).await?,
+                    )
+                } else {
+                    let prev_bytes = self.storage.get_raw(&root.catalog_manifest_path).await?;
+                    (None, None, root.catalog_manifest_path.clone(), prev_bytes)
+                };
+
             let mut catalog: CatalogDomainManifest =
                 serde_json::from_slice(&prev_bytes).map_err(|e| CatalogError::Serialization {
-                    message: format!("parse JSON at {}: {e}", root.catalog_manifest_path),
+                    message: format!("parse JSON at {previous_manifest_path}: {e}"),
                 })?;
             let prev_raw_hash = compute_manifest_hash(&prev_bytes);
             let prev_catalog = catalog.clone();
@@ -322,9 +345,14 @@ impl Tier1Writer {
 
             catalog.updated_at = Utc::now();
             catalog.parent_hash = Some(prev_raw_hash.clone());
-            catalog.fencing_token = Some(guard.fencing_token().sequence());
+            catalog.fencing_token = Some(writer_epoch);
+            catalog.epoch = writer_epoch;
+            catalog.previous_manifest_path = Some(previous_manifest_path.clone());
+            catalog.writer_session_id = Some(Ulid::new().to_string());
             let commit_ulid = next_commit_ulid(prev_catalog.commit_ulid.as_deref())?;
             catalog.commit_ulid = Some(commit_ulid.clone());
+            catalog.manifest_id = next_manifest_id(&prev_catalog.manifest_id)
+                .map_err(|message| CatalogError::InvariantViolation { message })?;
 
             catalog
                 .validate_succession(&prev_catalog, &prev_raw_hash)
@@ -336,35 +364,52 @@ impl Tier1Writer {
             catalog.last_commit_id = Some(commit.commit_id.clone());
 
             let catalog_bytes = json_bytes(&catalog)?;
-            let permit = issuer.issue_permit_with_commit_ulid(
-                CatalogDomain::Catalog.as_str(),
-                meta.version.clone(),
-                commit_ulid,
+            let snapshot_manifest_path = CatalogPaths::domain_manifest_snapshot(
+                CatalogDomain::Catalog,
+                &catalog.manifest_id,
             );
 
-            match publisher
-                .publish(
-                    permit,
-                    &ManifestKey::domain(CatalogDomain::Catalog),
-                    catalog_bytes,
-                )
-                .await?
+            let pointer = DomainManifestPointer {
+                manifest_id: catalog.manifest_id.clone(),
+                manifest_path: snapshot_manifest_path.clone(),
+                epoch: writer_epoch,
+                parent_pointer_hash: pointer_parent_hash.clone(),
+                updated_at: Utc::now(),
+            };
+            let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+            match publish_snapshot_pointer_transaction(
+                &self.storage,
+                &snapshot_manifest_path,
+                catalog_bytes.clone(),
+                &pointer_path,
+                json_bytes(&pointer)?,
+                pointer_expected_version.as_deref(),
+                Some((&root.catalog_manifest_path, catalog_bytes.clone())),
+                SnapshotPointerDurability::Visible,
+                async { Ok(()) },
+            )
+            .await
             {
-                WriteResult::Success { .. } => {
+                Ok(SnapshotPointerPublishOutcome::Visible { .. }) => {
                     self.persist_commit_record(&commit).await?;
                     return Ok(commit);
                 }
-                WriteResult::PreconditionFailed { .. } => {
+                Ok(SnapshotPointerPublishOutcome::PersistedNotVisible) => {
+                    return Err(CatalogError::InvariantViolation {
+                        message:
+                            "unexpected persisted-not-visible outcome in visible durability mode"
+                                .to_string(),
+                    });
+                }
+                Err(arco_core::Error::PreconditionFailed { .. }) => {
                     if attempt == self.cas_max_retries {
                         return Err(CatalogError::PreconditionFailed {
                             message: "manifest update lost CAS race after max retries".into(),
                         });
                     }
-
-                    // Another writer updated the manifest between read and write.
-                    // Retry from fresh state.
-                    crate::metrics::record_cas_retry("catalog_manifest");
+                    crate::metrics::record_cas_retry("catalog_manifest_pointer");
                 }
+                Err(e) => return Err(CatalogError::from(e)),
             }
         }
 
@@ -669,6 +714,41 @@ mod tests {
             .await?;
         let core: CatalogDomainManifest = parse_json(&core_bytes)?;
         assert_eq!(core.snapshot_version, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_writes_pointer_and_snapshot_manifest() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await?;
+
+        writer
+            .update(|manifest| {
+                manifest.snapshot_version = 1;
+                manifest.snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1);
+                Ok(())
+            })
+            .await?;
+
+        let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+        let pointer_bytes = storage.get_raw(&pointer_path).await?;
+        let pointer: DomainManifestPointer = parse_json(&pointer_bytes)?;
+        assert_eq!(pointer.manifest_id, "00000000000000000001");
+
+        let snapshot_bytes = storage.get_raw(&pointer.manifest_path).await?;
+        let snapshot: CatalogDomainManifest = parse_json(&snapshot_bytes)?;
+        assert_eq!(snapshot.manifest_id, "00000000000000000001");
+        assert_eq!(snapshot.snapshot_version, 1);
+
+        // Compatibility shim: legacy mutable manifest path remains readable.
+        let legacy_bytes = storage
+            .get_raw(&CatalogPaths::domain_manifest(CatalogDomain::Catalog))
+            .await?;
+        let legacy: CatalogDomainManifest = parse_json(&legacy_bytes)?;
+        assert_eq!(legacy.snapshot_version, 1);
 
         Ok(())
     }

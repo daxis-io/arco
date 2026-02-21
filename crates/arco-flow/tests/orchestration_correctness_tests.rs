@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -488,6 +488,121 @@ impl StorageBackend for CountingBackend {
     ) -> arco_core::error::Result<String> {
         self.inner.signed_url(path, expiry).await
     }
+}
+
+#[derive(Debug)]
+struct FailOncePathBackend {
+    inner: MemoryBackend,
+    fail_once: AtomicBool,
+    path_substring: String,
+}
+
+impl FailOncePathBackend {
+    fn new(path_substring: impl Into<String>) -> Self {
+        Self {
+            inner: MemoryBackend::new(),
+            fail_once: AtomicBool::new(false),
+            path_substring: path_substring.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl StorageBackend for FailOncePathBackend {
+    async fn get(&self, path: &str) -> arco_core::error::Result<Bytes> {
+        self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::error::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::error::Result<WriteResult> {
+        if path.contains(self.path_substring.as_str())
+            && !self.fail_once.swap(true, Ordering::SeqCst)
+        {
+            return Err(arco_core::Error::Storage {
+                message: format!("injected manifest publish failure at {path}"),
+                source: None,
+            });
+        }
+
+        self.inner.put(path, data, precondition).await
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::error::Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::error::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn head(&self, path: &str) -> arco_core::error::Result<Option<ObjectMeta>> {
+        self.inner.head(path).await
+    }
+
+    async fn signed_url(
+        &self,
+        path: &str,
+        expiry: std::time::Duration,
+    ) -> arco_core::error::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+}
+
+#[tokio::test]
+async fn test_compaction_replay_recovers_after_manifest_publish_failure() -> Result<()> {
+    let backend = Arc::new(FailOncePathBackend::new(
+        "state/orchestration/manifest.json",
+    ));
+    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let ledger = LedgerWriter::new(storage.clone());
+    let compactor = MicroCompactor::new(storage.clone());
+
+    let run_id = "run-replay";
+    let plan_id = "plan-replay";
+    let tasks = vec![default_task_def("extract", vec![])];
+
+    let events = vec![
+        run_triggered_event(run_id, plan_id),
+        plan_created_event(run_id, plan_id, tasks),
+    ];
+
+    let mut paths = Vec::new();
+    for event in events {
+        let path = LedgerWriter::event_path(&event);
+        ledger.append(event).await?;
+        paths.push(path);
+    }
+
+    // First compaction fails during manifest publish (injected), simulating crash window.
+    let first = compactor.compact_events(paths.clone()).await;
+    assert!(
+        first.is_err(),
+        "first compaction should fail due to injected manifest publish failure"
+    );
+
+    // Replay the same event set after restart; state must converge.
+    MicroCompactor::new(storage.clone())
+        .compact_events(paths)
+        .await?;
+
+    let (_, state) = MicroCompactor::new(storage).load_state().await?;
+    assert!(state.runs.contains_key(run_id));
+    assert!(
+        state
+            .tasks
+            .contains_key(&(run_id.to_string(), "extract".to_string()))
+    );
+    assert_eq!(state.idempotency_keys.len(), 2);
+
+    Ok(())
 }
 
 // ============================================================================

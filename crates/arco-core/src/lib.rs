@@ -39,7 +39,9 @@ pub mod canonical_json;
 pub mod catalog_event;
 pub mod catalog_paths;
 pub mod error;
+pub mod flow_paths;
 pub mod id;
+pub mod internal_oidc;
 pub mod lock;
 pub mod observability;
 pub mod partition;
@@ -49,6 +51,8 @@ pub mod storage;
 pub mod storage_keys;
 pub mod storage_traits;
 pub mod sync_compact;
+pub mod table_format;
+pub mod task_tokens;
 pub mod tenant;
 
 /// Prelude module for convenient imports.
@@ -62,6 +66,7 @@ pub mod prelude {
     pub use crate::catalog_event::{CatalogEvent, CatalogEventPayload};
     pub use crate::catalog_paths::{CatalogDomain, CatalogPaths};
     pub use crate::error::{Error, Result};
+    pub use crate::flow_paths::{ApiPaths, DeltaPaths, FlowPaths, IcebergPaths};
     pub use crate::id::{AssetId, EventId, MaterializationId, RunId, TaskId};
     pub use crate::lock::{DistributedLock, LockGuard, LockInfo};
     pub use crate::partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
@@ -80,6 +85,12 @@ pub mod prelude {
         SignedUrlStore, StatePutStore,
     };
     pub use crate::sync_compact::{SyncCompactRequest, SyncCompactResponse};
+    pub use crate::table_format::TableFormat;
+    pub use crate::task_tokens::{
+        DEFAULT_DISPATCH_TASK_TIMEOUT_SECONDS, DEFAULT_TASK_TOKEN_TTL_SECONDS,
+        MAX_TASK_TOKEN_TTL_SECONDS, MintedTaskToken, TASK_TOKEN_CALLBACK_GRACE_SECONDS,
+        TaskTokenClaims, TaskTokenConfig, decode_task_token, mint_task_token,
+    };
     pub use crate::tenant::TenantId;
 }
 
@@ -87,7 +98,11 @@ pub mod prelude {
 pub use catalog_event::{CatalogEvent, CatalogEventPayload};
 pub use catalog_paths::{CatalogDomain, CatalogPaths};
 pub use error::{Error, Result};
+pub use flow_paths::{ApiPaths, DeltaPaths, FlowPaths, IcebergPaths};
 pub use id::{AssetId, EventId, MaterializationId, RunId, TaskId};
+pub use internal_oidc::{
+    InternalOidcConfig, InternalOidcError, InternalOidcVerifier, VerifiedPrincipal,
+};
 pub use lock::{DistributedLock, LockGuard, LockInfo};
 pub use observability::{LogFormat, Redacted, init_logging};
 pub use partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
@@ -96,4 +111,10 @@ pub use storage::{
     MemoryBackend, ObjectMeta, ObjectStoreBackend, StorageBackend, WritePrecondition, WriteResult,
 };
 pub use sync_compact::{SyncCompactRequest, SyncCompactResponse};
+pub use table_format::TableFormat;
+pub use task_tokens::{
+    DEFAULT_DISPATCH_TASK_TIMEOUT_SECONDS, DEFAULT_TASK_TOKEN_TTL_SECONDS,
+    MAX_TASK_TOKEN_TTL_SECONDS, MintedTaskToken, TASK_TOKEN_CALLBACK_GRACE_SECONDS,
+    TaskTokenClaims, TaskTokenConfig, decode_task_token, mint_task_token,
+};
 pub use tenant::TenantId;

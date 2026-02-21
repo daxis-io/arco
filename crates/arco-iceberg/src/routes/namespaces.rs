@@ -564,6 +564,14 @@ mod tests {
             .expect("create namespace");
     }
 
+    async fn initialize_empty_catalog(state: &IcebergState) {
+        let storage = ScopedStorage::new(Arc::clone(&state.storage), "acme", "analytics")
+            .expect("scoped storage");
+        let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+        let writer = CatalogWriter::new(storage).with_sync_compactor(compactor);
+        writer.initialize().await.expect("init");
+    }
+
     fn app(state: IcebergState) -> Router {
         Router::new()
             .nest("/v1/:prefix", routes())
@@ -574,9 +582,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_namespaces() {
+    async fn test_list_namespaces_returns_namespaces_from_catalog() {
         let state = build_state();
         seed_namespace(&state, "sales").await;
+        seed_namespace(&state, "finance").await;
 
         let app = app(state);
         let response = app
@@ -592,6 +601,387 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: ListNamespacesResponse =
+            serde_json::from_slice(&body).expect("deserialize list response");
+        assert_eq!(
+            payload.namespaces,
+            vec![vec!["finance".to_string()], vec!["sales".to_string()],]
+        );
+        assert!(payload.next_page_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_namespaces_pagination_with_page_token_and_size() {
+        let state = build_state();
+        seed_namespace(&state, "a").await;
+        seed_namespace(&state, "b").await;
+        seed_namespace(&state, "c").await;
+
+        let router = app(state.clone());
+        let first = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces?pageSize=2")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let first_payload: ListNamespacesResponse =
+            serde_json::from_slice(&first_body).expect("deserialize first page");
+        assert_eq!(
+            first_payload.namespaces,
+            vec![vec!["a".to_string()], vec!["b".to_string()]]
+        );
+        assert_eq!(first_payload.next_page_token, Some("2".to_string()));
+
+        let router = app(state);
+        let second = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces?pageToken=2&pageSize=2")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let second_payload: ListNamespacesResponse =
+            serde_json::from_slice(&second_body).expect("deserialize second page");
+        assert_eq!(second_payload.namespaces, vec![vec!["c".to_string()]]);
+        assert!(second_payload.next_page_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_namespaces_parent_filtering() {
+        let state = build_state();
+        seed_namespace(&state, "accounting").await;
+        seed_namespace(&state, "accounting\u{1F}tax").await;
+        seed_namespace(&state, "accounting\u{1F}payroll").await;
+        seed_namespace(&state, "accounting\u{1F}tax\u{1F}paid").await;
+        seed_namespace(&state, "sales").await;
+
+        let router = app(state.clone());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces?parent=accounting")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: ListNamespacesResponse =
+            serde_json::from_slice(&body).expect("deserialize list response");
+        assert_eq!(
+            payload.namespaces,
+            vec![
+                vec!["accounting".to_string(), "payroll".to_string()],
+                vec!["accounting".to_string(), "tax".to_string()],
+            ]
+        );
+        assert!(payload.next_page_token.is_none());
+
+        let router = app(state);
+        let nested = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces?parent=accounting%1Ftax")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(nested.status(), StatusCode::OK);
+        let nested_body = axum::body::to_bytes(nested.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let nested_payload: ListNamespacesResponse =
+            serde_json::from_slice(&nested_body).expect("deserialize list response");
+        assert_eq!(
+            nested_payload.namespaces,
+            vec![vec![
+                "accounting".to_string(),
+                "tax".to_string(),
+                "paid".to_string(),
+            ]]
+        );
+        assert!(nested_payload.next_page_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_namespaces_parent_not_found_returns_404() {
+        let state = build_state();
+        seed_namespace(&state, "sales").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces?parent=missing")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("deserialize error");
+        assert_eq!(payload["error"]["type"], "NoSuchNamespaceException");
+    }
+
+    #[tokio::test]
+    async fn test_list_namespaces_invalid_page_token_returns_400() {
+        let state = build_state();
+        seed_namespace(&state, "sales").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces?pageToken=not-a-number&pageSize=1")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("deserialize error");
+        assert_eq!(payload["error"]["type"], "BadRequestException");
+        assert_eq!(payload["error"]["message"], "Invalid pageToken");
+    }
+
+    #[tokio::test]
+    async fn test_list_namespaces_page_token_out_of_range_returns_400() {
+        let state = build_state();
+        seed_namespace(&state, "sales").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces?pageToken=10&pageSize=1")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("deserialize error");
+        assert_eq!(payload["error"]["type"], "BadRequestException");
+        assert_eq!(payload["error"]["message"], "pageToken out of range");
+    }
+
+    #[tokio::test]
+    async fn test_list_namespaces_page_size_zero_returns_400() {
+        let state = build_state();
+        seed_namespace(&state, "sales").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces?pageSize=0")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("deserialize error");
+        assert_eq!(payload["error"]["type"], "BadRequestException");
+        assert_eq!(
+            payload["error"]["message"],
+            "pageSize must be greater than zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_namespaces_empty_catalog_returns_empty_list() {
+        let state = build_state();
+        initialize_empty_catalog(&state).await;
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: ListNamespacesResponse =
+            serde_json::from_slice(&body).expect("deserialize list response");
+        assert!(payload.namespaces.is_empty());
+        assert!(payload.next_page_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_namespace_existing_returns_properties() {
+        let state = build_state();
+        seed_namespace_with_description(&state, "sales", Some("Sales data")).await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces/sales")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: GetNamespaceResponse =
+            serde_json::from_slice(&body).expect("deserialize get namespace response");
+        assert_eq!(payload.namespace, vec!["sales".to_string()]);
+        assert_eq!(
+            payload.properties.get("comment"),
+            Some(&"Sales data".to_string())
+        );
+        assert!(
+            payload
+                .properties
+                .get("arco.id")
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_namespace_non_existent_returns_404() {
+        let app = app(build_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces/missing")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_namespace_identifier_is_url_decoded() {
+        let state = build_state();
+        seed_namespace(&state, "sales ops").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces/sales%20ops")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: GetNamespaceResponse =
+            serde_json::from_slice(&body).expect("deserialize get namespace response");
+        assert_eq!(payload.namespace, vec!["sales ops".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_get_namespace_nested_identifier_decodes_separator() {
+        let state = build_state();
+        seed_namespace(&state, "accounting\u{1F}tax").await;
+
+        let app = app(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/arco/namespaces/accounting%1Ftax")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let payload: GetNamespaceResponse =
+            serde_json::from_slice(&body).expect("deserialize get namespace response");
+        assert_eq!(
+            payload.namespace,
+            vec!["accounting".to_string(), "tax".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -611,10 +1001,14 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(body.is_empty());
     }
 
     #[tokio::test]
-    async fn test_head_namespace_exists_returns_no_content() {
+    async fn test_head_namespace_exists_returns_no_content_without_body() {
         let state = build_state();
         seed_namespace(&state, "sales").await;
 
@@ -633,6 +1027,10 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(body.is_empty());
     }
 
     #[tokio::test]

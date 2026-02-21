@@ -97,6 +97,8 @@ pub trait TaskTokenValidator: Send + Sync {
     fn validate_task_token(
         &self,
         task_id: &str,
+        run_id: &str,
+        attempt: u32,
         token: &str,
     ) -> impl Future<Output = Result<(), String>> + Send;
 }
@@ -162,17 +164,6 @@ where
         .record(duration.as_secs_f64());
     });
 
-    if let Err(reason) = ctx
-        .token_validator
-        .validate_task_token(task_id, task_token)
-        .await
-    {
-        return finish_callback(
-            "task_started",
-            CallbackResult::Unauthorized(CallbackError::invalid_token(&reason)),
-        );
-    }
-
     let TaskStartedRequest {
         attempt,
         attempt_id,
@@ -208,6 +199,17 @@ where
     tracing::Span::current().record("worker_id", tracing::field::display(&worker_id));
     if let Some(traceparent) = &traceparent {
         tracing::Span::current().record("traceparent", tracing::field::display(traceparent));
+    }
+
+    if let Err(reason) = ctx
+        .token_validator
+        .validate_task_token(task_id, &state.run_id, attempt, task_token)
+        .await
+    {
+        return finish_callback(
+            "task_started",
+            CallbackResult::Unauthorized(CallbackError::invalid_token(&reason)),
+        );
     }
 
     // Check if task is already terminal
@@ -311,17 +313,6 @@ where
         .record(duration.as_secs_f64());
     });
 
-    if let Err(reason) = ctx
-        .token_validator
-        .validate_task_token(task_id, task_token)
-        .await
-    {
-        return finish_callback(
-            "heartbeat",
-            CallbackResult::Unauthorized(CallbackError::invalid_token(&reason)),
-        );
-    }
-
     let HeartbeatRequest {
         attempt,
         attempt_id,
@@ -374,6 +365,17 @@ where
     tracing::Span::current().record("worker_id", tracing::field::display(&worker_id));
     if let Some(traceparent) = &traceparent {
         tracing::Span::current().record("traceparent", tracing::field::display(traceparent));
+    }
+
+    if let Err(reason) = ctx
+        .token_validator
+        .validate_task_token(task_id, &state.run_id, attempt, task_token)
+        .await
+    {
+        return finish_callback(
+            "heartbeat",
+            CallbackResult::Unauthorized(CallbackError::invalid_token(&reason)),
+        );
     }
 
     // Check if task is no longer active (410 Gone)
@@ -480,17 +482,6 @@ where
         .record(duration.as_secs_f64());
     });
 
-    if let Err(reason) = ctx
-        .token_validator
-        .validate_task_token(task_id, task_token)
-        .await
-    {
-        return finish_callback(
-            "task_completed",
-            CallbackResult::Unauthorized(CallbackError::invalid_token(&reason)),
-        );
-    }
-
     let TaskCompletedRequest {
         attempt,
         attempt_id,
@@ -532,6 +523,17 @@ where
     tracing::Span::current().record("worker_id", tracing::field::display(&worker_id));
     if let Some(traceparent) = &traceparent {
         tracing::Span::current().record("traceparent", tracing::field::display(traceparent));
+    }
+
+    if let Err(reason) = ctx
+        .token_validator
+        .validate_task_token(task_id, &state.run_id, attempt, task_token)
+        .await
+    {
+        return finish_callback(
+            "task_completed",
+            CallbackResult::Unauthorized(CallbackError::invalid_token(&reason)),
+        );
     }
 
     // Check if task is already terminal
@@ -697,7 +699,13 @@ mod tests {
     }
 
     impl TaskTokenValidator for MockTokenValidator {
-        async fn validate_task_token(&self, _task_id: &str, _token: &str) -> Result<(), String> {
+        async fn validate_task_token(
+            &self,
+            _task_id: &str,
+            _run_id: &str,
+            _attempt: u32,
+            _token: &str,
+        ) -> Result<(), String> {
             if self.allow {
                 Ok(())
             } else {
@@ -1407,7 +1415,20 @@ mod tests {
         let validator = Arc::new(MockTokenValidator { allow: false });
         let ctx = CallbackContext::new(ledger, validator, "tenant-1", "workspace-1");
 
-        let lookup = MockTaskLookup::new();
+        let mut lookup = MockTaskLookup::new();
+        lookup.add_task(
+            "task-1",
+            TaskState {
+                state: "RUNNING".to_string(),
+                attempt: 1,
+                attempt_id: "att-1".to_string(),
+                run_id: "run-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
+                cancel_requested: false,
+            },
+        );
         let request = TaskStartedRequest {
             attempt: 1,
             attempt_id: "att-1".to_string(),

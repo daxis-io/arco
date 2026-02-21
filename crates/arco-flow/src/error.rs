@@ -47,6 +47,24 @@ pub enum Error {
         asset_key: String,
     },
 
+    /// A stale fencing token was provided for a lock-protected write.
+    #[error("stale fencing token: expected {expected}, got {provided}")]
+    StaleFencingToken {
+        /// Current lock epoch or pointer epoch expected by the system.
+        expected: u64,
+        /// Caller-provided lock epoch.
+        provided: u64,
+    },
+
+    /// The fencing lock is missing or expired for the requested write.
+    #[error("fencing lock unavailable at {lock_path} for provided epoch {provided}")]
+    FencingLockUnavailable {
+        /// Lock object path used for fencing validation.
+        lock_path: String,
+        /// Caller-provided lock epoch.
+        provided: u64,
+    },
+
     /// A DAG node was not found (internal graph operation error).
     #[error("DAG node not found: {node}")]
     DagNodeNotFound {

@@ -833,13 +833,44 @@ impl BackfillController {
             return 0;
         }
 
+        let Ok(asset_key) = self.ensure_single_asset(&backfill.asset_selection) else {
+            return 0;
+        };
+
         #[allow(clippy::cast_possible_truncation)]
         let total_partitions = match &backfill.partition_selector {
             PartitionSelector::Explicit { partition_keys } => partition_keys.len() as u32,
-            _ => backfill.total_partitions,
+            PartitionSelector::Range { start, end } => {
+                self.partition_resolver.count_range(asset_key, start, end)
+            }
+            PartitionSelector::Filter { filters } => {
+                if let Some((start, end)) = Self::filter_start_end(filters) {
+                    self.partition_resolver.count_range(asset_key, start, end)
+                } else {
+                    backfill.total_partitions
+                }
+            }
         };
 
         total_partitions.div_ceil(backfill.chunk_size)
+    }
+
+    fn filter_start_end(filters: &HashMap<String, String>) -> Option<(&str, &str)> {
+        if filters.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "start" | "end" | "partition_start" | "partition_end"
+            )
+        }) {
+            return None;
+        }
+        let start = filters
+            .get("start")
+            .or_else(|| filters.get("partition_start"))?;
+        let end = filters
+            .get("end")
+            .or_else(|| filters.get("partition_end"))?;
+        Some((start.as_str(), end.as_str()))
     }
 
     fn get_chunk_partitions(
@@ -866,9 +897,16 @@ impl BackfillController {
                 .take(limit as usize)
                 .cloned()
                 .collect()),
-            PartitionSelector::Filter { .. } => Err(BackfillError::InvalidRequest(
-                "filter partition selector is not supported yet".to_string(),
-            )),
+            PartitionSelector::Filter { filters } => {
+                let Some((start, end)) = Self::filter_start_end(filters) else {
+                    return Err(BackfillError::InvalidRequest(
+                        "filter selector requires start/end bounds".to_string(),
+                    ));
+                };
+                Ok(self
+                    .partition_resolver
+                    .list_range_chunk(asset_key, start, end, offset, limit))
+            }
         }
     }
 }
@@ -959,6 +997,8 @@ mod tests {
 
     fn fresh_watermarks() -> Watermarks {
         Watermarks {
+            last_committed_event_id: Some("01HQ123".into()),
+            last_visible_event_id: Some("01HQ123".into()),
             events_processed_through: Some("01HQ123".into()),
             last_processed_file: Some(orchestration_event_path("2025-01-15", "01HQ123")),
             last_processed_at: Utc::now() - Duration::seconds(5),
@@ -967,6 +1007,8 @@ mod tests {
 
     fn stale_watermarks() -> Watermarks {
         Watermarks {
+            last_committed_event_id: Some("01HQ100".into()),
+            last_visible_event_id: Some("01HQ100".into()),
             events_processed_through: Some("01HQ100".into()),
             last_processed_file: Some(orchestration_event_path("2025-01-15", "01HQ100")),
             last_processed_at: Utc::now() - Duration::seconds(120), // 2 minutes stale
@@ -1560,6 +1602,82 @@ mod tests {
         assert!(
             events.is_empty(),
             "Should not plan chunks for unsupported filter selector"
+        );
+    }
+
+    #[test]
+    fn test_backfill_reconcile_plans_filter_selector_with_start_end_filters() {
+        let controller = BackfillController::new(test_partition_resolver());
+
+        let mut filters = HashMap::new();
+        filters.insert("start".to_string(), "2025-01-01".to_string());
+        filters.insert("end".to_string(), "2025-01-03".to_string());
+
+        let mut backfills = HashMap::new();
+        backfills.insert(
+            "bf_filter_supported".into(),
+            BackfillRow {
+                backfill_id: "bf_filter_supported".into(),
+                partition_selector: PartitionSelector::Filter { filters },
+                total_partitions: 0,
+                chunk_size: 2,
+                max_concurrent_runs: 1,
+                ..default_backfill_row()
+            },
+        );
+
+        let watermarks = fresh_watermarks();
+        let events =
+            controller.reconcile(&watermarks, &backfills, &HashMap::new(), &HashMap::new());
+
+        assert_eq!(
+            events.len(),
+            2,
+            "Expected BackfillChunkPlanned + RunRequested"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.data, OrchestrationEventData::BackfillChunkPlanned { .. })),
+            "Expected BackfillChunkPlanned event"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.data, OrchestrationEventData::RunRequested { .. })),
+            "Expected RunRequested event"
+        );
+    }
+
+    #[test]
+    fn test_backfill_reconcile_skips_filter_selector_with_unsupported_keys() {
+        let controller = BackfillController::new(test_partition_resolver());
+
+        let mut filters = HashMap::new();
+        filters.insert("start".to_string(), "2025-01-01".to_string());
+        filters.insert("end".to_string(), "2025-01-03".to_string());
+        filters.insert("region".to_string(), "us-*".to_string());
+
+        let mut backfills = HashMap::new();
+        backfills.insert(
+            "bf_filter_unsupported".into(),
+            BackfillRow {
+                backfill_id: "bf_filter_unsupported".into(),
+                partition_selector: PartitionSelector::Filter { filters },
+                total_partitions: 0,
+                chunk_size: 2,
+                max_concurrent_runs: 1,
+                ..default_backfill_row()
+            },
+        );
+
+        let watermarks = fresh_watermarks();
+        let events =
+            controller.reconcile(&watermarks, &backfills, &HashMap::new(), &HashMap::new());
+
+        assert!(
+            events.is_empty(),
+            "unsupported filter keys must not silently schedule chunks"
         );
     }
 }

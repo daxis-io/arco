@@ -88,3 +88,80 @@ impl SyncCompactor for CompactorClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use axum::routing::post;
+    use serde_json::json;
+
+    async fn spawn_status_server(status: StatusCode, body: serde_json::Value) -> String {
+        let app = Router::new().route(
+            "/internal/sync-compact",
+            post(move || {
+                let status = status;
+                let body = body.clone();
+                async move { (status, axum::Json(body)) }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        format!("http://{addr}")
+    }
+
+    fn sample_request() -> SyncCompactRequest {
+        SyncCompactRequest {
+            domain: "catalog".to_string(),
+            event_paths: vec!["ledger/catalog/evt.json".to_string()],
+            fencing_token: 1,
+            request_id: Some("req-1".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_compact_maps_conflict_to_precondition_failed() {
+        let base_url =
+            spawn_status_server(StatusCode::CONFLICT, json!({ "message": "stale" })).await;
+        let client = CompactorClient::new(base_url);
+
+        let result = client.sync_compact(sample_request()).await;
+        assert!(matches!(
+            result,
+            Err(CatalogError::PreconditionFailed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn sync_compact_maps_bad_request_to_validation() {
+        let base_url =
+            spawn_status_server(StatusCode::BAD_REQUEST, json!({ "message": "bad" })).await;
+        let client = CompactorClient::new(base_url);
+
+        let result = client.sync_compact(sample_request()).await;
+        assert!(matches!(result, Err(CatalogError::Validation { .. })));
+    }
+
+    #[tokio::test]
+    async fn sync_compact_maps_not_implemented_to_invariant_violation() {
+        let base_url = spawn_status_server(
+            StatusCode::NOT_IMPLEMENTED,
+            json!({ "message": "not implemented" }),
+        )
+        .await;
+        let client = CompactorClient::new(base_url);
+
+        let result = client.sync_compact(sample_request()).await;
+        assert!(matches!(
+            result,
+            Err(CatalogError::InvariantViolation { .. })
+        ));
+    }
+}

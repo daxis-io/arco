@@ -104,3 +104,74 @@ impl OrchestrationLedgerWriter for CompactingLedgerWriter {
             .map_err(|e| format!("{e:?}"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    async fn spawn_error_server(status: StatusCode, body: serde_json::Value) -> String {
+        let app = Router::new().route(
+            "/compact",
+            post(move || {
+                let status = status;
+                let body = body.clone();
+                async move { (status, Json(body)) }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn sample_storage() -> ScopedStorage {
+        let backend = Arc::new(arco_core::MemoryBackend::new());
+        ScopedStorage::new(backend, "tenant", "workspace").expect("scoped storage")
+    }
+
+    #[tokio::test]
+    async fn compact_orchestration_events_noop_when_empty() {
+        let result = compact_orchestration_events(
+            &Config::default(),
+            sample_storage(),
+            Vec::<String>::new(),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn compact_orchestration_events_maps_remote_error_message() {
+        let url = spawn_error_server(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "error": "compactor unavailable" }),
+        )
+        .await;
+
+        let config = Config {
+            debug: false,
+            orchestration_compactor_url: Some(url),
+            ..Config::default()
+        };
+
+        let result = compact_orchestration_events(
+            &config,
+            sample_storage(),
+            vec!["ledger/executions/evt.json".to_string()],
+        )
+        .await;
+        let err = result.expect_err("must fail");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message().contains("compactor unavailable"));
+    }
+}

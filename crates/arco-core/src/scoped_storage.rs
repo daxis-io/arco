@@ -349,6 +349,18 @@ impl ScopedStorage {
         self.scoped_path(&CatalogPaths::domain_manifest(domain))
     }
 
+    /// Path to a domain manifest pointer (canonical).
+    #[must_use]
+    pub fn manifest_pointer(&self, domain: CatalogDomain) -> String {
+        self.scoped_path(&CatalogPaths::domain_manifest_pointer(domain))
+    }
+
+    /// Path to an immutable domain manifest snapshot (canonical).
+    #[must_use]
+    pub fn manifest_snapshot(&self, domain: CatalogDomain, manifest_id: &str) -> String {
+        self.scoped_path(&CatalogPaths::domain_manifest_snapshot(domain, manifest_id))
+    }
+
     /// Path to a domain lock file (canonical).
     #[must_use]
     pub fn lock(&self, domain: CatalogDomain) -> String {

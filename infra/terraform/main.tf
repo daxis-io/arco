@@ -44,6 +44,17 @@ provider "google" {
   region  = var.region
 }
 
+data "google_project" "current" {
+  count      = var.project_number == "" ? 1 : 0
+  project_id = var.project_id
+}
+
+locals {
+  # Prefer explicit configuration to allow `terraform plan` with example tfvars files
+  # (no cloud auth / API calls). If unset, auto-discover from the project.
+  project_number = var.project_number != "" ? var.project_number : tostring(data.google_project.current[0].number)
+}
+
 # ============================================================================
 # Storage
 # ============================================================================
@@ -109,6 +120,21 @@ resource "google_secret_manager_secret" "jwt_secret" {
   count     = var.jwt_secret_name != "" ? 1 : 0
   project   = var.project_id
   secret_id = var.jwt_secret_name
+
+  replication {
+    auto {}
+  }
+
+  labels = {
+    environment = var.environment
+    service     = "arco"
+  }
+}
+
+resource "google_secret_manager_secret" "tenant_secret" {
+  count     = var.tenant_secret_name != "" && var.environment != "dev" ? 1 : 0
+  project   = var.project_id
+  secret_id = var.tenant_secret_name
 
   replication {
     auto {}

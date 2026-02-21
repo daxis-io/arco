@@ -17,11 +17,12 @@ workspace = true
 
 [features]
 default = []
+legacy-scheduler = []
 full = ["gcp", "aws", "azure"]
 gcp = ["arco-core/gcp", "dep:reqwest", "dep:gcp_auth"]
 aws = ["arco-core/aws"]
 azure = ["arco-core/azure"]
-test-utils = ["arco-core/test-utils", "dep:proptest", "dep:tempfile"]
+test-utils = ["arco-core/test-utils", "dep:proptest", "dep:tempfile", "dep:reqwest"]
 
 [dependencies]
 arco-core = { path = "../arco-core" }
@@ -74,6 +75,7 @@ tempfile = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 gcp_auth = { workspace = true, optional = true }
 base64 = { workspace = true }
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

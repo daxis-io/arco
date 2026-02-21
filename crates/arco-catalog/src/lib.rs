@@ -106,8 +106,9 @@ pub use idempotency::{
 pub use lock::{DistributedLock, LockGuard, LockInfo};
 pub use manifest::{
     CatalogDomainManifest, CatalogManifest, CommitRecord, CompactionMetadata, CoreManifest,
-    ExecutionManifest, ExecutionsManifest, GovernanceManifest, LineageManifest, RootManifest,
-    SearchManifest,
+    DomainManifestPointer, ExecutionManifest, ExecutionsManifest, GovernanceManifest,
+    LineageManifest, RootManifest, SearchManifest, format_manifest_id, next_manifest_id,
+    parse_manifest_id,
 };
 pub use reader::{CatalogReader, LineageGraph, SignedUrl, SnapshotFreshness};
 pub use reconciler::{Reconciler, ReconciliationIssue, ReconciliationReport, RepairResult};

@@ -29,6 +29,7 @@ use arco_catalog::idempotency::{
     CatalogOperation, IdempotencyCheck, IdempotencyStore, IdempotencyStoreImpl,
     calculate_retry_after, canonical_request_hash, check_idempotency,
 };
+use arco_core::TableFormat;
 
 /// Request to register a table.
 #[derive(Debug, Deserialize, ToSchema)]
@@ -37,6 +38,8 @@ pub struct RegisterTableRequest {
     pub name: String,
     /// Optional description.
     pub description: Option<String>,
+    /// Optional table format (`delta`, `iceberg`, `parquet`), defaults to `delta`.
+    pub format: Option<String>,
     /// Table schema (columns).
     pub columns: Vec<ColumnDefinition>,
 }
@@ -78,6 +81,8 @@ pub struct TableResponse {
     /// Optional description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Effective table format.
+    pub format: String,
     /// Table columns.
     pub columns: Vec<ColumnResponse>,
     /// Creation timestamp (ISO 8601).
@@ -164,6 +169,7 @@ pub(crate) async fn register_table(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
+    let requested_format = normalize_requested_format(req.format.as_deref())?;
 
     let columns_json: Vec<serde_json::Value> = req
         .columns
@@ -182,6 +188,7 @@ pub(crate) async fn register_table(
         "namespace": namespace,
         "name": req.name,
         "description": req.description,
+        "format": &requested_format,
         "columns": columns_json
     });
     let request_hash = canonical_request_hash(&request_json)
@@ -221,6 +228,7 @@ pub(crate) async fn register_table(
                 namespace,
                 name: table.name,
                 description: table.description,
+                format: effective_table_format(table.format.as_deref())?,
                 columns: cols
                     .into_iter()
                     .map(|c| ColumnResponse {
@@ -290,7 +298,7 @@ pub(crate) async fn register_table(
                 name: req.name.clone(),
                 description: req.description.clone(),
                 location: None,
-                format: None,
+                format: Some(requested_format.clone()),
                 columns,
             },
             options,
@@ -344,6 +352,7 @@ pub(crate) async fn register_table(
         namespace,
         name: table.name,
         description: table.description,
+        format: effective_table_format(table.format.as_deref())?,
         columns: cols
             .into_iter()
             .map(|c| ColumnResponse {
@@ -415,6 +424,7 @@ pub(crate) async fn list_tables(
             namespace: namespace.clone(),
             name: table.name,
             description: table.description,
+            format: effective_table_format(table.format.as_deref())?,
             columns: cols
                 .into_iter()
                 .map(|c| ColumnResponse {
@@ -488,6 +498,7 @@ pub(crate) async fn get_table(
         namespace,
         name: table.name,
         description: table.description,
+        format: effective_table_format(table.format.as_deref())?,
         columns: cols
             .into_iter()
             .map(|c| ColumnResponse {
@@ -583,6 +594,7 @@ pub(crate) async fn update_table(
         namespace,
         name: table.name,
         description: table.description,
+        format: effective_table_format(table.format.as_deref())?,
         columns: cols
             .into_iter()
             .map(|c| ColumnResponse {
@@ -664,4 +676,19 @@ pub(crate) async fn drop_table(
 fn format_timestamp(millis: i64) -> String {
     chrono::DateTime::from_timestamp_millis(millis)
         .map_or_else(|| millis.to_string(), |dt| dt.to_rfc3339())
+}
+
+fn effective_table_format(format: Option<&str>) -> Result<String, ApiError> {
+    TableFormat::effective(format)
+        .map(|value| value.as_str().to_string())
+        .map_err(|err| ApiError::internal(format!("invalid persisted table format: {err}")))
+}
+
+fn normalize_requested_format(format: Option<&str>) -> Result<String, ApiError> {
+    format
+        .map_or_else(
+            || Ok(TableFormat::Delta.as_str().to_string()),
+            TableFormat::normalize,
+        )
+        .map_err(ApiError::from)
 }

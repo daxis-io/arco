@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use arco_core::storage::StorageBackend;
 use arco_core::sync_compact::SyncCompactRequest;
-use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
+use arco_core::{CatalogDomain, CatalogPaths, DeltaPaths, ScopedStorage, TableFormat};
 
 use crate::error::{CatalogError, Result};
 use crate::event_writer::EventWriter;
@@ -50,6 +50,38 @@ use crate::write_options::WriteOptions;
 const DEFAULT_LOCK_TTL: Duration = Duration::from_secs(30);
 /// Default maximum lock acquisition retries.
 const DEFAULT_LOCK_MAX_RETRIES: u32 = 10;
+
+fn normalize_new_table_format(raw: Option<&str>) -> Result<String> {
+    match raw {
+        Some(value) => TableFormat::normalize(value).map_err(CatalogError::from),
+        None => Ok(TableFormat::Delta.as_str().to_string()),
+    }
+}
+
+fn normalize_table_format_patch(raw: Option<String>) -> Result<Option<String>> {
+    raw.map(|value| TableFormat::normalize(&value).map_err(CatalogError::from))
+        .transpose()
+}
+
+fn normalize_table_location_for_write(
+    format: TableFormat,
+    raw: Option<String>,
+    tenant: &str,
+    workspace: &str,
+) -> Result<Option<String>> {
+    if format != TableFormat::Delta {
+        return Ok(raw);
+    }
+
+    let Some(location) = raw else {
+        return Ok(None);
+    };
+
+    let trimmed = location.trim().to_string();
+    DeltaPaths::from_table_location(Uuid::nil(), Some(&trimmed), tenant, workspace)
+        .map_err(CatalogError::from)?;
+    Ok(Some(trimmed))
+}
 // ============================================================================
 // Domain Types (returned from write operations)
 // ============================================================================
@@ -1210,14 +1242,22 @@ impl CatalogWriter {
 
         let now = Utc::now().timestamp_millis();
         let table_id = Uuid::now_v7().to_string();
+        let table_format = normalize_new_table_format(req.format.as_deref())?;
+        let table_format_kind = TableFormat::parse(&table_format).map_err(CatalogError::from)?;
+        let table_location = normalize_table_location_for_write(
+            table_format_kind,
+            req.location.clone(),
+            self.storage.tenant_id(),
+            self.storage.workspace_id(),
+        )?;
 
         let table = Table {
             id: table_id.clone(),
             namespace_id: namespace_id.clone(),
             name: req.name.clone(),
             description: req.description.clone(),
-            location: req.location.clone(),
-            format: req.format.clone(),
+            location: table_location,
+            format: Some(table_format),
             created_at: now,
             updated_at: now,
         };
@@ -1318,7 +1358,6 @@ impl CatalogWriter {
                 });
             }
         }
-
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
@@ -1381,14 +1420,22 @@ impl CatalogWriter {
 
         let now = Utc::now().timestamp_millis();
         let table_id = Uuid::now_v7().to_string();
+        let table_format = normalize_new_table_format(req.format.as_deref())?;
+        let table_format_kind = TableFormat::parse(&table_format).map_err(CatalogError::from)?;
+        let table_location = normalize_table_location_for_write(
+            table_format_kind,
+            req.location.clone(),
+            self.storage.tenant_id(),
+            self.storage.workspace_id(),
+        )?;
 
         let table = Table {
             id: table_id.clone(),
             namespace_id: namespace_id.clone(),
             name: req.name.clone(),
             description: req.description.clone(),
-            location: req.location.clone(),
-            format: req.format.clone(),
+            location: table_location,
+            format: Some(table_format),
             created_at: now,
             updated_at: now,
         };
@@ -1538,7 +1585,22 @@ impl CatalogWriter {
             table_rec.location = loc;
         }
         if let Some(fmt) = patch.format {
-            table_rec.format = fmt;
+            table_rec.format = normalize_table_format_patch(fmt)?;
+        }
+
+        let effective_format = table_rec
+            .format
+            .as_deref()
+            .map(TableFormat::parse)
+            .transpose()
+            .map_err(CatalogError::from)?;
+        if effective_format == Some(TableFormat::Delta) {
+            table_rec.location = normalize_table_location_for_write(
+                TableFormat::Delta,
+                table_rec.location.clone(),
+                self.storage.tenant_id(),
+                self.storage.workspace_id(),
+            )?;
         }
 
         let table_record = table_rec.clone();
@@ -2197,40 +2259,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_register_table_in_schema_uses_catalog_and_schema() {
-        let writer = setup();
-        writer.initialize().await.expect("initialize");
-
-        writer
-            .create_catalog("analytics", None, WriteOptions::default())
-            .await
-            .expect("create analytics catalog");
-        let sales = writer
-            .create_schema("analytics", "sales", None, WriteOptions::default())
-            .await
-            .expect("create sales schema");
-
-        let table = writer
-            .register_table_in_schema(
-                "analytics",
-                "sales",
-                RegisterTableInSchemaRequest {
-                    name: "orders".to_string(),
-                    description: None,
-                    location: Some("gs://bucket/warehouse/sales/orders".to_string()),
-                    format: Some("delta".to_string()),
-                    columns: vec![],
-                },
-                WriteOptions::default(),
-            )
-            .await
-            .expect("register table");
-
-        assert_eq!(table.namespace_id, sales.id);
-        assert_eq!(table.name, "orders");
-    }
-
-    #[tokio::test]
     async fn test_initialize_creates_manifests() {
         let writer = setup();
         writer.initialize().await.expect("initialize");
@@ -2385,6 +2413,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_register_table_defaults_to_delta_format() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_namespace("default", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+
+        let table = writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "default".to_string(),
+                    name: "events".to_string(),
+                    description: None,
+                    location: Some("warehouse/default/events".to_string()),
+                    format: None,
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+
+        assert_eq!(table.format.as_deref(), Some("delta"));
+    }
+
+    #[tokio::test]
+    async fn test_register_table_validates_and_canonicalizes_format() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_namespace("default", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+
+        let table = writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "default".to_string(),
+                    name: "delta_table".to_string(),
+                    description: None,
+                    location: Some("warehouse/default/delta_table".to_string()),
+                    format: Some("DeLtA".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+
+        assert_eq!(table.format.as_deref(), Some("delta"));
+
+        let err = writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "default".to_string(),
+                    name: "unknown_format".to_string(),
+                    description: None,
+                    location: Some("warehouse/default/unknown_format".to_string()),
+                    format: Some("avro".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect_err("unknown format must fail");
+        assert!(matches!(err, CatalogError::Validation { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_register_table_rejects_invalid_delta_location() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_namespace("default", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+
+        let empty_location = writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "default".to_string(),
+                    name: "events_empty_location".to_string(),
+                    description: None,
+                    location: Some("   ".to_string()),
+                    format: Some("delta".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect_err("empty location must fail");
+        assert!(matches!(empty_location, CatalogError::Validation { .. }));
+
+        let traversal_location = writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "default".to_string(),
+                    name: "events_traversal_location".to_string(),
+                    description: None,
+                    location: Some("../escape".to_string()),
+                    format: Some("delta".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect_err("path traversal location must fail");
+        assert!(matches!(
+            traversal_location,
+            CatalogError::Validation { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn test_register_table_resolves_namespace_in_default_catalog() {
         let writer = setup();
         writer.initialize().await.expect("initialize");
@@ -2423,6 +2569,197 @@ mod tests {
         assert_eq!(table.namespace_id, default_sales.id);
     }
 
+    #[tokio::test]
+    async fn test_register_table_in_schema_uses_catalog_and_schema() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_catalog("analytics", None, WriteOptions::default())
+            .await
+            .expect("create analytics catalog");
+        let sales = writer
+            .create_schema("analytics", "sales", None, WriteOptions::default())
+            .await
+            .expect("create sales schema");
+
+        let table = writer
+            .register_table_in_schema(
+                "analytics",
+                "sales",
+                RegisterTableInSchemaRequest {
+                    name: "orders".to_string(),
+                    description: None,
+                    location: Some("gs://bucket/warehouse/sales/orders".to_string()),
+                    format: Some("delta".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+
+        assert_eq!(table.namespace_id, sales.id);
+        assert_eq!(table.name, "orders");
+    }
+
+    #[tokio::test]
+    async fn test_register_table_in_schema_defaults_to_delta_and_validates() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_catalog("analytics", None, WriteOptions::default())
+            .await
+            .expect("create analytics catalog");
+        writer
+            .create_schema("analytics", "sales", None, WriteOptions::default())
+            .await
+            .expect("create schema");
+
+        let created = writer
+            .register_table_in_schema(
+                "analytics",
+                "sales",
+                RegisterTableInSchemaRequest {
+                    name: "orders".to_string(),
+                    description: None,
+                    location: Some("warehouse/sales/orders".to_string()),
+                    format: None,
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+        assert_eq!(created.format.as_deref(), Some("delta"));
+
+        let created_iceberg = writer
+            .register_table_in_schema(
+                "analytics",
+                "sales",
+                RegisterTableInSchemaRequest {
+                    name: "orders_iceberg".to_string(),
+                    description: None,
+                    location: Some("warehouse/sales/orders_iceberg".to_string()),
+                    format: Some("Iceberg".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+        assert_eq!(created_iceberg.format.as_deref(), Some("iceberg"));
+
+        let err = writer
+            .register_table_in_schema(
+                "analytics",
+                "sales",
+                RegisterTableInSchemaRequest {
+                    name: "orders_invalid".to_string(),
+                    description: None,
+                    location: Some("warehouse/sales/orders_invalid".to_string()),
+                    format: Some("orc".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect_err("invalid format");
+        assert!(matches!(err, CatalogError::Validation { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_register_table_in_schema_rejects_invalid_delta_location() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_catalog("analytics", None, WriteOptions::default())
+            .await
+            .expect("create analytics catalog");
+        writer
+            .create_schema("analytics", "sales", None, WriteOptions::default())
+            .await
+            .expect("create schema");
+
+        let empty_location = writer
+            .register_table_in_schema(
+                "analytics",
+                "sales",
+                RegisterTableInSchemaRequest {
+                    name: "orders_empty_location".to_string(),
+                    description: None,
+                    location: Some("   ".to_string()),
+                    format: Some("delta".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect_err("empty location must fail");
+        assert!(matches!(empty_location, CatalogError::Validation { .. }));
+
+        let traversal_location = writer
+            .register_table_in_schema(
+                "analytics",
+                "sales",
+                RegisterTableInSchemaRequest {
+                    name: "orders_traversal_location".to_string(),
+                    description: None,
+                    location: Some("../escape".to_string()),
+                    format: Some("delta".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect_err("path traversal location must fail");
+        assert!(matches!(
+            traversal_location,
+            CatalogError::Validation { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_update_table_rejects_invalid_location_when_switching_to_delta() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_namespace("default", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+
+        writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "default".to_string(),
+                    name: "legacy_parquet".to_string(),
+                    description: None,
+                    location: Some("../legacy/parquet/path".to_string()),
+                    format: Some("parquet".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register parquet table");
+
+        let err = writer
+            .update_table(
+                "default",
+                "legacy_parquet",
+                TablePatch {
+                    format: Some(Some("delta".to_string())),
+                    ..TablePatch::default()
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect_err("switching to delta with invalid location must fail");
+        assert!(matches!(err, CatalogError::Validation { .. }));
+    }
     #[tokio::test]
     async fn test_event_writer_returns_owned() {
         let writer = setup();

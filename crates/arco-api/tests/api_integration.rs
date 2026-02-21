@@ -352,6 +352,7 @@ mod tables {
         namespace: String,
         name: String,
         description: Option<String>,
+        format: String,
         columns: Vec<ColumnResponse>,
     }
 
@@ -395,6 +396,7 @@ mod tables {
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(table.name, "orders");
         assert_eq!(table.namespace, "sales");
+        assert_eq!(table.format, "delta");
         assert_eq!(table.columns.len(), 3);
         assert!(!table.id.is_empty());
 
@@ -465,6 +467,440 @@ mod tables {
         let response = router.oneshot(request).await.map_err(|err| match err {})?;
 
         assert!(response.status().is_client_error() || response.status().is_server_error());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_register_table_canonicalizes_explicit_format() -> Result<()> {
+        let router = test_router();
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/namespaces",
+            serde_json::json!({
+                "name": "warehouse",
+            }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, table): (_, TableResponse) = helpers::post_json(
+            router,
+            "/api/v1/namespaces/warehouse/tables",
+            serde_json::json!({
+                "name": "iceberg_orders",
+                "format": "Iceberg",
+                "columns": [],
+            }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(table.format, "iceberg");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_register_table_rejects_unknown_format() -> Result<()> {
+        let router = test_router();
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/namespaces",
+            serde_json::json!({
+                "name": "lake",
+            }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let request = helpers::make_request(
+            Method::POST,
+            "/api/v1/namespaces/lake/tables",
+            Some(serde_json::json!({
+                "name": "bad_format_table",
+                "format": "orc",
+                "columns": []
+            })),
+        )?;
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+}
+
+mod catalogs {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct SchemaTableResponse {
+        #[allow(dead_code)]
+        id: String,
+        catalog: String,
+        schema: String,
+        name: String,
+        format: String,
+    }
+
+    #[tokio::test]
+    async fn test_register_table_in_schema_defaults_to_delta() -> Result<()> {
+        let router = test_router();
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs",
+            serde_json::json!({ "name": "analytics" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs/analytics/schemas",
+            serde_json::json!({ "name": "sales" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, table): (_, SchemaTableResponse) = helpers::post_json(
+            router,
+            "/api/v1/catalogs/analytics/schemas/sales/tables",
+            serde_json::json!({
+                "name": "orders",
+                "location": "warehouse/sales/orders",
+                "columns": [],
+            }),
+        )
+        .await?;
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(table.catalog, "analytics");
+        assert_eq!(table.schema, "sales");
+        assert_eq!(table.name, "orders");
+        assert_eq!(table.format, "delta");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_register_table_in_schema_rejects_unknown_format() -> Result<()> {
+        let router = test_router();
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs",
+            serde_json::json!({ "name": "analytics" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs/analytics/schemas",
+            serde_json::json!({ "name": "sales" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let request = helpers::make_request(
+            Method::POST,
+            "/api/v1/catalogs/analytics/schemas/sales/tables",
+            Some(serde_json::json!({
+                "name": "bad_orders",
+                "location": "warehouse/sales/bad_orders",
+                "format": "unknown",
+                "columns": []
+            })),
+        )?;
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_register_delta_table_in_schema_rejects_invalid_location() -> Result<()> {
+        let router = test_router();
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs",
+            serde_json::json!({ "name": "analytics" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs/analytics/schemas",
+            serde_json::json!({ "name": "sales" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let empty_location = helpers::make_request(
+            Method::POST,
+            "/api/v1/catalogs/analytics/schemas/sales/tables",
+            Some(serde_json::json!({
+                "name": "orders_empty_location",
+                "location": "   ",
+                "format": "delta",
+                "columns": []
+            })),
+        )?;
+        let empty_location_resp = router
+            .clone()
+            .oneshot(empty_location)
+            .await
+            .map_err(|err| match err {})?;
+        assert_eq!(empty_location_resp.status(), StatusCode::BAD_REQUEST);
+
+        let traversal_location = helpers::make_request(
+            Method::POST,
+            "/api/v1/catalogs/analytics/schemas/sales/tables",
+            Some(serde_json::json!({
+                "name": "orders_traversal_location",
+                "location": "../escape",
+                "format": "delta",
+                "columns": []
+            })),
+        )?;
+        let traversal_location_resp = router
+            .oneshot(traversal_location)
+            .await
+            .map_err(|err| match err {})?;
+        assert_eq!(traversal_location_resp.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+}
+
+mod delta {
+    use super::*;
+    use serde::Deserialize;
+    use uuid::Uuid;
+
+    #[derive(Debug, Deserialize)]
+    struct SchemaTableResponse {
+        id: String,
+        format: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct NamespaceTableResponse {
+        id: String,
+        format: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct StageCommitResponse {
+        staged_path: String,
+        staged_version: String,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    struct CommitResponse {
+        version: i64,
+        delta_log_path: String,
+    }
+
+    #[tokio::test]
+    async fn test_delta_stage_rejects_missing_table() -> Result<()> {
+        let router = test_router();
+
+        let request = helpers::make_request(
+            Method::POST,
+            &format!("/api/v1/delta/tables/{}/commits/stage", Uuid::now_v7()),
+            Some(serde_json::json!({
+                "payload": "{\"commitInfo\":{\"timestamp\":1}}\\n"
+            })),
+        )?;
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delta_stage_rejects_non_delta_table() -> Result<()> {
+        let router = test_router();
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs",
+            serde_json::json!({ "name": "analytics" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs/analytics/schemas",
+            serde_json::json!({ "name": "sales" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, table): (_, SchemaTableResponse) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs/analytics/schemas/sales/tables",
+            serde_json::json!({
+                "name": "orders_iceberg",
+                "location": "warehouse/sales/orders_iceberg",
+                "format": "iceberg",
+                "columns": [],
+            }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(table.format, "iceberg");
+
+        let request = helpers::make_request(
+            Method::POST,
+            &format!("/api/v1/delta/tables/{}/commits/stage", table.id),
+            Some(serde_json::json!({
+                "payload": "{\"commitInfo\":{\"timestamp\":2}}\\n"
+            })),
+        )?;
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delta_commit_rejects_missing_table() -> Result<()> {
+        let router = test_router();
+        let table_id = Uuid::now_v7();
+        let idempotency_key = Uuid::now_v7().to_string();
+
+        let request = helpers::make_request_with_headers(
+            Method::POST,
+            &format!("/api/v1/delta/tables/{table_id}/commits"),
+            Some(serde_json::json!({
+                "read_version": -1,
+                "staged_path": format!("delta/staging/{table_id}/missing.json"),
+                "staged_version": "missing-version"
+            })),
+            &[("Idempotency-Key", &idempotency_key)],
+        )?;
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delta_commit_rejects_non_delta_table() -> Result<()> {
+        let router = test_router();
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs",
+            serde_json::json!({ "name": "analytics" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs/analytics/schemas",
+            serde_json::json!({ "name": "sales" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, table): (_, SchemaTableResponse) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs/analytics/schemas/sales/tables",
+            serde_json::json!({
+                "name": "orders_iceberg_commit",
+                "location": "warehouse/sales/orders_iceberg_commit",
+                "format": "iceberg",
+                "columns": [],
+            }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let idempotency_key = Uuid::now_v7().to_string();
+        let request = helpers::make_request_with_headers(
+            Method::POST,
+            &format!("/api/v1/delta/tables/{}/commits", table.id),
+            Some(serde_json::json!({
+                "read_version": -1,
+                "staged_path": format!("delta/staging/{}/missing.json", table.id),
+                "staged_version": "missing-version"
+            })),
+            &[("Idempotency-Key", &idempotency_key)],
+        )?;
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delta_commit_replay_succeeds_after_table_drop() -> Result<()> {
+        let router = test_router();
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/namespaces",
+            serde_json::json!({ "name": "sales" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, table): (_, NamespaceTableResponse) = helpers::post_json(
+            router.clone(),
+            "/api/v1/namespaces/sales/tables",
+            serde_json::json!({
+                "name": "orders_delta_replay",
+                "columns": [],
+            }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(table.format, "delta");
+
+        let (status, staged): (_, StageCommitResponse) = helpers::post_json(
+            router.clone(),
+            &format!("/api/v1/delta/tables/{}/commits/stage", table.id),
+            serde_json::json!({
+                "payload": "{\"commitInfo\":{\"timestamp\":42}}\\n"
+            }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+
+        let idempotency_key = Uuid::now_v7().to_string();
+        let commit_body = serde_json::json!({
+            "read_version": -1,
+            "staged_path": staged.staged_path,
+            "staged_version": staged.staged_version
+        });
+
+        let (status, committed): (_, CommitResponse) = helpers::post_json_with_headers(
+            router.clone(),
+            &format!("/api/v1/delta/tables/{}/commits", table.id),
+            commit_body.clone(),
+            &[("Idempotency-Key", &idempotency_key)],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+
+        let status = helpers::delete(
+            router.clone(),
+            "/api/v1/namespaces/sales/tables/orders_delta_replay",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, replayed): (_, CommitResponse) = helpers::post_json_with_headers(
+            router,
+            &format!("/api/v1/delta/tables/{}/commits", table.id),
+            commit_body,
+            &[("Idempotency-Key", &idempotency_key)],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replayed, committed);
+
         Ok(())
     }
 }
@@ -1709,7 +2145,7 @@ mod query {
         let cursor = Cursor::new(body.to_vec());
         let mut reader = StreamReader::try_new(cursor, None).context("open arrow stream reader")?;
         let mut rows = 0;
-        while let Some(batch) = reader.next() {
+        for batch in &mut reader {
             let batch = batch.context("read arrow batch")?;
             rows += batch.num_rows();
         }
@@ -1851,7 +2287,7 @@ mod query {
         let deny_event = events
             .iter()
             .find(|e| e.action == AuditAction::AuthDeny)
-            .expect("should have AuthDeny event");
+            .context("should have AuthDeny event")?;
         assert_eq!(deny_event.decision_reason, "missing_token");
 
         Ok(())
@@ -2022,6 +2458,74 @@ mod idempotency {
         )?;
         let response = router.oneshot(request).await.map_err(|err| match err {})?;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+}
+
+mod query_read_only {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct QueryError {
+        message: String,
+    }
+
+    #[tokio::test]
+    async fn test_query_endpoint_rejects_write_statements() -> Result<()> {
+        let router = test_router();
+        let statements = [
+            "INSERT INTO catalog.tables VALUES (1)",
+            "UPDATE catalog.tables SET name = 'x'",
+            "DELETE FROM catalog.tables",
+            "CREATE TABLE t(id INT)",
+        ];
+
+        for statement in statements {
+            let (status, error): (_, QueryError) = helpers::post_json(
+                router.clone(),
+                "/api/v1/query?format=json",
+                serde_json::json!({ "sql": statement }),
+            )
+            .await?;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                error
+                    .message
+                    .contains("Only SELECT/CTE queries are supported")
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_query_data_endpoint_rejects_write_statements() -> Result<()> {
+        let router = test_router();
+        let statements = [
+            "INSERT INTO analytics.sales.orders VALUES (1)",
+            "UPDATE analytics.sales.orders SET id = 2",
+            "DELETE FROM analytics.sales.orders",
+            "DROP TABLE analytics.sales.orders",
+        ];
+
+        for statement in statements {
+            let (status, error): (_, QueryError) = helpers::post_json(
+                router.clone(),
+                "/api/v1/query-data?format=json",
+                serde_json::json!({ "sql": statement }),
+            )
+            .await?;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                error
+                    .message
+                    .contains("Only SELECT/CTE queries are supported")
+            );
+        }
 
         Ok(())
     }

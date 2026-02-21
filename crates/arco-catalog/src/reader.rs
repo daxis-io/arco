@@ -27,7 +27,8 @@
 #![allow(clippy::option_if_let_else)]
 #![allow(clippy::uninlined_format_args)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -36,8 +37,8 @@ use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
 
 use crate::error::{CatalogError, Result};
 use crate::manifest::{
-    CatalogDomainManifest, CatalogManifest, ExecutionsManifest, LineageManifest, RootManifest,
-    SearchManifest, SnapshotInfo, TailRange,
+    CatalogDomainManifest, CatalogManifest, DomainManifestPointer, ExecutionsManifest,
+    LineageManifest, RootManifest, SearchManifest, SnapshotInfo, TailRange,
 };
 use crate::parquet_util;
 use crate::write_options::SnapshotVersion;
@@ -124,6 +125,13 @@ pub struct SignedUrl {
 /// ```
 pub struct CatalogReader {
     storage: ScopedStorage,
+    table_lookup_cache: RwLock<Option<TableLookupCache>>,
+}
+
+#[derive(Debug, Clone)]
+struct TableLookupCache {
+    snapshot_version: u64,
+    by_id: Arc<HashMap<String, Table>>,
 }
 
 fn join_snapshot_path(dir: &str, file: &str) -> String {
@@ -146,7 +154,10 @@ impl CatalogReader {
     /// Creates a new catalog reader for the given workspace.
     #[must_use]
     pub fn new(storage: ScopedStorage) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            table_lookup_cache: RwLock::new(None),
+        }
     }
 
     // ========================================================================
@@ -162,13 +173,18 @@ impl CatalogReader {
             serde_json::from_slice(&root_bytes).map_err(|e| CatalogError::Serialization {
                 message: format!("failed to parse root manifest: {}", e),
             })?;
+        let mut root = root;
+        root.normalize_paths();
 
-        // Read domain manifests in parallel
+        // Read domain manifests in parallel, preferring pointer-resolved immutable snapshots.
         let (catalog_bytes, lineage_bytes, executions_bytes, search_bytes) = tokio::join!(
-            self.storage.get_raw(&root.catalog_manifest_path),
-            self.storage.get_raw(&root.lineage_manifest_path),
-            self.storage.get_raw(&root.executions_manifest_path),
-            self.storage.get_raw(&root.search_manifest_path),
+            self.read_domain_manifest_bytes(CatalogDomain::Catalog, &root.catalog_manifest_path),
+            self.read_domain_manifest_bytes(CatalogDomain::Lineage, &root.lineage_manifest_path),
+            self.read_domain_manifest_bytes(
+                CatalogDomain::Executions,
+                &root.executions_manifest_path
+            ),
+            self.read_domain_manifest_bytes(CatalogDomain::Search, &root.search_manifest_path),
         );
 
         let catalog: CatalogDomainManifest =
@@ -204,6 +220,99 @@ impl CatalogReader {
         })
     }
 
+    async fn table_lookup_by_id(
+        &self,
+        snapshot_version: u64,
+    ) -> Result<Arc<HashMap<String, Table>>> {
+        let cached_lookup = {
+            let cache =
+                self.table_lookup_cache
+                    .read()
+                    .map_err(|_| CatalogError::InvariantViolation {
+                        message: "table lookup cache lock poisoned".to_string(),
+                    })?;
+            cache.as_ref().and_then(|entry| {
+                (entry.snapshot_version == snapshot_version).then(|| Arc::clone(&entry.by_id))
+            })
+        };
+        if let Some(cached_lookup) = cached_lookup {
+            return Ok(cached_lookup);
+        }
+
+        let tables_path =
+            CatalogPaths::snapshot_file(CatalogDomain::Catalog, snapshot_version, "tables.parquet");
+        let bytes = self.storage.get_raw(&tables_path).await?;
+        let records = parquet_util::read_tables(&bytes)?;
+        let by_id = Arc::new(
+            records
+                .into_iter()
+                .map(Table::from)
+                .map(|table| (table.id.clone(), table))
+                .collect::<HashMap<_, _>>(),
+        );
+
+        let existing_lookup = {
+            let mut cache =
+                self.table_lookup_cache
+                    .write()
+                    .map_err(|_| CatalogError::InvariantViolation {
+                        message: "table lookup cache lock poisoned".to_string(),
+                    })?;
+            if let Some(entry) = cache.as_ref() {
+                if entry.snapshot_version == snapshot_version {
+                    Some(Arc::clone(&entry.by_id))
+                } else {
+                    *cache = Some(TableLookupCache {
+                        snapshot_version,
+                        by_id: Arc::clone(&by_id),
+                    });
+                    None
+                }
+            } else {
+                *cache = Some(TableLookupCache {
+                    snapshot_version,
+                    by_id: Arc::clone(&by_id),
+                });
+                None
+            }
+        };
+        if let Some(existing_lookup) = existing_lookup {
+            return Ok(existing_lookup);
+        }
+
+        Ok(by_id)
+    }
+
+    async fn read_domain_manifest_bytes(
+        &self,
+        domain: CatalogDomain,
+        legacy_path: &str,
+    ) -> Result<bytes::Bytes> {
+        let pointer_path = CatalogPaths::domain_manifest_pointer(domain);
+        match self.storage.get_raw(&pointer_path).await {
+            Ok(pointer_bytes) => {
+                let pointer: DomainManifestPointer = serde_json::from_slice(&pointer_bytes)
+                    .map_err(|e| CatalogError::Serialization {
+                        message: format!("failed to parse manifest pointer at {pointer_path}: {e}"),
+                    })?;
+
+                match self.storage.get_raw(&pointer.manifest_path).await {
+                    Ok(bytes) => Ok(bytes),
+                    Err(
+                        arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. },
+                    ) => {
+                        // Migration fallback: pointer exists but immutable snapshot is unavailable.
+                        self.storage.get_raw(legacy_path).await.map_err(Into::into)
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            }
+            Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+                self.storage.get_raw(legacy_path).await.map_err(Into::into)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
     // ========================================================================
     // Catalog Operations (UC-like model)
     // ========================================================================
@@ -501,6 +610,29 @@ impl CatalogReader {
     pub async fn get_table(&self, namespace: &str, name: &str) -> Result<Option<Table>> {
         let tables = self.list_tables(namespace).await?;
         Ok(tables.into_iter().find(|t| t.name == name))
+    }
+
+    /// Gets a table by table ID.
+    ///
+    /// # Returns
+    ///
+    /// Returns `None` if the table doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if snapshot reads fail.
+    pub async fn get_table_by_id(&self, table_id: &str) -> Result<Option<Table>> {
+        let manifest = self.read_manifest().await?;
+
+        if manifest.catalog.snapshot_version == 0 {
+            return Ok(None);
+        }
+
+        let by_id = self
+            .table_lookup_by_id(manifest.catalog.snapshot_version)
+            .await?;
+
+        Ok(by_id.get(table_id).cloned())
     }
 
     /// Lists columns for a table by table ID.
@@ -864,16 +996,108 @@ impl CatalogReader {
 mod tests {
     use super::*;
     use crate::manifest::SnapshotFile;
+    use crate::tier1_compactor::Tier1Compactor;
     use crate::tier1_writer::Tier1Writer;
-    use arco_core::storage::{MemoryBackend, WritePrecondition};
+    use crate::write_options::WriteOptions;
+    use crate::writer::{CatalogWriter, ColumnDefinition, RegisterTableRequest};
+    use arco_core::storage::{
+        MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+    };
+    use async_trait::async_trait;
     use bytes::Bytes;
+    use std::ops::Range;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn setup() -> CatalogReader {
         let backend = Arc::new(MemoryBackend::new());
         let storage =
             ScopedStorage::new(backend, "test-tenant", "test-workspace").expect("scoped storage");
         CatalogReader::new(storage)
+    }
+
+    #[derive(Debug)]
+    struct CountingTablesBackend {
+        inner: MemoryBackend,
+        table_reads: AtomicUsize,
+    }
+
+    impl CountingTablesBackend {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                table_reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn table_reads(&self) -> usize {
+            self.table_reads.load(Ordering::Relaxed)
+        }
+
+        fn reset_table_reads(&self) {
+            self.table_reads.store(0, Ordering::Relaxed);
+        }
+
+        fn maybe_record_table_read(&self, path: &str) {
+            if path.ends_with("/tables.parquet") {
+                self.table_reads.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for CountingTablesBackend {
+        async fn get(&self, path: &str) -> arco_core::error::Result<Bytes> {
+            self.maybe_record_table_read(path);
+            self.inner.get(path).await
+        }
+
+        async fn get_range(
+            &self,
+            path: &str,
+            range: Range<u64>,
+        ) -> arco_core::error::Result<Bytes> {
+            self.maybe_record_table_read(path);
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::error::Result<WriteResult> {
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::error::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::error::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::error::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(
+            &self,
+            path: &str,
+            expiry: Duration,
+        ) -> arco_core::error::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    fn column(name: &str) -> ColumnDefinition {
+        ColumnDefinition {
+            name: name.to_string(),
+            data_type: "STRING".to_string(),
+            is_nullable: true,
+            description: None,
+        }
     }
 
     #[tokio::test]
@@ -965,6 +1189,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_catalog_mintable_paths_include_catalogs_parquet() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage =
+            ScopedStorage::new(backend, "test-tenant", "test-workspace").expect("storage");
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await.expect("init");
+
+        let root_bytes = storage
+            .get_raw(CatalogPaths::ROOT_MANIFEST)
+            .await
+            .expect("root manifest");
+        let mut root: RootManifest = serde_json::from_slice(&root_bytes).expect("root parse");
+        root.normalize_paths();
+
+        let catalog_bytes = storage
+            .get_raw(&root.catalog_manifest_path)
+            .await
+            .expect("catalog manifest");
+        let mut catalog: CatalogDomainManifest =
+            serde_json::from_slice(&catalog_bytes).expect("catalog parse");
+        catalog.snapshot_version = 1;
+        catalog.snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1);
+        catalog.snapshot = None;
+        catalog.updated_at = Utc::now();
+
+        let catalog_payload = serde_json::to_vec(&catalog).expect("serialize");
+        storage
+            .put_raw(
+                &root.catalog_manifest_path,
+                Bytes::from(catalog_payload),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write catalog manifest");
+
+        let reader = CatalogReader::new(storage);
+        let paths = reader
+            .get_mintable_paths(CatalogDomain::Catalog)
+            .await
+            .expect("paths");
+        assert_eq!(
+            paths,
+            vec![
+                CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "catalogs.parquet"),
+                CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "namespaces.parquet"),
+                CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "tables.parquet"),
+                CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "columns.parquet"),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn test_mint_signed_urls_validates_paths() {
         let reader = setup();
         // Try to mint URL for path not in allowlist
@@ -983,5 +1259,115 @@ mod tests {
         let graph = LineageGraph::default();
         assert!(graph.upstream.is_empty());
         assert!(graph.downstream.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_table_by_id_reads_tables_snapshot_once_per_version() {
+        let backend = Arc::new(CountingTablesBackend::new());
+        let storage =
+            ScopedStorage::new(backend.clone(), "test-tenant", "test-workspace").expect("storage");
+        let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+        let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_namespace("default", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+        let table = writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "default".to_string(),
+                    name: "events".to_string(),
+                    description: None,
+                    location: None,
+                    format: None,
+                    columns: vec![column("event_id")],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+
+        let reader = CatalogReader::new(storage.clone());
+        backend.reset_table_reads();
+
+        let first = reader
+            .get_table_by_id(&table.id)
+            .await
+            .expect("first lookup")
+            .expect("table exists");
+        let second = reader
+            .get_table_by_id(&table.id)
+            .await
+            .expect("second lookup")
+            .expect("table exists");
+
+        assert_eq!(first.id, table.id);
+        assert_eq!(second.id, table.id);
+        assert_eq!(
+            backend.table_reads(),
+            1,
+            "repeated lookup should not reload tables.parquet for the same snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_table_by_id_cache_refreshes_on_new_snapshot() {
+        let backend = Arc::new(CountingTablesBackend::new());
+        let storage =
+            ScopedStorage::new(backend.clone(), "test-tenant", "test-workspace").expect("storage");
+        let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+        let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_namespace("default", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+        let first = writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "default".to_string(),
+                    name: "events".to_string(),
+                    description: None,
+                    location: None,
+                    format: None,
+                    columns: vec![column("event_id")],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register first table");
+
+        let reader = CatalogReader::new(storage.clone());
+        let resolved_first = reader
+            .get_table_by_id(&first.id)
+            .await
+            .expect("first lookup")
+            .expect("first exists");
+        assert_eq!(resolved_first.id, first.id);
+
+        let second = writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "default".to_string(),
+                    name: "sessions".to_string(),
+                    description: None,
+                    location: None,
+                    format: None,
+                    columns: vec![column("session_id")],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register second table");
+
+        let resolved_second = reader
+            .get_table_by_id(&second.id)
+            .await
+            .expect("second lookup")
+            .expect("second exists");
+        assert_eq!(resolved_second.id, second.id);
     }
 }

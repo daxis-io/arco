@@ -17,7 +17,7 @@
 //! # Critical Invariants
 //!
 //! - **No listing**: Events are passed explicitly, not discovered via list
-//! - **Fencing validation**: Stale lock holders are rejected
+//! - **Fencing validation**: Stale lock epochs are rejected
 //! - **Sole writer**: Only compactor writes Parquet + manifest
 
 use serde::{Deserialize, Serialize};

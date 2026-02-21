@@ -177,6 +177,8 @@ impl std::fmt::Display for StateKey {
 ///
 /// - Root: `manifests/root.manifest.json`
 /// - Domain: `manifests/{domain}.manifest.json`
+/// - Domain pointer: `manifests/{domain}.pointer.json`
+/// - Domain snapshot: `manifests/{domain}/{manifest_id}.json`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ManifestKey(String);
 
@@ -194,6 +196,30 @@ impl ManifestKey {
     #[must_use]
     pub fn domain(domain: CatalogDomain) -> Self {
         Self(format!("manifests/{}.manifest.json", domain.as_str()))
+    }
+
+    /// Creates a domain manifest pointer key.
+    #[must_use]
+    pub fn domain_pointer(domain: CatalogDomain) -> Self {
+        Self(format!("manifests/{}.pointer.json", domain.as_str()))
+    }
+
+    /// Creates an immutable domain manifest snapshot key.
+    ///
+    /// The manifest identifier is encoded as a fixed-width 20-digit decimal.
+    #[must_use]
+    pub fn domain_snapshot(domain: CatalogDomain, manifest_id: u64) -> Self {
+        Self::domain_snapshot_id(domain, &format!("{manifest_id:020}"))
+    }
+
+    /// Creates an immutable domain manifest snapshot key from an explicit ID.
+    #[must_use]
+    pub fn domain_snapshot_id(domain: CatalogDomain, manifest_id: &str) -> Self {
+        Self(format!(
+            "manifests/{}/{}.json",
+            domain.as_str(),
+            manifest_id
+        ))
     }
 }
 
@@ -420,6 +446,22 @@ mod tests {
 
         let domain = ManifestKey::domain(CatalogDomain::Catalog);
         assert_eq!(domain.as_ref(), "manifests/catalog.manifest.json");
+
+        let pointer = ManifestKey::domain_pointer(CatalogDomain::Catalog);
+        assert_eq!(pointer.as_ref(), "manifests/catalog.pointer.json");
+
+        let snapshot = ManifestKey::domain_snapshot(CatalogDomain::Catalog, 42);
+        assert_eq!(
+            snapshot.as_ref(),
+            "manifests/catalog/00000000000000000042.json"
+        );
+
+        let snapshot_id =
+            ManifestKey::domain_snapshot_id(CatalogDomain::Search, "00000000000000012345");
+        assert_eq!(
+            snapshot_id.as_ref(),
+            "manifests/search/00000000000000012345.json"
+        );
     }
 
     #[test]

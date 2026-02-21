@@ -48,6 +48,14 @@ resource "google_secret_manager_secret_iam_member" "api_jwt_secret" {
   member    = "serviceAccount:${google_service_account.api.email}"
 }
 
+resource "google_secret_manager_secret_iam_member" "compactor_tenant_secret" {
+  count     = var.tenant_secret_name != "" && var.environment != "dev" ? 1 : 0
+  project   = var.project_id
+  secret_id = var.tenant_secret_name
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.compactor.email}"
+}
+
 # ============================================================================
 # Compactor Service Accounts (Split for Gate 5 Defense-in-Depth)
 # ============================================================================
@@ -79,6 +87,42 @@ resource "google_service_account" "compactor_antientropy" {
   project      = var.project_id
 }
 
+# ============================================================================
+# Flow Control-Plane Service Accounts
+# ============================================================================
+
+resource "google_service_account" "flow_dispatcher" {
+  count        = local.flow_services_enabled ? 1 : 0
+  account_id   = "arco-flow-disp-${var.environment}"
+  display_name = "Arco Flow Dispatcher (${var.environment})"
+  description  = "Flow dispatcher service account"
+  project      = var.project_id
+}
+
+resource "google_service_account" "flow_sweeper" {
+  count        = local.flow_services_enabled ? 1 : 0
+  account_id   = "arco-flow-sweep-${var.environment}"
+  display_name = "Arco Flow Sweeper (${var.environment})"
+  description  = "Flow sweeper service account"
+  project      = var.project_id
+}
+
+resource "google_service_account" "flow_timer_ingest" {
+  count        = local.flow_services_enabled ? 1 : 0
+  account_id   = "arco-flow-timer-${var.environment}"
+  display_name = "Arco Flow Timer Ingest (${var.environment})"
+  description  = "Flow timer callback ingest service account"
+  project      = var.project_id
+}
+
+resource "google_service_account" "flow_tasks_oidc" {
+  count        = local.flow_services_enabled ? 1 : 0
+  account_id   = "arco-flow-tasks-${var.environment}"
+  display_name = "Arco Flow Cloud Tasks OIDC (${var.environment})"
+  description  = "OIDC identity used by Cloud Tasks callbacks"
+  project      = var.project_id
+}
+
 # REMOVED (Gate 5 violation): Bucket-wide objectUser grants
 # The following resource was removed and replaced with prefix-scoped bindings:
 # resource "google_storage_bucket_iam_member" "compactor_catalog_access" { ... }
@@ -96,6 +140,31 @@ resource "google_service_account" "invoker" {
 }
 
 # ============================================================================
+# Arco Flow Service Accounts
+# ============================================================================
+
+resource "google_service_account" "flow_controller" {
+  account_id   = "arco-flow-controller-${var.environment}"
+  display_name = "Arco Flow Controller (${var.environment})"
+  description  = "Service account for Arco Flow controllers (dispatcher/sweeper/automation)"
+  project      = var.project_id
+}
+
+resource "google_service_account" "flow_task_invoker" {
+  account_id   = "arco-flow-task-invoker-${var.environment}"
+  display_name = "Arco Flow Task Invoker (${var.environment})"
+  description  = "Service account used for Cloud Tasks OIDC invocations into Cloud Run"
+  project      = var.project_id
+}
+
+resource "google_service_account" "flow_worker" {
+  account_id   = "arco-flow-worker-${var.environment}"
+  display_name = "Arco Flow Worker (${var.environment})"
+  description  = "Service account for Arco Flow worker service (executes dispatched tasks)"
+  project      = var.project_id
+}
+
+# ============================================================================
 # Custom IAM Roles
 # ============================================================================
 
@@ -106,6 +175,22 @@ resource "google_project_iam_custom_role" "storage_object_reader_no_list" {
   description = "Read individual objects without list capability"
   permissions = ["storage.objects.get"]
   project     = var.project_id
+}
+
+# Flow dispatcher runs with the API service account and must enqueue to Cloud Tasks.
+# This enables both worker dispatch and timer callback task creation.
+resource "google_project_iam_member" "api_cloud_tasks_enqueuer" {
+  project = var.project_id
+  role    = "roles/cloudtasks.enqueuer"
+  member  = "serviceAccount:${google_service_account.api.email}"
+}
+
+# Flow dispatcher (running as API SA) must be able to attach the invoker SA to
+# Cloud Tasks OIDC HTTP targets (`iam.serviceAccounts.actAs`).
+resource "google_service_account_iam_member" "api_can_act_as_invoker_for_cloud_tasks_oidc" {
+  service_account_id = google_service_account.invoker.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.api.email}"
 }
 
 # Invoker can trigger Cloud Run services
@@ -125,6 +210,82 @@ resource "google_cloud_run_v2_service_iam_member" "compactor_antientropy_invoker
   name     = google_cloud_run_v2_service.compactor.name
   role     = "roles/run.invoker"
   member   = "serviceAccount:${google_service_account.compactor_antientropy.email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "invoker_flow_dispatcher" {
+  count    = local.flow_services_enabled ? 1 : 0
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.flow_dispatcher.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.invoker.email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "invoker_flow_sweeper" {
+  count    = local.flow_services_enabled ? 1 : 0
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.flow_sweeper.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.invoker.email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "flow_tasks_timer_ingest_invoker" {
+  count    = local.flow_services_enabled ? 1 : 0
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.flow_timer_ingest[0].name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.flow_tasks_oidc[0].email}"
+}
+
+resource "google_project_iam_member" "flow_dispatcher_cloudtasks_enqueuer" {
+  count   = local.flow_services_enabled ? 1 : 0
+  project = var.project_id
+  role    = "roles/cloudtasks.enqueuer"
+  member  = "serviceAccount:${google_service_account.flow_dispatcher[0].email}"
+}
+
+resource "google_project_iam_member" "flow_sweeper_cloudtasks_enqueuer" {
+  count   = local.flow_services_enabled ? 1 : 0
+  project = var.project_id
+  role    = "roles/cloudtasks.enqueuer"
+  member  = "serviceAccount:${google_service_account.flow_sweeper[0].email}"
+}
+
+resource "google_service_account_iam_member" "flow_dispatcher_act_as_tasks_oidc" {
+  count              = local.flow_services_enabled ? 1 : 0
+  service_account_id = google_service_account.flow_tasks_oidc[0].name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.flow_dispatcher[0].email}"
+}
+
+resource "google_service_account_iam_member" "flow_sweeper_act_as_tasks_oidc" {
+  count              = local.flow_services_enabled ? 1 : 0
+  service_account_id = google_service_account.flow_tasks_oidc[0].name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.flow_sweeper[0].email}"
+}
+
+resource "google_storage_bucket_iam_member" "flow_dispatcher_storage_access" {
+  count  = local.flow_services_enabled ? 1 : 0
+  bucket = google_storage_bucket.catalog.name
+  role   = "roles/storage.objectUser"
+  member = "serviceAccount:${google_service_account.flow_dispatcher[0].email}"
+}
+
+resource "google_storage_bucket_iam_member" "flow_sweeper_storage_access" {
+  count  = local.flow_services_enabled ? 1 : 0
+  bucket = google_storage_bucket.catalog.name
+  role   = "roles/storage.objectUser"
+  member = "serviceAccount:${google_service_account.flow_sweeper[0].email}"
+}
+
+resource "google_storage_bucket_iam_member" "flow_timer_ingest_storage_access" {
+  count  = local.flow_services_enabled ? 1 : 0
+  bucket = google_storage_bucket.catalog.name
+  role   = "roles/storage.objectUser"
+  member = "serviceAccount:${google_service_account.flow_timer_ingest[0].email}"
 }
 
 # ============================================================================
@@ -163,4 +324,24 @@ output "compactor_antientropy_service_account_email" {
 output "invoker_service_account_email" {
   description = "Email of the Invoker service account"
   value       = google_service_account.invoker.email
+}
+
+output "flow_dispatcher_service_account_email" {
+  description = "Email of the Flow dispatcher service account"
+  value       = local.flow_services_enabled ? google_service_account.flow_dispatcher[0].email : ""
+}
+
+output "flow_sweeper_service_account_email" {
+  description = "Email of the Flow sweeper service account"
+  value       = local.flow_services_enabled ? google_service_account.flow_sweeper[0].email : ""
+}
+
+output "flow_timer_ingest_service_account_email" {
+  description = "Email of the Flow timer-ingest service account"
+  value       = local.flow_services_enabled ? google_service_account.flow_timer_ingest[0].email : ""
+}
+
+output "flow_tasks_oidc_service_account_email" {
+  description = "Email of the Flow Cloud Tasks OIDC service account"
+  value       = local.flow_services_enabled ? google_service_account.flow_tasks_oidc[0].email : ""
 }

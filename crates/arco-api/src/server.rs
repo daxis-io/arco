@@ -801,6 +801,7 @@ impl Server {
         self.create_router(None)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate_config(&self) -> Result<()> {
         if !self.config.posture.is_dev() && self.config.debug {
             return Err(arco_core::Error::InvalidInput(
@@ -883,6 +884,39 @@ impl Server {
                 {
                     return Err(arco_core::Error::InvalidInput(
                         "jwt.audience is required when debug=false and posture!=dev".to_string(),
+                    ));
+                }
+            }
+
+            self.config.task_token.validate().map_err(|err| {
+                arco_core::Error::InvalidInput(format!(
+                    "task token config invalid when debug=false: {err}"
+                ))
+            })?;
+
+            if !self.config.posture.is_dev() {
+                if self
+                    .config
+                    .task_token
+                    .issuer
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    return Err(arco_core::Error::InvalidInput(
+                        "task_token.issuer is required when debug=false and posture!=dev"
+                            .to_string(),
+                    ));
+                }
+                if self
+                    .config
+                    .task_token
+                    .audience
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    return Err(arco_core::Error::InvalidInput(
+                        "task_token.audience is required when debug=false and posture!=dev"
+                            .to_string(),
                     ));
                 }
             }
@@ -1054,6 +1088,9 @@ mod tests {
         builder.config.storage.bucket = Some("test-bucket".to_string());
         builder.config.compactor_url = Some("http://compactor:8081".to_string());
         builder.config.jwt.hs256_secret = Some("test-secret".to_string());
+        builder.config.task_token.hs256_secret = "task-secret".to_string();
+        builder.config.task_token.issuer = Some("task-issuer".to_string());
+        builder.config.task_token.audience = Some("task-audience".to_string());
     }
 
     #[test]
@@ -1129,6 +1166,38 @@ mod tests {
         let server = builder.build();
         server.validate_config()?;
         Ok(())
+    }
+
+    #[test]
+    fn test_posture_requires_task_token_issuer_outside_dev() {
+        let mut builder = ServerBuilder::new();
+        configure_non_dev_jwt(&mut builder);
+        builder.config.jwt.issuer = Some("test-issuer".to_string());
+        builder.config.jwt.audience = Some("test-audience".to_string());
+        builder.config.task_token.issuer = None;
+
+        let server = builder.build();
+        let err = server.validate_config().unwrap_err();
+        let arco_core::Error::InvalidInput(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("task_token.issuer"));
+    }
+
+    #[test]
+    fn test_posture_requires_task_token_audience_outside_dev() {
+        let mut builder = ServerBuilder::new();
+        configure_non_dev_jwt(&mut builder);
+        builder.config.jwt.issuer = Some("test-issuer".to_string());
+        builder.config.jwt.audience = Some("test-audience".to_string());
+        builder.config.task_token.audience = None;
+
+        let server = builder.build();
+        let err = server.validate_config().unwrap_err();
+        let arco_core::Error::InvalidInput(message) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(message.contains("task_token.audience"));
     }
 
     #[tokio::test]

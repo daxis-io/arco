@@ -24,6 +24,15 @@ Arco unifies a **file-native catalog** and an **execution-first orchestration** 
 | **Two-tier consistency** | Strong consistency for DDL; eventual consistency for high-volume operational facts |
 | **Tenant isolation** | Enforced at storage layout, service boundaries, and test gates |
 
+## Documentation
+
+- Documentation map: `docs/README.md`
+- Canonical guide/reference docs (mdBook): `docs/guide/src/`
+- Architecture decisions: `docs/adr/README.md`
+- Operations runbooks: `docs/runbooks/`
+- Release process: `RELEASE.md`
+- Evidence policy: `docs/guide/src/reference/evidence-policy.md`
+
 ## Architecture
 
 ```
@@ -37,8 +46,23 @@ arco/
 │   └── arco-compactor/  # Compaction binary for Tier 2 events
 ├── proto/               # Canonical .proto files
 ├── python/              # Python SDK
-└── docs/                # Documentation and ADRs
+└── docs/                # mdBook docs + ADRs + audits
 ```
+
+## Engine Boundaries (ADR-032)
+
+Arco enforces explicit engine responsibilities in split-services deployments:
+
+- `arco-api` and `arco-flow` are control-plane services.
+- DataFusion endpoints (`/api/v1/query`, `/api/v1/query-data`) are read-only (`SELECT`/`CTE`).
+- Compactors are sole writers for state/snapshot Parquet projections.
+- Browser query path uses DuckDB-WASM via signed URLs only.
+- ETL compute runs in external workers via canonical `WorkerDispatchEnvelope`.
+
+Current cycle non-goals:
+
+- No in-process ETL engine.
+- No Spark/dbt/Flink adapter implementation.
 
 ## Quick Start
 
@@ -46,6 +70,7 @@ arco/
 
 - Rust 1.85+ (Edition 2024)
 - Protocol Buffers compiler (`protoc`)
+- mdBook (`cargo install mdbook --version 0.4.52 --locked`) for local docs builds
 
 ### Build
 
@@ -61,20 +86,23 @@ cargo build --workspace
 cargo test --workspace
 
 # Check formatting and lints
-cargo fmt --check
-cargo clippy --workspace -- -D warnings
+cargo fmt --all --check
+cargo clippy --workspace --all-features -- -D warnings
 ```
 
-### Example Usage
+### Local CI/Gate Parity
 
-```rust
-use arco_core::prelude::*;
+```bash
+cargo xtask doctor
+cargo xtask adr-check
+cargo xtask verify-integrity
+cargo xtask parity-matrix-check
+cargo xtask repo-hygiene-check
+cargo xtask uc-openapi-inventory
+git diff --exit-code -- docs/guide/src/reference/unity-catalog-openapi-inventory.md
 
-// Create a tenant context
-let tenant = TenantId::new("acme-corp")?;
-
-// Generate a unique asset ID
-let asset_id = AssetId::generate();
+# Build docs
+cd docs/guide && mdbook build
 ```
 
 ## Crates
@@ -88,33 +116,18 @@ let asset_id = AssetId::generate();
 | `arco-proto` | Protobuf definitions for cross-language contracts | Alpha |
 | `arco-compactor` | Compaction binary for Tier 2 event consolidation | Alpha |
 
-## Performance Targets
-
-| Operation | P95 Target |
-|-----------|------------|
-| Catalog table lookup | < 50ms |
-| Full catalog scan (1000 tables) | < 500ms |
-| Lineage traversal (5 hops) | < 100ms |
-| Plan generation (100 tasks) | < 200ms |
-
 ## Contributing
 
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+- Contribution guidelines: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Community pathways: [COMMUNITY.md](COMMUNITY.md), [SUPPORT.md](SUPPORT.md)
+- Code of conduct: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 
 ### Development
 
 ```bash
-# Format code
-cargo fmt
-
-# Run clippy
+cargo fmt --all --check
 cargo clippy --workspace --all-features -- -D warnings
-
-# Run tests with coverage
-cargo llvm-cov --workspace
-
-# Check supply chain security
-cargo deny check
+cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
 ```
 
 ## Security
@@ -128,7 +141,3 @@ Licensed under the Apache License, Version 2.0.
 - License text: [LICENSE-APACHE](LICENSE-APACHE)
 - Project license notice: [LICENSE](LICENSE)
 - Attribution notice: [NOTICE](NOTICE)
-
-## Acknowledgments
-
-Arco is developed by [Daxis](https://daxis.io) and open sourced to advance the data ecosystem.

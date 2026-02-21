@@ -23,6 +23,9 @@ pub struct ApiErrorBody {
     pub code: String,
     /// Human-readable message (safe for clients).
     pub message: String,
+    /// Optional error category (e.g., `unprocessable_entity`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Optional request ID for correlation.
     pub request_id: Option<String>,
@@ -37,6 +40,7 @@ pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    error: Option<&'static str>,
     request_id: Option<String>,
     details: Option<Value>,
     retry_after_secs: Option<u64>,
@@ -97,9 +101,38 @@ impl ApiError {
         )
     }
 
+    /// Returns an error response when a request times out.
+    pub fn request_timeout(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::REQUEST_TIMEOUT, "REQUEST_TIMEOUT", message)
+    }
+
     /// Returns an internal error response.
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", message)
+    }
+
+    /// Builds an API error from an HTTP status and message.
+    pub fn from_status_and_message(status: u16, message: impl Into<String>) -> Self {
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let message = message.into();
+        match status {
+            StatusCode::BAD_REQUEST => Self::bad_request(message),
+            StatusCode::UNAUTHORIZED => Self::unauthorized(message),
+            StatusCode::FORBIDDEN => Self::forbidden(message),
+            StatusCode::NOT_FOUND => Self::not_found(message),
+            StatusCode::CONFLICT => Self::conflict(message),
+            StatusCode::PRECONDITION_FAILED => Self::precondition_failed(message),
+            StatusCode::NOT_ACCEPTABLE => Self::not_acceptable(message),
+            StatusCode::NOT_IMPLEMENTED => Self::not_implemented(message),
+            StatusCode::REQUEST_TIMEOUT => Self::request_timeout(message),
+            StatusCode::TOO_MANY_REQUESTS => {
+                Self::new(StatusCode::TOO_MANY_REQUESTS, "TOO_MANY_REQUESTS", message)
+            }
+            StatusCode::UNPROCESSABLE_ENTITY => {
+                Self::unprocessable_entity("UNPROCESSABLE_ENTITY", message)
+            }
+            _ => Self::new(status, "UPSTREAM_ERROR", message),
+        }
     }
 
     /// Returns an error response for unsupported operations (406).
@@ -112,20 +145,14 @@ impl ApiError {
         Self::new(StatusCode::NOT_IMPLEMENTED, "NOT_IMPLEMENTED", message)
     }
 
-    /// Creates an error from status code and message for idempotency replays.
-    #[must_use]
-    pub fn from_status_and_message(status: u16, message: impl Into<String>) -> Self {
-        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let code = match status {
-            StatusCode::BAD_REQUEST => "BAD_REQUEST",
-            StatusCode::UNAUTHORIZED => "UNAUTHORIZED",
-            StatusCode::FORBIDDEN => "FORBIDDEN",
-            StatusCode::NOT_FOUND => "NOT_FOUND",
-            StatusCode::CONFLICT => "CONFLICT",
-            StatusCode::PRECONDITION_FAILED => "PRECONDITION_FAILED",
-            _ => "INTERNAL",
-        };
-        Self::new(status, code, message)
+    /// Returns an unprocessable entity error response.
+    pub fn unprocessable_entity(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new_with_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            code,
+            message,
+            Some("unprocessable_entity"),
+        )
     }
 
     /// Attaches a request ID for correlation.
@@ -160,10 +187,20 @@ impl ApiError {
     }
 
     fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self::new_with_error(status, code, message, None)
+    }
+
+    fn new_with_error(
+        status: StatusCode,
+        code: &'static str,
+        message: impl Into<String>,
+        error: Option<&'static str>,
+    ) -> Self {
         Self {
             status,
             code,
             message: message.into(),
+            error,
             request_id: None,
             details: None,
             retry_after_secs: None,
@@ -201,6 +238,7 @@ impl IntoResponse for ApiError {
             Json(ApiErrorBody {
                 code: self.code.to_string(),
                 message: self.message,
+                error: self.error.map(str::to_string),
                 request_id: request_id.clone(),
                 details,
             }),

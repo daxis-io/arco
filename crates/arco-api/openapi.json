@@ -2358,16 +2358,6 @@
                 }
               }
             }
-          },
-          "422": {
-            "description": "Partition selector not supported",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UnprocessableEntityResponse"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -3769,6 +3759,35 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "Filter evaluations after this timestamp (inclusive)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "description": "Filter evaluations before this timestamp (inclusive)",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "Filter by status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SensorEvalStatusFilter"
+            }
           }
         ],
         "responses": {
@@ -3910,6 +3929,13 @@
           "code": {
             "type": "string",
             "description": "Stable machine-readable error code."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional error category (e.g., `unprocessable_entity`)."
           },
           "message": {
             "type": "string",
@@ -5270,6 +5296,55 @@
           }
         }
       },
+      "ListSensorEvalsQuery": {
+        "type": "object",
+        "description": "Query parameters for listing sensor evaluations.",
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cursor for pagination."
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Maximum evaluations to return.",
+            "minimum": 0
+          },
+          "since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Filter evaluations after this timestamp (inclusive)."
+          },
+          "status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SensorEvalStatusFilter",
+                "description": "Filter by evaluation status."
+              }
+            ]
+          },
+          "until": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Filter evaluations before this timestamp (inclusive)."
+          }
+        }
+      },
       "ListSensorEvalsResponse": {
         "type": "object",
         "description": "Response for listing sensor evaluations.",
@@ -5644,7 +5719,7 @@
             "properties": {
               "filters": {
                 "type": "object",
-                "description": "Filter expressions.",
+                "description": "Filter bounds. Supported keys: `start`, `end`, `partition_start`, `partition_end`.",
                 "additionalProperties": {
                   "type": "string"
                 },
@@ -5723,7 +5798,7 @@
             "properties": {
               "filters": {
                 "type": "object",
-                "description": "Filter expressions.",
+                "description": "Filter bounds (`start`/`end`) captured on the backfill.",
                 "additionalProperties": {
                   "type": "string"
                 },
@@ -5891,6 +5966,13 @@
               "null"
             ],
             "description": "Optional description."
+          },
+          "format": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional table format (`delta`, `iceberg`, `parquet`), defaults to `delta`."
           },
           "name": {
             "type": "string",
@@ -6582,6 +6664,7 @@
           "catalog",
           "schema",
           "name",
+          "format",
           "created_at",
           "updated_at"
         ],
@@ -6602,11 +6685,8 @@
             "description": "Optional description."
           },
           "format": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Table format."
+            "type": "string",
+            "description": "Effective table format."
           },
           "id": {
             "type": "string",
@@ -6682,6 +6762,16 @@
             "description": "Evaluation status."
           }
         }
+      },
+      "SensorEvalStatusFilter": {
+        "type": "string",
+        "description": "Sensor evaluation status filter (query parameter).",
+        "enum": [
+          "TRIGGERED",
+          "NO_NEW_DATA",
+          "ERROR",
+          "SKIPPED_STALE_CURSOR"
+        ]
       },
       "SensorEvalStatusResponse": {
         "oneOf": [
@@ -6928,6 +7018,7 @@
           "id",
           "namespace",
           "name",
+          "format",
           "columns",
           "created_at",
           "updated_at"
@@ -6950,6 +7041,10 @@
               "null"
             ],
             "description": "Optional description."
+          },
+          "format": {
+            "type": "string",
+            "description": "Effective table format."
           },
           "id": {
             "type": "string",
@@ -7569,29 +7664,6 @@
           "state": {
             "$ref": "#/components/schemas/RunStateResponse",
             "description": "Current run state."
-          }
-        }
-      },
-      "UnprocessableEntityResponse": {
-        "type": "object",
-        "description": "Error response for unsupported partition selectors.",
-        "required": [
-          "error",
-          "message",
-          "code"
-        ],
-        "properties": {
-          "code": {
-            "type": "string",
-            "description": "Stable error code."
-          },
-          "error": {
-            "type": "string",
-            "description": "Error category."
-          },
-          "message": {
-            "type": "string",
-            "description": "Human-readable error message."
           }
         }
       },

@@ -11,12 +11,16 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 
 use arco_core::ScopedStorage;
-use arco_core::storage::{MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
+use arco_core::storage::{
+    MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+};
 use arco_flow::error::Result;
 use arco_flow::orchestration::compactor::{
     LedgerRebuildManifest, MicroCompactor, OrchestrationManifest, OrchestrationManifestPointer,
 };
-use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData, TaskDef, TaskOutcome, TriggerInfo};
+use arco_flow::orchestration::events::{
+    OrchestrationEvent, OrchestrationEventData, TaskDef, TaskOutcome, TriggerInfo,
+};
 
 const TENANT: &str = "tenant";
 const WORKSPACE: &str = "workspace";
@@ -80,7 +84,11 @@ impl StorageBackend for ListTrackingBackend {
         self.inner.head(path).await
     }
 
-    async fn signed_url(&self, path: &str, expiry: std::time::Duration) -> arco_core::Result<String> {
+    async fn signed_url(
+        &self,
+        path: &str,
+        expiry: std::time::Duration,
+    ) -> arco_core::Result<String> {
         self.inner.signed_url(path, expiry).await
     }
 }
@@ -199,7 +207,12 @@ async fn rebuild_from_ledger_manifest_reproduces_equivalent_projection_state() -
     baseline_compactor.compact_events(paths.clone()).await?;
 
     let rebuild_manifest = LedgerRebuildManifest {
-        event_paths: vec![paths[2].clone(), paths[0].clone(), paths[1].clone(), paths[2].clone()],
+        event_paths: vec![
+            paths[2].clone(),
+            paths[0].clone(),
+            paths[1].clone(),
+            paths[2].clone(),
+        ],
     };
     rebuild_compactor
         .rebuild_from_ledger_manifest(rebuild_manifest, None)
@@ -210,8 +223,14 @@ async fn rebuild_from_ledger_manifest_reproduces_equivalent_projection_state() -
 
     assert_eq!(baseline_state.runs, rebuild_state.runs);
     assert_eq!(baseline_state.tasks, rebuild_state.tasks);
-    assert_eq!(baseline_state.dep_satisfaction, rebuild_state.dep_satisfaction);
-    assert_eq!(baseline_state.idempotency_keys, rebuild_state.idempotency_keys);
+    assert_eq!(
+        baseline_state.dep_satisfaction,
+        rebuild_state.dep_satisfaction
+    );
+    assert_eq!(
+        baseline_state.idempotency_keys,
+        rebuild_state.idempotency_keys
+    );
     assert_eq!(
         baseline_manifest.watermarks.last_visible_event_id,
         rebuild_manifest.watermarks.last_visible_event_id

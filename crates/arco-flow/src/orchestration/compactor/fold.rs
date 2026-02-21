@@ -2668,17 +2668,20 @@ impl FoldState {
 
         if let Some(output) = output {
             if metadata.materialization_id.is_none() {
-                metadata.materialization_id = json_string_field(output, &[
-                    "materializationId",
-                    "materialization_id",
-                ]);
+                metadata.materialization_id =
+                    json_string_field(output, &["materializationId", "materialization_id"]);
             }
 
             metadata.delta_table = json_string_field(output, &["deltaTable", "delta_table"]);
             metadata.delta_version = json_i64_field(output, &["deltaVersion", "delta_version"]);
             metadata.delta_partition = json_string_field(
                 output,
-                &["deltaPartition", "delta_partition", "partitionKey", "partition_key"],
+                &[
+                    "deltaPartition",
+                    "delta_partition",
+                    "partitionKey",
+                    "partition_key",
+                ],
             );
         }
 
@@ -5628,7 +5631,7 @@ mod tests {
     fn event_id_from_ledger_path_extracts_suffix_without_extension() {
         let path = "ledger/orchestration/2026-02-21/01J1DRREBUILD00000000000013.json";
         assert_eq!(
-            super::event_id_from_ledger_path(path),
+            event_id_from_ledger_path(path),
             Some("01J1DRREBUILD00000000000013")
         );
     }
@@ -5636,11 +5639,11 @@ mod tests {
     #[test]
     fn event_id_from_ledger_path_rejects_invalid_paths() {
         assert_eq!(
-            super::event_id_from_ledger_path("ledger/orchestration/2026-02-21/"),
+            event_id_from_ledger_path("ledger/orchestration/2026-02-21/"),
             None
         );
         assert_eq!(
-            super::event_id_from_ledger_path("ledger/orchestration/2026-02-21/event.txt"),
+            event_id_from_ledger_path("ledger/orchestration/2026-02-21/event.txt"),
             None
         );
     }

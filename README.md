@@ -138,6 +138,5 @@ For security vulnerabilities, please see [SECURITY.md](SECURITY.md).
 
 Licensed under the Apache License, Version 2.0.
 
-- License text: [LICENSE-APACHE](LICENSE-APACHE)
-- Project license notice: [LICENSE](LICENSE)
+- License text: [LICENSE](LICENSE)
 - Attribution notice: [NOTICE](NOTICE)

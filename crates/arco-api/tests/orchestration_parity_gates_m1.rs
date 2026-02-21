@@ -1348,6 +1348,341 @@ async fn parity_m1_rerun_subset_respects_include_downstream() -> Result<()> {
 }
 
 #[tokio::test]
+async fn parity_m1_skip_attribution_is_deterministic_across_edge_ordering() -> Result<()> {
+    let (state, router) = test_state_and_router()?;
+
+    let (status, _manifest): (_, DeployManifestResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/manifests",
+                Some(serde_json::json!({
+                    "manifestVersion": "1.0",
+                    "codeVersionId": "abc123",
+                    "assets": [
+                        {
+                            "key": { "namespace": "analytics", "name": "a" },
+                            "id": "01HQA000001",
+                            "dependencies": []
+                        },
+                        {
+                            "key": { "namespace": "analytics", "name": "b" },
+                            "id": "01HQB000001",
+                            "dependencies": []
+                        },
+                        {
+                            "key": { "namespace": "analytics", "name": "c" },
+                            "id": "01HQC000001",
+                            "dependencies": [
+                                {
+                                    "upstreamKey": { "namespace": "analytics", "name": "a" }
+                                },
+                                {
+                                    "upstreamKey": { "namespace": "analytics", "name": "b" }
+                                }
+                            ]
+                        }
+                    ],
+                    "schedules": []
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, created): (_, TriggerRunResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/runs",
+                Some(serde_json::json!({
+                    "selection": ["analytics.a", "analytics.b", "analytics.c"],
+                    "partitions": [],
+                    "labels": {},
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    let run_id = created.run_id;
+
+    let ctx = test_ctx();
+    let base = Utc::now();
+    let b_attempt_id = Ulid::new().to_string();
+    let a_attempt_id = Ulid::new().to_string();
+
+    append_events_and_compact(
+        &state,
+        &ctx,
+        vec![
+            {
+                let mut event = OrchestrationEvent::new(
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    OrchestrationEventData::TaskStarted {
+                        run_id: run_id.clone(),
+                        task_key: "analytics.b".to_string(),
+                        attempt: 3,
+                        attempt_id: b_attempt_id.clone(),
+                        worker_id: "worker-1".to_string(),
+                    },
+                );
+                event.timestamp = base;
+                event
+            },
+            {
+                let mut event = OrchestrationEvent::new(
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    OrchestrationEventData::TaskFinished {
+                        run_id: run_id.clone(),
+                        task_key: "analytics.b".to_string(),
+                        attempt: 3,
+                        attempt_id: b_attempt_id,
+                        worker_id: "worker-1".to_string(),
+                        outcome: TaskOutcome::Failed,
+                        materialization_id: None,
+                        error_message: Some("b failed".to_string()),
+                        output: None,
+                        error: None,
+                        metrics: None,
+                        cancelled_during_phase: None,
+                        partial_progress: None,
+                        asset_key: Some("analytics.b".to_string()),
+                        partition_key: None,
+                        code_version: None,
+                    },
+                );
+                event.timestamp = base + Duration::milliseconds(1);
+                event
+            },
+            {
+                let mut event = OrchestrationEvent::new(
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    OrchestrationEventData::TaskStarted {
+                        run_id: run_id.clone(),
+                        task_key: "analytics.a".to_string(),
+                        attempt: 3,
+                        attempt_id: a_attempt_id.clone(),
+                        worker_id: "worker-1".to_string(),
+                    },
+                );
+                event.timestamp = base;
+                event
+            },
+            {
+                let mut event = OrchestrationEvent::new(
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    OrchestrationEventData::TaskFinished {
+                        run_id: run_id.clone(),
+                        task_key: "analytics.a".to_string(),
+                        attempt: 3,
+                        attempt_id: a_attempt_id,
+                        worker_id: "worker-1".to_string(),
+                        outcome: TaskOutcome::Failed,
+                        materialization_id: None,
+                        error_message: Some("a failed".to_string()),
+                        output: None,
+                        error: None,
+                        metrics: None,
+                        cancelled_during_phase: None,
+                        partial_progress: None,
+                        asset_key: Some("analytics.a".to_string()),
+                        partition_key: None,
+                        code_version: None,
+                    },
+                );
+                // Same satisfied_at as analytics.b to force deterministic tie-break on upstream key.
+                event.timestamp = base + Duration::milliseconds(1);
+                event
+            },
+        ],
+    )
+    .await?;
+
+    let (status, run): (_, RunResponse) = helpers::response_json(
+        helpers::send(
+            router,
+            helpers::make_request(
+                Method::GET,
+                &format!("/api/v1/workspaces/test-workspace/runs/{run_id}"),
+                None,
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let skipped = run
+        .tasks
+        .iter()
+        .find(|task| task.task_key == "analytics.c")
+        .expect("expected downstream task in run response");
+    assert_eq!(skipped.state, "SKIPPED");
+    let skip_attribution = skipped
+        .skip_attribution
+        .as_ref()
+        .expect("skipped task should include skip attribution");
+
+    assert_eq!(skip_attribution.upstream_task_key, "analytics.a");
+    assert_eq!(skip_attribution.upstream_resolution, "FAILED");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn parity_m1_rerun_run_key_conflict_surfaces_diagnostics_payload() -> Result<()> {
+    let (_state, router) = test_state_and_router()?;
+
+    let (status, _manifest): (_, DeployManifestResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/manifests",
+                Some(serde_json::json!({
+                    "manifestVersion": "1.0",
+                    "codeVersionId": "abc123",
+                    "assets": [
+                        {
+                            "key": { "namespace": "analytics", "name": "a" },
+                            "id": "01HQA000001",
+                            "dependencies": []
+                        },
+                        {
+                            "key": { "namespace": "analytics", "name": "b" },
+                            "id": "01HQB000001",
+                            "dependencies": [
+                                {
+                                    "upstreamKey": { "namespace": "analytics", "name": "a" }
+                                }
+                            ]
+                        },
+                        {
+                            "key": { "namespace": "analytics", "name": "c" },
+                            "id": "01HQC000001",
+                            "dependencies": [
+                                {
+                                    "upstreamKey": { "namespace": "analytics", "name": "b" }
+                                }
+                            ]
+                        }
+                    ],
+                    "schedules": []
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, created): (_, TriggerRunResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/runs",
+                Some(serde_json::json!({
+                    "selection": ["analytics.a"],
+                    "includeDownstream": true,
+                    "partitions": [],
+                    "labels": {},
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    let parent_run_id = created.run_id;
+
+    let (status, first_rerun): (_, RerunRunResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                &format!("/api/v1/workspaces/test-workspace/runs/{parent_run_id}/rerun"),
+                Some(serde_json::json!({
+                    "mode": "subset",
+                    "selection": ["analytics.b"],
+                    "includeDownstream": true,
+                    "runKey": "rk-parity-m1-rerun-conflict-001",
+                    "labels": {},
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(first_rerun.created);
+
+    let response = helpers::send(
+        router,
+        helpers::make_request(
+            Method::POST,
+            &format!("/api/v1/workspaces/test-workspace/runs/{parent_run_id}/rerun"),
+            Some(serde_json::json!({
+                "mode": "subset",
+                "selection": ["analytics.b"],
+                "includeDownstream": false,
+                "runKey": "rk-parity-m1-rerun-conflict-001",
+                "labels": {},
+            })),
+        )?,
+    )
+    .await?;
+
+    let (status, error): (_, ApiErrorResponse) = helpers::response_json(response).await?;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error.code, "CONFLICT");
+
+    let details = error
+        .details
+        .as_ref()
+        .expect("rerun run_key conflicts should expose diagnostics payload");
+    assert_eq!(
+        details.get("conflictType").and_then(Value::as_str),
+        Some("RUN_KEY_FINGERPRINT_MISMATCH")
+    );
+    assert_eq!(
+        details.get("runKey").and_then(Value::as_str),
+        Some("rk-parity-m1-rerun-conflict-001")
+    );
+    assert_eq!(
+        details.get("existingRunId").and_then(Value::as_str),
+        Some(first_rerun.run_id.as_str())
+    );
+    assert!(
+        details
+            .get("existingFingerprint")
+            .and_then(Value::as_str)
+            .is_some(),
+        "existing fingerprint should be included for operators"
+    );
+    assert!(
+        details
+            .get("requestedFingerprint")
+            .and_then(Value::as_str)
+            .is_some(),
+        "requested fingerprint should be included for operators"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn parity_m1_rerun_from_failure_rejects_succeeded_parent() -> Result<()> {
     let (state, router) = test_state_and_router()?;
 

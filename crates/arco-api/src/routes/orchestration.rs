@@ -2226,40 +2226,77 @@ fn dep_resolution_str(resolution: DepResolution) -> &'static str {
     }
 }
 
-fn task_skip_attribution(
+fn build_skip_attribution_index(
     fold_state: &FoldState,
     run_id: &str,
+) -> HashMap<String, TaskSkipAttributionResponse> {
+    let mut first_causes: HashMap<String, (i64, String, String, DepResolution)> = HashMap::new();
+
+    for edge in fold_state
+        .dep_satisfaction
+        .values()
+        .filter(|edge| edge.run_id == run_id)
+    {
+        let Some(resolution) = edge.resolution else {
+            continue;
+        };
+        if matches!(resolution, DepResolution::Success) {
+            continue;
+        }
+
+        let satisfied_at = edge.satisfied_at.map(|t| t.timestamp_millis()).unwrap_or(0);
+        let upstream_task_key = edge.upstream_task_key.clone();
+        let row_version = edge.row_version.clone();
+
+        let replace = match first_causes.get(&edge.downstream_task_key) {
+            Some(current) => {
+                (
+                    satisfied_at,
+                    upstream_task_key.as_str(),
+                    row_version.as_str(),
+                ) < (current.0, current.1.as_str(), current.2.as_str())
+            }
+            None => true,
+        };
+
+        if replace {
+            first_causes.insert(
+                edge.downstream_task_key.clone(),
+                (satisfied_at, upstream_task_key, row_version, resolution),
+            );
+        }
+    }
+
+    first_causes
+        .into_iter()
+        .map(
+            |(downstream_task_key, (_, upstream_task_key, _, resolution))| {
+                (
+                    downstream_task_key,
+                    TaskSkipAttributionResponse {
+                        upstream_task_key,
+                        upstream_resolution: dep_resolution_str(resolution).to_string(),
+                    },
+                )
+            },
+        )
+        .collect()
+}
+
+fn task_skip_attribution(
     task: &TaskRow,
+    skip_attribution_index: &HashMap<String, TaskSkipAttributionResponse>,
 ) -> Option<TaskSkipAttributionResponse> {
     if task.state != FoldTaskState::Skipped {
         return None;
     }
 
-    let mut causes: Vec<_> = fold_state
-        .dep_satisfaction
-        .values()
-        .filter(|edge| edge.run_id == run_id && edge.downstream_task_key == task.task_key)
-        .filter_map(|edge| {
-            let resolution = edge.resolution?;
-            if matches!(resolution, DepResolution::Success) {
-                return None;
-            }
-            Some((
-                edge.satisfied_at.map(|t| t.timestamp_millis()).unwrap_or(0),
-                edge.upstream_task_key.clone(),
-                edge.row_version.clone(),
-                resolution,
-            ))
+    skip_attribution_index
+        .get(&task.task_key)
+        .map(|attr| TaskSkipAttributionResponse {
+            upstream_task_key: attr.upstream_task_key.clone(),
+            upstream_resolution: attr.upstream_resolution.clone(),
         })
-        .collect();
-
-    causes.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
-
-    let (_, upstream_task_key, _, resolution) = causes.into_iter().next()?;
-    Some(TaskSkipAttributionResponse {
-        upstream_task_key,
-        upstream_resolution: dep_resolution_str(resolution).to_string(),
-    })
 }
 
 fn reject_reserved_lineage_labels(labels: &HashMap<String, String>) -> Result<(), ApiError> {
@@ -4511,6 +4548,7 @@ pub(crate) async fn get_run(
         .values()
         .filter(|row| row.run_id == run_id)
         .collect();
+    let skip_attribution_index = build_skip_attribution_index(&fold_state, &run_id);
 
     let task_counts = build_task_counts(run, &tasks);
     let started_at = tasks.iter().filter_map(|row| row.started_at).min();
@@ -4529,7 +4567,7 @@ pub(crate) async fn get_run(
             delta_version: row.delta_version,
             delta_partition: row.delta_partition.clone(),
             retry_attribution: task_retry_attribution(row),
-            skip_attribution: task_skip_attribution(&fold_state, &run_id, row),
+            skip_attribution: task_skip_attribution(row, &skip_attribution_index),
         })
         .collect::<Vec<_>>();
 

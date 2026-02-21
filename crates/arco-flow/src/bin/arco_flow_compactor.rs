@@ -38,6 +38,13 @@ struct CompactRequest {
     epoch: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RebuildRequest {
+    rebuild_manifest_path: String,
+    #[serde(default)]
+    epoch: Option<u64>,
+}
+
 #[derive(Debug, Serialize)]
 struct CompactResponse {
     events_processed: u32,
@@ -106,6 +113,28 @@ async fn compact_handler(
     } = state
         .compactor
         .compact_events_with_epoch(request.event_paths, request.epoch)
+        .await?;
+
+    Ok(Json(CompactResponse {
+        events_processed,
+        delta_id,
+        manifest_revision,
+        visibility_status: visibility_status.as_str().to_string(),
+    }))
+}
+
+async fn rebuild_handler(
+    State(state): State<AppState>,
+    Json(request): Json<RebuildRequest>,
+) -> std::result::Result<Json<CompactResponse>, ApiError> {
+    let CompactionResult {
+        events_processed,
+        delta_id,
+        manifest_revision,
+        visibility_status,
+    } = state
+        .compactor
+        .rebuild_from_ledger_manifest_path(&request.rebuild_manifest_path, request.epoch)
         .await?;
 
     Ok(Json(CompactResponse {
@@ -247,6 +276,27 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_request_requires_manifest_path() {
+        let raw = r#"{"rebuild_manifest_path":"state/orchestration/rebuilds/rebuild-01.json"}"#;
+        let parsed: RebuildRequest = serde_json::from_str(raw).expect("valid rebuild request");
+        assert_eq!(
+            parsed.rebuild_manifest_path,
+            "state/orchestration/rebuilds/rebuild-01.json"
+        );
+        assert_eq!(parsed.epoch, None);
+    }
+
+    #[test]
+    fn rebuild_request_accepts_epoch_payload() {
+        let raw = r#"{
+            "rebuild_manifest_path":"state/orchestration/rebuilds/rebuild-01.json",
+            "epoch":9
+        }"#;
+        let parsed: RebuildRequest = serde_json::from_str(raw).expect("valid epoch request");
+        assert_eq!(parsed.epoch, Some(9));
+    }
+
+    #[test]
     fn api_error_maps_core_precondition_to_conflict() {
         let error = Error::Core(CoreError::PreconditionFailed {
             message: "manifest publish failed - concurrent write".to_string(),
@@ -282,10 +332,19 @@ async fn main() -> Result<()> {
         compactor: MicroCompactor::with_tenant_secret(storage, tenant_secret),
     };
 
-    let compact_route = internal_auth.map_or_else(
+    let compact_route = internal_auth.clone().map_or_else(
         || post(compact_handler),
         |auth| {
             post(compact_handler).route_layer(middleware::from_fn_with_state(
+                auth,
+                internal_auth_middleware,
+            ))
+        },
+    );
+    let rebuild_route = internal_auth.map_or_else(
+        || post(rebuild_handler),
+        |auth| {
+            post(rebuild_handler).route_layer(middleware::from_fn_with_state(
                 auth,
                 internal_auth_middleware,
             ))
@@ -295,6 +354,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/compact", compact_route)
+        .route("/rebuild", rebuild_route)
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

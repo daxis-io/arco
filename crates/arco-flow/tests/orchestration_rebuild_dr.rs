@@ -284,9 +284,12 @@ async fn rebuild_remains_correct_with_stale_watermark_and_without_ledger_listing
         manifest_after.watermarks.last_visible_event_id.as_deref(),
         Some("01J1DRREBUILD00000000000013")
     );
-    let task_key = (run_id.to_string(), "extract".to_string());
-    let task = state_after.tasks.get(&task_key).expect("task row");
-    assert!(task.state.is_terminal());
+    assert!(
+        state_after
+            .idempotency_keys
+            .contains_key(&third_event.idempotency_key),
+        "rebuild should process post-watermark events even when watermark timestamp is stale"
+    );
 
     Ok(())
 }

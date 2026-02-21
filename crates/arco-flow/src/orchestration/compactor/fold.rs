@@ -114,6 +114,19 @@ fn json_i64_field(value: &Value, keys: &[&str]) -> Option<i64> {
     }
 }
 
+/// Extracts an orchestration event ID from a ledger path.
+///
+/// Expected form: `ledger/orchestration/<date>/<event_id>.json`.
+#[must_use]
+pub fn event_id_from_ledger_path(path: &str) -> Option<&str> {
+    let filename = path.rsplit('/').next()?;
+    let event_id = filename.strip_suffix(".json")?;
+    if event_id.is_empty() {
+        return None;
+    }
+    Some(event_id)
+}
+
 /// Dependency edge resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -5609,5 +5622,26 @@ mod tests {
             "last_attempt_run_id should be from the latest attempt"
         );
         assert_eq!(status.last_attempt_outcome, Some(TaskOutcome::Failed));
+    }
+
+    #[test]
+    fn event_id_from_ledger_path_extracts_suffix_without_extension() {
+        let path = "ledger/orchestration/2026-02-21/01J1DRREBUILD00000000000013.json";
+        assert_eq!(
+            super::event_id_from_ledger_path(path),
+            Some("01J1DRREBUILD00000000000013")
+        );
+    }
+
+    #[test]
+    fn event_id_from_ledger_path_rejects_invalid_paths() {
+        assert_eq!(
+            super::event_id_from_ledger_path("ledger/orchestration/2026-02-21/"),
+            None
+        );
+        assert_eq!(
+            super::event_id_from_ledger_path("ledger/orchestration/2026-02-21/event.txt"),
+            None
+        );
     }
 }

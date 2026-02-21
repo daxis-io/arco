@@ -10,7 +10,9 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+use super::fold::event_id_from_ledger_path;
 
 /// Fixed width for immutable orchestration manifest identifiers.
 pub const MANIFEST_ID_WIDTH: usize = 20;
@@ -187,6 +189,72 @@ impl Watermarks {
     pub fn is_fresh(&self, max_lag: chrono::Duration) -> bool {
         Utc::now() - self.last_processed_at <= max_lag
     }
+}
+
+/// Explicit ledger manifest consumed by orchestration rebuild.
+///
+/// This is intentionally path-driven: rebuild callers must provide explicit
+/// event paths rather than relying on bucket-wide listing.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LedgerRebuildManifest {
+    /// Ledger event paths to replay.
+    pub event_paths: Vec<String>,
+}
+
+impl LedgerRebuildManifest {
+    /// Returns deterministic replay paths filtered by current watermark floor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any provided event path does not match expected
+    /// orchestration ledger naming (`.../{event_id}.json`).
+    pub fn event_paths_after_watermark(
+        &self,
+        watermarks: &Watermarks,
+    ) -> Result<Vec<String>, String> {
+        select_rebuild_event_paths(&self.event_paths, watermarks)
+    }
+}
+
+/// Selects deterministic replay paths that are newer than the safe watermark floor.
+///
+/// The floor uses visible/processed watermarks first, then falls back to
+/// committed watermark. This ensures rebuild can safely catch up when the
+/// compactor has persisted ahead of reader visibility.
+///
+/// # Errors
+///
+/// Returns an error if any path cannot be parsed as an orchestration event path.
+pub fn select_rebuild_event_paths(
+    event_paths: &[String],
+    watermarks: &Watermarks,
+) -> Result<Vec<String>, String> {
+    let floor = replay_floor_event_id(watermarks);
+    let mut dedup = BTreeMap::<String, String>::new();
+
+    for path in event_paths {
+        let event_id = event_id_from_ledger_path(path).ok_or_else(|| {
+            format!("invalid orchestration ledger path for rebuild: '{path}'")
+        })?;
+
+        if floor.is_some_and(|floor| event_id <= floor) {
+            continue;
+        }
+
+        dedup
+            .entry(event_id.to_string())
+            .or_insert_with(|| path.clone());
+    }
+
+    Ok(dedup.into_values().collect())
+}
+
+fn replay_floor_event_id(watermarks: &Watermarks) -> Option<&str> {
+    watermarks
+        .last_visible_event_id
+        .as_deref()
+        .or(watermarks.events_processed_through.as_deref())
+        .or(watermarks.last_committed_event_id.as_deref())
 }
 
 /// Base snapshot metadata.
@@ -577,5 +645,55 @@ mod tests {
         let json = serde_json::to_string_pretty(&manifest).unwrap();
         assert!(json.contains("l0/delta-01/tasks.parquet"));
         assert!(json.contains("01HQXYZ001EVT"));
+    }
+
+    #[test]
+    fn test_select_rebuild_event_paths_filters_by_visible_watermark() {
+        let watermarks = Watermarks {
+            last_committed_event_id: Some("01J1DR0003".to_string()),
+            last_visible_event_id: Some("01J1DR0002".to_string()),
+            events_processed_through: Some("01J1DR0002".to_string()),
+            last_processed_file: Some("ledger/orchestration/2026-02-21/01J1DR0002.json".to_string()),
+            last_processed_at: Utc::now(),
+        };
+
+        let event_paths = vec![
+            "ledger/orchestration/2026-02-21/01J1DR0001.json".to_string(),
+            "ledger/orchestration/2026-02-21/01J1DR0002.json".to_string(),
+            "ledger/orchestration/2026-02-21/01J1DR0003.json".to_string(),
+            "ledger/orchestration/2026-02-21/01J1DR0003.json".to_string(),
+        ];
+
+        let selected = select_rebuild_event_paths(&event_paths, &watermarks).expect("selected");
+        assert_eq!(
+            selected,
+            vec!["ledger/orchestration/2026-02-21/01J1DR0003.json".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_select_rebuild_event_paths_ignores_stale_timestamp_if_ids_are_ordered() {
+        let watermarks = Watermarks {
+            last_committed_event_id: Some("01J1DR0001".to_string()),
+            last_visible_event_id: Some("01J1DR0001".to_string()),
+            events_processed_through: Some("01J1DR0001".to_string()),
+            last_processed_file: Some("ledger/orchestration/2026-02-21/01J1DR0001.json".to_string()),
+            last_processed_at: Utc::now() - Duration::minutes(45),
+        };
+
+        let manifest = LedgerRebuildManifest {
+            event_paths: vec![
+                "ledger/orchestration/2026-02-21/01J1DR0001.json".to_string(),
+                "ledger/orchestration/2026-02-21/01J1DR0002.json".to_string(),
+            ],
+        };
+
+        let selected = manifest
+            .event_paths_after_watermark(&watermarks)
+            .expect("selected");
+        assert_eq!(
+            selected,
+            vec!["ledger/orchestration/2026-02-21/01J1DR0002.json".to_string()]
+        );
     }
 }

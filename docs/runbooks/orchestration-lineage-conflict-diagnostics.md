@@ -33,7 +33,7 @@ Confirm on succeeded task rows:
 
 ```bash
 curl -sS -H "Authorization: Bearer $TOKEN" \
-  "$BASE_URL/api/v1/workspaces/$WORKSPACE_ID/partitions?asset=<ASSET_KEY>&limit=100" | jq '.'
+  "$BASE_URL/api/v1/workspaces/$WORKSPACE_ID/partitions?assetKey=<ASSET_KEY>&limit=100" | jq '.'
 ```
 
 For the corresponding partition row, confirm:
@@ -50,10 +50,10 @@ all match for the same asset + partition.
 ## 2. Verify deterministic rerun/retry/skip diagnostics
 
 ### Step 1: Check rerun reason
-For rerun-created runs, `GET /runs/{id}` should include deterministic `rerunReason` values (`from_failure` or `subset`).
+For rerun-created runs, `GET /runs/{id}` should include deterministic `rerunReason` values (`from_failure_unsucceeded_tasks` or `subset_selection`).
 
 ### Step 2: Check retry attribution
-For tasks with `attempt > 1`, `retryAttribution` should explain why the retry occurred and include attempt/max-attempt context.
+For tasks with `attempt > 1`, `retryAttribution` should include deterministic retry context (`retries`, `reason`).
 
 ### Step 3: Check skip attribution
 For skipped tasks, `skipAttribution` should identify deterministic dependency causes (for example, upstream failure/cancelled/skipped).

@@ -84,7 +84,7 @@ Suggested locations:
 ### Q3 operator diagnostics evidence
 - Code: `crates/arco-api/src/routes/orchestration.rs` (`rerun_reason_for_kind`, `task_retry_attribution`, `task_skip_attribution`, run-key conflict detail helpers)
 - Code: `crates/arco-api/src/error.rs` (`details` payload on API errors)
-- Tests: `crates/arco-api/tests/orchestration_parity_gates_m1.rs` (`parity_m1_rerun_from_failure_plans_only_unsucceeded_tasks`, `parity_m1_rerun_subset_respects_include_downstream`, `parity_m1_run_key_conflicts_on_payload_mismatch`)
+- Tests: `crates/arco-api/tests/orchestration_parity_gates_m1.rs` (`parity_m1_rerun_from_failure_plans_only_unsucceeded_tasks`, `parity_m1_rerun_subset_respects_include_downstream`, `parity_m1_skip_attribution_is_deterministic_across_edge_ordering`, `parity_m1_run_key_conflicts_on_payload_mismatch`, `parity_m1_rerun_run_key_conflict_surfaces_diagnostics_payload`)
 - CI: `.github/workflows/ci.yml` (job `test`: `cargo test -p arco-api --all-features --test orchestration_parity_gates_m1`)
 
 ## Operator surface (implemented)

@@ -73,8 +73,8 @@ Suggested locations:
 - CI prevents regressions.
 
 ## Evidence (parity-08)
-- Code: `crates/arco-api/src/routes/orchestration.rs:2691` (`rerun_run` endpoint)
-- Code: `crates/arco-api/src/routes/orchestration.rs:1823` (lineage extraction) and `crates/arco-api/src/routes/orchestration.rs:1833` (reject reserved lineage labels)
+- Code: `crates/arco-api/src/routes/orchestration.rs:4187` (`rerun_run` endpoint)
+- Code: `crates/arco-api/src/routes/orchestration.rs:2372` (lineage extraction) and `crates/arco-api/src/routes/orchestration.rs:2482` (reject reserved lineage labels)
 - Tests: `crates/arco-api/tests/orchestration_parity_gates_m1.rs:809` (`parity_m1_rerun_from_failure_plans_only_unsucceeded_tasks`)
 - Tests: `crates/arco-api/tests/orchestration_parity_gates_m1.rs:1105` (`parity_m1_rerun_subset_respects_include_downstream`)
 - Tests: `crates/arco-api/tests/orchestration_parity_gates_m1.rs:1261` (`parity_m1_rerun_from_failure_rejects_succeeded_parent`)

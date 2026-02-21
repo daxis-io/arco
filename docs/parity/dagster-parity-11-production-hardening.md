@@ -73,7 +73,23 @@ Enumerate failure modes:
 
 ## Evidence Targets
 - Existing invariants tests: `crates/arco-flow/tests/orchestration_correctness_tests.rs`
+- Delta coordinator DR crash-window tests: `crates/arco-delta/tests/idempotency_replay.rs`
+- Orchestration rebuild DR tests: `crates/arco-flow/tests/orchestration_rebuild_dr.rs`
+- DR runbook: `docs/runbooks/disaster-recovery-coordinator-orchestration.md`
 - CI wiring: `.github/workflows/ci.yml`
+
+## Q4 DR Hardening Evidence (2026-02-21)
+- Coordinator crash-window coverage:
+  - crash after reservation, before delta-log write
+  - crash after delta-log write, before idempotency marker
+  - crash after idempotency marker, before finalize
+  - repeated replay returns stable `(version, delta_log_path)`
+- Orchestration rebuild coverage:
+  - deterministic rebuild from explicit ledger manifest reproduces equivalent projection state
+  - stale watermark rebuild correctness without ledger listing
+- Proof-gate CI commands:
+  - `cargo test -p arco-delta --all-features --test idempotency_replay`
+  - `cargo test -p arco-flow --features test-utils --test orchestration_rebuild_dr`
 
 ## Risks / Edge Cases
 - HA without strict external coordination can create duplication; must be proven by tests.

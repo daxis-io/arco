@@ -2424,20 +2424,19 @@ fn build_skip_attribution_index(
             continue;
         }
 
-        let satisfied_at = edge.satisfied_at.map(|t| t.timestamp_millis()).unwrap_or(0);
+        let satisfied_at = edge.satisfied_at.map_or(0, |t| t.timestamp_millis());
         let upstream_task_key = edge.upstream_task_key.clone();
         let row_version = edge.row_version.clone();
 
-        let replace = match first_causes.get(&edge.downstream_task_key) {
-            Some(current) => {
+        let replace = first_causes
+            .get(&edge.downstream_task_key)
+            .map_or(true, |current| {
                 (
                     satisfied_at,
                     upstream_task_key.as_str(),
                     row_version.as_str(),
                 ) < (current.0, current.1.as_str(), current.2.as_str())
-            }
-            None => true,
-        };
+            });
 
         if replace {
             first_causes.insert(

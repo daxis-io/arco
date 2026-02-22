@@ -2,7 +2,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,6 +27,8 @@ const WORKSPACE: &str = "analytics";
 struct FailOnceBackend {
     inner: MemoryBackend,
     fail_once_put_paths: Arc<Mutex<HashSet<String>>>,
+    fail_put_attempts: Arc<Mutex<HashMap<String, VecDeque<usize>>>>,
+    put_attempts: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl FailOnceBackend {
@@ -41,8 +43,42 @@ impl FailOnceBackend {
             .insert(path.to_string());
     }
 
+    fn fail_put_attempt_on_exact_path(&self, path: &str, attempt: usize) {
+        assert!(attempt > 0, "attempt must be 1-based");
+        let mut fail_put_attempts = self.fail_put_attempts.lock().expect("lock");
+        fail_put_attempts
+            .entry(path.to_string())
+            .or_default()
+            .push_back(attempt);
+    }
+
     fn should_fail_put(&self, path: &str) -> bool {
-        self.fail_once_put_paths.lock().expect("lock").remove(path)
+        if self.fail_once_put_paths.lock().expect("lock").remove(path) {
+            return true;
+        }
+
+        let attempt = {
+            let mut put_attempts = self.put_attempts.lock().expect("lock");
+            let current = put_attempts.entry(path.to_string()).or_insert(0);
+            *current += 1;
+            *current
+        };
+
+        let mut fail_put_attempts = self.fail_put_attempts.lock().expect("lock");
+        let should_fail = fail_put_attempts
+            .get(path)
+            .and_then(|attempts| attempts.front().copied())
+            == Some(attempt);
+        if should_fail {
+            let attempts = fail_put_attempts.get_mut(path).expect("attempt queue");
+            let _ = attempts.pop_front();
+            if attempts.is_empty() {
+                fail_put_attempts.remove(path);
+            }
+            return true;
+        }
+
+        false
     }
 }
 
@@ -97,6 +133,14 @@ fn idempotency_record_relative_path(table_id: Uuid, idempotency_key: &str) -> St
     format!("delta/idempotency/{table_id}/{prefix}/{hash}.json")
 }
 
+fn coordinator_state_relative_path(table_id: Uuid) -> String {
+    format!("delta/coordinator/{table_id}.json")
+}
+
+fn delta_log_relative_path(table_id: Uuid, version: i64) -> String {
+    format!("tables/{table_id}/_delta_log/{version:020}.json")
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -104,7 +148,51 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 #[tokio::test]
-async fn commit_retry_replays_after_transient_idempotency_write_failure() {
+async fn crash_after_reservation_before_delta_log_write_replays_same_version_and_path() {
+    let backend = Arc::new(FailOnceBackend::new());
+    let storage = ScopedStorage::new(backend.clone(), TENANT, WORKSPACE).expect("scoped storage");
+    let table_id = Uuid::now_v7();
+    let coordinator = DeltaCommitCoordinator::new(storage.clone(), table_id);
+
+    let staged = coordinator
+        .stage_commit_payload(Bytes::from_static(b"{\"commitInfo\":{\"ts\":1}}\n"))
+        .await
+        .expect("stage payload");
+
+    let idempotency_key = Uuid::now_v7().to_string();
+    let request = CommitDeltaRequest {
+        read_version: -1,
+        staged_path: staged.staged_path.clone(),
+        staged_version: staged.staged_version.clone(),
+        idempotency_key: idempotency_key.clone(),
+    };
+
+    let delta_log_path = delta_log_relative_path(table_id, 0);
+    backend.fail_next_put_on_exact_path(&scoped_path(&delta_log_path));
+
+    let first = coordinator.commit(request.clone(), Utc::now()).await;
+    assert!(
+        first.is_err(),
+        "first attempt should fail on injected delta-log write"
+    );
+
+    let replay = coordinator
+        .commit(request.clone(), Utc::now())
+        .await
+        .expect("retry should complete reserved inflight commit");
+    assert_eq!(replay.version, 0);
+    assert_eq!(replay.delta_log_path, delta_log_path);
+
+    let replay_again = coordinator
+        .commit(request, Utc::now())
+        .await
+        .expect("replay should remain stable");
+    assert_eq!(replay_again.version, replay.version);
+    assert_eq!(replay_again.delta_log_path, replay.delta_log_path);
+}
+
+#[tokio::test]
+async fn crash_after_delta_log_write_before_idempotency_replays_same_version_and_path() {
     let backend = Arc::new(FailOnceBackend::new());
     let storage = ScopedStorage::new(backend.clone(), TENANT, WORKSPACE).expect("scoped storage");
     let table_id = Uuid::now_v7();
@@ -133,14 +221,18 @@ async fn commit_retry_replays_after_transient_idempotency_write_failure() {
     );
 
     let replay = coordinator
-        .commit(request, Utc::now())
+        .commit(request.clone(), Utc::now())
         .await
         .expect("retry should replay committed response");
     assert_eq!(replay.version, 0);
-    assert_eq!(
-        replay.delta_log_path,
-        format!("tables/{table_id}/_delta_log/00000000000000000000.json")
-    );
+    assert_eq!(replay.delta_log_path, delta_log_relative_path(table_id, 0));
+
+    let replay_again = coordinator
+        .commit(request, Utc::now())
+        .await
+        .expect("repeat replay should remain stable");
+    assert_eq!(replay_again.version, replay.version);
+    assert_eq!(replay_again.delta_log_path, replay.delta_log_path);
 
     assert!(
         storage
@@ -149,6 +241,95 @@ async fn commit_retry_replays_after_transient_idempotency_write_failure() {
             .expect("head idempotency record")
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn crash_after_idempotency_marker_before_finalize_recovers_and_clears_inflight() {
+    let backend = Arc::new(FailOnceBackend::new());
+    let storage = ScopedStorage::new(backend.clone(), TENANT, WORKSPACE).expect("scoped storage");
+    let table_id = Uuid::now_v7();
+    let coordinator = DeltaCommitCoordinator::new(storage.clone(), table_id);
+
+    let staged = coordinator
+        .stage_commit_payload(Bytes::from_static(b"{\"commitInfo\":{\"ts\":2}}\n"))
+        .await
+        .expect("stage payload");
+
+    let idempotency_key = Uuid::now_v7().to_string();
+    let request = CommitDeltaRequest {
+        read_version: -1,
+        staged_path: staged.staged_path.clone(),
+        staged_version: staged.staged_version.clone(),
+        idempotency_key: idempotency_key.clone(),
+    };
+
+    let state_path = coordinator_state_relative_path(table_id);
+    backend.fail_put_attempt_on_exact_path(&scoped_path(&state_path), 2);
+
+    let first = coordinator.commit(request.clone(), Utc::now()).await;
+    assert!(
+        first.is_err(),
+        "first attempt should fail on injected finalize write"
+    );
+
+    let replay = coordinator
+        .commit(request.clone(), Utc::now())
+        .await
+        .expect("retry should replay committed response");
+    assert_eq!(replay.version, 0);
+    assert_eq!(replay.delta_log_path, delta_log_relative_path(table_id, 0));
+
+    let state_bytes = storage
+        .get_raw(&state_path)
+        .await
+        .expect("read coordinator state");
+    let state: DeltaCoordinatorState =
+        serde_json::from_slice(&state_bytes).expect("deserialize coordinator state");
+    assert_eq!(state.latest_version, 0);
+    assert!(state.inflight.is_none(), "replay must clear stale inflight");
+
+    let replay_again = coordinator
+        .commit(request, Utc::now())
+        .await
+        .expect("repeat replay should remain stable");
+    assert_eq!(replay_again.version, replay.version);
+    assert_eq!(replay_again.delta_log_path, replay.delta_log_path);
+}
+
+#[tokio::test]
+async fn repeated_replay_returns_same_version_and_path() {
+    let backend = Arc::new(FailOnceBackend::new());
+    let storage = ScopedStorage::new(backend, TENANT, WORKSPACE).expect("scoped storage");
+    let table_id = Uuid::now_v7();
+    let coordinator = DeltaCommitCoordinator::new(storage, table_id);
+
+    let staged = coordinator
+        .stage_commit_payload(Bytes::from_static(b"{\"commitInfo\":{\"ts\":3}}\n"))
+        .await
+        .expect("stage payload");
+
+    let request = CommitDeltaRequest {
+        read_version: -1,
+        staged_path: staged.staged_path.clone(),
+        staged_version: staged.staged_version.clone(),
+        idempotency_key: Uuid::now_v7().to_string(),
+    };
+
+    let first = coordinator
+        .commit(request.clone(), Utc::now())
+        .await
+        .expect("first commit");
+    assert_eq!(first.version, 0);
+    assert_eq!(first.delta_log_path, delta_log_relative_path(table_id, 0));
+
+    for _ in 0..3 {
+        let replay = coordinator
+            .commit(request.clone(), Utc::now())
+            .await
+            .expect("replay commit");
+        assert_eq!(replay.version, first.version);
+        assert_eq!(replay.delta_log_path, first.delta_log_path);
+    }
 }
 
 #[tokio::test]

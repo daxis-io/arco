@@ -802,3 +802,76 @@ fn parity_m2_retry_failed_only_targets_failed_partitions_deterministically() {
         &vec!["2025-01-01".to_string(), "2025-01-02".to_string()]
     );
 }
+
+#[test]
+fn parity_m2_schedule_sensor_backfill_and_manual_reexecution_share_run_key_consistency() {
+    let mut state = FoldState::new();
+    let run_key = "rk_shared_q3";
+    let fingerprint = "fp_shared_q3";
+
+    let sources = vec![
+        SourceRef::Schedule {
+            schedule_id: "daily".to_string(),
+            tick_id: "tick_1".to_string(),
+        },
+        SourceRef::Sensor {
+            sensor_id: "sensor_1".to_string(),
+            eval_id: "eval_1".to_string(),
+        },
+        SourceRef::Backfill {
+            backfill_id: "bf_1".to_string(),
+            chunk_id: "chunk_1".to_string(),
+        },
+        SourceRef::Manual {
+            user_id: "operator@example.com".to_string(),
+            request_id: "rerun_req_1".to_string(),
+        },
+    ];
+
+    for source in sources {
+        state.fold_event(&OrchestrationEvent::new(
+            "tenant-abc",
+            "workspace-prod",
+            OrchestrationEventData::RunRequested {
+                run_key: run_key.to_string(),
+                request_fingerprint: fingerprint.to_string(),
+                asset_selection: vec!["analytics.daily".to_string()],
+                partition_selection: Some(vec!["date=2025-01-15".to_string()]),
+                trigger_source_ref: source,
+                labels: HashMap::new(),
+            },
+        ));
+    }
+
+    assert_eq!(state.run_key_index.len(), 1);
+    assert!(
+        state.run_key_conflicts.is_empty(),
+        "equivalent run requests from schedule/sensor/backfill/manual should dedupe cleanly"
+    );
+
+    state.fold_event(&OrchestrationEvent::new(
+        "tenant-abc",
+        "workspace-prod",
+        OrchestrationEventData::RunRequested {
+            run_key: run_key.to_string(),
+            request_fingerprint: "fp_conflict_q3".to_string(),
+            asset_selection: vec!["analytics.other".to_string()],
+            partition_selection: Some(vec!["date=2025-01-16".to_string()]),
+            trigger_source_ref: SourceRef::Manual {
+                user_id: "operator@example.com".to_string(),
+                request_id: "rerun_req_2".to_string(),
+            },
+            labels: HashMap::new(),
+        },
+    ));
+
+    assert_eq!(state.run_key_conflicts.len(), 1);
+    let conflict = state
+        .run_key_conflicts
+        .values()
+        .next()
+        .expect("expected one conflict row");
+    assert_eq!(conflict.run_key, run_key);
+    assert_eq!(conflict.existing_fingerprint, fingerprint);
+    assert_eq!(conflict.conflicting_fingerprint, "fp_conflict_q3");
+}

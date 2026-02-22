@@ -57,6 +57,7 @@ jobs:
       - run: cargo xtask verify-integrity
       - run: cargo xtask engine-boundary-check
       - run: cargo xtask parity-matrix-check
+      - run: cargo xtask repo-hygiene-check
 
   check:
     name: Check
@@ -125,6 +126,7 @@ jobs:
           sudo mkdir -p /mnt/target
           sudo chown -R "$(id -u):$(id -g)" /mnt/target
       - run: cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
+      - run: cargo test -p arco-delta --all-features --test idempotency_replay -- --nocapture
       - run: cargo test -p arco-api --all-features --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_
       - run: cargo test -p arco-api --all-features --test task_token_contract_tests
       - run: cargo test -p arco-api --all-features --test orchestration_parity_gates_m1
@@ -132,6 +134,7 @@ jobs:
       - run: cargo test -p arco-flow --features "test-utils,legacy-scheduler" --no-run
       - run: cargo test -p arco-flow --features test-utils --lib
       - run: cargo test -p arco-flow --features "test-utils,legacy-scheduler" --lib
+      - run: cargo test -p arco-flow --features test-utils --test orchestration_rebuild_dr -- --nocapture
       - run: cargo test -p arco-flow --features test-utils --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_
       - run: cargo test -p arco-flow --features test-utils --test worker_dispatch_envelope_tests
       - run: cargo test -p arco-flow --features "test-utils,legacy-scheduler" --test integration
@@ -173,9 +176,12 @@ jobs:
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install mdBook
+        run: cargo install mdbook --version 0.4.52 --locked
       - run: cargo doc --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      - run: cd docs/guide && mdbook build
 
   doc-tests:
     name: Doc Tests

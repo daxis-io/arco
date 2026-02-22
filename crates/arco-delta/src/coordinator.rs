@@ -160,6 +160,8 @@ impl DeltaCommitCoordinator {
         now: DateTime<Utc>,
     ) -> Result<CommitDeltaResponse> {
         if let Some(response) = self.replay_committed(&req).await? {
+            self.finalize_replayed_commit(&req.idempotency_key, response.version)
+                .await?;
             return Ok(response);
         }
 
@@ -479,6 +481,52 @@ impl DeltaCommitCoordinator {
 
         Err(DeltaError::conflict(
             "failed to finalize delta commit after retries".to_string(),
+        ))
+    }
+
+    async fn finalize_replayed_commit(
+        &self,
+        commit_id: &str,
+        committed_version: i64,
+    ) -> Result<()> {
+        for _ in 0..self.config.max_cas_retries {
+            let (state, version) = self.load_state().await?;
+            let Some(version) = version else {
+                return Ok(());
+            };
+
+            let Some(inflight) = &state.inflight else {
+                if state.latest_version >= committed_version {
+                    return Ok(());
+                }
+
+                let mut updated = state.clone();
+                updated.latest_version = committed_version;
+
+                let put = self.store_state(&updated, Some(&version)).await?;
+                match put {
+                    WriteResult::Success { .. } => return Ok(()),
+                    WriteResult::PreconditionFailed { .. } => continue,
+                }
+            };
+
+            if inflight.commit_id != commit_id {
+                return Ok(());
+            }
+
+            let mut updated = state.clone();
+            updated.latest_version = committed_version.max(inflight.version);
+            updated.inflight = None;
+
+            let put = self.store_state(&updated, Some(&version)).await?;
+            match put {
+                WriteResult::Success { .. } => return Ok(()),
+                WriteResult::PreconditionFailed { .. } => continue,
+            }
+        }
+
+        Err(DeltaError::conflict(
+            "failed to finalize replayed delta commit after retries".to_string(),
         ))
     }
 

@@ -2430,7 +2430,7 @@ fn build_skip_attribution_index(
 
         let replace = first_causes
             .get(&edge.downstream_task_key)
-            .map_or(true, |current| {
+            .is_none_or(|current| {
                 (
                     satisfied_at,
                     upstream_task_key.as_str(),

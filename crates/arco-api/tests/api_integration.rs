@@ -1239,6 +1239,10 @@ mod orchestration {
         task_key: String,
         attempt: u32,
         state: String,
+        delta_table: Option<String>,
+        delta_version: Option<i64>,
+        delta_partition: Option<String>,
+        execution_lineage_ref: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1429,6 +1433,14 @@ mod orchestration {
             "workerId": "worker-1",
             "outcome": "SUCCEEDED",
             "completedAt": Utc::now().to_rfc3339(),
+            "output": {
+                "materializationId": "mat-arco-flow-001",
+                "rowCount": 42,
+                "byteSize": 1024,
+                "deltaTable": "analytics.users",
+                "deltaVersion": 17,
+                "deltaPartition": "date=2025-01-15"
+            }
         });
         let (status, completed): (_, TaskCallbackResponse) = helpers::post_json_with_headers(
             router.clone(),
@@ -1449,6 +1461,21 @@ mod orchestration {
             .find(|task| task.task_key == task_key)
             .context("expected completed task")?;
         assert_eq!(finished_task.state, "SUCCEEDED");
+        assert_eq!(
+            finished_task.delta_table.as_deref(),
+            Some("analytics.users")
+        );
+        assert_eq!(finished_task.delta_version, Some(17));
+        assert_eq!(
+            finished_task.delta_partition.as_deref(),
+            Some("date=2025-01-15")
+        );
+        assert!(
+            finished_task
+                .execution_lineage_ref
+                .as_ref()
+                .is_some_and(|value| !value.is_empty())
+        );
 
         let (status, logs_text) = helpers::get_text(
             router,

@@ -998,16 +998,43 @@ mod tests {
             "output": {
                 "materializationId": "mat-456",
                 "rowCount": 1000,
-                "byteSize": 52428800
+                "byteSize": 52428800,
+                "deltaTable": "analytics.daily",
+                "deltaVersion": 17,
+                "deltaPartition": "date=2025-01-15"
             }
         }"#;
 
         let request: TaskCompletedRequest = serde_json::from_str(json).expect("deserialize");
         assert_eq!(request.attempt, 1);
         assert!(matches!(request.outcome, WorkerOutcome::Succeeded));
-        assert!(request.output.is_some());
+        let output = request.output.expect("expected output");
+        assert_eq!(output.delta_table.as_deref(), Some("analytics.daily"));
+        assert_eq!(output.delta_version, Some(17));
+        assert_eq!(output.delta_partition.as_deref(), Some("date=2025-01-15"));
         assert!(request.error.is_none());
         assert!(request.traceparent.is_none());
+    }
+
+    #[test]
+    fn test_task_output_conversion_preserves_delta_lineage() {
+        let output = TaskOutput {
+            materialization_id: Some("mat-456".to_string()),
+            row_count: Some(1000),
+            byte_size: Some(52428800),
+            output_path: Some("gs://bucket/path".to_string()),
+            delta_table: Some("analytics.daily".to_string()),
+            delta_version: Some(17),
+            delta_partition: Some("date=2025-01-15".to_string()),
+        };
+
+        let flow_output: FlowTaskOutput = output.into();
+        assert_eq!(flow_output.delta_table.as_deref(), Some("analytics.daily"));
+        assert_eq!(flow_output.delta_version, Some(17));
+        assert_eq!(
+            flow_output.delta_partition.as_deref(),
+            Some("date=2025-01-15")
+        );
     }
 
     #[test]

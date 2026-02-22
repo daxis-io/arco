@@ -119,12 +119,37 @@ fn json_i64_field(value: &Value, keys: &[&str]) -> Option<i64> {
 /// Expected form: `ledger/orchestration/<date>/<event_id>.json`.
 #[must_use]
 pub fn event_id_from_ledger_path(path: &str) -> Option<&str> {
-    let filename = path.rsplit('/').next()?;
+    let mut parts = path.split('/');
+    if parts.next()? != "ledger" || parts.next()? != "orchestration" {
+        return None;
+    }
+
+    let date_segment = parts.next()?;
+    if !is_iso8601_date_segment(date_segment) {
+        return None;
+    }
+
+    let filename = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
     let event_id = filename.strip_suffix(".json")?;
     if event_id.is_empty() {
         return None;
     }
     Some(event_id)
+}
+
+fn is_iso8601_date_segment(segment: &str) -> bool {
+    if segment.len() != 10 {
+        return false;
+    }
+
+    segment.bytes().enumerate().all(|(idx, byte)| match idx {
+        4 | 7 => byte == b'-',
+        _ => byte.is_ascii_digit(),
+    })
 }
 
 /// Dependency edge resolution.
@@ -5644,6 +5669,18 @@ mod tests {
         );
         assert_eq!(
             event_id_from_ledger_path("ledger/orchestration/2026-02-21/event.txt"),
+            None
+        );
+        assert_eq!(
+            event_id_from_ledger_path("state/orchestration/rebuilds/event.json"),
+            None
+        );
+        assert_eq!(
+            event_id_from_ledger_path("ledger/orchestration/not-a-date/event.json"),
+            None
+        );
+        assert_eq!(
+            event_id_from_ledger_path("ledger/orchestration/2026-02-21/subdir/event.json"),
             None
         );
     }

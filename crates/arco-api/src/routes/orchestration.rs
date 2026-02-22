@@ -6692,6 +6692,7 @@ mod tests {
             labels: HashMap::new(),
             parent_run_id: None,
             rerun_kind: None,
+            rerun_reason: None,
         };
 
         let json = serde_json::to_string(&response).expect("serialize");

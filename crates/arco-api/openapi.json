@@ -3930,6 +3930,9 @@
             "type": "string",
             "description": "Stable machine-readable error code."
           },
+          "details": {
+            "description": "Optional structured diagnostics payload."
+          },
           "error": {
             "type": [
               "string",
@@ -5830,6 +5833,35 @@
             "type": "string",
             "description": "Asset key."
           },
+          "deltaPartition": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Delta partition recorded for the latest successful materialization."
+          },
+          "deltaTable": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Delta table recorded for the latest successful materialization."
+          },
+          "deltaVersion": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Delta version recorded for the latest successful materialization."
+          },
+          "executionLineageRef": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Deterministic execution lineage reference."
+          },
           "isStale": {
             "type": "boolean",
             "description": "Whether this partition is stale."
@@ -6051,7 +6083,8 @@
           "created",
           "createdAt",
           "parentRunId",
-          "rerunKind"
+          "rerunKind",
+          "rerunReason"
         ],
         "properties": {
           "created": {
@@ -6074,6 +6107,10 @@
           "rerunKind": {
             "$ref": "#/components/schemas/RerunKindResponse",
             "description": "Rerun kind."
+          },
+          "rerunReason": {
+            "type": "string",
+            "description": "Deterministic operator-facing reason for this rerun."
           },
           "runId": {
             "type": "string",
@@ -6397,6 +6434,13 @@
                 "description": "Rerun kind (for reruns)."
               }
             ]
+          },
+          "rerunReason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Deterministic operator-facing reason for rerun creation."
           },
           "runId": {
             "type": "string",
@@ -7327,6 +7371,28 @@
             "description": "Size in bytes.",
             "minimum": 0
           },
+          "deltaPartition": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Delta partition for lineage correlation."
+          },
+          "deltaTable": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Delta table identifier for lineage correlation."
+          },
+          "deltaVersion": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Delta version for lineage correlation."
+          },
           "materializationId": {
             "type": [
               "string",
@@ -7349,6 +7415,44 @@
             "format": "int64",
             "description": "Number of rows produced.",
             "minimum": 0
+          }
+        }
+      },
+      "TaskRetryAttributionResponse": {
+        "type": "object",
+        "description": "Retry attribution details for a task.",
+        "required": [
+          "retries",
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "description": "Deterministic reason code."
+          },
+          "retries": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of retries consumed before current attempt.",
+            "minimum": 0
+          }
+        }
+      },
+      "TaskSkipAttributionResponse": {
+        "type": "object",
+        "description": "Skip attribution details for a task.",
+        "required": [
+          "upstreamTaskKey",
+          "upstreamResolution"
+        ],
+        "properties": {
+          "upstreamResolution": {
+            "type": "string",
+            "description": "Upstream resolution that propagated the skip."
+          },
+          "upstreamTaskKey": {
+            "type": "string",
+            "description": "Upstream task that caused this skip."
           }
         }
       },
@@ -7454,12 +7558,63 @@
             "format": "date-time",
             "description": "Task completion time."
           },
+          "deltaPartition": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Delta partition recorded for this materialization."
+          },
+          "deltaTable": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Delta table recorded for this materialization."
+          },
+          "deltaVersion": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Delta version recorded for this materialization."
+          },
           "errorMessage": {
             "type": [
               "string",
               "null"
             ],
             "description": "Error message (if failed)."
+          },
+          "executionLineageRef": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Deterministic execution lineage reference for successful materializations."
+          },
+          "retryAttribution": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TaskRetryAttributionResponse",
+                "description": "Retry attribution for tasks that consumed retries."
+              }
+            ]
+          },
+          "skipAttribution": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TaskSkipAttributionResponse",
+                "description": "Skip attribution for tasks skipped due to upstream outcomes."
+              }
+            ]
           },
           "startedAt": {
             "type": [

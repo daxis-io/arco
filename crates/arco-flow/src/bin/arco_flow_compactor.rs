@@ -20,6 +20,8 @@ use arco_core::{InternalOidcConfig, InternalOidcError, InternalOidcVerifier, Sco
 use arco_flow::error::{Error, Result};
 use arco_flow::orchestration::compactor::{CompactionResult, MicroCompactor};
 
+const REBUILD_MANIFEST_PREFIX: &str = "state/orchestration/rebuilds/";
+
 #[derive(Clone)]
 struct AppState {
     compactor: MicroCompactor,
@@ -76,6 +78,9 @@ impl From<Error> for ApiError {
                 | arco_core::Error::InvalidId { .. }
                 | arco_core::Error::Validation { .. },
             ) => StatusCode::BAD_REQUEST,
+            Error::Core(
+                arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. },
+            ) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
@@ -127,6 +132,15 @@ async fn rebuild_handler(
     State(state): State<AppState>,
     Json(request): Json<RebuildRequest>,
 ) -> std::result::Result<Json<CompactResponse>, ApiError> {
+    if !is_valid_rebuild_manifest_path(&request.rebuild_manifest_path) {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!(
+                "invalid rebuild_manifest_path: expected '{REBUILD_MANIFEST_PREFIX}*.json'"
+            ),
+        });
+    }
+
     let CompactionResult {
         events_processed,
         delta_id,
@@ -147,6 +161,10 @@ async fn rebuild_handler(
 
 fn required_env(key: &str) -> Result<String> {
     std::env::var(key).map_err(|_| Error::configuration(format!("missing {key}")))
+}
+
+fn is_valid_rebuild_manifest_path(path: &str) -> bool {
+    !path.is_empty() && path.starts_with(REBUILD_MANIFEST_PREFIX) && path.ends_with(".json")
 }
 
 fn resolve_port() -> Result<u16> {
@@ -297,6 +315,27 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_manifest_path_validator_accepts_expected_path() {
+        assert!(is_valid_rebuild_manifest_path(
+            "state/orchestration/rebuilds/rebuild-01.json"
+        ));
+    }
+
+    #[test]
+    fn rebuild_manifest_path_validator_rejects_invalid_paths() {
+        assert!(!is_valid_rebuild_manifest_path(""));
+        assert!(!is_valid_rebuild_manifest_path(
+            "state/orchestration/manifest.pointer.json"
+        ));
+        assert!(!is_valid_rebuild_manifest_path(
+            "state/orchestration/rebuilds/"
+        ));
+        assert!(!is_valid_rebuild_manifest_path(
+            "state/orchestration/rebuilds/rebuild-01"
+        ));
+    }
+
+    #[test]
     fn api_error_maps_core_precondition_to_conflict() {
         let error = Error::Core(CoreError::PreconditionFailed {
             message: "manifest publish failed - concurrent write".to_string(),
@@ -310,6 +349,13 @@ mod tests {
         let error = Error::Core(CoreError::InvalidInput("invalid lock_path".to_string()));
         let api_error = ApiError::from(error);
         assert_eq!(api_error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn api_error_maps_core_not_found_to_not_found() {
+        let error = Error::Core(CoreError::NotFound("missing object".to_string()));
+        let api_error = ApiError::from(error);
+        assert_eq!(api_error.status, StatusCode::NOT_FOUND);
     }
 }
 

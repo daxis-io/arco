@@ -65,6 +65,6 @@ Complete Q3 by making orchestration outcomes cross-verifiable from run execution
 - [x] Execution-to-catalog lineage linkage by Delta version + partition is present on run and partition read surfaces.
 - [x] Operator diagnostics include deterministic rerun reason, retry attribution, skip attribution, and run_key conflict introspection payloads.
 - [x] Parity evidence policy remains enforced by `cargo xtask parity-matrix-check`.
-- [x] Q3 verification suite evidence captured in `docs/plans/2026-02-21-q3-verification-evidence.md`.
+- [x] Q3 verification suite evidence captured in `2026-02-21-q3-verification-evidence.md`.
 
 No open Q3 code gaps remain under the Q3 scope defined in this roadmap.

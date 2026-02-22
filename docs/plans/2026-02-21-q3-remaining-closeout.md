@@ -1,6 +1,6 @@
 # Q3 Remaining Orchestration Closeout Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> Execute this plan task-by-task in order, validating each step before proceeding.
 
 **Goal:** Finish the remaining Q3 work by landing deterministic diagnostics fixes, tightening parity evidence, and producing a clean Q3 verification/sign-off artifact.
 
@@ -144,8 +144,8 @@ git commit -m "docs(parity): refresh Q3 diagnostics and lineage evidence referen
 ### Task 4: Full Q3 verification gate and release evidence snapshot
 
 **Files:**
-- Modify: `docs/plans/2026-02-20-q3-orchestration-leadership-layer.md`
-- Create: `docs/plans/2026-02-21-q3-verification-evidence.md`
+- Modify: `2026-02-20-q3-orchestration-leadership-layer.md`
+- Create: `2026-02-21-q3-verification-evidence.md`
 
 **Step 1: Run full Q3 command suite**
 
@@ -172,22 +172,22 @@ Create a dated evidence note containing:
 
 ```markdown
 # Q3 Verification Evidence (2026-02-21)
-- Branch: codex/q3-orchestration-leadership-layer
+- Branch: q3-orchestration-leadership-layer
 - Commit: <sha>
 - Result: all Q3 gates passing
 ```
 
 **Step 3: Update Q3 plan status from in-progress to closed**
 
-Update `docs/plans/2026-02-20-q3-orchestration-leadership-layer.md` to include:
+Update `2026-02-20-q3-orchestration-leadership-layer.md` to include:
 - final acceptance criteria checklist marked complete
-- link to `docs/plans/2026-02-21-q3-verification-evidence.md`
+- link to `2026-02-21-q3-verification-evidence.md`
 - explicit note: no open Q3 code gaps remain
 
 **Step 4: Commit**
 
 ```bash
-git add docs/plans/2026-02-20-q3-orchestration-leadership-layer.md docs/plans/2026-02-21-q3-verification-evidence.md
+git add 2026-02-20-q3-orchestration-leadership-layer.md 2026-02-21-q3-verification-evidence.md
 git commit -m "chore(q3): add final verification evidence and close remaining items"
 ```
 

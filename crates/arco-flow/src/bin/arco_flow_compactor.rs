@@ -164,7 +164,11 @@ fn required_env(key: &str) -> Result<String> {
 }
 
 fn is_valid_rebuild_manifest_path(path: &str) -> bool {
-    !path.is_empty() && path.starts_with(REBUILD_MANIFEST_PREFIX) && path.ends_with(".json")
+    !path.is_empty()
+        && path.starts_with(REBUILD_MANIFEST_PREFIX)
+        && std::path::Path::new(path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
 }
 
 fn resolve_port() -> Result<u16> {

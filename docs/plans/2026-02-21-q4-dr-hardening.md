@@ -1,6 +1,6 @@
 # Q4 DR Hardening Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> Execute this plan task-by-task in order, validating each step before proceeding.
 
 **Goal:** Harden delta commit and orchestration compactor crash recovery so replay/rebuild is deterministic and CI-enforced.
 

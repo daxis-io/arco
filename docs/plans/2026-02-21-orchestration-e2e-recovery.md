@@ -1,6 +1,6 @@
 # Orchestration End-to-End Recovery (M1-M3) Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> Execute this plan task-by-task in order, validating each step before proceeding.
 
 **Goal:** Restore orchestration end-to-end reliability by fixing the callback-path break and hardening M1/M2/M3 callback-lineage regressions to PR-ready quality.
 
@@ -36,4 +36,3 @@
 - Callback success payload can carry Delta lineage fields (`deltaTable`, `deltaVersion`, `deltaPartition`).
 - Callback lineage metadata appears on compacted task state and API run-read response.
 - Existing M2/M3 parity coverage remains green.
-

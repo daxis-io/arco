@@ -883,9 +883,8 @@ async fn lineage_metadata_flows_from_task_output_to_catalog_and_run_read_surface
         .get("partitions")
         .and_then(|v| v.as_array())
         .and_then(|rows| {
-            rows.iter().find(|row| {
-                row.get("partitionKey").and_then(|v| v.as_str()) == Some(partition_key)
-            })
+            rows.iter()
+                .find(|row| row.get("partitionKey").and_then(|v| v.as_str()) == Some(partition_key))
         })
         .context("expected partition status row")?;
 

@@ -29,7 +29,7 @@ jobs:
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/dependency-review-action@3c4e3dcb1aa7874d2c16be7d79418e9b7efd6261 # v4
+      - uses: actions/dependency-review-action@05fe4576374b728f0c523d6a13d64c25081e0803 # v4
         with:
           fail-on-severity: high
           deny-licenses: GPL-3.0, AGPL-3.0
@@ -44,7 +44,7 @@ jobs:
           toolchain: 1.85
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install cargo-deny
-        uses: taiki-e/install-action@887bc4e03483810873d617344dd5189cd82e7b8b # v2
+        uses: taiki-e/install-action@cfdb446e391c69574ebc316dfb7d7849ec12b940 # v2
         with:
           tool: cargo-deny@0.18.9
       - name: Setup Buf
@@ -213,7 +213,7 @@ jobs:
           toolchain: 1.85
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install cargo-deny
-        uses: taiki-e/install-action@887bc4e03483810873d617344dd5189cd82e7b8b # v2
+        uses: taiki-e/install-action@cfdb446e391c69574ebc316dfb7d7849ec12b940 # v2
         with:
           tool: cargo-deny@0.18.9
       - run: cargo deny check bans licenses sources
@@ -228,7 +228,7 @@ jobs:
           toolchain: 1.85
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install cargo-deny
-        uses: taiki-e/install-action@887bc4e03483810873d617344dd5189cd82e7b8b # v2
+        uses: taiki-e/install-action@cfdb446e391c69574ebc316dfb7d7849ec12b940 # v2
         with:
           tool: cargo-deny@0.18.9
       - name: cargo-deny advisories

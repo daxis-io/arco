@@ -142,9 +142,9 @@ pub(crate) async fn mint_urls(
         .min(MAX_TTL_SECONDS);
     let ttl = Duration::from_secs(ttl_seconds);
 
-    // SECURITY: Validate path traversal FIRST (before any I/O)
+    // SECURITY: Validate all user-provided paths FIRST (before any I/O)
     for path in &req.paths {
-        if path.contains("..") {
+        if let Err(err) = arco_core::ScopedStorage::validate_path(path) {
             crate::audit::emit_url_mint_deny(
                 state.audit(),
                 &ctx,
@@ -152,9 +152,7 @@ pub(crate) async fn mint_urls(
                 crate::audit::REASON_PATH_TRAVERSAL,
                 &state.config.audit,
             );
-            return Err(ApiError::forbidden(format!(
-                "Path traversal not allowed: {path}"
-            )));
+            return Err(ApiError::forbidden(format!("Invalid path '{path}': {err}")));
         }
     }
 
@@ -178,7 +176,7 @@ pub(crate) async fn mint_urls(
         .get_mintable_paths(domain)
         .await
         .map_err(ApiError::from)?;
-    let mintable_set: HashSet<_> = mintable.iter().collect();
+    let mintable_set: HashSet<String> = mintable.into_iter().collect();
 
     // Validate ALL requested paths are in allowlist
     for path in &req.paths {
@@ -199,7 +197,7 @@ pub(crate) async fn mint_urls(
     // Mint signed URLs
     let paths_to_mint = req.paths.clone();
     let signed = reader
-        .mint_signed_urls(paths_to_mint, ttl)
+        .mint_signed_urls_with_allowlist(paths_to_mint, &mintable_set, ttl)
         .await
         .map_err(ApiError::from)?;
 
@@ -232,5 +230,47 @@ fn parse_domain(domain: &str) -> Result<CatalogDomain, ApiError> {
         "executions" => Ok(CatalogDomain::Executions),
         "search" => Ok(CatalogDomain::Search),
         _ => Err(ApiError::bad_request(format!("Unknown domain: {domain}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use tower::util::ServiceExt;
+
+    use crate::config::Config;
+    use crate::server::AppState;
+
+    #[tokio::test]
+    async fn mint_urls_rejects_encoded_path_traversal_sequences() {
+        let mut config = Config::default();
+        config.debug = true;
+        let state = Arc::new(AppState::with_memory_storage(config));
+        let app = routes().with_state(state);
+
+        let body = serde_json::json!({
+            "domain": "catalog",
+            "paths": ["catalog/%2e%2e/secret.parquet"],
+            "ttlSeconds": 300
+        })
+        .to_string();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/browser/urls")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-tenant-id", "acme")
+                    .header("x-workspace-id", "analytics")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

@@ -42,8 +42,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -163,7 +165,7 @@ enum Commands {
         #[arg(
             long,
             env = "ARCO_METRICS_SECRET",
-            help = "Optional shared secret for /metrics endpoint. Non-empty (trimmed) values enable the gate; requests must include X-Metrics-Secret or Authorization: Bearer header."
+            help = "Optional shared secret for /metrics and /internal/* endpoints. Non-empty (trimmed) values enable the gate; requests must include X-Metrics-Secret or Authorization: Bearer header."
         )]
         metrics_secret: Option<String>,
     },
@@ -380,6 +382,33 @@ struct AutoAntiEntropyConfig {
     reprocess_timeout_secs: u64,
 }
 
+enum CompactionCycleOutcome {
+    Flushed,
+    NoWork,
+    Deferred { pending_events: usize },
+}
+
+struct InProgressFlagGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl<'a> InProgressFlagGuard<'a> {
+    fn set_true(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::Release);
+        Self { flag }
+    }
+
+    fn assume_set(flag: &'a AtomicBool) -> Self {
+        Self { flag }
+    }
+}
+
+impl Drop for InProgressFlagGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NotifyRequest {
@@ -521,6 +550,7 @@ async fn anti_entropy_handler(
             })),
         );
     }
+    let _in_progress = InProgressFlagGuard::assume_set(&state.compactor.compaction_in_progress);
 
     let mut job = anti_entropy::AntiEntropyJob::new(state.storage.clone(), request);
     let response = match job.run_pass().await {
@@ -549,13 +579,7 @@ async fn anti_entropy_handler(
             })),
         ),
     };
-
-    state
-        .compactor
-        .compaction_in_progress
-        .store(false, Ordering::Release);
     drop(compaction_guard);
-
     response
 }
 
@@ -768,17 +792,20 @@ async fn run_compaction_cycle_guarded(state: &Arc<ServiceState>) {
     let _guard = state.compactor.compaction_lock.lock().await;
 
     // If this cycle was started by the periodic loop, `compaction_in_progress` may be false.
-    // If it was started by `/compact`, it is already true. Either way, ensure it's true while
-    // work is running and reset it at the end.
-    state
-        .compactor
-        .compaction_in_progress
-        .store(true, Ordering::Release);
+    // If it was started by `/compact`, it may already be true. Keep it true while work runs
+    // and guarantee reset on every exit path.
+    let _in_progress = InProgressFlagGuard::set_true(&state.compactor.compaction_in_progress);
 
     match run_compaction_cycle(state).await {
-        Ok(()) => {
+        Ok(CompactionCycleOutcome::Flushed | CompactionCycleOutcome::NoWork) => {
             state.compactor.record_success();
             tracing::info!("Compaction cycle completed successfully");
+        }
+        Ok(CompactionCycleOutcome::Deferred { pending_events }) => {
+            tracing::info!(
+                pending_events = pending_events,
+                "Compaction cycle deferred; pending events remain queued",
+            );
         }
         Err(e) => {
             state.compactor.record_failure();
@@ -786,23 +813,19 @@ async fn run_compaction_cycle_guarded(state: &Arc<ServiceState>) {
             tracing::error!(error = %e, "Compaction cycle failed");
         }
     }
-
-    state
-        .compactor
-        .compaction_in_progress
-        .store(false, Ordering::Release);
 }
 
 /// Runs a single compaction cycle.
-async fn run_compaction_cycle(state: &Arc<ServiceState>) -> Result<()> {
+async fn run_compaction_cycle(state: &Arc<ServiceState>) -> Result<CompactionCycleOutcome> {
     let mut consumer = state.notification_consumer.lock().await;
-    if consumer.pending_count() == 0 {
+    let pending_events = consumer.pending_count();
+    if pending_events == 0 {
         drop(consumer);
         run_auto_anti_entropy(state).await?;
-        return Ok(());
+        return Ok(CompactionCycleOutcome::NoWork);
     }
     if !consumer.should_flush() {
-        return Ok(());
+        return Ok(CompactionCycleOutcome::Deferred { pending_events });
     }
 
     let result = consumer.flush().await?;
@@ -820,7 +843,7 @@ async fn run_compaction_cycle(state: &Arc<ServiceState>) -> Result<()> {
         return Err(anyhow!("compaction cycle completed with errors"));
     }
 
-    Ok(())
+    Ok(CompactionCycleOutcome::Flushed)
 }
 
 async fn run_auto_anti_entropy(state: &Arc<ServiceState>) -> Result<()> {
@@ -866,7 +889,7 @@ mod tests {
     use super::*;
     use arco_core::storage::MemoryBackend;
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{Request, StatusCode, header};
     use tower::util::ServiceExt;
 
     fn test_state() -> Arc<ServiceState> {
@@ -1005,6 +1028,118 @@ mod tests {
             .expect("request failed");
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn test_internal_notify_requires_secret_when_configured() {
+        let state = test_state();
+        let router = build_router(state, Some("topsecret".to_string()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/notify")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"eventPaths":["ledger/executions/evt-1.json"],"flush":false}"#,
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_internal_notify_accepts_bearer_secret_when_configured() {
+        let state = test_state();
+        let router = build_router(state, Some("topsecret".to_string()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/notify")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("Authorization", "Bearer topsecret")
+                    .body(Body::from(
+                        r#"{"eventPaths":["ledger/executions/evt-1.json"],"flush":false}"#,
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_pending_without_flush_does_not_record_success() {
+        let state = test_state();
+        {
+            let mut consumer = state.notification_consumer.lock().await;
+            let should_flush = consumer.add_event(
+                EventNotification::from_path("ledger/executions/evt-1.json", "acme", "analytics")
+                    .expect("event path should parse"),
+            );
+            assert!(
+                !should_flush,
+                "single event should stay below flush threshold"
+            );
+            assert_eq!(consumer.pending_count(), 1);
+        }
+
+        run_compaction_cycle_guarded(&state).await;
+
+        assert_eq!(
+            state
+                .compactor
+                .successful_compactions
+                .load(Ordering::Acquire),
+            0,
+            "deferred cycle should not count as successful compaction",
+        );
+        let consumer = state.notification_consumer.lock().await;
+        assert_eq!(
+            consumer.pending_count(),
+            1,
+            "pending events should remain queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compaction_in_progress_resets_when_cycle_is_aborted() {
+        let state = test_state();
+        let _consumer_guard = state.notification_consumer.lock().await;
+
+        let state_for_task = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            run_compaction_cycle_guarded(&state_for_task).await;
+        });
+
+        let started = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state
+                    .compactor
+                    .compaction_in_progress
+                    .load(Ordering::Acquire)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(started.is_ok(), "cycle should set compaction_in_progress");
+
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            !state
+                .compactor
+                .compaction_in_progress
+                .load(Ordering::Acquire),
+            "aborted cycle must reset compaction_in_progress",
+        );
+    }
 }
 
 fn normalize_metrics_secret(secret: Option<String>) -> Option<String> {
@@ -1029,43 +1164,70 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
+fn has_valid_shared_secret(headers: &HeaderMap, secret: &str) -> bool {
+    let from_custom = headers
+        .get("X-Metrics-Secret")
+        .and_then(|value| value.to_str().ok());
+    let from_bearer = headers
+        .get("Authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let secret_bytes = secret.as_bytes();
+    let matches_custom =
+        from_custom.is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
+    let matches_bearer =
+        from_bearer.is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
+    matches_custom || matches_bearer
+}
+
 fn build_router(state: Arc<ServiceState>, metrics_secret: Option<String>) -> Router {
     // Build HTTP router
     // Note: /internal/anti-entropy is separate from /internal/sync-compact
     // because they have different IAM requirements:
     // - sync-compact: compactor-fastpath-sa (NO list)
     // - anti-entropy: compactor-antientropy-sa (WITH list)
-    let base_router = Router::new()
-        .route("/health", get(health))
-        .route("/ready", get(ready))
-        .route("/compact", post(compact))
+    let shared_secret = metrics_secret.map(Arc::<str>::from);
+
+    let mut internal_router = Router::new()
         .route("/internal/notify", post(notify_handler))
         .route("/internal/sync-compact", post(sync_compact_handler))
         .route("/internal/anti-entropy", post(anti_entropy_handler));
 
-    let router = if let Some(secret) = metrics_secret {
+    if let Some(secret) = shared_secret.as_ref() {
+        tracing::info!(
+            "Internal endpoints protected (accepts X-Metrics-Secret or Authorization: Bearer)"
+        );
+        let secret = Arc::clone(secret);
+        internal_router = internal_router.route_layer(middleware::from_fn(
+            move |request: Request<Body>, next: Next| {
+                let secret = Arc::clone(&secret);
+                async move {
+                    if has_valid_shared_secret(request.headers(), secret.as_ref()) {
+                        next.run(request).await
+                    } else {
+                        StatusCode::FORBIDDEN.into_response()
+                    }
+                }
+            },
+        ));
+    }
+
+    let base_router = Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/compact", post(compact))
+        .merge(internal_router);
+
+    let router = if let Some(secret) = shared_secret {
         tracing::info!(
             "Metrics endpoint protected (accepts X-Metrics-Secret or Authorization: Bearer)"
         );
-        let secret = Arc::<str>::from(secret);
         base_router.route(
             "/metrics",
-            get(move |headers: axum::http::HeaderMap| {
+            get(move |headers: HeaderMap| {
                 let secret = Arc::clone(&secret);
                 async move {
-                    let from_custom = headers
-                        .get("X-Metrics-Secret")
-                        .and_then(|v| v.to_str().ok());
-                    let from_bearer = headers
-                        .get("Authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.strip_prefix("Bearer "));
-                    let secret_bytes = secret.as_bytes();
-                    let matches_custom = from_custom
-                        .is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
-                    let matches_bearer = from_bearer
-                        .is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
-                    if matches_custom || matches_bearer {
+                    if has_valid_shared_secret(&headers, secret.as_ref()) {
                         metrics::serve_metrics().await.into_response()
                     } else {
                         StatusCode::FORBIDDEN.into_response()

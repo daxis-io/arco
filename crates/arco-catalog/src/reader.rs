@@ -928,9 +928,37 @@ impl CatalogReader {
             }
         }
 
+        self.mint_signed_urls_with_allowlist(paths, &allowed, capped_ttl)
+            .await
+    }
+
+    /// Mints signed URLs using a caller-provided allowlist.
+    ///
+    /// This is useful when the caller already fetched domain paths and wants to
+    /// avoid recomputing manifest-derived allowlists.
+    ///
+    /// # Arguments
+    ///
+    /// * `paths` - Paths to mint URLs for (must be in the provided allowlist)
+    /// * `allowlist` - Manifest-derived allowed paths
+    /// * `ttl` - Time-to-live for the signed URLs
+    ///
+    /// # Errors
+    ///
+    /// Returns `CatalogError::Validation` if any path is not in the allowlist.
+    /// Returns an error if URL signing fails.
+    pub async fn mint_signed_urls_with_allowlist(
+        &self,
+        paths: Vec<String>,
+        allowlist: &HashSet<String>,
+        ttl: Duration,
+    ) -> Result<Vec<SignedUrl>> {
+        // Cap TTL at 1 hour for security.
+        let capped_ttl = ttl.min(Duration::from_secs(3600));
+
         // Validate all requested paths are in allowlist
         for path in &paths {
-            if !allowed.contains(path) {
+            if !allowlist.contains(path) {
                 return Err(CatalogError::Validation {
                     message: format!("path not in manifest allowlist: {}", path),
                 });
@@ -1252,6 +1280,27 @@ mod tests {
             .await;
         // Should error because no manifest exists
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_mint_signed_urls_with_allowlist_avoids_manifest_recompute() {
+        let reader = setup();
+        let path = "state/catalog/snapshots/v1/tables.parquet".to_string();
+        let mut allowlist = HashSet::new();
+        allowlist.insert(path.clone());
+
+        let urls = reader
+            .mint_signed_urls_with_allowlist(
+                vec![path.clone()],
+                &allowlist,
+                Duration::from_secs(300),
+            )
+            .await
+            .expect("mint with precomputed allowlist");
+
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].path, path);
+        assert!(urls[0].url.contains("signature=mock"));
     }
 
     #[tokio::test]

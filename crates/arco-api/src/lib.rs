@@ -1,12 +1,12 @@
 //! # arco-api
 //!
-//! HTTP/gRPC composition layer for the Arco serverless lakehouse infrastructure.
+//! HTTP composition layer for the Arco serverless lakehouse infrastructure.
 //!
 //! This crate provides the API surface for Arco, handling:
 //!
 //! - **Authentication**: Tenant/workspace/user identity from JWTs (user claim defaults to `sub`,
 //!   configurable via `ARCO_JWT_USER_CLAIM`)
-//! - **Routing**: HTTP and gRPC endpoint configuration
+//! - **Routing**: HTTP endpoint configuration
 //! - **Service Wiring**: Composition of catalog and flow services
 //! - **Observability**: Metrics, tracing, and health checks
 //!
@@ -26,9 +26,8 @@
 //!   /api/v1/lineage              - Lineage edge APIs
 //!   /api/v1/browser/urls         - Signed URL minting for browser reads
 //!
-//! gRPC:
-//!   arco.v1.CatalogService - Catalog operations
-//!   arco.v1.FlowService    - Orchestration operations
+//! Note:
+//!   `grpc_port` is currently reserved for future use; this crate serves HTTP only.
 //! ```
 //!
 //! ## Example

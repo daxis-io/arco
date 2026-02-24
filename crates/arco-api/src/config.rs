@@ -167,6 +167,16 @@ pub struct Config {
     /// gRPC server port.
     pub grpc_port: u16,
 
+    /// Optional shared secret required to access `/metrics`.
+    ///
+    /// When set to a non-empty value, callers must provide either:
+    /// - `X-Metrics-Secret: <secret>`, or
+    /// - `Authorization: Bearer <secret>`
+    ///
+    /// Empty/whitespace values are treated as unset.
+    #[serde(default)]
+    pub metrics_secret: Option<String>,
+
     /// Enable debug mode.
     ///
     /// When enabled:
@@ -343,6 +353,7 @@ impl Default for Config {
         Self {
             http_port: 8080,
             grpc_port: 9090,
+            metrics_secret: None,
             debug: false,
             posture: Posture::Dev,
             cors: CorsConfig::default(),
@@ -483,6 +494,7 @@ impl Config {
     /// Supported env vars:
     /// - `ARCO_HTTP_PORT`
     /// - `ARCO_GRPC_PORT`
+    /// - `ARCO_METRICS_SECRET`
     /// - `ARCO_DEBUG`
     /// - `ARCO_ENVIRONMENT`
     /// - `ARCO_API_PUBLIC`
@@ -541,6 +553,7 @@ impl Config {
         if let Some(port) = env_u16("ARCO_GRPC_PORT")? {
             config.grpc_port = port;
         }
+        config.metrics_secret = env_string("ARCO_METRICS_SECRET");
         if let Some(debug) = env_bool("ARCO_DEBUG")? {
             config.debug = debug;
         }

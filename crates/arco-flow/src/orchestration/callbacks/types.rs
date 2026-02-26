@@ -449,9 +449,9 @@ mod tests {
                 row_count: Some(1000),
                 byte_size: Some(52428800),
                 output_path: Some("gs://bucket/path".to_string()),
-                delta_table: None,
-                delta_version: None,
-                delta_partition: None,
+                delta_table: Some("analytics.daily_orders".to_string()),
+                delta_version: Some(42),
+                delta_partition: Some("date=2025-01-15".to_string()),
             }),
             error: None,
             metrics: Some(TaskMetrics {
@@ -467,6 +467,15 @@ mod tests {
         let json = serde_json::to_string(&request).expect("serialize");
         assert!(json.contains("SUCCEEDED"));
         assert!(json.contains("materializationId"));
+        assert!(json.contains("deltaTable"));
+        assert!(json.contains("deltaVersion"));
+        assert!(json.contains("deltaPartition"));
+
+        let decoded: TaskCompletedRequest = serde_json::from_str(&json).expect("deserialize");
+        let output = decoded.output.expect("output");
+        assert_eq!(output.delta_table.as_deref(), Some("analytics.daily_orders"));
+        assert_eq!(output.delta_version, Some(42));
+        assert_eq!(output.delta_partition.as_deref(), Some("date=2025-01-15"));
     }
 
     #[test]

@@ -1214,10 +1214,10 @@ mod tests {
                 materialization_id: Some("mat-123".to_string()),
                 row_count: Some(1000),
                 byte_size: Some(1024),
-                output_path: None,
-                delta_table: None,
-                delta_version: None,
-                delta_partition: None,
+                output_path: Some("s3://analytics/daily_orders".to_string()),
+                delta_table: Some("analytics.daily_orders".to_string()),
+                delta_version: Some(42),
+                delta_partition: Some("date=2025-01-15".to_string()),
             }),
             error: None,
             metrics: None,
@@ -1243,12 +1243,28 @@ mod tests {
             asset_key,
             partition_key,
             code_version,
+            output,
             ..
         } = &events[0].data
         {
             assert_eq!(asset_key.as_deref(), Some("analytics.daily"));
             assert_eq!(partition_key.as_deref(), Some("2025-01-15"));
             assert_eq!(code_version.as_deref(), Some("v1.2.3"));
+            let output = output.as_ref().expect("output payload");
+            assert_eq!(
+                output.get("deltaTable").and_then(serde_json::Value::as_str),
+                Some("analytics.daily_orders")
+            );
+            assert_eq!(
+                output.get("deltaVersion").and_then(serde_json::Value::as_i64),
+                Some(42)
+            );
+            assert_eq!(
+                output
+                    .get("deltaPartition")
+                    .and_then(serde_json::Value::as_str),
+                Some("date=2025-01-15")
+            );
         } else {
             panic!("Expected TaskFinished event");
         }

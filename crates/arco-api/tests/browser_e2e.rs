@@ -437,7 +437,10 @@ mod signed_url_security {
         let error: ApiErrorResponse = response_json(response).await?;
         assert_eq!(error.code, "FORBIDDEN");
         assert!(
-            error.message.contains("Path traversal"),
+            error
+                .message
+                .to_ascii_lowercase()
+                .contains("path traversal"),
             "unexpected error message: {}",
             error.message
         );

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::Response;
 use axum::routing::post;
@@ -28,6 +28,7 @@ use datafusion::sql::TableReference;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use tower::limit::ConcurrencyLimitLayer;
 
 use arco_catalog::CatalogReader;
 use arco_core::CatalogDomain;
@@ -41,6 +42,9 @@ const JSON_CONTENT_TYPE: &str = "application/json";
 const MAX_QUERY_LENGTH: usize = 10_000;
 const MAX_QUERY_ROWS: usize = 10_000;
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_QUERY_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_QUERY_CONCURRENCY: usize = 8;
+const MAX_SNAPSHOT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Query request payload.
@@ -58,7 +62,10 @@ pub(crate) struct QueryParams {
 
 /// Creates query routes.
 pub fn routes() -> Router<Arc<AppState>> {
-    Router::new().route("/query", post(query))
+    Router::new()
+        .route("/query", post(query))
+        .layer(DefaultBodyLimit::max(MAX_QUERY_REQUEST_BYTES))
+        .layer(ConcurrencyLimitLayer::new(MAX_QUERY_CONCURRENCY))
 }
 
 /// Execute a SQL query against catalog snapshots.
@@ -258,6 +265,13 @@ async fn register_domain_tables(
             continue;
         };
 
+        let object_meta = storage
+            .head_raw(&path)
+            .await
+            .map_err(ApiError::from)?
+            .ok_or_else(|| ApiError::not_found(format!("snapshot file not found: {path}")))?;
+        ensure_snapshot_file_size(&path, object_meta.size)?;
+
         let bytes = storage.get_raw(&path).await.map_err(ApiError::from)?;
         let table = parquet_bytes_to_mem_table(bytes)?;
         session
@@ -343,11 +357,74 @@ fn ensure_response_size(len: usize) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn ensure_snapshot_file_size(path: &str, size: u64) -> Result<(), ApiError> {
+    if size > MAX_SNAPSHOT_FILE_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "snapshot file exceeds max size ({MAX_SNAPSHOT_FILE_BYTES} bytes): {path}",
+        )));
+    }
+    Ok(())
+}
+
 fn map_datafusion_error(err: &DataFusionError) -> ApiError {
     match err {
         DataFusionError::SQL(_, _)
         | DataFusionError::Plan(_)
         | DataFusionError::SchemaError(_, _) => ApiError::bad_request(err.to_string()),
         _ => ApiError::internal(format!("query failed: {err}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use tower::util::ServiceExt;
+
+    use crate::config::Config;
+    use crate::server::AppState;
+
+    #[tokio::test]
+    async fn query_route_rejects_oversized_payload() {
+        let mut config = Config::default();
+        config.debug = true;
+        let state = Arc::new(AppState::with_memory_storage(config));
+        let app = routes().with_state(state);
+
+        let sql = "x".repeat(70_000);
+        let body = serde_json::json!({ "sql": sql }).to_string();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-tenant-id", "acme")
+                    .header("x-workspace-id", "analytics")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn snapshot_file_size_limit_rejects_oversized_file() {
+        let err = ensure_snapshot_file_size(
+            "catalog/tables.parquet",
+            MAX_SNAPSHOT_FILE_BYTES.saturating_add(1),
+        )
+        .expect_err("oversized file should be rejected");
+        assert!(err.message().contains("snapshot file exceeds max size"));
+    }
+
+    #[test]
+    fn snapshot_file_size_limit_allows_boundary_size() {
+        ensure_snapshot_file_size("catalog/tables.parquet", MAX_SNAPSHOT_FILE_BYTES)
+            .expect("boundary size should be allowed");
     }
 }

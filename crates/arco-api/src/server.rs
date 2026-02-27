@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{FromRequestParts, State};
-use axum::http::{HeaderValue, Method, Request, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -436,7 +436,8 @@ fn api_error_to_unity_catalog_response(
 
 /// The Arco API server.
 ///
-/// Serves both HTTP and gRPC endpoints for catalog and orchestration.
+/// Serves HTTP endpoints for catalog and orchestration.
+/// `grpc_port` remains reserved for future gRPC listener wiring.
 pub struct Server {
     config: Config,
     storage: Arc<dyn arco_core::storage::StorageBackend>,
@@ -523,8 +524,23 @@ impl Server {
             crate::rate_limit::rate_limit_middleware,
         );
         let metrics_layer = middleware::from_fn(crate::metrics::metrics_middleware);
+        let metrics_secret = normalized_metrics_secret(state.config.metrics_secret.as_deref());
         let metrics_handler = if state.config.posture.is_public() {
             get(|| async { StatusCode::NOT_FOUND })
+        } else if let Some(secret) = metrics_secret {
+            tracing::info!(
+                "Metrics endpoint protected (accepts X-Metrics-Secret or Authorization: Bearer)"
+            );
+            get(move |headers: HeaderMap| {
+                let secret = Arc::clone(&secret);
+                async move {
+                    if has_valid_shared_secret(&headers, secret.as_ref()) {
+                        crate::metrics::serve_metrics().await.into_response()
+                    } else {
+                        StatusCode::FORBIDDEN.into_response()
+                    }
+                }
+            })
         } else {
             get(crate::metrics::serve_metrics)
         };
@@ -769,6 +785,10 @@ impl Server {
             grpc_port = self.config.grpc_port,
             "Starting Arco API server"
         );
+        tracing::warn!(
+            grpc_port = self.config.grpc_port,
+            "gRPC listener is not active in this binary; serving HTTP only"
+        );
 
         let listener =
             tokio::net::TcpListener::bind(addr)
@@ -778,6 +798,7 @@ impl Server {
                 })?;
 
         axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(|e| arco_core::Error::Internal {
                 message: format!("server error: {e}"),
@@ -924,6 +945,78 @@ impl Server {
 
         Ok(())
     }
+}
+
+fn normalized_metrics_secret(secret: Option<&str>) -> Option<Arc<str>> {
+    secret.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(Arc::<str>::from(trimmed))
+        }
+    })
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for i in 0..max_len {
+        let left_byte = *left.get(i).unwrap_or(&0);
+        let right_byte = *right.get(i).unwrap_or(&0);
+        diff |= (left_byte ^ right_byte) as usize;
+    }
+    diff == 0
+}
+
+fn has_valid_shared_secret(headers: &HeaderMap, secret: &str) -> bool {
+    let from_custom = headers
+        .get("X-Metrics-Secret")
+        .and_then(|value| value.to_str().ok());
+    let from_bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let secret_bytes = secret.as_bytes();
+    let matches_custom =
+        from_custom.is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
+    let matches_bearer =
+        from_bearer.is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
+    matches_custom || matches_bearer
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %err, "failed to install Ctrl+C signal handler");
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to install SIGTERM signal handler");
+                    ctrl_c.await;
+                    tracing::info!("Shutdown signal received");
+                    return;
+                }
+            };
+
+        tokio::select! {
+            _ = ctrl_c => {},
+            _ = terminate.recv() => {},
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
+    }
+
+    tracing::info!("Shutdown signal received");
 }
 
 /// Builder for constructing a server.
@@ -1241,6 +1334,86 @@ mod tests {
             .context("read response body")?;
         let ready: ReadyResponse = serde_json::from_slice(&body).context("parse JSON body")?;
         assert!(ready.ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_requires_secret_when_configured() -> Result<()> {
+        crate::metrics::init_metrics();
+
+        let mut builder = ServerBuilder::new();
+        builder.config.metrics_secret = Some("topsecret".to_string());
+        let server = builder.build();
+        let router = server.test_router();
+
+        let request = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_accepts_secret_when_configured() -> Result<()> {
+        crate::metrics::init_metrics();
+
+        let mut builder = ServerBuilder::new();
+        builder.config.metrics_secret = Some("topsecret".to_string());
+        let server = builder.build();
+        let router = server.test_router();
+
+        let request = Request::builder()
+            .uri("/metrics")
+            .header("X-Metrics-Secret", "topsecret")
+            .body(Body::empty())
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_accepts_bearer_secret_when_configured() -> Result<()> {
+        crate::metrics::init_metrics();
+
+        let mut builder = ServerBuilder::new();
+        builder.config.metrics_secret = Some("topsecret".to_string());
+        let server = builder.build();
+        let router = server.test_router();
+
+        let request = Request::builder()
+            .uri("/metrics")
+            .header(header::AUTHORIZATION, "Bearer topsecret")
+            .body(Body::empty())
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint_hidden_in_public_posture() -> Result<()> {
+        crate::metrics::init_metrics();
+
+        let mut builder = ServerBuilder::new();
+        builder.config.posture = Posture::Public;
+        builder.config.metrics_secret = Some("topsecret".to_string());
+        let server = builder.build();
+        let router = server.test_router();
+
+        let request = Request::builder()
+            .uri("/metrics")
+            .header("X-Metrics-Secret", "topsecret")
+            .body(Body::empty())
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         Ok(())
     }
 

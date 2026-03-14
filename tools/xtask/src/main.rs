@@ -30,7 +30,6 @@ mod versions {
     pub const CARGO_DENY_MIN: &str = "0.18.9";
     pub const BUF_VERSION: &str = "1.47.2";
 }
-
 #[derive(Parser)]
 #[command(name = "xtask", about = "Arco workspace automation")]
 struct Cli {
@@ -2291,5 +2290,4 @@ mod tests {
             "expected removed release evidence tree to be blocked"
         );
     }
-
 }

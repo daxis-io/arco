@@ -2,10 +2,10 @@
 
 ## Execution Metadata
 - Timestamp (UTC): `2026-02-21T13:56:49Z`
-- Branch: `codex/q3-orchestration-leadership-layer`
+- Branch: `q3-orchestration-leadership-layer`
 - Tested commit (exact): `19b4ebe5a7c372b64d25c8bf25620f3f4b18f5d2`
 - Sync status before verification: merged `origin/main` (`abbfa70`) into branch
-- Workspace state during run: `clean for tracked files` (only untracked `.claude/` present)
+- Workspace state during run: `clean for tracked files` (only untracked local tooling config present)
 
 ## Commands And Results
 1. `cargo test -p arco-api --all-features --test orchestration_parity_gates_m1` -> PASS (`14 passed; 0 failed`)

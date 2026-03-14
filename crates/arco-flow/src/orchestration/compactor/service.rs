@@ -181,8 +181,9 @@ impl MicroCompactor {
         let (manifest, _, _) = self.read_manifest_with_version().await?;
         let event_paths = rebuild_manifest
             .event_paths_after_watermark(&manifest.watermarks)
-            .map_err(Error::configuration)?;
-        self.compact_events_with_epoch(event_paths, expected_epoch).await
+            .map_err(|message| Error::Core(arco_core::Error::InvalidInput(message)))?;
+        self.compact_events_with_epoch(event_paths, expected_epoch)
+            .await
     }
 
     /// Rebuilds orchestration projection state from a stored rebuild manifest JSON.
@@ -197,10 +198,10 @@ impl MicroCompactor {
     ) -> Result<CompactionResult> {
         let bytes = self.storage.get_raw(rebuild_manifest_path).await?;
         let rebuild_manifest: LedgerRebuildManifest =
-            serde_json::from_slice(&bytes).map_err(|e| Error::Serialization {
-                message: format!(
+            serde_json::from_slice(&bytes).map_err(|e| {
+                Error::Core(arco_core::Error::InvalidInput(format!(
                     "failed to parse ledger rebuild manifest at {rebuild_manifest_path}: {e}"
-                ),
+                )))
             })?;
         self.rebuild_from_ledger_manifest(rebuild_manifest, expected_epoch)
             .await

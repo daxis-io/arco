@@ -1434,9 +1434,11 @@ mod orchestration {
             "outcome": "SUCCEEDED",
             "completedAt": Utc::now().to_rfc3339(),
             "output": {
-                "materializationId": "mat-123",
+                "materializationId": "mat-arco-flow-001",
+                "rowCount": 42,
+                "byteSize": 1024,
                 "deltaTable": "analytics.users",
-                "deltaVersion": 7,
+                "deltaVersion": 17,
                 "deltaPartition": "date=2025-01-15"
             }
         });
@@ -1459,8 +1461,11 @@ mod orchestration {
             .find(|task| task.task_key == task_key)
             .context("expected completed task")?;
         assert_eq!(finished_task.state, "SUCCEEDED");
-        assert_eq!(finished_task.delta_table.as_deref(), Some("analytics.users"));
-        assert_eq!(finished_task.delta_version, Some(7));
+        assert_eq!(
+            finished_task.delta_table.as_deref(),
+            Some("analytics.users")
+        );
+        assert_eq!(finished_task.delta_version, Some(17));
         assert_eq!(
             finished_task.delta_partition.as_deref(),
             Some("date=2025-01-15")
@@ -1469,7 +1474,7 @@ mod orchestration {
             finished_task
                 .execution_lineage_ref
                 .as_ref()
-                .is_some_and(|lineage| !lineage.is_empty())
+                .is_some_and(|value| !value.is_empty())
         );
 
         let (status, logs_text) = helpers::get_text(

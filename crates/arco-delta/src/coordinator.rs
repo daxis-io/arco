@@ -484,7 +484,11 @@ impl DeltaCommitCoordinator {
         ))
     }
 
-    async fn finalize_replayed_commit(&self, commit_id: &str, committed_version: i64) -> Result<()> {
+    async fn finalize_replayed_commit(
+        &self,
+        commit_id: &str,
+        committed_version: i64,
+    ) -> Result<()> {
         for _ in 0..self.config.max_cas_retries {
             let (state, version) = self.load_state().await?;
             let Some(version) = version else {

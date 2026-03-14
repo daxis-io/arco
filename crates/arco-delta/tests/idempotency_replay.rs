@@ -225,10 +225,14 @@ async fn crash_after_delta_log_write_before_idempotency_replays_same_version_and
         .await
         .expect("retry should replay committed response");
     assert_eq!(replay.version, 0);
-    assert_eq!(
-        replay.delta_log_path,
-        delta_log_relative_path(table_id, 0)
-    );
+    assert_eq!(replay.delta_log_path, delta_log_relative_path(table_id, 0));
+
+    let replay_again = coordinator
+        .commit(request, Utc::now())
+        .await
+        .expect("repeat replay should remain stable");
+    assert_eq!(replay_again.version, replay.version);
+    assert_eq!(replay_again.delta_log_path, replay.delta_log_path);
 
     let replay_again = coordinator
         .commit(request, Utc::now())

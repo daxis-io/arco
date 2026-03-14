@@ -233,9 +233,8 @@ pub fn select_rebuild_event_paths(
     let mut dedup = BTreeMap::<String, String>::new();
 
     for path in event_paths {
-        let event_id = event_id_from_ledger_path(path).ok_or_else(|| {
-            format!("invalid orchestration ledger path for rebuild: '{path}'")
-        })?;
+        let event_id = event_id_from_ledger_path(path)
+            .ok_or_else(|| format!("invalid orchestration ledger path for rebuild: '{path}'"))?;
 
         if floor.is_some_and(|floor| event_id <= floor) {
             continue;
@@ -653,7 +652,9 @@ mod tests {
             last_committed_event_id: Some("01J1DR0003".to_string()),
             last_visible_event_id: Some("01J1DR0002".to_string()),
             events_processed_through: Some("01J1DR0002".to_string()),
-            last_processed_file: Some("ledger/orchestration/2026-02-21/01J1DR0002.json".to_string()),
+            last_processed_file: Some(
+                "ledger/orchestration/2026-02-21/01J1DR0002.json".to_string(),
+            ),
             last_processed_at: Utc::now(),
         };
 
@@ -677,7 +678,9 @@ mod tests {
             last_committed_event_id: Some("01J1DR0001".to_string()),
             last_visible_event_id: Some("01J1DR0001".to_string()),
             events_processed_through: Some("01J1DR0001".to_string()),
-            last_processed_file: Some("ledger/orchestration/2026-02-21/01J1DR0001.json".to_string()),
+            last_processed_file: Some(
+                "ledger/orchestration/2026-02-21/01J1DR0001.json".to_string(),
+            ),
             last_processed_at: Utc::now() - Duration::minutes(45),
         };
 

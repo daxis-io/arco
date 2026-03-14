@@ -119,12 +119,37 @@ fn json_i64_field(value: &Value, keys: &[&str]) -> Option<i64> {
 /// Expected form: `ledger/orchestration/<date>/<event_id>.json`.
 #[must_use]
 pub fn event_id_from_ledger_path(path: &str) -> Option<&str> {
-    let filename = path.rsplit('/').next()?;
+    let mut parts = path.split('/');
+    if parts.next()? != "ledger" || parts.next()? != "orchestration" {
+        return None;
+    }
+
+    let date_segment = parts.next()?;
+    if !is_iso8601_date_segment(date_segment) {
+        return None;
+    }
+
+    let filename = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
     let event_id = filename.strip_suffix(".json")?;
     if event_id.is_empty() {
         return None;
     }
     Some(event_id)
+}
+
+fn is_iso8601_date_segment(segment: &str) -> bool {
+    if segment.len() != 10 {
+        return false;
+    }
+
+    segment.bytes().enumerate().all(|(idx, byte)| match idx {
+        4 | 7 => byte == b'-',
+        _ => byte.is_ascii_digit(),
+    })
 }
 
 /// Dependency edge resolution.
@@ -1781,11 +1806,12 @@ impl FoldState {
                 let lineage_ref =
                     Self::build_execution_lineage_ref(run_id, task_key, attempt, &metadata);
 
-                task.materialization_id = metadata.materialization_id.clone();
-                task.delta_table = metadata.delta_table.clone();
+                task.materialization_id
+                    .clone_from(&metadata.materialization_id);
+                task.delta_table.clone_from(&metadata.delta_table);
                 task.delta_version = metadata.delta_version;
-                task.delta_partition = metadata.delta_partition.clone();
-                task.execution_lineage_ref = Some(lineage_ref.clone());
+                task.delta_partition.clone_from(&metadata.delta_partition);
+                task.execution_lineage_ref = Some(lineage_ref);
             }
 
             // Update run counters
@@ -2724,16 +2750,15 @@ impl FoldState {
             delta_partition: metadata.delta_partition.as_deref(),
         };
 
-        match serde_json::to_string(&ref_payload) {
-            Ok(payload) => payload,
-            Err(_) => format!(
+        serde_json::to_string(&ref_payload).unwrap_or_else(|_| {
+            format!(
                 "run={run_id};task={task_key};attempt={attempt};delta_version={};delta_partition={}",
                 metadata
                     .delta_version
                     .map_or_else(|| "null".to_string(), |v| v.to_string()),
                 metadata.delta_partition.as_deref().unwrap_or("null")
-            ),
-        }
+            )
+        })
     }
 
     /// Update partition materialization status on successful task completion.
@@ -5644,6 +5669,18 @@ mod tests {
         );
         assert_eq!(
             event_id_from_ledger_path("ledger/orchestration/2026-02-21/event.txt"),
+            None
+        );
+        assert_eq!(
+            event_id_from_ledger_path("state/orchestration/rebuilds/event.json"),
+            None
+        );
+        assert_eq!(
+            event_id_from_ledger_path("ledger/orchestration/not-a-date/event.json"),
+            None
+        );
+        assert_eq!(
+            event_id_from_ledger_path("ledger/orchestration/2026-02-21/subdir/event.json"),
             None
         );
     }

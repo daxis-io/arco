@@ -1,49 +1,38 @@
-# Orchestration End-to-End Recovery (M1-M3)
+# Orchestration End-to-End Recovery (M1-M3) Implementation Plan
 
-Date: 2026-02-21
-Branch: `codex/orchestration-e2e-recovery`
+> Execute this plan task-by-task in order, validating each step before proceeding.
 
-## Goal
-Restore orchestration end-to-end reliability by repairing callback-path schema drift and hardening callback lineage regression coverage across:
-- `arco-integration-tests` external worker callback E2E
-- `arco-flow` callback contracts and handlers
-- `arco-api` callback route mapping and run-read surfaces
+**Goal:** Restore orchestration end-to-end reliability by fixing the callback-path break and hardening M1/M2/M3 callback-lineage regressions to PR-ready quality.
 
-## Executed Tasks
-- [x] Task 1: Reproduced failing seam and confirmed surrounding orchestration suites healthy.
-- [x] Task 2: Fixed `TaskOutput` initializer break in external worker E2E and asserted delta lineage propagation.
-- [x] Task 3: Hardened callback type/handler tests for delta lineage serialization and `TaskFinished` output propagation.
-- [x] Task 4: Hardened API callback request parsing, output mapping, and HTTP integration assertions for delta lineage and execution lineage ref.
-- [x] Task 5: Ran full acceptance matrix for M1/M2/M3 and API orchestration suites.
+**Architecture:** Keep the current append-first event architecture intact while repairing the failing integration seam where `TaskOutput` evolved. Harden coverage at the callback type/handler boundary, API callback mapping boundary, and callback-to-run-read end-to-end boundary.
 
-## Code Changes
-- `crates/arco-integration-tests/tests/orchestration_external_worker_e2e.rs`
-  - Added `delta_table`, `delta_version`, `delta_partition` in `TaskOutput`.
-  - Added compacted final-task assertions for those fields.
-- `crates/arco-flow/src/orchestration/callbacks/types.rs`
-  - Extended success callback type test to serialize + deserialize delta lineage fields.
-- `crates/arco-flow/src/orchestration/callbacks/handlers.rs`
-  - Extended success handler test to assert `TaskFinished.output` contains delta lineage fields.
-- `crates/arco-api/src/routes/tasks.rs`
-  - Extended completed request deserialization test for `deltaTable`, `deltaVersion`, `deltaPartition`.
-  - Added `TaskOutput -> FlowTaskOutput` mapping test asserting delta field passthrough.
-- `crates/arco-api/tests/api_integration.rs`
-  - Extended callback completion payload with delta lineage output.
-  - Added run-read assertions for `delta_table`, `delta_version`, `delta_partition`, and non-empty `execution_lineage_ref`.
+**Tech Stack:** Rust (`cargo test`), Axum routes, `serde` JSON contracts, `arco-flow` compactor/callback modules, `arco-api` integration tests.
 
-## Verification
-Final acceptance matrix (all passed):
+---
 
-1. `cargo test -p arco-integration-tests --test orchestration_external_worker_e2e`
-2. `cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m1`
-3. `cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m2`
-4. `cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m3`
-5. `cargo test -p arco-flow --features test-utils --test orchestration_schedule_e2e_tests`
-6. `cargo test -p arco-flow --features test-utils --test orchestration_sensor_e2e_tests`
-7. `cargo test -p arco-api --all-features --test api_integration`
-8. `cargo test -p arco-api --all-features --test orchestration_schedule_e2e_tests`
-9. `cargo test -p arco-api --all-features --test orchestration_api_tests`
+## Scope
 
-## Notes
-- During verification, a `No space left on device` failure occurred while building `libduckdb-sys` in the worktree-local `target/`.
-- Recovery was done with `cargo clean` in the worktree and by reusing `CARGO_TARGET_DIR=/Users/ethanurbanski/arco/target` for the acceptance runs.
+- Fix compile break in `orchestration_external_worker_e2e` caused by missing Delta fields in `TaskOutput` initializer.
+- Add lineage assertions so callback output metadata survives compaction.
+- Add callback contract tests ensuring Delta output fields serialize/deserialize and map through API conversion.
+- Extend API integration callback path assertions to confirm run-read surfaces include lineage metadata.
+- Re-run M1/M2/M3 verification matrix.
+
+## Verification Matrix
+
+- `cargo test -p arco-integration-tests --test orchestration_external_worker_e2e`
+- `cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m1`
+- `cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m2`
+- `cargo test -p arco-flow --features test-utils --test orchestration_parity_gates_m3`
+- `cargo test -p arco-flow --features test-utils --test orchestration_schedule_e2e_tests`
+- `cargo test -p arco-flow --features test-utils --test orchestration_sensor_e2e_tests`
+- `cargo test -p arco-api --all-features --test api_integration test_arco_flow_deploy_run_callbacks_and_logs`
+- `cargo test -p arco-api --all-features --test orchestration_schedule_e2e_tests`
+- `cargo test -p arco-api --all-features --test orchestration_api_tests`
+
+## Acceptance Criteria
+
+- No compile errors in orchestration external worker E2E tests.
+- Callback success payload can carry Delta lineage fields (`deltaTable`, `deltaVersion`, `deltaPartition`).
+- Callback lineage metadata appears on compacted task state and API run-read response.
+- Existing M2/M3 parity coverage remains green.

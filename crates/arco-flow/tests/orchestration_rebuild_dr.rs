@@ -14,7 +14,7 @@ use arco_core::ScopedStorage;
 use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
 };
-use arco_flow::error::Result;
+use arco_flow::error::{Error as FlowError, Result};
 use arco_flow::orchestration::compactor::{
     LedgerRebuildManifest, MicroCompactor, OrchestrationManifest, OrchestrationManifestPointer,
 };
@@ -311,4 +311,53 @@ async fn rebuild_remains_correct_with_stale_watermark_and_without_ledger_listing
     );
 
     Ok(())
+}
+
+#[tokio::test]
+async fn rebuild_rejects_invalid_event_paths_as_invalid_input() {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, TENANT, WORKSPACE).expect("scoped storage");
+    let compactor = MicroCompactor::new(storage);
+
+    let error = compactor
+        .rebuild_from_ledger_manifest(
+            LedgerRebuildManifest {
+                event_paths: vec!["ledger/orchestration/2026-02-21/".to_string()],
+            },
+            None,
+        )
+        .await
+        .expect_err("invalid event path must be rejected");
+
+    assert!(matches!(
+        error,
+        FlowError::Core(arco_core::Error::InvalidInput(_))
+    ));
+}
+
+#[tokio::test]
+async fn rebuild_manifest_parse_error_is_invalid_input() {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, TENANT, WORKSPACE).expect("scoped storage");
+    let compactor = MicroCompactor::new(storage.clone());
+
+    let rebuild_manifest_path = "state/orchestration/rebuilds/invalid-manifest.json";
+    storage
+        .put_raw(
+            rebuild_manifest_path,
+            Bytes::from_static(br#"{"event_paths":"not-an-array"}"#),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("write malformed rebuild manifest");
+
+    let error = compactor
+        .rebuild_from_ledger_manifest_path(rebuild_manifest_path, None)
+        .await
+        .expect_err("invalid manifest payload must be rejected");
+
+    assert!(matches!(
+        error,
+        FlowError::Core(arco_core::Error::InvalidInput(_))
+    ));
 }

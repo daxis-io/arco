@@ -370,7 +370,7 @@ async fn run_dispatch_callback_path_advances_task_state() {
                 row_count: Some(10),
                 byte_size: Some(100),
                 output_path: Some("s3://bucket/path".to_string()),
-                delta_table: Some("analytics.daily_orders".to_string()),
+                delta_table: Some("analytics.extract".to_string()),
                 delta_version: Some(42),
                 delta_partition: Some("date=2025-01-15".to_string()),
             }),
@@ -391,10 +391,7 @@ async fn run_dispatch_callback_path_advances_task_state() {
         .find(|row| row.task_key == task_key)
         .expect("task row");
     assert_eq!(task.state, FoldTaskState::Succeeded);
-    assert_eq!(
-        task.delta_table.as_deref(),
-        Some("analytics.daily_orders")
-    );
+    assert_eq!(task.delta_table.as_deref(), Some("analytics.extract"));
     assert_eq!(task.delta_version, Some(42));
     assert_eq!(task.delta_partition.as_deref(), Some("date=2025-01-15"));
 

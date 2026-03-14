@@ -518,6 +518,7 @@ pub fn write_runs(rows: &[RunRow]) -> Result<Bytes> {
 /// # Errors
 ///
 /// Returns an error if Parquet serialization fails.
+#[allow(clippy::too_many_lines)]
 pub fn write_tasks(rows: &[TaskRow]) -> Result<Bytes> {
     let schema = tasks_schema();
 
@@ -1148,6 +1149,7 @@ pub(super) fn write_run_key_conflicts(rows: &[RunKeyConflictRow]) -> Result<Byte
 /// # Errors
 ///
 /// Returns an error if Parquet serialization fails.
+#[allow(clippy::too_many_lines)]
 pub fn write_partition_status(rows: &[PartitionStatusRow]) -> Result<Bytes> {
     let schema = partition_status_schema();
 
@@ -1944,6 +1946,7 @@ pub fn read_runs(bytes: &Bytes) -> Result<Vec<RunRow>> {
 /// # Errors
 ///
 /// Returns an error if Parquet decoding fails or required columns are missing.
+#[allow(clippy::too_many_lines)]
 pub fn read_tasks(bytes: &Bytes) -> Result<Vec<TaskRow>> {
     let mut out = Vec::new();
     for batch in read_batches(bytes)? {
@@ -3176,7 +3179,10 @@ mod tests {
         assert_eq!(parsed[0].partition_key, "2025-01-15");
         assert_eq!(parsed[0].last_attempt_outcome, Some(TaskOutcome::Failed));
         assert_eq!(parsed[0].delta_version, Some(42));
-        assert_eq!(parsed[0].delta_partition.as_deref(), Some("date=2025-01-15"));
+        assert_eq!(
+            parsed[0].delta_partition.as_deref(),
+            Some("date=2025-01-15")
+        );
         assert_eq!(
             parsed[0].partition_values.get("date").map(String::as_str),
             Some("2025-01-15")
@@ -3319,7 +3325,10 @@ mod tests {
         assert_eq!(parsed[0].state, TaskState::Ready);
         assert_eq!(parsed[0].asset_key.as_deref(), Some("analytics.extract"));
         assert_eq!(parsed[0].delta_version, Some(9));
-        assert_eq!(parsed[0].delta_partition.as_deref(), Some("date=2025-01-15"));
+        assert_eq!(
+            parsed[0].delta_partition.as_deref(),
+            Some("date=2025-01-15")
+        );
         assert!(parsed[0].started_at.is_some());
     }
 

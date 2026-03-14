@@ -145,7 +145,7 @@ jobs:
           toolchain: 1.85
 
       - name: Install cargo-sbom
-        uses: taiki-e/install-action@cede0bb282aae847dfa8aacca3a41c86d973d4d7 # v2
+        uses: taiki-e/install-action@a37010ded18ff788be4440302bd6830b1ae50d8b # v2
         with:
           tool: cargo-sbom@0.10.0
 
@@ -160,7 +160,7 @@ jobs:
           sha256sum "${SBOM_SPDX_FILE}" "${SBOM_CYCLONEDX_FILE}" > "${SBOM_SHA256_FILE}"
 
       - name: Upload release SBOM artifact pack (retained)
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: release-sbom-${{ env.RELEASE_TAG }}
           retention-days: ${{ env.SBOM_RETENTION_DAYS }}
@@ -173,7 +173,7 @@ jobs:
             arco-${{ env.RELEASE_TAG }}.tag-verify.txt
 
       - name: Publish build provenance attestation for SBOM artifacts
-        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: |
             ${{ env.SBOM_SPDX_FILE }}
@@ -201,7 +201,7 @@ jobs:
           tar -C "$(dirname "${PACK_DIR}")" -czf "${EVIDENCE_ARCHIVE}" "$(basename "${PACK_DIR}")"
 
       - name: Upload release evidence pack artifact (retained)
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: release-evidence-${{ env.RELEASE_TAG }}
           retention-days: ${{ env.SBOM_RETENTION_DAYS }}

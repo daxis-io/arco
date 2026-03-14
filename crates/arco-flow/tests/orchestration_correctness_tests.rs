@@ -310,6 +310,11 @@ fn test_anti_entropy_recovers_orphaned_tasks() -> Result<()> {
         ready_at: Some(now - Duration::minutes(10)),
         asset_key: None,
         partition_key: None,
+        materialization_id: None,
+        delta_table: None,
+        delta_version: None,
+        delta_partition: None,
+        execution_lineage_ref: None,
         row_version: "01HQ123EVT".to_string(),
     };
 

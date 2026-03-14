@@ -2,7 +2,7 @@
 
 **Purpose:** Verify that GCP conditional IAM correctly constrains `storage.objects.list` to prefix-scoped results.
 
-**Related Evidence:** `docs/catalog-metastore/evidence/security-ops-evidence-pack.md` section A.1
+**Evidence Policy:** `docs/guide/src/reference/evidence-policy.md`
 
 ---
 
@@ -106,7 +106,7 @@ echo "  - If ledger/ lists successfully and commits/state/ fail: IAM is working 
 echo "  - If all prefixes list successfully: Conditional IAM does NOT constrain list results"
 echo "  - If all prefixes fail: Condition may be too restrictive"
 echo ""
-echo "Document results in release evidence."
+echo "Attach results to CI artifacts or release assets."
 ```
 
 ---
@@ -126,7 +126,7 @@ ERROR: ... does not have storage.objects.list access ...
 ERROR: ... does not have storage.objects.list access ...
 ```
 
-**Action**: Document in evidence pack; no changes needed.
+**Action**: Attach verification output to CI artifacts or release assets; no code changes needed.
 
 ### Scenario B: Conditional IAM Does NOT Constrain List
 
@@ -182,7 +182,7 @@ iam-list-semantics:
 
 ## Evidence Capture Template
 
-After running verification, update `docs/catalog-metastore/evidence/security-ops-evidence-pack.md` section A.1:
+After running verification, record results in CI artifacts or release notes using:
 
 ```markdown
 **IAM list semantics verification (P0-6):**

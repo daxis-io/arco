@@ -226,6 +226,10 @@ mod tests {
             stale_since: None,
             stale_reason_code: None,
             partition_values: HashMap::new(),
+            delta_table: None,
+            delta_version: None,
+            delta_partition: None,
+            execution_lineage_ref: None,
             row_version: "v1".into(),
         }
     }

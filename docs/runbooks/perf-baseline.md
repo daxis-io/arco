@@ -18,7 +18,7 @@ Define and capture baseline performance for catalog lookup and query endpoints b
 4. Record P50/P95 latency and throughput.
 
 ## Evidence to capture
-- Benchmark logs under `release_evidence/.../ci-logs/`
+- Benchmark logs attached to CI artifacts or release assets
 - Load test output and error rates
 - Grafana dashboard snapshot for latency/CPU/memory
 

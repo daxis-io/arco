@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::http::header::HeaderName;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
+use serde_json::Value;
 use utoipa::ToSchema;
 
 use arco_catalog::CatalogError;
@@ -28,6 +29,9 @@ pub struct ApiErrorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Optional request ID for correlation.
     pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional structured diagnostics payload.
+    pub details: Option<Value>,
 }
 
 /// HTTP API error with stable machine-readable code.
@@ -38,6 +42,7 @@ pub struct ApiError {
     message: String,
     error: Option<&'static str>,
     request_id: Option<String>,
+    details: Option<Value>,
     retry_after_secs: Option<u64>,
 }
 
@@ -197,8 +202,16 @@ impl ApiError {
             message: message.into(),
             error,
             request_id: None,
+            details: None,
             retry_after_secs: None,
         }
+    }
+
+    /// Attaches structured diagnostics payload to the error body.
+    #[must_use]
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
     }
 
     /// Attaches a Retry-After header value in seconds.
@@ -218,6 +231,7 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let request_id = self.request_id;
+        let details = self.details;
         let retry_after_secs = self.retry_after_secs;
         let mut response = (
             self.status,
@@ -226,6 +240,7 @@ impl IntoResponse for ApiError {
                 message: self.message,
                 error: self.error.map(str::to_string),
                 request_id: request_id.clone(),
+                details,
             }),
         )
             .into_response();

@@ -20,6 +20,8 @@ use arco_core::{InternalOidcConfig, InternalOidcError, InternalOidcVerifier, Sco
 use arco_flow::error::{Error, Result};
 use arco_flow::orchestration::compactor::{CompactionResult, MicroCompactor};
 
+const REBUILD_MANIFEST_PREFIX: &str = "state/orchestration/rebuilds/";
+
 #[derive(Clone)]
 struct AppState {
     compactor: MicroCompactor,
@@ -34,6 +36,13 @@ struct InternalAuthState {
 #[derive(Debug, Deserialize)]
 struct CompactRequest {
     event_paths: Vec<String>,
+    #[serde(default)]
+    epoch: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RebuildRequest {
+    rebuild_manifest_path: String,
     #[serde(default)]
     epoch: Option<u64>,
 }
@@ -69,6 +78,9 @@ impl From<Error> for ApiError {
                 | arco_core::Error::InvalidId { .. }
                 | arco_core::Error::Validation { .. },
             ) => StatusCode::BAD_REQUEST,
+            Error::Core(
+                arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. },
+            ) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
@@ -116,8 +128,47 @@ async fn compact_handler(
     }))
 }
 
+async fn rebuild_handler(
+    State(state): State<AppState>,
+    Json(request): Json<RebuildRequest>,
+) -> std::result::Result<Json<CompactResponse>, ApiError> {
+    if !is_valid_rebuild_manifest_path(&request.rebuild_manifest_path) {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!(
+                "invalid rebuild_manifest_path: expected '{REBUILD_MANIFEST_PREFIX}*.json'"
+            ),
+        });
+    }
+
+    let CompactionResult {
+        events_processed,
+        delta_id,
+        manifest_revision,
+        visibility_status,
+    } = state
+        .compactor
+        .rebuild_from_ledger_manifest_path(&request.rebuild_manifest_path, request.epoch)
+        .await?;
+
+    Ok(Json(CompactResponse {
+        events_processed,
+        delta_id,
+        manifest_revision,
+        visibility_status: visibility_status.as_str().to_string(),
+    }))
+}
+
 fn required_env(key: &str) -> Result<String> {
     std::env::var(key).map_err(|_| Error::configuration(format!("missing {key}")))
+}
+
+fn is_valid_rebuild_manifest_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.starts_with(REBUILD_MANIFEST_PREFIX)
+        && std::path::Path::new(path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
 }
 
 fn resolve_port() -> Result<u16> {
@@ -247,6 +298,48 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_request_requires_manifest_path() {
+        let raw = r#"{"rebuild_manifest_path":"state/orchestration/rebuilds/rebuild-01.json"}"#;
+        let parsed: RebuildRequest = serde_json::from_str(raw).expect("valid rebuild request");
+        assert_eq!(
+            parsed.rebuild_manifest_path,
+            "state/orchestration/rebuilds/rebuild-01.json"
+        );
+        assert_eq!(parsed.epoch, None);
+    }
+
+    #[test]
+    fn rebuild_request_accepts_epoch_payload() {
+        let raw = r#"{
+            "rebuild_manifest_path":"state/orchestration/rebuilds/rebuild-01.json",
+            "epoch":9
+        }"#;
+        let parsed: RebuildRequest = serde_json::from_str(raw).expect("valid epoch request");
+        assert_eq!(parsed.epoch, Some(9));
+    }
+
+    #[test]
+    fn rebuild_manifest_path_validator_accepts_expected_path() {
+        assert!(is_valid_rebuild_manifest_path(
+            "state/orchestration/rebuilds/rebuild-01.json"
+        ));
+    }
+
+    #[test]
+    fn rebuild_manifest_path_validator_rejects_invalid_paths() {
+        assert!(!is_valid_rebuild_manifest_path(""));
+        assert!(!is_valid_rebuild_manifest_path(
+            "state/orchestration/manifest.pointer.json"
+        ));
+        assert!(!is_valid_rebuild_manifest_path(
+            "state/orchestration/rebuilds/"
+        ));
+        assert!(!is_valid_rebuild_manifest_path(
+            "state/orchestration/rebuilds/rebuild-01"
+        ));
+    }
+
+    #[test]
     fn api_error_maps_core_precondition_to_conflict() {
         let error = Error::Core(CoreError::PreconditionFailed {
             message: "manifest publish failed - concurrent write".to_string(),
@@ -260,6 +353,13 @@ mod tests {
         let error = Error::Core(CoreError::InvalidInput("invalid lock_path".to_string()));
         let api_error = ApiError::from(error);
         assert_eq!(api_error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn api_error_maps_core_not_found_to_not_found() {
+        let error = Error::Core(CoreError::NotFound("missing object".to_string()));
+        let api_error = ApiError::from(error);
+        assert_eq!(api_error.status, StatusCode::NOT_FOUND);
     }
 }
 
@@ -282,10 +382,19 @@ async fn main() -> Result<()> {
         compactor: MicroCompactor::with_tenant_secret(storage, tenant_secret),
     };
 
-    let compact_route = internal_auth.map_or_else(
+    let compact_route = internal_auth.clone().map_or_else(
         || post(compact_handler),
         |auth| {
             post(compact_handler).route_layer(middleware::from_fn_with_state(
+                auth,
+                internal_auth_middleware,
+            ))
+        },
+    );
+    let rebuild_route = internal_auth.map_or_else(
+        || post(rebuild_handler),
+        |auth| {
+            post(rebuild_handler).route_layer(middleware::from_fn_with_state(
                 auth,
                 internal_auth_middleware,
             ))
@@ -295,6 +404,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/compact", compact_route)
+        .route("/rebuild", rebuild_route)
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

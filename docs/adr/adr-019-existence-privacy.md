@@ -194,5 +194,6 @@ Focus on core functionality. All users with workspace access see all assets.
 
 ## References
 
-- Gate 5 Hardening Plan: `docs/plans/2025-12-18-gate5-hardening.md`
-- Unified Platform Design (Jan 12, 2025)
+- `docs/adr/adr-005-storage-layout.md`
+- `docs/adr/adr-018-tier1-write-path.md`
+- `docs/guide/src/concepts/catalog.md`

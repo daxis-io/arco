@@ -1,7 +1,0 @@
-error: unexpected argument '--manifest-path' found
-
-  tip: a similar argument exists: '--feature-depth'
-
-Usage: cargo-deny check --feature-depth <FEATURE_DEPTH> [WHICH]...
-
-For more information, try '--help'.

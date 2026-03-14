@@ -1,3 +1,0 @@
-# command: cargo deny check advisories
-# start_utc: 2026-02-15T18:23:38Z
-advisories ok

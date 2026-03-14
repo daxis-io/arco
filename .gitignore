@@ -9,8 +9,7 @@
 *.swo
 *~
 
-# Codex / agents
-.claude/
+# Local agent directories
 .worktrees/
 
 # OS
@@ -53,6 +52,3 @@ coverage/
 *.tfstate
 *.tfstate.backup
 *.tfplan
-
-# Local AI assistant tooling
-.claude/

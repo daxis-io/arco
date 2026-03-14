@@ -1,16 +1,12 @@
 //! Orchestration compaction helpers (sync or remote).
 
-use std::time::Duration;
-
 use serde::Serialize;
 
-use arco_core::{DistributedLock, ScopedStorage};
-use arco_flow::error::Error as FlowError;
+use arco_core::ScopedStorage;
 use arco_flow::orchestration::OrchestrationLedgerWriter;
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_flow::orchestration::events::OrchestrationEvent;
 use arco_flow::orchestration::ledger::LedgerWriter;
-use arco_flow::orchestration_compaction_lock_path;
 
 use crate::config::Config;
 use crate::error::ApiError;
@@ -18,12 +14,7 @@ use crate::error::ApiError;
 #[derive(Debug, Serialize)]
 struct CompactRequest {
     event_paths: Vec<String>,
-    fencing_token: u64,
-    lock_path: String,
 }
-
-const COMPACTION_LOCK_TTL: Duration = Duration::from_secs(30);
-const COMPACTION_LOCK_MAX_RETRIES: u32 = 8;
 
 /// Compacts orchestration events using a remote compactor or inline micro-compactor.
 pub async fn compact_orchestration_events(
@@ -34,33 +25,13 @@ pub async fn compact_orchestration_events(
     if event_paths.is_empty() {
         return Ok(());
     }
-    if config.orchestration_compactor_url.is_none() && !config.debug {
-        return Ok(());
-    }
-
-    let lock_path = orchestration_compaction_lock_path().to_string();
-    let lock = DistributedLock::new(storage.backend().clone(), lock_path.clone());
-    let guard = lock
-        .acquire(COMPACTION_LOCK_TTL, COMPACTION_LOCK_MAX_RETRIES)
-        .await
-        .map_err(|e| match e {
-            arco_core::Error::PreconditionFailed { message } => ApiError::conflict(format!(
-                "orchestration compaction lock unavailable: {message}"
-            )),
-            other => ApiError::from(other),
-        })?;
-    let fencing_token = guard.fencing_token().sequence();
 
     if let Some(url) = config.orchestration_compactor_url.as_ref() {
         let client = reqwest::Client::new();
         let endpoint = format!("{}/compact", url.trim_end_matches('/'));
         let response = client
             .post(endpoint)
-            .json(&CompactRequest {
-                event_paths,
-                fencing_token,
-                lock_path,
-            })
+            .json(&CompactRequest { event_paths })
             .send()
             .await
             .map_err(|e| {
@@ -86,43 +57,20 @@ pub async fn compact_orchestration_events(
             })
             .unwrap_or_else(|| String::from_utf8_lossy(&body).to_string());
 
-        return Err(map_remote_compaction_error(status, &message));
+        return Err(ApiError::internal(format!(
+            "orchestration compaction failed ({status}): {message}"
+        )));
     }
 
     if config.debug {
         let compactor = MicroCompactor::new(storage);
         compactor
-            .compact_events_fenced(event_paths, fencing_token, &lock_path)
+            .compact_events(event_paths)
             .await
-            .map_err(|e| map_inline_compaction_error(&e))?;
+            .map_err(|e| ApiError::internal(format!("orchestration compaction failed: {e}")))?;
     }
 
     Ok(())
-}
-
-fn map_remote_compaction_error(status: reqwest::StatusCode, message: &str) -> ApiError {
-    let detail = format!("orchestration compaction failed ({status}): {message}");
-    if status == reqwest::StatusCode::CONFLICT || status == reqwest::StatusCode::PRECONDITION_FAILED
-    {
-        ApiError::conflict(detail)
-    } else {
-        ApiError::internal(detail)
-    }
-}
-
-fn map_inline_compaction_error(error: &FlowError) -> ApiError {
-    let detail = format!("orchestration compaction failed: {error}");
-    match error {
-        FlowError::StaleFencingToken { .. } | FlowError::FencingLockUnavailable { .. } => {
-            ApiError::conflict(detail)
-        }
-        FlowError::Core(arco_core::Error::PreconditionFailed { message })
-            if message.contains("fencing") || message.contains("stale fencing token") =>
-        {
-            ApiError::conflict(detail)
-        }
-        _ => ApiError::internal(detail),
-    }
 }
 
 /// Ledger writer that triggers orchestration compaction after each event append.
@@ -160,30 +108,70 @@ impl OrchestrationLedgerWriter for CompactingLedgerWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arco_flow::error::Error as FlowError;
-    use reqwest::StatusCode;
+    use std::sync::Arc;
 
-    #[test]
-    fn maps_remote_compaction_conflict_to_http_409() {
-        let error = map_remote_compaction_error(StatusCode::CONFLICT, "stale fencing token");
-        assert_eq!(error.status(), StatusCode::CONFLICT);
-    }
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::{Json, Router};
 
-    #[test]
-    fn maps_remote_compaction_non_conflict_to_http_500() {
-        let error = map_remote_compaction_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "upstream internal error",
+    async fn spawn_error_server(status: StatusCode, body: serde_json::Value) -> String {
+        let app = Router::new().route(
+            "/compact",
+            post(move || {
+                let status = status;
+                let body = body.clone();
+                async move { (status, Json(body)) }
+            }),
         );
-        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
     }
 
-    #[test]
-    fn maps_inline_fencing_precondition_to_http_409() {
-        let error =
-            map_inline_compaction_error(&FlowError::Core(arco_core::Error::PreconditionFailed {
-                message: "stale fencing token".to_string(),
-            }));
-        assert_eq!(error.status(), StatusCode::CONFLICT);
+    fn sample_storage() -> ScopedStorage {
+        let backend = Arc::new(arco_core::MemoryBackend::new());
+        ScopedStorage::new(backend, "tenant", "workspace").expect("scoped storage")
+    }
+
+    #[tokio::test]
+    async fn compact_orchestration_events_noop_when_empty() {
+        let result = compact_orchestration_events(
+            &Config::default(),
+            sample_storage(),
+            Vec::<String>::new(),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn compact_orchestration_events_maps_remote_error_message() {
+        let url = spawn_error_server(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({ "error": "compactor unavailable" }),
+        )
+        .await;
+
+        let config = Config {
+            debug: false,
+            orchestration_compactor_url: Some(url),
+            ..Config::default()
+        };
+
+        let result = compact_orchestration_events(
+            &config,
+            sample_storage(),
+            vec!["ledger/executions/evt.json".to_string()],
+        )
+        .await;
+        let err = result.expect_err("must fail");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message().contains("compactor unavailable"));
     }
 }

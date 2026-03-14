@@ -41,7 +41,7 @@ Parity claims must be backed by **repo-addressable** evidence.
   - `.github/workflows/ci.yml`
 
 ### Non‑normative (may not be used as proof)
-- Anything under `docs/plans/**` (git-ignored by `.gitignore`, so it is not present in CI checkouts)
+- Removed legacy planning documents
 - Anything under `.worktrees/**`
 - External trackers/docs (Notion/Jira/etc.)
 - External product docs (including Dagster docs) may define target behavior, but do not prove parity in this repo
@@ -83,13 +83,13 @@ All are required:
 In parity matrices and plans:
 - Prefer linking to concrete **file paths and tests** over prose.
 - Use `path:line` references where possible.
-- Do not use `docs/plans/**` as evidence.
+- Do not use removed legacy planning documents as evidence.
 
 ## Historical / Superseded Documents
 The following documents may contain useful background but are not valid proof for parity claims:
 
 - `docs/audits/arco-flow-dagster-parity-audit.md` is explicitly superseded.
-- Anything under `docs/plans/**` (for example `docs/plans/2026-01-13-layer2-dagster-oss-parity-serverless-ship-plan.md`) is non-normative and may not be used as proof.
+- Removed legacy planning documents are non-normative and may not be used as proof.
 
 ## Change Policy
 This charter is intended to be stable. If scope or “done” criteria must change:

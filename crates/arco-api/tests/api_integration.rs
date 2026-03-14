@@ -1239,6 +1239,10 @@ mod orchestration {
         task_key: String,
         attempt: u32,
         state: String,
+        delta_table: Option<String>,
+        delta_version: Option<i64>,
+        delta_partition: Option<String>,
+        execution_lineage_ref: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1429,6 +1433,14 @@ mod orchestration {
             "workerId": "worker-1",
             "outcome": "SUCCEEDED",
             "completedAt": Utc::now().to_rfc3339(),
+            "output": {
+                "materializationId": "mat-arco-flow-001",
+                "rowCount": 42,
+                "byteSize": 1024,
+                "deltaTable": "analytics.users",
+                "deltaVersion": 17,
+                "deltaPartition": "date=2025-01-15"
+            }
         });
         let (status, completed): (_, TaskCallbackResponse) = helpers::post_json_with_headers(
             router.clone(),
@@ -1449,6 +1461,21 @@ mod orchestration {
             .find(|task| task.task_key == task_key)
             .context("expected completed task")?;
         assert_eq!(finished_task.state, "SUCCEEDED");
+        assert_eq!(
+            finished_task.delta_table.as_deref(),
+            Some("analytics.users")
+        );
+        assert_eq!(finished_task.delta_version, Some(17));
+        assert_eq!(
+            finished_task.delta_partition.as_deref(),
+            Some("date=2025-01-15")
+        );
+        assert!(
+            finished_task
+                .execution_lineage_ref
+                .as_ref()
+                .is_some_and(|value| !value.is_empty())
+        );
 
         let (status, logs_text) = helpers::get_text(
             router,
@@ -2458,6 +2485,74 @@ mod idempotency {
         )?;
         let response = router.oneshot(request).await.map_err(|err| match err {})?;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+}
+
+mod query_read_only {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct QueryError {
+        message: String,
+    }
+
+    #[tokio::test]
+    async fn test_query_endpoint_rejects_write_statements() -> Result<()> {
+        let router = test_router();
+        let statements = [
+            "INSERT INTO catalog.tables VALUES (1)",
+            "UPDATE catalog.tables SET name = 'x'",
+            "DELETE FROM catalog.tables",
+            "CREATE TABLE t(id INT)",
+        ];
+
+        for statement in statements {
+            let (status, error): (_, QueryError) = helpers::post_json(
+                router.clone(),
+                "/api/v1/query?format=json",
+                serde_json::json!({ "sql": statement }),
+            )
+            .await?;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                error
+                    .message
+                    .contains("Only SELECT/CTE queries are supported")
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_query_data_endpoint_rejects_write_statements() -> Result<()> {
+        let router = test_router();
+        let statements = [
+            "INSERT INTO analytics.sales.orders VALUES (1)",
+            "UPDATE analytics.sales.orders SET id = 2",
+            "DELETE FROM analytics.sales.orders",
+            "DROP TABLE analytics.sales.orders",
+        ];
+
+        for statement in statements {
+            let (status, error): (_, QueryError) = helpers::post_json(
+                router.clone(),
+                "/api/v1/query-data?format=json",
+                serde_json::json!({ "sql": statement }),
+            )
+            .await?;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                error
+                    .message
+                    .contains("Only SELECT/CTE queries are supported")
+            );
+        }
 
         Ok(())
     }

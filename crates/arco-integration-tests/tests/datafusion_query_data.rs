@@ -212,3 +212,75 @@ async fn query_data_does_not_fail_when_other_registered_tables_are_missing() {
     assert_eq!(rows.first().expect("row 0")["id"], 2);
     assert_eq!(rows.get(1).expect("row 1")["id"], 3);
 }
+
+#[tokio::test]
+async fn query_endpoint_rejects_non_read_sql() {
+    let config = Config {
+        debug: true,
+        posture: Posture::Dev,
+        ..Config::default()
+    };
+
+    let state = Arc::new(AppState::with_memory_storage(config));
+    let app = routes::api_v1_routes().with_state(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/query?format=json")
+        .header("Content-Type", "application/json")
+        .header("X-Tenant-Id", "acme")
+        .header("X-Workspace-Id", "analytics")
+        .body(Body::from(r#"{"sql":"CREATE TABLE denied(id INT)"}"#))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Only SELECT/CTE queries are supported")
+    );
+}
+
+#[tokio::test]
+async fn query_data_endpoint_rejects_non_read_sql() {
+    let config = Config {
+        debug: true,
+        posture: Posture::Dev,
+        ..Config::default()
+    };
+
+    let state = Arc::new(AppState::with_memory_storage(config));
+    let app = routes::api_v1_routes().with_state(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/query-data?format=json")
+        .header("Content-Type", "application/json")
+        .header("X-Tenant-Id", "acme")
+        .header("X-Workspace-Id", "analytics")
+        .body(Body::from(
+            r#"{"sql":"DELETE FROM analytics.sales.orders"}"#,
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Only SELECT/CTE queries are supported")
+    );
+}

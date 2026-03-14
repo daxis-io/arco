@@ -70,10 +70,11 @@ Expected result: all tests pass.
 
 ### 4) Batch matrix evidence (release gate input)
 
-Batch 3 command matrix output is archived at:
+Batch 3 command matrix output should be captured in CI artifacts for the run
+that executes these commands.
 
-- `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-matrix-status.tsv`
-- `release_evidence/2026-02-12-prod-readiness/phase-3/batch-3-head/command-logs/`
+- CI workflow source of truth: `.github/workflows/ci.yml`
+- Evidence retention policy: `docs/guide/src/reference/evidence-policy.md`
 
 ---
 
@@ -151,7 +152,7 @@ print("dashboard covers all required G3-006 metrics")
 PY
 
 promtool check rules infra/monitoring/alerts.yaml
-promtool test rules release_evidence/2026-02-12-prod-readiness/gate-3/observability_orch_alert_drill.test.yaml
+promtool test rules infra/monitoring/tests/observability_orch_alert_drill.test.yaml
 ```
 
 Expected result: dashboard contains each required metric query, alert rules compile, and controlled-signal drill fires expected alerts.
@@ -191,7 +192,7 @@ their behavior.
 ```bash
 promtool check rules infra/monitoring/alerts.yaml
 promtool test rules \
-  release_evidence/2026-02-12-prod-readiness/gate-4/observability/observability_gate4_alert_drill.test.yaml
+  infra/monitoring/tests/observability_gate4_alert_drill.test.yaml
 ```
 
 Expected result: rule check passes and controlled series fire all threshold

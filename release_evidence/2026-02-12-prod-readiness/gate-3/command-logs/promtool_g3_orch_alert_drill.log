@@ -1,7 +1,0 @@
-# command: promtool test rules release_evidence/2026-02-12-prod-readiness/gate-3/observability_orch_alert_drill.test.yaml
-# start_utc: 2026-02-14T04:43:16Z
-  SUCCESS
-
-
-# exit_code: 0
-# end_utc: 2026-02-14T04:43:16Z

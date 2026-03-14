@@ -1,7 +1,0 @@
-# command: find release_evidence/2026-02-12-prod-readiness/gate-5/signoff -maxdepth 2 -type f | sort
-# start_utc: 2026-02-15T18:24:51Z
-release_evidence/2026-02-12-prod-readiness/gate-5/signoff/command-logs/20260215T182451Z_changelog_sections.log
-release_evidence/2026-02-12-prod-readiness/gate-5/signoff/command-logs/20260215T182451Z_existing_signoff_artifacts.log
-release_evidence/2026-02-12-prod-readiness/gate-5/signoff/command-logs/20260215T182451Z_release_docs_presence.log
-release_evidence/2026-02-12-prod-readiness/gate-5/signoff/command-logs/20260215T182451Z_release_gate_snapshot.log
-release_evidence/2026-02-12-prod-readiness/gate-5/signoff/g5-006-command-status.tsv

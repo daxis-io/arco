@@ -1,5 +1,0 @@
-error: unexpected argument '-D' found
-
-Usage: cargo doc [OPTIONS]
-
-For more information, try '--help'.

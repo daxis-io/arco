@@ -1,1 +1,0 @@
-Failure: Must set --against or --against-registry

@@ -37,8 +37,13 @@ pub struct CommitDeltaResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeltaCoordinatorState {
     /// Latest committed Delta log version (starts at -1 for empty tables).
+    ///
+    /// During crash recovery this can lag a materialized delta log until
+    /// replay/recovery finalization advances it.
     pub latest_version: i64,
     /// Inflight reserved commit (used for crash recovery).
+    ///
+    /// Replay paths are responsible for clearing stale matching inflight state.
     pub inflight: Option<InflightCommit>,
 }
 

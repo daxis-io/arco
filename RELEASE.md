@@ -1,6 +1,6 @@
 # Release Process
 
-This repository uses signed release tags, release-tag CI discipline checks, and retained SBOM/provenance artifacts.
+This repository uses signed release tags, release-tag CI discipline checks, and SBOM/provenance publishing.
 
 ## Versioning
 
@@ -19,63 +19,60 @@ For each release tag `vX.Y.Z`:
    - `## Verification`
 3. Release notes must not contain placeholders (`TODO`, `TBD`, `PLACEHOLDER`, `XXX`).
 
-Validate locally before tagging:
+## Pre-Release Verification
+
+Run from repository root unless noted:
 
 ```bash
+cargo xtask doctor
+cargo xtask verify-integrity
+cargo xtask repo-hygiene-check
+cargo xtask adr-check
+cargo xtask parity-matrix-check
+cargo xtask uc-openapi-inventory
+git diff --exit-code -- docs/guide/src/reference/unity-catalog-openapi-inventory.md
+cargo check --workspace --all-features
+cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
+cd docs/guide && mdbook build
 bash tools/check-release-tag-discipline.sh --tag vX.Y.Z
 ```
 
+Also run targeted parity/API gates that mirror CI for `arco-api` and `arco-flow` before final tagging.
+
 ## Release Steps
 
-1. Ensure CI is green on `main`.
-2. Update versioned release notes (`release_notes/vX.Y.Z.md`).
-3. Validate release-tag discipline:
+1. Prepare release docs:
+   - Update `CHANGELOG.md` with `## [X.Y.Z] - YYYY-MM-DD`.
+   - Add/update `release_notes/vX.Y.Z.md` using `release_notes/TEMPLATE.md`.
+2. Open a PR with the release-doc updates and ensure required checks pass.
+3. Merge the PR to `main`, then validate release-tag discipline:
    ```bash
    bash tools/check-release-tag-discipline.sh --tag vX.Y.Z
    ```
-4. Create a signed, annotated tag:
+4. Create a signed, annotated tag on the release commit:
    ```bash
    git tag -s vX.Y.Z -m "vX.Y.Z"
    ```
-5. Push branch and tag:
+5. Push the tag:
    ```bash
-   git push origin main
    git push origin vX.Y.Z
    ```
 6. Pushing `vX.Y.Z` triggers:
    - `.github/workflows/ci.yml` release-tag discipline enforcement
-   - `.github/workflows/release-sbom.yml` (which waits for successful release-tag CI discipline before SBOM publication, provenance attestation, release asset upload, and immutable evidence pack archive)
+   - `.github/workflows/release-sbom.yml` for SBOM publication and provenance attestation
 7. Ensure the SSH public key used for release-tag signing is present in `.github/release-signers.allowed` so CI can verify `git verify-tag`.
-
-## Immutable Evidence Collector
-
-Collect deterministic Gate 1 evidence for a release tag:
-
-```bash
-bash tools/collect_release_evidence.sh --tag vX.Y.Z
-```
-
-Output path is immutable and deterministic:
-
-```text
-release_evidence/2026-02-12-prod-readiness/gate-1/collector-packs/vX.Y.Z/<tag-object-sha>-<commit-sha>/
-```
-
-The collector refuses overwrites by default.
-If `--allow-existing` is used, the collector only verifies an existing pack manifest and returns the path (no files are rewritten).
-
-## SBOM Retention Policy
-
-- Workflow artifact retention: 90 days (`actions/upload-artifact retention-days`).
-- Published release assets: attached to GitHub release for the same tag.
-- Release workflow validates signed-tag material and verifies tag signatures with `.github/release-signers.allowed` before publishing artifacts.
-- Artifacts produced per release tag:
-  - `arco-vX.Y.Z.spdx.json`
-  - `arco-vX.Y.Z.cyclonedx.json`
-  - `arco-vX.Y.Z.sbom.sha256`
-  - Provenance attestation via `actions/attest-build-provenance`
 
 ## Post-Release
 
-- Record immutable collector output path in the gate evidence pack.
-- Open/maintain `[Unreleased]` entries in `CHANGELOG.md` for subsequent work.
+1. Confirm release artifacts are accessible.
+2. Re-open `[Unreleased]` in the changelog for follow-up changes.
+3. If this is the first clean release after OSS hard-cleanup, retire the temporary archive branch:
+   ```bash
+   git branch -D <archive-branch-name>
+   git push origin --delete <archive-branch-name>
+   ```
+
+## Evidence Policy
+
+Transient verification evidence belongs in CI artifacts and release assets, not long-lived tracked directories.
+For evidence policy details, see `docs/guide/src/reference/evidence-policy.md`.

@@ -1,4 +1,0 @@
-Command: cargo clippy --workspace --all-features -- -D warnings
-
-Output:
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.58s

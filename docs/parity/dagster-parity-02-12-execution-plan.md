@@ -11,12 +11,12 @@ Every claimed parity milestone must be **provable via repo-addressable artifacts
 
 **Deliverables**
 - A tracked parity index (this `docs/parity/` directory is the starting point).
-- Any “authoritative” content currently living under `docs/plans/**` that we still rely on is either:
+- Any historical planning content that we still rely on is either:
   - copied into tracked docs (recommended), or
   - replaced by ADRs/tests.
 
 **Acceptance criteria**
-- No parity claim requires `docs/plans/**`.
+- No parity claim requires removed legacy planning docs.
 - CI-gated tests exist for any “Implemented” claim.
 
 **Evidence targets**

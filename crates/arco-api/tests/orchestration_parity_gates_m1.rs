@@ -14,6 +14,7 @@ use axum::http::{Method, StatusCode, header};
 use axum::middleware;
 use chrono::{Duration, Utc};
 use serde::Deserialize;
+use serde_json::Value;
 use tower::ServiceExt;
 use ulid::{Generator, Ulid};
 
@@ -48,6 +49,8 @@ struct RerunRunResponse {
     created: bool,
     parent_run_id: String,
     rerun_kind: String,
+    #[serde(default)]
+    rerun_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +67,26 @@ struct TaskSummary {
     state: String,
     #[allow(dead_code)]
     attempt: u32,
+    #[serde(default)]
+    execution_lineage_ref: Option<String>,
+    #[serde(default)]
+    retry_attribution: Option<TaskRetryAttribution>,
+    #[serde(default)]
+    skip_attribution: Option<TaskSkipAttribution>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskRetryAttribution {
+    retries: u32,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskSkipAttribution {
+    upstream_task_key: String,
+    upstream_resolution: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,12 +97,16 @@ struct RunResponse {
     tasks: Vec<TaskSummary>,
     #[serde(default)]
     labels: HashMap<String, String>,
+    #[serde(default)]
+    rerun_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ApiErrorResponse {
     message: String,
     code: String,
+    #[serde(default)]
+    details: Option<Value>,
 }
 
 mod helpers {
@@ -88,7 +115,7 @@ mod helpers {
     pub fn make_request(
         method: Method,
         uri: &str,
-        body: Option<serde_json::Value>,
+        body: Option<Value>,
     ) -> Result<axum::http::Request<Body>> {
         let body = match body {
             Some(v) => Body::from(serde_json::to_vec(&v).context("serialize request body")?),
@@ -632,6 +659,32 @@ async fn parity_m1_run_key_conflicts_on_payload_mismatch() -> Result<()> {
         error.message.contains("run_key"),
         "expected conflict error to mention run_key"
     );
+    let details = error
+        .details
+        .as_ref()
+        .expect("run_key conflicts should expose diagnostics payload");
+    assert_eq!(
+        details.get("conflictType").and_then(Value::as_str),
+        Some("RUN_KEY_FINGERPRINT_MISMATCH")
+    );
+    assert_eq!(
+        details.get("runKey").and_then(Value::as_str),
+        Some("rk-parity-m1-002")
+    );
+    assert!(
+        details
+            .get("existingFingerprint")
+            .and_then(Value::as_str)
+            .is_some(),
+        "existing fingerprint should be included for operators"
+    );
+    assert!(
+        details
+            .get("requestedFingerprint")
+            .and_then(Value::as_str)
+            .is_some(),
+        "requested fingerprint should be included for operators"
+    );
 
     Ok(())
 }
@@ -1018,6 +1071,34 @@ async fn parity_m1_rerun_from_failure_plans_only_unsucceeded_tasks() -> Result<(
         Some("SKIPPED")
     );
 
+    let failed_task = parent
+        .tasks
+        .iter()
+        .find(|task| task.task_key == "analytics.b")
+        .expect("expected failed task in parent run");
+    let retry_attribution = failed_task
+        .retry_attribution
+        .as_ref()
+        .expect("failed task with attempt=3 should carry retry attribution");
+    assert_eq!(retry_attribution.retries, 2);
+    assert_eq!(retry_attribution.reason, "prior_attempt_failed");
+
+    let skipped_task = parent
+        .tasks
+        .iter()
+        .find(|task| task.task_key == "analytics.c")
+        .expect("expected skipped task in parent run");
+    let skip_attribution = skipped_task
+        .skip_attribution
+        .as_ref()
+        .expect("skipped task should carry upstream attribution");
+    assert_eq!(skip_attribution.upstream_task_key, "analytics.b");
+    assert_eq!(skip_attribution.upstream_resolution, "FAILED");
+    assert!(
+        skipped_task.execution_lineage_ref.is_none(),
+        "skipped tasks should not expose execution lineage refs"
+    );
+
     let (status, rerun): (_, RerunRunResponse) = helpers::response_json(
         helpers::send(
             router.clone(),
@@ -1037,6 +1118,10 @@ async fn parity_m1_rerun_from_failure_plans_only_unsucceeded_tasks() -> Result<(
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(rerun.parent_run_id, parent_run_id);
     assert_eq!(rerun.rerun_kind, "FROM_FAILURE");
+    assert_eq!(
+        rerun.rerun_reason.as_deref(),
+        Some("from_failure_unsucceeded_tasks")
+    );
 
     let rerun_run_id = rerun.run_id;
 
@@ -1064,6 +1149,10 @@ async fn parity_m1_rerun_from_failure_plans_only_unsucceeded_tasks() -> Result<(
     assert_eq!(
         rerun_run.labels.get("arco.rerun.kind").map(String::as_str),
         Some("FROM_FAILURE")
+    );
+    assert_eq!(
+        rerun_run.rerun_reason.as_deref(),
+        Some("from_failure_unsucceeded_tasks")
     );
 
     let mut task_keys: Vec<String> = rerun_run.tasks.iter().map(|t| t.task_key.clone()).collect();
@@ -1269,6 +1358,341 @@ async fn parity_m1_rerun_subset_respects_include_downstream() -> Result<()> {
     let mut keys: Vec<String> = rerun_run.tasks.iter().map(|t| t.task_key.clone()).collect();
     keys.sort();
     assert_eq!(keys, vec!["analytics.b".to_string()]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn parity_m1_skip_attribution_is_deterministic_across_edge_ordering() -> Result<()> {
+    let (state, router) = test_state_and_router()?;
+
+    let (status, _manifest): (_, DeployManifestResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/manifests",
+                Some(serde_json::json!({
+                    "manifestVersion": "1.0",
+                    "codeVersionId": "abc123",
+                    "assets": [
+                        {
+                            "key": { "namespace": "analytics", "name": "a" },
+                            "id": "01HQA000001",
+                            "dependencies": []
+                        },
+                        {
+                            "key": { "namespace": "analytics", "name": "b" },
+                            "id": "01HQB000001",
+                            "dependencies": []
+                        },
+                        {
+                            "key": { "namespace": "analytics", "name": "c" },
+                            "id": "01HQC000001",
+                            "dependencies": [
+                                {
+                                    "upstreamKey": { "namespace": "analytics", "name": "a" }
+                                },
+                                {
+                                    "upstreamKey": { "namespace": "analytics", "name": "b" }
+                                }
+                            ]
+                        }
+                    ],
+                    "schedules": []
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, created): (_, TriggerRunResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/runs",
+                Some(serde_json::json!({
+                    "selection": ["analytics.a", "analytics.b", "analytics.c"],
+                    "partitions": [],
+                    "labels": {},
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    let run_id = created.run_id;
+
+    let ctx = test_ctx();
+    let base = Utc::now();
+    let b_attempt_id = Ulid::new().to_string();
+    let a_attempt_id = Ulid::new().to_string();
+
+    append_events_and_compact(
+        &state,
+        &ctx,
+        vec![
+            {
+                let mut event = OrchestrationEvent::new(
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    OrchestrationEventData::TaskStarted {
+                        run_id: run_id.clone(),
+                        task_key: "analytics.b".to_string(),
+                        attempt: 3,
+                        attempt_id: b_attempt_id.clone(),
+                        worker_id: "worker-1".to_string(),
+                    },
+                );
+                event.timestamp = base;
+                event
+            },
+            {
+                let mut event = OrchestrationEvent::new(
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    OrchestrationEventData::TaskFinished {
+                        run_id: run_id.clone(),
+                        task_key: "analytics.b".to_string(),
+                        attempt: 3,
+                        attempt_id: b_attempt_id,
+                        worker_id: "worker-1".to_string(),
+                        outcome: TaskOutcome::Failed,
+                        materialization_id: None,
+                        error_message: Some("b failed".to_string()),
+                        output: None,
+                        error: None,
+                        metrics: None,
+                        cancelled_during_phase: None,
+                        partial_progress: None,
+                        asset_key: Some("analytics.b".to_string()),
+                        partition_key: None,
+                        code_version: None,
+                    },
+                );
+                event.timestamp = base + Duration::milliseconds(1);
+                event
+            },
+            {
+                let mut event = OrchestrationEvent::new(
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    OrchestrationEventData::TaskStarted {
+                        run_id: run_id.clone(),
+                        task_key: "analytics.a".to_string(),
+                        attempt: 3,
+                        attempt_id: a_attempt_id.clone(),
+                        worker_id: "worker-1".to_string(),
+                    },
+                );
+                event.timestamp = base;
+                event
+            },
+            {
+                let mut event = OrchestrationEvent::new(
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    OrchestrationEventData::TaskFinished {
+                        run_id: run_id.clone(),
+                        task_key: "analytics.a".to_string(),
+                        attempt: 3,
+                        attempt_id: a_attempt_id,
+                        worker_id: "worker-1".to_string(),
+                        outcome: TaskOutcome::Failed,
+                        materialization_id: None,
+                        error_message: Some("a failed".to_string()),
+                        output: None,
+                        error: None,
+                        metrics: None,
+                        cancelled_during_phase: None,
+                        partial_progress: None,
+                        asset_key: Some("analytics.a".to_string()),
+                        partition_key: None,
+                        code_version: None,
+                    },
+                );
+                // Same satisfied_at as analytics.b to force deterministic tie-break on upstream key.
+                event.timestamp = base + Duration::milliseconds(1);
+                event
+            },
+        ],
+    )
+    .await?;
+
+    let (status, run): (_, RunResponse) = helpers::response_json(
+        helpers::send(
+            router,
+            helpers::make_request(
+                Method::GET,
+                &format!("/api/v1/workspaces/test-workspace/runs/{run_id}"),
+                None,
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let skipped = run
+        .tasks
+        .iter()
+        .find(|task| task.task_key == "analytics.c")
+        .expect("expected downstream task in run response");
+    assert_eq!(skipped.state, "SKIPPED");
+    let skip_attribution = skipped
+        .skip_attribution
+        .as_ref()
+        .expect("skipped task should include skip attribution");
+
+    assert_eq!(skip_attribution.upstream_task_key, "analytics.a");
+    assert_eq!(skip_attribution.upstream_resolution, "FAILED");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn parity_m1_rerun_run_key_conflict_surfaces_diagnostics_payload() -> Result<()> {
+    let (_state, router) = test_state_and_router()?;
+
+    let (status, _manifest): (_, DeployManifestResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/manifests",
+                Some(serde_json::json!({
+                    "manifestVersion": "1.0",
+                    "codeVersionId": "abc123",
+                    "assets": [
+                        {
+                            "key": { "namespace": "analytics", "name": "a" },
+                            "id": "01HQA000001",
+                            "dependencies": []
+                        },
+                        {
+                            "key": { "namespace": "analytics", "name": "b" },
+                            "id": "01HQB000001",
+                            "dependencies": [
+                                {
+                                    "upstreamKey": { "namespace": "analytics", "name": "a" }
+                                }
+                            ]
+                        },
+                        {
+                            "key": { "namespace": "analytics", "name": "c" },
+                            "id": "01HQC000001",
+                            "dependencies": [
+                                {
+                                    "upstreamKey": { "namespace": "analytics", "name": "b" }
+                                }
+                            ]
+                        }
+                    ],
+                    "schedules": []
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, created): (_, TriggerRunResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                "/api/v1/workspaces/test-workspace/runs",
+                Some(serde_json::json!({
+                    "selection": ["analytics.a"],
+                    "includeDownstream": true,
+                    "partitions": [],
+                    "labels": {},
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    let parent_run_id = created.run_id;
+
+    let (status, first_rerun): (_, RerunRunResponse) = helpers::response_json(
+        helpers::send(
+            router.clone(),
+            helpers::make_request(
+                Method::POST,
+                &format!("/api/v1/workspaces/test-workspace/runs/{parent_run_id}/rerun"),
+                Some(serde_json::json!({
+                    "mode": "subset",
+                    "selection": ["analytics.b"],
+                    "includeDownstream": true,
+                    "runKey": "rk-parity-m1-rerun-conflict-001",
+                    "labels": {},
+                })),
+            )?,
+        )
+        .await?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(first_rerun.created);
+
+    let response = helpers::send(
+        router,
+        helpers::make_request(
+            Method::POST,
+            &format!("/api/v1/workspaces/test-workspace/runs/{parent_run_id}/rerun"),
+            Some(serde_json::json!({
+                "mode": "subset",
+                "selection": ["analytics.b"],
+                "includeDownstream": false,
+                "runKey": "rk-parity-m1-rerun-conflict-001",
+                "labels": {},
+            })),
+        )?,
+    )
+    .await?;
+
+    let (status, error): (_, ApiErrorResponse) = helpers::response_json(response).await?;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error.code, "CONFLICT");
+
+    let details = error
+        .details
+        .as_ref()
+        .expect("rerun run_key conflicts should expose diagnostics payload");
+    assert_eq!(
+        details.get("conflictType").and_then(Value::as_str),
+        Some("RUN_KEY_FINGERPRINT_MISMATCH")
+    );
+    assert_eq!(
+        details.get("runKey").and_then(Value::as_str),
+        Some("rk-parity-m1-rerun-conflict-001")
+    );
+    assert_eq!(
+        details.get("existingRunId").and_then(Value::as_str),
+        Some(first_rerun.run_id.as_str())
+    );
+    assert!(
+        details
+            .get("existingFingerprint")
+            .and_then(Value::as_str)
+            .is_some(),
+        "existing fingerprint should be included for operators"
+    );
+    assert!(
+        details
+            .get("requestedFingerprint")
+            .and_then(Value::as_str)
+            .is_some(),
+        "requested fingerprint should be included for operators"
+    );
 
     Ok(())
 }

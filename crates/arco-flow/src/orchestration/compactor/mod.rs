@@ -5,6 +5,7 @@
 //!
 //! - **Base snapshots**: Full Parquet files periodically merged
 //! - **L0 deltas**: Small Parquet files for near-real-time visibility
+//! - **Ledger rebuilds**: Deterministic replay from explicit ledger manifests
 //!
 //! Controllers read base + L0 deltas from the manifest (never the ledger).
 

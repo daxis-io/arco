@@ -78,8 +78,9 @@ class ArcoFlowApiClient:
 
         return headers
 
-    def _url(self, path: str) -> str:
-        return f"{self._base_url}/api/v1{path}"
+    def _url(self, path: str, *, base_url: str | None = None) -> str:
+        resolved = (base_url or self._base_url).rstrip("/")
+        return f"{resolved}/api/v1{path}"
 
     def _request_json(
         self,
@@ -89,10 +90,11 @@ class ArcoFlowApiClient:
         json_body: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        base_url: str | None = None,
     ) -> dict[str, Any]:
         response = self._client.request(
             method,
-            self._url(path),
+            self._url(path, base_url=base_url),
             json=json_body,
             params=params,
             headers=headers,
@@ -107,10 +109,11 @@ class ArcoFlowApiClient:
         *,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        base_url: str | None = None,
     ) -> str:
         response = self._client.request(
             method,
-            self._url(path),
+            self._url(path, base_url=base_url),
             params=params,
             headers=headers,
         )
@@ -310,6 +313,7 @@ class ArcoFlowApiClient:
         traceparent: str | None,
         started_at: str,
         task_token: str,
+        callback_base_url: str | None = None,
     ) -> ApiResponse:
         headers = self._build_headers(task_token=task_token)
         payload = {
@@ -324,6 +328,7 @@ class ArcoFlowApiClient:
             f"/tasks/{task_key}/started",
             json_body=payload,
             headers=headers,
+            base_url=callback_base_url,
         )
         return ApiResponse(payload=response)
 
@@ -340,6 +345,7 @@ class ArcoFlowApiClient:
         output: dict[str, Any] | None,
         error: dict[str, Any] | None,
         task_token: str,
+        callback_base_url: str | None = None,
     ) -> ApiResponse:
         headers = self._build_headers(task_token=task_token)
         payload: dict[str, Any] = {
@@ -359,5 +365,6 @@ class ArcoFlowApiClient:
             f"/tasks/{task_key}/completed",
             json_body=payload,
             headers=headers,
+            base_url=callback_base_url,
         )
         return ApiResponse(payload=response)

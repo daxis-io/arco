@@ -5,7 +5,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use arco_core::{Error, Result};
+pub use arco_core::TaskTokenConfig;
+use arco_core::{Error, MAX_TASK_TOKEN_TTL_SECONDS, Result};
 
 use crate::rate_limit::RateLimitConfig;
 
@@ -187,6 +188,10 @@ pub struct Config {
     #[serde(default)]
     pub jwt: JwtConfig,
 
+    /// Task callback token authentication configuration.
+    #[serde(default)]
+    pub task_token: TaskTokenConfig,
+
     /// Rate limiting configuration (denial-of-wallet protection).
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -342,6 +347,7 @@ impl Default for Config {
             posture: Posture::Dev,
             cors: CorsConfig::default(),
             jwt: JwtConfig::default(),
+            task_token: TaskTokenConfig::default(),
             rate_limit: RateLimitConfig::default(),
             storage: StorageConfig::default(),
             compactor_url: None,
@@ -491,6 +497,10 @@ impl Config {
     /// - `ARCO_JWT_WORKSPACE_CLAIM`
     /// - `ARCO_JWT_USER_CLAIM`
     /// - `ARCO_JWT_GROUPS_CLAIM`
+    /// - `ARCO_TASK_TOKEN_SECRET`
+    /// - `ARCO_TASK_TOKEN_ISSUER`
+    /// - `ARCO_TASK_TOKEN_AUDIENCE`
+    /// - `ARCO_TASK_TOKEN_TTL_SECS`
     /// - `ARCO_STORAGE_BUCKET`
     /// - `ARCO_COMPACTOR_URL`
     /// - `ARCO_COMPACTOR_AUTH_MODE` (`none` | `static_bearer` | `gcp_id_token`)
@@ -581,6 +591,28 @@ impl Config {
         }
         if let Some(claim) = env_string("ARCO_JWT_GROUPS_CLAIM") {
             config.jwt.groups_claim = claim;
+        }
+        if let Some(secret) = env_string("ARCO_TASK_TOKEN_SECRET") {
+            config.task_token.hs256_secret = secret;
+        }
+        if let Some(issuer) = env_string("ARCO_TASK_TOKEN_ISSUER") {
+            config.task_token.issuer = Some(issuer);
+        }
+        if let Some(audience) = env_string("ARCO_TASK_TOKEN_AUDIENCE") {
+            config.task_token.audience = Some(audience);
+        }
+        if let Some(ttl) = env_u64("ARCO_TASK_TOKEN_TTL_SECS")? {
+            if ttl == 0 {
+                return Err(Error::InvalidInput(
+                    "ARCO_TASK_TOKEN_TTL_SECS must be greater than 0".to_string(),
+                ));
+            }
+            if ttl > MAX_TASK_TOKEN_TTL_SECONDS {
+                return Err(Error::InvalidInput(format!(
+                    "ARCO_TASK_TOKEN_TTL_SECS must be at most {MAX_TASK_TOKEN_TTL_SECONDS}"
+                )));
+            }
+            config.task_token.ttl_seconds = ttl;
         }
 
         if let Some(bucket) = env_string("ARCO_STORAGE_BUCKET") {

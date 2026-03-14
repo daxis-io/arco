@@ -270,6 +270,11 @@ mod tests {
             ready_at: Some(Utc::now()),
             asset_key: None,
             partition_key: None,
+            materialization_id: None,
+            delta_table: None,
+            delta_version: None,
+            delta_partition: None,
+            execution_lineage_ref: None,
             row_version: "01HQ123EVT".to_string(),
         }
     }

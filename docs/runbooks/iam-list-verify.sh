@@ -119,4 +119,4 @@ echo "  - If ledger/ lists successfully and commits/state/ fail: IAM is working 
 echo "  - If all prefixes list successfully: Conditional IAM does NOT constrain list results"
 echo "  - If all prefixes fail: Condition may be too restrictive"
 echo ""
-echo "Document results in release evidence."
+echo "Attach results to CI artifacts or release assets."

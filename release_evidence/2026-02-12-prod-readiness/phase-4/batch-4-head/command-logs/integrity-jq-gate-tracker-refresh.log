@@ -1,2 +1,0 @@
-[2026-02-15T20:19:44Z] STEP=integrity-jq-gate-tracker-refresh
-COMMAND: jq empty docs/audits/2026-02-12-prod-readiness/gate-tracker.json

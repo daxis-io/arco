@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 ### Added
 - Server-side SQL query endpoint at `/api/v1/query` backed by DataFusion (Arrow IPC or JSON output).
+### Changed
+- Refreshed `README.md`, `RELEASE.md`, and release-note templates to align with mdBook-first docs and CI/release artifact policy.
 
 ## [0.1.4] - 2026-02-18
 ### Fixed

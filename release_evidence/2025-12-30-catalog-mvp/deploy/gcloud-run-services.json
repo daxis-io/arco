@@ -1,4 +1,0 @@
-Command: gcloud run services list --project dataverse-dev-471815 --region us-central1 --format=json
-
-ERROR: Reauthentication failed. gcloud cannot prompt during non-interactive execution.
-Action: run `gcloud auth login` or set an authenticated account.

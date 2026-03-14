@@ -1,9 +1,0 @@
-
-running 4 tests
-test runtime_config_uses_expected_defaults ... ok
-test runtime_config_applies_env_overrides ... ok
-test runtime_config_rejects_non_positive_values ... ok
-test backlog_snapshot_reports_pending_counts_conflicts_and_lag ... ok
-
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-

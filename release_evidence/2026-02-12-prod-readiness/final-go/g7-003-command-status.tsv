@@ -1,6 +1,0 @@
-signal	command	start_utc	end_utc	exit_code	log_path
-G7-003	jq -r "[.gates[] | {id, status}]" docs/audits/2026-02-12-prod-readiness/gate-tracker.json	2026-02-15T18:26:38Z	2026-02-15T18:26:38Z	0	release_evidence/2026-02-12-prod-readiness/final-go/command-logs/20260215T182638Z_all_gates_green_check.log
-G7-003	jq -r "[.gates[] | select(.status != \"GO\")] | length" docs/audits/2026-02-12-prod-readiness/gate-tracker.json	2026-02-15T18:26:38Z	2026-02-15T18:26:38Z	0	release_evidence/2026-02-12-prod-readiness/final-go/command-logs/20260215T182638Z_non_go_gate_count.log
-G7-003	jq -r "[.gates[] | {id, status}]" docs/audits/2026-02-12-prod-readiness/gate-tracker.json	2026-02-15T19:34:05Z	2026-02-15T19:34:05Z	0	release_evidence/2026-02-12-prod-readiness/final-go/command-logs/20260215T193405Z_all_gates_green_check_refresh.log
-G7-003	jq -r "[.gates[] | select(.status != \"GO\")] | length" docs/audits/2026-02-12-prod-readiness/gate-tracker.json	2026-02-15T19:34:05Z	2026-02-15T19:34:05Z	0	release_evidence/2026-02-12-prod-readiness/final-go/command-logs/20260215T193405Z_non_go_gate_count_refresh.log
-G7-003	jq -e "[.gates[] | select(.status != \"GO\")] | length == 0" docs/audits/2026-02-12-prod-readiness/gate-tracker.json	2026-02-15T19:34:05Z	2026-02-15T19:34:05Z	1	release_evidence/2026-02-12-prod-readiness/final-go/command-logs/20260215T193405Z_all_gates_go_assertion.log

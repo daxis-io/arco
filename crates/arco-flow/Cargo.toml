@@ -17,6 +17,7 @@ workspace = true
 
 [features]
 default = []
+legacy-scheduler = []
 full = ["gcp", "aws", "azure"]
 gcp = ["arco-core/gcp", "dep:reqwest", "dep:gcp_auth"]
 aws = ["arco-core/aws"]

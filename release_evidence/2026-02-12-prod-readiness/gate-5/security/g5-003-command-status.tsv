@@ -1,8 +1,0 @@
-signal	command	start_utc	end_utc	exit_code	log_path
-G5-003	test -f docs/runbooks/pen-test-scope.md	2026-02-15T18:23:38Z	2026-02-15T18:23:38Z	0	release_evidence/2026-02-12-prod-readiness/gate-5/security/command-logs/20260215T182338Z_pen_test_runbook_presence.log
-G5-003	cargo deny check advisories	2026-02-15T18:23:38Z	2026-02-15T18:23:39Z	0	release_evidence/2026-02-12-prod-readiness/gate-5/security/command-logs/20260215T182338Z_cargo_deny_advisories.log
-G5-003	rg -n "In-scope APIs|In-scope storage paths|Out-of-scope|Procedure|Evidence to capture" docs/runbooks/pen-test-scope.md	2026-02-15T18:23:39Z	2026-02-15T18:23:39Z	0	release_evidence/2026-02-12-prod-readiness/gate-5/security/command-logs/20260215T182339Z_pen_test_scope_extract.log
-G5-003	rg -n "JWKS/rotation|Unknown:|rotation|secrets" docs/catalog-metastore/evidence/security-ops-evidence-pack.md | head -n 40	2026-02-15T18:23:39Z	2026-02-15T18:23:39Z	0	release_evidence/2026-02-12-prod-readiness/gate-5/security/command-logs/20260215T182339Z_security_findings_extract.log
-G5-003	test -f docs/runbooks/pen-test-scope.md	2026-02-15T19:26:40Z	2026-02-15T19:26:40Z	0	release_evidence/2026-02-12-prod-readiness/gate-5/security/command-logs/20260215T192640Z_pen_test_runbook_presence_refresh.log
-G5-003	cargo deny check advisories	2026-02-15T19:26:40Z	2026-02-15T19:26:41Z	0	release_evidence/2026-02-12-prod-readiness/gate-5/security/command-logs/20260215T192640Z_cargo_deny_advisories_refresh.log
-G5-003	rg -n "\[PENDING\]|pending" release_evidence/2026-02-12-prod-readiness/gate-5/security/g5-003-pen-test-evidence.md	2026-02-15T19:26:41Z	2026-02-15T19:26:41Z	0	release_evidence/2026-02-12-prod-readiness/gate-5/security/command-logs/20260215T192641Z_pen_test_pending_findings_scan.log

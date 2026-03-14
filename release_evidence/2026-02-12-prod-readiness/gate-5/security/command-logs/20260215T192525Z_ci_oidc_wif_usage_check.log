@@ -1,5 +1,0 @@
-277:          if [ -z "${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}" ] || [ -z "${{ vars.GCP_SERVICE_ACCOUNT }}" ] || [ -z "${{ vars.ARCO_BUCKET_DEV }}" ]; then
-285:        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v2
-287:          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-288:          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
-302:          echo "Skipping IAM smoke tests: missing vars.GCP_WORKLOAD_IDENTITY_PROVIDER, vars.GCP_SERVICE_ACCOUNT, or vars.ARCO_BUCKET_DEV"

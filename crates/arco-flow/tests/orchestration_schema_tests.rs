@@ -243,6 +243,10 @@ fn test_partition_status_row_schema() {
         stale_since: None,
         stale_reason_code: None,
         partition_values,
+        delta_table: Some("analytics.summary".into()),
+        delta_version: Some(12),
+        delta_partition: Some("date=2025-01-15".into()),
+        execution_lineage_ref: Some("{\"runId\":\"run_01HQ123\"}".into()),
         row_version: "01HQ505".into(),
     };
 

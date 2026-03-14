@@ -13,7 +13,9 @@ use arco_core::ScopedStorage;
 use arco_core::storage::{MemoryBackend, StorageBackend};
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_flow::orchestration::controllers::ScheduleController;
-use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData, TickStatus};
+use arco_flow::orchestration::events::{
+    OrchestrationEvent, OrchestrationEventData, TaskDef, TaskOutcome, TickStatus, TriggerInfo,
+};
 use arco_flow::orchestration::ledger::LedgerWriter;
 use chrono::{TimeZone, Utc};
 
@@ -744,6 +746,162 @@ async fn list_schedule_ticks_missing_schedule_returns_empty_list() -> Result<()>
     assert!(
         body.get("nextCursor").is_none()
             || body.get("nextCursor") == Some(&serde_json::Value::Null)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn lineage_metadata_flows_from_task_output_to_catalog_and_run_read_surfaces() -> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let router = test_router(backend.clone());
+
+    let storage = ScopedStorage::new(backend.clone(), "test-tenant", "test-workspace")?;
+    let ledger = LedgerWriter::new(storage.clone());
+    let compactor = MicroCompactor::new(storage.clone());
+
+    let run_id = "run_lineage_api_q3";
+    let plan_id = "plan_lineage_api_q3";
+    let task_key = "analytics.users";
+    let partition_key = "date=2025-01-15";
+
+    let events = vec![
+        OrchestrationEvent::new(
+            "test-tenant",
+            "test-workspace",
+            OrchestrationEventData::RunTriggered {
+                run_id: run_id.to_string(),
+                plan_id: plan_id.to_string(),
+                trigger: TriggerInfo::Manual {
+                    user_id: "operator@example.com".to_string(),
+                },
+                root_assets: vec![task_key.to_string()],
+                run_key: None,
+                labels: std::collections::HashMap::new(),
+                code_version: Some("code_v1".to_string()),
+            },
+        ),
+        OrchestrationEvent::new(
+            "test-tenant",
+            "test-workspace",
+            OrchestrationEventData::PlanCreated {
+                run_id: run_id.to_string(),
+                plan_id: plan_id.to_string(),
+                tasks: vec![TaskDef {
+                    key: task_key.to_string(),
+                    depends_on: vec![],
+                    asset_key: Some(task_key.to_string()),
+                    partition_key: Some(partition_key.to_string()),
+                    max_attempts: 1,
+                    heartbeat_timeout_sec: 300,
+                }],
+            },
+        ),
+        OrchestrationEvent::new(
+            "test-tenant",
+            "test-workspace",
+            OrchestrationEventData::TaskStarted {
+                run_id: run_id.to_string(),
+                task_key: task_key.to_string(),
+                attempt: 1,
+                attempt_id: "att_lineage_api_q3".to_string(),
+                worker_id: "worker-1".to_string(),
+            },
+        ),
+        OrchestrationEvent::new(
+            "test-tenant",
+            "test-workspace",
+            OrchestrationEventData::TaskFinished {
+                run_id: run_id.to_string(),
+                task_key: task_key.to_string(),
+                attempt: 1,
+                attempt_id: "att_lineage_api_q3".to_string(),
+                worker_id: "worker-1".to_string(),
+                outcome: TaskOutcome::Succeeded,
+                materialization_id: Some("mat_lineage_api_q3".to_string()),
+                error_message: None,
+                output: Some(serde_json::json!({
+                    "materializationId": "mat_lineage_api_q3",
+                    "deltaTable": task_key,
+                    "deltaVersion": 17,
+                    "deltaPartition": partition_key
+                })),
+                error: None,
+                metrics: None,
+                cancelled_during_phase: None,
+                partial_progress: None,
+                asset_key: Some(task_key.to_string()),
+                partition_key: Some(partition_key.to_string()),
+                code_version: Some("code_v1".to_string()),
+            },
+        ),
+    ];
+
+    let event_paths: Vec<String> = events.iter().map(LedgerWriter::event_path).collect();
+    ledger.append_all(events).await?;
+    compactor.compact_events(event_paths).await?;
+
+    let (status, run): (_, serde_json::Value) = helpers::get_json(
+        router.clone(),
+        &format!("/api/v1/workspaces/test-workspace/runs/{run_id}"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let run_task = run
+        .get("tasks")
+        .and_then(|v| v.as_array())
+        .and_then(|tasks| {
+            tasks
+                .iter()
+                .find(|task| task.get("taskKey").and_then(|v| v.as_str()) == Some(task_key))
+        })
+        .context("expected run task row")?;
+
+    assert_eq!(
+        run_task.get("deltaVersion").and_then(|v| v.as_i64()),
+        Some(17)
+    );
+    assert_eq!(
+        run_task.get("deltaPartition").and_then(|v| v.as_str()),
+        Some(partition_key)
+    );
+    let run_lineage_ref = run_task
+        .get("executionLineageRef")
+        .and_then(|v| v.as_str())
+        .context("expected execution lineage ref on run task")?
+        .to_string();
+
+    let (status, partitions): (_, serde_json::Value) = helpers::get_json(
+        router,
+        &format!("/api/v1/workspaces/test-workspace/partitions?assetKey={task_key}"),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let partition = partitions
+        .get("partitions")
+        .and_then(|v| v.as_array())
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get("partitionKey").and_then(|v| v.as_str()) == Some(partition_key))
+        })
+        .context("expected partition status row")?;
+
+    assert_eq!(
+        partition.get("deltaVersion").and_then(|v| v.as_i64()),
+        Some(17)
+    );
+    assert_eq!(
+        partition.get("deltaPartition").and_then(|v| v.as_str()),
+        Some(partition_key)
+    );
+    assert_eq!(
+        partition
+            .get("executionLineageRef")
+            .and_then(|v| v.as_str())
+            .context("expected execution lineage ref on partition row")?,
+        run_lineage_ref
     );
 
     Ok(())

@@ -234,13 +234,6 @@ async fn crash_after_delta_log_write_before_idempotency_replays_same_version_and
     assert_eq!(replay_again.version, replay.version);
     assert_eq!(replay_again.delta_log_path, replay.delta_log_path);
 
-    let replay_again = coordinator
-        .commit(request, Utc::now())
-        .await
-        .expect("repeat replay should remain stable");
-    assert_eq!(replay_again.version, replay.version);
-    assert_eq!(replay_again.delta_log_path, replay.delta_log_path);
-
     assert!(
         storage
             .head_raw(&record_path)

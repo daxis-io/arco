@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::State;
@@ -56,6 +57,18 @@ pub struct RateLimitConfig {
     /// Maximum burst size (requests allowed above steady rate).
     #[serde(default = "default_burst_size")]
     pub burst_size: u32,
+
+    /// Maximum number of cached tenant limiter entries per limiter map.
+    ///
+    /// Applies independently to default and URL-minting limiter maps.
+    #[serde(default = "default_max_tenant_entries")]
+    pub max_tenant_entries: usize,
+
+    /// Time-to-live for inactive tenant limiter entries in seconds.
+    ///
+    /// Stale entries are pruned during limiter access.
+    #[serde(default = "default_tenant_entry_ttl_secs")]
+    pub tenant_entry_ttl_secs: u64,
 }
 
 const fn default_enabled() -> bool {
@@ -74,6 +87,14 @@ const fn default_burst_size() -> u32 {
     50
 }
 
+const fn default_max_tenant_entries() -> usize {
+    10_000
+}
+
+const fn default_tenant_entry_ttl_secs() -> u64 {
+    3600
+}
+
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
@@ -81,6 +102,8 @@ impl Default for RateLimitConfig {
             default_requests_per_minute: default_requests_per_minute(),
             url_minting_requests_per_minute: default_url_minting_per_minute(),
             burst_size: default_burst_size(),
+            max_tenant_entries: default_max_tenant_entries(),
+            tenant_entry_ttl_secs: default_tenant_entry_ttl_secs(),
         }
     }
 }
@@ -92,14 +115,20 @@ impl Default for RateLimitConfig {
 /// Per-tenant rate limiter using in-memory state.
 type TenantLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>;
 
+#[derive(Clone)]
+struct TenantLimiterEntry {
+    limiter: Arc<TenantLimiter>,
+    last_seen: Instant,
+}
+
 /// Rate limiting state shared across all request handlers.
 #[derive(Clone)]
 pub struct RateLimitState {
     config: RateLimitConfig,
     /// Per-tenant rate limiters for default endpoints.
-    default_limiters: Arc<RwLock<HashMap<String, Arc<TenantLimiter>>>>,
+    default_limiters: Arc<RwLock<HashMap<String, TenantLimiterEntry>>>,
     /// Per-tenant rate limiters for URL minting (lower limits).
-    url_minting_limiters: Arc<RwLock<HashMap<String, Arc<TenantLimiter>>>>,
+    url_minting_limiters: Arc<RwLock<HashMap<String, TenantLimiterEntry>>>,
 }
 
 impl std::fmt::Debug for RateLimitState {
@@ -125,25 +154,31 @@ impl RateLimitState {
 
     /// Gets or creates a rate limiter for the given tenant.
     async fn get_or_create_limiter(
-        limiters: &RwLock<HashMap<String, Arc<TenantLimiter>>>,
+        limiters: &RwLock<HashMap<String, TenantLimiterEntry>>,
         tenant: &str,
         requests_per_minute: u32,
         burst_size: u32,
+        max_tenant_entries: usize,
+        tenant_entry_ttl: Duration,
     ) -> Arc<TenantLimiter> {
-        // Fast path: check if limiter exists
-        {
-            let read_guard = limiters.read().await;
-            if let Some(limiter) = read_guard.get(tenant) {
-                return Arc::clone(limiter);
-            }
+        let now = Instant::now();
+        let mut write_guard = limiters.write().await;
+        Self::prune_stale_limiters(&mut write_guard, now, tenant_entry_ttl);
+
+        if let Some(entry) = write_guard.get_mut(tenant) {
+            entry.last_seen = now;
+            return Arc::clone(&entry.limiter);
         }
 
-        // Slow path: create new limiter
-        let mut write_guard = limiters.write().await;
-
-        // Double-check after acquiring write lock
-        if let Some(limiter) = write_guard.get(tenant) {
-            return Arc::clone(limiter);
+        let max_tenant_entries = max_tenant_entries.max(1);
+        if write_guard.len() >= max_tenant_entries {
+            if let Some(oldest_tenant) = write_guard
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_seen)
+                .map(|(tenant_id, _)| tenant_id.clone())
+            {
+                write_guard.remove(&oldest_tenant);
+            }
         }
 
         // Create quota: X requests per minute with burst capacity
@@ -153,8 +188,22 @@ impl RateLimitState {
         let quota = Quota::per_minute(replenish_rate).allow_burst(burst);
         let limiter = Arc::new(RateLimiter::direct(quota));
 
-        write_guard.insert(tenant.to_string(), Arc::clone(&limiter));
+        write_guard.insert(
+            tenant.to_string(),
+            TenantLimiterEntry {
+                limiter: Arc::clone(&limiter),
+                last_seen: now,
+            },
+        );
         limiter
+    }
+
+    fn prune_stale_limiters(
+        limiters: &mut HashMap<String, TenantLimiterEntry>,
+        now: Instant,
+        tenant_entry_ttl: Duration,
+    ) {
+        limiters.retain(|_, entry| now.duration_since(entry.last_seen) < tenant_entry_ttl);
     }
 
     /// Checks rate limit for a default endpoint.
@@ -171,6 +220,8 @@ impl RateLimitState {
             tenant,
             self.config.default_requests_per_minute,
             self.config.burst_size,
+            self.config.max_tenant_entries,
+            Duration::from_secs(self.config.tenant_entry_ttl_secs),
         )
         .await;
 
@@ -191,6 +242,8 @@ impl RateLimitState {
             tenant,
             self.config.url_minting_requests_per_minute,
             self.config.burst_size / 2, // Lower burst for expensive operations
+            self.config.max_tenant_entries,
+            Duration::from_secs(self.config.tenant_entry_ttl_secs),
         )
         .await;
 
@@ -199,14 +252,12 @@ impl RateLimitState {
 
     fn check_limiter(limiter: &TenantLimiter, limit: u32) -> RateLimitResult {
         match limiter.check() {
-            Ok(()) => {
-                // Estimate remaining (approximate, not exact)
-                let remaining = limiter
-                    .check()
-                    .map(|()| limit.saturating_sub(1))
-                    .unwrap_or(0);
-                RateLimitResult::Allowed { limit, remaining }
-            }
+            Ok(()) => RateLimitResult::Allowed {
+                limit,
+                // Exact remaining is not exposed by governor's direct limiter API.
+                // Report a conservative approximation without consuming another token.
+                remaining: limit.saturating_sub(1),
+            },
             Err(not_until) => {
                 let retry_after =
                     not_until.wait_time_from(governor::clock::Clock::now(&DefaultClock::default()));
@@ -352,6 +403,7 @@ mod tests {
             default_requests_per_minute: 10,
             url_minting_requests_per_minute: 5,
             burst_size: 5,
+            ..RateLimitConfig::default()
         };
         let state = RateLimitState::new(config);
 
@@ -367,6 +419,7 @@ mod tests {
             default_requests_per_minute: 2,
             url_minting_requests_per_minute: 1,
             burst_size: 1,
+            ..RateLimitConfig::default()
         };
         let state = RateLimitState::new(config);
 
@@ -400,6 +453,7 @@ mod tests {
             default_requests_per_minute: 100,
             url_minting_requests_per_minute: 10,
             burst_size: 10,
+            ..RateLimitConfig::default()
         };
         let state = RateLimitState::new(config);
 
@@ -412,5 +466,77 @@ mod tests {
             result,
             RateLimitResult::Allowed { limit: 100, .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_does_not_double_consume_tokens() {
+        let config = RateLimitConfig {
+            enabled: true,
+            default_requests_per_minute: 2,
+            url_minting_requests_per_minute: 1,
+            burst_size: 2,
+            ..RateLimitConfig::default()
+        };
+        let state = RateLimitState::new(config);
+
+        let first = state.check_default("tenant-1").await;
+        let second = state.check_default("tenant-1").await;
+        let third = state.check_default("tenant-1").await;
+
+        assert!(
+            matches!(first, RateLimitResult::Allowed { .. }),
+            "first request should be allowed",
+        );
+        assert!(
+            matches!(second, RateLimitResult::Allowed { .. }),
+            "second request should be allowed when limit=2",
+        );
+        assert!(
+            matches!(third, RateLimitResult::Limited { .. }),
+            "third request should be rate limited",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_enforces_max_tenant_entries() {
+        let config = RateLimitConfig {
+            enabled: true,
+            default_requests_per_minute: 100,
+            url_minting_requests_per_minute: 10,
+            burst_size: 10,
+            max_tenant_entries: 2,
+            tenant_entry_ttl_secs: 3600,
+        };
+        let state = RateLimitState::new(config);
+
+        let _ = state.check_default("tenant-1").await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let _ = state.check_default("tenant-2").await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let _ = state.check_default("tenant-3").await;
+
+        let limiters = state.default_limiters.read().await;
+        assert_eq!(limiters.len(), 2, "limiter map should stay bounded");
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_prunes_stale_entries() {
+        let config = RateLimitConfig {
+            enabled: true,
+            default_requests_per_minute: 100,
+            url_minting_requests_per_minute: 10,
+            burst_size: 10,
+            max_tenant_entries: 100,
+            tenant_entry_ttl_secs: 1,
+        };
+        let state = RateLimitState::new(config);
+
+        let _ = state.check_default("tenant-1").await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let _ = state.check_default("tenant-2").await;
+
+        let limiters = state.default_limiters.read().await;
+        assert_eq!(limiters.len(), 1, "stale entries should be pruned");
+        assert!(limiters.contains_key("tenant-2"));
     }
 }

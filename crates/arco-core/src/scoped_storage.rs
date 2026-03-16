@@ -112,8 +112,16 @@ impl ScopedStorage {
         Ok(())
     }
 
-    /// Validates a relative path for path traversal attacks.
-    fn validate_path(path: &str) -> Result<()> {
+    /// Validates a relative path for traversal and encoding attacks.
+    ///
+    /// This is the canonical path validator used by scoped APIs to reject
+    /// absolute paths, `.`/`..` segments, percent-encoding tricks, and control
+    /// characters before path-prefixing is applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidInput` when the path is unsafe.
+    pub fn validate_path(path: &str) -> Result<()> {
         if path.starts_with('/') || path.starts_with('\\') {
             return Err(Error::InvalidInput(format!(
                 "absolute paths not allowed: {path}"

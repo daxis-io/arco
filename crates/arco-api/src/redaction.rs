@@ -62,20 +62,19 @@ fn redact_query_fallback(value: &str) -> String {
             continue;
         };
 
+        redacted_query.push_str(key);
+        redacted_query.push('=');
         if is_sensitive_query_key(key) {
-            redacted_query.push_str(key);
-            redacted_query.push_str("=REDACTED");
+            redacted_query.push_str("REDACTED");
         } else {
-            redacted_query.push_str(key);
-            redacted_query.push('=');
             redacted_query.push_str(raw_value);
         }
     }
 
-    match fragment {
-        Some(fragment) => format!("{prefix}{redacted_query}#{fragment}"),
-        None => format!("{prefix}{redacted_query}"),
-    }
+    fragment.map_or_else(
+        || format!("{prefix}{redacted_query}"),
+        |fragment| format!("{prefix}{redacted_query}#{fragment}"),
+    )
 }
 
 fn is_sensitive_query_key(key: &str) -> bool {

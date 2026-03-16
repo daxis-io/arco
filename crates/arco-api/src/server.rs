@@ -986,37 +986,37 @@ fn has_valid_shared_secret(headers: &HeaderMap, secret: &str) -> bool {
 }
 
 async fn shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            tracing::error!(error = %err, "failed to install Ctrl+C signal handler");
-        }
-    };
-
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(signal) => signal,
-                Err(err) => {
-                    tracing::error!(error = %err, "failed to install SIGTERM signal handler");
-                    ctrl_c.await;
-                    tracing::info!("Shutdown signal received");
-                    return;
-                }
-            };
-
-        tokio::select! {
-            _ = ctrl_c => {},
-            _ = terminate.recv() => {},
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        ctrl_c.await;
-    }
-
+    wait_for_shutdown_signal().await;
     tracing::info!("Shutdown signal received");
+}
+
+async fn ctrl_c_signal() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        tracing::error!(error = %err, "failed to install Ctrl+C signal handler");
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    let mut terminate =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to install SIGTERM signal handler");
+                ctrl_c_signal().await;
+                return;
+            }
+        };
+
+    tokio::select! {
+        () = ctrl_c_signal() => {},
+        _ = terminate.recv() => {},
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    ctrl_c_signal().await;
 }
 
 /// Builder for constructing a server.

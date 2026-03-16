@@ -1,6 +1,6 @@
 # Remaining Security/Reliability Hardening Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> Execution note: implement this plan task-by-task with verification after each step.
 
 **Goal:** Implement all remaining actionable findings from the audit in priority order across API, catalog reader, and compactor.
 

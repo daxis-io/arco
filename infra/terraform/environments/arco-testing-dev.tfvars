@@ -20,15 +20,15 @@ api_code_version         = "bootstrap-infra-only"
 compactor_tenant_id    = "tenant-dev"
 compactor_workspace_id = "workspace-dev"
 
-api_min_instances       = 0
-api_max_instances       = 1
-compactor_min_instances = 0
-compactor_max_instances = 1
+api_min_instances            = 0
+api_max_instances            = 1
+compactor_min_instances      = 0
+compactor_max_instances      = 1
 background_automation_enabled = false
-api_cpu                 = "1"
-api_memory              = "512Mi"
-compactor_cpu           = "1"
-compactor_memory        = "512Mi"
+api_cpu                      = "1"
+api_memory                   = "512Mi"
+compactor_cpu                = "1"
+compactor_memory             = "512Mi"
 
 api_public           = false
 allowed_cors_origins = "*"

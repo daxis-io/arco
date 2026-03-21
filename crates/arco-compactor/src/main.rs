@@ -1034,7 +1034,7 @@ fn build_router(state: Arc<ServiceState>, metrics_secret: Option<String>) -> Rou
     // Note: /internal/anti-entropy is separate from /internal/sync-compact
     // because they have different IAM requirements:
     // - sync-compact: compactor-fastpath-sa (NO list)
-    // - anti-entropy: compactor-antientropy-sa (WITH list)
+    // - anti-entropy: compactor-antientropy-sa (WITH bucket-level list)
     let base_router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))

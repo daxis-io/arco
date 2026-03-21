@@ -496,12 +496,12 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
 
       env {
         name  = "ARCO_FLOW_QUEUE"
-        value = "arco-flow-dispatch"
+        value = var.flow_dispatch_queue_name
       }
 
       env {
         name  = "ARCO_FLOW_TIMER_QUEUE"
-        value = "arco-flow-timer"
+        value = var.flow_timer_queue_name
       }
 
       env {
@@ -633,7 +633,7 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
 
       env {
         name  = "ARCO_FLOW_QUEUE"
-        value = "arco-flow-dispatch"
+        value = var.flow_dispatch_queue_name
       }
 
       env {

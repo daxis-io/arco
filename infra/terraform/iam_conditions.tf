@@ -1,7 +1,8 @@
 # Gate 5 IAM Prefix Scoping
 #
-# CRITICAL: Use `startsWith()` on the full expected prefix or `matches()` with an
-# anchored regex. Do NOT use `contains()` for prefix scoping.
+# CRITICAL: Use supported IAM CEL functions. For GCS object paths that means
+# extracting the tenant/workspace-relative object path and checking it with
+# `startsWith()`. Do NOT use `contains()` for prefix scoping.
 #
 # Path format: projects/_/buckets/{bucket}/objects/tenant={id}/workspace={id}/{prefix}/...
 #
@@ -24,17 +25,17 @@ locals {
   bucket_objects_prefix = "projects/_/buckets/${google_storage_bucket.catalog.name}/objects/"
 
   # Gate 5 layout: tenant=<id>/workspace=<id>/... with unknown tenant/workspace at deploy time.
-  # Use an anchored regex so the protected prefix must occur at the expected path boundary.
-  tenant_workspace_prefix_regex = "^${local.bucket_objects_prefix}tenant=[^/]+/workspace=[^/]+/"
+  # Extract the path segment after tenant/workspace so prefix checks stay anchored.
+  object_path_extract_template = "${local.bucket_objects_prefix}tenant={tenant}/workspace={workspace}/{object_path}"
 
-  ledger_prefix_regex             = "${local.tenant_workspace_prefix_regex}ledger/"
-  locks_prefix_regex              = "${local.tenant_workspace_prefix_regex}locks/"
-  commits_prefix_regex            = "${local.tenant_workspace_prefix_regex}commits/"
-  manifests_prefix_regex          = "${local.tenant_workspace_prefix_regex}manifests/"
-  snapshots_prefix_regex          = "${local.tenant_workspace_prefix_regex}snapshots/"
-  state_prefix_regex              = "${local.tenant_workspace_prefix_regex}state/"
-  anti_entropy_state_prefix_regex = "${local.tenant_workspace_prefix_regex}state/anti_entropy/"
-  l0_prefix_regex                 = "${local.tenant_workspace_prefix_regex}l0/"
+  ledger_object_prefix      = "ledger/"
+  locks_object_prefix       = "locks/"
+  commits_object_prefix     = "commits/"
+  manifests_object_prefix   = "manifests/"
+  snapshots_object_prefix   = "snapshots/"
+  state_object_prefix       = "state/"
+  anti_entropy_state_prefix = "state/anti_entropy/"
+  l0_object_prefix          = "l0/"
 }
 
 # ============================================================================
@@ -51,7 +52,8 @@ resource "google_storage_bucket_iam_member" "api_write_ledger" {
     title       = "ApiWriteLedger"
     description = "Gate 5: API can create ledger events (immutable)"
     expression  = <<-EOT
-      resource.name.matches("${local.ledger_prefix_regex}")
+      resource.type == "storage.googleapis.com/Object" &&
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.ledger_object_prefix}")
     EOT
   }
 }
@@ -66,7 +68,8 @@ resource "google_storage_bucket_iam_member" "api_write_locks" {
     title       = "ApiWriteLocks"
     description = "Gate 5: API can manage distributed locks"
     expression  = <<-EOT
-      resource.name.matches("${local.locks_prefix_regex}")
+      resource.type == "storage.googleapis.com/Object" &&
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.locks_object_prefix}")
     EOT
   }
 }
@@ -81,7 +84,8 @@ resource "google_storage_bucket_iam_member" "api_write_commits" {
     title       = "ApiWriteCommits"
     description = "Gate 5: API can create commit records (immutable)"
     expression  = <<-EOT
-      resource.name.matches("${local.commits_prefix_regex}")
+      resource.type == "storage.googleapis.com/Object" &&
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.commits_object_prefix}")
     EOT
   }
 }
@@ -106,7 +110,8 @@ resource "google_storage_bucket_iam_member" "flow_controller_write_ledger" {
     title       = "FlowControllerWriteLedger"
     description = "Gate 5: Flow controllers can create orchestration ledger events"
     expression  = <<-EOT
-      resource.name.matches("${local.ledger_prefix_regex}")
+      resource.type == "storage.googleapis.com/Object" &&
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.ledger_object_prefix}")
     EOT
   }
 }
@@ -120,8 +125,11 @@ resource "google_storage_bucket_iam_member" "flow_controller_read_objects" {
     title       = "FlowControllerReadObjects"
     description = "Gate 5: Flow controllers can read projections (state/) and ledger events (no list)"
     expression  = <<-EOT
-      resource.name.matches("${local.ledger_prefix_regex}") ||
-      resource.name.matches("${local.state_prefix_regex}")
+      resource.type == "storage.googleapis.com/Object" &&
+      (
+        resource.name.extract("${local.object_path_extract_template}").startsWith("${local.ledger_object_prefix}") ||
+        resource.name.extract("${local.object_path_extract_template}").startsWith("${local.state_object_prefix}")
+      )
     EOT
   }
 }
@@ -146,7 +154,8 @@ resource "google_storage_bucket_iam_member" "compactor_write_snapshots" {
     title       = "CompactorFastpathWriteSnapshots"
     description = "Gate 5: Fast-path compactor can write snapshots/ (Tier-1 Parquet)"
     expression  = <<-EOT
-      resource.name.matches("${local.snapshots_prefix_regex}")
+      resource.type == "storage.googleapis.com/Object" &&
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.snapshots_object_prefix}")
     EOT
   }
 }
@@ -161,7 +170,8 @@ resource "google_storage_bucket_iam_member" "compactor_write_state" {
     title       = "CompactorFastpathWriteState"
     description = "Gate 5: Fast-path compactor can write state/ (Parquet snapshots)"
     expression  = <<-EOT
-      resource.name.matches("${local.state_prefix_regex}")
+      resource.type == "storage.googleapis.com/Object" &&
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.state_object_prefix}")
     EOT
   }
 }
@@ -176,7 +186,8 @@ resource "google_storage_bucket_iam_member" "compactor_write_l0" {
     title       = "CompactorFastpathWriteL0"
     description = "Gate 5: Fast-path compactor can write l0/ tier"
     expression  = <<-EOT
-      resource.name.matches("${local.l0_prefix_regex}")
+      resource.type == "storage.googleapis.com/Object" &&
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.l0_object_prefix}")
     EOT
   }
 }
@@ -191,7 +202,8 @@ resource "google_storage_bucket_iam_member" "compactor_write_manifests" {
     title       = "CompactorFastpathWriteManifests"
     description = "Gate 5: Fast-path compactor can update manifests"
     expression  = <<-EOT
-      resource.name.matches("${local.manifests_prefix_regex}")
+      resource.type == "storage.googleapis.com/Object" &&
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.manifests_object_prefix}")
     EOT
   }
 }
@@ -207,11 +219,14 @@ resource "google_storage_bucket_iam_member" "compactor_fastpath_read_objects" {
     title       = "CompactorFastpathReadObjects"
     description = "Gate 5: Fast-path compactor can read ledger/manifests/state/snapshots/l0"
     expression  = <<-EOT
-      resource.name.matches("${local.ledger_prefix_regex}") ||
-      resource.name.matches("${local.manifests_prefix_regex}") ||
-      resource.name.matches("${local.snapshots_prefix_regex}") ||
-      resource.name.matches("${local.state_prefix_regex}") ||
-      resource.name.matches("${local.l0_prefix_regex}")
+      resource.type == "storage.googleapis.com/Object" &&
+      (
+        resource.name.extract("${local.object_path_extract_template}").startsWith("${local.ledger_object_prefix}") ||
+        resource.name.extract("${local.object_path_extract_template}").startsWith("${local.manifests_object_prefix}") ||
+        resource.name.extract("${local.object_path_extract_template}").startsWith("${local.snapshots_object_prefix}") ||
+        resource.name.extract("${local.object_path_extract_template}").startsWith("${local.state_object_prefix}") ||
+        resource.name.extract("${local.object_path_extract_template}").startsWith("${local.l0_object_prefix}")
+      )
     EOT
   }
 }
@@ -220,24 +235,19 @@ resource "google_storage_bucket_iam_member" "compactor_fastpath_read_objects" {
 # Compactor Anti-Entropy Service Account (Patch 9)
 # ============================================================================
 #
-# Anti-entropy job can LIST ledger/ to discover missed events.
-# This is the ONLY compactor component with list permission.
+# Anti-entropy job should be the only component that lists objects.
+# Cloud Storage evaluates `storage.objects.list` conditions against the bucket,
+# not individual objects, so allow-policy conditions cannot safely enforce a
+# ledger-only list scope here. We therefore grant list at the bucket level to
+# the dedicated anti-entropy service account only.
 #
-# Permissions: ledger/ list + read all
+# Permissions: bucket list + read all
 
-# Anti-entropy can list AND read ledger events (to discover missed notifications)
-resource "google_storage_bucket_iam_member" "compactor_antientropy_list_ledger" {
+# Anti-entropy can list bucket objects to discover missed notifications.
+resource "google_storage_bucket_iam_member" "compactor_antientropy_list_bucket" {
   bucket = google_storage_bucket.catalog.name
-  role   = "roles/storage.objectViewer"
+  role   = google_project_iam_custom_role.storage_object_lister.name
   member = "serviceAccount:${google_service_account.compactor_antientropy.email}"
-
-  condition {
-    title       = "CompactorAntiEntropyListLedger"
-    description = "Gate 5: Anti-entropy can list ledger/ to find missed events"
-    expression  = <<-EOT
-      resource.name.matches("${local.ledger_prefix_regex}")
-    EOT
-  }
 }
 
 # Anti-entropy: Read all objects for state verification
@@ -257,7 +267,8 @@ resource "google_storage_bucket_iam_member" "compactor_antientropy_write_cursor"
     title       = "CompactorAntiEntropyWriteCursor"
     description = "Gate 5: Anti-entropy can update state/anti_entropy cursor"
     expression  = <<-EOT
-      resource.name.matches("${local.anti_entropy_state_prefix_regex}")
+      resource.type == "storage.googleapis.com/Object" &&
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.anti_entropy_state_prefix}")
     EOT
   }
 }

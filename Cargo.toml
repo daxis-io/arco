@@ -26,7 +26,7 @@ homepage = "https://arco.dev"
 documentation = "https://docs.rs/arco"
 keywords = ["lakehouse", "catalog", "orchestration", "data", "serverless"]
 categories = ["database", "data-structures"]
-authors = ["Daxis <engineering@daxis.io>"]
+authors = ["Ethan Urbanski <ethan@daxistech.io>"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

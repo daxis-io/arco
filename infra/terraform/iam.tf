@@ -66,7 +66,7 @@ resource "google_secret_manager_secret_iam_member" "compactor_tenant_secret" {
 # | SA                     | Permissions                          | Purpose               |
 # |------------------------|--------------------------------------|-----------------------|
 # | compactor-fastpath     | state/, l0/, manifests/ write; NO list | Notification consumer |
-# | compactor-antientropy  | ledger/ list; state/ read            | Anti-entropy job      |
+# | compactor-antientropy  | bucket list; state/ read             | Anti-entropy job      |
 #
 # This makes "oops, compactor started listing in hot path" a deploy-time
 # IAM failure, not just a code review issue.
@@ -79,11 +79,11 @@ resource "google_service_account" "compactor" {
   project      = var.project_id
 }
 
-# Anti-entropy compactor: can list ledger to find missed events
+# Anti-entropy compactor: dedicated lister for missed-event discovery
 resource "google_service_account" "compactor_antientropy" {
   account_id   = "arco-compactor-ae-${var.environment}"
   display_name = "Arco Compactor Anti-Entropy (${var.environment})"
-  description  = "Anti-entropy job - can list ledger/ to discover missed events"
+  description  = "Anti-entropy job - can list bucket objects to discover missed events"
   project      = var.project_id
 }
 
@@ -174,6 +174,16 @@ resource "google_project_iam_custom_role" "storage_object_reader_no_list" {
   title       = "Storage Object Reader (No List)"
   description = "Read individual objects without list capability"
   permissions = ["storage.objects.get"]
+  project     = var.project_id
+}
+
+# Bucket/object listing without object read permission.
+# Cloud Storage evaluates storage.objects.list against the bucket, not per object.
+resource "google_project_iam_custom_role" "storage_object_lister" {
+  role_id     = "storageObjectLister"
+  title       = "Storage Object Lister"
+  description = "List bucket objects without read capability"
+  permissions = ["storage.objects.list"]
   project     = var.project_id
 }
 

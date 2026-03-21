@@ -29,7 +29,7 @@
 //! # IAM (Patch 9)
 //!
 //! Anti-entropy runs with `compactor-antientropy-sa` which has:
-//! - List: `ledger/**` (can enumerate events)
+//! - List: bucket objects (Cloud Storage IAM cannot safely scope list to `ledger/**`)
 //! - Read: `state/**` (can read manifests to check watermark)
 //! - **NO write permission** (only enqueues for reprocessing)
 
@@ -897,7 +897,7 @@ mod tests {
         // The fast-path NotificationConsumer does NOT list.
         // IAM enforces this:
         // - compactor-fastpath-sa: NO list permission
-        // - compactor-antientropy-sa: list permission on ledger/
+        // - compactor-antientropy-sa: bucket-level list permission
         //
         // This separation ensures the hot path is never blocked by list latency.
 

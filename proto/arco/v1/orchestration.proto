@@ -146,13 +146,16 @@ message Run {
 // Run state machine states.
 // Per orchestration design: reliable run state management with recovery.
 //
-// Success/failure reflects readable required outputs, not only worker completion.
+// Output visibility is tracked separately on TaskExecution.output.
+// Consumers that need consumability should inspect required task outputs
+// alongside the run state; by convention, materialize tasks are the
+// required-output-producing task kind.
 enum RunState {
   RUN_STATE_UNSPECIFIED = 0;
   RUN_STATE_PENDING = 1; // Created, waiting to start
   RUN_STATE_RUNNING = 2; // Actively executing tasks
-  RUN_STATE_SUCCEEDED = 3; // All required tasks completed and required outputs are visible
-  RUN_STATE_FAILED = 4; // One or more tasks failed, or a required output failed to publish
+  RUN_STATE_SUCCEEDED = 3; // Run completed successfully
+  RUN_STATE_FAILED = 4; // Run completed with failure
   RUN_STATE_CANCELLED = 5; // Cancelled by user or system
   RUN_STATE_TIMED_OUT = 6; // Exceeded maximum duration
 }

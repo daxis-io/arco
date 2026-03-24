@@ -68,4 +68,36 @@ mod tests {
         assert!(!header.idempotency_key.is_empty());
         assert!(!header.request_id.is_empty());
     }
+
+    #[test]
+    fn task_output_visibility_contract() {
+        let output = TaskOutput {
+            materialization_id: Some(MaterializationId {
+                value: "mat_01HQXYZ".into(),
+            }),
+            files: Vec::new(),
+            row_count: None,
+            byte_size: None,
+            visibility_state: OutputVisibilityState::Pending as i32,
+            published_at: None,
+            publish_error: None,
+        };
+
+        assert!(output.row_count.is_none());
+        assert!(output.byte_size.is_none());
+        assert_eq!(
+            output.visibility_state,
+            OutputVisibilityState::Pending as i32
+        );
+        assert!(output.published_at.is_none());
+        assert!(output.publish_error.is_none());
+    }
+
+    #[test]
+    fn output_visibility_state_enum_values() {
+        assert_eq!(OutputVisibilityState::Unspecified as i32, 0);
+        assert_eq!(OutputVisibilityState::Pending as i32, 1);
+        assert_eq!(OutputVisibilityState::Visible as i32, 2);
+        assert_eq!(OutputVisibilityState::Failed as i32, 3);
+    }
 }

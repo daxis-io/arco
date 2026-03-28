@@ -249,8 +249,8 @@ message TaskOutput {
   repeated FileEntry files = 2;
 
   // Published output statistics. Only meaningful when visibility is VISIBLE.
-  int64 row_count = 3;
-  int64 byte_size = 4;
+  uint64 row_count = 3;
+  uint64 byte_size = 4;
 
   // Visibility/readability of the output object.
   OutputVisibilityState visibility_state = 5;
@@ -303,17 +303,17 @@ enum TaskErrorCategory {
 // Task execution metrics.
 message TaskMetrics {
   // Wall clock duration in milliseconds
-  int64 duration_ms = 1;
+  uint64 duration_ms = 1;
 
   // CPU time in milliseconds
-  int64 cpu_time_ms = 2;
+  uint64 cpu_time_ms = 2;
 
   // Peak memory usage in bytes
-  int64 peak_memory_bytes = 3;
+  uint64 peak_memory_bytes = 3;
 
   // Bytes read from storage
-  int64 bytes_read = 4;
+  uint64 bytes_read = 4;
 
   // Bytes written to storage
-  int64 bytes_written = 5;
+  uint64 bytes_written = 5;
 }

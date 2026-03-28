@@ -122,8 +122,8 @@ message MaterializationCompleted {
   repeated FileEntry files = 6;
 
   // Statistics
-  int64 row_count = 7;
-  int64 byte_size = 8;
+  uint64 row_count = 7;
+  uint64 byte_size = 8;
   string schema_hash = 9;
 
   // Timing

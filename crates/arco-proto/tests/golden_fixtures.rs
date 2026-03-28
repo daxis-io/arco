@@ -5,33 +5,17 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use arco_proto::PartitionKey;
+use arco_proto::{FileEntry, PartitionKey, ScalarValue};
+use serde_json::{Value as JsonValue, json};
 
 #[test]
 fn test_partition_key_golden_fixture() {
-    let fixture = include_str!("../fixtures/partition_key_v1.json");
+    let fixture = include_str!("../fixtures/partition_key_v2.json");
     let pk: PartitionKey = serde_json::from_str(fixture).expect("golden fixture should parse");
+    let actual = serde_json::to_value(&pk).expect("should serialize");
+    let expected: JsonValue = serde_json::from_str(fixture).expect("fixture should be valid JSON");
 
-    // Verify structure
-    assert_eq!(pk.dimensions.len(), 2);
-    assert!(pk.dimensions.contains_key("date"));
-    assert!(pk.dimensions.contains_key("region"));
-
-    // Re-serialize and verify stability (no field reordering)
-    let reserialized = serde_json::to_string(&pk).expect("should serialize");
-    let reparsed: PartitionKey = serde_json::from_str(&reserialized).expect("should reparse");
-
-    assert_eq!(pk.dimensions.len(), reparsed.dimensions.len());
-}
-
-#[test]
-fn test_fixture_backward_compatibility() {
-    // This test ensures old fixtures remain parseable
-    // Add new versions as fixtures/partition_key_v2.json etc.
-
-    let v1_fixture = include_str!("../fixtures/partition_key_v1.json");
-    let _: PartitionKey =
-        serde_json::from_str(v1_fixture).expect("v1 fixture must remain parseable");
+    assert_eq!(actual, expected);
 }
 
 #[test]
@@ -53,7 +37,7 @@ fn test_id_types_serde_roundtrip() {
     assert_eq!(workspace.value, parsed.value);
 
     let asset = AssetId {
-        value: "asset_123".to_string(),
+        value: "01959a32-4517-7d8b-a13d-5d3e8f840f13".to_string(),
     };
     let json = serde_json::to_string(&asset).expect("serialize");
     let parsed: AssetId = serde_json::from_str(&json).expect("deserialize");
@@ -62,37 +46,39 @@ fn test_id_types_serde_roundtrip() {
 
 #[test]
 fn test_scalar_value_variants() {
-    use arco_proto::{ScalarValue, scalar_value::Value};
+    let cases = [
+        json!({ "stringValue": "hello" }),
+        json!({ "int64Value": "42" }),
+        json!({ "boolValue": true }),
+        json!({ "date": { "year": 2025, "month": 1, "day": 15 } }),
+        json!({ "timestamp": "2025-01-15T10:30:00+00:00" }),
+        json!({ "doubleValue": 3.5 }),
+        json!({ "bytesValue": "AQIDBA==" }),
+        json!({ "nullValue": "NULL_VALUE_NULL" }),
+    ];
 
-    // String value
-    let sv = ScalarValue {
-        value: Some(Value::StringValue("hello".to_string())),
-    };
-    let json = serde_json::to_string(&sv).expect("serialize");
-    let parsed: ScalarValue = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(sv, parsed);
+    for case in cases {
+        let parsed: ScalarValue = serde_json::from_value(case.clone()).expect("deserialize");
+        let actual = serde_json::to_value(&parsed).expect("serialize");
+        assert_eq!(actual, case);
+    }
+}
 
-    // Int64 value
-    let sv = ScalarValue {
-        value: Some(Value::Int64Value(42)),
-    };
-    let json = serde_json::to_string(&sv).expect("serialize");
-    let parsed: ScalarValue = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(sv, parsed);
+#[test]
+fn test_file_entry_golden_fixture() {
+    let fixture = json!({
+        "path": "s3://bucket/materializations/part-000.parquet",
+        "sizeBytes": "9223372036854775808",
+        "rowCount": "9223372036854775808",
+        "contentDigest": {
+            "algorithm": "HASH_ALGORITHM_SHA256",
+            "digest": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        },
+        "fileFormat": "FILE_FORMAT_PARQUET"
+    });
+    let entry: FileEntry =
+        serde_json::from_value(fixture.clone()).expect("file entry fixture should parse");
+    let actual = serde_json::to_value(&entry).expect("should serialize");
 
-    // Bool value
-    let sv = ScalarValue {
-        value: Some(Value::BoolValue(true)),
-    };
-    let json = serde_json::to_string(&sv).expect("serialize");
-    let parsed: ScalarValue = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(sv, parsed);
-
-    // Date value
-    let sv = ScalarValue {
-        value: Some(Value::DateValue("2025-01-15".to_string())),
-    };
-    let json = serde_json::to_string(&sv).expect("serialize");
-    let parsed: ScalarValue = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(sv, parsed);
+    assert_eq!(actual, fixture);
 }

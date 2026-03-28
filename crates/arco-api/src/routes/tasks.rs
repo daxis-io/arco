@@ -46,6 +46,7 @@ use arco_flow::orchestration::{
     HeartbeatResponse as FlowHeartbeatResponse, TaskCompletedRequest as FlowTaskCompletedRequest,
     TaskCompletedResponse as FlowTaskCompletedResponse, TaskError as FlowTaskError,
     TaskMetrics as FlowTaskMetrics, TaskOutput as FlowTaskOutput,
+    TaskOutputVisibilityState as FlowTaskOutputVisibilityState,
     TaskStartedRequest as FlowTaskStartedRequest, TaskStartedResponse as FlowTaskStartedResponse,
     WorkerOutcome as FlowWorkerOutcome,
 };
@@ -181,6 +182,18 @@ pub enum WorkerOutcome {
     Cancelled,
 }
 
+/// Worker-reported output visibility state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TaskOutputVisibilityState {
+    /// Output exists but is not consumable yet.
+    Pending,
+    /// Output is published and consumable.
+    Visible,
+    /// Output failed to become visible.
+    Failed,
+}
+
 /// Output from a successful task.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -206,6 +219,15 @@ pub struct TaskOutput {
     /// Delta partition for lineage correlation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta_partition: Option<String>,
+    /// Output visibility state, when the worker/runtime can report it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_visibility_state: Option<TaskOutputVisibilityState>,
+    /// When output became visible, if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<DateTime<Utc>>,
+    /// Publish failure details, if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish_error: Option<String>,
 }
 
 /// Error details from a failed task.
@@ -708,6 +730,16 @@ impl From<WorkerOutcome> for FlowWorkerOutcome {
     }
 }
 
+impl From<TaskOutputVisibilityState> for FlowTaskOutputVisibilityState {
+    fn from(state: TaskOutputVisibilityState) -> Self {
+        match state {
+            TaskOutputVisibilityState::Pending => Self::Pending,
+            TaskOutputVisibilityState::Visible => Self::Visible,
+            TaskOutputVisibilityState::Failed => Self::Failed,
+        }
+    }
+}
+
 impl From<ErrorCategory> for FlowErrorCategory {
     fn from(category: ErrorCategory) -> Self {
         match category {
@@ -731,6 +763,9 @@ impl From<TaskOutput> for FlowTaskOutput {
             delta_table: output.delta_table,
             delta_version: output.delta_version,
             delta_partition: output.delta_partition,
+            output_visibility_state: output.output_visibility_state.map(Into::into),
+            published_at: output.published_at,
+            publish_error: output.publish_error,
         }
     }
 }
@@ -1026,6 +1061,9 @@ mod tests {
             delta_table: Some("analytics.daily".to_string()),
             delta_version: Some(17),
             delta_partition: Some("date=2025-01-15".to_string()),
+            output_visibility_state: Some(TaskOutputVisibilityState::Visible),
+            published_at: Some(Utc::now()),
+            publish_error: None,
         };
 
         let flow_output: FlowTaskOutput = output.into();
@@ -1034,6 +1072,10 @@ mod tests {
         assert_eq!(
             flow_output.delta_partition.as_deref(),
             Some("date=2025-01-15")
+        );
+        assert_eq!(
+            flow_output.output_visibility_state,
+            Some(FlowTaskOutputVisibilityState::Visible)
         );
     }
 

@@ -355,5 +355,6 @@ fn build_tasks(asset_selection: &[String], partition_selection: Option<&[String]
         partition_key: None,
         max_attempts: 3,
         heartbeat_timeout_sec: 300,
+        requires_visible_output: false,
     }]
 }

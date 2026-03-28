@@ -353,6 +353,26 @@ pub enum OrchestrationEventData {
         code_version: Option<String>,
     },
 
+    /// Output visibility changed for a task's successful execution.
+    TaskOutputVisibilityChanged {
+        /// Run identifier.
+        run_id: String,
+        /// Task name within run.
+        task_key: String,
+        /// Attempt number.
+        attempt: u32,
+        /// Attempt identifier - must match active successful attempt for state update.
+        attempt_id: String,
+        /// Latest output visibility state.
+        visibility_state: OutputVisibilityState,
+        /// When output became visible, if applicable.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        published_at: Option<DateTime<Utc>>,
+        /// Publish failure details, if applicable.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        publish_error: Option<String>,
+    },
+
     // ========================================================================
     // Intent Events
     // ========================================================================
@@ -604,6 +624,7 @@ impl OrchestrationEventData {
             Self::TaskStarted { .. } => "TaskStarted",
             Self::TaskHeartbeat { .. } => "TaskHeartbeat",
             Self::TaskFinished { .. } => "TaskFinished",
+            Self::TaskOutputVisibilityChanged { .. } => "TaskOutputVisibilityChanged",
             Self::DispatchRequested { .. } => "DispatchRequested",
             Self::TimerRequested { .. } => "TimerRequested",
             Self::DispatchEnqueued { .. } => "DispatchEnqueued",
@@ -657,6 +678,16 @@ impl OrchestrationEventData {
                 attempt,
                 ..
             } => format!("finished:{run_id}:{task_key}:{attempt}"),
+            Self::TaskOutputVisibilityChanged {
+                run_id,
+                task_key,
+                attempt,
+                visibility_state,
+                ..
+            } => format!(
+                "output_visibility:{run_id}:{task_key}:{attempt}:{}",
+                visibility_state.as_idempotency_segment()
+            ),
 
             Self::DispatchRequested { dispatch_id, .. } => format!("dispatch_req:{dispatch_id}"),
             Self::TimerRequested { timer_id, .. } => format!("timer_req:{timer_id}"),
@@ -809,6 +840,7 @@ impl OrchestrationEventData {
             | Self::TaskStarted { run_id, .. }
             | Self::TaskHeartbeat { run_id, .. }
             | Self::TaskFinished { run_id, .. }
+            | Self::TaskOutputVisibilityChanged { run_id, .. }
             | Self::DispatchRequested { run_id, .. } => Some(run_id),
 
             Self::TimerRequested { run_id, .. }
@@ -880,6 +912,9 @@ pub struct TaskDef {
     /// Heartbeat timeout in seconds.
     #[serde(default = "default_heartbeat_timeout")]
     pub heartbeat_timeout_sec: u32,
+    /// Whether this task's success requires visible output before the run is publicly successful.
+    #[serde(default)]
+    pub requires_visible_output: bool,
 }
 
 fn default_max_attempts() -> u32 {
@@ -892,6 +927,28 @@ fn default_heartbeat_timeout() -> u32 {
 
 fn default_worker_queue() -> String {
     "default-queue".to_string()
+}
+
+/// Public output visibility state collapsed from Arco's internal publication lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputVisibilityState {
+    /// Output exists but is not consumable yet.
+    Pending,
+    /// Output is published and consumable.
+    Visible,
+    /// Output failed to become visible after publish retries.
+    Failed,
+}
+
+impl OutputVisibilityState {
+    fn as_idempotency_segment(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Visible => "visible",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// Task completion outcome.
@@ -1002,5 +1059,40 @@ mod tests {
         };
 
         assert_eq!(data.idempotency_key(), "finished:run123:extract:1");
+    }
+
+    #[test]
+    fn test_task_output_visibility_changed_idempotency_key() {
+        let data = OrchestrationEventData::TaskOutputVisibilityChanged {
+            run_id: "run123".into(),
+            task_key: "extract".into(),
+            attempt: 1,
+            attempt_id: "att456".into(),
+            visibility_state: OutputVisibilityState::Visible,
+            published_at: Some(Utc::now()),
+            publish_error: None,
+        };
+
+        assert_eq!(
+            data.idempotency_key(),
+            "output_visibility:run123:extract:1:visible"
+        );
+    }
+
+    #[test]
+    fn test_task_def_requires_visible_output_defaults_false() {
+        let task_def: TaskDef = serde_json::from_str(
+            r#"{
+                "key":"extract",
+                "depends_on":[],
+                "asset_key":"analytics.extract",
+                "partition_key":null,
+                "max_attempts":3,
+                "heartbeat_timeout_sec":300
+            }"#,
+        )
+        .expect("deserialize task def");
+
+        assert!(!task_def.requires_visible_output);
     }
 }

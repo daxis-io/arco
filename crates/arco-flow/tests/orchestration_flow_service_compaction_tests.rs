@@ -117,6 +117,7 @@ async fn dispatcher_compacts_emitted_events_to_prevent_ledger_spam() -> Result<(
                 partition_key: None,
                 max_attempts: 3,
                 heartbeat_timeout_sec: 300,
+                requires_visible_output: false,
             }],
         },
     );

@@ -234,6 +234,7 @@ pub fn build_task_defs_for_selection(
                 partition_key: partition_key.clone(),
                 max_attempts: 3,
                 heartbeat_timeout_sec: 300,
+                requires_visible_output: true,
             }
         })
         .collect();

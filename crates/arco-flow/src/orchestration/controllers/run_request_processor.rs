@@ -136,6 +136,7 @@ impl RunRequestProcessor {
                 partition_key: partition_key.clone(),
                 max_attempts: self.default_max_attempts,
                 heartbeat_timeout_sec: self.default_heartbeat_timeout_sec,
+                requires_visible_output: true,
             })
             .collect()
     }

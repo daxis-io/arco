@@ -114,6 +114,7 @@ fn orchestration_invariant_events() -> Vec<OrchestrationEvent> {
                 partition_key: None,
                 max_attempts: 3,
                 heartbeat_timeout_sec: 60,
+                requires_visible_output: false,
             }],
         },
         timestamp,

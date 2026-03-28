@@ -4,10 +4,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
+use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
-use axum::Router;
 use chrono::Utc;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -83,14 +83,18 @@ async fn worker_dispatch_posts_started_and_completed_callbacks() -> Result<()> {
     let callback_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
     let callback_addr: SocketAddr = callback_listener.local_addr()?;
     let callback_server = tokio::spawn(async move {
-        axum::serve(callback_listener, callback_app).await.expect("callback server");
+        axum::serve(callback_listener, callback_app)
+            .await
+            .expect("callback server");
     });
 
     let worker_app = arco_flow_worker::build_app("cloud-test-worker".to_string());
     let worker_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
     let worker_addr: SocketAddr = worker_listener.local_addr()?;
     let worker_server = tokio::spawn(async move {
-        axum::serve(worker_listener, worker_app).await.expect("worker server");
+        axum::serve(worker_listener, worker_app)
+            .await
+            .expect("worker server");
     });
 
     let client = reqwest::Client::new();

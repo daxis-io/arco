@@ -24,20 +24,20 @@ api_max_instances       = 5
 compactor_min_instances = 1
 compactor_max_instances = 2
 
-api_cpu         = "2"
-api_memory      = "1Gi"
-compactor_cpu   = "2"
+api_cpu          = "2"
+api_memory       = "1Gi"
+compactor_cpu    = "2"
 compactor_memory = "2Gi"
 
 # Security and networking (staging defaults to private)
-api_public            = false
-allowed_cors_origins  = "https://staging.arco.example.com"
-jwt_secret_name       = "arco-jwt-secret-staging"
-jwt_issuer            = "https://issuer.example.com/staging"
-jwt_audience          = "arco-staging"
-vpc_connector_name    = ""
+api_public           = false
+allowed_cors_origins = "https://staging.arco.example.com"
+jwt_secret_name      = "arco-jwt-secret-staging"
+jwt_issuer           = "https://issuer.example.com/staging"
+jwt_audience         = "arco-staging"
+vpc_connector_name   = ""
 
 # Flow dispatcher Cloud Tasks queues
-flow_dispatch_queue_name    = "arco-flow-dispatch-staging"
-flow_timer_queue_name       = "arco-flow-timers-staging"
+flow_dispatch_queue_name     = "arco-flow-dispatch-staging"
+flow_timer_queue_name        = "arco-flow-timers-staging"
 flow_dispatcher_service_name = "arco-flow-dispatcher-staging"

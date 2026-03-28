@@ -202,7 +202,14 @@ pub fn mint_task_token(
     workspace_id: impl Into<String>,
     now: DateTime<Utc>,
 ) -> Result<MintedTaskToken> {
-    mint_task_token_for_run(config, task_id, tenant_id, workspace_id, None::<String>, now)
+    mint_task_token_for_run(
+        config,
+        task_id,
+        tenant_id,
+        workspace_id,
+        None::<String>,
+        now,
+    )
 }
 
 /// Mints a task-scoped callback token with an optional run identifier.

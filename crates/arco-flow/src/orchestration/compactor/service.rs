@@ -1473,14 +1473,18 @@ fn event_priority(data: &OrchestrationEventData) -> u8 {
         | OrchestrationEventData::SensorEvaluated { .. }
         | OrchestrationEventData::BackfillChunkPlanned { .. } => 0,
         OrchestrationEventData::RunRequested { .. } => 1,
-        _ => 2,
+        // RunTriggered must fold before PlanCreated when the runtime emits them atomically
+        // with the same timestamp, otherwise the run row can miss the task-count update.
+        OrchestrationEventData::RunTriggered { .. } => 2,
+        OrchestrationEventData::PlanCreated { .. } => 3,
+        _ => 4,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orchestration::compactor::fold::{DispatchOutboxRow, TimerRow};
+    use crate::orchestration::compactor::fold::{DispatchOutboxRow, RunState, TimerRow};
     use crate::orchestration::events::{
         OrchestrationEventData, PartitionSelector, RunRequest, SensorEvalStatus, SourceRef,
         TaskDef, TickStatus, TimerType, TriggerInfo, TriggerSource,
@@ -1862,6 +1866,50 @@ mod tests {
                 .contains_key(&("run_01".to_string(), "transform".to_string()))
         );
         assert_eq!(state.dep_satisfaction.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compact_orders_run_triggered_before_plan_created_at_same_timestamp() -> Result<()> {
+        let (compactor, storage) = create_test_compactor().await?;
+
+        let timestamp = Utc::now();
+        let mut run_event =
+            make_named_run_triggered_event("run_01", "plan_01", "evt_02_run_triggered");
+        run_event.timestamp = timestamp;
+
+        let mut plan_event = make_plan_created_event();
+        plan_event.timestamp = timestamp;
+        plan_event.event_id = "evt_01_plan_created".to_string();
+
+        let run_path = orchestration_event_path("2025-01-15", &run_event.event_id);
+        let plan_path = orchestration_event_path("2025-01-15", &plan_event.event_id);
+
+        storage
+            .put_raw(
+                &run_path,
+                Bytes::from(serde_json::to_string(&run_event).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
+        storage
+            .put_raw(
+                &plan_path,
+                Bytes::from(serde_json::to_string(&plan_event).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
+
+        compactor.compact_events(vec![plan_path, run_path]).await?;
+
+        let (_, state) = compactor.load_state().await?;
+        let run = state.runs.get("run_01").expect("run row");
+
+        assert_eq!(run.state, RunState::Running);
+        assert_eq!(run.tasks_total, 2);
+        assert_eq!(run.tasks_completed, 0);
+        assert_eq!(state.tasks.len(), 2);
 
         Ok(())
     }
@@ -2440,6 +2488,35 @@ mod tests {
         };
 
         assert!(event_priority(&tick) < event_priority(&run_requested));
+    }
+
+    #[test]
+    fn event_priority_orders_run_triggered_before_plan_created() {
+        let run_triggered = OrchestrationEventData::RunTriggered {
+            run_id: "run-01".to_string(),
+            plan_id: "plan-01".to_string(),
+            trigger: TriggerInfo::Manual {
+                user_id: "user@example.com".to_string(),
+            },
+            root_assets: vec!["asset.a".to_string()],
+            run_key: None,
+            labels: HashMap::new(),
+            code_version: None,
+        };
+        let plan_created = OrchestrationEventData::PlanCreated {
+            run_id: "run-01".to_string(),
+            plan_id: "plan-01".to_string(),
+            tasks: vec![TaskDef {
+                key: "asset.a".to_string(),
+                depends_on: vec![],
+                asset_key: Some("asset.a".to_string()),
+                partition_key: None,
+                max_attempts: 3,
+                heartbeat_timeout_sec: 300,
+            }],
+        };
+
+        assert!(event_priority(&run_triggered) < event_priority(&plan_created));
     }
 
     #[test]

@@ -718,7 +718,8 @@ mod tests {
         compactor.compact_events(initial_paths).await?;
 
         let (manifest, fold_state) = compactor.load_state().await?;
-        let ready_actions = ReadyDispatchController::with_defaults().reconcile(&manifest, &fold_state);
+        let ready_actions =
+            ReadyDispatchController::with_defaults().reconcile(&manifest, &fold_state);
         assert_eq!(ready_actions.len(), 1);
 
         let ready_events: Vec<_> = ready_actions
@@ -730,16 +731,21 @@ mod tests {
         append_and_compact_events(&ledger, &compactor, ready_events).await?;
 
         let (manifest, fold_state) = compactor.load_state().await?;
-        let dispatch_id =
-            format!("dispatch:{run_id}:{task_key}:1");
+        let dispatch_id = format!("dispatch:{run_id}:{task_key}:1");
         let outbox_row = fold_state
             .dispatch_outbox
             .get(&dispatch_id)
             .expect("dispatch requested must be visible after compaction");
         assert_eq!(outbox_row.status, DispatchStatus::Pending);
 
-        let dispatch_actions = DispatcherController::with_defaults()
-            .reconcile(&manifest, &fold_state.dispatch_outbox.values().cloned().collect::<Vec<_>>());
+        let dispatch_actions = DispatcherController::with_defaults().reconcile(
+            &manifest,
+            &fold_state
+                .dispatch_outbox
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(dispatch_actions.len(), 1);
 
         Ok(())
@@ -810,7 +816,10 @@ mod tests {
             .get(&dispatch_id)
             .expect("dispatch enqueued must be visible after compaction");
         assert_eq!(outbox_row.status, DispatchStatus::Created);
-        assert_eq!(outbox_row.cloud_task_id.as_deref(), Some(cloud_task_id.as_str()));
+        assert_eq!(
+            outbox_row.cloud_task_id.as_deref(),
+            Some(cloud_task_id.as_str())
+        );
 
         Ok(())
     }

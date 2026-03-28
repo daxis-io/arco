@@ -53,7 +53,10 @@ async fn dispatch_handler(
     StatusCode::ACCEPTED
 }
 
-async fn process_dispatch(state: AppState, envelope: WorkerDispatchEnvelope) -> Result<(), reqwest::Error> {
+async fn process_dispatch(
+    state: AppState,
+    envelope: WorkerDispatchEnvelope,
+) -> Result<(), reqwest::Error> {
     let started = TaskStartedRequest {
         attempt: envelope.attempt,
         attempt_id: envelope.attempt_id.clone(),
@@ -91,7 +94,10 @@ async fn process_dispatch(state: AppState, envelope: WorkerDispatchEnvelope) -> 
                 .get("deltaTable")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
-            delta_version: envelope.payload.get("deltaVersion").and_then(serde_json::Value::as_i64),
+            delta_version: envelope
+                .payload
+                .get("deltaVersion")
+                .and_then(serde_json::Value::as_i64),
             delta_partition: envelope
                 .payload
                 .get("deltaPartition")

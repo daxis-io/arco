@@ -3,7 +3,8 @@ project_number = "135245112198"
 region         = "us-central1"
 environment    = "dev"
 
-# Real service deployment uses images built by scripts/build-images.sh.
+# Baseline config for the shared dev/test stack. scripts/deploy.sh overrides
+# project selection and service images with explicit -var arguments at runtime.
 api_image                = "us-central1-docker.pkg.dev/arco-testing-20260320/arco/arco-api:task-token-runid-20260321-1749"
 compactor_image          = "us-central1-docker.pkg.dev/arco-testing-20260320/arco/arco-compactor:dev-latest"
 flow_compactor_image     = "us-central1-docker.pkg.dev/arco-testing-20260320/arco/arco-flow-compactor:dev-latest"

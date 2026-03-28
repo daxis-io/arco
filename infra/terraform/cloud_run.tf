@@ -343,8 +343,7 @@ resource "google_cloud_run_v2_service" "flow_compactor" {
     service_account = google_service_account.compactor.email
 
     scaling {
-      # Keep warm for low-latency compaction in pipeline tests.
-      min_instance_count = 1
+      min_instance_count = var.flow_min_instances
       max_instance_count = 1
     }
 
@@ -457,7 +456,7 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
     service_account = google_service_account.flow_controller.email
 
     scaling {
-      min_instance_count = 1
+      min_instance_count = var.flow_min_instances
       max_instance_count = 1
     }
 
@@ -619,7 +618,7 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
     service_account = google_service_account.flow_controller.email
 
     scaling {
-      min_instance_count = 1
+      min_instance_count = var.flow_min_instances
       max_instance_count = 1
     }
 

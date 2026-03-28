@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VAR_FILE="${1:-environments/arco-testing-dev.tfvars}"
+VAR_FILE="${1:-environments/dev.tfvars}"
 
 require_bin() {
   local bin="$1"
@@ -58,12 +58,29 @@ resource_attr() {
   query ".planned_values.root_module.resources[] | select(.address==\"$address\") | $expr"
 }
 
+cloud_run_address() {
+  local service="$1"
+  case "$service" in
+    flow_timer_ingest)
+      echo "google_cloud_run_v2_service.flow_timer_ingest[0]"
+      ;;
+    *)
+      echo "google_cloud_run_v2_service.${service}"
+      ;;
+  esac
+}
+
 api_ingress="$(resource_attr "google_cloud_run_v2_service.api" ".values.ingress")"
 expect_eq "$api_ingress" "INGRESS_TRAFFIC_ALL" "API must use public ingress for dev callback testing"
 
-for service in flow_compactor flow_dispatcher flow_sweeper flow_worker; do
-  ingress="$(resource_attr "google_cloud_run_v2_service.${service}" ".values.ingress")"
+for service in flow_compactor flow_dispatcher flow_sweeper flow_worker flow_timer_ingest; do
+  ingress="$(resource_attr "$(cloud_run_address "$service")" ".values.ingress")"
   expect_eq "$ingress" "INGRESS_TRAFFIC_ALL" "${service} must use public ingress when no VPC connector is configured"
+done
+
+for service in api compactor flow_compactor flow_dispatcher flow_sweeper flow_timer_ingest flow_worker; do
+  min_instances="$(resource_attr "$(cloud_run_address "$service")" ".values.template[0].scaling[0].min_instance_count")"
+  expect_eq "$min_instances" "0" "${service} must scale to zero in dev"
 done
 
 dispatcher_uri="$(resource_attr "google_cloud_scheduler_job.flow_dispatcher_run[0]" ".values.http_target[0].uri")"

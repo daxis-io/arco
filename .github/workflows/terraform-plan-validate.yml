@@ -27,6 +27,12 @@ jobs:
       - name: Terraform Validate
         run: terraform -chdir=infra/terraform validate
 
+      - name: Verify Deploy Default Dev Tfvars
+        run: bash infra/terraform/tests/verify_deploy_default_dev_tfvars.sh
+
+      - name: Verify Dev Routing Contract
+        run: bash infra/terraform/tests/verify_arco_testing_dev_routing.sh
+
       - name: Terraform Plan (Base Vars, No Refresh)
         env:
           GOOGLE_OAUTH_ACCESS_TOKEN: "ci-plan-noop-token"

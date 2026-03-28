@@ -26,6 +26,14 @@ fail() {
   exit 1
 }
 
+expect_logged_arg() {
+  local expected="$1"
+  local message="$2"
+  if ! grep -F -- "$expected" "$TERRAFORM_LOG" >/dev/null; then
+    fail "$message"
+  fi
+}
+
 cat >"$BIN_DIR/terraform" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -45,8 +53,9 @@ chmod +x "$BIN_DIR/terraform" "$BIN_DIR/gcloud" "$BIN_DIR/curl" "$BIN_DIR/jq"
 
 if ! env \
   PATH="$BIN_DIR:$PATH" \
-  PROJECT_ID="arco-testing-20260320" \
-  PROJECT_NUMBER="135245112198" \
+  PROJECT_ID="runtime-project" \
+  PROJECT_NUMBER="999888777666" \
+  REGION="europe-west1" \
   API_IMAGE="test/api" \
   COMPACTOR_IMAGE="test/compactor" \
   FLOW_COMPACTOR_IMAGE="test/flow-compactor" \
@@ -59,9 +68,29 @@ if ! env \
   fail "deploy.sh dry-run should succeed for ENVIRONMENT=dev without --tfvars"
 fi
 
-EXPECTED_VAR_FILE="-var-file=$ROOT_DIR/infra/terraform/environments/dev.tfvars"
-if ! grep -F -- "$EXPECTED_VAR_FILE" "$TERRAFORM_LOG" >/dev/null; then
-  fail "terraform plan did not use the default dev tfvars path"
-fi
+expect_logged_arg "-var-file=$ROOT_DIR/infra/terraform/environments/dev.tfvars" \
+  "terraform plan did not use the default dev tfvars path"
+expect_logged_arg "-var=project_id=runtime-project" \
+  "terraform plan did not pin project_id to the deploy target"
+expect_logged_arg "-var=project_number=999888777666" \
+  "terraform plan did not pin project_number to the deploy target"
+expect_logged_arg "-var=region=europe-west1" \
+  "terraform plan did not pin region to the deploy target"
+expect_logged_arg "-var=environment=dev" \
+  "terraform plan did not pin environment to the deploy target"
+expect_logged_arg "-var=api_image=test/api" \
+  "terraform plan did not override api_image from the deploy environment"
+expect_logged_arg "-var=compactor_image=test/compactor" \
+  "terraform plan did not override compactor_image from the deploy environment"
+expect_logged_arg "-var=flow_compactor_image=test/flow-compactor" \
+  "terraform plan did not override flow_compactor_image from the deploy environment"
+expect_logged_arg "-var=flow_dispatcher_image=test/flow-dispatcher" \
+  "terraform plan did not override flow_dispatcher_image from the deploy environment"
+expect_logged_arg "-var=flow_sweeper_image=test/flow-sweeper" \
+  "terraform plan did not override flow_sweeper_image from the deploy environment"
+expect_logged_arg "-var=flow_timer_ingest_image=test/flow-timer" \
+  "terraform plan did not override flow_timer_ingest_image from the deploy environment"
+expect_logged_arg "-var=flow_worker_image=test/flow-worker" \
+  "terraform plan did not override flow_worker_image from the deploy environment"
 
-echo "PASS: deploy.sh dry-run resolves the default dev tfvars path"
+echo "PASS: deploy.sh dry-run uses the default dev tfvars path and explicit runtime overrides"

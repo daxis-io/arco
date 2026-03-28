@@ -118,7 +118,7 @@ git commit -m "build: add rust service image pipeline"
 - Modify: `infra/terraform/cloud_run.tf`
 - Modify: `infra/terraform/cloud_run_flow.tf`
 - Modify: `infra/terraform/variables.tf`
-- Modify: `infra/terraform/environments/arco-testing-dev.tfvars`
+- Modify: `infra/terraform/environments/dev.tfvars`
 - Modify: `scripts/deploy.sh`
 
 **Step 1: Write the failing verification**
@@ -135,7 +135,7 @@ Update Terraform and deploy wiring so:
 - API gets task token env vars
 - dispatcher and sweeper get callback base URL plus flow task-token env vars
 - timer-ingest enablement keys off real required images/tenant/workspace inputs
-- `arco-testing-dev.tfvars` points at the Artifact Registry image names instead of placeholder hello images
+- `dev.tfvars` points at the Artifact Registry image names instead of placeholder hello images
 - `scripts/deploy.sh` requires and exports `FLOW_TIMER_INGEST_IMAGE`
 
 **Step 3: Run verification**
@@ -150,7 +150,7 @@ Expected: all commands succeed
 **Step 4: Commit**
 
 ```bash
-git add infra/terraform/cloud_run.tf infra/terraform/cloud_run_flow.tf infra/terraform/variables.tf infra/terraform/environments/arco-testing-dev.tfvars scripts/deploy.sh
+git add infra/terraform/cloud_run.tf infra/terraform/cloud_run_flow.tf infra/terraform/variables.tf infra/terraform/environments/dev.tfvars scripts/deploy.sh
 git commit -m "infra: wire cloud test worker deployment"
 ```
 

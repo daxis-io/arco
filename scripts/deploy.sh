@@ -26,6 +26,7 @@ FLOW_COMPACTOR_HEALTH_TIMEOUT="${FLOW_COMPACTOR_HEALTH_TIMEOUT:-120}"
 API_HEALTH_TIMEOUT="${API_HEALTH_TIMEOUT:-120}"
 HEALTH_CHECK_INTERVAL="${HEALTH_CHECK_INTERVAL:-10}"
 TFVARS_FILE="${TFVARS_FILE:-}"
+TERRAFORM_VAR_ARGS=()
 
 usage() {
   cat <<EOF
@@ -97,6 +98,33 @@ resolve_tfvars_file() {
   fi
 
   echo "${ROOT_DIR}/infra/terraform/environments/${ENVIRONMENT}.tfvars"
+}
+
+resolve_project_number() {
+  if [[ -n "${PROJECT_NUMBER:-}" ]]; then
+    echo "${PROJECT_NUMBER}"
+    return
+  fi
+
+  # Best-effort: avoids Terraform needing Cloud Resource Manager permissions just to read project number.
+  gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>/dev/null || true
+}
+
+build_terraform_var_args() {
+  local project_number="$1"
+  TERRAFORM_VAR_ARGS=(
+    "-var=project_id=${PROJECT_ID}"
+    "-var=project_number=${project_number}"
+    "-var=region=${REGION}"
+    "-var=environment=${ENVIRONMENT}"
+    "-var=api_image=${API_IMAGE}"
+    "-var=compactor_image=${COMPACTOR_IMAGE}"
+    "-var=flow_compactor_image=${FLOW_COMPACTOR_IMAGE}"
+    "-var=flow_dispatcher_image=${FLOW_DISPATCHER_IMAGE}"
+    "-var=flow_sweeper_image=${FLOW_SWEEPER_IMAGE}"
+    "-var=flow_timer_ingest_image=${FLOW_TIMER_INGEST_IMAGE}"
+    "-var=flow_worker_image=${FLOW_WORKER_IMAGE}"
+  )
 }
 
 get_cloud_run_service_json() {
@@ -201,34 +229,28 @@ deploy_terraform() {
     die "tfvars file not found: $tfvars_file"
   fi
 
-  export TF_VAR_api_image="$API_IMAGE"
-  export TF_VAR_compactor_image="$COMPACTOR_IMAGE"
-  export TF_VAR_flow_compactor_image="$FLOW_COMPACTOR_IMAGE"
-  export TF_VAR_flow_dispatcher_image="$FLOW_DISPATCHER_IMAGE"
-  export TF_VAR_flow_sweeper_image="$FLOW_SWEEPER_IMAGE"
-  export TF_VAR_flow_timer_ingest_image="$FLOW_TIMER_INGEST_IMAGE"
-  export TF_VAR_flow_worker_image="$FLOW_WORKER_IMAGE"
-  if [[ -n "${PROJECT_NUMBER:-}" ]]; then
-    export TF_VAR_project_number="$PROJECT_NUMBER"
-  else
-    # Best-effort: avoids Terraform needing Cloud Resource Manager permissions just to read project number.
-    TF_VAR_project_number="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>/dev/null || true)"
-    export TF_VAR_project_number
+  local project_number
+  project_number="$(resolve_project_number)"
+  if [[ -z "$project_number" ]]; then
+    die "PROJECT_NUMBER is required or must be discoverable via gcloud"
   fi
+  build_terraform_var_args "$project_number"
 
   if [[ "$DRY_RUN" == "true" ]]; then
     log "DRY RUN: Would deploy compactors first (terraform plan -target=google_cloud_run_v2_service.compactor -target=google_cloud_run_v2_service.flow_compactor)"
+    log "Using tfvars baseline: $tfvars_file"
     terraform init -upgrade
-    terraform plan -var-file="$tfvars_file" \
+    terraform plan -var-file="$tfvars_file" "${TERRAFORM_VAR_ARGS[@]}" \
       -target=google_cloud_run_v2_service.compactor \
       -target=google_cloud_run_v2_service.flow_compactor
     log "DRY RUN: Would deploy remaining resources (terraform plan)"
-    terraform plan -var-file="$tfvars_file"
+    terraform plan -var-file="$tfvars_file" "${TERRAFORM_VAR_ARGS[@]}"
   else
     terraform init -upgrade
     # HARD GATE ENFORCEMENT:
     # Deploy compactors first, wait for them to become healthy, then deploy API.
-    terraform apply -var-file="$tfvars_file" -auto-approve \
+    log "Using tfvars baseline: $tfvars_file"
+    terraform apply -var-file="$tfvars_file" "${TERRAFORM_VAR_ARGS[@]}" -auto-approve \
       -target=google_cloud_run_v2_service.compactor \
       -target=google_cloud_run_v2_service.flow_compactor
   fi
@@ -241,21 +263,14 @@ deploy_terraform_remaining() {
 
   local tfvars_file
   tfvars_file="$(resolve_tfvars_file)"
-  export TF_VAR_api_image="$API_IMAGE"
-  export TF_VAR_compactor_image="$COMPACTOR_IMAGE"
-  export TF_VAR_flow_compactor_image="$FLOW_COMPACTOR_IMAGE"
-  export TF_VAR_flow_dispatcher_image="$FLOW_DISPATCHER_IMAGE"
-  export TF_VAR_flow_sweeper_image="$FLOW_SWEEPER_IMAGE"
-  export TF_VAR_flow_timer_ingest_image="$FLOW_TIMER_INGEST_IMAGE"
-  export TF_VAR_flow_worker_image="$FLOW_WORKER_IMAGE"
-  if [[ -n "${PROJECT_NUMBER:-}" ]]; then
-    export TF_VAR_project_number="$PROJECT_NUMBER"
-  else
-    TF_VAR_project_number="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>/dev/null || true)"
-    export TF_VAR_project_number
+  local project_number
+  project_number="$(resolve_project_number)"
+  if [[ -z "$project_number" ]]; then
+    die "PROJECT_NUMBER is required or must be discoverable via gcloud"
   fi
+  build_terraform_var_args "$project_number"
 
-  terraform apply -var-file="$tfvars_file" -auto-approve
+  terraform apply -var-file="$tfvars_file" "${TERRAFORM_VAR_ARGS[@]}" -auto-approve
 
   popd >/dev/null
 }

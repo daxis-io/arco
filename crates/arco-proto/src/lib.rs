@@ -9,8 +9,11 @@
 
 #[allow(clippy::all, clippy::cargo, clippy::nursery, clippy::pedantic)]
 mod generated {
+    #![allow(unused_qualifications)]
+
     // Include generated code; all types are re-exported at crate root.
     include!(concat!(env!("OUT_DIR"), "/arco.v1.rs"));
+    include!(concat!(env!("OUT_DIR"), "/arco.v1.serde.rs"));
 }
 
 pub use generated::*;
@@ -18,6 +21,7 @@ pub use generated::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value as JsonValue;
 
     #[test]
     fn test_tenant_id_roundtrip() {
@@ -32,19 +36,14 @@ mod tests {
     fn test_partition_key_serialization() -> Result<(), prost::DecodeError> {
         use prost::Message;
 
-        let mut dimensions = std::collections::BTreeMap::new();
-        dimensions.insert(
-            "date".to_string(),
-            ScalarValue {
-                value: Some(scalar_value::Value::DateValue("2025-01-15".to_string())),
-            },
-        );
-
-        let pk = PartitionKey { dimensions };
+        let fixture = include_str!("../fixtures/partition_key_v2.json");
+        let pk: PartitionKey = serde_json::from_str(fixture).expect("v2 fixture should parse");
         let encoded = pk.encode_to_vec();
         let decoded = PartitionKey::decode(encoded.as_slice())?;
+        let original: JsonValue = serde_json::from_str(fixture).expect("fixture should be valid JSON");
+        let decoded_json = serde_json::to_value(&decoded).expect("decoded partition key should serialize");
 
-        assert_eq!(decoded.dimensions.len(), 1);
+        assert_eq!(decoded_json, original);
         Ok(())
     }
 

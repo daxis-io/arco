@@ -1,0 +1,20 @@
+{
+  "dimensions": [
+    {
+      "key": "date",
+      "value": {
+        "date": {
+          "year": 2025,
+          "month": 1,
+          "day": 15
+        }
+      }
+    },
+    {
+      "key": "region",
+      "value": {
+        "stringValue": "us-east"
+      }
+    }
+  ]
+}

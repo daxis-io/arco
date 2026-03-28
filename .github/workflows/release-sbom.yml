@@ -145,7 +145,7 @@ jobs:
           toolchain: 1.85
 
       - name: Install cargo-sbom
-        uses: taiki-e/install-action@a37010ded18ff788be4440302bd6830b1ae50d8b # v2
+        uses: taiki-e/install-action@cbb1dcaa26e1459e2876c39f61c1e22a1258aac5 # v2
         with:
           tool: cargo-sbom@0.10.0
 
@@ -181,7 +181,7 @@ jobs:
             ${{ env.SBOM_SHA256_FILE }}
 
       - name: Attach SBOM files to GitHub release
-        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           files: |

@@ -46,6 +46,7 @@ use super::parquet_util::{
 
 const SENSOR_EVAL_RETENTION_DAYS: i64 = 30;
 const IDEMPOTENCY_KEY_RETENTION_DAYS: i64 = 30;
+const COMPACTION_PUBLISH_RETRY_DELAYS_MS: [u64; 3] = [0, 5, 25];
 
 /// Internal durability mode for orchestration compaction acknowledgements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +78,61 @@ impl CompactionVisibility {
 }
 
 type PublishOutcome = CompactionVisibility;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishRetryReason {
+    SnapshotConflict,
+    ConcurrentWrite,
+}
+
+impl PublishRetryReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SnapshotConflict => "snapshot_conflict",
+            Self::ConcurrentWrite => "concurrent_write",
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum PublishManifestError {
+    #[error("storage error: immutable manifest snapshot already exists: {snapshot_path}")]
+    SnapshotConflict { snapshot_path: String },
+    #[error("storage error: manifest publish failed - concurrent write")]
+    ConcurrentWrite,
+    #[error(transparent)]
+    Other(#[from] Error),
+}
+
+impl PublishManifestError {
+    const fn retry_reason(&self) -> Option<PublishRetryReason> {
+        match self {
+            Self::SnapshotConflict { .. } => Some(PublishRetryReason::SnapshotConflict),
+            Self::ConcurrentWrite => Some(PublishRetryReason::ConcurrentWrite),
+            Self::Other(_) => None,
+        }
+    }
+}
+
+impl From<PublishManifestError> for Error {
+    fn from(value: PublishManifestError) -> Self {
+        match value {
+            PublishManifestError::SnapshotConflict { snapshot_path } => Self::storage(format!(
+                "immutable manifest snapshot already exists: {snapshot_path}"
+            )),
+            PublishManifestError::ConcurrentWrite => {
+                Self::storage("manifest publish failed - concurrent write")
+            }
+            PublishManifestError::Other(error) => error,
+        }
+    }
+}
+
+impl From<arco_core::error::Error> for PublishManifestError {
+    fn from(value: arco_core::error::Error) -> Self {
+        Self::Other(Error::from(value))
+    }
+}
 
 /// Micro-compactor for orchestration events.
 ///
@@ -244,21 +300,222 @@ impl MicroCompactor {
         expected_epoch: Option<u64>,
     ) -> Result<CompactionResult> {
         let ack_started = Instant::now();
+        'retry: for retry_attempt in 0..=COMPACTION_PUBLISH_RETRY_DELAYS_MS.len() {
+            // Load current manifest + version for CAS
+            let (mut manifest, pointer_version, previous_pointer) =
+                self.read_manifest_with_version().await?;
+            validate_expected_epoch(expected_epoch, previous_pointer.as_ref())?;
 
-        // Load current manifest + version for CAS
-        let (mut manifest, pointer_version, previous_pointer) =
-            self.read_manifest_with_version().await?;
-        validate_expected_epoch(expected_epoch, previous_pointer.as_ref())?;
+            if event_paths.is_empty() {
+                let mut visibility_status = CompactionVisibility::Visible;
+                if pointer_version.is_none() {
+                    match self
+                        .publish_manifest(&manifest, None, previous_pointer.as_ref())
+                        .await
+                    {
+                        Ok(outcome) => visibility_status = outcome,
+                        Err(publish_error) => {
+                            if let Some(delay_ms) =
+                                should_retry_publish_error(&publish_error, retry_attempt)
+                            {
+                                record_compaction_publish_retry(
+                                    self.durability_mode,
+                                    publish_error
+                                        .retry_reason()
+                                        .expect("retryable publish error must have reason"),
+                                    retry_attempt + 1,
+                                    delay_ms,
+                                );
+                                wait_for_publish_retry(delay_ms).await;
+                                continue 'retry;
+                            }
+                            let error: Error = publish_error.into();
+                            record_compaction_metrics(
+                                self.durability_mode,
+                                ack_started.elapsed(),
+                                &manifest,
+                                CompactionVisibility::Visible,
+                                "error",
+                            );
+                            return Err(error);
+                        }
+                    }
+                }
+                record_compaction_metrics(
+                    self.durability_mode,
+                    ack_started.elapsed(),
+                    &manifest,
+                    visibility_status,
+                    "success",
+                );
+                return Ok(CompactionResult {
+                    events_processed: 0,
+                    delta_id: None,
+                    manifest_revision: manifest.revision_ulid,
+                    visibility_status,
+                });
+            }
 
-        if event_paths.is_empty() {
+            // Load current fold state from base + L0 deltas
+            let mut state = self.load_current_state(&manifest).await?;
+            state.tenant_secret.clone_from(&self.tenant_secret);
+            let base_state = state.clone();
+
+            // Process events
+            let mut events = Vec::new();
+            for path in &event_paths {
+                let data = self.storage.get_raw(path).await?;
+                let event: OrchestrationEvent =
+                    serde_json::from_slice(&data).map_err(|e| Error::Serialization {
+                        message: format!("failed to parse event at {path}: {e}"),
+                    })?;
+                events.push((path.clone(), event));
+            }
+
+            // Sort by timestamp with a stable ordering for atomic batches.
+            events.sort_by(|a, b| {
+                let a_event = &a.1;
+                let b_event = &b.1;
+                let ordering = a_event.timestamp.cmp(&b_event.timestamp);
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+                let ordering = event_priority(&a_event.data).cmp(&event_priority(&b_event.data));
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+                a_event.event_id.cmp(&b_event.event_id)
+            });
+
+            // Fold events into state
+            for (_, event) in &events {
+                state.fold_event(event);
+            }
+
+            let retention_now = retention_reference_time_for_events(&events);
+            prune_sensor_evals(&mut state, retention_now);
+            prune_idempotency_keys(&mut state, retention_now);
+
+            // Compute delta state (rows changed by this batch)
+            let delta_state = delta_from_states(&base_state, &state);
+            let has_delta = !delta_state_is_empty(&delta_state);
+
+            // Write L0 delta Parquet files if anything changed
+            let mut delta_id = None;
+            let mut delta_paths = TablePaths::default();
+            if has_delta {
+                let new_delta_id = Ulid::new().to_string();
+                delta_paths = self
+                    .write_delta_parquet(&new_delta_id, &delta_state)
+                    .await?;
+                delta_id = Some(new_delta_id);
+            }
+
+            // Count rows
+            let row_counts = RowCounts {
+                runs: u32::try_from(delta_state.runs.len()).unwrap_or(u32::MAX),
+                tasks: u32::try_from(delta_state.tasks.len()).unwrap_or(u32::MAX),
+                dep_satisfaction: u32::try_from(delta_state.dep_satisfaction.len())
+                    .unwrap_or(u32::MAX),
+                timers: u32::try_from(delta_state.timers.len()).unwrap_or(u32::MAX),
+                dispatch_outbox: u32::try_from(delta_state.dispatch_outbox.len())
+                    .unwrap_or(u32::MAX),
+                sensor_state: u32::try_from(delta_state.sensor_state.len()).unwrap_or(u32::MAX),
+                sensor_evals: u32::try_from(delta_state.sensor_evals.len()).unwrap_or(u32::MAX),
+                run_key_index: u32::try_from(delta_state.run_key_index.len()).unwrap_or(u32::MAX),
+                run_key_conflicts: u32::try_from(delta_state.run_key_conflicts.len())
+                    .unwrap_or(u32::MAX),
+                partition_status: u32::try_from(delta_state.partition_status.len())
+                    .unwrap_or(u32::MAX),
+                idempotency_keys: u32::try_from(delta_state.idempotency_keys.len())
+                    .unwrap_or(u32::MAX),
+                schedule_definitions: u32::try_from(delta_state.schedule_definitions.len())
+                    .unwrap_or(u32::MAX),
+                schedule_state: u32::try_from(delta_state.schedule_state.len()).unwrap_or(u32::MAX),
+                schedule_ticks: u32::try_from(delta_state.schedule_ticks.len()).unwrap_or(u32::MAX),
+                backfills: u32::try_from(delta_state.backfills.len()).unwrap_or(u32::MAX),
+                backfill_chunks: u32::try_from(delta_state.backfill_chunks.len())
+                    .unwrap_or(u32::MAX),
+            };
+
+            // Create L0 delta entry when changes exist
+            let first_event = events
+                .first()
+                .map(|e| e.1.event_id.clone())
+                .unwrap_or_default();
+            let last_event = events
+                .last()
+                .map(|e| e.1.event_id.clone())
+                .unwrap_or_default();
+            let delta_changed = if let Some(delta_id) = delta_id.clone() {
+                let delta = L0Delta {
+                    delta_id,
+                    created_at: Utc::now(),
+                    event_range: EventRange {
+                        from_event: first_event.clone(),
+                        to_event: last_event.clone(),
+                        event_count: u32::try_from(events.len()).unwrap_or(u32::MAX),
+                    },
+                    tables: delta_paths,
+                    row_counts,
+                };
+
+                // Update manifest
+                manifest.l0_deltas.push(delta);
+                manifest.l0_count += 1;
+                true
+            } else {
+                false
+            };
+
+            let watermark_changed =
+                update_watermarks(&mut manifest, &events, &last_event, self.durability_mode);
+            let manifest_changed = delta_changed || watermark_changed;
+
             let mut visibility_status = CompactionVisibility::Visible;
-            if pointer_version.is_none() {
+            let manifest_revision = if manifest_changed {
+                let previous_manifest_path = previous_pointer.as_ref().map_or_else(
+                    || orchestration_manifest_path().to_string(),
+                    |p| p.manifest_path.clone(),
+                );
+
+                manifest.manifest_id =
+                    next_manifest_id(&manifest.manifest_id).map_err(Error::serialization)?;
+                manifest.previous_manifest_path = Some(previous_manifest_path);
+                let pointer_epoch = previous_pointer.as_ref().map_or(0, |p| p.epoch);
+                manifest.epoch = manifest.epoch.max(pointer_epoch);
+                if let Some(expected_epoch) = expected_epoch {
+                    manifest.epoch = manifest.epoch.max(expected_epoch);
+                }
+
+                let new_revision = Ulid::new().to_string();
+                manifest.revision_ulid.clone_from(&new_revision);
+                manifest.published_at = Utc::now();
                 match self
-                    .publish_manifest(&manifest, None, previous_pointer.as_ref())
+                    .publish_manifest(
+                        &manifest,
+                        pointer_version.as_deref(),
+                        previous_pointer.as_ref(),
+                    )
                     .await
                 {
                     Ok(outcome) => visibility_status = outcome,
-                    Err(error) => {
+                    Err(publish_error) => {
+                        if let Some(delay_ms) =
+                            should_retry_publish_error(&publish_error, retry_attempt)
+                        {
+                            record_compaction_publish_retry(
+                                self.durability_mode,
+                                publish_error
+                                    .retry_reason()
+                                    .expect("retryable publish error must have reason"),
+                                retry_attempt + 1,
+                                delay_ms,
+                            );
+                            wait_for_publish_retry(delay_ms).await;
+                            continue 'retry;
+                        }
+                        let error: Error = publish_error.into();
                         record_compaction_metrics(
                             self.durability_mode,
                             ack_started.elapsed(),
@@ -269,7 +526,11 @@ impl MicroCompactor {
                         return Err(error);
                     }
                 }
-            }
+                new_revision
+            } else {
+                manifest.revision_ulid.clone()
+            };
+
             record_compaction_metrics(
                 self.durability_mode,
                 ack_started.elapsed(),
@@ -277,183 +538,16 @@ impl MicroCompactor {
                 visibility_status,
                 "success",
             );
+
             return Ok(CompactionResult {
-                events_processed: 0,
-                delta_id: None,
-                manifest_revision: manifest.revision_ulid,
+                events_processed: u32::try_from(events.len()).unwrap_or(u32::MAX),
+                delta_id,
+                manifest_revision,
                 visibility_status,
             });
         }
 
-        // Load current fold state from base + L0 deltas
-        let mut state = self.load_current_state(&manifest).await?;
-        state.tenant_secret.clone_from(&self.tenant_secret);
-        let base_state = state.clone();
-
-        // Process events
-        let mut events = Vec::new();
-        for path in &event_paths {
-            let data = self.storage.get_raw(path).await?;
-            let event: OrchestrationEvent =
-                serde_json::from_slice(&data).map_err(|e| Error::Serialization {
-                    message: format!("failed to parse event at {path}: {e}"),
-                })?;
-            events.push((path.clone(), event));
-        }
-
-        // Sort by timestamp with a stable ordering for atomic batches.
-        events.sort_by(|a, b| {
-            let a_event = &a.1;
-            let b_event = &b.1;
-            let ordering = a_event.timestamp.cmp(&b_event.timestamp);
-            if ordering != Ordering::Equal {
-                return ordering;
-            }
-            let ordering = event_priority(&a_event.data).cmp(&event_priority(&b_event.data));
-            if ordering != Ordering::Equal {
-                return ordering;
-            }
-            a_event.event_id.cmp(&b_event.event_id)
-        });
-
-        // Fold events into state
-        for (_, event) in &events {
-            state.fold_event(event);
-        }
-
-        let retention_now = retention_reference_time_for_events(&events);
-        prune_sensor_evals(&mut state, retention_now);
-        prune_idempotency_keys(&mut state, retention_now);
-
-        // Compute delta state (rows changed by this batch)
-        let delta_state = delta_from_states(&base_state, &state);
-        let has_delta = !delta_state_is_empty(&delta_state);
-
-        // Write L0 delta Parquet files if anything changed
-        let mut delta_id = None;
-        let mut delta_paths = TablePaths::default();
-        if has_delta {
-            let new_delta_id = Ulid::new().to_string();
-            delta_paths = self
-                .write_delta_parquet(&new_delta_id, &delta_state)
-                .await?;
-            delta_id = Some(new_delta_id);
-        }
-
-        // Count rows
-        let row_counts = RowCounts {
-            runs: u32::try_from(delta_state.runs.len()).unwrap_or(u32::MAX),
-            tasks: u32::try_from(delta_state.tasks.len()).unwrap_or(u32::MAX),
-            dep_satisfaction: u32::try_from(delta_state.dep_satisfaction.len()).unwrap_or(u32::MAX),
-            timers: u32::try_from(delta_state.timers.len()).unwrap_or(u32::MAX),
-            dispatch_outbox: u32::try_from(delta_state.dispatch_outbox.len()).unwrap_or(u32::MAX),
-            sensor_state: u32::try_from(delta_state.sensor_state.len()).unwrap_or(u32::MAX),
-            sensor_evals: u32::try_from(delta_state.sensor_evals.len()).unwrap_or(u32::MAX),
-            run_key_index: u32::try_from(delta_state.run_key_index.len()).unwrap_or(u32::MAX),
-            run_key_conflicts: u32::try_from(delta_state.run_key_conflicts.len())
-                .unwrap_or(u32::MAX),
-            partition_status: u32::try_from(delta_state.partition_status.len()).unwrap_or(u32::MAX),
-            idempotency_keys: u32::try_from(delta_state.idempotency_keys.len()).unwrap_or(u32::MAX),
-            schedule_definitions: u32::try_from(delta_state.schedule_definitions.len())
-                .unwrap_or(u32::MAX),
-            schedule_state: u32::try_from(delta_state.schedule_state.len()).unwrap_or(u32::MAX),
-            schedule_ticks: u32::try_from(delta_state.schedule_ticks.len()).unwrap_or(u32::MAX),
-            backfills: u32::try_from(delta_state.backfills.len()).unwrap_or(u32::MAX),
-            backfill_chunks: u32::try_from(delta_state.backfill_chunks.len()).unwrap_or(u32::MAX),
-        };
-
-        // Create L0 delta entry when changes exist
-        let first_event = events
-            .first()
-            .map(|e| e.1.event_id.clone())
-            .unwrap_or_default();
-        let last_event = events
-            .last()
-            .map(|e| e.1.event_id.clone())
-            .unwrap_or_default();
-        let delta_changed = if let Some(delta_id) = delta_id.clone() {
-            let delta = L0Delta {
-                delta_id,
-                created_at: Utc::now(),
-                event_range: EventRange {
-                    from_event: first_event.clone(),
-                    to_event: last_event.clone(),
-                    event_count: u32::try_from(events.len()).unwrap_or(u32::MAX),
-                },
-                tables: delta_paths,
-                row_counts,
-            };
-
-            // Update manifest
-            manifest.l0_deltas.push(delta);
-            manifest.l0_count += 1;
-            true
-        } else {
-            false
-        };
-
-        let watermark_changed =
-            update_watermarks(&mut manifest, &events, &last_event, self.durability_mode);
-        let manifest_changed = delta_changed || watermark_changed;
-
-        let mut visibility_status = CompactionVisibility::Visible;
-        let manifest_revision = if manifest_changed {
-            let previous_manifest_path = previous_pointer.as_ref().map_or_else(
-                || orchestration_manifest_path().to_string(),
-                |p| p.manifest_path.clone(),
-            );
-
-            manifest.manifest_id =
-                next_manifest_id(&manifest.manifest_id).map_err(Error::serialization)?;
-            manifest.previous_manifest_path = Some(previous_manifest_path);
-            let pointer_epoch = previous_pointer.as_ref().map_or(0, |p| p.epoch);
-            manifest.epoch = manifest.epoch.max(pointer_epoch);
-            if let Some(expected_epoch) = expected_epoch {
-                manifest.epoch = manifest.epoch.max(expected_epoch);
-            }
-
-            let new_revision = Ulid::new().to_string();
-            manifest.revision_ulid.clone_from(&new_revision);
-            manifest.published_at = Utc::now();
-            match self
-                .publish_manifest(
-                    &manifest,
-                    pointer_version.as_deref(),
-                    previous_pointer.as_ref(),
-                )
-                .await
-            {
-                Ok(outcome) => visibility_status = outcome,
-                Err(error) => {
-                    record_compaction_metrics(
-                        self.durability_mode,
-                        ack_started.elapsed(),
-                        &manifest,
-                        CompactionVisibility::Visible,
-                        "error",
-                    );
-                    return Err(error);
-                }
-            }
-            new_revision
-        } else {
-            manifest.revision_ulid.clone()
-        };
-
-        record_compaction_metrics(
-            self.durability_mode,
-            ack_started.elapsed(),
-            &manifest,
-            visibility_status,
-            "success",
-        );
-
-        Ok(CompactionResult {
-            events_processed: u32::try_from(events.len()).unwrap_or(u32::MAX),
-            delta_id,
-            manifest_revision,
-            visibility_status,
-        })
+        unreachable!("bounded compaction publish retry loop must return or continue")
     }
 
     /// Reads the current manifest and pointer CAS version.
@@ -860,7 +954,7 @@ impl MicroCompactor {
         manifest: &OrchestrationManifest,
         current_pointer_version: Option<&str>,
         previous_pointer: Option<&OrchestrationManifestPointer>,
-    ) -> Result<PublishOutcome> {
+    ) -> std::result::Result<PublishOutcome, PublishManifestError> {
         let snapshot_path = orchestration_manifest_snapshot_path(&manifest.manifest_id);
         let json = serde_json::to_string_pretty(manifest).map_err(|e| Error::Serialization {
             message: format!("failed to serialize manifest: {e}"),
@@ -877,9 +971,7 @@ impl MicroCompactor {
         match snapshot_result {
             WriteResult::Success { .. } => {}
             WriteResult::PreconditionFailed { .. } => {
-                return Err(Error::storage(format!(
-                    "immutable manifest snapshot already exists: {snapshot_path}"
-                )));
+                return Err(PublishManifestError::SnapshotConflict { snapshot_path });
             }
         }
 
@@ -890,7 +982,7 @@ impl MicroCompactor {
                 Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
                     None
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(Error::from(e).into()),
             },
             None => None,
         };
@@ -942,7 +1034,7 @@ impl MicroCompactor {
                     );
                     Ok(PublishOutcome::PersistedNotVisible)
                 } else {
-                    Err(Error::storage("manifest publish failed - concurrent write"))
+                    Err(PublishManifestError::ConcurrentWrite)
                 }
             }
         }
@@ -1425,6 +1517,49 @@ fn record_compaction_metrics(
     });
 }
 
+fn should_retry_publish_error(
+    publish_error: &PublishManifestError,
+    retry_attempt: usize,
+) -> Option<u64> {
+    match publish_error.retry_reason() {
+        // Concurrent compactions deriving the next manifest ID from the same base
+        // manifest collide on the immutable snapshot path before pointer CAS.
+        Some(PublishRetryReason::SnapshotConflict) => COMPACTION_PUBLISH_RETRY_DELAYS_MS
+            .get(retry_attempt)
+            .copied(),
+        Some(PublishRetryReason::ConcurrentWrite) | None => None,
+    }
+}
+
+async fn wait_for_publish_retry(delay_ms: u64) {
+    if delay_ms == 0 {
+        tokio::task::yield_now().await;
+    } else {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
+}
+
+fn record_compaction_publish_retry(
+    durability_mode: DurabilityMode,
+    reason: PublishRetryReason,
+    attempt: usize,
+    delay_ms: u64,
+) {
+    tracing::warn!(
+        attempt,
+        reason = reason.as_str(),
+        delay_ms,
+        "retrying compaction after concurrent manifest publish race"
+    );
+    counter!(
+        metric_names::ORCH_COMPACTOR_PUBLISH_RETRIES_TOTAL,
+        metric_labels::DURABILITY_MODE => durability_mode_label(durability_mode).to_string(),
+        metric_labels::REASON => reason.as_str().to_string(),
+        "attempt" => attempt.to_string(),
+    )
+    .increment(1);
+}
+
 fn event_priority(data: &OrchestrationEventData) -> u8 {
     match data {
         // Fold trigger evaluations before emitted RunRequested events at the same timestamp.
@@ -1445,14 +1580,26 @@ mod tests {
         TaskDef, TickStatus, TimerType, TriggerInfo, TriggerSource,
     };
     use crate::paths::orchestration_event_path;
-    use arco_core::MemoryBackend;
+    use arco_core::{MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
+    use async_trait::async_trait;
     use chrono::DateTime;
     use std::collections::HashMap;
+    use std::ops::Range;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::sync::{Barrier, Notify};
     use ulid::Ulid;
 
     async fn create_test_compactor() -> Result<(MicroCompactor, ScopedStorage)> {
         let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+        let compactor = MicroCompactor::new(storage.clone());
+        Ok((compactor, storage))
+    }
+
+    async fn create_test_compactor_with_backend<B: StorageBackend>(
+        backend: Arc<B>,
+    ) -> Result<(MicroCompactor, ScopedStorage)> {
         let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
         let compactor = MicroCompactor::new(storage.clone());
         Ok((compactor, storage))
@@ -1588,6 +1735,285 @@ mod tests {
                 cloud_task_id: "t_cloud456".to_string(),
             },
         )
+    }
+
+    async fn write_basic_compaction_events(storage: &ScopedStorage) -> Result<Vec<String>> {
+        let event1 = make_run_triggered_event();
+        let event2 = make_plan_created_event();
+
+        let path1 = orchestration_event_path("2025-01-15", &event1.event_id);
+        let path2 = orchestration_event_path("2025-01-15", &event2.event_id);
+
+        storage
+            .put_raw(
+                &path1,
+                Bytes::from(serde_json::to_string(&event1).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
+        storage
+            .put_raw(
+                &path2,
+                Bytes::from(serde_json::to_string(&event2).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
+
+        Ok(vec![path1, path2])
+    }
+
+    #[derive(Debug)]
+    struct SnapshotRaceBackend {
+        inner: MemoryBackend,
+        manifest_suffix: String,
+        race_barrier: Barrier,
+        race_hits: AtomicUsize,
+    }
+
+    impl SnapshotRaceBackend {
+        fn new(manifest_suffix: impl Into<String>) -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                manifest_suffix: manifest_suffix.into(),
+                race_barrier: Barrier::new(2),
+                race_hits: AtomicUsize::new(0),
+            }
+        }
+
+        fn should_race(&self, path: &str, precondition: &WritePrecondition) -> bool {
+            path.ends_with(self.manifest_suffix.as_str())
+                && matches!(precondition, WritePrecondition::DoesNotExist)
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for SnapshotRaceBackend {
+        async fn get(&self, path: &str) -> arco_core::error::Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(
+            &self,
+            path: &str,
+            range: Range<u64>,
+        ) -> arco_core::error::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::error::Result<WriteResult> {
+            if self.should_race(path, &precondition)
+                && self.race_hits.fetch_add(1, Ordering::SeqCst) < 2
+            {
+                self.race_barrier.wait().await;
+            }
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::error::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::error::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::error::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(
+            &self,
+            path: &str,
+            expiry: Duration,
+        ) -> arco_core::error::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    #[derive(Debug)]
+    struct PreferredEpochSnapshotRaceBackend {
+        inner: MemoryBackend,
+        manifest_suffix: String,
+        preferred_epoch: u64,
+        race_barrier: Barrier,
+        preferred_committed: Notify,
+        preferred_committed_flag: AtomicBool,
+        race_hits: AtomicUsize,
+    }
+
+    impl PreferredEpochSnapshotRaceBackend {
+        fn new(manifest_suffix: impl Into<String>, preferred_epoch: u64) -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                manifest_suffix: manifest_suffix.into(),
+                preferred_epoch,
+                race_barrier: Barrier::new(2),
+                preferred_committed: Notify::new(),
+                preferred_committed_flag: AtomicBool::new(false),
+                race_hits: AtomicUsize::new(0),
+            }
+        }
+
+        fn race_epoch(
+            &self,
+            path: &str,
+            precondition: &WritePrecondition,
+            data: &Bytes,
+        ) -> Option<u64> {
+            if !path.ends_with(self.manifest_suffix.as_str())
+                || !matches!(precondition, WritePrecondition::DoesNotExist)
+            {
+                return None;
+            }
+
+            serde_json::from_slice::<OrchestrationManifest>(data.as_ref())
+                .ok()
+                .map(|manifest| manifest.epoch)
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for PreferredEpochSnapshotRaceBackend {
+        async fn get(&self, path: &str) -> arco_core::error::Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(
+            &self,
+            path: &str,
+            range: Range<u64>,
+        ) -> arco_core::error::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::error::Result<WriteResult> {
+            if let Some(epoch) = self.race_epoch(path, &precondition, &data) {
+                if self.race_hits.fetch_add(1, Ordering::SeqCst) < 2 {
+                    self.race_barrier.wait().await;
+                    if epoch != self.preferred_epoch
+                        && !self.preferred_committed_flag.load(Ordering::SeqCst)
+                    {
+                        self.preferred_committed.notified().await;
+                    }
+                    let result = self.inner.put(path, data, precondition).await;
+                    if epoch == self.preferred_epoch {
+                        self.preferred_committed_flag.store(true, Ordering::SeqCst);
+                        self.preferred_committed.notify_waiters();
+                    }
+                    return result;
+                }
+            }
+
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::error::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::error::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::error::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(
+            &self,
+            path: &str,
+            expiry: Duration,
+        ) -> arco_core::error::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_events_retries_after_concurrent_manifest_snapshot_conflict() -> Result<()> {
+        let backend = Arc::new(SnapshotRaceBackend::new(
+            "state/orchestration/manifests/00000000000000000001.json",
+        ));
+        let (compactor_a, storage) = create_test_compactor_with_backend(backend.clone()).await?;
+        let compactor_b = MicroCompactor::new(storage.clone());
+        let event_paths = write_basic_compaction_events(&storage).await?;
+
+        let (result_a, result_b) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                compactor_a.compact_events(event_paths.clone()),
+                compactor_b.compact_events(event_paths),
+            )
+        })
+        .await
+        .expect("racing compactors should not deadlock");
+
+        let result_a = result_a?;
+        let result_b = result_b?;
+        assert!(
+            result_a.delta_id.is_some() ^ result_b.delta_id.is_some(),
+            "exactly one racing compaction should publish a new delta"
+        );
+
+        let manifest_data = storage.get_raw(orchestration_manifest_path()).await?;
+        let manifest: OrchestrationManifest =
+            serde_json::from_slice(&manifest_data).expect("parse manifest");
+        assert_eq!(manifest.manifest_id, "00000000000000000001");
+        assert_eq!(manifest.l0_count, 1);
+        assert_eq!(manifest.l0_deltas.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compact_events_retry_revalidates_expected_epoch() -> Result<()> {
+        let backend = Arc::new(PreferredEpochSnapshotRaceBackend::new(
+            "state/orchestration/manifests/00000000000000000001.json",
+            2,
+        ));
+        let (winning_compactor, storage) =
+            create_test_compactor_with_backend(backend.clone()).await?;
+        let stale_compactor = MicroCompactor::new(storage.clone());
+
+        let mut manifest = OrchestrationManifest::new("01HQXYZ300REV");
+        manifest.manifest_id = "00000000000000000000".to_string();
+        manifest.epoch = 1;
+        winning_compactor
+            .publish_manifest(&manifest, None, None)
+            .await?;
+
+        let event_paths = write_basic_compaction_events(&storage).await?;
+
+        let (stale_result, winning_result) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                stale_compactor.compact_events_with_epoch(event_paths.clone(), Some(1)),
+                winning_compactor.compact_events_with_epoch(event_paths, Some(2)),
+            )
+        })
+        .await
+        .expect("epoch-race compactors should not deadlock");
+
+        let stale_error = stale_result.expect_err("retry must revalidate a stale epoch");
+        assert!(
+            stale_error
+                .to_string()
+                .contains("stale epoch: request epoch 1 is behind pointer epoch 2"),
+            "expected stale epoch after retry, got {stale_error:?}"
+        );
+        assert!(
+            winning_result.is_ok(),
+            "higher epoch writer should publish successfully"
+        );
+
+        Ok(())
     }
 
     #[tokio::test]

@@ -105,6 +105,9 @@ pub mod names {
     /// Gauge: Visibility lag measured as committed-vs-visible event skew.
     pub const ORCH_COMPACTOR_VISIBILITY_LAG_EVENTS: &str =
         "arco_flow_orch_compactor_visibility_lag_events";
+    /// Counter: Compactor manifest publish retries after classified races.
+    pub const ORCH_COMPACTOR_PUBLISH_RETRIES_TOTAL: &str =
+        "arco_flow_orch_compactor_publish_retries_total";
 }
 
 /// Label keys used across metrics.
@@ -137,6 +140,8 @@ pub mod labels {
     pub const SENSOR_TYPE: &str = "sensor_type";
     /// Durability mode label.
     pub const DURABILITY_MODE: &str = "durability_mode";
+    /// Retry or failure reason label.
+    pub const REASON: &str = "reason";
 }
 
 /// High-level interface for recording orchestration metrics.

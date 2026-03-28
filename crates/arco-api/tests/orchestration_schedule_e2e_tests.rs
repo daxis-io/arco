@@ -794,6 +794,7 @@ async fn lineage_metadata_flows_from_task_output_to_catalog_and_run_read_surface
                     partition_key: Some(partition_key.to_string()),
                     max_attempts: 1,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: true,
                 }],
             },
         ),

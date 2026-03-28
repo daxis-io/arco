@@ -14,7 +14,11 @@ use utoipa::{Modify, OpenApi};
     info(
         title = "Arco API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "Arco catalog REST API (M4/M5)"
+        description = "Arco catalog REST API (M4/M5)",
+        contact(
+            name = "Daxis",
+            email = "engineering@daxis.io"
+        )
     ),
     paths(
         crate::routes::catalogs::create_catalog,
@@ -111,6 +115,7 @@ use utoipa::{Modify, OpenApi};
             crate::routes::orchestration::RunStateResponse,
             crate::routes::orchestration::RunResponse,
             crate::routes::orchestration::TaskSummary,
+            crate::routes::orchestration::TaskOutputVisibilityStateResponse,
             crate::routes::orchestration::TaskStateResponse,
             crate::routes::orchestration::TaskCounts,
             crate::routes::orchestration::ListRunsResponse,
@@ -172,6 +177,7 @@ use utoipa::{Modify, OpenApi};
             crate::routes::tasks::TaskCompletedRequest,
             crate::routes::tasks::TaskCompletedResponse,
             crate::routes::tasks::WorkerOutcome,
+            crate::routes::tasks::TaskOutputVisibilityState,
             crate::routes::tasks::TaskOutput,
             crate::routes::tasks::TaskError,
             crate::routes::tasks::ErrorCategory,

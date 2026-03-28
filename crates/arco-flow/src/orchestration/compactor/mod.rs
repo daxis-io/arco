@@ -12,9 +12,14 @@
 pub mod fold;
 pub mod manifest;
 pub mod parquet_util;
+pub mod reconciler;
 pub mod service;
 
 pub use fold::*;
 pub use manifest::*;
 pub use parquet_util::*;
+pub use reconciler::{
+    OrchestrationReconciler, OrchestrationReconciliationPolicy, OrchestrationReconciliationReport,
+    OrchestrationRepairResult,
+};
 pub use service::{CompactionResult, CompactionVisibility, DurabilityMode, MicroCompactor};

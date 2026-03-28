@@ -24,6 +24,10 @@ fn orchestration_and_flow_paths_are_stable() {
         FlowPaths::orchestration_l0_dir("delta-001"),
         "state/orchestration/l0/delta-001"
     );
+    assert_eq!(
+        FlowPaths::orchestration_base_snapshot_dir("snapshot-001"),
+        "state/orchestration/base/snapshot-001"
+    );
 }
 
 #[test]

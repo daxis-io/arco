@@ -144,13 +144,92 @@ impl OrchestrationManifest {
     /// Checks if L0 compaction should be triggered.
     #[must_use]
     pub fn should_compact_l0(&self) -> bool {
-        self.l0_count >= self.l0_limits.max_count
+        if self.l0_count >= self.l0_limits.max_count {
+            return true;
+        }
+
+        let total_rows: u64 = self
+            .l0_deltas
+            .iter()
+            .map(|delta| u64::from(delta.row_counts.total()))
+            .sum();
+        if total_rows >= u64::from(self.l0_limits.max_rows) {
+            return true;
+        }
+
+        let max_age = chrono::Duration::seconds(i64::from(self.l0_limits.max_age_seconds));
+        self.l0_deltas
+            .iter()
+            .any(|delta| Utc::now() - delta.created_at >= max_age)
     }
 
     /// Returns the watermark lag (time since last processed event).
     #[must_use]
     pub fn watermark_lag(&self) -> chrono::Duration {
         Utc::now() - self.watermarks.last_processed_at
+    }
+
+    /// Validates that this manifest is a legal successor to the previous revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest chain regresses or would allow a stale holder.
+    pub fn validate_succession(&self, previous: &Self) -> Result<(), String> {
+        let previous_manifest_id = parse_manifest_id(&previous.manifest_id)?;
+        let next_manifest_id = parse_manifest_id(&self.manifest_id)?;
+        if next_manifest_id <= previous_manifest_id {
+            return Err(format!(
+                "manifest_id did not advance: {} -> {}",
+                previous.manifest_id, self.manifest_id
+            ));
+        }
+
+        if self.epoch < previous.epoch {
+            return Err(format!(
+                "epoch regression: {} -> {} (stale holder)",
+                previous.epoch, self.epoch
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl OrchestrationManifestPointer {
+    /// Validates that this pointer is a legal successor to the previous pointer payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when manifest IDs regress, epochs go backwards, or the
+    /// stored parent hash does not match the previous raw pointer payload.
+    pub fn validate_succession(
+        &self,
+        previous: &Self,
+        previous_raw_hash: &str,
+    ) -> Result<(), String> {
+        let previous_manifest_id = parse_manifest_id(&previous.manifest_id)?;
+        let next_manifest_id = parse_manifest_id(&self.manifest_id)?;
+        if next_manifest_id <= previous_manifest_id {
+            return Err(format!(
+                "pointer manifest_id did not advance: {} -> {}",
+                previous.manifest_id, self.manifest_id
+            ));
+        }
+
+        if self.epoch < previous.epoch {
+            return Err(format!(
+                "pointer epoch regression: {} -> {} (stale holder)",
+                previous.epoch, self.epoch
+            ));
+        }
+
+        match self.parent_pointer_hash.as_deref() {
+            Some(parent_pointer_hash) if parent_pointer_hash == previous_raw_hash => Ok(()),
+            Some(parent_pointer_hash) => Err(format!(
+                "parent pointer hash mismatch: expected {previous_raw_hash}, got {parent_pointer_hash}"
+            )),
+            None => Err("missing parent_pointer_hash for pointer succession".to_string()),
+        }
     }
 }
 
@@ -273,72 +352,142 @@ pub struct BaseSnapshot {
     pub tables: TablePaths,
 }
 
+/// Metadata for a stored Parquet artifact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TableArtifactMetadata {
+    /// Scope-relative object path.
+    pub path: String,
+    /// SHA-256 checksum of the stored bytes (hex encoded).
+    pub checksum_sha256: String,
+    /// Stored object size in bytes.
+    pub byte_size: u64,
+}
+
+/// Backward-compatible artifact reference for manifest table entries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum TableArtifact {
+    /// Legacy manifests stored only a raw path string.
+    Legacy(String),
+    /// Current manifests store full artifact metadata.
+    Metadata(TableArtifactMetadata),
+}
+
+impl TableArtifact {
+    /// Creates a new metadata-backed artifact reference.
+    #[must_use]
+    pub fn new(
+        path: impl Into<String>,
+        checksum_sha256: impl Into<String>,
+        byte_size: u64,
+    ) -> Self {
+        Self::Metadata(TableArtifactMetadata {
+            path: path.into(),
+            checksum_sha256: checksum_sha256.into(),
+            byte_size,
+        })
+    }
+
+    /// Creates a legacy path-only artifact reference.
+    #[must_use]
+    pub fn legacy(path: impl Into<String>) -> Self {
+        Self::Legacy(path.into())
+    }
+
+    /// Returns the artifact path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Legacy(path) => path,
+            Self::Metadata(metadata) => &metadata.path,
+        }
+    }
+
+    /// Returns the checksum when available.
+    #[must_use]
+    pub fn checksum_sha256(&self) -> Option<&str> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Metadata(metadata) => Some(&metadata.checksum_sha256),
+        }
+    }
+
+    /// Returns the byte size when available.
+    #[must_use]
+    pub fn byte_size(&self) -> Option<u64> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Metadata(metadata) => Some(metadata.byte_size),
+        }
+    }
+}
+
 /// Paths to Parquet table files within a snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TablePaths {
     /// Path to runs.parquet (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub runs: Option<String>,
+    pub runs: Option<TableArtifact>,
 
     /// Path to tasks.parquet (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tasks: Option<String>,
+    pub tasks: Option<TableArtifact>,
 
     /// Path to `dep_satisfaction.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dep_satisfaction: Option<String>,
+    pub dep_satisfaction: Option<TableArtifact>,
 
     /// Path to timers.parquet (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub timers: Option<String>,
+    pub timers: Option<TableArtifact>,
 
     /// Path to `dispatch_outbox.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dispatch_outbox: Option<String>,
+    pub dispatch_outbox: Option<TableArtifact>,
 
     /// Path to `sensor_state.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sensor_state: Option<String>,
+    pub sensor_state: Option<TableArtifact>,
 
     /// Path to `sensor_evals.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sensor_evals: Option<String>,
+    pub sensor_evals: Option<TableArtifact>,
 
     /// Path to `run_key_index.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_key_index: Option<String>,
+    pub run_key_index: Option<TableArtifact>,
 
     /// Path to `run_key_conflicts.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_key_conflicts: Option<String>,
+    pub run_key_conflicts: Option<TableArtifact>,
 
     /// Path to `partition_status.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub partition_status: Option<String>,
+    pub partition_status: Option<TableArtifact>,
 
     /// Path to `idempotency_keys.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub idempotency_keys: Option<String>,
+    pub idempotency_keys: Option<TableArtifact>,
 
     /// Path to `schedule_definitions.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub schedule_definitions: Option<String>,
+    pub schedule_definitions: Option<TableArtifact>,
 
     /// Path to `schedule_state.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub schedule_state: Option<String>,
+    pub schedule_state: Option<TableArtifact>,
 
     /// Path to `schedule_ticks.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub schedule_ticks: Option<String>,
+    pub schedule_ticks: Option<TableArtifact>,
 
     /// Path to `backfills.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub backfills: Option<String>,
+    pub backfills: Option<TableArtifact>,
 
     /// Path to `backfill_chunks.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub backfill_chunks: Option<String>,
+    pub backfill_chunks: Option<TableArtifact>,
 }
 
 impl TablePaths {
@@ -347,52 +496,52 @@ impl TablePaths {
     pub fn all(&self) -> HashMap<&'static str, &str> {
         let mut paths = HashMap::new();
         if let Some(ref p) = self.runs {
-            paths.insert("runs", p.as_str());
+            paths.insert("runs", p.path());
         }
         if let Some(ref p) = self.tasks {
-            paths.insert("tasks", p.as_str());
+            paths.insert("tasks", p.path());
         }
         if let Some(ref p) = self.dep_satisfaction {
-            paths.insert("dep_satisfaction", p.as_str());
+            paths.insert("dep_satisfaction", p.path());
         }
         if let Some(ref p) = self.timers {
-            paths.insert("timers", p.as_str());
+            paths.insert("timers", p.path());
         }
         if let Some(ref p) = self.dispatch_outbox {
-            paths.insert("dispatch_outbox", p.as_str());
+            paths.insert("dispatch_outbox", p.path());
         }
         if let Some(ref p) = self.sensor_state {
-            paths.insert("sensor_state", p.as_str());
+            paths.insert("sensor_state", p.path());
         }
         if let Some(ref p) = self.sensor_evals {
-            paths.insert("sensor_evals", p.as_str());
+            paths.insert("sensor_evals", p.path());
         }
         if let Some(ref p) = self.run_key_index {
-            paths.insert("run_key_index", p.as_str());
+            paths.insert("run_key_index", p.path());
         }
         if let Some(ref p) = self.run_key_conflicts {
-            paths.insert("run_key_conflicts", p.as_str());
+            paths.insert("run_key_conflicts", p.path());
         }
         if let Some(ref p) = self.partition_status {
-            paths.insert("partition_status", p.as_str());
+            paths.insert("partition_status", p.path());
         }
         if let Some(ref p) = self.idempotency_keys {
-            paths.insert("idempotency_keys", p.as_str());
+            paths.insert("idempotency_keys", p.path());
         }
         if let Some(ref p) = self.schedule_definitions {
-            paths.insert("schedule_definitions", p.as_str());
+            paths.insert("schedule_definitions", p.path());
         }
         if let Some(ref p) = self.schedule_state {
-            paths.insert("schedule_state", p.as_str());
+            paths.insert("schedule_state", p.path());
         }
         if let Some(ref p) = self.schedule_ticks {
-            paths.insert("schedule_ticks", p.as_str());
+            paths.insert("schedule_ticks", p.path());
         }
         if let Some(ref p) = self.backfills {
-            paths.insert("backfills", p.as_str());
+            paths.insert("backfills", p.path());
         }
         if let Some(ref p) = self.backfill_chunks {
-            paths.insert("backfill_chunks", p.as_str());
+            paths.insert("backfill_chunks", p.path());
         }
         paths
     }
@@ -567,6 +716,8 @@ mod tests {
     fn test_l0_compaction_trigger() {
         let mut manifest = OrchestrationManifest::new("01HQXYZ123REV");
         manifest.l0_limits.max_count = 5;
+        manifest.l0_limits.max_rows = u32::MAX;
+        manifest.l0_limits.max_age_seconds = u32::MAX;
 
         // Not triggered initially
         assert!(!manifest.should_compact_l0());
@@ -581,15 +732,96 @@ mod tests {
     }
 
     #[test]
+    fn test_l0_compaction_trigger_includes_rows_and_age() {
+        let mut manifest = OrchestrationManifest::new("01HQXYZ123REV");
+        manifest.l0_limits.max_count = u32::MAX;
+        manifest.l0_limits.max_rows = 5;
+        manifest.l0_limits.max_age_seconds = 10;
+        manifest.l0_deltas.push(L0Delta {
+            delta_id: "01HQXYZ456DEL".to_string(),
+            created_at: Utc::now() - Duration::seconds(30),
+            event_range: EventRange {
+                from_event: "01HQXYZ001EVT".to_string(),
+                to_event: "01HQXYZ010EVT".to_string(),
+                event_count: 10,
+            },
+            tables: TablePaths::default(),
+            row_counts: RowCounts {
+                runs: 6,
+                ..Default::default()
+            },
+        });
+        manifest.l0_count = 1;
+
+        assert!(
+            manifest.should_compact_l0(),
+            "row and age thresholds should also trigger merge"
+        );
+    }
+
+    #[test]
+    fn test_manifest_succession_rejects_regression() {
+        let mut previous = OrchestrationManifest::new("01HQXYZ123REV");
+        previous.manifest_id = "00000000000000000005".to_string();
+        previous.epoch = 7;
+
+        let mut next = OrchestrationManifest::new("01HQXYZ124REV");
+        next.manifest_id = "00000000000000000004".to_string();
+        next.epoch = 6;
+
+        let error = next
+            .validate_succession(&previous)
+            .expect_err("regression must be rejected");
+        assert!(
+            error.contains("manifest_id did not advance") || error.contains("epoch regression")
+        );
+    }
+
+    #[test]
+    fn test_pointer_succession_requires_parent_hash_match() {
+        let previous = OrchestrationManifestPointer {
+            manifest_id: "00000000000000000005".to_string(),
+            manifest_path: "state/orchestration/manifests/00000000000000000005.json".to_string(),
+            epoch: 7,
+            parent_pointer_hash: Some("sha256:older".to_string()),
+            updated_at: Utc::now(),
+        };
+        let next = OrchestrationManifestPointer {
+            manifest_id: "00000000000000000006".to_string(),
+            manifest_path: "state/orchestration/manifests/00000000000000000006.json".to_string(),
+            epoch: 7,
+            parent_pointer_hash: Some("sha256:expected".to_string()),
+            updated_at: Utc::now(),
+        };
+
+        assert!(
+            next.validate_succession(&previous, "sha256:expected")
+                .is_ok()
+        );
+        assert!(
+            next.validate_succession(&previous, "sha256:different")
+                .expect_err("hash mismatch must fail")
+                .contains("parent pointer hash mismatch")
+        );
+    }
+
+    #[test]
     fn test_table_paths_all() {
         let mut tables = TablePaths::default();
-        tables.runs = Some("runs/snapshot-01.parquet".to_string());
-        tables.tasks = Some("tasks/snapshot-01.parquet".to_string());
+        tables.runs = Some(TableArtifact::legacy("runs/snapshot-01.parquet"));
+        tables.tasks = Some(TableArtifact::new(
+            "tasks/snapshot-01.abcd1234.parquet",
+            "sha256:abcd1234",
+            42,
+        ));
 
         let all = tables.all();
         assert_eq!(all.len(), 2);
         assert_eq!(all.get("runs"), Some(&"runs/snapshot-01.parquet"));
-        assert_eq!(all.get("tasks"), Some(&"tasks/snapshot-01.parquet"));
+        assert_eq!(
+            all.get("tasks"),
+            Some(&"tasks/snapshot-01.abcd1234.parquet")
+        );
     }
 
     #[test]
@@ -629,7 +861,7 @@ mod tests {
                 event_count: 10,
             },
             tables: TablePaths {
-                tasks: Some("l0/delta-01/tasks.parquet".to_string()),
+                tasks: Some(TableArtifact::legacy("l0/delta-01/tasks.parquet")),
                 ..Default::default()
             },
             row_counts: RowCounts {

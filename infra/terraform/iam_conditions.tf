@@ -90,10 +90,33 @@ resource "google_storage_bucket_iam_member" "api_write_commits" {
   }
 }
 
+# API can publish manifests, idempotency records, and latest-manifest index
+resource "google_storage_bucket_iam_member" "api_write_manifests" {
+  bucket = google_storage_bucket.catalog.name
+  role   = "roles/storage.objectUser"
+  member = "serviceAccount:${google_service_account.api.email}"
+
+  condition {
+    title       = "ApiWriteManifests"
+    description = "Gate 5: API can write manifest payloads and index records"
+    expression  = <<-EOT
+      resource.type == "storage.googleapis.com/Object" &&
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.manifests_object_prefix}")
+    EOT
+  }
+}
+
 # API: Read all objects (no prefix restriction on reads)
 resource "google_storage_bucket_iam_member" "api_read_all" {
   bucket = google_storage_bucket.catalog.name
   role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.api.email}"
+}
+
+resource "google_storage_bucket_iam_member" "api_relaxed_catalog_access" {
+  count  = var.dev_relaxed_catalog_access ? 1 : 0
+  bucket = google_storage_bucket.catalog.name
+  role   = "roles/storage.objectUser"
   member = "serviceAccount:${google_service_account.api.email}"
 }
 
@@ -132,6 +155,13 @@ resource "google_storage_bucket_iam_member" "flow_controller_read_objects" {
       )
     EOT
   }
+}
+
+resource "google_storage_bucket_iam_member" "flow_controller_relaxed_catalog_access" {
+  count  = var.dev_relaxed_catalog_access ? 1 : 0
+  bucket = google_storage_bucket.catalog.name
+  role   = "roles/storage.objectUser"
+  member = "serviceAccount:${google_service_account.flow_controller.email}"
 }
 
 # ============================================================================
@@ -229,6 +259,13 @@ resource "google_storage_bucket_iam_member" "compactor_fastpath_read_objects" {
       )
     EOT
   }
+}
+
+resource "google_storage_bucket_iam_member" "compactor_relaxed_catalog_access" {
+  count  = var.dev_relaxed_catalog_access ? 1 : 0
+  bucket = google_storage_bucket.catalog.name
+  role   = "roles/storage.objectUser"
+  member = "serviceAccount:${google_service_account.compactor.email}"
 }
 
 # ============================================================================

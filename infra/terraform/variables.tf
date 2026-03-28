@@ -255,6 +255,30 @@ variable "tenant_secret_name" {
   default     = "arco-tenant-secret"
 }
 
+variable "task_token_secret" {
+  description = "Shared HS256 secret for worker callback task tokens"
+  type        = string
+  default     = ""
+}
+
+variable "task_token_issuer" {
+  description = "Issuer claim for worker callback task tokens"
+  type        = string
+  default     = ""
+}
+
+variable "task_token_audience" {
+  description = "Audience claim for worker callback task tokens"
+  type        = string
+  default     = ""
+}
+
+variable "task_token_ttl_seconds" {
+  description = "TTL in seconds for worker callback task tokens"
+  type        = number
+  default     = 1200
+}
+
 # ============================================================================
 # Networking
 # ============================================================================
@@ -265,10 +289,22 @@ variable "api_public" {
   default     = false
 }
 
+variable "api_allow_unauthenticated_internal" {
+  description = "Allow unauthenticated Cloud Run invoke for internal-only API traffic so workers can use task-token Authorization headers"
+  type        = bool
+  default     = false
+}
+
 variable "vpc_connector_name" {
   description = "Serverless VPC connector name (optional, for private services)"
   type        = string
   default     = ""
+}
+
+variable "dev_relaxed_catalog_access" {
+  description = "Grant broad bucket object access in dev-only test environments to bypass GCS IAM condition incompatibilities"
+  type        = bool
+  default     = false
 }
 
 # ============================================================================

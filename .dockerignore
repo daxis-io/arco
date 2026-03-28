@@ -1,0 +1,9 @@
+.git
+.github
+.worktrees
+worktrees
+target
+**/target
+.terraform
+**/.terraform
+node_modules

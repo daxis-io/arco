@@ -390,6 +390,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "arco-flow-worker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arco-flow",
+ "axum 0.7.9",
+ "chrono",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "arco-iceberg"
 version = "0.1.0"
 dependencies = [

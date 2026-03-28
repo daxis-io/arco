@@ -3,15 +3,15 @@
 # Arco Deployment Script
 #
 # Deploys Arco Cloud Run services with a compactor-first hard gate:
-# - Wait until the compactor reports ready+healthy and has completed at least one
+# - Wait until the compactor revision is Ready and has completed at least one
 #   successful compaction cycle before considering the deploy successful.
 #
-# This script uses `gcloud run services proxy` for health checks so it works with:
-# - `INGRESS_TRAFFIC_INTERNAL_ONLY`
-# - IAM-protected services (no unauthenticated curl)
+# Internal-only Cloud Run services are not reachable from a local shell, even via
+# `gcloud run services proxy`, so health checks use Cloud Run status and Cloud
+# Logging instead of direct HTTP probes.
 #
 # Usage:
-#   ./scripts/deploy.sh [--env dev|staging|prod] [--dry-run] [--timeout SECONDS]
+#   ./scripts/deploy.sh [--env dev|staging|prod] [--tfvars FILE] [--dry-run] [--timeout SECONDS]
 #
 set -euo pipefail
 
@@ -25,6 +25,7 @@ COMPACTOR_HEALTH_TIMEOUT="${COMPACTOR_HEALTH_TIMEOUT:-300}"
 FLOW_COMPACTOR_HEALTH_TIMEOUT="${FLOW_COMPACTOR_HEALTH_TIMEOUT:-120}"
 API_HEALTH_TIMEOUT="${API_HEALTH_TIMEOUT:-120}"
 HEALTH_CHECK_INTERVAL="${HEALTH_CHECK_INTERVAL:-10}"
+TFVARS_FILE="${TFVARS_FILE:-}"
 
 usage() {
   cat <<EOF
@@ -32,6 +33,7 @@ Usage: $0 [OPTIONS]
 
 Options:
   --env ENV           Environment (dev, staging, prod). Default: dev
+  --tfvars FILE       Terraform tfvars file relative to infra/terraform or absolute path
   --dry-run           Show what would be deployed without making changes
   --timeout SECONDS   Compactor health timeout. Default: ${COMPACTOR_HEALTH_TIMEOUT}
   -h, --help          Show this help message
@@ -43,6 +45,7 @@ Required env vars:
   FLOW_COMPACTOR_IMAGE
   FLOW_DISPATCHER_IMAGE
   FLOW_SWEEPER_IMAGE
+  FLOW_TIMER_INGEST_IMAGE
   FLOW_WORKER_IMAGE
 
 Optional env vars:
@@ -74,6 +77,7 @@ validate_env() {
   [[ -z "${FLOW_COMPACTOR_IMAGE:-}" ]] && die "FLOW_COMPACTOR_IMAGE is required"
   [[ -z "${FLOW_DISPATCHER_IMAGE:-}" ]] && die "FLOW_DISPATCHER_IMAGE is required"
   [[ -z "${FLOW_SWEEPER_IMAGE:-}" ]] && die "FLOW_SWEEPER_IMAGE is required"
+  [[ -z "${FLOW_TIMER_INGEST_IMAGE:-}" ]] && die "FLOW_TIMER_INGEST_IMAGE is required"
   [[ -z "${FLOW_WORKER_IMAGE:-}" ]] && die "FLOW_WORKER_IMAGE is required"
 
   case "$ENVIRONMENT" in
@@ -82,57 +86,93 @@ validate_env() {
   esac
 }
 
-start_run_proxy() {
-  local service_name="$1"
-  local port="$2"
+resolve_tfvars_file() {
+  if [[ -n "${TFVARS_FILE}" ]]; then
+    if [[ "${TFVARS_FILE}" = /* ]]; then
+      echo "${TFVARS_FILE}"
+    else
+      echo "${ROOT_DIR}/infra/terraform/${TFVARS_FILE}"
+    fi
+    return
+  fi
 
-  # `--quiet` avoids interactive prompts.
-  gcloud run services proxy "$service_name" \
-    --region="$REGION" \
-    --project="$PROJECT_ID" \
-    --port="$port" \
-    --quiet \
-    >/dev/null 2>&1 &
-
-  echo "$!"
+  echo "${ROOT_DIR}/infra/terraform/environments/${ENVIRONMENT}.tfvars"
 }
 
-stop_run_proxy() {
-  local pid="$1"
-  if [[ -n "${pid}" ]]; then
-    kill "$pid" >/dev/null 2>&1 || true
-    wait "$pid" >/dev/null 2>&1 || true
-  fi
+get_cloud_run_service_json() {
+  local service_name="$1"
+  gcloud run services describe "$service_name" \
+    --region="$REGION" \
+    --project="$PROJECT_ID" \
+    --format=json
+}
+
+get_cloud_run_ready_status() {
+  local service_name="$1"
+  get_cloud_run_service_json "$service_name" | jq -r '
+    ([.status.conditions[]? | select(.type == "Ready") | .status][0]) // "False"
+  '
+}
+
+get_cloud_run_latest_ready_revision() {
+  local service_name="$1"
+  get_cloud_run_service_json "$service_name" | jq -r '.status.latestReadyRevisionName // ""'
+}
+
+wait_for_cloud_run_ready() {
+  local service_name="$1"
+  local timeout_secs="$2"
+  local label="$3"
+
+  log "Waiting for ${label} Cloud Run service readiness (timeout: ${timeout_secs}s)..."
+
+  local elapsed=0
+  while [[ "$elapsed" -lt "$timeout_secs" ]]; do
+    local ready_status latest_revision
+    ready_status="$(get_cloud_run_ready_status "$service_name")"
+    latest_revision="$(get_cloud_run_latest_ready_revision "$service_name")"
+
+    if [[ "$ready_status" == "True" && -n "$latest_revision" ]]; then
+      log "${label} Cloud Run service ready (revision=${latest_revision})"
+      return 0
+    fi
+
+    log "${label} Cloud Run service not ready yet (ready=${ready_status}, revision=${latest_revision:-none}). Waiting..."
+    sleep "$HEALTH_CHECK_INTERVAL"
+    elapsed=$((elapsed + HEALTH_CHECK_INTERVAL))
+  done
+
+  die "${label} Cloud Run readiness timed out after ${timeout_secs}s"
+}
+
+get_latest_compactor_success_timestamp() {
+  local service_name="$1"
+  local revision_name="$2"
+
+  gcloud logging read \
+    "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${service_name}\" AND resource.labels.revision_name=\"${revision_name}\" AND jsonPayload.fields.message=\"Compaction cycle completed successfully\"" \
+    --project="$PROJECT_ID" \
+    --limit=1 \
+    --format='value(timestamp)' 2>/dev/null || true
 }
 
 wait_for_compactor_health() {
   local service_name="arco-compactor-${ENVIRONMENT}"
-  local local_port="18081"
-  local pid=""
 
-  log "Waiting for compactor health via proxy (timeout: ${COMPACTOR_HEALTH_TIMEOUT}s)..."
-
-  pid="$(start_run_proxy "$service_name" "$local_port")"
-  trap 'stop_run_proxy "$pid"' RETURN
+  wait_for_cloud_run_ready "$service_name" "$COMPACTOR_HEALTH_TIMEOUT" "Compactor"
 
   local elapsed=0
   while [[ "$elapsed" -lt "$COMPACTOR_HEALTH_TIMEOUT" ]]; do
-    local response
-    response="$(curl -sf "http://127.0.0.1:${local_port}/ready" 2>/dev/null || echo "{}")"
+    local revision_name last_compaction
+    revision_name="$(get_cloud_run_latest_ready_revision "$service_name")"
+    last_compaction="$(get_latest_compactor_success_timestamp "$service_name" "$revision_name")"
 
-    local ready healthy successful
-    ready="$(echo "$response" | jq -r '.ready // false')"
-    healthy="$(echo "$response" | jq -r '.healthy // false')"
-    successful="$(echo "$response" | jq -r '.successful_compactions // 0')"
-
-    if [[ "$ready" == "true" && "$healthy" == "true" && "$successful" != "0" ]]; then
-      local last_compaction
-      last_compaction="$(echo "$response" | jq -r '.last_successful_compaction // "unknown"')"
-      log "Compactor healthy (successful_compactions=$successful, last=$last_compaction)"
+    if [[ -n "$last_compaction" ]]; then
+      log "Compactor healthy (revision=${revision_name}, last_successful_compaction=${last_compaction})"
       return 0
     fi
 
-    log "Compactor not ready (ready=$ready, healthy=$healthy, successful_compactions=$successful). Waiting..."
+    log "Compactor revision ${revision_name} is ready but has not logged a successful compaction yet. Waiting..."
     sleep "$HEALTH_CHECK_INTERVAL"
     elapsed=$((elapsed + HEALTH_CHECK_INTERVAL))
   done
@@ -142,58 +182,12 @@ wait_for_compactor_health() {
 
 wait_for_flow_compactor_health() {
   local service_name="arco-flow-compactor-${ENVIRONMENT}"
-  local local_port="18082"
-  local pid=""
-
-  log "Waiting for flow compactor health via proxy (timeout: ${FLOW_COMPACTOR_HEALTH_TIMEOUT}s)..."
-
-  pid="$(start_run_proxy "$service_name" "$local_port")"
-  trap 'stop_run_proxy "$pid"' RETURN
-
-  local elapsed=0
-  while [[ "$elapsed" -lt "$FLOW_COMPACTOR_HEALTH_TIMEOUT" ]]; do
-    local status
-    status="$(curl -sf "http://127.0.0.1:${local_port}/health" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")"
-
-    if [[ "$status" == "200" ]]; then
-      log "Flow compactor healthy"
-      return 0
-    fi
-
-    log "Flow compactor not healthy yet (status=$status). Waiting..."
-    sleep "$HEALTH_CHECK_INTERVAL"
-    elapsed=$((elapsed + HEALTH_CHECK_INTERVAL))
-  done
-
-  die "Flow compactor health check timed out after ${FLOW_COMPACTOR_HEALTH_TIMEOUT}s"
+  wait_for_cloud_run_ready "$service_name" "$FLOW_COMPACTOR_HEALTH_TIMEOUT" "Flow compactor"
 }
 
 wait_for_api_health() {
   local service_name="arco-api-${ENVIRONMENT}"
-  local local_port="18080"
-  local pid=""
-
-  log "Waiting for API health via proxy (timeout: ${API_HEALTH_TIMEOUT}s)..."
-
-  pid="$(start_run_proxy "$service_name" "$local_port")"
-  trap 'stop_run_proxy "$pid"' RETURN
-
-  local elapsed=0
-  while [[ "$elapsed" -lt "$API_HEALTH_TIMEOUT" ]]; do
-    local status
-    status="$(curl -sf "http://127.0.0.1:${local_port}/health" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")"
-
-    if [[ "$status" == "200" ]]; then
-      log "API healthy"
-      return 0
-    fi
-
-    log "API not healthy yet (status=$status). Waiting..."
-    sleep "$HEALTH_CHECK_INTERVAL"
-    elapsed=$((elapsed + HEALTH_CHECK_INTERVAL))
-  done
-
-  die "API health check timed out after ${API_HEALTH_TIMEOUT}s"
+  wait_for_cloud_run_ready "$service_name" "$API_HEALTH_TIMEOUT" "API"
 }
 
 deploy_terraform() {
@@ -201,7 +195,8 @@ deploy_terraform() {
 
   pushd "${ROOT_DIR}/infra/terraform" >/dev/null
 
-  local tfvars_file="environments/${ENVIRONMENT}.tfvars"
+  local tfvars_file
+  tfvars_file="$(resolve_tfvars_file)"
   if [[ ! -f "$tfvars_file" ]]; then
     die "tfvars file not found: $tfvars_file"
   fi
@@ -211,6 +206,7 @@ deploy_terraform() {
   export TF_VAR_flow_compactor_image="$FLOW_COMPACTOR_IMAGE"
   export TF_VAR_flow_dispatcher_image="$FLOW_DISPATCHER_IMAGE"
   export TF_VAR_flow_sweeper_image="$FLOW_SWEEPER_IMAGE"
+  export TF_VAR_flow_timer_ingest_image="$FLOW_TIMER_INGEST_IMAGE"
   export TF_VAR_flow_worker_image="$FLOW_WORKER_IMAGE"
   if [[ -n "${PROJECT_NUMBER:-}" ]]; then
     export TF_VAR_project_number="$PROJECT_NUMBER"
@@ -243,12 +239,14 @@ deploy_terraform() {
 deploy_terraform_remaining() {
   pushd "${ROOT_DIR}/infra/terraform" >/dev/null
 
-  local tfvars_file="environments/${ENVIRONMENT}.tfvars"
+  local tfvars_file
+  tfvars_file="$(resolve_tfvars_file)"
   export TF_VAR_api_image="$API_IMAGE"
   export TF_VAR_compactor_image="$COMPACTOR_IMAGE"
   export TF_VAR_flow_compactor_image="$FLOW_COMPACTOR_IMAGE"
   export TF_VAR_flow_dispatcher_image="$FLOW_DISPATCHER_IMAGE"
   export TF_VAR_flow_sweeper_image="$FLOW_SWEEPER_IMAGE"
+  export TF_VAR_flow_timer_ingest_image="$FLOW_TIMER_INGEST_IMAGE"
   export TF_VAR_flow_worker_image="$FLOW_WORKER_IMAGE"
   if [[ -n "${PROJECT_NUMBER:-}" ]]; then
     export TF_VAR_project_number="$PROJECT_NUMBER"
@@ -272,6 +270,10 @@ main() {
     case "$1" in
       --env)
         ENVIRONMENT="$2"
+        shift 2
+        ;;
+      --tfvars)
+        TFVARS_FILE="$2"
         shift 2
         ;;
       --dry-run)

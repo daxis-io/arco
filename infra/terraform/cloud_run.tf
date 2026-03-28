@@ -21,8 +21,9 @@ resource "google_cloud_run_v2_service" "api" {
   location = var.region
   project  = var.project_id
 
-  # Don't route traffic until manually verified (compactor-first deployment)
-  ingress = var.api_public ? "INGRESS_TRAFFIC_ALL" : "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  # In dev callback mode, the API must be reachable over run.app because worker
+  # callbacks authenticate at the application layer with task tokens, not Cloud Run ID tokens.
+  ingress = var.api_public || var.api_allow_unauthenticated_internal ? "INGRESS_TRAFFIC_ALL" : "INGRESS_TRAFFIC_INTERNAL_ONLY"
 
   template {
     service_account = google_service_account.api.email
@@ -116,9 +117,12 @@ resource "google_cloud_run_v2_service" "api" {
         value = google_storage_bucket.catalog.name
       }
 
-      env {
-        name  = "ARCO_ORCH_COMPACTOR_URL"
-        value = google_cloud_run_v2_service.flow_compactor.uri
+      dynamic "env" {
+        for_each = var.environment == "dev" ? [] : [1]
+        content {
+          name  = "ARCO_ORCH_COMPACTOR_URL"
+          value = google_cloud_run_v2_service.flow_compactor.uri
+        }
       }
 
       env {
@@ -134,6 +138,26 @@ resource "google_cloud_run_v2_service" "api" {
       env {
         name  = "ARCO_CODE_VERSION"
         value = var.api_code_version
+      }
+
+      env {
+        name  = "ARCO_TASK_TOKEN_SECRET"
+        value = var.task_token_secret
+      }
+
+      env {
+        name  = "ARCO_TASK_TOKEN_ISSUER"
+        value = var.task_token_issuer
+      }
+
+      env {
+        name  = "ARCO_TASK_TOKEN_AUDIENCE"
+        value = var.task_token_audience
+      }
+
+      env {
+        name  = "ARCO_TASK_TOKEN_TTL_SECS"
+        value = tostring(var.task_token_ttl_seconds)
       }
 
       # JWT secret from Secret Manager (if configured)
@@ -200,6 +224,8 @@ resource "google_cloud_run_v2_service" "compactor" {
     containers {
       image = var.compactor_image
 
+      args = ["serve"]
+
       resources {
         limits = {
           cpu    = var.compactor_cpu
@@ -248,6 +274,16 @@ resource "google_cloud_run_v2_service" "compactor" {
       }
 
       env {
+        name  = "ARCO_TENANT_ID"
+        value = var.compactor_tenant_id
+      }
+
+      env {
+        name  = "ARCO_WORKSPACE_ID"
+        value = var.compactor_workspace_id
+      }
+
+      env {
         name  = "ARCO_ENVIRONMENT"
         value = var.environment
       }
@@ -267,6 +303,13 @@ resource "google_cloud_run_v2_service" "compactor" {
       env {
         name  = "ARCO_COMPACTOR_GC_RETENTION_DAYS"
         value = "7"
+      }
+
+      # Auto anti-entropy requires the dedicated lister/cursor-writer identity.
+      # Keep the fast-path compactor narrowly scoped for cloud test deploys.
+      env {
+        name  = "ARCO_ANTI_ENTROPY_MAX_OBJECTS_PER_RUN"
+        value = "0"
       }
     }
   }
@@ -293,8 +336,8 @@ resource "google_cloud_run_v2_service" "flow_compactor" {
   location = var.region
   project  = var.project_id
 
-  # Internal-only service (invoked by other flow services)
-  ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  # Without VPC egress, service-to-service run.app calls must use public ingress and IAM auth.
+  ingress = var.vpc_connector_name != "" ? "INGRESS_TRAFFIC_INTERNAL_ONLY" : "INGRESS_TRAFFIC_ALL"
 
   template {
     service_account = google_service_account.compactor.email
@@ -408,7 +451,7 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
   location = var.region
   project  = var.project_id
 
-  ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  ingress = var.vpc_connector_name != "" ? "INGRESS_TRAFFIC_INTERNAL_ONLY" : "INGRESS_TRAFFIC_ALL"
 
   template {
     service_account = google_service_account.flow_controller.email
@@ -512,6 +555,11 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
       }
 
       env {
+        name  = "ARCO_FLOW_CALLBACK_BASE_URL"
+        value = google_cloud_run_v2_service.api.uri
+      }
+
+      env {
         name  = "ARCO_FLOW_SERVICE_ACCOUNT_EMAIL"
         value = google_service_account.flow_task_invoker.email
       }
@@ -519,6 +567,26 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
       env {
         name  = "ARCO_ORCH_COMPACTOR_URL"
         value = google_cloud_run_v2_service.flow_compactor.uri
+      }
+
+      env {
+        name  = "ARCO_FLOW_TASK_TOKEN_SECRET"
+        value = var.task_token_secret
+      }
+
+      env {
+        name  = "ARCO_FLOW_TASK_TOKEN_ISSUER"
+        value = var.task_token_issuer
+      }
+
+      env {
+        name  = "ARCO_FLOW_TASK_TOKEN_AUDIENCE"
+        value = var.task_token_audience
+      }
+
+      env {
+        name  = "ARCO_FLOW_TASK_TOKEN_TTL_SECS"
+        value = tostring(var.task_token_ttl_seconds)
       }
     }
   }
@@ -545,7 +613,7 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
   location = var.region
   project  = var.project_id
 
-  ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  ingress = var.vpc_connector_name != "" ? "INGRESS_TRAFFIC_INTERNAL_ONLY" : "INGRESS_TRAFFIC_ALL"
 
   template {
     service_account = google_service_account.flow_controller.email
@@ -642,8 +710,33 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
       }
 
       env {
+        name  = "ARCO_FLOW_CALLBACK_BASE_URL"
+        value = google_cloud_run_v2_service.api.uri
+      }
+
+      env {
         name  = "ARCO_ORCH_COMPACTOR_URL"
         value = google_cloud_run_v2_service.flow_compactor.uri
+      }
+
+      env {
+        name  = "ARCO_FLOW_TASK_TOKEN_SECRET"
+        value = var.task_token_secret
+      }
+
+      env {
+        name  = "ARCO_FLOW_TASK_TOKEN_ISSUER"
+        value = var.task_token_issuer
+      }
+
+      env {
+        name  = "ARCO_FLOW_TASK_TOKEN_AUDIENCE"
+        value = var.task_token_audience
+      }
+
+      env {
+        name  = "ARCO_FLOW_TASK_TOKEN_TTL_SECS"
+        value = tostring(var.task_token_ttl_seconds)
       }
     }
   }
@@ -670,7 +763,7 @@ resource "google_cloud_run_v2_service" "flow_worker" {
   location = var.region
   project  = var.project_id
 
-  ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  ingress = var.vpc_connector_name != "" ? "INGRESS_TRAFFIC_INTERNAL_ONLY" : "INGRESS_TRAFFIC_ALL"
 
   template {
     service_account = google_service_account.flow_worker.email
@@ -744,6 +837,11 @@ resource "google_cloud_run_v2_service" "flow_worker" {
       env {
         name  = "ARCO_FLOW_DEBUG"
         value = var.environment == "dev" ? "1" : "0"
+      }
+
+      env {
+        name  = "ARCO_FLOW_WORKER_ID"
+        value = "arco-flow-worker-${var.environment}"
       }
     }
   }

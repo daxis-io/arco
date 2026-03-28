@@ -5,6 +5,7 @@ members = [
     "crates/arco-catalog",
     "crates/arco-delta",
     "crates/arco-flow",
+    "crates/arco-flow-worker",
     "crates/arco-api",
     "crates/arco-proto",
     "crates/arco-compactor",

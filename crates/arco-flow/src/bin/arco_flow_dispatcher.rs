@@ -15,7 +15,7 @@ use arco_core::observability::{LogFormat, init_logging};
 use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 use arco_core::{
     DEFAULT_DISPATCH_TASK_TIMEOUT_SECONDS, DEFAULT_TASK_TOKEN_TTL_SECONDS, ScopedStorage,
-    TaskTokenConfig, mint_task_token,
+    TaskTokenConfig, mint_task_token_for_run,
 };
 use arco_flow::dispatch::cloud_tasks::{CloudTasksConfig, CloudTasksDispatcher};
 use arco_flow::dispatch::{EnqueueOptions, EnqueueResult};
@@ -123,6 +123,21 @@ async fn health_handler() -> StatusCode {
     StatusCode::OK
 }
 
+async fn append_and_compact_events(
+    ledger: &LedgerWriter,
+    compactor: &MicroCompactor,
+    events: Vec<OrchestrationEvent>,
+) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let event_paths = events.iter().map(LedgerWriter::event_path).collect();
+    ledger.append_all(events).await?;
+    compactor.compact_events(event_paths).await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_handler(
     State(state): State<AppState>,
@@ -150,9 +165,9 @@ async fn run_handler(
         }
     }
 
-    if !ready_events.is_empty() {
-        state.ledger.append_all(ready_events).await?;
-    }
+    append_and_compact_events(&state.ledger, &state.compactor, ready_events).await?;
+
+    let (manifest, fold_state) = state.compactor.load_state().await?;
 
     let outbox_rows: Vec<_> = fold_state.dispatch_outbox.values().cloned().collect();
     let dispatcher = DispatcherController::with_defaults();
@@ -178,11 +193,12 @@ async fn run_handler(
             continue;
         };
 
-        let minted = mint_task_token(
+        let minted = mint_task_token_for_run(
             &state.task_token_config,
             task_key.clone(),
             state.tenant_id.clone(),
             state.workspace_id.clone(),
+            Some(run_id.clone()),
             Utc::now(),
         )
         .map_err(|e| Error::configuration(format!("task token minting failed: {e}")))?;
@@ -271,9 +287,7 @@ async fn run_handler(
         }
     }
 
-    if !dispatch_events.is_empty() {
-        state.ledger.append_all(dispatch_events).await?;
-    }
+    append_and_compact_events(&state.ledger, &state.compactor, dispatch_events).await?;
 
     let timer_rows: Vec<_> = fold_state.timers.values().cloned().collect();
     let timer_controller = TimerController::with_defaults();
@@ -392,9 +406,7 @@ async fn run_handler(
         }
     }
 
-    if !timer_events.is_empty() {
-        state.ledger.append_all(timer_events).await?;
-    }
+    append_and_compact_events(&state.ledger, &state.compactor, timer_events).await?;
 
     let summary = RunSummary {
         ready_dispatch_emitted: ready_emitted,
@@ -603,6 +615,14 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use arco_core::{MemoryBackend, ScopedStorage};
+    use arco_flow::orchestration::compactor::fold::DispatchStatus;
+    use arco_flow::orchestration::controllers::{
+        DispatchAction, DispatcherController, ReadyDispatchAction, ReadyDispatchController,
+    };
+    use arco_flow::orchestration::events::{TaskDef, TriggerInfo};
 
     #[test]
     fn task_token_config_from_parts_rejects_missing_issuer() {
@@ -645,5 +665,153 @@ mod tests {
     fn validate_task_timeout_seconds_rejects_zero() {
         let err = validate_task_timeout_seconds(0).expect_err("zero timeout must fail");
         assert!(matches!(err, Error::Configuration { .. }));
+    }
+
+    #[tokio::test]
+    async fn append_and_compact_events_refreshes_projection_for_dispatch_requested() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+        let ledger = LedgerWriter::new(storage.clone());
+        let compactor = MicroCompactor::new(storage);
+
+        let run_id = "run_01";
+        let plan_id = "plan_01";
+        let task_key = "extract";
+
+        let run_triggered = OrchestrationEvent::new(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::RunTriggered {
+                run_id: run_id.to_string(),
+                plan_id: plan_id.to_string(),
+                trigger: TriggerInfo::Manual {
+                    user_id: "tester".to_string(),
+                },
+                root_assets: vec![],
+                run_key: None,
+                labels: std::collections::HashMap::new(),
+                code_version: None,
+            },
+        );
+        let plan_created = OrchestrationEvent::new(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::PlanCreated {
+                run_id: run_id.to_string(),
+                plan_id: plan_id.to_string(),
+                tasks: vec![TaskDef {
+                    key: task_key.to_string(),
+                    depends_on: vec![],
+                    asset_key: None,
+                    partition_key: None,
+                    max_attempts: 3,
+                    heartbeat_timeout_sec: 300,
+                }],
+            },
+        );
+        let initial_paths = vec![
+            LedgerWriter::event_path(&run_triggered),
+            LedgerWriter::event_path(&plan_created),
+        ];
+        ledger.append(run_triggered).await?;
+        ledger.append(plan_created).await?;
+        compactor.compact_events(initial_paths).await?;
+
+        let (manifest, fold_state) = compactor.load_state().await?;
+        let ready_actions = ReadyDispatchController::with_defaults().reconcile(&manifest, &fold_state);
+        assert_eq!(ready_actions.len(), 1);
+
+        let ready_events: Vec<_> = ready_actions
+            .into_iter()
+            .filter_map(ReadyDispatchAction::into_event_data)
+            .map(|data| OrchestrationEvent::new("tenant", "workspace", data))
+            .collect();
+
+        append_and_compact_events(&ledger, &compactor, ready_events).await?;
+
+        let (manifest, fold_state) = compactor.load_state().await?;
+        let dispatch_id =
+            format!("dispatch:{run_id}:{task_key}:1");
+        let outbox_row = fold_state
+            .dispatch_outbox
+            .get(&dispatch_id)
+            .expect("dispatch requested must be visible after compaction");
+        assert_eq!(outbox_row.status, DispatchStatus::Pending);
+
+        let dispatch_actions = DispatcherController::with_defaults()
+            .reconcile(&manifest, &fold_state.dispatch_outbox.values().cloned().collect::<Vec<_>>());
+        assert_eq!(dispatch_actions.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_and_compact_events_refreshes_projection_for_dispatch_enqueued() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+        let ledger = LedgerWriter::new(storage.clone());
+        let compactor = MicroCompactor::new(storage);
+
+        let dispatch_requested = OrchestrationEvent::new(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::DispatchRequested {
+                run_id: "run_01".to_string(),
+                task_key: "extract".to_string(),
+                attempt: 1,
+                attempt_id: "attempt_01".to_string(),
+                worker_queue: "default-queue".to_string(),
+                dispatch_id: "dispatch:run_01:extract:1".to_string(),
+            },
+        );
+        append_and_compact_events(&ledger, &compactor, vec![dispatch_requested]).await?;
+
+        let dispatch_action = DispatcherController::with_defaults()
+            .reconcile(
+                &compactor.load_state().await?.0,
+                &compactor
+                    .load_state()
+                    .await?
+                    .1
+                    .dispatch_outbox
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+            .into_iter()
+            .next()
+            .expect("dispatch action");
+
+        let DispatchAction::CreateCloudTask {
+            cloud_task_id,
+            dispatch_id,
+            ..
+        } = dispatch_action
+        else {
+            panic!("expected CreateCloudTask action");
+        };
+
+        let dispatch_enqueued = OrchestrationEvent::new(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::DispatchEnqueued {
+                dispatch_id: dispatch_id.clone(),
+                run_id: Some("run_01".to_string()),
+                task_key: Some("extract".to_string()),
+                attempt: Some(1),
+                cloud_task_id: cloud_task_id.clone(),
+            },
+        );
+        append_and_compact_events(&ledger, &compactor, vec![dispatch_enqueued]).await?;
+
+        let (_, fold_state) = compactor.load_state().await?;
+        let outbox_row = fold_state
+            .dispatch_outbox
+            .get(&dispatch_id)
+            .expect("dispatch enqueued must be visible after compaction");
+        assert_eq!(outbox_row.status, DispatchStatus::Created);
+        assert_eq!(outbox_row.cloud_task_id.as_deref(), Some(cloud_task_id.as_str()));
+
+        Ok(())
     }
 }

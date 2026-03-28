@@ -46,6 +46,7 @@ use super::parquet_util::{
 
 const SENSOR_EVAL_RETENTION_DAYS: i64 = 30;
 const IDEMPOTENCY_KEY_RETENTION_DAYS: i64 = 30;
+const COMPACTION_CONFLICT_RETRY_LIMIT: usize = 4;
 
 /// Internal durability mode for orchestration compaction acknowledgements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +78,16 @@ impl CompactionVisibility {
 }
 
 type PublishOutcome = CompactionVisibility;
+
+fn is_manifest_publish_conflict(error: &Error) -> bool {
+    match error {
+        Error::Storage { message, .. } => {
+            message.contains("immutable manifest snapshot already exists")
+                || message.contains("manifest publish failed - concurrent write")
+        }
+        _ => false,
+    }
+}
 
 /// Micro-compactor for orchestration events.
 ///
@@ -243,6 +254,36 @@ impl MicroCompactor {
         event_paths: Vec<String>,
         expected_epoch: Option<u64>,
     ) -> Result<CompactionResult> {
+        let mut attempt = 0usize;
+        loop {
+            match self
+                .compact_events_once_with_epoch(&event_paths, expected_epoch)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(error)
+                    if attempt < COMPACTION_CONFLICT_RETRY_LIMIT
+                        && is_manifest_publish_conflict(&error) =>
+                {
+                    attempt += 1;
+                    tracing::warn!(
+                        retry_attempt = attempt,
+                        error = %error,
+                        "manifest publish lost a race; retrying compaction from fresh state"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn compact_events_once_with_epoch(
+        &self,
+        event_paths: &[String],
+        expected_epoch: Option<u64>,
+    ) -> Result<CompactionResult> {
         let ack_started = Instant::now();
 
         // Load current manifest + version for CAS
@@ -292,7 +333,7 @@ impl MicroCompactor {
 
         // Process events
         let mut events = Vec::new();
-        for path in &event_paths {
+        for path in event_paths {
             let data = self.storage.get_raw(path).await?;
             let event: OrchestrationEvent =
                 serde_json::from_slice(&data).map_err(|e| Error::Serialization {
@@ -1444,11 +1485,20 @@ mod tests {
         OrchestrationEventData, PartitionSelector, RunRequest, SensorEvalStatus, SourceRef,
         TaskDef, TickStatus, TimerType, TriggerInfo, TriggerSource,
     };
-    use crate::paths::orchestration_event_path;
-    use arco_core::MemoryBackend;
+    use crate::paths::{
+        orchestration_event_path, orchestration_manifest_pointer_path,
+        orchestration_manifest_snapshot_path,
+    };
+    use arco_core::{MemoryBackend, StorageBackend};
+    use async_trait::async_trait;
+    use bytes::Bytes;
     use chrono::DateTime;
     use std::collections::HashMap;
+    use std::ops::Range;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Barrier;
     use ulid::Ulid;
 
     async fn create_test_compactor() -> Result<(MicroCompactor, ScopedStorage)> {
@@ -1456,6 +1506,85 @@ mod tests {
         let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
         let compactor = MicroCompactor::new(storage.clone());
         Ok((compactor, storage))
+    }
+
+    #[derive(Debug)]
+    struct CoordinatedMemoryBackend {
+        inner: MemoryBackend,
+        pointer_path: String,
+        first_snapshot_path: String,
+        pointer_head_hits: AtomicUsize,
+        snapshot_write_hits: AtomicUsize,
+        pointer_head_barrier: Barrier,
+        snapshot_write_barrier: Barrier,
+    }
+
+    impl CoordinatedMemoryBackend {
+        fn new() -> Self {
+            let scope = "tenant=tenant/workspace=workspace";
+            Self {
+                inner: MemoryBackend::new(),
+                pointer_path: format!("{scope}/{}", orchestration_manifest_pointer_path()),
+                first_snapshot_path: format!(
+                    "{scope}/{}",
+                    orchestration_manifest_snapshot_path("00000000000000000001")
+                ),
+                pointer_head_hits: AtomicUsize::new(0),
+                snapshot_write_hits: AtomicUsize::new(0),
+                pointer_head_barrier: Barrier::new(2),
+                snapshot_write_barrier: Barrier::new(2),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for CoordinatedMemoryBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            if path == self.first_snapshot_path
+                && matches!(precondition, WritePrecondition::DoesNotExist)
+            {
+                let hit = self.snapshot_write_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                if hit <= 2 {
+                    self.snapshot_write_barrier.wait().await;
+                }
+            }
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<arco_core::ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::Result<Option<arco_core::ObjectMeta>> {
+            if path == self.pointer_path {
+                let hit = self.pointer_head_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                if hit <= 2 {
+                    self.pointer_head_barrier.wait().await;
+                }
+            }
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
     }
 
     // Use deterministic event IDs to avoid parallel test flakiness.
@@ -1479,6 +1608,29 @@ mod tests {
                 code_version: None,
             },
             "evt_01_run_triggered",
+        )
+    }
+
+    fn make_named_run_triggered_event(
+        run_id: &str,
+        plan_id: &str,
+        event_id: &str,
+    ) -> OrchestrationEvent {
+        OrchestrationEvent::new_with_event_id(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::RunTriggered {
+                run_id: run_id.to_string(),
+                plan_id: plan_id.to_string(),
+                trigger: TriggerInfo::Manual {
+                    user_id: "user@example.com".to_string(),
+                },
+                root_assets: vec!["analytics.report".to_string()],
+                run_key: None,
+                labels: HashMap::new(),
+                code_version: None,
+            },
+            event_id,
         )
     }
 
@@ -2158,6 +2310,49 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("manifest publish failed"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compact_events_retries_after_concurrent_manifest_snapshot_conflict() -> Result<()> {
+        let backend = Arc::new(CoordinatedMemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+        let compactor_a = MicroCompactor::new(storage.clone());
+        let compactor_b = MicroCompactor::new(storage.clone());
+
+        let event_a = make_named_run_triggered_event("run_a", "plan_a", "evt_01_run_a");
+        let event_b = make_named_run_triggered_event("run_b", "plan_b", "evt_02_run_b");
+
+        let path_a = orchestration_event_path("2025-01-15", &event_a.event_id);
+        let path_b = orchestration_event_path("2025-01-15", &event_b.event_id);
+
+        storage
+            .put_raw(
+                &path_a,
+                Bytes::from(serde_json::to_string(&event_a).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
+        storage
+            .put_raw(
+                &path_b,
+                Bytes::from(serde_json::to_string(&event_b).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
+
+        let (result_a, result_b) = tokio::join!(
+            compactor_a.compact_events(vec![path_a]),
+            compactor_b.compact_events(vec![path_b])
+        );
+
+        result_a?;
+        result_b?;
+
+        let (_, state) = compactor_a.load_state().await?;
+        assert!(state.runs.contains_key("run_a"));
+        assert!(state.runs.contains_key("run_b"));
 
         Ok(())
     }

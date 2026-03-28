@@ -18,6 +18,7 @@ Arco uses split services with hard boundaries:
 - Compactors own Parquet projection writes.
 - Browser analytics use DuckDB-WASM via signed URLs.
 - Task execution happens in external workers via canonical dispatch envelopes.
+- This repo also ships a minimal cloud test worker for deployment validation; it is not the production ETL runtime boundary.
 
 Current cycle non-goals: no in-process ETL engine and no Spark/dbt/Flink adapter implementation.
 

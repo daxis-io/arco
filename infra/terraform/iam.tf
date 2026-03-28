@@ -249,32 +249,49 @@ resource "google_cloud_run_v2_service_iam_member" "flow_tasks_timer_ingest_invok
   member   = "serviceAccount:${google_service_account.flow_tasks_oidc[0].email}"
 }
 
+resource "google_cloud_run_v2_service_iam_member" "flow_task_invoker_worker" {
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.flow_worker.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.flow_task_invoker.email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "flow_controller_flow_compactor" {
+  count    = local.flow_services_enabled ? 1 : 0
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.flow_compactor.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.flow_controller.email}"
+}
+
 resource "google_project_iam_member" "flow_dispatcher_cloudtasks_enqueuer" {
   count   = local.flow_services_enabled ? 1 : 0
   project = var.project_id
   role    = "roles/cloudtasks.enqueuer"
-  member  = "serviceAccount:${google_service_account.flow_dispatcher[0].email}"
+  member  = "serviceAccount:${google_service_account.flow_controller.email}"
 }
 
 resource "google_project_iam_member" "flow_sweeper_cloudtasks_enqueuer" {
   count   = local.flow_services_enabled ? 1 : 0
   project = var.project_id
   role    = "roles/cloudtasks.enqueuer"
-  member  = "serviceAccount:${google_service_account.flow_sweeper[0].email}"
+  member  = "serviceAccount:${google_service_account.flow_controller.email}"
 }
 
 resource "google_service_account_iam_member" "flow_dispatcher_act_as_tasks_oidc" {
   count              = local.flow_services_enabled ? 1 : 0
-  service_account_id = google_service_account.flow_tasks_oidc[0].name
+  service_account_id = google_service_account.flow_task_invoker.name
   role               = "roles/iam.serviceAccountUser"
-  member             = "serviceAccount:${google_service_account.flow_dispatcher[0].email}"
+  member             = "serviceAccount:${google_service_account.flow_controller.email}"
 }
 
 resource "google_service_account_iam_member" "flow_sweeper_act_as_tasks_oidc" {
   count              = local.flow_services_enabled ? 1 : 0
-  service_account_id = google_service_account.flow_tasks_oidc[0].name
+  service_account_id = google_service_account.flow_task_invoker.name
   role               = "roles/iam.serviceAccountUser"
-  member             = "serviceAccount:${google_service_account.flow_sweeper[0].email}"
+  member             = "serviceAccount:${google_service_account.flow_controller.email}"
 }
 
 resource "google_storage_bucket_iam_member" "flow_dispatcher_storage_access" {
@@ -304,7 +321,7 @@ resource "google_storage_bucket_iam_member" "flow_timer_ingest_storage_access" {
 
 # Allow unauthenticated access to API (if public)
 resource "google_cloud_run_v2_service_iam_member" "api_public" {
-  count    = var.api_public ? 1 : 0
+  count    = var.api_public || var.api_allow_unauthenticated_internal ? 1 : 0
   project  = var.project_id
   location = var.region
   name     = google_cloud_run_v2_service.api.name

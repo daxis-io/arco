@@ -330,12 +330,13 @@ impl TaskTokenValidator for JwtTaskTokenValidator {
     fn validate_task_token(
         &self,
         task_id: &str,
-        _run_id: &str,
+        run_id: &str,
         _attempt: u32,
         token: &str,
     ) -> impl Future<Output = Result<(), String>> + Send {
         let validator = self.clone();
         let task_id = task_id.to_string();
+        let run_id = run_id.to_string();
         let token = token.to_string();
 
         async move {
@@ -353,6 +354,11 @@ impl TaskTokenValidator for JwtTaskTokenValidator {
             if claims.task_id != task_id {
                 return Err("task_id_mismatch".to_string());
             }
+            if let Some(claim_run_id) = claims.run_id.as_deref() {
+                if claim_run_id != run_id {
+                    return Err("run_id_mismatch".to_string());
+                }
+            }
             if claims.tenant_id != validator.tenant {
                 return Err("tenant_mismatch".to_string());
             }
@@ -368,10 +374,14 @@ impl TaskTokenValidator for JwtTaskTokenValidator {
 #[derive(Clone)]
 struct ParquetTaskStateLookup {
     state: Arc<FoldState>,
+    run_id_hint: Option<String>,
 }
 
 impl ParquetTaskStateLookup {
-    async fn load(storage: arco_core::ScopedStorage) -> Result<Self, ApiError> {
+    async fn load(
+        storage: arco_core::ScopedStorage,
+        run_id_hint: Option<String>,
+    ) -> Result<Self, ApiError> {
         let compactor = MicroCompactor::new(storage);
         let (_, state) = compactor
             .load_state()
@@ -379,6 +389,7 @@ impl ParquetTaskStateLookup {
             .map_err(|e| ApiError::internal(format!("failed to load orchestration state: {e}")))?;
         Ok(Self {
             state: Arc::new(state),
+            run_id_hint,
         })
     }
 }
@@ -390,12 +401,18 @@ impl TaskStateLookup for ParquetTaskStateLookup {
     ) -> impl Future<Output = Result<Option<CallbackTaskState>, String>> + Send {
         let state = Arc::clone(&self.state);
         let task_id = task_id.to_string();
+        let run_id_hint = self.run_id_hint.clone();
         async move {
             // Task IDs are expected to be unique task keys in orchestration state.
             let matches: Vec<_> = state
                 .tasks
                 .values()
                 .filter(|row| row.task_key == task_id)
+                .filter(|row| {
+                    run_id_hint
+                        .as_ref()
+                        .is_none_or(|run_id| row.run_id == *run_id)
+                })
                 .collect();
 
             if matches.is_empty() {
@@ -453,6 +470,7 @@ fn callback_error_response(error: CallbackError) -> CallbackErrorResponse {
 }
 
 fn callback_result_response<T, U>(
+    handler: &str,
     result: CallbackResult<T>,
 ) -> Result<axum::response::Response, ApiError>
 where
@@ -480,7 +498,10 @@ where
         CallbackResult::NotFound(error) => {
             (StatusCode::NOT_FOUND, Json(callback_error_response(error))).into_response()
         }
-        CallbackResult::InternalError(message) => return Err(ApiError::internal(message)),
+        CallbackResult::InternalError(message) => {
+            tracing::error!(handler, error = %message, "Task callback internal error");
+            return Err(ApiError::internal(message));
+        }
     };
 
     Ok(response)
@@ -600,6 +621,7 @@ pub async fn task_auth_middleware(
 async fn build_callback_dependencies(
     ctx: &RequestContext,
     state: &AppState,
+    run_id_hint: Option<String>,
 ) -> Result<
     (
         CallbackContext<CompactingLedgerWriter, JwtTaskTokenValidator>,
@@ -609,7 +631,7 @@ async fn build_callback_dependencies(
 > {
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
-    let lookup = ParquetTaskStateLookup::load(storage.clone()).await?;
+    let lookup = ParquetTaskStateLookup::load(storage.clone(), run_id_hint).await?;
     let ledger = Arc::new(CompactingLedgerWriter::new(storage, state.config.clone()));
     let debug_allowed = state.config.debug && state.config.posture.is_dev();
     let validator = Arc::new(JwtTaskTokenValidator::new(
@@ -622,6 +644,12 @@ async fn build_callback_dependencies(
         CallbackContext::new(ledger, validator, ctx.tenant.clone(), ctx.workspace.clone());
 
     Ok((callback_ctx, lookup))
+}
+
+fn decode_task_token_run_hint(state: &AppState, token: &str) -> Option<String> {
+    decode_task_token(&state.config.task_token, token)
+        .ok()
+        .and_then(|claims| claims.run_id)
 }
 
 impl From<TaskStartedRequest> for FlowTaskStartedRequest {
@@ -810,15 +838,26 @@ pub(crate) async fn task_started(
     let Some(token) = extract_bearer_token(&headers) else {
         let error = CallbackError::invalid_token("missing bearer token");
         return callback_result_response::<FlowTaskStartedResponse, TaskStartedResponse>(
+            "task_started",
             CallbackResult::Unauthorized(error),
         );
     };
 
-    let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state).await?;
+    let run_id_hint = decode_task_token_run_hint(&state, &token);
+    let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state, run_id_hint)
+        .await
+        .map_err(|err| {
+            tracing::error!(
+                task_id = %task_id,
+                error = %err.message(),
+                "Failed to build task started callback dependencies"
+            );
+            err
+        })?;
     let result =
         handle_task_started(&callback_ctx, &task_id, &token, request.into(), &lookup).await;
 
-    callback_result_response::<FlowTaskStartedResponse, TaskStartedResponse>(result)
+    callback_result_response::<FlowTaskStartedResponse, TaskStartedResponse>("task_started", result)
 }
 
 /// Worker heartbeat callback.
@@ -862,14 +901,25 @@ pub(crate) async fn task_heartbeat(
     let Some(token) = extract_bearer_token(&headers) else {
         let error = CallbackError::invalid_token("missing bearer token");
         return callback_result_response::<FlowHeartbeatResponse, HeartbeatResponse>(
+            "heartbeat",
             CallbackResult::Unauthorized(error),
         );
     };
 
-    let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state).await?;
+    let run_id_hint = decode_task_token_run_hint(&state, &token);
+    let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state, run_id_hint)
+        .await
+        .map_err(|err| {
+            tracing::error!(
+                task_id = %task_id,
+                error = %err.message(),
+                "Failed to build task heartbeat callback dependencies"
+            );
+            err
+        })?;
     let result = handle_heartbeat(&callback_ctx, &task_id, &token, request.into(), &lookup).await;
 
-    callback_result_response::<FlowHeartbeatResponse, HeartbeatResponse>(result)
+    callback_result_response::<FlowHeartbeatResponse, HeartbeatResponse>("heartbeat", result)
 }
 
 /// Worker task completed callback.
@@ -912,15 +962,29 @@ pub(crate) async fn task_completed(
     let Some(token) = extract_bearer_token(&headers) else {
         let error = CallbackError::invalid_token("missing bearer token");
         return callback_result_response::<FlowTaskCompletedResponse, TaskCompletedResponse>(
+            "task_completed",
             CallbackResult::Unauthorized(error),
         );
     };
 
-    let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state).await?;
+    let run_id_hint = decode_task_token_run_hint(&state, &token);
+    let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state, run_id_hint)
+        .await
+        .map_err(|err| {
+            tracing::error!(
+                task_id = %task_id,
+                error = %err.message(),
+                "Failed to build task completed callback dependencies"
+            );
+            err
+        })?;
     let result =
         handle_task_completed(&callback_ctx, &task_id, &token, request.into(), &lookup).await;
 
-    callback_result_response::<FlowTaskCompletedResponse, TaskCompletedResponse>(result)
+    callback_result_response::<FlowTaskCompletedResponse, TaskCompletedResponse>(
+        "task_completed",
+        result,
+    )
 }
 
 // ============================================================================
@@ -941,6 +1005,7 @@ mod tests {
     use crate::config::Posture;
     use anyhow::Result;
     use arco_core::TaskTokenClaims;
+    use arco_flow::orchestration::compactor::{RunRow, RunState, TaskRow};
     use axum::body::Body as AxumBody;
     use axum::http::Request as AxumRequest;
     use axum::routing::get;
@@ -1148,6 +1213,153 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_jwt_task_token_validator_rejects_run_id_mismatch_when_claim_present() {
+        let config = TaskTokenConfig {
+            hs256_secret: "test-secret".to_string(),
+            issuer: None,
+            audience: None,
+            ttl_seconds: 900,
+        };
+
+        let validator = JwtTaskTokenValidator::new(&config, "tenant-1", "workspace-1", false)
+            .expect("validator");
+
+        let exp = (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize;
+        let claims = serde_json::json!({
+            "taskId": "task-123",
+            "tenantId": "tenant-1",
+            "workspaceId": "workspace-1",
+            "runId": "run-2",
+            "exp": exp
+        });
+        let token = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(b"test-secret"),
+        )
+        .expect("token");
+
+        let result =
+            tokio_test::block_on(validator.validate_task_token("task-123", "run-1", 1, &token));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parquet_task_state_lookup_run_hint_disambiguates_duplicate_task_ids() {
+        let mut state = FoldState::new();
+        let triggered_at = Utc::now();
+
+        state.runs.insert(
+            "run-1".to_string(),
+            RunRow {
+                run_id: "run-1".to_string(),
+                plan_id: "plan-1".to_string(),
+                state: RunState::Running,
+                run_key: None,
+                labels: std::collections::HashMap::new(),
+                code_version: Some("code-v1".to_string()),
+                cancel_requested: false,
+                tasks_total: 1,
+                tasks_completed: 0,
+                tasks_succeeded: 0,
+                tasks_failed: 0,
+                tasks_skipped: 0,
+                tasks_cancelled: 0,
+                triggered_at,
+                completed_at: None,
+                row_version: "01H00000000000000000000001".to_string(),
+            },
+        );
+        state.runs.insert(
+            "run-2".to_string(),
+            RunRow {
+                run_id: "run-2".to_string(),
+                plan_id: "plan-2".to_string(),
+                state: RunState::Running,
+                run_key: None,
+                labels: std::collections::HashMap::new(),
+                code_version: Some("code-v2".to_string()),
+                cancel_requested: false,
+                tasks_total: 1,
+                tasks_completed: 0,
+                tasks_succeeded: 0,
+                tasks_failed: 0,
+                tasks_skipped: 0,
+                tasks_cancelled: 0,
+                triggered_at,
+                completed_at: None,
+                row_version: "01H00000000000000000000002".to_string(),
+            },
+        );
+        state.tasks.insert(
+            ("run-1".to_string(), "analytics.users".to_string()),
+            TaskRow {
+                run_id: "run-1".to_string(),
+                task_key: "analytics.users".to_string(),
+                state: FoldTaskState::Dispatched,
+                attempt: 1,
+                attempt_id: Some("attempt-1".to_string()),
+                started_at: None,
+                completed_at: None,
+                error_message: None,
+                deps_total: 0,
+                deps_satisfied_count: 0,
+                max_attempts: 1,
+                heartbeat_timeout_sec: 300,
+                last_heartbeat_at: None,
+                ready_at: None,
+                asset_key: Some("analytics.users".to_string()),
+                partition_key: None,
+                materialization_id: None,
+                delta_table: None,
+                delta_version: None,
+                delta_partition: None,
+                execution_lineage_ref: None,
+                row_version: "01H00000000000000000000003".to_string(),
+            },
+        );
+        state.tasks.insert(
+            ("run-2".to_string(), "analytics.users".to_string()),
+            TaskRow {
+                run_id: "run-2".to_string(),
+                task_key: "analytics.users".to_string(),
+                state: FoldTaskState::Dispatched,
+                attempt: 2,
+                attempt_id: Some("attempt-2".to_string()),
+                started_at: None,
+                completed_at: None,
+                error_message: None,
+                deps_total: 0,
+                deps_satisfied_count: 0,
+                max_attempts: 2,
+                heartbeat_timeout_sec: 300,
+                last_heartbeat_at: None,
+                ready_at: None,
+                asset_key: Some("analytics.users".to_string()),
+                partition_key: None,
+                materialization_id: None,
+                delta_table: None,
+                delta_version: None,
+                delta_partition: None,
+                execution_lineage_ref: None,
+                row_version: "01H00000000000000000000004".to_string(),
+            },
+        );
+
+        let lookup = ParquetTaskStateLookup {
+            state: Arc::new(state),
+            run_id_hint: Some("run-2".to_string()),
+        };
+
+        let task = tokio_test::block_on(lookup.get_task_state("analytics.users"))
+            .expect("lookup succeeds")
+            .expect("task exists");
+        assert_eq!(task.run_id, "run-2");
+        assert_eq!(task.attempt, 2);
+        assert_eq!(task.attempt_id, "attempt-2");
+    }
+
     #[tokio::test]
     async fn test_task_auth_middleware_rejects_missing_token() -> Result<()> {
         let mut config = crate::config::Config::default();
@@ -1204,6 +1416,7 @@ mod tests {
                 task_id: "task-123".to_string(),
                 tenant_id: "tenant-1".to_string(),
                 workspace_id: "workspace-1".to_string(),
+                run_id: None,
                 exp: 2_000_000_000,
                 nbf: None,
                 iat: None,

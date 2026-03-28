@@ -157,6 +157,9 @@ pub struct TaskTokenClaims {
     /// Workspace identifier.
     #[serde(alias = "workspace_id", alias = "workspace")]
     pub workspace_id: String,
+    /// Optional run identifier for disambiguating repeated task keys across runs.
+    #[serde(alias = "run_id", skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     /// Expiry (unix timestamp seconds).
     pub exp: usize,
     /// Not-before (unix timestamp seconds).
@@ -199,6 +202,22 @@ pub fn mint_task_token(
     workspace_id: impl Into<String>,
     now: DateTime<Utc>,
 ) -> Result<MintedTaskToken> {
+    mint_task_token_for_run(config, task_id, tenant_id, workspace_id, None::<String>, now)
+}
+
+/// Mints a task-scoped callback token with an optional run identifier.
+///
+/// # Errors
+///
+/// Returns an error when configuration is invalid or signing fails.
+pub fn mint_task_token_for_run(
+    config: &TaskTokenConfig,
+    task_id: impl Into<String>,
+    tenant_id: impl Into<String>,
+    workspace_id: impl Into<String>,
+    run_id: Option<impl Into<String>>,
+    now: DateTime<Utc>,
+) -> Result<MintedTaskToken> {
     config.validate()?;
 
     let expires_at = now + config.ttl();
@@ -206,6 +225,7 @@ pub fn mint_task_token(
         task_id: task_id.into(),
         tenant_id: tenant_id.into(),
         workspace_id: workspace_id.into(),
+        run_id: run_id.map(Into::into),
         exp: timestamp_to_usize(expires_at.timestamp(), "exp")?,
         nbf: Some(timestamp_to_usize(now.timestamp(), "nbf")?),
         iat: Some(timestamp_to_usize(now.timestamp(), "iat")?),
@@ -273,6 +293,34 @@ mod tests {
         assert_eq!(claims.task_id, "task-123");
         assert_eq!(claims.tenant_id, "tenant-1");
         assert_eq!(claims.workspace_id, "workspace-1");
+        assert_eq!(claims.run_id, None);
+        assert!(minted.expires_at > now);
+    }
+
+    #[test]
+    fn mint_and_decode_task_token_with_run_round_trip() {
+        let config = TaskTokenConfig {
+            hs256_secret: "secret".to_string(),
+            issuer: Some("https://issuer.task".to_string()),
+            audience: Some("arco-worker-callback".to_string()),
+            ttl_seconds: 60,
+        };
+
+        let now = Utc::now();
+        let minted = mint_task_token_for_run(
+            &config,
+            "task-123",
+            "tenant-1",
+            "workspace-1",
+            Some("run-123"),
+            now,
+        )
+        .expect("mint");
+
+        let claims = decode_task_token(&config, &minted.token).expect("decode");
+
+        assert_eq!(claims.task_id, "task-123");
+        assert_eq!(claims.run_id.as_deref(), Some("run-123"));
         assert!(minted.expires_at > now);
     }
 

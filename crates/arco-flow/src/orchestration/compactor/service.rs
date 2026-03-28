@@ -1497,6 +1497,7 @@ mod tests {
                         partition_key: None,
                         max_attempts: 3,
                         heartbeat_timeout_sec: 300,
+                        requires_visible_output: true,
                     },
                     TaskDef {
                         key: "transform".to_string(),
@@ -1505,6 +1506,7 @@ mod tests {
                         partition_key: None,
                         max_attempts: 3,
                         heartbeat_timeout_sec: 300,
+                        requires_visible_output: true,
                     },
                 ],
             },

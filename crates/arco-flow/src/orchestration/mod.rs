@@ -49,7 +49,7 @@ pub mod worker_contract;
 pub use callbacks::{
     CallbackError, CallbackResult, ErrorCategory, HeartbeatRequest, HeartbeatResponse,
     TaskCompletedRequest, TaskCompletedResponse, TaskError, TaskMetrics, TaskOutput,
-    TaskStartedRequest, TaskStartedResponse, WorkerOutcome,
+    TaskOutputVisibilityState, TaskStartedRequest, TaskStartedResponse, WorkerOutcome,
 };
 pub use ledger::{LedgerWriter, OrchestrationLedgerWriter};
 pub use run_key::{

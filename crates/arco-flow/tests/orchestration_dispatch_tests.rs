@@ -56,6 +56,7 @@ async fn dispatch_e2e_loop_creates_outbox_and_enqueued_event() -> Result<()> {
                 partition_key: None,
                 max_attempts: 3,
                 heartbeat_timeout_sec: 300,
+                requires_visible_output: false,
             }],
         },
     );

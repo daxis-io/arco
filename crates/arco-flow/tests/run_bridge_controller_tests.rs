@@ -358,3 +358,34 @@ fn run_bridge_skips_when_source_fingerprint_does_not_match_index() {
             if run_key == "sched:daily:1" && reason == "run_request_source_not_found"
     ));
 }
+
+#[test]
+fn run_bridge_fallback_task_does_not_require_visible_output() {
+    let mut state = FoldState::new();
+    state.run_key_index.insert(
+        "sched:daily:1".to_string(),
+        run_key_index_row("sched:daily:1", "run_sched_1", "fp-1"),
+    );
+    state.schedule_ticks.insert(
+        "sched-01:1736935200".to_string(),
+        schedule_tick_row("sched:daily:1", "fp-1", vec!["invalid asset".to_string()]),
+    );
+
+    let controller = RunBridgeController::with_defaults();
+    let actions = controller.reconcile(&fresh_manifest(), &state);
+    assert_eq!(actions.len(), 1, "expected one run bridge action");
+
+    let RunBridgeAction::EmitRunEvents { plan_created, .. } = actions.first().expect("action")
+    else {
+        panic!("expected EmitRunEvents action");
+    };
+
+    match plan_created {
+        OrchestrationEventData::PlanCreated { tasks, .. } => {
+            assert_eq!(tasks.len(), 1, "expected fallback materialize task");
+            assert_eq!(tasks[0].key, "materialize");
+            assert!(!tasks[0].requires_visible_output);
+        }
+        _ => panic!("expected PlanCreated event"),
+    }
+}

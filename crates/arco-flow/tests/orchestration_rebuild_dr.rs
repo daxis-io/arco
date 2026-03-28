@@ -128,6 +128,7 @@ fn plan_created(event_id: &str, run_id: &str, plan_id: &str) -> OrchestrationEve
                 partition_key: None,
                 max_attempts: 3,
                 heartbeat_timeout_sec: 300,
+                requires_visible_output: false,
             }],
         },
         Utc::now(),

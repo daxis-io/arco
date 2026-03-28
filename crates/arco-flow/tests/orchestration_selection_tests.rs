@@ -110,6 +110,24 @@ fn selection_includes_upstream_when_requested() {
 }
 
 #[test]
+fn selection_marks_materialize_tasks_as_requiring_visible_output() {
+    let mut graph = AssetGraph::new();
+    graph.insert_asset("analytics.a".to_string(), vec![]);
+
+    let tasks = build_task_defs_for_selection(
+        &graph,
+        &["analytics.a".to_string()],
+        SelectionOptions::none(),
+        Some("2026-03-24"),
+    )
+    .expect("plan");
+
+    assert_eq!(tasks.len(), 1);
+    assert!(tasks[0].requires_visible_output);
+    assert_eq!(tasks[0].partition_key.as_deref(), Some("2026-03-24"));
+}
+
+#[test]
 fn canonicalize_asset_key_rejects_invalid_inputs() {
     let invalid = [
         "analytics/",

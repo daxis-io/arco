@@ -117,6 +117,7 @@ fn default_task_def(key: &str, depends_on: Vec<&str>) -> TaskDef {
         partition_key: None,
         max_attempts: 3,
         heartbeat_timeout_sec: 60,
+        requires_visible_output: false,
     }
 }
 
@@ -310,7 +311,11 @@ fn test_anti_entropy_recovers_orphaned_tasks() -> Result<()> {
         ready_at: Some(now - Duration::minutes(10)),
         asset_key: None,
         partition_key: None,
+        requires_visible_output: false,
         materialization_id: None,
+        output_visibility_state: None,
+        published_at: None,
+        publish_error: None,
         delta_table: None,
         delta_version: None,
         delta_partition: None,

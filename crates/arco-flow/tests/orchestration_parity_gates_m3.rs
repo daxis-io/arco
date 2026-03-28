@@ -181,6 +181,7 @@ fn parity_m3_successful_materialization_links_execution_lineage_to_delta_version
                 partition_key: Some(partition_key.to_string()),
                 max_attempts: 1,
                 heartbeat_timeout_sec: 300,
+                requires_visible_output: true,
             }],
         },
     ));

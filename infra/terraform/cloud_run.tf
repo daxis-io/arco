@@ -205,7 +205,7 @@ resource "google_cloud_run_v2_service" "compactor" {
           cpu    = var.compactor_cpu
           memory = var.compactor_memory
         }
-        cpu_idle          = false # Always allocated (background worker)
+        cpu_idle          = var.compactor_min_instances == 0
         startup_cpu_boost = true
       }
 
@@ -300,8 +300,8 @@ resource "google_cloud_run_v2_service" "flow_compactor" {
     service_account = google_service_account.compactor.email
 
     scaling {
-      # Keep warm for low-latency compaction in pipeline tests.
-      min_instance_count = 1
+      # Dev can let this scale to zero when background automation is disabled.
+      min_instance_count = var.background_automation_enabled ? 1 : 0
       max_instance_count = 1
     }
 
@@ -321,7 +321,7 @@ resource "google_cloud_run_v2_service" "flow_compactor" {
           cpu    = "1"
           memory = "512Mi"
         }
-        cpu_idle          = false
+        cpu_idle          = !var.background_automation_enabled
         startup_cpu_boost = true
       }
 
@@ -414,7 +414,7 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
     service_account = google_service_account.flow_controller.email
 
     scaling {
-      min_instance_count = 1
+      min_instance_count = var.background_automation_enabled ? 1 : 0
       max_instance_count = 1
     }
 
@@ -434,7 +434,7 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
           cpu    = "1"
           memory = "512Mi"
         }
-        cpu_idle          = false
+        cpu_idle          = !var.background_automation_enabled
         startup_cpu_boost = true
       }
 
@@ -551,7 +551,7 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
     service_account = google_service_account.flow_controller.email
 
     scaling {
-      min_instance_count = 1
+      min_instance_count = var.background_automation_enabled ? 1 : 0
       max_instance_count = 1
     }
 
@@ -571,7 +571,7 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
           cpu    = "1"
           memory = "512Mi"
         }
-        cpu_idle          = false
+        cpu_idle          = !var.background_automation_enabled
         startup_cpu_boost = true
       }
 
@@ -767,7 +767,7 @@ resource "google_cloud_run_v2_service" "flow_worker" {
 
 # Optional: Trigger compactor on a schedule (for environments without always-on)
 resource "google_cloud_scheduler_job" "compactor_trigger" {
-  count = var.compactor_min_instances == 0 ? 1 : 0
+  count = var.background_automation_enabled && var.compactor_min_instances == 0 ? 1 : 0
 
   name        = "arco-compactor-trigger-${var.environment}"
   project     = var.project_id

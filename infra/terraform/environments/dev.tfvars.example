@@ -28,6 +28,7 @@ api_min_instances       = 0
 api_max_instances       = 2
 compactor_min_instances = 0
 compactor_max_instances = 1
+background_automation_enabled = false
 
 # Resource limits (dev: smaller)
 api_cpu        = "1"

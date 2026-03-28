@@ -65,7 +65,7 @@ resource "google_cloud_run_v2_service" "flow_timer_ingest" {
 }
 
 resource "google_cloud_scheduler_job" "flow_dispatcher_run" {
-  count       = local.flow_services_enabled ? 1 : 0
+  count       = local.flow_services_enabled && var.background_automation_enabled ? 1 : 0
   name        = "arco-flow-dispatcher-run-${var.environment}"
   project     = var.project_id
   region      = var.region
@@ -84,7 +84,7 @@ resource "google_cloud_scheduler_job" "flow_dispatcher_run" {
 }
 
 resource "google_cloud_scheduler_job" "flow_sweeper_run" {
-  count       = local.flow_services_enabled ? 1 : 0
+  count       = local.flow_services_enabled && var.background_automation_enabled ? 1 : 0
   name        = "arco-flow-sweeper-run-${var.environment}"
   project     = var.project_id
   region      = var.region

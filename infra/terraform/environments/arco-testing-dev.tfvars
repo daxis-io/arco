@@ -24,6 +24,7 @@ api_min_instances       = 0
 api_max_instances       = 1
 compactor_min_instances = 0
 compactor_max_instances = 1
+background_automation_enabled = false
 api_cpu                 = "1"
 api_memory              = "512Mi"
 compactor_cpu           = "1"

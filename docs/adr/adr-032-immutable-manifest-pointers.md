@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
@@ -17,6 +17,11 @@ failover. We need a commit primitive that is:
 ## Decision
 
 Arco adopts an immutable manifest snapshot model with a mutable pointer per domain.
+
+Catalog domain writers and the orchestration micro-compactor now use this
+snapshot+pointer model for visible state publication. Orchestration orphan
+reconciliation/GC for abandoned snapshots and L0 directories remains follow-up
+operational work.
 
 ### Storage layout
 

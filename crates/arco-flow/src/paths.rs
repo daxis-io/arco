@@ -39,6 +39,11 @@ pub fn orchestration_l0_dir(delta_id: &str) -> String {
     FlowPaths::orchestration_l0_dir(delta_id)
 }
 
+/// Returns the canonical orchestration base snapshot directory for a snapshot id.
+pub fn orchestration_base_snapshot_dir(snapshot_id: &str) -> String {
+    FlowPaths::orchestration_base_snapshot_dir(snapshot_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,6 +61,10 @@ mod tests {
         assert_eq!(
             orchestration_compaction_lock_path(),
             "locks/orchestration.compaction.lock.json"
+        );
+        assert_eq!(
+            orchestration_base_snapshot_dir("snapshot-001"),
+            "state/orchestration/base/snapshot-001"
         );
     }
 }

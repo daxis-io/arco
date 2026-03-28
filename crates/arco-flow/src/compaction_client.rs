@@ -7,10 +7,12 @@
 //! In cloud deployments, this is done via the `arco-flow-compactor` Cloud Run service:
 //! `POST {ARCO_ORCH_COMPACTOR_URL}/compact` with `{ "event_paths": [...] }`.
 
+#[cfg(any(feature = "gcp", feature = "test-utils"))]
 use serde::Serialize;
 
 use crate::error::{Error, Result};
 
+#[cfg(any(feature = "gcp", feature = "test-utils"))]
 #[derive(Debug, Serialize)]
 struct CompactRequest<'a> {
     event_paths: &'a [String],

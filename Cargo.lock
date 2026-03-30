@@ -258,6 +258,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
+ "tracing-subscriber",
  "ulid",
  "uuid",
 ]
@@ -389,6 +390,7 @@ dependencies = [
  "tokio-test",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "ulid",
 ]
 

@@ -17,9 +17,9 @@ use arco_flow::dispatch::memory::InMemoryTaskQueue;
 use arco_flow::dispatch::{EnqueueOptions, EnqueueResult, TaskEnvelope, TaskQueue};
 use arco_flow::error::{Error, Result};
 use arco_flow::orchestration::LedgerWriter;
-use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_flow::orchestration::compactor::fold::{FoldState, TaskRow, TaskState};
 use arco_flow::orchestration::compactor::manifest::OrchestrationManifest;
+use arco_flow::orchestration::compactor::{CompactionVisibility, MicroCompactor};
 use arco_flow::orchestration::controllers::{
     AntiEntropySweeper, DispatcherController, ReadyDispatchController,
 };
@@ -557,7 +557,8 @@ impl StorageBackend for FailOncePathBackend {
 }
 
 #[tokio::test]
-async fn test_compaction_replay_recovers_after_manifest_publish_failure() -> Result<()> {
+async fn test_compaction_replay_recovers_after_repair_pending_legacy_manifest_failure() -> Result<()>
+{
     let backend = Arc::new(FailOncePathBackend::new(
         "state/orchestration/manifest.json",
     ));
@@ -581,11 +582,19 @@ async fn test_compaction_replay_recovers_after_manifest_publish_failure() -> Res
         paths.push(path);
     }
 
-    // First compaction fails during manifest publish (injected), simulating crash window.
-    let first = compactor.compact_events(paths.clone()).await;
+    // First compaction succeeds via pointer CAS but leaves the legacy manifest mirror repairable.
+    let first = compactor.compact_events(paths.clone()).await?;
+    assert_eq!(first.visibility_status, CompactionVisibility::Visible);
     assert!(
-        first.is_err(),
-        "first compaction should fail due to injected manifest publish failure"
+        first.repair_pending,
+        "legacy manifest mirror failure should surface as repair_pending"
+    );
+    assert!(
+        storage
+            .head_raw("state/orchestration/manifest.json")
+            .await?
+            .is_none(),
+        "legacy manifest mirror should remain absent after injected failure"
     );
 
     // Replay the same event set after restart; state must converge.

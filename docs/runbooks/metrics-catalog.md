@@ -513,7 +513,8 @@ sum(rate(arco_lock_acquisitions_total{result="contention"}[5m])) / sum(rate(arco
 
 ## Alert Definitions
 
-See [prometheus-alerts.yaml](./prometheus-alerts.yaml) for complete alert definitions.
+See [infra/monitoring/alerts.yaml](../../infra/monitoring/alerts.yaml) for the active alert rules.
+The local [prometheus-alerts.yaml](./prometheus-alerts.yaml) file is only a historical pointer.
 
 ### Critical Alerts (Page Immediately)
 

@@ -9,6 +9,32 @@ This runbook covers ADR-034 PI-1 operations for:
 
 The read path remains pointer-first and manifest-driven throughout these procedures. Legacy mirrors and catalog commit records are repaired side effects, not commit prerequisites.
 
+## Rollout Flags
+
+PI-1 rollout is controlled on the orchestration compactor by two env vars:
+
+- `ARCO_FLOW_COMPACTOR_REQUEST_MODE`
+  - default: `compatibility`
+  - supported values: `compatibility`, `fenced_only`
+  - `compatibility` preserves PI-1 behavior and allows requests that do not carry the full fenced contract
+  - `fenced_only` rejects requests unless they carry both `fencing_token` and canonical `lock_path`
+- `ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE`
+  - default: `accept`
+  - supported values: `accept`, `reject`
+  - `accept` allows the legacy `epoch` request field alias during PI-1
+  - `reject` returns `400` for requests that still use the legacy `epoch` field alias
+
+These flags are read once during `arco-flow-compactor` startup. Changing shell env vars alone does
+not update a running service; apply the new values through the deployment mechanism for the
+compactor and restart/redeploy it before running the probes below.
+
+Recommended sequence:
+
+1. Baseline: `ARCO_FLOW_COMPACTOR_REQUEST_MODE=compatibility` and `ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE=accept`
+2. Non-prod alias gate: keep `compatibility`, switch `ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE=reject`, and confirm the legacy-epoch telemetry stays at zero or shows only expected rejected callers
+3. Non-prod fenced dark launch: switch to `ARCO_FLOW_COMPACTOR_REQUEST_MODE=fenced_only` and keep `ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE=reject`
+4. Roll back by restoring `compatibility` first, then `accept` only if older callers still need the alias
+
 ## Preconditions
 
 - Target a non-production tenant/workspace first.
@@ -43,6 +69,16 @@ curl -fsS http://$ARCO_FLOW_COMPACTOR_HOST/internal/reconcile \
 - `arco_flow_orch_reconciler_repair_issues_total`
 - `arco_flow_orch_reconciler_repairs_total`
 - `arco_flow_orch_compactor_stale_fencing_rejects_total`
+- `arco_flow_orch_compactor_legacy_epoch_requests_total`
+- `arco_flow_orch_compactor_partial_fenced_requests_total`
+
+Related active alerts in `infra/monitoring/alerts.yaml`:
+
+- `ArcoControlPlaneRepairPending`
+- `ArcoControlPlaneRepairIssuesDetected`
+- `ArcoControlPlaneReconcilerRepairFailures`
+- `ArcoFlowStaleFenceRejects`
+- `ArcoFlowLegacyEpochPayloadsObserved`
 
 ## Dry Run
 
@@ -77,6 +113,14 @@ Expected PI-1 repairable findings:
 - catalog `missing_current_head_legacy_mirror` or `stale_current_head_legacy_mirror`
 - catalog `missing_current_head_commit_record`
 - orchestration `missing_current_head_legacy_manifest_path` with `current_head_legacy_manifest_issue=missing|stale`
+
+Compatibility-mode behavior:
+
+- catalog sync compaction requires canonical `lock_path` when the caller supplies it
+- orchestration compaction still accepts legacy request shapes in `compatibility` mode
+- orchestration requests using the legacy `epoch` field increment `arco_flow_orch_compactor_legacy_epoch_requests_total`
+- orchestration requests rejected by `ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE=reject` increment the same metric with `status="rejected"`
+- partially populated canonical orchestration requests now return `400` and increment `arco_flow_orch_compactor_partial_fenced_requests_total`
 
 ## Enforce Repair
 
@@ -132,21 +176,77 @@ Expected results:
 
 Run this sequence in non-prod before enabling wider fenced-write rollout:
 
-1. Trigger one catalog write and one orchestration write through the fenced path.
-2. Confirm both commit points advance via pointer-target manifests, not legacy mirrors.
-3. Inject a post-CAS side-effect failure and confirm the caller receives success with `repair_pending=true`.
-4. Confirm readers observe the new head before repair runs.
-5. Run the reconcile dry run, then enforce repair.
-6. Confirm the follow-up dry run is clean and repair metrics incremented exactly once per repaired side effect.
+1. Configure the baseline rollout flags, restart/redeploy `arco-flow-compactor`, and wait for the
+   startup log confirming the loaded rollout config:
+
+```bash
+export ARCO_FLOW_COMPACTOR_REQUEST_MODE=compatibility
+export ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE=accept
+```
+
+2. Trigger one catalog write and one orchestration write through the fenced path.
+3. Confirm both commit points advance via pointer-target manifests, not legacy mirrors.
+4. Inject a post-CAS side-effect failure and confirm the caller receives success with `repair_pending=true`.
+5. Confirm readers observe the new head before repair runs.
+6. Run the reconcile dry run, then enforce repair.
+7. Confirm the follow-up dry run is clean and repair metrics incremented exactly once per repaired side effect.
+8. Update the deployment to turn on alias rejection without changing request mode, then
+   restart/redeploy `arco-flow-compactor`:
+
+```bash
+export ARCO_FLOW_COMPACTOR_REQUEST_MODE=compatibility
+export ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE=reject
+```
+
+9. Replay one known fenced request and one known legacy-epoch request:
+   - fenced request should continue to succeed
+   - legacy request should fail with `400`
+   - `arco_flow_orch_compactor_legacy_epoch_requests_total` should increment with `status="rejected"`
+10. Update the deployment to turn on fenced-only mode, then restart/redeploy
+    `arco-flow-compactor`:
+
+```bash
+export ARCO_FLOW_COMPACTOR_REQUEST_MODE=fenced_only
+export ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE=reject
+```
+
+11. Replay:
+   - one fully fenced request with canonical `lock_path`
+   - one request with missing `lock_path`
+   - one request using legacy `epoch`
+12. Expected fenced-only results:
+   - canonical fenced request succeeds
+   - missing-`lock_path` request fails with `400`
+   - legacy-epoch request fails with `400`
+   - `ArcoFlowLegacyEpochPayloadsObserved` fires if legacy requests were still present
+   - `ArcoFlowStaleFenceRejects` remains quiet unless the test intentionally injects stale fencing
+
+Expected telemetry during the drill:
+
+- `arco_catalog_repair_pending_total` and/or `arco_flow_orch_repair_pending_total` rise only when post-CAS side effects are intentionally failed
+- `arco_catalog_reconciler_issues_total` and `arco_flow_orch_reconciler_repair_issues_total` rise during the dry run before repair
+- `arco_catalog_reconciler_repairs_total` and `arco_flow_orch_reconciler_repairs_total` rise during enforce repair
+- `arco_flow_orch_compactor_legacy_epoch_requests_total` shows `status="accepted"` in baseline compatibility mode and `status="rejected"` once alias rejection is enabled
+- `arco_flow_orch_compactor_partial_fenced_requests_total` stays at zero unless a caller sends only one of `fencing_token` or `lock_path`
+- `arco_flow_orch_compactor_stale_fencing_rejects_total` rises only when the drill intentionally reuses stale fencing tokens
 
 ## Rollback
 
 Rollback does not revert the pointer once a visible CAS succeeds. Instead:
 
-1. Stop or gate the writer that is producing repair-pending outcomes.
-2. Run reconcile dry run to enumerate missing current-head side effects.
-3. Run enforce repair until current-head repair findings clear.
-4. Leave legacy mirrors and commit records consistent with the current pointer target before re-enabling traffic.
+1. Restore orchestration compatibility in the deployment and restart/redeploy
+   `arco-flow-compactor` first:
+
+```bash
+export ARCO_FLOW_COMPACTOR_REQUEST_MODE=compatibility
+export ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE=accept
+```
+
+2. Stop or gate the writer that is producing repair-pending outcomes.
+3. Run reconcile dry run to enumerate missing current-head side effects.
+4. Run enforce repair until current-head repair findings clear.
+5. Leave legacy mirrors and commit records consistent with the current pointer target before re-enabling traffic.
+6. Confirm the legacy-epoch metric stops increasing before attempting another fenced-only rollout.
 
 ## Escalation
 

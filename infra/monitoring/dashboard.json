@@ -1,7 +1,7 @@
 {
   "$schema": "https://grafana.com/schema/dashboard/v0",
-  "title": "Arco Orchestration Operator",
-  "description": "Operational dashboard for Layer-2 orchestration backlog, lag, conflicts, controller latency, and SLOs",
+  "title": "Arco Control Plane Operator",
+  "description": "Operational dashboard for orchestration runtime signals plus ADR-034 PI-1 repair, reconcile, stale-fence, and compatibility telemetry",
   "uid": "arco-orchestration-operator",
   "tags": ["arco", "orchestration", "operator"],
   "refresh": "30s",
@@ -93,6 +93,78 @@
         }
       ],
       "description": "Recent SLO breach increments by SLO key"
+    },
+    {
+      "title": "Control-Plane Repair Pending (15m increase)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "targets": [
+        {
+          "expr": "sum(increase(arco_catalog_repair_pending_total[15m])) by (domain)",
+          "legendFormat": "catalog {{domain}}"
+        },
+        {
+          "expr": "sum(increase(arco_flow_orch_repair_pending_total[15m]))",
+          "legendFormat": "orchestration"
+        }
+      ],
+      "description": "Visible pointer-CAS commits that still need repair of legacy mirrors or commit records"
+    },
+    {
+      "title": "Control-Plane Reconcile Issues (15m increase)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "targets": [
+        {
+          "expr": "sum(increase(arco_catalog_reconciler_issues_total{repairable=\"true\"}[15m])) by (domain)",
+          "legendFormat": "catalog {{domain}}"
+        },
+        {
+          "expr": "sum(increase(arco_flow_orch_reconciler_repair_issues_total[15m])) by (reason)",
+          "legendFormat": "orch {{reason}}"
+        }
+      ],
+      "description": "Repairable current-head issues detected by catalog and orchestration reconciler dry runs"
+    },
+    {
+      "title": "Control-Plane Repairs (15m increase)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "targets": [
+        {
+          "expr": "sum(increase(arco_catalog_reconciler_repairs_total[15m])) by (status)",
+          "legendFormat": "catalog {{status}}"
+        },
+        {
+          "expr": "sum(increase(arco_flow_orch_reconciler_repairs_total[15m])) by (status)",
+          "legendFormat": "orch {{status}}"
+        }
+      ],
+      "description": "Repair attempts and outcomes for current-head reconciliation"
+    },
+    {
+      "title": "Stale Fence Rejects (15m increase)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "targets": [
+        {
+          "expr": "sum(increase(arco_flow_orch_compactor_stale_fencing_rejects_total[15m])) by (reason)",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "description": "Lock-backed stale-fence rejections during orchestration compaction"
+    },
+    {
+      "title": "Legacy Epoch Payloads (15m increase)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 48 },
+      "targets": [
+        {
+          "expr": "sum(increase(arco_flow_orch_compactor_legacy_epoch_requests_total[15m])) by (endpoint, status, request_mode)",
+          "legendFormat": "{{endpoint}} {{status}} {{request_mode}}"
+        }
+      ],
+      "description": "Compatibility telemetry for legacy orchestration compactor payloads during PI-1 rollout"
     }
   ]
 }

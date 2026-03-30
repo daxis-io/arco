@@ -70,6 +70,7 @@ tempfile = { workspace = true, optional = true }
 tokio-test = { workspace = true }
 criterion = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "catalog_lookup"

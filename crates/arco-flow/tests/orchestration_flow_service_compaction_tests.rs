@@ -4,12 +4,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
 
 use arco_core::{MemoryBackend, ScopedStorage};
 use arco_flow::error::Result;
@@ -22,43 +21,54 @@ use arco_flow::orchestration::events::{
     OrchestrationEvent, OrchestrationEventData, TaskDef, TriggerInfo,
 };
 use arco_flow::orchestration::flow_service::append_events_and_compact;
+use arco_flow::orchestration_compaction::{
+    OrchestrationCompactRequest, OrchestrationCompactionResponse,
+};
 
 #[derive(Clone)]
 struct CompactorState {
     compactor: MicroCompactor,
-}
-
-#[derive(Debug, Deserialize)]
-struct CompactRequest {
-    event_paths: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct CompactResponse {
-    events_processed: u32,
+    captured_request: Arc<Mutex<Option<OrchestrationCompactRequest>>>,
 }
 
 async fn compact_handler(
     State(state): State<CompactorState>,
-    Json(req): Json<CompactRequest>,
-) -> std::result::Result<Json<CompactResponse>, axum::http::StatusCode> {
+    Json(req): Json<OrchestrationCompactRequest>,
+) -> std::result::Result<Json<OrchestrationCompactionResponse>, axum::http::StatusCode> {
+    *state.captured_request.lock().expect("capture lock") = Some(req.clone());
     let result = state
         .compactor
-        .compact_events(req.event_paths)
+        .compact_events_fenced(
+            req.event_paths,
+            req.fencing_token.expect("fencing token"),
+            req.lock_path.as_deref().expect("lock path"),
+        )
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Json(CompactResponse {
+    Ok(Json(OrchestrationCompactionResponse {
         events_processed: result.events_processed,
+        delta_id: result.delta_id,
+        manifest_revision: result.manifest_revision,
+        visibility_status: result.visibility_status.into(),
+        repair_pending: false,
     }))
 }
 
 async fn start_compactor_server(
     compactor: MicroCompactor,
-) -> (String, tokio::task::JoinHandle<()>) {
+) -> (
+    String,
+    Arc<Mutex<Option<OrchestrationCompactRequest>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let captured_request = Arc::new(Mutex::new(None));
     let app = Router::new()
         .route("/compact", post(compact_handler))
-        .with_state(CompactorState { compactor });
+        .with_state(CompactorState {
+            compactor,
+            captured_request: captured_request.clone(),
+        });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -70,7 +80,7 @@ async fn start_compactor_server(
         axum::serve(listener, app).await.expect("serve compactor");
     });
 
-    (base_url, handle)
+    (base_url, captured_request, handle)
 }
 
 #[tokio::test]
@@ -81,7 +91,8 @@ async fn dispatcher_compacts_emitted_events_to_prevent_ledger_spam() -> Result<(
     let ledger = LedgerWriter::new(storage.clone());
     let compactor = MicroCompactor::new(storage.clone());
 
-    let (compactor_url, _handle) = start_compactor_server(compactor.clone()).await;
+    let (compactor_url, captured_request, _handle) =
+        start_compactor_server(compactor.clone()).await;
 
     // Seed a pending dispatch outbox row.
     let run_id = "run_01";
@@ -201,5 +212,16 @@ async fn dispatcher_compacts_emitted_events_to_prevent_ledger_spam() -> Result<(
     }
 
     assert_eq!(emitted_counts, vec![1, 0]);
+
+    let request = captured_request
+        .lock()
+        .expect("capture lock")
+        .clone()
+        .expect("captured fenced request");
+    assert!(request.fencing_token.is_some());
+    assert_eq!(
+        request.lock_path.as_deref(),
+        Some("locks/orchestration.compaction.lock.json")
+    );
     Ok(())
 }

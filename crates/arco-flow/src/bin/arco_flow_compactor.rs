@@ -15,16 +15,23 @@ use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 
 use arco_core::observability::{LogFormat, init_logging};
+use arco_core::orchestration_compaction::{
+    OrchestrationCompactRequest, OrchestrationCompactionResponse, OrchestrationRebuildRequest,
+};
 use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 use arco_core::{InternalOidcConfig, InternalOidcError, InternalOidcVerifier, ScopedStorage};
 use arco_flow::error::{Error, Result};
-use arco_flow::orchestration::compactor::{CompactionResult, MicroCompactor};
+use arco_flow::orchestration::compactor::{
+    CompactionResult, MicroCompactor, OrchestrationReconciler, OrchestrationReconciliationReport,
+    OrchestrationRepairResult,
+};
 
 const REBUILD_MANIFEST_PREFIX: &str = "state/orchestration/rebuilds/";
 
 #[derive(Clone)]
 struct AppState {
     compactor: MicroCompactor,
+    storage: ScopedStorage,
 }
 
 #[derive(Clone)]
@@ -33,31 +40,22 @@ struct InternalAuthState {
     enforce: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct CompactRequest {
-    event_paths: Vec<String>,
-    #[serde(default)]
-    epoch: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RebuildRequest {
-    rebuild_manifest_path: String,
-    #[serde(default)]
-    epoch: Option<u64>,
-}
-
-#[derive(Debug, Serialize)]
-struct CompactResponse {
-    events_processed: u32,
-    delta_id: Option<String>,
-    manifest_revision: String,
-    visibility_status: String,
-}
-
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReconcileRequest {
+    #[serde(default)]
+    repair: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ReconcileResponse {
+    report: OrchestrationReconciliationReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repair_result: Option<OrchestrationRepairResult>,
 }
 
 #[derive(Debug)]
@@ -108,30 +106,42 @@ async fn health_handler() -> StatusCode {
 
 async fn compact_handler(
     State(state): State<AppState>,
-    Json(request): Json<CompactRequest>,
-) -> std::result::Result<Json<CompactResponse>, ApiError> {
+    Json(request): Json<OrchestrationCompactRequest>,
+) -> std::result::Result<Json<OrchestrationCompactionResponse>, ApiError> {
     let CompactionResult {
         events_processed,
         delta_id,
         manifest_revision,
         visibility_status,
-    } = state
-        .compactor
-        .compact_events_with_epoch(request.event_paths, request.epoch)
-        .await?;
+        repair_pending,
+    } = match (request.fencing_token, request.lock_path.as_deref()) {
+        (Some(fencing_token), Some(lock_path)) => {
+            state
+                .compactor
+                .compact_events_fenced(request.event_paths, fencing_token, lock_path)
+                .await?
+        }
+        (token, _) => {
+            state
+                .compactor
+                .compact_events_with_epoch(request.event_paths, token)
+                .await?
+        }
+    };
 
-    Ok(Json(CompactResponse {
+    Ok(Json(OrchestrationCompactionResponse {
         events_processed,
         delta_id,
         manifest_revision,
-        visibility_status: visibility_status.as_str().to_string(),
+        visibility_status: visibility_status.into(),
+        repair_pending,
     }))
 }
 
 async fn rebuild_handler(
     State(state): State<AppState>,
-    Json(request): Json<RebuildRequest>,
-) -> std::result::Result<Json<CompactResponse>, ApiError> {
+    Json(request): Json<OrchestrationRebuildRequest>,
+) -> std::result::Result<Json<OrchestrationCompactionResponse>, ApiError> {
     if !is_valid_rebuild_manifest_path(&request.rebuild_manifest_path) {
         return Err(ApiError {
             status: StatusCode::BAD_REQUEST,
@@ -146,16 +156,50 @@ async fn rebuild_handler(
         delta_id,
         manifest_revision,
         visibility_status,
-    } = state
-        .compactor
-        .rebuild_from_ledger_manifest_path(&request.rebuild_manifest_path, request.epoch)
-        .await?;
+        repair_pending,
+    } = match (request.fencing_token, request.lock_path.as_deref()) {
+        (Some(fencing_token), Some(lock_path)) => {
+            state
+                .compactor
+                .rebuild_from_ledger_manifest_path_fenced(
+                    &request.rebuild_manifest_path,
+                    fencing_token,
+                    lock_path,
+                )
+                .await?
+        }
+        (token, _) => {
+            state
+                .compactor
+                .rebuild_from_ledger_manifest_path(&request.rebuild_manifest_path, token)
+                .await?
+        }
+    };
 
-    Ok(Json(CompactResponse {
+    Ok(Json(OrchestrationCompactionResponse {
         events_processed,
         delta_id,
         manifest_revision,
-        visibility_status: visibility_status.as_str().to_string(),
+        visibility_status: visibility_status.into(),
+        repair_pending,
+    }))
+}
+
+async fn reconcile_handler(
+    State(state): State<AppState>,
+    Json(request): Json<ReconcileRequest>,
+) -> std::result::Result<Json<ReconcileResponse>, ApiError> {
+    let reconciler = OrchestrationReconciler::new(state.storage.clone());
+    let report = reconciler.check().await?;
+    let repair_result = if request.repair {
+        Some(reconciler.repair(&report).await?)
+    } else {
+        None
+    };
+
+    Ok(Json(ReconcileResponse {
+        report,
+        repair_result,
     }))
 }
 
@@ -275,16 +319,85 @@ async fn internal_auth_middleware(
     }
 }
 
+fn build_router(state: AppState, internal_auth: Option<Arc<InternalAuthState>>) -> Router {
+    let compact_route = internal_auth.clone().map_or_else(
+        || post(compact_handler),
+        |auth| {
+            post(compact_handler).route_layer(middleware::from_fn_with_state(
+                auth,
+                internal_auth_middleware,
+            ))
+        },
+    );
+    let rebuild_route = internal_auth.clone().map_or_else(
+        || post(rebuild_handler),
+        |auth| {
+            post(rebuild_handler).route_layer(middleware::from_fn_with_state(
+                auth,
+                internal_auth_middleware,
+            ))
+        },
+    );
+    let reconcile_route = internal_auth.map_or_else(
+        || post(reconcile_handler),
+        |auth| {
+            post(reconcile_handler).route_layer(middleware::from_fn_with_state(
+                auth,
+                internal_auth_middleware,
+            ))
+        },
+    );
+
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/compact", compact_route)
+        .route("/rebuild", rebuild_route)
+        .route("/internal/reconcile", reconcile_route)
+        .with_state(state)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use arco_core::Error as CoreError;
+    use arco_core::storage::MemoryBackend;
+    use axum::http::Request;
+    use tower::util::ServiceExt;
+
+    fn test_state() -> AppState {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        AppState {
+            compactor: MicroCompactor::new(storage.clone()),
+            storage,
+        }
+    }
+
+    fn test_internal_auth_state() -> Arc<InternalAuthState> {
+        let config = InternalOidcConfig::hs256_for_tests(
+            "https://accounts.google.com",
+            "https://flow-compactor.internal",
+            "test-secret",
+            [String::from("svc-flow-compactor")]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::new(),
+            true,
+        );
+        let verifier = InternalOidcVerifier::new(config).expect("test verifier");
+        Arc::new(InternalAuthState {
+            verifier: Arc::new(verifier),
+            enforce: true,
+        })
+    }
 
     #[test]
     fn compact_request_allows_missing_epoch() {
         let raw = r#"{"event_paths":["ledger/orchestration/2025-01-15/evt_01.json"]}"#;
-        let parsed: CompactRequest = serde_json::from_str(raw).expect("valid request");
-        assert_eq!(parsed.epoch, None);
+        let parsed: OrchestrationCompactRequest = serde_json::from_str(raw).expect("valid request");
+        assert_eq!(parsed.fencing_token, None);
     }
 
     #[test]
@@ -293,19 +406,21 @@ mod tests {
             "event_paths":["ledger/orchestration/2025-01-15/evt_01.json"],
             "epoch":7
         }"#;
-        let parsed: CompactRequest = serde_json::from_str(raw).expect("valid epoch request");
-        assert_eq!(parsed.epoch, Some(7));
+        let parsed: OrchestrationCompactRequest =
+            serde_json::from_str(raw).expect("valid epoch request");
+        assert_eq!(parsed.fencing_token, Some(7));
     }
 
     #[test]
     fn rebuild_request_requires_manifest_path() {
         let raw = r#"{"rebuild_manifest_path":"state/orchestration/rebuilds/rebuild-01.json"}"#;
-        let parsed: RebuildRequest = serde_json::from_str(raw).expect("valid rebuild request");
+        let parsed: OrchestrationRebuildRequest =
+            serde_json::from_str(raw).expect("valid rebuild request");
         assert_eq!(
             parsed.rebuild_manifest_path,
             "state/orchestration/rebuilds/rebuild-01.json"
         );
-        assert_eq!(parsed.epoch, None);
+        assert_eq!(parsed.fencing_token, None);
     }
 
     #[test]
@@ -314,8 +429,9 @@ mod tests {
             "rebuild_manifest_path":"state/orchestration/rebuilds/rebuild-01.json",
             "epoch":9
         }"#;
-        let parsed: RebuildRequest = serde_json::from_str(raw).expect("valid epoch request");
-        assert_eq!(parsed.epoch, Some(9));
+        let parsed: OrchestrationRebuildRequest =
+            serde_json::from_str(raw).expect("valid epoch request");
+        assert_eq!(parsed.fencing_token, Some(9));
     }
 
     #[test]
@@ -361,6 +477,46 @@ mod tests {
         let api_error = ApiError::from(error);
         assert_eq!(api_error.status, StatusCode::NOT_FOUND);
     }
+
+    #[test]
+    fn reconcile_request_defaults_to_check_mode() {
+        let request: ReconcileRequest = serde_json::from_str("{}").expect("default reconcile");
+        assert!(!request.repair);
+    }
+
+    #[tokio::test]
+    async fn reconcile_endpoint_returns_report_when_auth_disabled() {
+        let router = build_router(test_state(), None);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"repair":false}"#.to_string()))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn reconcile_endpoint_requires_auth_when_internal_auth_enforced() {
+        let router = build_router(test_state(), Some(test_internal_auth_state()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"repair":false}"#.to_string()))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }
 
 #[tokio::main]
@@ -379,33 +535,11 @@ async fn main() -> Result<()> {
     let storage = ScopedStorage::new(backend, tenant_id, workspace_id)?;
 
     let state = AppState {
-        compactor: MicroCompactor::with_tenant_secret(storage, tenant_secret),
+        compactor: MicroCompactor::with_tenant_secret(storage.clone(), tenant_secret),
+        storage,
     };
 
-    let compact_route = internal_auth.clone().map_or_else(
-        || post(compact_handler),
-        |auth| {
-            post(compact_handler).route_layer(middleware::from_fn_with_state(
-                auth,
-                internal_auth_middleware,
-            ))
-        },
-    );
-    let rebuild_route = internal_auth.map_or_else(
-        || post(rebuild_handler),
-        |auth| {
-            post(rebuild_handler).route_layer(middleware::from_fn_with_state(
-                auth,
-                internal_auth_middleware,
-            ))
-        },
-    );
-
-    let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/compact", compact_route)
-        .route("/rebuild", rebuild_route)
-        .with_state(state);
+    let app = build_router(state, internal_auth);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr)

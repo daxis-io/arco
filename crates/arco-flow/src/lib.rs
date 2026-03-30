@@ -73,6 +73,7 @@ pub(crate) mod paths;
 
 /// Remote orchestration compaction client for flow services.
 pub mod compaction_client;
+pub use arco_core::orchestration_compaction;
 
 pub mod dispatch;
 

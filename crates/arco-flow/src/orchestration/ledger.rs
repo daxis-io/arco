@@ -48,6 +48,12 @@ impl LedgerWriter {
         Self { storage }
     }
 
+    /// Returns the scoped storage used by this ledger writer.
+    #[must_use]
+    pub fn storage(&self) -> ScopedStorage {
+        self.storage.clone()
+    }
+
     /// Appends an event to the ledger.
     ///
     /// Events are written to `ledger/orchestration/{date}/{event_id}.json`.

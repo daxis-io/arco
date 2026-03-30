@@ -122,6 +122,7 @@ mod tests {
             domain: "catalog".to_string(),
             event_paths: vec!["ledger/catalog/evt.json".to_string()],
             fencing_token: 1,
+            lock_path: Some("locks/catalog.lock.json".to_string()),
             request_id: Some("req-1".to_string()),
         }
     }

@@ -42,9 +42,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -52,10 +54,10 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use arco_catalog::Compactor;
-use arco_core::CatalogDomain;
+use arco_catalog::{Compactor, Reconciler, ReconciliationReport, RepairResult, RepairScope};
 use arco_core::scoped_storage::ScopedStorage;
 use arco_core::storage::{ObjectStoreBackend, StorageBackend};
+use arco_core::{CatalogDomain, InternalOidcConfig, InternalOidcError, InternalOidcVerifier};
 
 use crate::notification_consumer::{
     EventNotification, NotificationConsumer, NotificationConsumerConfig,
@@ -380,12 +382,88 @@ struct AutoAntiEntropyConfig {
     reprocess_timeout_secs: u64,
 }
 
+#[derive(Clone)]
+struct InternalAuthState {
+    verifier: Arc<InternalOidcVerifier>,
+    enforce: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NotifyRequest {
     event_paths: Vec<String>,
     #[serde(default)]
     flush: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconcileRequest {
+    domain: String,
+    #[serde(default)]
+    repair: bool,
+    #[serde(default)]
+    repair_scope: Option<RepairScope>,
+}
+
+impl ReconcileRequest {
+    fn effective_repair_scope(&self) -> RepairScope {
+        self.repair_scope.unwrap_or(RepairScope::CurrentHeadOnly)
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconcileResponse {
+    report: ReconciliationReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repair_result: Option<RepairResult>,
+}
+
+fn build_internal_auth() -> Result<Option<Arc<InternalAuthState>>> {
+    let config = InternalOidcConfig::from_env().map_err(|e| anyhow!(e.to_string()))?;
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    let enforce = config.enforce;
+    let verifier = InternalOidcVerifier::new(config).map_err(|e| anyhow!(e.to_string()))?;
+    Ok(Some(Arc::new(InternalAuthState {
+        verifier: Arc::new(verifier),
+        enforce,
+    })))
+}
+
+async fn internal_auth_middleware(
+    State(state): State<Arc<InternalAuthState>>,
+    request: axum::http::Request<Body>,
+    next: Next,
+) -> Response {
+    match state.verifier.verify_headers(request.headers()).await {
+        Ok(_) => next.run(request).await,
+        Err(err) => {
+            if state.enforce {
+                let message = match err {
+                    InternalOidcError::MissingBearerToken => "missing bearer token".to_string(),
+                    InternalOidcError::InvalidToken(reason) => format!("invalid token: {reason}"),
+                    InternalOidcError::PrincipalNotAllowlisted => {
+                        "principal not allowlisted".to_string()
+                    }
+                    InternalOidcError::JwksRefresh(reason) => {
+                        format!("jwks refresh failed: {reason}")
+                    }
+                };
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({ "error": message })),
+                )
+                    .into_response();
+            }
+
+            tracing::warn!(error = %err, "internal auth check failed in report-only mode");
+            next.run(request).await
+        }
+    }
 }
 
 // ============================================================================
@@ -702,6 +780,68 @@ async fn sync_compact_handler(
     }
 }
 
+async fn reconcile_handler(
+    State(state): State<Arc<ServiceState>>,
+    Json(request): Json<ReconcileRequest>,
+) -> impl IntoResponse {
+    let domain = match parse_catalog_domain(&request.domain) {
+        Ok(domain) => domain,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_domain",
+                    "message": message,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let reconciler = Reconciler::new(state.storage.clone());
+    match reconciler.check(domain).await {
+        Ok(report) => {
+            let repair_result = if request.repair {
+                match reconciler
+                    .repair_with_scope(&report, request.effective_repair_scope())
+                    .await
+                {
+                    Ok(result) => Some(result),
+                    Err(error) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "repair_error",
+                                "message": error.to_string(),
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
+            } else {
+                None
+            };
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!(ReconcileResponse {
+                    report,
+                    repair_result,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "reconcile_error",
+                "message": error.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// POST /compact - Trigger a compaction cycle on-demand.
 ///
 /// Returns:
@@ -863,10 +1003,15 @@ async fn run_auto_anti_entropy(state: &Arc<ServiceState>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+    use arco_catalog::{CatalogDomainManifest, RootManifest};
     use arco_core::storage::MemoryBackend;
+    use arco_core::{CatalogPaths, WritePrecondition};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use bytes::Bytes;
     use tower::util::ServiceExt;
 
     fn test_state() -> Arc<ServiceState> {
@@ -896,6 +1041,91 @@ mod tests {
         })
     }
 
+    async fn seed_catalog_reconcile_state_with_old_snapshot(storage: &ScopedStorage) -> String {
+        let mut root = RootManifest::new();
+        root.normalize_paths();
+        storage
+            .put_raw(
+                CatalogPaths::ROOT_MANIFEST,
+                Bytes::from(serde_json::to_vec(&root).expect("serialize root")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write root");
+
+        let snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1);
+        let mut snapshot = arco_catalog::manifest::SnapshotInfo::new(1, snapshot_path);
+        snapshot.add_file(arco_catalog::manifest::SnapshotFile {
+            path: "current.parquet".to_string(),
+            checksum_sha256: "ab".repeat(32),
+            byte_size: 1,
+            row_count: 1,
+            position_range: None,
+        });
+        let manifest = CatalogDomainManifest {
+            manifest_id: arco_catalog::manifest::format_manifest_id(1),
+            epoch: 1,
+            previous_manifest_path: None,
+            writer_session_id: Some("route-test".to_string()),
+            snapshot_version: 1,
+            snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1),
+            snapshot: Some(snapshot),
+            watermark_event_id: None,
+            last_commit_id: None,
+            fencing_token: Some(1),
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                &root.catalog_manifest_path,
+                Bytes::from(serde_json::to_vec(&manifest).expect("serialize manifest")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write manifest");
+        storage
+            .put_raw(
+                &CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "current.parquet"),
+                Bytes::from_static(b"current"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write current snapshot");
+
+        let old_snapshot =
+            CatalogPaths::snapshot_file(CatalogDomain::Catalog, 0, "old-route-test.parquet");
+        storage
+            .put_raw(
+                &old_snapshot,
+                Bytes::from_static(b"old"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write old snapshot");
+
+        old_snapshot
+    }
+
+    fn test_internal_auth_state() -> Arc<InternalAuthState> {
+        let config = InternalOidcConfig::hs256_for_tests(
+            "https://accounts.google.com",
+            "https://compactor.internal",
+            "test-secret",
+            [String::from("svc-compactor")]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::new(),
+            true,
+        );
+        let verifier = InternalOidcVerifier::new(config).expect("test verifier");
+        Arc::new(InternalAuthState {
+            verifier: Arc::new(verifier),
+            enforce: true,
+        })
+    }
+
     #[test]
     fn test_normalize_metrics_secret_trims_empty() {
         assert!(normalize_metrics_secret(Some("  ".to_string())).is_none());
@@ -905,11 +1135,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_parse_catalog_domain_accepts_supported_values() {
+        assert_eq!(
+            parse_catalog_domain("catalog").unwrap(),
+            CatalogDomain::Catalog
+        );
+        assert_eq!(
+            parse_catalog_domain("lineage").unwrap(),
+            CatalogDomain::Lineage
+        );
+        assert_eq!(
+            parse_catalog_domain("executions").unwrap(),
+            CatalogDomain::Executions
+        );
+        assert_eq!(
+            parse_catalog_domain("search").unwrap(),
+            CatalogDomain::Search
+        );
+    }
+
+    #[test]
+    fn test_reconcile_request_defaults_to_current_head_only_scope() {
+        let request: ReconcileRequest =
+            serde_json::from_str(r#"{"domain":"catalog","repair":true}"#)
+                .expect("parse reconcile request");
+        assert_eq!(
+            request.effective_repair_scope(),
+            RepairScope::CurrentHeadOnly
+        );
+    }
+
     #[tokio::test]
     async fn test_metrics_gate_disabled_when_secret_empty() {
         metrics::init_metrics();
         let state = test_state();
-        let router = build_router(state, normalize_metrics_secret(Some("  ".to_string())));
+        let router = build_router(
+            state,
+            normalize_metrics_secret(Some("  ".to_string())),
+            None,
+        );
         let response = router
             .oneshot(
                 Request::builder()
@@ -926,7 +1191,7 @@ mod tests {
     async fn test_metrics_gate_accepts_x_metrics_secret() {
         metrics::init_metrics();
         let state = test_state();
-        let router = build_router(state, Some("topsecret".to_string()));
+        let router = build_router(state, Some("topsecret".to_string()), None);
         let response = router
             .oneshot(
                 Request::builder()
@@ -944,7 +1209,7 @@ mod tests {
     async fn test_metrics_gate_accepts_bearer_secret() {
         metrics::init_metrics();
         let state = test_state();
-        let router = build_router(state, Some("topsecret".to_string()));
+        let router = build_router(state, Some("topsecret".to_string()), None);
         let response = router
             .oneshot(
                 Request::builder()
@@ -961,7 +1226,7 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_gate_rejects_missing_or_wrong_secret() {
         let state = test_state();
-        let router = build_router(Arc::clone(&state), Some("topsecret".to_string()));
+        let router = build_router(Arc::clone(&state), Some("topsecret".to_string()), None);
         let response = router
             .oneshot(
                 Request::builder()
@@ -973,7 +1238,7 @@ mod tests {
             .expect("request failed");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-        let router = build_router(state, Some("topsecret".to_string()));
+        let router = build_router(state, Some("topsecret".to_string()), None);
         let response = router
             .oneshot(
                 Request::builder()
@@ -991,7 +1256,7 @@ mod tests {
     async fn test_metrics_gate_accepts_when_both_headers_present() {
         metrics::init_metrics();
         let state = test_state();
-        let router = build_router(state, Some("topsecret".to_string()));
+        let router = build_router(state, Some("topsecret".to_string()), None);
         let response = router
             .oneshot(
                 Request::builder()
@@ -1004,6 +1269,88 @@ mod tests {
             .await
             .expect("request failed");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_endpoint_defaults_to_current_head_only_scope() {
+        let state = test_state();
+        let old_snapshot = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
+        let router = build_router(state.clone(), None, None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"domain":"catalog","repair":true}"#.to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state
+                .storage
+                .head_raw(&old_snapshot)
+                .await
+                .expect("head old snapshot")
+                .is_some(),
+            "default reconcile repair scope must not delete generic cleanup candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_endpoint_full_scope_repairs_cleanup_items() {
+        let state = test_state();
+        let old_snapshot = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
+        let router = build_router(state.clone(), None, None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"domain":"catalog","repair":true,"repairScope":"full"}"#.to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state
+                .storage
+                .head_raw(&old_snapshot)
+                .await
+                .expect("head old snapshot")
+                .is_none(),
+            "full reconcile repair scope must delete generic cleanup candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_endpoint_requires_internal_auth_when_enforced() {
+        let router = build_router(test_state(), None, Some(test_internal_auth_state()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"domain":"catalog","repair":false}"#.to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
 
@@ -1029,18 +1376,42 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
-fn build_router(state: Arc<ServiceState>, metrics_secret: Option<String>) -> Router {
+fn parse_catalog_domain(raw: &str) -> std::result::Result<CatalogDomain, String> {
+    match raw {
+        "catalog" | "core" => Ok(CatalogDomain::Catalog),
+        "lineage" => Ok(CatalogDomain::Lineage),
+        "executions" => Ok(CatalogDomain::Executions),
+        "search" | "governance" => Ok(CatalogDomain::Search),
+        _ => Err(format!("unsupported catalog reconcile domain: {raw}")),
+    }
+}
+
+fn build_router(
+    state: Arc<ServiceState>,
+    metrics_secret: Option<String>,
+    internal_auth: Option<Arc<InternalAuthState>>,
+) -> Router {
     // Build HTTP router
     // Note: /internal/anti-entropy is separate from /internal/sync-compact
     // because they have different IAM requirements:
     // - sync-compact: compactor-fastpath-sa (NO list)
     // - anti-entropy: compactor-antientropy-sa (WITH bucket-level list)
+    let reconcile_route = internal_auth.map_or_else(
+        || post(reconcile_handler),
+        |auth| {
+            post(reconcile_handler).route_layer(middleware::from_fn_with_state(
+                auth,
+                internal_auth_middleware,
+            ))
+        },
+    );
     let base_router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/compact", post(compact))
         .route("/internal/notify", post(notify_handler))
         .route("/internal/sync-compact", post(sync_compact_handler))
+        .route("/internal/reconcile", reconcile_route)
         .route("/internal/anti-entropy", post(anti_entropy_handler));
 
     let router = if let Some(secret) = metrics_secret {
@@ -1114,6 +1485,7 @@ async fn main() -> Result<()> {
         } => {
             let scoped_storage = scoped.scoped_storage()?;
             let metrics_secret = normalize_metrics_secret(metrics_secret);
+            let internal_auth = build_internal_auth()?;
 
             // Initialize metrics before starting
             metrics::init_metrics();
@@ -1180,7 +1552,7 @@ async fn main() -> Result<()> {
                 }
             });
 
-            let router = build_router(Arc::clone(&state), metrics_secret);
+            let router = build_router(Arc::clone(&state), metrics_secret, internal_auth);
 
             // Spawn compaction loop
             let state_clone = Arc::clone(&state);

@@ -14,7 +14,9 @@ use arco_core::publish::Publisher;
 use arco_core::storage::{StorageBackend, WriteResult};
 use arco_core::storage_keys::{CommitKey, ManifestKey};
 use arco_core::storage_traits::CommitPutStore;
-use arco_core::{CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths, ScopedStorage};
+use arco_core::{
+    CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths, ScopedStorage, VisibilityStatus,
+};
 
 use crate::error::{CatalogError, Result as CatalogResult};
 use crate::manifest::{
@@ -38,6 +40,10 @@ pub struct Tier1CompactionResult {
     pub events_processed: usize,
     /// Snapshot version after compaction.
     pub snapshot_version: u64,
+    /// Visibility of the compaction result for readers.
+    pub visibility_status: VisibilityStatus,
+    /// Whether legacy side effects must be repaired after pointer CAS success.
+    pub repair_pending: bool,
 }
 
 /// Errors from Tier-1 synchronous compaction.
@@ -378,8 +384,10 @@ impl Tier1Compactor {
                 .map_err(map_publish_error)?
             {
                 WriteResult::Success { version } => {
+                    let mut repair_pending = false;
+
                     // Legacy migration shim: keep mutable manifest path readable.
-                    let _ = self
+                    if let Err(error) = self
                         .storage
                         .put_raw(
                             &root.catalog_manifest_path,
@@ -387,13 +395,41 @@ impl Tier1Compactor {
                             arco_core::WritePrecondition::None,
                         )
                         .await
-                        .map_err(map_processing_error)?;
-                    persist_commit_record(&self.storage, CatalogDomain::Catalog, &commit).await?;
+                    {
+                        repair_pending = true;
+                        crate::metrics::record_repair_pending(
+                            CatalogDomain::Catalog,
+                            "legacy_manifest_mirror",
+                        );
+                        tracing::warn!(
+                            domain = %CatalogDomain::Catalog.as_str(),
+                            manifest_path = %root.catalog_manifest_path,
+                            error = %error,
+                            "catalog legacy manifest mirror write failed after pointer CAS"
+                        );
+                    }
+                    if let Err(error) =
+                        persist_commit_record(&self.storage, CatalogDomain::Catalog, &commit).await
+                    {
+                        repair_pending = true;
+                        crate::metrics::record_repair_pending(
+                            CatalogDomain::Catalog,
+                            "commit_record",
+                        );
+                        tracing::warn!(
+                            domain = %CatalogDomain::Catalog.as_str(),
+                            commit_ulid = %commit_ulid,
+                            error = %error,
+                            "catalog commit record write failed after pointer CAS"
+                        );
+                    }
                     return Ok(Tier1CompactionResult {
                         manifest_version: version,
                         commit_ulid,
                         events_processed,
                         snapshot_version: manifest.snapshot_version,
+                        visibility_status: VisibilityStatus::Visible,
+                        repair_pending,
                     });
                 }
                 WriteResult::PreconditionFailed { .. } => {
@@ -586,8 +622,10 @@ impl Tier1Compactor {
                 .map_err(map_publish_error)?
             {
                 WriteResult::Success { version } => {
+                    let mut repair_pending = false;
+
                     // Legacy migration shim: keep mutable manifest path readable.
-                    let _ = self
+                    if let Err(error) = self
                         .storage
                         .put_raw(
                             &root.lineage_manifest_path,
@@ -595,13 +633,41 @@ impl Tier1Compactor {
                             arco_core::WritePrecondition::None,
                         )
                         .await
-                        .map_err(map_processing_error)?;
-                    persist_commit_record(&self.storage, CatalogDomain::Lineage, &commit).await?;
+                    {
+                        repair_pending = true;
+                        crate::metrics::record_repair_pending(
+                            CatalogDomain::Lineage,
+                            "legacy_manifest_mirror",
+                        );
+                        tracing::warn!(
+                            domain = %CatalogDomain::Lineage.as_str(),
+                            manifest_path = %root.lineage_manifest_path,
+                            error = %error,
+                            "lineage legacy manifest mirror write failed after pointer CAS"
+                        );
+                    }
+                    if let Err(error) =
+                        persist_commit_record(&self.storage, CatalogDomain::Lineage, &commit).await
+                    {
+                        repair_pending = true;
+                        crate::metrics::record_repair_pending(
+                            CatalogDomain::Lineage,
+                            "commit_record",
+                        );
+                        tracing::warn!(
+                            domain = %CatalogDomain::Lineage.as_str(),
+                            commit_ulid = %commit_ulid,
+                            error = %error,
+                            "lineage commit record write failed after pointer CAS"
+                        );
+                    }
                     return Ok(Tier1CompactionResult {
                         manifest_version: version,
                         commit_ulid,
                         events_processed,
                         snapshot_version: manifest.snapshot_version,
+                        visibility_status: VisibilityStatus::Visible,
+                        repair_pending,
                     });
                 }
                 WriteResult::PreconditionFailed { .. } => {
@@ -807,8 +873,10 @@ impl Tier1Compactor {
                 .map_err(map_publish_error)?
             {
                 WriteResult::Success { version } => {
+                    let mut repair_pending = false;
+
                     // Legacy migration shim: keep mutable manifest path readable.
-                    let _ = self
+                    if let Err(error) = self
                         .storage
                         .put_raw(
                             &root.search_manifest_path,
@@ -816,13 +884,41 @@ impl Tier1Compactor {
                             arco_core::WritePrecondition::None,
                         )
                         .await
-                        .map_err(map_processing_error)?;
-                    persist_commit_record(&self.storage, CatalogDomain::Search, &commit).await?;
+                    {
+                        repair_pending = true;
+                        crate::metrics::record_repair_pending(
+                            CatalogDomain::Search,
+                            "legacy_manifest_mirror",
+                        );
+                        tracing::warn!(
+                            domain = %CatalogDomain::Search.as_str(),
+                            manifest_path = %root.search_manifest_path,
+                            error = %error,
+                            "search legacy manifest mirror write failed after pointer CAS"
+                        );
+                    }
+                    if let Err(error) =
+                        persist_commit_record(&self.storage, CatalogDomain::Search, &commit).await
+                    {
+                        repair_pending = true;
+                        crate::metrics::record_repair_pending(
+                            CatalogDomain::Search,
+                            "commit_record",
+                        );
+                        tracing::warn!(
+                            domain = %CatalogDomain::Search.as_str(),
+                            commit_ulid = %commit_ulid,
+                            error = %error,
+                            "search commit record write failed after pointer CAS"
+                        );
+                    }
                     return Ok(Tier1CompactionResult {
                         manifest_version: version,
                         commit_ulid,
                         events_processed,
                         snapshot_version: manifest.snapshot_version,
+                        visibility_status: VisibilityStatus::Visible,
+                        repair_pending,
                     });
                 }
                 WriteResult::PreconditionFailed { .. } => {

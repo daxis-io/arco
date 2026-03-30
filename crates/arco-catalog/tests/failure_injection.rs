@@ -15,11 +15,12 @@
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
@@ -27,8 +28,35 @@ use arco_core::storage::{
 use arco_core::{Error as CoreError, Result as CoreResult, ScopedStorage};
 
 use arco_catalog::manifest::{CatalogDomainManifest, DomainManifestPointer, RootManifest};
+use arco_catalog::parquet_util::NamespaceRecord;
+use arco_catalog::tier1_events::CatalogDdlEvent;
 use arco_catalog::write_options::WriteOptions;
-use arco_catalog::{CatalogWriter, Tier1Compactor};
+use arco_catalog::{CatalogWriter, Tier1Compactor, Tier1Writer};
+use arco_core::CatalogDomain;
+
+fn init_metrics() -> PrometheusHandle {
+    static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+
+    PROMETHEUS_HANDLE
+        .get_or_init(|| {
+            PrometheusBuilder::new()
+                .install_recorder()
+                .expect("install prometheus recorder for failure injection tests")
+        })
+        .clone()
+}
+
+fn assert_metric_lines_contain(metrics: &str, name: &str, needle: &str) {
+    let lines: Vec<&str> = metrics
+        .lines()
+        .filter(|line| line.starts_with(name))
+        .collect();
+    assert!(!lines.is_empty(), "missing metric {name} in {metrics}");
+    assert!(
+        lines.iter().any(|line| line.contains(needle)),
+        "missing {needle} on metric {name} in {metrics}"
+    );
+}
 
 // ============================================================================
 // FailingBackend - Configurable failure injection
@@ -377,9 +405,7 @@ async fn tier1_initialize_idempotent_after_failure() {
 
     // Remove failure and verify state is still good
     let reader = arco_catalog::CatalogReader::new(storage);
-    let freshness = reader
-        .get_freshness(arco_core::CatalogDomain::Catalog)
-        .await;
+    let freshness = reader.get_freshness(CatalogDomain::Catalog).await;
     assert!(
         freshness.is_ok(),
         "Catalog should be readable after init failures"
@@ -415,6 +441,71 @@ async fn tier1_lock_failure_does_not_corrupt_state() {
     assert!(
         namespaces.is_empty(),
         "No namespaces should exist after failed lock"
+    );
+}
+
+/// Test that legacy mirror failures after pointer CAS return success with repair pending.
+#[tokio::test]
+async fn sync_compact_returns_repair_pending_when_legacy_mirror_write_fails() {
+    let handle = init_metrics();
+    let backend = Arc::new(FailingBackend::new());
+    let storage =
+        ScopedStorage::new(backend.clone(), TEST_TENANT, TEST_WORKSPACE).expect("scoped storage");
+    let tier1_writer = Tier1Writer::new(storage.clone());
+    tier1_writer.initialize().await.expect("initialize");
+
+    let guard = tier1_writer
+        .acquire_lock(Duration::from_secs(30), 1)
+        .await
+        .expect("catalog lock");
+
+    let namespace = NamespaceRecord {
+        id: "018f0000-0000-7000-8000-000000000001".to_string(),
+        catalog_id: None,
+        name: "repair-pending-ns".to_string(),
+        description: Some("repair pending".to_string()),
+        created_at: 1_710_000_000_000,
+        updated_at: 1_710_000_000_000,
+    };
+    let event = CatalogDdlEvent::NamespaceCreated { namespace };
+    let event_id = tier1_writer
+        .append_ledger_event(&guard, CatalogDomain::Catalog, &event, "test")
+        .await
+        .expect("append event");
+    let event_path = format!("ledger/catalog/{}.json", event_id);
+
+    let legacy_manifest_path = scoped_path(
+        TEST_TENANT,
+        TEST_WORKSPACE,
+        "manifests/catalog.manifest.json",
+    );
+    backend.fail_on_write(&legacy_manifest_path);
+
+    let compactor = Tier1Compactor::new(storage.clone());
+    let result = compactor
+        .sync_compact(
+            "catalog",
+            vec![event_path],
+            guard.fencing_token().sequence(),
+        )
+        .await
+        .expect("sync compact should still succeed after commit");
+
+    assert!(result.repair_pending);
+
+    let reader = arco_catalog::CatalogReader::new(storage);
+    let namespace = reader
+        .get_namespace("repair-pending-ns")
+        .await
+        .expect("read namespace")
+        .expect("namespace visible");
+    assert_eq!(namespace.name, "repair-pending-ns");
+
+    let metrics = handle.render();
+    assert_metric_lines_contain(
+        &metrics,
+        arco_catalog::metrics::REPAIR_PENDING,
+        "reason=\"legacy_manifest_mirror\"",
     );
 }
 

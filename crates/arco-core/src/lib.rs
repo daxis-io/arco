@@ -44,6 +44,7 @@ pub mod id;
 pub mod internal_oidc;
 pub mod lock;
 pub mod observability;
+pub mod orchestration_compaction;
 pub mod partition;
 pub mod publish;
 pub mod scoped_storage;
@@ -69,6 +70,9 @@ pub mod prelude {
     pub use crate::flow_paths::{ApiPaths, DeltaPaths, FlowPaths, IcebergPaths};
     pub use crate::id::{AssetId, EventId, MaterializationId, RunId, TaskId};
     pub use crate::lock::{DistributedLock, LockGuard, LockInfo};
+    pub use crate::orchestration_compaction::{
+        OrchestrationCompactRequest, OrchestrationCompactionResponse, OrchestrationRebuildRequest,
+    };
     pub use crate::partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
     pub use crate::publish::{FencingToken, PermitIssuer, PublishPermit, Publisher};
     pub use crate::scoped_storage::ScopedStorage;
@@ -84,7 +88,7 @@ pub mod prelude {
         CasStore, CommitPutStore, LedgerPutStore, ListStore, LockPutStore, MetaStore, ReadStore,
         SignedUrlStore, StatePutStore,
     };
-    pub use crate::sync_compact::{SyncCompactRequest, SyncCompactResponse};
+    pub use crate::sync_compact::{SyncCompactRequest, SyncCompactResponse, VisibilityStatus};
     pub use crate::table_format::TableFormat;
     pub use crate::task_tokens::{
         DEFAULT_DISPATCH_TASK_TIMEOUT_SECONDS, DEFAULT_TASK_TOKEN_TTL_SECONDS,
@@ -105,12 +109,15 @@ pub use internal_oidc::{
 };
 pub use lock::{DistributedLock, LockGuard, LockInfo};
 pub use observability::{LogFormat, Redacted, init_logging};
+pub use orchestration_compaction::{
+    OrchestrationCompactRequest, OrchestrationCompactionResponse, OrchestrationRebuildRequest,
+};
 pub use partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
 pub use scoped_storage::ScopedStorage;
 pub use storage::{
     MemoryBackend, ObjectMeta, ObjectStoreBackend, StorageBackend, WritePrecondition, WriteResult,
 };
-pub use sync_compact::{SyncCompactRequest, SyncCompactResponse};
+pub use sync_compact::{SyncCompactRequest, SyncCompactResponse, VisibilityStatus};
 pub use table_format::TableFormat;
 pub use task_tokens::{
     DEFAULT_DISPATCH_TASK_TIMEOUT_SECONDS, DEFAULT_TASK_TOKEN_TTL_SECONDS,

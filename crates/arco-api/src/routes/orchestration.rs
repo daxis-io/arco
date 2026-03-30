@@ -36,7 +36,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
-use crate::orchestration_compaction::compact_orchestration_events;
+use crate::orchestration_compaction::{append_event_and_compact, append_events_and_compact};
 use crate::paths::{
     MANIFEST_IDEMPOTENCY_PREFIX, MANIFEST_LATEST_INDEX_PATH, MANIFEST_PREFIX,
     backfill_idempotency_path,
@@ -2197,14 +2197,13 @@ async fn append_backfill_created_event(
     let accepted_event_id = event.event_id.clone();
     let accepted_at = event.timestamp;
 
-    let ledger = LedgerWriter::new(storage.clone());
-    let event_path = LedgerWriter::event_path(&event);
-    ledger
-        .append(event)
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to write BackfillCreated event: {e}")))?;
-
-    compact_orchestration_events(&state.config, storage.clone(), vec![event_path]).await?;
+    append_event_and_compact(
+        &state.config,
+        storage.clone(),
+        event,
+        Some(ctx.request_id.as_str()),
+    )
+    .await?;
 
     let record = BackfillIdempotencyRecord {
         idempotency_key: idempotency_key.to_string(),
@@ -2259,7 +2258,9 @@ struct RunEventOverrides {
 
 #[allow(clippy::too_many_arguments)]
 async fn append_run_events(
-    ledger: &LedgerWriter,
+    config: &crate::config::Config,
+    storage: ScopedStorage,
+    request_id: Option<&str>,
     tenant_id: &str,
     workspace_id: &str,
     user_id: String,
@@ -2271,7 +2272,8 @@ async fn append_run_events(
     root_assets: Vec<String>,
     tasks: Vec<TaskDef>,
     overrides: Option<RunEventOverrides>,
-) -> Result<Vec<String>, ApiError> {
+) -> Result<(), ApiError> {
+    let mut events = Vec::with_capacity(2);
     let mut run_triggered = OrchestrationEvent::new(
         tenant_id,
         workspace_id,
@@ -2294,11 +2296,7 @@ async fn append_run_events(
         );
     }
 
-    let run_event_path = LedgerWriter::event_path(&run_triggered);
-    ledger
-        .append(run_triggered)
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to write RunTriggered event: {e}")))?;
+    events.push(run_triggered);
 
     let mut plan_created = OrchestrationEvent::new(
         tenant_id,
@@ -2318,13 +2316,9 @@ async fn append_run_events(
         );
     }
 
-    let plan_event_path = LedgerWriter::event_path(&plan_created);
-    ledger
-        .append(plan_created)
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to write PlanCreated event: {e}")))?;
-
-    Ok(vec![run_event_path, plan_event_path])
+    events.push(plan_created);
+    append_events_and_compact(config, storage, events, request_id).await?;
+    Ok(())
 }
 
 fn map_run_state(state: FoldRunState) -> RunStateResponse {
@@ -3780,7 +3774,6 @@ pub(crate) async fn trigger_run(
     // Create storage for reservation and ledger
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
-    let ledger = LedgerWriter::new(storage.clone());
     let mut run_event_overrides: Option<RunEventOverrides> = None;
 
     let has_partition_request = request.partition_key.is_some() || !request.partitions.is_empty();
@@ -3900,8 +3893,10 @@ pub(crate) async fn trigger_run(
                     "re-emitting run plan from latest manifest"
                 );
 
-                let event_paths = append_run_events(
-                    &ledger,
+                append_run_events(
+                    &state.config,
+                    storage.clone(),
+                    Some(ctx.request_id.as_str()),
                     &ctx.tenant,
                     &workspace_id,
                     user_id.clone(),
@@ -3919,8 +3914,6 @@ pub(crate) async fn trigger_run(
                     }),
                 )
                 .await?;
-
-                compact_orchestration_events(&state.config, storage.clone(), event_paths).await?;
             }
 
             return Ok((
@@ -4054,8 +4047,10 @@ pub(crate) async fn trigger_run(
                         "re-emitting run plan from latest manifest"
                     );
 
-                    let event_paths = append_run_events(
-                        &ledger,
+                    append_run_events(
+                        &state.config,
+                        storage.clone(),
+                        Some(ctx.request_id.as_str()),
                         &ctx.tenant,
                         &workspace_id,
                         user_id.clone(),
@@ -4073,9 +4068,6 @@ pub(crate) async fn trigger_run(
                         }),
                     )
                     .await?;
-
-                    compact_orchestration_events(&state.config, storage.clone(), event_paths)
-                        .await?;
                 }
 
                 return Ok((
@@ -4132,8 +4124,10 @@ pub(crate) async fn trigger_run(
         "planning run from latest manifest"
     );
 
-    let event_paths = append_run_events(
-        &ledger,
+    append_run_events(
+        &state.config,
+        storage.clone(),
+        Some(ctx.request_id.as_str()),
         &ctx.tenant,
         &workspace_id,
         user_id,
@@ -4147,8 +4141,6 @@ pub(crate) async fn trigger_run(
         run_event_overrides,
     )
     .await?;
-
-    compact_orchestration_events(&state.config, storage.clone(), event_paths).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -4333,7 +4325,6 @@ pub(crate) async fn rerun_run(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
-    let ledger = LedgerWriter::new(storage.clone());
 
     let fingerprint_policy =
         FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff);
@@ -4378,8 +4369,10 @@ pub(crate) async fn rerun_run(
                     .clone()
                     .unwrap_or_else(|| Ulid::new().to_string());
 
-                let event_paths = append_run_events(
-                    &ledger,
+                append_run_events(
+                    &state.config,
+                    storage.clone(),
+                    Some(ctx.request_id.as_str()),
                     &ctx.tenant,
                     &workspace_id,
                     user_id,
@@ -4397,8 +4390,6 @@ pub(crate) async fn rerun_run(
                     }),
                 )
                 .await?;
-
-                compact_orchestration_events(&state.config, storage.clone(), event_paths).await?;
             }
 
             return Ok((
@@ -4428,8 +4419,10 @@ pub(crate) async fn rerun_run(
 
     let user_id = user_id_for_events(&ctx);
 
-    let event_paths = append_run_events(
-        &ledger,
+    append_run_events(
+        &state.config,
+        storage.clone(),
+        Some(ctx.request_id.as_str()),
         &ctx.tenant,
         &workspace_id,
         user_id,
@@ -4443,8 +4436,6 @@ pub(crate) async fn rerun_run(
         run_event_overrides,
     )
     .await?;
-
-    compact_orchestration_events(&state.config, storage.clone(), event_paths).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -4560,16 +4551,14 @@ pub(crate) async fn manual_evaluate_sensor(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
-    let ledger = LedgerWriter::new(storage.clone());
-    let event_paths: Vec<String> = events.iter().map(LedgerWriter::event_path).collect();
-    let events_written = event_paths.len();
-
-    ledger
-        .append_all(events)
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to append sensor events: {e}")))?;
-
-    compact_orchestration_events(&state.config, storage, event_paths).await?;
+    let events_written = events.len();
+    append_events_and_compact(
+        &state.config,
+        storage,
+        events,
+        Some(ctx.request_id.as_str()),
+    )
+    .await?;
 
     Ok((
         StatusCode::OK,
@@ -4978,8 +4967,6 @@ pub(crate) async fn cancel_run(
     // Create ledger writer
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
-    let ledger = LedgerWriter::new(storage.clone());
-
     // Emit RunCancelRequested event
     let cancel_event = OrchestrationEvent::new(
         &ctx.tenant,
@@ -4991,12 +4978,13 @@ pub(crate) async fn cancel_run(
         },
     );
 
-    let event_path = LedgerWriter::event_path(&cancel_event);
-    ledger.append(cancel_event).await.map_err(|e| {
-        ApiError::internal(format!("failed to write RunCancelRequested event: {e}"))
-    })?;
-
-    compact_orchestration_events(&state.config, storage, vec![event_path]).await?;
+    append_event_and_compact(
+        &state.config,
+        storage,
+        cancel_event,
+        Some(ctx.request_id.as_str()),
+    )
+    .await?;
 
     Ok(Json(CancelRunResponse {
         run_id,
@@ -5249,7 +5237,6 @@ pub(crate) async fn upsert_schedule(
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
 
-    let ledger = LedgerWriter::new(storage.clone());
     let existed = existing.is_some();
 
     let mut event = OrchestrationEvent::new(
@@ -5278,13 +5265,7 @@ pub(crate) async fn upsert_schedule(
         .unwrap_or_else(|| event.event_id.clone());
     event.idempotency_key = format!("sched_def_api:{schedule_id}:{request_key}");
 
-    let event_path = LedgerWriter::event_path(&event);
-
-    ledger.append(event).await.map_err(|e| {
-        ApiError::internal(format!("failed to append schedule definition event: {e}"))
-    })?;
-
-    compact_orchestration_events(&state.config, storage, vec![event_path]).await?;
+    append_event_and_compact(&state.config, storage, event, Some(ctx.request_id.as_str())).await?;
 
     let fold_state = load_orchestration_state(&ctx, &state).await?;
     let definition = fold_state
@@ -5325,7 +5306,6 @@ pub(crate) async fn enable_schedule(
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
 
-    let ledger = LedgerWriter::new(storage.clone());
     let mut event = OrchestrationEvent::new(
         &ctx.tenant,
         &workspace_id,
@@ -5350,13 +5330,7 @@ pub(crate) async fn enable_schedule(
         .unwrap_or_else(|| event.event_id.clone());
     event.idempotency_key = format!("sched_enable:{schedule_id}:{request_key}");
 
-    let event_path = LedgerWriter::event_path(&event);
-
-    ledger.append(event).await.map_err(|e| {
-        ApiError::internal(format!("failed to append schedule definition event: {e}"))
-    })?;
-
-    compact_orchestration_events(&state.config, storage, vec![event_path]).await?;
+    append_event_and_compact(&state.config, storage, event, Some(ctx.request_id.as_str())).await?;
 
     let fold_state = load_orchestration_state(&ctx, &state).await?;
     let definition = fold_state
@@ -5394,7 +5368,6 @@ pub(crate) async fn disable_schedule(
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
 
-    let ledger = LedgerWriter::new(storage.clone());
     let mut event = OrchestrationEvent::new(
         &ctx.tenant,
         &workspace_id,
@@ -5419,13 +5392,7 @@ pub(crate) async fn disable_schedule(
         .unwrap_or_else(|| event.event_id.clone());
     event.idempotency_key = format!("sched_disable:{schedule_id}:{request_key}");
 
-    let event_path = LedgerWriter::event_path(&event);
-
-    ledger.append(event).await.map_err(|e| {
-        ApiError::internal(format!("failed to append schedule definition event: {e}"))
-    })?;
-
-    compact_orchestration_events(&state.config, storage, vec![event_path]).await?;
+    append_event_and_compact(&state.config, storage, event, Some(ctx.request_id.as_str())).await?;
 
     let fold_state = load_orchestration_state(&ctx, &state).await?;
     let definition = fold_state

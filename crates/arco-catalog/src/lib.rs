@@ -117,7 +117,9 @@ pub use manifest::{
     parse_manifest_id,
 };
 pub use reader::{CatalogReader, LineageGraph, SignedUrl, SnapshotFreshness};
-pub use reconciler::{Reconciler, ReconciliationIssue, ReconciliationReport, RepairResult};
+pub use reconciler::{
+    Reconciler, ReconciliationIssue, ReconciliationReport, RepairResult, RepairScope,
+};
 pub use search_tombstone::{SearchTombstone, TombstoneBatch, TombstoneReason};
 pub use sync_compactor::SyncCompactor;
 pub use tier1_compactor::{Tier1CompactionError, Tier1CompactionResult, Tier1Compactor};

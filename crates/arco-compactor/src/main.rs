@@ -782,6 +782,13 @@ async fn sync_compact_handler(
                 "message": format!("Domain '{}' is not supported for sync compaction", domain)
             })),
         ),
+        Err(sync_compact::SyncCompactError::Validation { message }) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "validation_error",
+                "message": message
+            })),
+        ),
         Err(sync_compact::SyncCompactError::NotImplemented { domain, message }) => (
             StatusCode::NOT_IMPLEMENTED,
             Json(serde_json::json!({

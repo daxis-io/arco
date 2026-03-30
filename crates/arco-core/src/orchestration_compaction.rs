@@ -13,6 +13,9 @@ pub struct OrchestrationCompactRequest {
     /// Fencing token from the orchestration compaction lock.
     ///
     /// During PI-1 migration this also accepts the legacy `epoch` field name.
+    ///
+    /// Servers may reject the legacy alias via rollout gating even while the
+    /// stored `epoch` field remains the serialized compatibility alias.
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "epoch")]
     pub fencing_token: Option<u64>,
 
@@ -34,6 +37,9 @@ pub struct OrchestrationRebuildRequest {
     /// Fencing token from the orchestration compaction lock.
     ///
     /// During PI-1 migration this also accepts the legacy `epoch` field name.
+    ///
+    /// Servers may reject the legacy alias via rollout gating even while the
+    /// stored `epoch` field remains the serialized compatibility alias.
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "epoch")]
     pub fencing_token: Option<u64>,
 

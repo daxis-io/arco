@@ -12,6 +12,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use arco_core::observability::{LogFormat, init_logging};
@@ -21,17 +22,108 @@ use arco_core::orchestration_compaction::{
 use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 use arco_core::{InternalOidcConfig, InternalOidcError, InternalOidcVerifier, ScopedStorage};
 use arco_flow::error::{Error, Result};
+use arco_flow::metrics::{
+    record_orch_compactor_legacy_epoch_request, record_orch_compactor_partial_fenced_request,
+};
 use arco_flow::orchestration::compactor::{
     CompactionResult, MicroCompactor, OrchestrationReconciler, OrchestrationReconciliationReport,
     OrchestrationRepairResult,
 };
 
 const REBUILD_MANIFEST_PREFIX: &str = "state/orchestration/rebuilds/";
+const ARCO_FLOW_COMPACTOR_REQUEST_MODE_ENV: &str = "ARCO_FLOW_COMPACTOR_REQUEST_MODE";
+const ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE_ENV: &str = "ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CompactionRequestMode {
+    #[default]
+    Compatibility,
+    FencedOnly,
+}
+
+impl CompactionRequestMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compatibility => "compatibility",
+            Self::FencedOnly => "fenced_only",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "compatibility" => Ok(Self::Compatibility),
+            "fenced_only" => Ok(Self::FencedOnly),
+            other => Err(Error::configuration(format!(
+                "invalid {ARCO_FLOW_COMPACTOR_REQUEST_MODE_ENV}: expected compatibility|fenced_only, got {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LegacyEpochPayloadMode {
+    #[default]
+    Accept,
+    Reject,
+}
+
+impl LegacyEpochPayloadMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Reject => "reject",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "accept" => Ok(Self::Accept),
+            "reject" => Ok(Self::Reject),
+            other => Err(Error::configuration(format!(
+                "invalid {ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE_ENV}: expected accept|reject, got {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RolloutConfig {
+    request_mode: CompactionRequestMode,
+    legacy_epoch_mode: LegacyEpochPayloadMode,
+}
+
+impl RolloutConfig {
+    fn from_env() -> Result<Self> {
+        Self::from_env_reader(|key| std::env::var(key).ok())
+    }
+
+    fn from_env_reader<F>(mut read_env: F) -> Result<Self>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let request_mode = read_env(ARCO_FLOW_COMPACTOR_REQUEST_MODE_ENV)
+            .as_deref()
+            .map(CompactionRequestMode::parse)
+            .transpose()?
+            .unwrap_or_default();
+        let legacy_epoch_mode = read_env(ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE_ENV)
+            .as_deref()
+            .map(LegacyEpochPayloadMode::parse)
+            .transpose()?
+            .unwrap_or_default();
+
+        Ok(Self {
+            request_mode,
+            legacy_epoch_mode,
+        })
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
     compactor: MicroCompactor,
     storage: ScopedStorage,
+    rollout: RolloutConfig,
 }
 
 #[derive(Clone)]
@@ -100,31 +192,245 @@ impl IntoResponse for ApiError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactorEndpoint {
+    Compact,
+    Rebuild,
+}
+
+impl CompactorEndpoint {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Rebuild => "rebuild",
+        }
+    }
+
+    const fn fenced_only_message(self) -> &'static str {
+        match self {
+            Self::Compact => {
+                "fenced-only mode requires compact requests to include fencing_token and lock_path"
+            }
+            Self::Rebuild => {
+                "fenced-only mode requires rebuild requests to include fencing_token and lock_path"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestExecutionMode {
+    CompatibilityFallback,
+    Fenced,
+}
+
+#[derive(Debug)]
+struct ParsedRequest<T> {
+    request: T,
+    used_legacy_epoch: bool,
+    supplied_canonical_fencing_token: bool,
+}
+
+fn parse_request<T>(raw: serde_json::Value) -> std::result::Result<ParsedRequest<T>, ApiError>
+where
+    T: DeserializeOwned,
+{
+    let supplied_canonical_fencing_token = raw.get("fencing_token").is_some();
+    let used_legacy_epoch = raw.get("epoch").is_some() && !supplied_canonical_fencing_token;
+    let request = serde_json::from_value(raw).map_err(|error| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("invalid request body: {error}"),
+    })?;
+
+    Ok(ParsedRequest {
+        request,
+        used_legacy_epoch,
+        supplied_canonical_fencing_token,
+    })
+}
+
+fn log_compactor_request(
+    endpoint: CompactorEndpoint,
+    request_id: Option<&str>,
+    used_legacy_epoch: bool,
+    rollout: RolloutConfig,
+) {
+    tracing::info!(
+        endpoint = endpoint.as_str(),
+        request_id = request_id.unwrap_or(""),
+        used_legacy_epoch,
+        request_mode = rollout.request_mode.as_str(),
+        legacy_epoch_mode = rollout.legacy_epoch_mode.as_str(),
+        "received orchestration compactor request"
+    );
+}
+
+fn resolve_request_execution(
+    endpoint: CompactorEndpoint,
+    rollout: RolloutConfig,
+    request_id: Option<&str>,
+    used_legacy_epoch: bool,
+    supplied_canonical_fencing_token: bool,
+    fencing_token: Option<u64>,
+    lock_path: Option<&str>,
+) -> std::result::Result<RequestExecutionMode, ApiError> {
+    if used_legacy_epoch && rollout.legacy_epoch_mode == LegacyEpochPayloadMode::Reject {
+        record_orch_compactor_legacy_epoch_request(
+            endpoint.as_str(),
+            "rejected",
+            rollout.request_mode.as_str(),
+        );
+        tracing::warn!(
+            endpoint = endpoint.as_str(),
+            request_id = request_id.unwrap_or(""),
+            request_mode = rollout.request_mode.as_str(),
+            "rejecting legacy epoch payload by rollout gate"
+        );
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!(
+                "legacy epoch payloads are disabled by {ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE_ENV}=reject"
+            ),
+        });
+    }
+
+    let missing_field = match (
+        supplied_canonical_fencing_token,
+        lock_path.is_some(),
+        used_legacy_epoch,
+    ) {
+        (true, false, _) => Some("lock_path"),
+        (false, true, false) => Some("fencing_token"),
+        _ => None,
+    };
+
+    if let Some(missing_field) = missing_field {
+        record_orch_compactor_partial_fenced_request(
+            endpoint.as_str(),
+            missing_field,
+            rollout.request_mode.as_str(),
+        );
+        tracing::warn!(
+            endpoint = endpoint.as_str(),
+            request_id = request_id.unwrap_or(""),
+            missing_field,
+            request_mode = rollout.request_mode.as_str(),
+            "rejecting partial canonical fenced request"
+        );
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!(
+                "partial fenced request requires both fencing_token and lock_path; missing {missing_field}"
+            ),
+        });
+    }
+
+    if fencing_token.is_some() && lock_path.is_some() {
+        if used_legacy_epoch {
+            record_orch_compactor_legacy_epoch_request(
+                endpoint.as_str(),
+                "accepted",
+                rollout.request_mode.as_str(),
+            );
+        }
+        return Ok(RequestExecutionMode::Fenced);
+    }
+
+    if rollout.request_mode == CompactionRequestMode::FencedOnly {
+        if used_legacy_epoch {
+            record_orch_compactor_legacy_epoch_request(
+                endpoint.as_str(),
+                "rejected",
+                rollout.request_mode.as_str(),
+            );
+        }
+        tracing::warn!(
+            endpoint = endpoint.as_str(),
+            request_id = request_id.unwrap_or(""),
+            has_fencing_token = fencing_token.is_some(),
+            has_lock_path = lock_path.is_some(),
+            "rejecting request because fenced-only mode requires the full fenced contract"
+        );
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: endpoint.fenced_only_message().to_string(),
+        });
+    }
+
+    if used_legacy_epoch {
+        record_orch_compactor_legacy_epoch_request(
+            endpoint.as_str(),
+            "accepted",
+            rollout.request_mode.as_str(),
+        );
+    }
+
+    if fencing_token.is_some() || lock_path.is_some() {
+        tracing::warn!(
+            endpoint = endpoint.as_str(),
+            request_id = request_id.unwrap_or(""),
+            has_fencing_token = fencing_token.is_some(),
+            has_lock_path = lock_path.is_some(),
+            "using orchestration compactor compatibility fallback without the full fenced contract"
+        );
+    }
+
+    Ok(RequestExecutionMode::CompatibilityFallback)
+}
+
 async fn health_handler() -> StatusCode {
     StatusCode::OK
 }
 
 async fn compact_handler(
     State(state): State<AppState>,
-    Json(request): Json<OrchestrationCompactRequest>,
+    Json(raw_request): Json<serde_json::Value>,
 ) -> std::result::Result<Json<OrchestrationCompactionResponse>, ApiError> {
+    let ParsedRequest {
+        request,
+        used_legacy_epoch,
+        supplied_canonical_fencing_token,
+    } = parse_request::<OrchestrationCompactRequest>(raw_request)?;
+    log_compactor_request(
+        CompactorEndpoint::Compact,
+        request.request_id.as_deref(),
+        used_legacy_epoch,
+        state.rollout,
+    );
+    let execution = resolve_request_execution(
+        CompactorEndpoint::Compact,
+        state.rollout,
+        request.request_id.as_deref(),
+        used_legacy_epoch,
+        supplied_canonical_fencing_token,
+        request.fencing_token,
+        request.lock_path.as_deref(),
+    )?;
+
     let CompactionResult {
         events_processed,
         delta_id,
         manifest_revision,
         visibility_status,
         repair_pending,
-    } = match (request.fencing_token, request.lock_path.as_deref()) {
-        (Some(fencing_token), Some(lock_path)) => {
+    } = match execution {
+        RequestExecutionMode::Fenced => {
+            let fencing_token = request
+                .fencing_token
+                .expect("fenced execution requires fencing_token");
+            let lock_path = request
+                .lock_path
+                .as_deref()
+                .expect("fenced execution requires lock_path");
             state
                 .compactor
                 .compact_events_fenced(request.event_paths, fencing_token, lock_path)
                 .await?
         }
-        (token, _) => {
+        RequestExecutionMode::CompatibilityFallback => {
             state
                 .compactor
-                .compact_events_with_epoch(request.event_paths, token)
+                .compact_events_with_epoch(request.event_paths, request.fencing_token)
                 .await?
         }
     };
@@ -140,8 +446,19 @@ async fn compact_handler(
 
 async fn rebuild_handler(
     State(state): State<AppState>,
-    Json(request): Json<OrchestrationRebuildRequest>,
+    Json(raw_request): Json<serde_json::Value>,
 ) -> std::result::Result<Json<OrchestrationCompactionResponse>, ApiError> {
+    let ParsedRequest {
+        request,
+        used_legacy_epoch,
+        supplied_canonical_fencing_token,
+    } = parse_request::<OrchestrationRebuildRequest>(raw_request)?;
+    log_compactor_request(
+        CompactorEndpoint::Rebuild,
+        request.request_id.as_deref(),
+        used_legacy_epoch,
+        state.rollout,
+    );
     if !is_valid_rebuild_manifest_path(&request.rebuild_manifest_path) {
         return Err(ApiError {
             status: StatusCode::BAD_REQUEST,
@@ -150,6 +467,15 @@ async fn rebuild_handler(
             ),
         });
     }
+    let execution = resolve_request_execution(
+        CompactorEndpoint::Rebuild,
+        state.rollout,
+        request.request_id.as_deref(),
+        used_legacy_epoch,
+        supplied_canonical_fencing_token,
+        request.fencing_token,
+        request.lock_path.as_deref(),
+    )?;
 
     let CompactionResult {
         events_processed,
@@ -157,8 +483,15 @@ async fn rebuild_handler(
         manifest_revision,
         visibility_status,
         repair_pending,
-    } = match (request.fencing_token, request.lock_path.as_deref()) {
-        (Some(fencing_token), Some(lock_path)) => {
+    } = match execution {
+        RequestExecutionMode::Fenced => {
+            let fencing_token = request
+                .fencing_token
+                .expect("fenced execution requires fencing_token");
+            let lock_path = request
+                .lock_path
+                .as_deref()
+                .expect("fenced execution requires lock_path");
             state
                 .compactor
                 .rebuild_from_ledger_manifest_path_fenced(
@@ -168,10 +501,13 @@ async fn rebuild_handler(
                 )
                 .await?
         }
-        (token, _) => {
+        RequestExecutionMode::CompatibilityFallback => {
             state
                 .compactor
-                .rebuild_from_ledger_manifest_path(&request.rebuild_manifest_path, token)
+                .rebuild_from_ledger_manifest_path(
+                    &request.rebuild_manifest_path,
+                    request.fencing_token,
+                )
                 .await?
         }
     };
@@ -359,19 +695,78 @@ fn build_router(state: AppState, internal_auth: Option<Arc<InternalAuthState>>) 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::io;
+    use std::sync::{Mutex, OnceLock};
 
     use super::*;
     use arco_core::Error as CoreError;
     use arco_core::storage::MemoryBackend;
     use axum::http::Request;
+    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
     use tower::util::ServiceExt;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct SharedWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl SharedWriter {
+        fn new(buffer: Arc<Mutex<Vec<u8>>>) -> Self {
+            Self { buffer }
+        }
+    }
+
+    struct BufferWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl io::Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedWriter {
+        type Writer = BufferWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            BufferWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    fn init_metrics() -> PrometheusHandle {
+        static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+        PROMETHEUS_HANDLE
+            .get_or_init(|| {
+                PrometheusBuilder::new()
+                    .install_recorder()
+                    .expect("install prometheus recorder for compactor tests")
+            })
+            .clone()
+    }
 
     fn test_state() -> AppState {
+        test_state_with_rollout(RolloutConfig::default())
+    }
+
+    fn test_state_with_rollout(rollout: RolloutConfig) -> AppState {
         let backend = Arc::new(MemoryBackend::new());
         let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
         AppState {
             compactor: MicroCompactor::new(storage.clone()),
             storage,
+            rollout,
         }
     }
 
@@ -456,6 +851,27 @@ mod tests {
     }
 
     #[test]
+    fn rollout_config_defaults_preserve_pi1_compatibility() {
+        let config = RolloutConfig::default();
+
+        assert_eq!(config.request_mode, CompactionRequestMode::Compatibility);
+        assert_eq!(config.legacy_epoch_mode, LegacyEpochPayloadMode::Accept);
+    }
+
+    #[test]
+    fn rollout_config_parses_fenced_only_and_legacy_epoch_reject() {
+        let config = RolloutConfig::from_env_reader(|key| match key {
+            "ARCO_FLOW_COMPACTOR_REQUEST_MODE" => Some("fenced_only".to_string()),
+            "ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE" => Some("reject".to_string()),
+            _ => None,
+        })
+        .expect("parse rollout config");
+
+        assert_eq!(config.request_mode, CompactionRequestMode::FencedOnly);
+        assert_eq!(config.legacy_epoch_mode, LegacyEpochPayloadMode::Reject);
+    }
+
+    #[test]
     fn api_error_maps_core_precondition_to_conflict() {
         let error = Error::Core(CoreError::PreconditionFailed {
             message: "manifest publish failed - concurrent write".to_string(),
@@ -517,6 +933,175 @@ mod tests {
             .expect("request failed");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+
+    #[tokio::test]
+    async fn fenced_only_mode_rejects_legacy_epoch_payload_and_records_metric() {
+        let handle = init_metrics();
+        let router = build_router(
+            test_state_with_rollout(RolloutConfig {
+                request_mode: CompactionRequestMode::FencedOnly,
+                legacy_epoch_mode: LegacyEpochPayloadMode::Accept,
+            }),
+            None,
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/compact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"event_paths":[],"epoch":7,"request_id":"req-flow-legacy"}"#
+                            .to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                "arco_flow_orch_compactor_legacy_epoch_requests_total{endpoint=\"compact\",status=\"rejected\",request_mode=\"fenced_only\"}"
+            ),
+            "expected legacy epoch metric in rendered output, got {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compatibility_mode_rejects_lock_path_without_fencing_token_and_records_metric() {
+        let handle = init_metrics();
+        let router = build_router(test_state(), None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/compact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"event_paths":[],"lock_path":"locks/orchestration.compaction.lock.json","request_id":"req-partial-lock"}"#
+                            .to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                "arco_flow_orch_compactor_partial_fenced_requests_total{endpoint=\"compact\",missing_field=\"fencing_token\",request_mode=\"compatibility\"}"
+            ),
+            "expected partial fenced request metric in rendered output, got {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compatibility_mode_rejects_fencing_token_without_lock_path_and_records_metric() {
+        let handle = init_metrics();
+        let router = build_router(test_state(), None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/rebuild")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"rebuild_manifest_path":"state/orchestration/rebuilds/rebuild-01.json","fencing_token":9,"request_id":"req-partial-token"}"#
+                            .to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(
+                "arco_flow_orch_compactor_partial_fenced_requests_total{endpoint=\"rebuild\",missing_field=\"lock_path\",request_mode=\"compatibility\"}"
+            ),
+            "expected partial fenced request metric in rendered output, got {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_epoch_reject_mode_rejects_rebuild_payload() {
+        let router = build_router(
+            test_state_with_rollout(RolloutConfig {
+                request_mode: CompactionRequestMode::Compatibility,
+                legacy_epoch_mode: LegacyEpochPayloadMode::Reject,
+            }),
+            None,
+        );
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/rebuild")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"rebuild_manifest_path":"state/orchestration/rebuilds/rebuild-01.json","epoch":9}"#
+                            .to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compact_handler_logs_request_id_for_legacy_epoch_payload() {
+        let router = build_router(
+            test_state_with_rollout(RolloutConfig {
+                request_mode: CompactionRequestMode::FencedOnly,
+                legacy_epoch_mode: LegacyEpochPayloadMode::Accept,
+            }),
+            None,
+        );
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(SharedWriter::new(Arc::clone(&logs)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/compact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"event_paths":[],"epoch":7,"request_id":"req-flow-trace"}"#.to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let rendered =
+            String::from_utf8(logs.lock().expect("logs lock").clone()).expect("utf8 logs");
+        assert!(
+            rendered.contains("req-flow-trace"),
+            "expected request_id in tracing output, got {rendered}"
+        );
+    }
 }
 
 #[tokio::main]
@@ -529,14 +1114,22 @@ async fn main() -> Result<()> {
     let port = resolve_port()?;
     let tenant_secret = load_tenant_secret()?;
     let internal_auth = build_internal_auth()?;
+    let rollout = RolloutConfig::from_env()?;
 
     let backend = ObjectStoreBackend::from_bucket(&bucket)?;
     let backend: Arc<dyn StorageBackend> = Arc::new(backend);
     let storage = ScopedStorage::new(backend, tenant_id, workspace_id)?;
 
+    tracing::info!(
+        request_mode = rollout.request_mode.as_str(),
+        legacy_epoch_mode = rollout.legacy_epoch_mode.as_str(),
+        "loaded orchestration compactor rollout config"
+    );
+
     let state = AppState {
         compactor: MicroCompactor::with_tenant_secret(storage.clone(), tenant_secret),
         storage,
+        rollout,
     };
 
     let app = build_router(state, internal_auth);

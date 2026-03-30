@@ -62,6 +62,11 @@ pub enum SyncCompactError {
         /// Error message.
         message: String,
     },
+    /// Request validation failed.
+    Validation {
+        /// Error message.
+        message: String,
+    },
     /// Failed to publish manifest (CAS conflict).
     PublishFailed {
         /// Error message.
@@ -90,6 +95,7 @@ impl std::fmt::Display for SyncCompactError {
             Self::ProcessingError { message } => {
                 write!(f, "event processing error: {message}")
             }
+            Self::Validation { message } => write!(f, "validation error: {message}"),
             Self::PublishFailed { message } => {
                 write!(f, "manifest publish failed: {message}")
             }
@@ -145,20 +151,9 @@ impl SyncCompactHandler {
         &self,
         request: SyncCompactRequest,
     ) -> Result<SyncCompactResponse, SyncCompactError> {
-        tracing::info!(
-            domain = %request.domain,
-            event_count = request.event_paths.len(),
-            fencing_token = request.fencing_token,
-            request_id = ?request.request_id,
-            "handling sync compaction request"
-        );
-
         let compactor = Tier1Compactor::new(self.storage.clone());
 
-        match compactor
-            .sync_compact(&request.domain, request.event_paths, request.fencing_token)
-            .await
-        {
+        match compactor.sync_compact_request(request).await {
             Ok(result) => Ok(SyncCompactResponse {
                 manifest_version: result.manifest_version,
                 commit_ulid: result.commit_ulid,
@@ -181,6 +176,9 @@ impl SyncCompactHandler {
             }
             Err(Tier1CompactionError::ProcessingError { message }) => {
                 Err(SyncCompactError::ProcessingError { message })
+            }
+            Err(Tier1CompactionError::Validation { message }) => {
+                Err(SyncCompactError::Validation { message })
             }
             Err(Tier1CompactionError::PublishFailed { message }) => {
                 Err(SyncCompactError::PublishFailed { message })
@@ -229,6 +227,11 @@ mod tests {
             domain: "unknown".to_string(),
         };
         assert!(err.to_string().contains("unsupported domain"));
+
+        let err = SyncCompactError::Validation {
+            message: "invalid lock_path".to_string(),
+        };
+        assert!(err.to_string().contains("validation error"));
     }
 
     #[tokio::test]
@@ -240,7 +243,7 @@ mod tests {
             domain: "executions".to_string(),
             event_paths: vec!["ledger/executions/01JFXYZ.json".to_string()],
             fencing_token: 1,
-            lock_path: Some("locks/executions.lock.json".to_string()),
+            lock_path: None,
             request_id: None,
         };
 
@@ -248,6 +251,27 @@ mod tests {
         assert!(matches!(
             result,
             Err(SyncCompactError::UnsupportedDomain { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_sync_compact_rejects_noncanonical_lock_path() {
+        let backend = std::sync::Arc::new(arco_core::storage::MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production").expect("storage");
+        let handler = SyncCompactHandler::new(storage);
+        let request = SyncCompactRequest {
+            domain: "catalog".to_string(),
+            event_paths: vec!["ledger/catalog/01JFXYZ.json".to_string()],
+            fencing_token: 1,
+            lock_path: Some("locks/lineage.lock.json".to_string()),
+            request_id: Some("req-lock-path".to_string()),
+        };
+
+        let result = handler.handle(request).await;
+        assert!(matches!(
+            result,
+            Err(SyncCompactError::Validation { ref message })
+                if message.contains("invalid lock_path")
         ));
     }
 }

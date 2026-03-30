@@ -14,6 +14,7 @@ use arco_core::publish::Publisher;
 use arco_core::storage::{StorageBackend, WriteResult};
 use arco_core::storage_keys::{CommitKey, ManifestKey};
 use arco_core::storage_traits::CommitPutStore;
+use arco_core::sync_compact::SyncCompactRequest;
 use arco_core::{
     CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths, ScopedStorage, VisibilityStatus,
 };
@@ -85,6 +86,12 @@ pub enum Tier1CompactionError {
         /// Error message.
         message: String,
     },
+    /// Request validation failed.
+    #[error("validation error: {message}")]
+    Validation {
+        /// Error message.
+        message: String,
+    },
     /// Failed to publish manifest (CAS conflict or storage error).
     #[error("manifest publish failed: {message}")]
     PublishFailed {
@@ -113,6 +120,7 @@ impl From<Tier1CompactionError> for CatalogError {
             Tier1CompactionError::ProcessingError { message } => {
                 Self::InvariantViolation { message }
             }
+            Tier1CompactionError::Validation { message } => Self::Validation { message },
             Tier1CompactionError::PublishFailed { message } => Self::CasFailed { message },
         }
     }
@@ -138,6 +146,38 @@ impl Tier1Compactor {
     ///
     /// # Errors
     ///
+    /// Returns an error if validation fails, any event cannot be read, or
+    /// manifest publishing fails.
+    pub async fn sync_compact_request(
+        &self,
+        request: SyncCompactRequest,
+    ) -> Result<Tier1CompactionResult, Tier1CompactionError> {
+        let domain = parse_domain(&request.domain)?;
+        let canonical_lock_path = self.storage.lock(domain);
+
+        if let Some(lock_path) = request.lock_path.as_deref() {
+            if lock_path != canonical_lock_path {
+                return Err(Tier1CompactionError::Validation {
+                    message: format!(
+                        "invalid lock_path: expected {canonical_lock_path}, got {lock_path}"
+                    ),
+                });
+            }
+        }
+
+        tracing::info!(
+            domain = %request.domain,
+            event_count = request.event_paths.len(),
+            fencing_token = request.fencing_token,
+            lock_path = request.lock_path.as_deref().unwrap_or(""),
+            request_id = request.request_id.as_deref().unwrap_or(""),
+            "handling sync compaction request"
+        );
+
+        self.sync_compact(&request.domain, request.event_paths, request.fencing_token)
+            .await
+    }
+
     /// Returns an error if validation fails, any event cannot be read, or
     /// manifest publishing fails.
     pub async fn sync_compact(

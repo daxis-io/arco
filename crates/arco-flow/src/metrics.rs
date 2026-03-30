@@ -114,6 +114,12 @@ pub mod names {
     /// Counter: Lock-backed fencing rejects during orchestration compaction.
     pub const ORCH_COMPACTOR_STALE_FENCING_REJECTS_TOTAL: &str =
         "arco_flow_orch_compactor_stale_fencing_rejects_total";
+    /// Counter: Legacy `epoch` payload usage observed by the orchestration compactor.
+    pub const ORCH_COMPACTOR_LEGACY_EPOCH_REQUESTS_TOTAL: &str =
+        "arco_flow_orch_compactor_legacy_epoch_requests_total";
+    /// Counter: Partial canonical fenced requests rejected by the orchestration compactor.
+    pub const ORCH_COMPACTOR_PARTIAL_FENCED_REQUESTS_TOTAL: &str =
+        "arco_flow_orch_compactor_partial_fenced_requests_total";
     /// Counter: Visible compaction commits that still require side-effect repair.
     pub const ORCH_REPAIR_PENDING_TOTAL: &str = "arco_flow_orch_repair_pending_total";
     /// Counter: Orphan orchestration artifacts discovered by reconciliation.
@@ -168,6 +174,10 @@ pub mod labels {
     pub const DURABILITY_MODE: &str = "durability_mode";
     /// Retry or failure reason label.
     pub const REASON: &str = "reason";
+    /// Compactor request endpoint label.
+    pub const ENDPOINT: &str = "endpoint";
+    /// Missing canonical fenced field label.
+    pub const MISSING_FIELD: &str = "missing_field";
 }
 
 /// High-level interface for recording orchestration metrics.
@@ -348,6 +358,36 @@ where
     F: FnOnce(Duration),
 {
     TimingGuard::new(on_complete)
+}
+
+/// Records legacy `epoch` payload usage in orchestration compactor requests.
+pub fn record_orch_compactor_legacy_epoch_request(
+    endpoint: &str,
+    status: &str,
+    request_mode: &str,
+) {
+    counter!(
+        names::ORCH_COMPACTOR_LEGACY_EPOCH_REQUESTS_TOTAL,
+        labels::ENDPOINT => endpoint.to_string(),
+        labels::STATUS => status.to_string(),
+        "request_mode" => request_mode.to_string(),
+    )
+    .increment(1);
+}
+
+/// Records rejected partial canonical fenced requests.
+pub fn record_orch_compactor_partial_fenced_request(
+    endpoint: &str,
+    missing_field: &str,
+    request_mode: &str,
+) {
+    counter!(
+        names::ORCH_COMPACTOR_PARTIAL_FENCED_REQUESTS_TOTAL,
+        labels::ENDPOINT => endpoint.to_string(),
+        labels::MISSING_FIELD => missing_field.to_string(),
+        "request_mode" => request_mode.to_string(),
+    )
+    .increment(1);
 }
 
 #[cfg(test)]

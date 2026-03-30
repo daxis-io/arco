@@ -1,0 +1,90 @@
+rule_files:
+  - ../alerts.yaml
+evaluation_interval: 1m
+tests:
+  - name: control_plane_repair_alerts_fire
+    interval: 1m
+    input_series:
+      - series: 'arco_catalog_repair_pending_total{domain="catalog",reason="legacy_manifest_mirror"}'
+        values: "0 0 1 1 1 1 1 1 1 1 1 1"
+      - series: 'arco_flow_orch_repair_pending_total{reason="legacy_manifest_mirror"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0 0"
+      - series: 'arco_catalog_reconciler_issues_total{domain="catalog",issue_type="missing_current_head_legacy_mirror",repairable="true"}'
+        values: "0 0 1 1 1 1 1 1 1 1 1 1"
+      - series: 'arco_flow_orch_reconciler_repair_issues_total{reason="legacy_manifest"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0 0"
+      - series: 'arco_catalog_reconciler_repairs_total{domain="catalog",issue_type="missing_current_head_legacy_mirror",status="failed"}'
+        values: "0 0 1 1 1 1 1 1 1 1 1 1"
+      - series: 'arco_flow_orch_reconciler_repairs_total{reason="legacy_manifest",status="failed"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0 0"
+      - series: 'arco_flow_orch_compactor_stale_fencing_rejects_total{reason="stale_token"}'
+        values: "0 0 0 0 0 1 2 3 4 5 6 7"
+      - series: 'arco_flow_orch_compactor_legacy_epoch_requests_total{endpoint="compact",status="accepted",request_mode="compatibility"}'
+        values: "0 0 1 1 1 1 1 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: ArcoControlPlaneRepairPending
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: arco-control-plane
+            exp_annotations:
+              summary: "Control-plane commit completed with repairable side effects"
+              description: |
+                A visible control-plane commit reported repair_pending in the last 15 minutes.
+                Pointer CAS already committed the head; run the control-plane reconcile dry run and
+                enforce repair if the current-head side effects are still missing.
+              runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+      - eval_time: 9m
+        alertname: ArcoControlPlaneRepairIssuesDetected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: arco-control-plane
+            exp_annotations:
+              summary: "Control-plane current-head repair issues detected"
+              description: |
+                The control-plane reconciler detected repairable current-head issues in the last 15 minutes.
+                Readers remain pointer-first, but legacy mirrors or commit records may still need repair.
+              runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+      - eval_time: 9m
+        alertname: ArcoControlPlaneReconcilerRepairFailures
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: arco-control-plane
+            exp_annotations:
+              summary: "Control-plane reconciler repair failed"
+              description: |
+                A current-head repair action failed in the last 15 minutes.
+                Readers continue to use the pointer-target manifest, but legacy mirrors or commit
+                records may remain missing until repair succeeds.
+              runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+      - eval_time: 10m
+        alertname: ArcoFlowStaleFenceRejects
+        exp_alerts:
+          - exp_labels:
+              reason: stale_token
+              severity: critical
+              service: arco-flow
+            exp_annotations:
+              summary: "Stale fence rejects detected (reason=stale_token)"
+              description: |
+                Orchestration compactor reported stale fence rejects in the last 5 minutes.
+                Reason: stale_token. This indicates competing writers or lock epoch drift.
+              runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+      - eval_time: 9m
+        alertname: ArcoFlowLegacyEpochPayloadsObserved
+        exp_alerts:
+          - exp_labels:
+              endpoint: compact
+              request_mode: compatibility
+              severity: warning
+              service: arco-flow
+              status: accepted
+            exp_annotations:
+              summary: "Legacy epoch compactor payloads observed (endpoint=compact, status=accepted)"
+              description: |
+                Legacy orchestration compactor payloads were observed in the last 15 minutes.
+                Endpoint: compact, status: accepted, request mode: compatibility.
+              runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"

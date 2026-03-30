@@ -96,6 +96,6 @@ metrics-exporter-prometheus = { workspace = true }
 
 [dev-dependencies]
 arco-test-utils = { path = "../arco-test-utils" }
-duckdb = { version = "1.10500.0", features = ["parquet"] }
+duckdb = { version = "1.10501.0", features = ["parquet"] }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }

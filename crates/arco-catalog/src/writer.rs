@@ -23,6 +23,7 @@
 #![allow(clippy::option_if_let_else)]
 #![allow(clippy::uninlined_format_args)]
 
+use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -495,6 +496,22 @@ impl CatalogWriter {
             })
     }
 
+    fn single_event_sync_compact_request(
+        &self,
+        domain: CatalogDomain,
+        event_id: &impl Display,
+        fencing_token: u64,
+        request_id: Option<String>,
+    ) -> SyncCompactRequest {
+        SyncCompactRequest {
+            domain: domain.as_str().to_string(),
+            event_paths: vec![CatalogPaths::ledger_event(domain, &event_id.to_string())],
+            fencing_token,
+            lock_path: Some(self.storage.lock(domain)),
+            request_id,
+        }
+    }
+
     async fn ensure_default_catalog_locked(
         &self,
         guard: &crate::lock::LockGuard<dyn StorageBackend>,
@@ -529,15 +546,12 @@ impl CatalogWriter {
             )
             .await?;
 
-        let request = SyncCompactRequest {
-            domain: CatalogDomain::Catalog.as_str().to_string(),
-            event_paths: vec![CatalogPaths::ledger_event(
-                CatalogDomain::Catalog,
-                &event_id.to_string(),
-            )],
-            fencing_token: guard.fencing_token().sequence(),
-            request_id: opts.request_id.clone(),
-        };
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
 
         compactor.sync_compact(request).await?;
 
@@ -653,15 +667,12 @@ impl CatalogWriter {
             )
             .await?;
 
-        let request = SyncCompactRequest {
-            domain: CatalogDomain::Catalog.as_str().to_string(),
-            event_paths: vec![CatalogPaths::ledger_event(
-                CatalogDomain::Catalog,
-                &event_id.to_string(),
-            )],
-            fencing_token: guard.fencing_token().sequence(),
-            request_id: opts.request_id.clone(),
-        };
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
 
         let result = compactor.sync_compact(request).await;
         guard.release().await?;
@@ -779,15 +790,12 @@ impl CatalogWriter {
             )
             .await?;
 
-        let request = SyncCompactRequest {
-            domain: CatalogDomain::Catalog.as_str().to_string(),
-            event_paths: vec![CatalogPaths::ledger_event(
-                CatalogDomain::Catalog,
-                &event_id.to_string(),
-            )],
-            fencing_token: guard.fencing_token().sequence(),
-            request_id: opts.request_id.clone(),
-        };
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
 
         let result = compactor.sync_compact(request).await;
         guard.release().await?;
@@ -901,15 +909,12 @@ impl CatalogWriter {
             )
             .await?;
 
-        let request = SyncCompactRequest {
-            domain: CatalogDomain::Catalog.as_str().to_string(),
-            event_paths: vec![CatalogPaths::ledger_event(
-                CatalogDomain::Catalog,
-                &event_id.to_string(),
-            )],
-            fencing_token: guard.fencing_token().sequence(),
-            request_id: opts.request_id.clone(),
-        };
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
 
         let result = compactor.sync_compact(request).await;
         guard.release().await?;
@@ -1013,15 +1018,12 @@ impl CatalogWriter {
             )
             .await?;
 
-        let request = SyncCompactRequest {
-            domain: CatalogDomain::Catalog.as_str().to_string(),
-            event_paths: vec![CatalogPaths::ledger_event(
-                CatalogDomain::Catalog,
-                &event_id.to_string(),
-            )],
-            fencing_token: guard.fencing_token().sequence(),
-            request_id: opts.request_id.clone(),
-        };
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
 
         let result = compactor.sync_compact(request).await;
         guard.release().await?;
@@ -1130,15 +1132,12 @@ impl CatalogWriter {
             )
             .await?;
 
-        let request = SyncCompactRequest {
-            domain: CatalogDomain::Catalog.as_str().to_string(),
-            event_paths: vec![CatalogPaths::ledger_event(
-                CatalogDomain::Catalog,
-                &event_id.to_string(),
-            )],
-            fencing_token: guard.fencing_token().sequence(),
-            request_id: opts.request_id.clone(),
-        };
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
 
         let result = compactor.sync_compact(request).await;
         guard.release().await?;
@@ -1292,15 +1291,12 @@ impl CatalogWriter {
             )
             .await?;
 
-        let request = SyncCompactRequest {
-            domain: CatalogDomain::Catalog.as_str().to_string(),
-            event_paths: vec![CatalogPaths::ledger_event(
-                CatalogDomain::Catalog,
-                &event_id.to_string(),
-            )],
-            fencing_token: guard.fencing_token().sequence(),
-            request_id: opts.request_id.clone(),
-        };
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
 
         let result = compactor.sync_compact(request).await;
         guard.release().await?;
@@ -1470,15 +1466,12 @@ impl CatalogWriter {
             )
             .await?;
 
-        let request = SyncCompactRequest {
-            domain: CatalogDomain::Catalog.as_str().to_string(),
-            event_paths: vec![CatalogPaths::ledger_event(
-                CatalogDomain::Catalog,
-                &event_id.to_string(),
-            )],
-            fencing_token: guard.fencing_token().sequence(),
-            request_id: opts.request_id.clone(),
-        };
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
 
         let result = compactor.sync_compact(request).await;
         guard.release().await?;
@@ -1620,15 +1613,12 @@ impl CatalogWriter {
             )
             .await?;
 
-        let request = SyncCompactRequest {
-            domain: CatalogDomain::Catalog.as_str().to_string(),
-            event_paths: vec![CatalogPaths::ledger_event(
-                CatalogDomain::Catalog,
-                &event_id.to_string(),
-            )],
-            fencing_token: guard.fencing_token().sequence(),
-            request_id: opts.request_id.clone(),
-        };
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
 
         let result = compactor.sync_compact(request).await;
         guard.release().await?;
@@ -1735,15 +1725,12 @@ impl CatalogWriter {
             )
             .await?;
 
-        let request = SyncCompactRequest {
-            domain: CatalogDomain::Catalog.as_str().to_string(),
-            event_paths: vec![CatalogPaths::ledger_event(
-                CatalogDomain::Catalog,
-                &event_id.to_string(),
-            )],
-            fencing_token: guard.fencing_token().sequence(),
-            request_id: opts.request_id.clone(),
-        };
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
 
         let result = compactor.sync_compact(request).await;
         guard.release().await?;
@@ -1965,15 +1952,12 @@ impl CatalogWriter {
             )
             .await?;
 
-        let request = SyncCompactRequest {
-            domain: CatalogDomain::Catalog.as_str().to_string(),
-            event_paths: vec![CatalogPaths::ledger_event(
-                CatalogDomain::Catalog,
-                &event_id.to_string(),
-            )],
-            fencing_token: guard.fencing_token().sequence(),
-            request_id: opts.request_id.clone(),
-        };
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
 
         let result = compactor.sync_compact(request).await;
         guard.release().await?;
@@ -2028,15 +2012,12 @@ impl CatalogWriter {
             )
             .await?;
 
-        let request = SyncCompactRequest {
-            domain: CatalogDomain::Lineage.as_str().to_string(),
-            event_paths: vec![CatalogPaths::ledger_event(
-                CatalogDomain::Lineage,
-                &event_id.to_string(),
-            )],
-            fencing_token: guard.fencing_token().sequence(),
-            request_id: opts.request_id.clone(),
-        };
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Lineage,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
 
         let result = compactor.sync_compact(request).await;
         guard.release().await?;
@@ -2080,15 +2061,12 @@ impl CatalogWriter {
             )
             .await?;
 
-        let request = SyncCompactRequest {
-            domain: CatalogDomain::Lineage.as_str().to_string(),
-            event_paths: vec![CatalogPaths::ledger_event(
-                CatalogDomain::Lineage,
-                &event_id.to_string(),
-            )],
-            fencing_token: guard.fencing_token().sequence(),
-            request_id: opts.request_id.clone(),
-        };
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Lineage,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
 
         let result = compactor.sync_compact(request).await;
         guard.release().await?;

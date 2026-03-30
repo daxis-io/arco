@@ -37,12 +37,14 @@ Required env (service mode):
 - `ARCO_WORKSPACE_ID`
 - `ARCO_STORAGE_BUCKET`
 - `ARCO_COMPACTOR_PORT` (default `8081`)
+- Optional internal OIDC for `/internal/reconcile`: `ARCO_INTERNAL_AUTH_ISSUER`, `ARCO_INTERNAL_AUTH_AUDIENCE`, `ARCO_INTERNAL_AUTH_ALLOWED_SUBS` and/or `ARCO_INTERNAL_AUTH_ALLOWED_EMAILS`, `ARCO_INTERNAL_AUTH_ENFORCE`
 
 HTTP:
 - `GET /health`
 - `GET /ready`
 - `POST /compact`
 - `POST /internal/sync-compact`
+- `POST /internal/reconcile`
 
 ### `arco_flow_compactor`
 
@@ -53,10 +55,13 @@ Required env:
 - `ARCO_TENANT_ID`
 - `ARCO_WORKSPACE_ID`
 - `ARCO_STORAGE_BUCKET`
+- Optional internal OIDC for `/compact`, `/rebuild`, and `/internal/reconcile`: `ARCO_INTERNAL_AUTH_ISSUER`, `ARCO_INTERNAL_AUTH_AUDIENCE`, `ARCO_INTERNAL_AUTH_ALLOWED_SUBS` and/or `ARCO_INTERNAL_AUTH_ALLOWED_EMAILS`, `ARCO_INTERNAL_AUTH_ENFORCE`
 
 HTTP:
 - `GET /health`
 - `POST /compact`
+- `POST /rebuild`
+- `POST /internal/reconcile`
 
 ### `arco_flow_dispatcher`
 
@@ -115,11 +120,13 @@ Catalog write path:
 1. API appends ledger event.
 2. API calls `arco-compactor` `POST /internal/sync-compact`.
 3. Compactor is sole snapshot writer.
+4. Operators call `POST /internal/reconcile` for current-head repair, and must attach internal OIDC bearer tokens when that gate is enabled.
 
 Orchestration write path:
 1. API appends orchestration event.
 2. API calls `arco_flow_compactor` `POST /compact`.
 3. Flow compactor is sole orchestration state writer.
+4. Operators call `POST /internal/reconcile` for current-head legacy-manifest repair, and must attach internal OIDC bearer tokens when that gate is enabled.
 
 Worker dispatch path:
 1. Dispatcher/sweeper enqueue only canonical `WorkerDispatchEnvelope`.

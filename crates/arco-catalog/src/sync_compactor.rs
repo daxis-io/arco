@@ -31,6 +31,8 @@ impl SyncCompactor for Tier1Compactor {
             commit_ulid: result.commit_ulid,
             events_processed: result.events_processed,
             snapshot_version: result.snapshot_version,
+            visibility_status: result.visibility_status,
+            repair_pending: result.repair_pending,
         })
     }
 }

@@ -164,6 +164,8 @@ impl SyncCompactHandler {
                 commit_ulid: result.commit_ulid,
                 events_processed: result.events_processed,
                 snapshot_version: result.snapshot_version,
+                visibility_status: result.visibility_status,
+                repair_pending: result.repair_pending,
             }),
             Err(Tier1CompactionError::StaleFencingToken { expected, provided }) => {
                 Err(SyncCompactError::StaleFencingToken { expected, provided })
@@ -197,6 +199,7 @@ mod tests {
             domain: "catalog".to_string(),
             event_paths: vec!["ledger/catalog/01JFXYZ.json".to_string()],
             fencing_token: 42,
+            lock_path: Some("locks/catalog.lock.json".to_string()),
             request_id: Some("req-123".to_string()),
         };
 
@@ -237,6 +240,7 @@ mod tests {
             domain: "executions".to_string(),
             event_paths: vec!["ledger/executions/01JFXYZ.json".to_string()],
             fencing_token: 1,
+            lock_path: Some("locks/executions.lock.json".to_string()),
             request_id: None,
         };
 

@@ -4,19 +4,14 @@
 //! to the ledger and must promptly trigger micro-compaction so Parquet projections stay
 //! fresh for subsequent reconciliations.
 //!
-//! In cloud deployments, this is done via the `arco-flow-compactor` Cloud Run service:
-//! `POST {ARCO_ORCH_COMPACTOR_URL}/compact` with `{ "event_paths": [...] }`.
+//! In cloud deployments, this is done via the `arco-flow-compactor` Cloud Run service.
 
 #[cfg(any(feature = "gcp", feature = "test-utils"))]
-use serde::Serialize;
+use arco_core::orchestration_compaction::{
+    OrchestrationCompactRequest, OrchestrationCompactionResponse,
+};
 
 use crate::error::{Error, Result};
-
-#[cfg(any(feature = "gcp", feature = "test-utils"))]
-#[derive(Debug, Serialize)]
-struct CompactRequest<'a> {
-    event_paths: &'a [String],
-}
 
 /// Request compaction of the provided orchestration ledger event paths.
 ///
@@ -31,11 +26,68 @@ pub async fn compact_orchestration_events(url: &str, event_paths: Vec<String>) -
         return Ok(());
     }
 
-    compact_orchestration_events_impl(url, &event_paths).await
+    #[cfg(any(feature = "gcp", feature = "test-utils"))]
+    {
+        return compact_orchestration_events_fenced_impl(url, &event_paths, None, None, None)
+            .await
+            .map(|_| ());
+    }
+
+    #[cfg(not(any(feature = "gcp", feature = "test-utils")))]
+    {
+        let _ = (url, event_paths);
+        Err(Error::configuration(
+            "orchestration compaction requires the 'gcp' feature",
+        ))
+    }
 }
 
 #[cfg(any(feature = "gcp", feature = "test-utils"))]
-async fn compact_orchestration_events_impl(url: &str, event_paths: &[String]) -> Result<()> {
+/// Request orchestration compaction using caller-held fencing data.
+///
+/// This is the ADR-034 PI-1 internal write contract used by API and flow
+/// services when they append orchestration events while holding the shared
+/// compaction lock.
+///
+/// # Errors
+///
+/// Returns an error if the HTTP request fails, the service returns a non-success
+/// status, or the response cannot be decoded.
+pub async fn compact_orchestration_events_fenced(
+    url: &str,
+    event_paths: Vec<String>,
+    fencing_token: u64,
+    lock_path: &str,
+    request_id: Option<&str>,
+) -> Result<OrchestrationCompactionResponse> {
+    if event_paths.is_empty() {
+        return Ok(OrchestrationCompactionResponse {
+            events_processed: 0,
+            delta_id: None,
+            manifest_revision: String::new(),
+            visibility_status: arco_core::VisibilityStatus::Visible,
+            repair_pending: false,
+        });
+    }
+
+    compact_orchestration_events_fenced_impl(
+        url,
+        &event_paths,
+        Some(fencing_token),
+        Some(lock_path),
+        request_id,
+    )
+    .await
+}
+
+#[cfg(any(feature = "gcp", feature = "test-utils"))]
+async fn compact_orchestration_events_fenced_impl(
+    url: &str,
+    event_paths: &[String],
+    fencing_token: Option<u64>,
+    lock_path: Option<&str>,
+    request_id: Option<&str>,
+) -> Result<OrchestrationCompactionResponse> {
     use std::time::Duration;
 
     const MAX_ATTEMPTS: usize = 3;
@@ -59,7 +111,12 @@ async fn compact_orchestration_events_impl(url: &str, event_paths: &[String]) ->
 
         let mut request = client
             .post(&endpoint)
-            .json(&CompactRequest { event_paths })
+            .json(&OrchestrationCompactRequest {
+                event_paths: event_paths.to_vec(),
+                fencing_token,
+                lock_path: lock_path.map(str::to_string),
+                request_id: request_id.map(str::to_string),
+            })
             .timeout(REQUEST_TIMEOUT);
 
         if let Some(auth_header) = auth_header.as_deref() {
@@ -69,7 +126,16 @@ async fn compact_orchestration_events_impl(url: &str, event_paths: &[String]) ->
         let response = request.send().await;
 
         match response {
-            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(resp) if resp.status().is_success() => {
+                return resp
+                    .json::<OrchestrationCompactionResponse>()
+                    .await
+                    .map_err(|e| {
+                        Error::dispatch(format!(
+                            "failed to decode orchestration compaction response: {e}"
+                        ))
+                    });
+            }
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
@@ -218,7 +284,19 @@ async fn fetch_gcp_identity_token(
 }
 
 #[cfg(not(any(feature = "gcp", feature = "test-utils")))]
-async fn compact_orchestration_events_impl(_url: &str, _event_paths: &[String]) -> Result<()> {
+/// Request orchestration compaction using caller-held fencing data.
+///
+/// # Errors
+///
+/// Always returns a configuration error unless the `gcp` or `test-utils`
+/// feature is enabled.
+pub async fn compact_orchestration_events_fenced(
+    _url: &str,
+    _event_paths: Vec<String>,
+    _fencing_token: u64,
+    _lock_path: &str,
+    _request_id: Option<&str>,
+) -> Result<arco_core::OrchestrationCompactionResponse> {
     Err(Error::configuration(
         "orchestration compaction requires the 'gcp' feature",
     ))

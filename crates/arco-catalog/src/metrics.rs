@@ -63,6 +63,19 @@ pub const EVENT_WRITER_BYTES: &str = "arco_event_writer_bytes_written_total";
 pub const EVENT_WRITER_SEQUENCE: &str = "arco_event_writer_sequence_allocation_total";
 
 // ============================================================================
+// ADR-034 Repair Metrics
+// ============================================================================
+
+/// Visible commits with repairable side-effect failures.
+pub const REPAIR_PENDING: &str = "arco_catalog_repair_pending_total";
+
+/// Reconciler issues discovered by domain/type.
+pub const RECONCILER_ISSUES: &str = "arco_catalog_reconciler_issues_total";
+
+/// Reconciler repair attempts by domain/type/status.
+pub const RECONCILER_REPAIRS: &str = "arco_catalog_reconciler_repairs_total";
+
+// ============================================================================
 // Metric Registration
 // ============================================================================
 
@@ -87,6 +100,18 @@ pub fn register_metrics() {
     describe_counter!(
         IDEMPOTENCY_TAKEOVER,
         "Total idempotency marker takeover attempts by result"
+    );
+    describe_counter!(
+        REPAIR_PENDING,
+        "Total visible commits that require repair of post-commit side effects"
+    );
+    describe_counter!(
+        RECONCILER_ISSUES,
+        "Total catalog reconciler issues discovered by domain and issue type"
+    );
+    describe_counter!(
+        RECONCILER_REPAIRS,
+        "Total catalog reconciler repair attempts by domain, issue type, and outcome"
     );
 }
 
@@ -181,6 +206,42 @@ pub fn record_idempotency_takeover(operation: &str, result: &str) {
         IDEMPOTENCY_TAKEOVER,
         "operation" => operation.to_string(),
         "result" => result.to_string()
+    )
+    .increment(1);
+}
+
+// ============================================================================
+// ADR-034 Repair Metric Recording
+// ============================================================================
+
+/// Records a visible commit that still needs side-effect repair.
+pub fn record_repair_pending(domain: CatalogDomain, reason: &str) {
+    counter!(
+        REPAIR_PENDING,
+        "domain" => domain.as_str().to_string(),
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
+/// Records a reconciler issue discovery.
+pub fn record_reconciler_issue(domain: CatalogDomain, issue_type: &str, repairable: bool) {
+    counter!(
+        RECONCILER_ISSUES,
+        "domain" => domain.as_str().to_string(),
+        "issue_type" => issue_type.to_string(),
+        "repairable" => repairable.to_string()
+    )
+    .increment(1);
+}
+
+/// Records a reconciler repair attempt or outcome.
+pub fn record_reconciler_repair(domain: CatalogDomain, issue_type: &str, status: &str) {
+    counter!(
+        RECONCILER_REPAIRS,
+        "domain" => domain.as_str().to_string(),
+        "issue_type" => issue_type.to_string(),
+        "status" => status.to_string()
     )
     .increment(1);
 }

@@ -82,7 +82,36 @@ impl CompactionVisibility {
     }
 }
 
-type PublishOutcome = CompactionVisibility;
+impl From<CompactionVisibility> for arco_core::VisibilityStatus {
+    fn from(value: CompactionVisibility) -> Self {
+        match value {
+            CompactionVisibility::Visible => Self::Visible,
+            CompactionVisibility::PersistedNotVisible => Self::PersistedNotVisible,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishOutcome {
+    Visible { repair_pending: bool },
+    PersistedNotVisible,
+}
+
+impl PublishOutcome {
+    const fn visibility_status(self) -> CompactionVisibility {
+        match self {
+            Self::Visible { .. } => CompactionVisibility::Visible,
+            Self::PersistedNotVisible => CompactionVisibility::PersistedNotVisible,
+        }
+    }
+
+    const fn repair_pending(self) -> bool {
+        match self {
+            Self::Visible { repair_pending } => repair_pending,
+            Self::PersistedNotVisible => false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublishRetryReason {
@@ -165,6 +194,8 @@ pub struct CompactionResult {
     pub manifest_revision: String,
     /// Visibility outcome for this compaction acknowledgement.
     pub visibility_status: CompactionVisibility,
+    /// Whether post-commit side effects failed and require repair.
+    pub repair_pending: bool,
 }
 
 impl MicroCompactor {
@@ -272,6 +303,51 @@ impl MicroCompactor {
             .await
     }
 
+    /// Fenced rebuild path for callers that hold the orchestration compaction lock.
+    ///
+    /// This preserves PI-1 compatibility with the existing stored rebuild manifest
+    /// workflow while validating the supplied lock path and fencing token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rebuild manifest cannot be read or the supplied
+    /// fencing token is stale.
+    pub async fn rebuild_from_ledger_manifest_path_fenced(
+        &self,
+        rebuild_manifest_path: &str,
+        fencing_token: u64,
+        lock_path: &str,
+    ) -> Result<CompactionResult> {
+        let bytes = self.storage.get_raw(rebuild_manifest_path).await?;
+        let rebuild_manifest: LedgerRebuildManifest =
+            serde_json::from_slice(&bytes).map_err(|e| {
+                Error::Core(arco_core::Error::InvalidInput(format!(
+                    "failed to parse ledger rebuild manifest at {rebuild_manifest_path}: {e}"
+                )))
+            })?;
+        self.rebuild_from_ledger_manifest_fenced(rebuild_manifest, fencing_token, lock_path)
+            .await
+    }
+
+    /// Fenced rebuild path for callers that already loaded the ledger rebuild manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if replay fails or the supplied fencing token is stale.
+    pub async fn rebuild_from_ledger_manifest_fenced(
+        &self,
+        rebuild_manifest: LedgerRebuildManifest,
+        fencing_token: u64,
+        lock_path: &str,
+    ) -> Result<CompactionResult> {
+        let (manifest, _, _, _) = self.read_manifest_with_version().await?;
+        let event_paths = rebuild_manifest
+            .event_paths_after_watermark(&manifest.watermarks)
+            .map_err(|message| Error::Core(arco_core::Error::InvalidInput(message)))?;
+        self.compact_events_internal(event_paths, Some(fencing_token), Some(lock_path))
+            .await
+    }
+
     /// Fenced compaction path for callers that hold the orchestration lock.
     ///
     /// This validates the canonical lock path, current lock holder, and supplied
@@ -333,6 +409,7 @@ impl MicroCompactor {
 
             if event_paths.is_empty() {
                 let mut visibility_status = CompactionVisibility::Visible;
+                let mut repair_pending = false;
                 if pointer_version.is_none() {
                     match self
                         .publish_manifest(
@@ -346,7 +423,10 @@ impl MicroCompactor {
                         )
                         .await
                     {
-                        Ok(outcome) => visibility_status = outcome,
+                        Ok(outcome) => {
+                            visibility_status = outcome.visibility_status();
+                            repair_pending = outcome.repair_pending();
+                        }
                         Err(publish_error) => {
                             if let Some(delay_ms) =
                                 should_retry_publish_error(&publish_error, retry_attempt)
@@ -392,6 +472,7 @@ impl MicroCompactor {
                     delta_id: None,
                     manifest_revision: manifest.revision_ulid,
                     visibility_status,
+                    repair_pending,
                 });
             }
 
@@ -557,6 +638,7 @@ impl MicroCompactor {
             let manifest_changed = storage_changed || watermark_changed;
 
             let mut visibility_status = CompactionVisibility::Visible;
+            let mut repair_pending = false;
             let manifest_revision = if manifest_changed {
                 let previous_manifest_path = previous_pointer.as_ref().map_or_else(
                     || orchestration_manifest_path().to_string(),
@@ -587,7 +669,10 @@ impl MicroCompactor {
                     )
                     .await
                 {
-                    Ok(outcome) => visibility_status = outcome,
+                    Ok(outcome) => {
+                        visibility_status = outcome.visibility_status();
+                        repair_pending = outcome.repair_pending();
+                    }
                     Err(publish_error) => {
                         if let Some(delay_ms) =
                             should_retry_publish_error(&publish_error, retry_attempt)
@@ -638,6 +723,7 @@ impl MicroCompactor {
                 delta_id,
                 manifest_revision,
                 visibility_status,
+                repair_pending,
             });
         }
 
@@ -1228,7 +1314,16 @@ impl MicroCompactor {
         )
         .await
         {
-            Ok(SnapshotPointerPublishOutcome::Visible { .. }) => Ok(PublishOutcome::Visible),
+            Ok(SnapshotPointerPublishOutcome::Visible { repair_pending, .. }) => {
+                if repair_pending {
+                    counter!(
+                        metric_names::ORCH_REPAIR_PENDING_TOTAL,
+                        metric_labels::REASON => "legacy_manifest_mirror".to_string(),
+                    )
+                    .increment(1);
+                }
+                Ok(PublishOutcome::Visible { repair_pending })
+            }
             Ok(SnapshotPointerPublishOutcome::PersistedNotVisible) => {
                 tracing::warn!(
                     manifest_id = %manifest.manifest_id,
@@ -2258,6 +2353,74 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct LegacyManifestFailureBackend {
+        inner: MemoryBackend,
+        inject_once: AtomicBool,
+    }
+
+    impl LegacyManifestFailureBackend {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                inject_once: AtomicBool::new(true),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for LegacyManifestFailureBackend {
+        async fn get(&self, path: &str) -> arco_core::error::Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(
+            &self,
+            path: &str,
+            range: Range<u64>,
+        ) -> arco_core::error::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::error::Result<WriteResult> {
+            if path.ends_with(orchestration_manifest_path())
+                && matches!(precondition, WritePrecondition::None)
+                && self.inject_once.swap(false, Ordering::SeqCst)
+            {
+                return Err(arco_core::Error::storage(format!(
+                    "injected orchestration legacy manifest write failure for {path}"
+                )));
+            }
+
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::error::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::error::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::error::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(
+            &self,
+            path: &str,
+            expiry: Duration,
+        ) -> arco_core::error::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
     #[async_trait]
     impl StorageBackend for OneShotL0WriteConflictBackend {
         async fn get(&self, path: &str) -> arco_core::error::Result<Bytes> {
@@ -3234,7 +3397,12 @@ mod tests {
         let base_outcome = persisted_a
             .publish_manifest(&base, None, None, None, None, None, None)
             .await?;
-        assert_eq!(base_outcome, PublishOutcome::Visible);
+        assert_eq!(
+            base_outcome,
+            PublishOutcome::Visible {
+                repair_pending: false
+            }
+        );
 
         let (stale_manifest, stale_version, stale_pointer, stale_pointer_bytes) =
             persisted_a.read_manifest_with_version().await?;
@@ -3256,7 +3424,12 @@ mod tests {
                 None,
             )
             .await?;
-        assert_eq!(winner_outcome, PublishOutcome::Visible);
+        assert_eq!(
+            winner_outcome,
+            PublishOutcome::Visible {
+                repair_pending: false
+            }
+        );
 
         let mut stale = OrchestrationManifest::new("01HQXYZ212REV");
         stale.manifest_id = "00000000000000000002".to_string();
@@ -3273,6 +3446,33 @@ mod tests {
             )
             .await?;
         assert_eq!(stale_outcome, PublishOutcome::PersistedNotVisible);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compact_events_returns_repair_pending_when_legacy_manifest_write_fails() -> Result<()>
+    {
+        let backend = Arc::new(LegacyManifestFailureBackend::new());
+        let (compactor, storage) = create_test_compactor_with_backend(backend).await?;
+
+        let result = compactor.compact_events(vec![]).await?;
+        assert_eq!(result.visibility_status, CompactionVisibility::Visible);
+        assert!(result.repair_pending);
+        assert!(
+            storage
+                .head_raw(orchestration_manifest_pointer_path())
+                .await?
+                .is_some(),
+            "pointer CAS must still succeed"
+        );
+        assert!(
+            storage
+                .head_raw(orchestration_manifest_path())
+                .await?
+                .is_none(),
+            "legacy manifest mirror should remain repairable side effect"
+        );
 
         Ok(())
     }

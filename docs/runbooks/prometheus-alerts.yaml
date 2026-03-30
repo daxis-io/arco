@@ -4,6 +4,42 @@
 # Adjust thresholds based on your SLOs and traffic patterns.
 
 groups:
+  - name: arco-control-plane-repair
+    rules:
+      - alert: ArcoControlPlaneRepairPending
+        expr: |
+          sum(increase(arco_catalog_repair_pending_total[15m]))
+          +
+          sum(increase(arco_flow_orch_repair_pending_total[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          team: data-platform
+        annotations:
+          summary: Control-plane commit completed with repairable side effects
+          description: |
+            A visible control-plane commit reported repair_pending in the last 15 minutes.
+            Pointer CAS already committed the head; run the control-plane reconcile dry run and
+            enforce repair if the current-head side effects are still missing.
+          runbook_url: https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch
+
+      - alert: ArcoControlPlaneReconcilerRepairFailures
+        expr: |
+          sum(increase(arco_catalog_reconciler_repairs_total{status="failed"}[15m]))
+          +
+          sum(increase(arco_flow_orch_reconciler_repairs_total{status="failed"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          team: data-platform
+        annotations:
+          summary: Control-plane reconciler repair failed
+          description: |
+            A current-head repair action failed in the last 15 minutes.
+            Readers continue to use the pointer-target manifest, but legacy mirrors or commit
+            records may still be missing until repair succeeds.
+          runbook_url: https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch
+
   - name: arco-flow-go-live-gates
     rules:
       - alert: ArcoFlowCallback5xxRateHigh

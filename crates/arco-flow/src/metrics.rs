@@ -114,8 +114,15 @@ pub mod names {
     /// Counter: Lock-backed fencing rejects during orchestration compaction.
     pub const ORCH_COMPACTOR_STALE_FENCING_REJECTS_TOTAL: &str =
         "arco_flow_orch_compactor_stale_fencing_rejects_total";
+    /// Counter: Visible compaction commits that still require side-effect repair.
+    pub const ORCH_REPAIR_PENDING_TOTAL: &str = "arco_flow_orch_repair_pending_total";
     /// Counter: Orphan orchestration artifacts discovered by reconciliation.
     pub const ORCH_RECONCILER_ORPHANS_TOTAL: &str = "arco_flow_orch_reconciler_orphans_total";
+    /// Counter: Current-head repair issues discovered by orchestration reconciliation.
+    pub const ORCH_RECONCILER_REPAIR_ISSUES_TOTAL: &str =
+        "arco_flow_orch_reconciler_repair_issues_total";
+    /// Counter: Repair actions attempted by orchestration reconciliation.
+    pub const ORCH_RECONCILER_REPAIRS_TOTAL: &str = "arco_flow_orch_reconciler_repairs_total";
     /// Counter: Orchestration orphan objects deleted by reconciliation repair.
     pub const ORCH_RECONCILER_DELETES_TOTAL: &str = "arco_flow_orch_reconciler_deletes_total";
     /// Counter: Total bytes deleted by orchestration reconciliation repair.

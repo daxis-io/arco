@@ -69,6 +69,7 @@ tempfile = { workspace = true, optional = true }
 [dev-dependencies]
 tokio-test = { workspace = true }
 criterion = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 [[bench]]
 name = "catalog_lookup"

@@ -81,6 +81,7 @@ jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 tokio-test = { workspace = true }
 criterion = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+tower = { workspace = true }
 
 [[bench]]
 name = "plan_generation"

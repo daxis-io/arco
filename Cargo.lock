@@ -245,6 +245,7 @@ dependencies = [
  "futures",
  "hex",
  "metrics",
+ "metrics-exporter-prometheus",
  "object_store",
  "parquet 54.3.1",
  "proptest",
@@ -386,6 +387,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",
+ "tower",
  "tracing",
  "ulid",
 ]

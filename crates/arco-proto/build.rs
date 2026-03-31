@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/arco/v1/catalog.proto",
         "../../proto/arco/v1/flow.proto",
         "../../proto/arco/v1/orchestration.proto",
+        "../../proto/arco/v1/transactions.proto",
     ];
 
     let includes = ["../../proto"];

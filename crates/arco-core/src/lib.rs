@@ -38,6 +38,7 @@ pub mod backpressure;
 pub mod canonical_json;
 pub mod catalog_event;
 pub mod catalog_paths;
+pub mod control_plane_transactions;
 pub mod error;
 pub mod flow_paths;
 pub mod id;
@@ -68,6 +69,12 @@ pub mod tenant;
 pub mod prelude {
     pub use crate::catalog_event::{CatalogEvent, CatalogEventPayload};
     pub use crate::catalog_paths::{CatalogDomain, CatalogPaths};
+    pub use crate::control_plane_transactions::{
+        CatalogTxReceipt, CatalogTxRecord, ControlPlaneIdempotencyRecord, ControlPlaneTxDomain,
+        ControlPlaneTxKind, ControlPlaneTxPaths, ControlPlaneTxRecord, ControlPlaneTxStatus,
+        DomainCommit, OrchestrationTxReceipt, OrchestrationTxRecord, RootTxManifest,
+        RootTxManifestDomain, RootTxReceipt, RootTxRecord,
+    };
     pub use crate::error::{Error, Result};
     pub use crate::flow_paths::{ApiPaths, DeltaPaths, FlowPaths, IcebergPaths};
     pub use crate::id::{AssetId, EventId, MaterializationId, RunId, TaskId};
@@ -103,6 +110,12 @@ pub mod prelude {
 // Re-export key types at crate root for ergonomics
 pub use catalog_event::{CatalogEvent, CatalogEventPayload};
 pub use catalog_paths::{CatalogDomain, CatalogPaths};
+pub use control_plane_transactions::{
+    CatalogTxReceipt, CatalogTxRecord, ControlPlaneIdempotencyRecord, ControlPlaneTxDomain,
+    ControlPlaneTxKind, ControlPlaneTxPaths, ControlPlaneTxRecord, ControlPlaneTxStatus,
+    DomainCommit, OrchestrationTxReceipt, OrchestrationTxRecord, RootTxManifest,
+    RootTxManifestDomain, RootTxReceipt, RootTxRecord,
+};
 pub use error::{Error, Result};
 pub use flow_paths::{ApiPaths, DeltaPaths, FlowPaths, IcebergPaths};
 pub use id::{AssetId, EventId, MaterializationId, RunId, TaskId};

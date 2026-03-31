@@ -64,6 +64,37 @@ impl std::fmt::Display for TaskOutputContractError {
 
 impl std::error::Error for TaskOutputContractError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlPlaneTransactionContractError {
+    MissingHeader,
+    MissingCatalogDdl,
+    MissingCatalogDdlOp,
+    EmptyOrchestrationEvents,
+    EmptyRootMutations,
+    MissingRootMutationKind(usize),
+}
+
+impl std::fmt::Display for ControlPlaneTransactionContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingHeader => f.write_str("request header is required"),
+            Self::MissingCatalogDdl => f.write_str("catalog DDL payload is required"),
+            Self::MissingCatalogDdlOp => f.write_str("catalog DDL operation is required"),
+            Self::EmptyOrchestrationEvents => {
+                f.write_str("orchestration batch must include at least one event")
+            }
+            Self::EmptyRootMutations => {
+                f.write_str("root transaction must include at least one mutation")
+            }
+            Self::MissingRootMutationKind(index) => {
+                write!(f, "root mutation at index {index} must set kind")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ControlPlaneTransactionContractError {}
+
 impl TaskOutput {
     pub fn validate_contract(&self) -> Result<(), TaskOutputContractError> {
         if self.materialization_id.is_none() {
@@ -114,6 +145,61 @@ impl TaskOutput {
                 Ok(())
             }
         }
+    }
+}
+
+impl ApplyCatalogDdlRequest {
+    pub fn validate_contract(&self) -> Result<(), ControlPlaneTransactionContractError> {
+        if self.header.is_none() {
+            return Err(ControlPlaneTransactionContractError::MissingHeader);
+        }
+
+        let ddl = self
+            .ddl
+            .as_ref()
+            .ok_or(ControlPlaneTransactionContractError::MissingCatalogDdl)?;
+
+        if ddl.op.is_none() {
+            return Err(ControlPlaneTransactionContractError::MissingCatalogDdlOp);
+        }
+
+        Ok(())
+    }
+}
+
+impl CommitOrchestrationBatchRequest {
+    pub fn validate_contract(&self) -> Result<(), ControlPlaneTransactionContractError> {
+        if self.header.is_none() {
+            return Err(ControlPlaneTransactionContractError::MissingHeader);
+        }
+
+        if self.events.is_empty() {
+            return Err(ControlPlaneTransactionContractError::EmptyOrchestrationEvents);
+        }
+
+        Ok(())
+    }
+}
+
+impl CommitRootTransactionRequest {
+    pub fn validate_contract(&self) -> Result<(), ControlPlaneTransactionContractError> {
+        if self.header.is_none() {
+            return Err(ControlPlaneTransactionContractError::MissingHeader);
+        }
+
+        if self.mutations.is_empty() {
+            return Err(ControlPlaneTransactionContractError::EmptyRootMutations);
+        }
+
+        if let Some(index) = self
+            .mutations
+            .iter()
+            .position(|mutation| mutation.kind.is_none())
+        {
+            return Err(ControlPlaneTransactionContractError::MissingRootMutationKind(index));
+        }
+
+        Ok(())
     }
 }
 

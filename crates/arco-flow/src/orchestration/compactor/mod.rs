@@ -20,6 +20,6 @@ pub use manifest::*;
 pub use parquet_util::*;
 pub use reconciler::{
     OrchestrationReconciler, OrchestrationReconciliationPolicy, OrchestrationReconciliationReport,
-    OrchestrationRepairResult,
+    OrchestrationRepairResult, OrchestrationRepairScope,
 };
 pub use service::{CompactionResult, CompactionVisibility, DurabilityMode, MicroCompactor};

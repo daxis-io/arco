@@ -6,22 +6,16 @@ use crate::sync_compact::VisibilityStatus;
 
 /// Request for orchestration compaction over explicit event paths.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct OrchestrationCompactRequest {
     /// Explicit event file paths to process.
     pub event_paths: Vec<String>,
 
     /// Fencing token from the orchestration compaction lock.
-    ///
-    /// During PI-1 migration this also accepts the legacy `epoch` field name.
-    ///
-    /// Servers may reject the legacy alias via rollout gating even while the
-    /// stored `epoch` field remains the serialized compatibility alias.
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "epoch")]
-    pub fencing_token: Option<u64>,
+    pub fencing_token: u64,
 
     /// Canonical lock path held by the caller.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lock_path: Option<String>,
+    pub lock_path: String,
 
     /// Optional request identifier for tracing and idempotency diagnostics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -30,22 +24,16 @@ pub struct OrchestrationCompactRequest {
 
 /// Request for orchestration rebuild from an explicit rebuild manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct OrchestrationRebuildRequest {
     /// Path to the stored rebuild manifest JSON.
     pub rebuild_manifest_path: String,
 
     /// Fencing token from the orchestration compaction lock.
-    ///
-    /// During PI-1 migration this also accepts the legacy `epoch` field name.
-    ///
-    /// Servers may reject the legacy alias via rollout gating even while the
-    /// stored `epoch` field remains the serialized compatibility alias.
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "epoch")]
-    pub fencing_token: Option<u64>,
+    pub fencing_token: u64,
 
     /// Canonical lock path held by the caller.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lock_path: Option<String>,
+    pub lock_path: String,
 
     /// Optional request identifier for tracing and idempotency diagnostics.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -51,7 +51,7 @@
 
 use std::time::{Duration, Instant};
 
-use metrics::{counter, gauge, histogram};
+use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 
 /// Metric names as constants for consistency.
 pub mod names {
@@ -114,12 +114,9 @@ pub mod names {
     /// Counter: Lock-backed fencing rejects during orchestration compaction.
     pub const ORCH_COMPACTOR_STALE_FENCING_REJECTS_TOTAL: &str =
         "arco_flow_orch_compactor_stale_fencing_rejects_total";
-    /// Counter: Legacy `epoch` payload usage observed by the orchestration compactor.
-    pub const ORCH_COMPACTOR_LEGACY_EPOCH_REQUESTS_TOTAL: &str =
-        "arco_flow_orch_compactor_legacy_epoch_requests_total";
-    /// Counter: Partial canonical fenced requests rejected by the orchestration compactor.
-    pub const ORCH_COMPACTOR_PARTIAL_FENCED_REQUESTS_TOTAL: &str =
-        "arco_flow_orch_compactor_partial_fenced_requests_total";
+    /// Counter: Removed compatibility request shapes rejected by the orchestration compactor.
+    pub const ORCH_COMPACTOR_REQUEST_CONTRACT_REJECTIONS_TOTAL: &str =
+        "arco_flow_orch_compactor_request_contract_rejections_total";
     /// Counter: Visible compaction commits that still require side-effect repair.
     pub const ORCH_REPAIR_PENDING_TOTAL: &str = "arco_flow_orch_repair_pending_total";
     /// Counter: Orphan orchestration artifacts discovered by reconciliation.
@@ -140,6 +137,22 @@ pub mod names {
     /// Counter: Orphan paths deferred until the reconciliation quarantine window elapses.
     pub const ORCH_RECONCILER_DEFERRED_PATHS_TOTAL: &str =
         "arco_flow_orch_reconciler_deferred_paths_total";
+    /// Counter: Automated orchestration repair executor runs.
+    pub const ORCH_REPAIR_AUTOMATION_RUNS_TOTAL: &str =
+        "arco_flow_orch_repair_automation_runs_total";
+    /// Counter: Automated orchestration repair findings discovered.
+    pub const ORCH_REPAIR_AUTOMATION_FINDINGS_TOTAL: &str =
+        "arco_flow_orch_repair_automation_findings_total";
+    /// Gauge: Current orchestration repair backlog count by mode and scope.
+    pub const ORCH_REPAIR_BACKLOG_COUNT: &str = "arco_flow_orch_repair_backlog_count";
+    /// Gauge: Age in seconds of the current orchestration repair backlog by mode and scope.
+    pub const ORCH_REPAIR_BACKLOG_AGE_SECONDS: &str = "arco_flow_orch_repair_backlog_age_seconds";
+    /// Histogram: Automated orchestration repair completion latency in seconds.
+    pub const ORCH_REPAIR_COMPLETION_LATENCY_SECONDS: &str =
+        "arco_flow_orch_repair_completion_latency_seconds";
+    /// Counter: Repeated orchestration repair-needed detections by mode and scope.
+    pub const ORCH_REPAIR_REPEAT_FINDINGS_TOTAL: &str =
+        "arco_flow_orch_repair_repeat_findings_total";
 }
 
 /// Label keys used across metrics.
@@ -176,8 +189,6 @@ pub mod labels {
     pub const REASON: &str = "reason";
     /// Compactor request endpoint label.
     pub const ENDPOINT: &str = "endpoint";
-    /// Missing canonical fenced field label.
-    pub const MISSING_FIELD: &str = "missing_field";
 }
 
 /// High-level interface for recording orchestration metrics.
@@ -189,6 +200,160 @@ pub mod labels {
 pub struct FlowMetrics {
     /// Optional prefix for metric names (for multi-tenant deployments).
     _prefix: Option<String>,
+}
+
+/// Registers flow metric descriptions when a metrics recorder is installed.
+pub fn register_metrics() {
+    describe_counter!(names::TASKS_TOTAL, "Total task state transitions");
+    describe_histogram!(
+        names::TASK_DURATION_SECONDS,
+        "Task execution duration in seconds"
+    );
+    describe_histogram!(
+        names::SCHEDULER_TICK_DURATION_SECONDS,
+        "Scheduler tick processing time in seconds"
+    );
+    describe_gauge!(names::ACTIVE_RUNS, "Currently active runs");
+    describe_gauge!(
+        names::DISPATCH_QUEUE_DEPTH,
+        "Tasks waiting in dispatch queue"
+    );
+    describe_counter!(names::DISPATCHES_TOTAL, "Total dispatch operations");
+    describe_counter!(names::RETRIES_TOTAL, "Total retry operations");
+    describe_counter!(
+        names::ORCH_CALLBACKS_TOTAL,
+        "Total orchestration callback requests"
+    );
+    describe_counter!(
+        names::ORCH_CALLBACK_ERRORS_TOTAL,
+        "Total orchestration callback errors"
+    );
+    describe_histogram!(
+        names::ORCH_CALLBACK_DURATION_SECONDS,
+        "Orchestration callback latency in seconds"
+    );
+    describe_counter!(
+        names::ORCH_CONTROLLER_ACTIONS_TOTAL,
+        "Orchestration controller actions emitted"
+    );
+    describe_histogram!(
+        names::ORCH_CONTROLLER_RECONCILE_SECONDS,
+        "Orchestration controller reconcile duration in seconds"
+    );
+    describe_gauge!(
+        names::ORCH_BACKLOG_DEPTH,
+        "Orchestration backlog depth by lane"
+    );
+    describe_gauge!(
+        names::ORCH_COMPACTION_LAG_SECONDS,
+        "Orchestration compaction watermark lag in seconds"
+    );
+    describe_gauge!(
+        names::ORCH_RUN_KEY_CONFLICTS,
+        "Durable run-key conflict row count"
+    );
+    describe_gauge!(
+        names::ORCH_SLO_TARGET_SECONDS,
+        "Runtime SLO target value in seconds"
+    );
+    describe_gauge!(
+        names::ORCH_SLO_OBSERVED_SECONDS,
+        "Runtime observed SLO value in seconds"
+    );
+    describe_counter!(
+        names::ORCH_SLO_BREACHES_TOTAL,
+        "Runtime SLO breaches detected"
+    );
+    describe_counter!(names::SCHEDULE_TICKS_TOTAL, "Schedule ticks by outcome");
+    describe_counter!(names::RUN_REQUESTS_TOTAL, "Run requests by source");
+    describe_counter!(
+        names::SENSOR_EVALS_TOTAL,
+        "Sensor evaluations by type and status"
+    );
+    describe_counter!(
+        names::ORCH_COMPACTIONS_TOTAL,
+        "Orchestration compaction acknowledgements"
+    );
+    describe_histogram!(
+        names::ORCH_COMPACTOR_ACK_LATENCY_SECONDS,
+        "End-to-end compaction acknowledgement latency in seconds"
+    );
+    describe_gauge!(
+        names::ORCH_COMPACTOR_VISIBILITY_LAG_EVENTS,
+        "Visibility lag measured as committed-vs-visible event skew"
+    );
+    describe_counter!(
+        names::ORCH_COMPACTOR_PUBLISH_RETRIES_TOTAL,
+        "Compactor manifest publish retries after classified races"
+    );
+    describe_counter!(
+        names::ORCH_COMPACTOR_OVERWRITE_REJECTS_TOTAL,
+        "Immutable orchestration artifact overwrite attempts rejected"
+    );
+    describe_counter!(
+        names::ORCH_COMPACTOR_STALE_FENCING_REJECTS_TOTAL,
+        "Lock-backed fencing rejects during orchestration compaction"
+    );
+    describe_counter!(
+        names::ORCH_COMPACTOR_REQUEST_CONTRACT_REJECTIONS_TOTAL,
+        "Removed compatibility request shapes rejected by the orchestration compactor"
+    );
+    describe_counter!(
+        names::ORCH_REPAIR_PENDING_TOTAL,
+        "Visible compaction commits that still require side-effect repair"
+    );
+    describe_counter!(
+        names::ORCH_RECONCILER_ORPHANS_TOTAL,
+        "Orphan orchestration artifacts discovered by reconciliation"
+    );
+    describe_counter!(
+        names::ORCH_RECONCILER_REPAIR_ISSUES_TOTAL,
+        "Current-head repair issues discovered by orchestration reconciliation"
+    );
+    describe_counter!(
+        names::ORCH_RECONCILER_REPAIRS_TOTAL,
+        "Repair actions attempted by orchestration reconciliation"
+    );
+    describe_counter!(
+        names::ORCH_RECONCILER_DELETES_TOTAL,
+        "Orchestration orphan objects deleted by reconciliation repair"
+    );
+    describe_counter!(
+        names::ORCH_RECONCILER_DELETED_BYTES_TOTAL,
+        "Total bytes deleted by orchestration reconciliation repair"
+    );
+    describe_counter!(
+        names::ORCH_RECONCILER_SKIPPED_PATHS_TOTAL,
+        "Protected paths skipped during orchestration reconciliation repair"
+    );
+    describe_counter!(
+        names::ORCH_RECONCILER_DEFERRED_PATHS_TOTAL,
+        "Orphan paths deferred until the reconciliation quarantine window elapses"
+    );
+    describe_counter!(
+        names::ORCH_REPAIR_AUTOMATION_RUNS_TOTAL,
+        "Automated orchestration repair executor runs"
+    );
+    describe_counter!(
+        names::ORCH_REPAIR_AUTOMATION_FINDINGS_TOTAL,
+        "Automated orchestration repair findings discovered"
+    );
+    describe_gauge!(
+        names::ORCH_REPAIR_BACKLOG_COUNT,
+        "Current orchestration repair backlog count by mode and scope"
+    );
+    describe_gauge!(
+        names::ORCH_REPAIR_BACKLOG_AGE_SECONDS,
+        "Age in seconds of the current orchestration repair backlog by mode and scope"
+    );
+    describe_histogram!(
+        names::ORCH_REPAIR_COMPLETION_LATENCY_SECONDS,
+        "Automated orchestration repair completion latency in seconds"
+    );
+    describe_counter!(
+        names::ORCH_REPAIR_REPEAT_FINDINGS_TOTAL,
+        "Repeated orchestration repair-needed detections by mode and scope"
+    );
 }
 
 impl FlowMetrics {
@@ -360,32 +525,88 @@ where
     TimingGuard::new(on_complete)
 }
 
-/// Records legacy `epoch` payload usage in orchestration compactor requests.
-pub fn record_orch_compactor_legacy_epoch_request(
-    endpoint: &str,
-    status: &str,
-    request_mode: &str,
-) {
+/// Records removed compatibility request shapes rejected by the orchestration compactor.
+pub fn record_orch_compactor_contract_rejection(endpoint: &str, reason: &str) {
     counter!(
-        names::ORCH_COMPACTOR_LEGACY_EPOCH_REQUESTS_TOTAL,
+        names::ORCH_COMPACTOR_REQUEST_CONTRACT_REJECTIONS_TOTAL,
         labels::ENDPOINT => endpoint.to_string(),
-        labels::STATUS => status.to_string(),
-        "request_mode" => request_mode.to_string(),
+        labels::REASON => reason.to_string(),
     )
     .increment(1);
 }
 
-/// Records rejected partial canonical fenced requests.
-pub fn record_orch_compactor_partial_fenced_request(
-    endpoint: &str,
-    missing_field: &str,
-    request_mode: &str,
-) {
+/// Records an automated orchestration repair executor run.
+pub fn record_orch_repair_automation_run(mode: &str, scope: &str, status: &str) {
     counter!(
-        names::ORCH_COMPACTOR_PARTIAL_FENCED_REQUESTS_TOTAL,
-        labels::ENDPOINT => endpoint.to_string(),
-        labels::MISSING_FIELD => missing_field.to_string(),
-        "request_mode" => request_mode.to_string(),
+        names::ORCH_REPAIR_AUTOMATION_RUNS_TOTAL,
+        "domain" => "orchestration".to_string(),
+        "mode" => mode.to_string(),
+        "scope" => scope.to_string(),
+        labels::STATUS => status.to_string(),
+    )
+    .increment(1);
+}
+
+/// Records findings discovered by the automated orchestration repair executor.
+pub fn record_orch_repair_automation_findings(mode: &str, scope: &str, findings: u64) {
+    counter!(
+        names::ORCH_REPAIR_AUTOMATION_FINDINGS_TOTAL,
+        "domain" => "orchestration".to_string(),
+        "mode" => mode.to_string(),
+        "scope" => scope.to_string(),
+    )
+    .increment(findings);
+}
+
+/// Sets the current orchestration repair backlog count and age.
+pub fn set_orch_repair_backlog(
+    tenant_id: &str,
+    workspace_id: &str,
+    mode: &str,
+    scope: &str,
+    count: u64,
+    age_seconds: f64,
+) {
+    gauge!(
+        names::ORCH_REPAIR_BACKLOG_COUNT,
+        "domain" => "orchestration".to_string(),
+        "mode" => mode.to_string(),
+        "scope" => scope.to_string(),
+        "tenant_id" => tenant_id.to_string(),
+        "workspace_id" => workspace_id.to_string(),
+    )
+    .set(count as f64);
+    gauge!(
+        names::ORCH_REPAIR_BACKLOG_AGE_SECONDS,
+        "domain" => "orchestration".to_string(),
+        "mode" => mode.to_string(),
+        "scope" => scope.to_string(),
+        "tenant_id" => tenant_id.to_string(),
+        "workspace_id" => workspace_id.to_string(),
+    )
+    .set(age_seconds);
+}
+
+/// Records automated orchestration repair completion latency.
+pub fn record_orch_repair_completion_latency(mode: &str, scope: &str, duration_secs: f64) {
+    histogram!(
+        names::ORCH_REPAIR_COMPLETION_LATENCY_SECONDS,
+        "domain" => "orchestration".to_string(),
+        "mode" => mode.to_string(),
+        "scope" => scope.to_string(),
+    )
+    .record(duration_secs);
+}
+
+/// Records that the same orchestration repair-needed backlog was seen again.
+pub fn record_orch_repair_repeat(tenant_id: &str, workspace_id: &str, mode: &str, scope: &str) {
+    counter!(
+        names::ORCH_REPAIR_REPEAT_FINDINGS_TOTAL,
+        "domain" => "orchestration".to_string(),
+        "mode" => mode.to_string(),
+        "scope" => scope.to_string(),
+        "tenant_id" => tenant_id.to_string(),
+        "workspace_id" => workspace_id.to_string(),
     )
     .increment(1);
 }

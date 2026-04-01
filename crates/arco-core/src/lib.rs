@@ -47,6 +47,8 @@ pub mod observability;
 pub mod orchestration_compaction;
 pub mod partition;
 pub mod publish;
+/// Shared repair backlog tracking helpers for automated repair loops.
+pub mod repair_backlog;
 pub mod scoped_storage;
 pub mod storage;
 pub mod storage_keys;

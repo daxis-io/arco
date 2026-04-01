@@ -114,9 +114,9 @@ groups:
     rules:
       - alert: ArcoControlPlaneRepairPending
         expr: |
-          sum(increase(arco_catalog_repair_pending_total[15m]))
+          (sum(increase(arco_catalog_repair_pending_total[15m])) or vector(0))
           +
-          sum(increase(arco_flow_orch_repair_pending_total[15m])) > 0
+          (sum(increase(arco_flow_orch_repair_pending_total[15m])) or vector(0)) > 0
         for: 5m
         labels:
           severity: warning
@@ -131,9 +131,9 @@ groups:
 
       - alert: ArcoControlPlaneRepairIssuesDetected
         expr: |
-          sum(increase(arco_catalog_reconciler_issues_total{repairable="true"}[15m]))
+          (sum(increase(arco_catalog_reconciler_issues_total{repairable="true"}[15m])) or vector(0))
           +
-          sum(increase(arco_flow_orch_reconciler_repair_issues_total[15m])) > 0
+          (sum(increase(arco_flow_orch_reconciler_repair_issues_total[15m])) or vector(0)) > 0
         for: 5m
         labels:
           severity: warning
@@ -147,9 +147,9 @@ groups:
 
       - alert: ArcoControlPlaneReconcilerRepairFailures
         expr: |
-          sum(increase(arco_catalog_reconciler_repairs_total{status="failed"}[15m]))
+          (sum(increase(arco_catalog_reconciler_repairs_total{status="failed"}[15m])) or vector(0))
           +
-          sum(increase(arco_flow_orch_reconciler_repairs_total{status="failed"}[15m])) > 0
+          (sum(increase(arco_flow_orch_reconciler_repairs_total{status="failed"}[15m])) or vector(0)) > 0
         for: 5m
         labels:
           severity: critical
@@ -160,6 +160,104 @@ groups:
             A current-head repair action failed in the last 15 minutes.
             Readers continue to use the pointer-target manifest, but legacy mirrors or commit
             records may remain missing until repair succeeds.
+          runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+
+      - alert: ArcoControlPlaneRepairAutomationFailures
+        expr: |
+          sum by (domain, mode, scope) (
+            increase(arco_catalog_repair_automation_runs_total{status=~"check_failed|repair_failed|recheck_failed"}[15m])
+          ) > 0
+          or
+          sum by (domain, mode, scope) (
+            increase(arco_flow_orch_repair_automation_runs_total{status=~"check_failed|repair_failed|recheck_failed"}[15m])
+          ) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: arco-control-plane
+        annotations:
+          summary: "Control-plane repair automation failed (domain={{ $labels.domain }}, mode={{ $labels.mode }}, scope={{ $labels.scope }})"
+          description: |
+            The automated control-plane repair executor reported a failed check, repair, or recheck
+            in the last 15 minutes for domain={{ $labels.domain }}, mode={{ $labels.mode }},
+            scope={{ $labels.scope }}. Manual dry-run and enforce repair may be required before the
+            backlog can drain.
+          runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+
+      - alert: ArcoControlPlaneRepairBacklogAgeHigh
+        expr: |
+          max by (domain, mode, scope) (arco_catalog_repair_backlog_age_seconds) > 900
+          or
+          max by (domain, mode, scope) (arco_flow_orch_repair_backlog_age_seconds) > 900
+        for: 10m
+        labels:
+          severity: warning
+          service: arco-control-plane
+        annotations:
+          summary: "Control-plane repair backlog age exceeded 15 minutes (domain={{ $labels.domain }}, mode={{ $labels.mode }}, scope={{ $labels.scope }})"
+          description: |
+            Repairable current-head work has remained in the automated repair backlog for more than
+            15 minutes for domain={{ $labels.domain }}, mode={{ $labels.mode }},
+            scope={{ $labels.scope }}. Readers stay pointer-first, but side-effect repair is not
+            converging fast enough.
+          runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+
+      - alert: ArcoControlPlaneRepairBacklogCountHigh
+        expr: |
+          sum by (domain, mode, scope) (arco_catalog_repair_backlog_count) > 0
+          or
+          sum by (domain, mode, scope) (arco_flow_orch_repair_backlog_count) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: arco-control-plane
+        annotations:
+          summary: "Control-plane repair backlog is non-zero (domain={{ $labels.domain }}, mode={{ $labels.mode }}, scope={{ $labels.scope }})"
+          description: |
+            Repairable current-head work has remained in the automated repair backlog for at least
+            15 minutes for domain={{ $labels.domain }}, mode={{ $labels.mode }},
+            scope={{ $labels.scope }}. Production cutover is not converged until the current-head
+            backlog returns to zero.
+          runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+
+      - alert: ArcoControlPlaneRepairCompletionLatencyHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(arco_catalog_repair_completion_latency_seconds_bucket[15m])) by (le, domain, mode, scope)
+          ) > 120
+          or
+          histogram_quantile(
+            0.95,
+            sum(rate(arco_flow_orch_repair_completion_latency_seconds_bucket[15m])) by (le, domain, mode, scope)
+          ) > 120
+        for: 15m
+        labels:
+          severity: warning
+          service: arco-control-plane
+        annotations:
+          summary: "Control-plane repair completion p95 exceeded 120 seconds (domain={{ $labels.domain }}, mode={{ $labels.mode }}, scope={{ $labels.scope }})"
+          description: |
+            Automated current-head repair is taking longer than two minutes at p95 over the last
+            15 minutes for domain={{ $labels.domain }}, mode={{ $labels.mode }},
+            scope={{ $labels.scope }}. Treat this as production SLO degradation until repair
+            latency returns to normal.
+          runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+
+      - alert: ArcoControlPlaneRepairPendingRateHigh
+        expr: |
+          (sum(increase(arco_catalog_repair_pending_total[1h])) or vector(0))
+          +
+          (sum(increase(arco_flow_orch_repair_pending_total[1h])) or vector(0)) > 3
+        for: 15m
+        labels:
+          severity: warning
+          service: arco-control-plane
+        annotations:
+          summary: "Control-plane repair_pending rate high"
+          description: |
+            More than three visible control-plane commits reported repair_pending in the last hour.
+            Investigate repeated repairable side effects before continuing or expanding production traffic.
           runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
 
       - alert: ArcoFlowStaleFenceRejects
@@ -176,20 +274,21 @@ groups:
             Reason: {{ $labels.reason }}. This indicates competing writers or lock epoch drift.
           runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
 
-      - alert: ArcoFlowLegacyEpochPayloadsObserved
+      - alert: ArcoFlowCompactorCompatibilityRegression
         expr: |
-          sum by (endpoint, status, request_mode) (
-            increase(arco_flow_orch_compactor_legacy_epoch_requests_total[15m])
+          sum by (endpoint, reason) (
+            increase(arco_flow_orch_compactor_request_contract_rejections_total[15m])
           ) > 0
         for: 5m
         labels:
-          severity: warning
+          severity: critical
           service: arco-flow
         annotations:
-          summary: "Legacy epoch compactor payloads observed (endpoint={{ $labels.endpoint }}, status={{ $labels.status }})"
+          summary: "Removed compactor compatibility path invoked (endpoint={{ $labels.endpoint }}, reason={{ $labels.reason }})"
           description: |
-            Legacy orchestration compactor payloads were observed in the last 15 minutes.
-            Endpoint: {{ $labels.endpoint }}, status: {{ $labels.status }}, request mode: {{ $labels.request_mode }}.
+            Orchestration compactor rejected a removed compatibility request shape in the last
+            15 minutes. Endpoint: {{ $labels.endpoint }}, reason: {{ $labels.reason }}.
+            This indicates a caller is still using PI-2 compatibility behavior and writes are failing.
           runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
 
   - name: arco.gc

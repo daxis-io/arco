@@ -19,7 +19,7 @@ tests:
         values: "0 0 0 0 0 0 0 0 0 0 0 0"
       - series: 'arco_flow_orch_compactor_stale_fencing_rejects_total{reason="stale_token"}'
         values: "0 0 0 0 0 1 2 3 4 5 6 7"
-      - series: 'arco_flow_orch_compactor_legacy_epoch_requests_total{endpoint="compact",status="accepted",request_mode="compatibility"}'
+      - series: 'arco_flow_orch_compactor_request_contract_rejections_total{endpoint="compact",reason="legacy_epoch_alias"}'
         values: "0 0 1 1 1 1 1 1 1 1 1 1"
     alert_rule_test:
       - eval_time: 9m
@@ -74,17 +74,119 @@ tests:
                 Reason: stale_token. This indicates competing writers or lock epoch drift.
               runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
       - eval_time: 9m
-        alertname: ArcoFlowLegacyEpochPayloadsObserved
+        alertname: ArcoFlowCompactorCompatibilityRegression
         exp_alerts:
           - exp_labels:
               endpoint: compact
-              request_mode: compatibility
-              severity: warning
+              reason: legacy_epoch_alias
+              severity: critical
               service: arco-flow
-              status: accepted
             exp_annotations:
-              summary: "Legacy epoch compactor payloads observed (endpoint=compact, status=accepted)"
+              summary: "Removed compactor compatibility path invoked (endpoint=compact, reason=legacy_epoch_alias)"
               description: |
-                Legacy orchestration compactor payloads were observed in the last 15 minutes.
-                Endpoint: compact, status: accepted, request mode: compatibility.
+                Orchestration compactor rejected a removed compatibility request shape in the last
+                15 minutes. Endpoint: compact, reason: legacy_epoch_alias.
+                This indicates a caller is still using PI-2 compatibility behavior and writes are failing.
+              runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+  - name: control_plane_pi3_repair_automation_alerts_fire
+    interval: 1m
+    input_series:
+      - series: 'arco_catalog_repair_automation_runs_total{domain="catalog",mode="enforce",scope="current_head_only",status="repair_failed"}'
+        values: "0 0 1 1 1 1 1 1 1 2 2 2 2 2 2 2 2 2 2 2"
+      - series: 'arco_catalog_repair_backlog_age_seconds{domain="catalog",mode="enforce",scope="current_head_only",tenant_id="acme",workspace_id="prod"}'
+        values: "0 0 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200"
+      - series: 'arco_flow_orch_repair_backlog_count{domain="orchestration",mode="enforce",scope="current_head_only",tenant_id="acme",workspace_id="prod"}'
+        values: "0 0 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2"
+      - series: 'arco_catalog_repair_completion_latency_seconds_bucket{domain="catalog",mode="enforce",scope="current_head_only",le="30"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
+      - series: 'arco_catalog_repair_completion_latency_seconds_bucket{domain="catalog",mode="enforce",scope="current_head_only",le="60"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
+      - series: 'arco_catalog_repair_completion_latency_seconds_bucket{domain="catalog",mode="enforce",scope="current_head_only",le="120"}'
+        values: "0 0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 34 36"
+      - series: 'arco_catalog_repair_completion_latency_seconds_bucket{domain="catalog",mode="enforce",scope="current_head_only",le="300"}'
+        values: "0 0 10 20 30 40 50 60 70 80 90 100 110 120 130 140 150 160 170 180"
+      - series: 'arco_catalog_repair_completion_latency_seconds_bucket{domain="catalog",mode="enforce",scope="current_head_only",le="+Inf"}'
+        values: "0 0 10 20 30 40 50 60 70 80 90 100 110 120 130 140 150 160 170 180"
+      - series: 'arco_flow_orch_repair_pending_total{reason="legacy_manifest_mirror"}'
+        values: "0 0 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4"
+    alert_rule_test:
+      - eval_time: 18m
+        alertname: ArcoControlPlaneRepairAutomationFailures
+        exp_alerts:
+          - exp_labels:
+              domain: catalog
+              mode: enforce
+              scope: current_head_only
+              severity: critical
+              service: arco-control-plane
+            exp_annotations:
+              summary: "Control-plane repair automation failed (domain=catalog, mode=enforce, scope=current_head_only)"
+              description: |
+                The automated control-plane repair executor reported a failed check, repair, or recheck
+                in the last 15 minutes for domain=catalog, mode=enforce,
+                scope=current_head_only. Manual dry-run and enforce repair may be required before the
+                backlog can drain.
+              runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+      - eval_time: 18m
+        alertname: ArcoControlPlaneRepairBacklogAgeHigh
+        exp_alerts:
+          - exp_labels:
+              domain: catalog
+              mode: enforce
+              scope: current_head_only
+              severity: warning
+              service: arco-control-plane
+            exp_annotations:
+              summary: "Control-plane repair backlog age exceeded 15 minutes (domain=catalog, mode=enforce, scope=current_head_only)"
+              description: |
+                Repairable current-head work has remained in the automated repair backlog for more than
+                15 minutes for domain=catalog, mode=enforce,
+                scope=current_head_only. Readers stay pointer-first, but side-effect repair is not
+                converging fast enough.
+              runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+      - eval_time: 18m
+        alertname: ArcoControlPlaneRepairBacklogCountHigh
+        exp_alerts:
+          - exp_labels:
+              domain: orchestration
+              mode: enforce
+              scope: current_head_only
+              severity: warning
+              service: arco-control-plane
+            exp_annotations:
+              summary: "Control-plane repair backlog is non-zero (domain=orchestration, mode=enforce, scope=current_head_only)"
+              description: |
+                Repairable current-head work has remained in the automated repair backlog for at least
+                15 minutes for domain=orchestration, mode=enforce,
+                scope=current_head_only. Production cutover is not converged until the current-head
+                backlog returns to zero.
+              runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+      - eval_time: 18m
+        alertname: ArcoControlPlaneRepairCompletionLatencyHigh
+        exp_alerts:
+          - exp_labels:
+              domain: catalog
+              mode: enforce
+              scope: current_head_only
+              severity: warning
+              service: arco-control-plane
+            exp_annotations:
+              summary: "Control-plane repair completion p95 exceeded 120 seconds (domain=catalog, mode=enforce, scope=current_head_only)"
+              description: |
+                Automated current-head repair is taking longer than two minutes at p95 over the last
+                15 minutes for domain=catalog, mode=enforce,
+                scope=current_head_only. Treat this as production SLO degradation until repair
+                latency returns to normal.
+              runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+      - eval_time: 18m
+        alertname: ArcoControlPlaneRepairPendingRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: arco-control-plane
+            exp_annotations:
+              summary: "Control-plane repair_pending rate high"
+              description: |
+                More than three visible control-plane commits reported repair_pending in the last hour.
+                Investigate repeated repairable side effects before continuing or expanding production traffic.
               runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"

@@ -87,6 +87,22 @@ pub struct OrchestrationRepairResult {
     pub deleted_bytes: u64,
 }
 
+/// Scope of orchestration repair actions to apply from a reconciliation report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationRepairScope {
+    /// Only repair current-head side effects for the visible pointer target.
+    CurrentHeadOnly,
+    /// Apply all repairable items, including generic cleanup work such as orphan deletion.
+    Full,
+}
+
+impl OrchestrationRepairScope {
+    const fn allows_generic_cleanup(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
 /// Policy controlling destructive orchestration reconciliation behavior.
 #[derive(Debug, Clone)]
 pub struct OrchestrationReconciliationPolicy {
@@ -239,6 +255,20 @@ impl OrchestrationReconciler {
         &self,
         report: &OrchestrationReconciliationReport,
     ) -> Result<OrchestrationRepairResult> {
+        self.repair_with_scope(report, OrchestrationRepairScope::Full)
+            .await
+    }
+
+    /// Repairs orchestration issues found in a reconciliation report using an explicit scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if storage reads or deletes fail.
+    pub async fn repair_with_scope(
+        &self,
+        report: &OrchestrationReconciliationReport,
+        scope: OrchestrationRepairScope,
+    ) -> Result<OrchestrationRepairResult> {
         let protected = self.current_references().await?;
         let report_ready_for_delete = self.report_ready_for_delete(report);
         let mut result = OrchestrationRepairResult::default();
@@ -283,6 +313,16 @@ impl OrchestrationReconciler {
         }
 
         for manifest_path in &report.orphan_manifest_snapshots {
+            if !scope.allows_generic_cleanup() {
+                result.skipped_paths += 1;
+                counter!(
+                    metric_names::ORCH_RECONCILER_REPAIRS_TOTAL,
+                    metric_labels::REASON => "manifest_snapshot".to_string(),
+                    metric_labels::STATUS => "skipped".to_string(),
+                )
+                .increment(1);
+                continue;
+            }
             if protected.manifest_paths.contains(manifest_path) {
                 result.skipped_paths += 1;
                 counter!(
@@ -320,6 +360,16 @@ impl OrchestrationReconciler {
         }
 
         for prefix in &report.orphan_base_dirs {
+            if !scope.allows_generic_cleanup() {
+                result.skipped_paths += 1;
+                counter!(
+                    metric_names::ORCH_RECONCILER_REPAIRS_TOTAL,
+                    metric_labels::REASON => "base_dir".to_string(),
+                    metric_labels::STATUS => "skipped".to_string(),
+                )
+                .increment(1);
+                continue;
+            }
             if protected.base_dirs.contains(prefix) {
                 result.skipped_paths += 1;
                 counter!(
@@ -359,6 +409,16 @@ impl OrchestrationReconciler {
         }
 
         for prefix in &report.orphan_l0_dirs {
+            if !scope.allows_generic_cleanup() {
+                result.skipped_paths += 1;
+                counter!(
+                    metric_names::ORCH_RECONCILER_REPAIRS_TOTAL,
+                    metric_labels::REASON => "l0_dir".to_string(),
+                    metric_labels::STATUS => "skipped".to_string(),
+                )
+                .increment(1);
+                continue;
+            }
             if protected.l0_dirs.contains(prefix) {
                 result.skipped_paths += 1;
                 counter!(
@@ -1173,6 +1233,40 @@ mod tests {
                 .await?
                 .iter()
                 .any(|meta| meta.path.as_str().ends_with(".parquet"))
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repair_with_current_head_only_scope_skips_aged_generic_cleanup_items() -> Result<()> {
+        let storage = create_storage().await?;
+        let (_current_manifest_path, _current_base_dir, _current_l0_dir) =
+            seed_current_manifest(&storage).await?;
+
+        let orphan_manifest_path = orchestration_manifest_snapshot_path("00000000000000000002");
+        storage
+            .put_raw(
+                &orphan_manifest_path,
+                Bytes::from_static(b"{}"),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+
+        let reconciler = OrchestrationReconciler::new(storage.clone());
+        let mut report = reconciler.check().await?;
+        report.checked_at -= Duration::hours(2);
+
+        let result = reconciler
+            .repair_with_scope(&report, OrchestrationRepairScope::CurrentHeadOnly)
+            .await?;
+
+        assert_eq!(result.deleted_objects, 0);
+        assert_eq!(result.deferred_paths, 0);
+        assert_eq!(result.skipped_paths, 1);
+        assert!(
+            storage.head_raw(&orphan_manifest_path).await?.is_some(),
+            "current-head-only repair must not delete aged generic cleanup candidates"
         );
 
         Ok(())

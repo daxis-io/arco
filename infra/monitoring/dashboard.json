@@ -1,7 +1,7 @@
 {
   "$schema": "https://grafana.com/schema/dashboard/v0",
   "title": "Arco Control Plane Operator",
-  "description": "Operational dashboard for orchestration runtime signals plus ADR-034 PI-1 repair, reconcile, stale-fence, and compatibility telemetry",
+  "description": "Operational dashboard for ADR-034 PI-3 production control-plane posture: repair SLOs, stale-fence rejects, and compatibility regression failures",
   "uid": "arco-orchestration-operator",
   "tags": ["arco", "orchestration", "operator"],
   "refresh": "30s",
@@ -155,16 +155,96 @@
       "description": "Lock-backed stale-fence rejections during orchestration compaction"
     },
     {
-      "title": "Legacy Epoch Payloads (15m increase)",
+      "title": "Compatibility Request Rejections (15m increase)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 48 },
       "targets": [
         {
-          "expr": "sum(increase(arco_flow_orch_compactor_legacy_epoch_requests_total[15m])) by (endpoint, status, request_mode)",
-          "legendFormat": "{{endpoint}} {{status}} {{request_mode}}"
+          "expr": "sum(increase(arco_flow_orch_compactor_request_contract_rejections_total[15m])) by (endpoint, reason)",
+          "legendFormat": "{{endpoint}} {{reason}}"
         }
       ],
-      "description": "Compatibility telemetry for legacy orchestration compactor payloads during PI-1 rollout"
+      "description": "Rejected requests that still depend on removed PI-2 compatibility paths"
+    },
+    {
+      "title": "Repair Automation Runs (15m increase)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
+      "targets": [
+        {
+          "expr": "sum(increase(arco_catalog_repair_automation_runs_total[15m])) by (domain, mode, scope, status)",
+          "legendFormat": "catalog {{domain}} {{mode}} {{scope}} {{status}}"
+        },
+        {
+          "expr": "sum(increase(arco_flow_orch_repair_automation_runs_total[15m])) by (domain, mode, scope, status)",
+          "legendFormat": "orch {{domain}} {{mode}} {{scope}} {{status}}"
+        }
+      ],
+      "description": "Automated repair executor activity and outcomes across production repair modes"
+    },
+    {
+      "title": "Repair Backlog Count",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 56 },
+      "targets": [
+        {
+          "expr": "sum(arco_catalog_repair_backlog_count) by (domain, mode, scope)",
+          "legendFormat": "catalog {{domain}} {{mode}} {{scope}}"
+        },
+        {
+          "expr": "sum(arco_flow_orch_repair_backlog_count) by (domain, mode, scope)",
+          "legendFormat": "orch {{domain}} {{mode}} {{scope}}"
+        }
+      ],
+      "description": "Current repair backlog size for catalog and orchestration current-head issues"
+    },
+    {
+      "title": "Repair Backlog Age (seconds)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 64 },
+      "targets": [
+        {
+          "expr": "max(arco_catalog_repair_backlog_age_seconds) by (domain, mode, scope)",
+          "legendFormat": "catalog {{domain}} {{mode}} {{scope}}"
+        },
+        {
+          "expr": "max(arco_flow_orch_repair_backlog_age_seconds) by (domain, mode, scope)",
+          "legendFormat": "orch {{domain}} {{mode}} {{scope}}"
+        }
+      ],
+      "description": "Age of the current repair backlog, used to enforce production repair SLOs"
+    },
+    {
+      "title": "Repair Repeat Findings (15m increase)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 64 },
+      "targets": [
+        {
+          "expr": "sum(increase(arco_catalog_repair_repeat_findings_total[15m])) by (domain, mode, scope)",
+          "legendFormat": "catalog {{domain}} {{mode}} {{scope}}"
+        },
+        {
+          "expr": "sum(increase(arco_flow_orch_repair_repeat_findings_total[15m])) by (domain, mode, scope)",
+          "legendFormat": "orch {{domain}} {{mode}} {{scope}}"
+        }
+      ],
+      "description": "Repeated repair-needed outcomes for the same tenant/workspace/domain backlog"
+    },
+    {
+      "title": "Repair Completion p95 (seconds)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 72 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(arco_catalog_repair_completion_latency_seconds_bucket[15m])) by (le, domain, mode, scope))",
+          "legendFormat": "catalog {{domain}} {{mode}} {{scope}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(arco_flow_orch_repair_completion_latency_seconds_bucket[15m])) by (le, domain, mode, scope))",
+          "legendFormat": "orch {{domain}} {{mode}} {{scope}}"
+        }
+      ],
+      "description": "Automated repair completion latency p95 for catalog and orchestration"
     }
   ]
 }

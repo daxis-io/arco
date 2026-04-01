@@ -2,6 +2,8 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::State;
@@ -12,87 +14,85 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use chrono::Utc;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
 use arco_core::observability::{LogFormat, init_logging};
 use arco_core::orchestration_compaction::{
     OrchestrationCompactRequest, OrchestrationCompactionResponse, OrchestrationRebuildRequest,
 };
+use arco_core::repair_backlog::RepairBacklogEntry;
 use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 use arco_core::{InternalOidcConfig, InternalOidcError, InternalOidcVerifier, ScopedStorage};
 use arco_flow::error::{Error, Result};
 use arco_flow::metrics::{
-    record_orch_compactor_legacy_epoch_request, record_orch_compactor_partial_fenced_request,
+    record_orch_compactor_contract_rejection, record_orch_repair_automation_findings,
+    record_orch_repair_automation_run, record_orch_repair_completion_latency,
+    record_orch_repair_repeat, set_orch_repair_backlog,
 };
 use arco_flow::orchestration::compactor::{
     CompactionResult, MicroCompactor, OrchestrationReconciler, OrchestrationReconciliationReport,
-    OrchestrationRepairResult,
+    OrchestrationRepairResult, OrchestrationRepairScope,
 };
 
 const REBUILD_MANIFEST_PREFIX: &str = "state/orchestration/rebuilds/";
-const ARCO_FLOW_COMPACTOR_REQUEST_MODE_ENV: &str = "ARCO_FLOW_COMPACTOR_REQUEST_MODE";
-const ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE_ENV: &str = "ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE";
+const ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_MODE_ENV: &str =
+    "ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_MODE";
+const ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS_ENV: &str =
+    "ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS";
+const ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_SCOPE_ENV: &str =
+    "ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_SCOPE";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum CompactionRequestMode {
+enum RepairAutomationMode {
     #[default]
-    Compatibility,
-    FencedOnly,
+    Disabled,
+    DryRun,
+    Enforce,
 }
 
-impl CompactionRequestMode {
+impl RepairAutomationMode {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Compatibility => "compatibility",
-            Self::FencedOnly => "fenced_only",
+            Self::Disabled => "disabled",
+            Self::DryRun => "dry_run",
+            Self::Enforce => "enforce",
         }
     }
 
     fn parse(raw: &str) -> Result<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "compatibility" => Ok(Self::Compatibility),
-            "fenced_only" => Ok(Self::FencedOnly),
+            "disabled" => Ok(Self::Disabled),
+            "dry_run" => Ok(Self::DryRun),
+            "enforce" => Ok(Self::Enforce),
             other => Err(Error::configuration(format!(
-                "invalid {ARCO_FLOW_COMPACTOR_REQUEST_MODE_ENV}: expected compatibility|fenced_only, got {other}"
+                "invalid {ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_MODE_ENV}: expected disabled|dry_run|enforce, got {other}"
             ))),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum LegacyEpochPayloadMode {
-    #[default]
-    Accept,
-    Reject,
+#[derive(Clone, Debug)]
+struct RepairAutomationConfig {
+    mode: RepairAutomationMode,
+    interval: Duration,
+    scope: OrchestrationRepairScope,
 }
 
-impl LegacyEpochPayloadMode {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Accept => "accept",
-            Self::Reject => "reject",
-        }
-    }
-
-    fn parse(raw: &str) -> Result<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "accept" => Ok(Self::Accept),
-            "reject" => Ok(Self::Reject),
-            other => Err(Error::configuration(format!(
-                "invalid {ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE_ENV}: expected accept|reject, got {other}"
-            ))),
+impl Default for RepairAutomationConfig {
+    fn default() -> Self {
+        Self {
+            mode: RepairAutomationMode::Enforce,
+            interval: Duration::from_secs(300),
+            scope: OrchestrationRepairScope::CurrentHeadOnly,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct RolloutConfig {
-    request_mode: CompactionRequestMode,
-    legacy_epoch_mode: LegacyEpochPayloadMode,
-}
-
-impl RolloutConfig {
+impl RepairAutomationConfig {
     fn from_env() -> Result<Self> {
         Self::from_env_reader(|key| std::env::var(key).ok())
     }
@@ -101,29 +101,43 @@ impl RolloutConfig {
     where
         F: FnMut(&str) -> Option<String>,
     {
-        let request_mode = read_env(ARCO_FLOW_COMPACTOR_REQUEST_MODE_ENV)
-            .as_deref()
-            .map(CompactionRequestMode::parse)
-            .transpose()?
-            .unwrap_or_default();
-        let legacy_epoch_mode = read_env(ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE_ENV)
-            .as_deref()
-            .map(LegacyEpochPayloadMode::parse)
-            .transpose()?
-            .unwrap_or_default();
+        let mut config = Self::default();
 
-        Ok(Self {
-            request_mode,
-            legacy_epoch_mode,
-        })
+        if let Some(raw) = read_env(ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_MODE_ENV) {
+            config.mode = RepairAutomationMode::parse(&raw)?;
+        }
+        if let Some(raw) = read_env(ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS_ENV) {
+            let secs = raw.parse::<u64>().map_err(|_| {
+                Error::configuration(format!(
+                    "invalid {ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS_ENV}: expected u64 seconds"
+                ))
+            })?;
+            config.interval = Duration::from_secs(secs.max(1));
+        }
+        if let Some(raw) = read_env(ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_SCOPE_ENV) {
+            config.scope = match raw.trim().to_ascii_lowercase().as_str() {
+                "current_head_only" => OrchestrationRepairScope::CurrentHeadOnly,
+                "full" => OrchestrationRepairScope::Full,
+                other => {
+                    return Err(Error::configuration(format!(
+                        "invalid {ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_SCOPE_ENV}: expected current_head_only|full, got {other}"
+                    )));
+                }
+            };
+        }
+
+        Ok(config)
     }
 }
+
+type RepairBacklogState = RepairBacklogEntry;
 
 #[derive(Clone)]
 struct AppState {
     compactor: MicroCompactor,
     storage: ScopedStorage,
-    rollout: RolloutConfig,
+    repair_automation: RepairAutomationConfig,
+    repair_backlog: Arc<Mutex<RepairBacklogState>>,
 }
 
 #[derive(Clone)]
@@ -137,10 +151,22 @@ struct ErrorResponse {
     error: String,
 }
 
+static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ReconcileRequest {
     #[serde(default)]
     repair: bool,
+    #[serde(default, alias = "repair_scope")]
+    repair_scope: Option<OrchestrationRepairScope>,
+}
+
+impl ReconcileRequest {
+    fn effective_repair_scope(&self) -> OrchestrationRepairScope {
+        self.repair_scope
+            .unwrap_or(OrchestrationRepairScope::CurrentHeadOnly)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -192,6 +218,39 @@ impl IntoResponse for ApiError {
     }
 }
 
+fn init_metrics() -> PrometheusHandle {
+    PROMETHEUS_HANDLE
+        .get_or_init(|| {
+            PrometheusBuilder::new()
+                .install_recorder()
+                .expect("install prometheus recorder for arco-flow-compactor")
+        })
+        .clone()
+}
+
+fn prometheus_handle() -> Option<PrometheusHandle> {
+    PROMETHEUS_HANDLE.get().cloned()
+}
+
+async fn metrics_handler() -> impl IntoResponse {
+    prometheus_handle().map_or_else(
+        || {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("content-type", "text/plain; charset=utf-8")],
+                "Metrics not initialized".to_string(),
+            )
+        },
+        |handle| {
+            (
+                StatusCode::OK,
+                [("content-type", "text/plain; charset=utf-8")],
+                handle.render(),
+            )
+        },
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompactorEndpoint {
     Compact,
@@ -206,176 +265,77 @@ impl CompactorEndpoint {
         }
     }
 
-    const fn fenced_only_message(self) -> &'static str {
+    const fn fenced_contract_message(self) -> &'static str {
         match self {
-            Self::Compact => {
-                "fenced-only mode requires compact requests to include fencing_token and lock_path"
-            }
-            Self::Rebuild => {
-                "fenced-only mode requires rebuild requests to include fencing_token and lock_path"
-            }
+            Self::Compact => "compact requests must include fencing_token and lock_path",
+            Self::Rebuild => "rebuild requests must include fencing_token and lock_path",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RequestExecutionMode {
-    CompatibilityFallback,
-    Fenced,
-}
-
-#[derive(Debug)]
-struct ParsedRequest<T> {
-    request: T,
-    used_legacy_epoch: bool,
-    supplied_canonical_fencing_token: bool,
-}
-
-fn parse_request<T>(raw: serde_json::Value) -> std::result::Result<ParsedRequest<T>, ApiError>
+fn parse_request<T>(
+    endpoint: CompactorEndpoint,
+    raw: serde_json::Value,
+) -> std::result::Result<T, ApiError>
 where
     T: DeserializeOwned,
 {
-    let supplied_canonical_fencing_token = raw.get("fencing_token").is_some();
-    let used_legacy_epoch = raw.get("epoch").is_some() && !supplied_canonical_fencing_token;
+    let request_id = request_id_from_raw(&raw).unwrap_or("");
+    let has_legacy_epoch = raw.get("epoch").is_some();
+    let has_fencing_token = raw.get("fencing_token").is_some();
+    let has_lock_path = raw.get("lock_path").is_some();
+
+    let rejection_reason = if has_legacy_epoch {
+        Some("legacy_epoch_alias")
+    } else {
+        match (has_fencing_token, has_lock_path) {
+            (false, false) => Some("missing_fencing_token_and_lock_path"),
+            (false, true) => Some("missing_fencing_token"),
+            (true, false) => Some("missing_lock_path"),
+            (true, true) => None,
+        }
+    };
+
+    if let Some(reason) = rejection_reason {
+        record_orch_compactor_contract_rejection(endpoint.as_str(), reason);
+        tracing::warn!(
+            endpoint = endpoint.as_str(),
+            request_id,
+            reason,
+            "rejecting removed orchestration compactor compatibility request shape"
+        );
+        let message = if reason == "legacy_epoch_alias" {
+            format!(
+                "{}; the legacy `epoch` alias is no longer accepted",
+                endpoint.fenced_contract_message()
+            )
+        } else {
+            endpoint.fenced_contract_message().to_string()
+        };
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message,
+        });
+    }
+
     let request = serde_json::from_value(raw).map_err(|error| ApiError {
         status: StatusCode::BAD_REQUEST,
         message: format!("invalid request body: {error}"),
     })?;
 
-    Ok(ParsedRequest {
-        request,
-        used_legacy_epoch,
-        supplied_canonical_fencing_token,
-    })
+    Ok(request)
 }
 
-fn log_compactor_request(
-    endpoint: CompactorEndpoint,
-    request_id: Option<&str>,
-    used_legacy_epoch: bool,
-    rollout: RolloutConfig,
-) {
+fn request_id_from_raw(raw: &serde_json::Value) -> Option<&str> {
+    raw.get("request_id").and_then(serde_json::Value::as_str)
+}
+
+fn log_compactor_request(endpoint: CompactorEndpoint, request_id: Option<&str>) {
     tracing::info!(
         endpoint = endpoint.as_str(),
         request_id = request_id.unwrap_or(""),
-        used_legacy_epoch,
-        request_mode = rollout.request_mode.as_str(),
-        legacy_epoch_mode = rollout.legacy_epoch_mode.as_str(),
         "received orchestration compactor request"
     );
-}
-
-fn resolve_request_execution(
-    endpoint: CompactorEndpoint,
-    rollout: RolloutConfig,
-    request_id: Option<&str>,
-    used_legacy_epoch: bool,
-    supplied_canonical_fencing_token: bool,
-    fencing_token: Option<u64>,
-    lock_path: Option<&str>,
-) -> std::result::Result<RequestExecutionMode, ApiError> {
-    if used_legacy_epoch && rollout.legacy_epoch_mode == LegacyEpochPayloadMode::Reject {
-        record_orch_compactor_legacy_epoch_request(
-            endpoint.as_str(),
-            "rejected",
-            rollout.request_mode.as_str(),
-        );
-        tracing::warn!(
-            endpoint = endpoint.as_str(),
-            request_id = request_id.unwrap_or(""),
-            request_mode = rollout.request_mode.as_str(),
-            "rejecting legacy epoch payload by rollout gate"
-        );
-        return Err(ApiError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!(
-                "legacy epoch payloads are disabled by {ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE_ENV}=reject"
-            ),
-        });
-    }
-
-    let missing_field = match (
-        supplied_canonical_fencing_token,
-        lock_path.is_some(),
-        used_legacy_epoch,
-    ) {
-        (true, false, _) => Some("lock_path"),
-        (false, true, false) => Some("fencing_token"),
-        _ => None,
-    };
-
-    if let Some(missing_field) = missing_field {
-        record_orch_compactor_partial_fenced_request(
-            endpoint.as_str(),
-            missing_field,
-            rollout.request_mode.as_str(),
-        );
-        tracing::warn!(
-            endpoint = endpoint.as_str(),
-            request_id = request_id.unwrap_or(""),
-            missing_field,
-            request_mode = rollout.request_mode.as_str(),
-            "rejecting partial canonical fenced request"
-        );
-        return Err(ApiError {
-            status: StatusCode::BAD_REQUEST,
-            message: format!(
-                "partial fenced request requires both fencing_token and lock_path; missing {missing_field}"
-            ),
-        });
-    }
-
-    if fencing_token.is_some() && lock_path.is_some() {
-        if used_legacy_epoch {
-            record_orch_compactor_legacy_epoch_request(
-                endpoint.as_str(),
-                "accepted",
-                rollout.request_mode.as_str(),
-            );
-        }
-        return Ok(RequestExecutionMode::Fenced);
-    }
-
-    if rollout.request_mode == CompactionRequestMode::FencedOnly {
-        if used_legacy_epoch {
-            record_orch_compactor_legacy_epoch_request(
-                endpoint.as_str(),
-                "rejected",
-                rollout.request_mode.as_str(),
-            );
-        }
-        tracing::warn!(
-            endpoint = endpoint.as_str(),
-            request_id = request_id.unwrap_or(""),
-            has_fencing_token = fencing_token.is_some(),
-            has_lock_path = lock_path.is_some(),
-            "rejecting request because fenced-only mode requires the full fenced contract"
-        );
-        return Err(ApiError {
-            status: StatusCode::BAD_REQUEST,
-            message: endpoint.fenced_only_message().to_string(),
-        });
-    }
-
-    if used_legacy_epoch {
-        record_orch_compactor_legacy_epoch_request(
-            endpoint.as_str(),
-            "accepted",
-            rollout.request_mode.as_str(),
-        );
-    }
-
-    if fencing_token.is_some() || lock_path.is_some() {
-        tracing::warn!(
-            endpoint = endpoint.as_str(),
-            request_id = request_id.unwrap_or(""),
-            has_fencing_token = fencing_token.is_some(),
-            has_lock_path = lock_path.is_some(),
-            "using orchestration compactor compatibility fallback without the full fenced contract"
-        );
-    }
-
-    Ok(RequestExecutionMode::CompatibilityFallback)
 }
 
 async fn health_handler() -> StatusCode {
@@ -386,26 +346,12 @@ async fn compact_handler(
     State(state): State<AppState>,
     Json(raw_request): Json<serde_json::Value>,
 ) -> std::result::Result<Json<OrchestrationCompactionResponse>, ApiError> {
-    let ParsedRequest {
-        request,
-        used_legacy_epoch,
-        supplied_canonical_fencing_token,
-    } = parse_request::<OrchestrationCompactRequest>(raw_request)?;
     log_compactor_request(
         CompactorEndpoint::Compact,
-        request.request_id.as_deref(),
-        used_legacy_epoch,
-        state.rollout,
+        request_id_from_raw(&raw_request),
     );
-    let execution = resolve_request_execution(
-        CompactorEndpoint::Compact,
-        state.rollout,
-        request.request_id.as_deref(),
-        used_legacy_epoch,
-        supplied_canonical_fencing_token,
-        request.fencing_token,
-        request.lock_path.as_deref(),
-    )?;
+    let request =
+        parse_request::<OrchestrationCompactRequest>(CompactorEndpoint::Compact, raw_request)?;
 
     let CompactionResult {
         events_processed,
@@ -413,27 +359,14 @@ async fn compact_handler(
         manifest_revision,
         visibility_status,
         repair_pending,
-    } = match execution {
-        RequestExecutionMode::Fenced => {
-            let fencing_token = request
-                .fencing_token
-                .expect("fenced execution requires fencing_token");
-            let lock_path = request
-                .lock_path
-                .as_deref()
-                .expect("fenced execution requires lock_path");
-            state
-                .compactor
-                .compact_events_fenced(request.event_paths, fencing_token, lock_path)
-                .await?
-        }
-        RequestExecutionMode::CompatibilityFallback => {
-            state
-                .compactor
-                .compact_events_with_epoch(request.event_paths, request.fencing_token)
-                .await?
-        }
-    };
+    } = state
+        .compactor
+        .compact_events_fenced(
+            request.event_paths,
+            request.fencing_token,
+            &request.lock_path,
+        )
+        .await?;
 
     Ok(Json(OrchestrationCompactionResponse {
         events_processed,
@@ -448,17 +381,12 @@ async fn rebuild_handler(
     State(state): State<AppState>,
     Json(raw_request): Json<serde_json::Value>,
 ) -> std::result::Result<Json<OrchestrationCompactionResponse>, ApiError> {
-    let ParsedRequest {
-        request,
-        used_legacy_epoch,
-        supplied_canonical_fencing_token,
-    } = parse_request::<OrchestrationRebuildRequest>(raw_request)?;
     log_compactor_request(
         CompactorEndpoint::Rebuild,
-        request.request_id.as_deref(),
-        used_legacy_epoch,
-        state.rollout,
+        request_id_from_raw(&raw_request),
     );
+    let request =
+        parse_request::<OrchestrationRebuildRequest>(CompactorEndpoint::Rebuild, raw_request)?;
     if !is_valid_rebuild_manifest_path(&request.rebuild_manifest_path) {
         return Err(ApiError {
             status: StatusCode::BAD_REQUEST,
@@ -467,15 +395,6 @@ async fn rebuild_handler(
             ),
         });
     }
-    let execution = resolve_request_execution(
-        CompactorEndpoint::Rebuild,
-        state.rollout,
-        request.request_id.as_deref(),
-        used_legacy_epoch,
-        supplied_canonical_fencing_token,
-        request.fencing_token,
-        request.lock_path.as_deref(),
-    )?;
 
     let CompactionResult {
         events_processed,
@@ -483,34 +402,14 @@ async fn rebuild_handler(
         manifest_revision,
         visibility_status,
         repair_pending,
-    } = match execution {
-        RequestExecutionMode::Fenced => {
-            let fencing_token = request
-                .fencing_token
-                .expect("fenced execution requires fencing_token");
-            let lock_path = request
-                .lock_path
-                .as_deref()
-                .expect("fenced execution requires lock_path");
-            state
-                .compactor
-                .rebuild_from_ledger_manifest_path_fenced(
-                    &request.rebuild_manifest_path,
-                    fencing_token,
-                    lock_path,
-                )
-                .await?
-        }
-        RequestExecutionMode::CompatibilityFallback => {
-            state
-                .compactor
-                .rebuild_from_ledger_manifest_path(
-                    &request.rebuild_manifest_path,
-                    request.fencing_token,
-                )
-                .await?
-        }
-    };
+    } = state
+        .compactor
+        .rebuild_from_ledger_manifest_path_fenced(
+            &request.rebuild_manifest_path,
+            request.fencing_token,
+            &request.lock_path,
+        )
+        .await?;
 
     Ok(Json(OrchestrationCompactionResponse {
         events_processed,
@@ -528,7 +427,11 @@ async fn reconcile_handler(
     let reconciler = OrchestrationReconciler::new(state.storage.clone());
     let report = reconciler.check().await?;
     let repair_result = if request.repair {
-        Some(reconciler.repair(&report).await?)
+        Some(
+            reconciler
+                .repair_with_scope(&report, request.effective_repair_scope())
+                .await?,
+        )
     } else {
         None
     };
@@ -537,6 +440,196 @@ async fn reconcile_handler(
         report,
         repair_result,
     }))
+}
+
+const fn repair_scope_as_str(scope: OrchestrationRepairScope) -> &'static str {
+    match scope {
+        OrchestrationRepairScope::CurrentHeadOnly => "current_head_only",
+        OrchestrationRepairScope::Full => "full",
+    }
+}
+
+fn repairable_issue_count(
+    report: &OrchestrationReconciliationReport,
+    scope: OrchestrationRepairScope,
+) -> u64 {
+    let current_head = u64::from(report.current_head_legacy_manifest_issue.is_some());
+    match scope {
+        OrchestrationRepairScope::CurrentHeadOnly => current_head,
+        OrchestrationRepairScope::Full => {
+            current_head
+                + u64::try_from(report.orphan_manifest_snapshots.len()).unwrap_or(u64::MAX)
+                + u64::try_from(report.orphan_base_dirs.len()).unwrap_or(u64::MAX)
+                + u64::try_from(report.orphan_l0_dirs.len()).unwrap_or(u64::MAX)
+        }
+    }
+}
+
+fn repair_backlog_fingerprint(
+    report: &OrchestrationReconciliationReport,
+    scope: OrchestrationRepairScope,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(issue) = report.current_head_legacy_manifest_issue {
+        parts.push(format!("current_head:{issue:?}"));
+    }
+    if scope == OrchestrationRepairScope::Full {
+        parts.extend(
+            report
+                .orphan_manifest_snapshots
+                .iter()
+                .map(|path| format!("manifest:{path}")),
+        );
+        parts.extend(
+            report
+                .orphan_base_dirs
+                .iter()
+                .map(|path| format!("base:{path}")),
+        );
+        parts.extend(
+            report
+                .orphan_l0_dirs
+                .iter()
+                .map(|path| format!("l0:{path}")),
+        );
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        parts.sort();
+        Some(parts.join("|"))
+    }
+}
+
+async fn update_repair_backlog_metrics(
+    state: &AppState,
+    report: &OrchestrationReconciliationReport,
+) {
+    let findings = repairable_issue_count(report, state.repair_automation.scope);
+    let fingerprint = repair_backlog_fingerprint(report, state.repair_automation.scope);
+    let mode = state.repair_automation.mode.as_str();
+    let scope = repair_scope_as_str(state.repair_automation.scope);
+
+    let snapshot = {
+        let mut backlog = state.repair_backlog.lock().await;
+        backlog.update(findings, fingerprint, Utc::now())
+    };
+    if snapshot.repeated_finding {
+        record_orch_repair_repeat(
+            state.storage.tenant_id(),
+            state.storage.workspace_id(),
+            mode,
+            scope,
+        );
+    }
+
+    set_orch_repair_backlog(
+        state.storage.tenant_id(),
+        state.storage.workspace_id(),
+        mode,
+        scope,
+        snapshot.count,
+        snapshot.age_seconds,
+    );
+}
+
+async fn run_repair_automation_once(state: &AppState) {
+    if state.repair_automation.mode == RepairAutomationMode::Disabled {
+        return;
+    }
+
+    let mode = state.repair_automation.mode.as_str();
+    let scope = repair_scope_as_str(state.repair_automation.scope);
+    let start = Instant::now();
+    let reconciler = OrchestrationReconciler::new(state.storage.clone());
+
+    let report = match reconciler.check().await {
+        Ok(report) => report,
+        Err(error) => {
+            record_orch_repair_automation_run(mode, scope, "check_failed");
+            tracing::error!(error = %error, "orchestration repair automation check failed");
+            return;
+        }
+    };
+
+    let findings = repairable_issue_count(&report, state.repair_automation.scope);
+    record_orch_repair_automation_findings(mode, scope, findings);
+
+    let status = match state.repair_automation.mode {
+        RepairAutomationMode::DryRun => {
+            update_repair_backlog_metrics(state, &report).await;
+            if findings > 0 {
+                "repair_needed"
+            } else {
+                "clean"
+            }
+        }
+        RepairAutomationMode::Enforce => {
+            if findings == 0 {
+                update_repair_backlog_metrics(state, &report).await;
+                "clean"
+            } else {
+                match reconciler
+                    .repair_with_scope(&report, state.repair_automation.scope)
+                    .await
+                {
+                    Ok(_) => match reconciler.check().await {
+                        Ok(post_report) => {
+                            let remaining =
+                                repairable_issue_count(&post_report, state.repair_automation.scope);
+                            update_repair_backlog_metrics(state, &post_report).await;
+                            if remaining > 0 {
+                                "repair_needed"
+                            } else {
+                                "repaired"
+                            }
+                        }
+                        Err(error) => {
+                            record_orch_repair_automation_run(mode, scope, "recheck_failed");
+                            tracing::error!(
+                                error = %error,
+                                "orchestration repair automation recheck failed"
+                            );
+                            return;
+                        }
+                    },
+                    Err(error) => {
+                        update_repair_backlog_metrics(state, &report).await;
+                        tracing::error!(
+                            error = %error,
+                            "orchestration repair automation enforcement failed"
+                        );
+                        "repair_failed"
+                    }
+                }
+            }
+        }
+        RepairAutomationMode::Disabled => return,
+    };
+
+    record_orch_repair_completion_latency(mode, scope, start.elapsed().as_secs_f64());
+    record_orch_repair_automation_run(mode, scope, status);
+}
+
+async fn run_repair_automation_loop(state: AppState) {
+    if state.repair_automation.mode == RepairAutomationMode::Disabled {
+        return;
+    }
+
+    tracing::info!(
+        mode = state.repair_automation.mode.as_str(),
+        scope = repair_scope_as_str(state.repair_automation.scope),
+        interval_secs = state.repair_automation.interval.as_secs(),
+        "orchestration repair automation enabled"
+    );
+
+    let mut interval_timer = tokio::time::interval(state.repair_automation.interval);
+    interval_timer.tick().await;
+
+    loop {
+        interval_timer.tick().await;
+        run_repair_automation_once(&state).await;
+    }
 }
 
 fn required_env(key: &str) -> Result<String> {
@@ -686,6 +779,7 @@ fn build_router(state: AppState, internal_auth: Option<Arc<InternalAuthState>>) 
 
     Router::new()
         .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler))
         .route("/compact", compact_route)
         .route("/rebuild", rebuild_route)
         .route("/internal/reconcile", reconcile_route)
@@ -696,13 +790,19 @@ fn build_router(state: AppState, internal_auth: Option<Arc<InternalAuthState>>) 
 mod tests {
     use std::collections::BTreeSet;
     use std::io;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
     use super::*;
     use arco_core::Error as CoreError;
+    use arco_core::WritePrecondition;
     use arco_core::storage::MemoryBackend;
+    use arco_flow::orchestration::compactor::manifest::{
+        OrchestrationManifest, OrchestrationManifestPointer,
+    };
+    use axum::body::to_bytes;
     use axum::http::Request;
-    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+    use bytes::Bytes;
+    use chrono::{Duration, Utc};
     use tower::util::ServiceExt;
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -746,27 +846,17 @@ mod tests {
     }
 
     fn init_metrics() -> PrometheusHandle {
-        static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
-        PROMETHEUS_HANDLE
-            .get_or_init(|| {
-                PrometheusBuilder::new()
-                    .install_recorder()
-                    .expect("install prometheus recorder for compactor tests")
-            })
-            .clone()
+        super::init_metrics()
     }
 
     fn test_state() -> AppState {
-        test_state_with_rollout(RolloutConfig::default())
-    }
-
-    fn test_state_with_rollout(rollout: RolloutConfig) -> AppState {
         let backend = Arc::new(MemoryBackend::new());
         let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
         AppState {
             compactor: MicroCompactor::new(storage.clone()),
             storage,
-            rollout,
+            repair_automation: RepairAutomationConfig::default(),
+            repair_backlog: Arc::new(tokio::sync::Mutex::new(RepairBacklogState::default())),
         }
     }
 
@@ -788,45 +878,115 @@ mod tests {
         })
     }
 
-    #[test]
-    fn compact_request_allows_missing_epoch() {
-        let raw = r#"{"event_paths":["ledger/orchestration/2025-01-15/evt_01.json"]}"#;
-        let parsed: OrchestrationCompactRequest = serde_json::from_str(raw).expect("valid request");
-        assert_eq!(parsed.fencing_token, None);
+    async fn seed_orphaned_orchestration_manifest(state: &AppState) -> String {
+        let current_manifest_path = "state/orchestration/manifests/00000000000000000001.json";
+        let mut current_manifest = OrchestrationManifest::new("rev-current");
+        current_manifest.manifest_id = "00000000000000000001".to_string();
+        current_manifest.published_at = Utc::now() - Duration::minutes(30);
+
+        state
+            .storage
+            .put_raw(
+                current_manifest_path,
+                Bytes::from(
+                    serde_json::to_vec(&current_manifest).expect("serialize current manifest"),
+                ),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write current manifest");
+        state
+            .storage
+            .put_raw(
+                "state/orchestration/manifest.pointer.json",
+                Bytes::from(
+                    serde_json::to_vec(&OrchestrationManifestPointer {
+                        manifest_id: "00000000000000000001".to_string(),
+                        manifest_path: current_manifest_path.to_string(),
+                        epoch: 1,
+                        parent_pointer_hash: None,
+                        updated_at: Utc::now() - Duration::minutes(30),
+                    })
+                    .expect("serialize pointer"),
+                ),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write pointer");
+        state
+            .storage
+            .put_raw(
+                arco_core::FlowPaths::orchestration_manifest_path(),
+                Bytes::from(
+                    serde_json::to_vec(&current_manifest).expect("serialize legacy manifest"),
+                ),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write legacy manifest");
+
+        let orphan_manifest_path = "state/orchestration/manifests/00000000000000000002.json";
+        state
+            .storage
+            .put_raw(
+                orphan_manifest_path,
+                Bytes::from_static(b"{}"),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write orphan manifest");
+
+        orphan_manifest_path.to_string()
     }
 
     #[test]
-    fn compact_request_accepts_epoch_payload() {
+    fn compact_request_requires_fencing_token() {
+        let raw = r#"{"event_paths":["ledger/orchestration/2025-01-15/evt_01.json"]}"#;
+        let error =
+            serde_json::from_str::<OrchestrationCompactRequest>(raw).expect_err("must reject");
+        assert!(
+            error.to_string().contains("fencing_token") || error.to_string().contains("lock_path"),
+            "expected missing fenced field error, got {error}"
+        );
+    }
+
+    #[test]
+    fn compact_request_rejects_epoch_payload() {
         let raw = r#"{
             "event_paths":["ledger/orchestration/2025-01-15/evt_01.json"],
             "epoch":7
         }"#;
-        let parsed: OrchestrationCompactRequest =
-            serde_json::from_str(raw).expect("valid epoch request");
-        assert_eq!(parsed.fencing_token, Some(7));
-    }
-
-    #[test]
-    fn rebuild_request_requires_manifest_path() {
-        let raw = r#"{"rebuild_manifest_path":"state/orchestration/rebuilds/rebuild-01.json"}"#;
-        let parsed: OrchestrationRebuildRequest =
-            serde_json::from_str(raw).expect("valid rebuild request");
-        assert_eq!(
-            parsed.rebuild_manifest_path,
-            "state/orchestration/rebuilds/rebuild-01.json"
+        let error =
+            serde_json::from_str::<OrchestrationCompactRequest>(raw).expect_err("must reject");
+        assert!(
+            error.to_string().contains("epoch"),
+            "expected legacy alias error, got {error}"
         );
-        assert_eq!(parsed.fencing_token, None);
     }
 
     #[test]
-    fn rebuild_request_accepts_epoch_payload() {
+    fn rebuild_request_requires_fencing_token() {
+        let raw = r#"{"rebuild_manifest_path":"state/orchestration/rebuilds/rebuild-01.json"}"#;
+        let error =
+            serde_json::from_str::<OrchestrationRebuildRequest>(raw).expect_err("must reject");
+        assert!(
+            error.to_string().contains("fencing_token") || error.to_string().contains("lock_path"),
+            "expected missing fenced field error, got {error}"
+        );
+    }
+
+    #[test]
+    fn rebuild_request_rejects_epoch_payload() {
         let raw = r#"{
             "rebuild_manifest_path":"state/orchestration/rebuilds/rebuild-01.json",
             "epoch":9
         }"#;
-        let parsed: OrchestrationRebuildRequest =
-            serde_json::from_str(raw).expect("valid epoch request");
-        assert_eq!(parsed.fencing_token, Some(9));
+        let error =
+            serde_json::from_str::<OrchestrationRebuildRequest>(raw).expect_err("must reject");
+        assert!(
+            error.to_string().contains("epoch"),
+            "expected legacy alias error, got {error}"
+        );
     }
 
     #[test]
@@ -851,24 +1011,28 @@ mod tests {
     }
 
     #[test]
-    fn rollout_config_defaults_preserve_pi1_compatibility() {
-        let config = RolloutConfig::default();
+    fn repair_automation_config_defaults_to_enforce_current_head_only() {
+        let config =
+            RepairAutomationConfig::from_env_reader(|_| None).expect("default repair config");
 
-        assert_eq!(config.request_mode, CompactionRequestMode::Compatibility);
-        assert_eq!(config.legacy_epoch_mode, LegacyEpochPayloadMode::Accept);
+        assert_eq!(config.mode, RepairAutomationMode::Enforce);
+        assert_eq!(config.interval, std::time::Duration::from_secs(300));
+        assert_eq!(config.scope, OrchestrationRepairScope::CurrentHeadOnly);
     }
 
     #[test]
-    fn rollout_config_parses_fenced_only_and_legacy_epoch_reject() {
-        let config = RolloutConfig::from_env_reader(|key| match key {
-            "ARCO_FLOW_COMPACTOR_REQUEST_MODE" => Some("fenced_only".to_string()),
-            "ARCO_FLOW_COMPACTOR_LEGACY_EPOCH_MODE" => Some("reject".to_string()),
+    fn repair_automation_config_parses_enforce_full_scope() {
+        let config = RepairAutomationConfig::from_env_reader(|key| match key {
+            "ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_MODE" => Some("enforce".to_string()),
+            "ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS" => Some("42".to_string()),
+            "ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_SCOPE" => Some("full".to_string()),
             _ => None,
         })
-        .expect("parse rollout config");
+        .expect("parse repair automation config");
 
-        assert_eq!(config.request_mode, CompactionRequestMode::FencedOnly);
-        assert_eq!(config.legacy_epoch_mode, LegacyEpochPayloadMode::Reject);
+        assert_eq!(config.mode, RepairAutomationMode::Enforce);
+        assert_eq!(config.interval, std::time::Duration::from_secs(42));
+        assert_eq!(config.scope, OrchestrationRepairScope::Full);
     }
 
     #[test]
@@ -898,6 +1062,10 @@ mod tests {
     fn reconcile_request_defaults_to_check_mode() {
         let request: ReconcileRequest = serde_json::from_str("{}").expect("default reconcile");
         assert!(!request.repair);
+        assert_eq!(
+            request.effective_repair_scope(),
+            OrchestrationRepairScope::CurrentHeadOnly
+        );
     }
 
     #[tokio::test]
@@ -918,6 +1086,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_endpoint_serves_prometheus_text() {
+        init_metrics();
+        arco_flow::metrics::register_metrics();
+        record_orch_compactor_contract_rejection("compact", "legacy_epoch_alias");
+        let router = build_router(test_state(), None);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read metrics body");
+        let rendered = String::from_utf8(body.to_vec()).expect("metrics utf8");
+        assert!(
+            rendered.contains("arco_flow_orch_compactor_request_contract_rejections_total"),
+            "expected prometheus output, got {rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "arco_flow_orch_compactor_request_contract_rejections_total{endpoint=\"compact\",reason=\"legacy_epoch_alias\"}"
+            ),
+            "expected emitted sample in metrics output, got {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_endpoint_defaults_to_current_head_only_scope() {
+        let state = test_state();
+        let orphan_manifest_path = seed_orphaned_orchestration_manifest(&state).await;
+        let router = build_router(state.clone(), None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"repair":true}"#.to_string()))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state
+                .storage
+                .head_raw(&orphan_manifest_path)
+                .await
+                .expect("head orphan manifest")
+                .is_some(),
+            "default orchestration reconcile repair scope must not delete generic cleanup candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_endpoint_accepts_camel_case_full_scope() {
+        let state = test_state();
+        let orphan_manifest_path = seed_orphaned_orchestration_manifest(&state).await;
+        let router = build_router(state.clone(), None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"repair":true,"repairScope":"full"}"#.to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read reconcile body");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("deserialize reconcile body");
+        assert_eq!(payload["repair_result"]["deferred_paths"], 1);
+        assert_eq!(payload["repair_result"]["skipped_paths"], 0);
+        assert!(
+            state
+                .storage
+                .head_raw(&orphan_manifest_path)
+                .await
+                .expect("head orphan manifest")
+                .is_some(),
+            "fresh full-scope reports should still defer generic cleanup until the delete quarantine expires"
+        );
+    }
+
+    #[tokio::test]
     async fn reconcile_endpoint_requires_auth_when_internal_auth_enforced() {
         let router = build_router(test_state(), Some(test_internal_auth_state()));
         let response = router
@@ -935,15 +1202,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fenced_only_mode_rejects_legacy_epoch_payload_and_records_metric() {
+    async fn default_request_contract_rejects_compact_requests_without_fencing() {
+        let router = build_router(test_state(), None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/compact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"event_paths":[]}"#.to_string()))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn default_request_contract_rejects_legacy_epoch_payload_and_records_metric() {
         let handle = init_metrics();
-        let router = build_router(
-            test_state_with_rollout(RolloutConfig {
-                request_mode: CompactionRequestMode::FencedOnly,
-                legacy_epoch_mode: LegacyEpochPayloadMode::Accept,
-            }),
-            None,
-        );
+        let router = build_router(test_state(), None);
 
         let response = router
             .oneshot(
@@ -964,15 +1244,13 @@ mod tests {
 
         let rendered = handle.render();
         assert!(
-            rendered.contains(
-                "arco_flow_orch_compactor_legacy_epoch_requests_total{endpoint=\"compact\",status=\"rejected\",request_mode=\"fenced_only\"}"
-            ),
-            "expected legacy epoch metric in rendered output, got {rendered}"
+            rendered.contains("reason=\"legacy_epoch_alias\""),
+            "expected compatibility rejection metric in rendered output, got {rendered}"
         );
     }
 
     #[tokio::test]
-    async fn compatibility_mode_rejects_lock_path_without_fencing_token_and_records_metric() {
+    async fn request_contract_rejects_lock_path_without_fencing_token_and_records_metric() {
         let handle = init_metrics();
         let router = build_router(test_state(), None);
 
@@ -996,14 +1274,14 @@ mod tests {
         let rendered = handle.render();
         assert!(
             rendered.contains(
-                "arco_flow_orch_compactor_partial_fenced_requests_total{endpoint=\"compact\",missing_field=\"fencing_token\",request_mode=\"compatibility\"}"
+                "arco_flow_orch_compactor_request_contract_rejections_total{endpoint=\"compact\",reason=\"missing_fencing_token\"}"
             ),
-            "expected partial fenced request metric in rendered output, got {rendered}"
+            "expected compatibility rejection metric in rendered output, got {rendered}"
         );
     }
 
     #[tokio::test]
-    async fn compatibility_mode_rejects_fencing_token_without_lock_path_and_records_metric() {
+    async fn request_contract_rejects_fencing_token_without_lock_path_and_records_metric() {
         let handle = init_metrics();
         let router = build_router(test_state(), None);
 
@@ -1027,21 +1305,15 @@ mod tests {
         let rendered = handle.render();
         assert!(
             rendered.contains(
-                "arco_flow_orch_compactor_partial_fenced_requests_total{endpoint=\"rebuild\",missing_field=\"lock_path\",request_mode=\"compatibility\"}"
+                "arco_flow_orch_compactor_request_contract_rejections_total{endpoint=\"rebuild\",reason=\"missing_lock_path\"}"
             ),
-            "expected partial fenced request metric in rendered output, got {rendered}"
+            "expected compatibility rejection metric in rendered output, got {rendered}"
         );
     }
 
     #[tokio::test]
-    async fn legacy_epoch_reject_mode_rejects_rebuild_payload() {
-        let router = build_router(
-            test_state_with_rollout(RolloutConfig {
-                request_mode: CompactionRequestMode::Compatibility,
-                legacy_epoch_mode: LegacyEpochPayloadMode::Reject,
-            }),
-            None,
-        );
+    async fn default_request_contract_rejects_rebuild_epoch_payload() {
+        let router = build_router(test_state(), None);
 
         let response = router
             .oneshot(
@@ -1062,14 +1334,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn compact_handler_logs_request_id_for_legacy_epoch_payload() {
-        let router = build_router(
-            test_state_with_rollout(RolloutConfig {
-                request_mode: CompactionRequestMode::FencedOnly,
-                legacy_epoch_mode: LegacyEpochPayloadMode::Accept,
-            }),
-            None,
-        );
+    async fn log_compactor_request_includes_request_id() {
         let logs = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -1079,21 +1344,7 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/compact")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"event_paths":[],"epoch":7,"request_id":"req-flow-trace"}"#.to_string(),
-                    ))
-                    .expect("request build failed"),
-            )
-            .await
-            .expect("request failed");
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        log_compactor_request(CompactorEndpoint::Compact, Some("req-flow-trace"));
 
         let rendered =
             String::from_utf8(logs.lock().expect("logs lock").clone()).expect("utf8 logs");
@@ -1114,25 +1365,32 @@ async fn main() -> Result<()> {
     let port = resolve_port()?;
     let tenant_secret = load_tenant_secret()?;
     let internal_auth = build_internal_auth()?;
-    let rollout = RolloutConfig::from_env()?;
+    let repair_automation = RepairAutomationConfig::from_env()?;
+    init_metrics();
+    arco_flow::metrics::register_metrics();
 
     let backend = ObjectStoreBackend::from_bucket(&bucket)?;
     let backend: Arc<dyn StorageBackend> = Arc::new(backend);
     let storage = ScopedStorage::new(backend, tenant_id, workspace_id)?;
 
     tracing::info!(
-        request_mode = rollout.request_mode.as_str(),
-        legacy_epoch_mode = rollout.legacy_epoch_mode.as_str(),
-        "loaded orchestration compactor rollout config"
+        request_contract = "fenced_only",
+        repair_automation_mode = repair_automation.mode.as_str(),
+        repair_automation_scope = repair_scope_as_str(repair_automation.scope),
+        "loaded orchestration compactor production config"
     );
 
     let state = AppState {
         compactor: MicroCompactor::with_tenant_secret(storage.clone(), tenant_secret),
         storage,
-        rollout,
+        repair_automation: repair_automation.clone(),
+        repair_backlog: Arc::new(Mutex::new(RepairBacklogState::default())),
     };
 
-    let app = build_router(state, internal_auth);
+    let app = build_router(state.clone(), internal_auth);
+    if repair_automation.mode != RepairAutomationMode::Disabled {
+        tokio::spawn(run_repair_automation_loop(state.clone()));
+    }
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr)

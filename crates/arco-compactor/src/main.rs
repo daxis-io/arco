@@ -36,10 +36,11 @@ mod metrics;
 pub mod notification_consumer;
 pub mod sync_compact;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use axum::body::Body;
@@ -54,7 +55,9 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use arco_catalog::reconciler::IssueType;
 use arco_catalog::{Compactor, Reconciler, ReconciliationReport, RepairResult, RepairScope};
+use arco_core::repair_backlog::RepairBacklogEntry;
 use arco_core::scoped_storage::ScopedStorage;
 use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 use arco_core::{CatalogDomain, InternalOidcConfig, InternalOidcError, InternalOidcVerifier};
@@ -74,6 +77,123 @@ const AUTO_ANTI_ENTROPY_DOMAINS: [CatalogDomain; 3] = [
     CatalogDomain::Executions,
 ];
 const COMPACTION_LAG_UPDATE_SECS: u64 = 30;
+const ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE_ENV: &str = "ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE";
+const ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS_ENV: &str =
+    "ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS";
+const ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE_ENV: &str = "ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE";
+const ARCO_COMPACTOR_REPAIR_AUTOMATION_DOMAINS_ENV: &str =
+    "ARCO_COMPACTOR_REPAIR_AUTOMATION_DOMAINS";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RepairAutomationMode {
+    #[default]
+    Disabled,
+    DryRun,
+    Enforce,
+}
+
+impl RepairAutomationMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::DryRun => "dry_run",
+            Self::Enforce => "enforce",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "disabled" => Ok(Self::Disabled),
+            "dry_run" => Ok(Self::DryRun),
+            "enforce" => Ok(Self::Enforce),
+            other => Err(anyhow!(
+                "invalid {ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE_ENV}: expected disabled|dry_run|enforce, got {other}"
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RepairAutomationConfig {
+    mode: RepairAutomationMode,
+    interval: Duration,
+    scope: RepairScope,
+    domains: Vec<CatalogDomain>,
+}
+
+impl Default for RepairAutomationConfig {
+    fn default() -> Self {
+        Self {
+            mode: RepairAutomationMode::Enforce,
+            interval: Duration::from_secs(300),
+            scope: RepairScope::CurrentHeadOnly,
+            domains: vec![
+                CatalogDomain::Catalog,
+                CatalogDomain::Lineage,
+                CatalogDomain::Search,
+            ],
+        }
+    }
+}
+
+impl RepairAutomationConfig {
+    fn from_env() -> Result<Self> {
+        Self::from_env_reader(|key| std::env::var(key).ok())
+    }
+
+    fn from_env_reader<F>(mut read_env: F) -> Result<Self>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let mut config = Self::default();
+
+        if let Some(raw) = read_env(ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE_ENV) {
+            config.mode = RepairAutomationMode::parse(&raw)?;
+        }
+        if let Some(raw) = read_env(ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS_ENV) {
+            let secs = raw.parse::<u64>().map_err(|_| {
+                anyhow!(
+                    "invalid {ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS_ENV}: expected u64 seconds"
+                )
+            })?;
+            config.interval = Duration::from_secs(secs.max(1));
+        }
+        if let Some(raw) = read_env(ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE_ENV) {
+            config.scope = match raw.trim().to_ascii_lowercase().as_str() {
+                "current_head_only" => RepairScope::CurrentHeadOnly,
+                "full" => RepairScope::Full,
+                other => {
+                    return Err(anyhow!(
+                        "invalid {ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE_ENV}: expected current_head_only|full, got {other}"
+                    ));
+                }
+            };
+        }
+        if let Some(raw) = read_env(ARCO_COMPACTOR_REPAIR_AUTOMATION_DOMAINS_ENV) {
+            let mut domains = Vec::new();
+            for value in raw
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let domain = parse_catalog_domain(value).map_err(anyhow::Error::msg)?;
+                if !domains.contains(&domain) {
+                    domains.push(domain);
+                }
+            }
+            if !domains.is_empty() {
+                config.domains = domains;
+            }
+        }
+
+        Ok(config)
+    }
+}
+
+#[derive(Debug, Default)]
+struct RepairBacklogTracker {
+    domains: HashMap<CatalogDomain, RepairBacklogEntry>,
+}
 
 /// Arco catalog compactor.
 #[derive(Debug, Parser)]
@@ -370,6 +490,8 @@ struct ServiceState {
     workspace_id: String,
     notification_consumer: Arc<Mutex<NotificationConsumer>>,
     auto_anti_entropy: AutoAntiEntropyConfig,
+    repair_automation: RepairAutomationConfig,
+    repair_backlog: Arc<Mutex<RepairBacklogTracker>>,
 }
 
 #[derive(Clone)]
@@ -1027,6 +1149,286 @@ async fn run_auto_anti_entropy(state: &Arc<ServiceState>) -> Result<()> {
     Ok(())
 }
 
+const fn repair_scope_as_str(scope: RepairScope) -> &'static str {
+    match scope {
+        RepairScope::CurrentHeadOnly => "current_head_only",
+        RepairScope::Full => "full",
+    }
+}
+
+const fn repair_scope_allows_issue(scope: RepairScope, issue_type: IssueType) -> bool {
+    match scope {
+        RepairScope::CurrentHeadOnly => matches!(
+            issue_type,
+            IssueType::MissingCurrentHeadLegacyMirror
+                | IssueType::StaleCurrentHeadLegacyMirror
+                | IssueType::MissingCurrentHeadCommitRecord
+        ),
+        RepairScope::Full => true,
+    }
+}
+
+fn repairable_issue_count(report: &ReconciliationReport, scope: RepairScope) -> u64 {
+    u64::try_from(
+        report
+            .issues
+            .iter()
+            .filter(|issue| issue.repairable && repair_scope_allows_issue(scope, issue.issue_type))
+            .count(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+fn repair_backlog_fingerprint(report: &ReconciliationReport, scope: RepairScope) -> Option<String> {
+    let mut items: Vec<String> = report
+        .issues
+        .iter()
+        .filter(|issue| issue.repairable && repair_scope_allows_issue(scope, issue.issue_type))
+        .map(|issue| format!("{}:{}", issue.issue_type.as_str(), issue.path))
+        .collect();
+    if items.is_empty() {
+        None
+    } else {
+        items.sort();
+        Some(items.join("|"))
+    }
+}
+
+async fn update_repair_backlog_metrics(
+    state: &Arc<ServiceState>,
+    domain: CatalogDomain,
+    report: &ReconciliationReport,
+    mode: &str,
+    scope: RepairScope,
+) {
+    let findings = repairable_issue_count(report, scope);
+    let fingerprint = repair_backlog_fingerprint(report, scope);
+    let scope_label = repair_scope_as_str(scope);
+    let snapshot = {
+        let mut tracker = state.repair_backlog.lock().await;
+        let entry = tracker.domains.entry(domain).or_default();
+        entry.update(findings, fingerprint, Utc::now())
+    };
+    if snapshot.repeated_finding {
+        arco_catalog::metrics::record_repair_repeat(
+            domain,
+            &state.tenant_id,
+            &state.workspace_id,
+            mode,
+            scope_label,
+        );
+    }
+
+    arco_catalog::metrics::set_repair_backlog(
+        domain,
+        &state.tenant_id,
+        &state.workspace_id,
+        mode,
+        scope_label,
+        snapshot.count,
+        snapshot.age_seconds,
+    );
+}
+
+async fn refresh_repair_backlog_metrics(
+    state: &Arc<ServiceState>,
+    domain: CatalogDomain,
+    mode: &str,
+    scope: RepairScope,
+) {
+    let scope_label = repair_scope_as_str(scope);
+    let Some(snapshot) = ({
+        let tracker = state.repair_backlog.lock().await;
+        tracker
+            .domains
+            .get(&domain)
+            .and_then(|entry| entry.refresh(Utc::now()))
+    }) else {
+        return;
+    };
+
+    arco_catalog::metrics::set_repair_backlog(
+        domain,
+        &state.tenant_id,
+        &state.workspace_id,
+        mode,
+        scope_label,
+        snapshot.count,
+        snapshot.age_seconds,
+    );
+}
+
+async fn run_repair_automation_once(state: &Arc<ServiceState>) {
+    if state.repair_automation.mode == RepairAutomationMode::Disabled {
+        return;
+    }
+
+    let mode = state.repair_automation.mode.as_str();
+    let scope = repair_scope_as_str(state.repair_automation.scope);
+
+    let Ok(_guard) = state.compactor.compaction_lock.try_lock() else {
+        for domain in &state.repair_automation.domains {
+            refresh_repair_backlog_metrics(state, *domain, mode, state.repair_automation.scope)
+                .await;
+            arco_catalog::metrics::record_repair_automation_run(*domain, mode, scope, "busy");
+        }
+        tracing::info!("skipping automated repair pass because the compactor lock is busy");
+        return;
+    };
+
+    for domain in &state.repair_automation.domains {
+        let start = Instant::now();
+        let reconciler = Reconciler::new(state.storage.clone());
+
+        let report = match reconciler.check(*domain).await {
+            Ok(report) => report,
+            Err(error) => {
+                arco_catalog::metrics::record_repair_automation_run(
+                    *domain,
+                    mode,
+                    scope,
+                    "check_failed",
+                );
+                tracing::error!(
+                    domain = domain.as_str(),
+                    error = %error,
+                    "automated repair check failed"
+                );
+                continue;
+            }
+        };
+
+        let findings = repairable_issue_count(&report, state.repair_automation.scope);
+        arco_catalog::metrics::record_repair_automation_findings(*domain, mode, scope, findings);
+
+        let status = match state.repair_automation.mode {
+            RepairAutomationMode::DryRun => {
+                update_repair_backlog_metrics(
+                    state,
+                    *domain,
+                    &report,
+                    mode,
+                    state.repair_automation.scope,
+                )
+                .await;
+                if findings > 0 {
+                    "repair_needed"
+                } else {
+                    "clean"
+                }
+            }
+            RepairAutomationMode::Enforce => {
+                if findings == 0 {
+                    update_repair_backlog_metrics(
+                        state,
+                        *domain,
+                        &report,
+                        mode,
+                        state.repair_automation.scope,
+                    )
+                    .await;
+                    "clean"
+                } else {
+                    match reconciler
+                        .repair_with_scope(&report, state.repair_automation.scope)
+                        .await
+                    {
+                        Ok(_) => match reconciler.check(*domain).await {
+                            Ok(post_report) => {
+                                let remaining = repairable_issue_count(
+                                    &post_report,
+                                    state.repair_automation.scope,
+                                );
+                                update_repair_backlog_metrics(
+                                    state,
+                                    *domain,
+                                    &post_report,
+                                    mode,
+                                    state.repair_automation.scope,
+                                )
+                                .await;
+                                if remaining > 0 {
+                                    "repair_needed"
+                                } else {
+                                    "repaired"
+                                }
+                            }
+                            Err(error) => {
+                                arco_catalog::metrics::record_repair_automation_run(
+                                    *domain,
+                                    mode,
+                                    scope,
+                                    "recheck_failed",
+                                );
+                                tracing::error!(
+                                    domain = domain.as_str(),
+                                    error = %error,
+                                    "automated repair recheck failed"
+                                );
+                                continue;
+                            }
+                        },
+                        Err(error) => {
+                            update_repair_backlog_metrics(
+                                state,
+                                *domain,
+                                &report,
+                                mode,
+                                state.repair_automation.scope,
+                            )
+                            .await;
+                            tracing::error!(
+                                domain = domain.as_str(),
+                                error = %error,
+                                "automated repair enforcement failed"
+                            );
+                            "repair_failed"
+                        }
+                    }
+                }
+            }
+            RepairAutomationMode::Disabled => continue,
+        };
+
+        arco_catalog::metrics::record_repair_completion_latency(
+            *domain,
+            mode,
+            scope,
+            start.elapsed().as_secs_f64(),
+        );
+        arco_catalog::metrics::record_repair_automation_run(*domain, mode, scope, status);
+    }
+}
+
+async fn run_repair_automation_loop(state: Arc<ServiceState>) {
+    if state.repair_automation.mode == RepairAutomationMode::Disabled {
+        return;
+    }
+
+    let interval_secs = state.repair_automation.interval.as_secs();
+    let domains: Vec<&str> = state
+        .repair_automation
+        .domains
+        .iter()
+        .map(CatalogDomain::as_str)
+        .collect();
+    tracing::info!(
+        mode = state.repair_automation.mode.as_str(),
+        scope = repair_scope_as_str(state.repair_automation.scope),
+        interval_secs,
+        domains = ?domains,
+        "catalog repair automation enabled"
+    );
+
+    let mut interval_timer = tokio::time::interval(state.repair_automation.interval);
+    interval_timer.tick().await;
+
+    loop {
+        interval_timer.tick().await;
+        run_repair_automation_once(&state).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -1041,9 +1443,13 @@ mod tests {
     use tower::util::ServiceExt;
 
     fn test_state() -> Arc<ServiceState> {
+        test_state_with_scope("acme", "analytics")
+    }
+
+    fn test_state_with_scope(tenant_id: &str, workspace_id: &str) -> Arc<ServiceState> {
         let storage = Arc::new(MemoryBackend::new());
         let scoped_storage =
-            ScopedStorage::new(storage, "acme", "analytics").expect("scoped storage");
+            ScopedStorage::new(storage, tenant_id, workspace_id).expect("scoped storage");
         let compactor_state = Arc::new(CompactorState::new(60));
         let notification_consumer = NotificationConsumer::new(
             scoped_storage.clone(),
@@ -1060,10 +1466,12 @@ mod tests {
         Arc::new(ServiceState {
             compactor: compactor_state,
             storage: scoped_storage,
-            tenant_id: "acme".to_string(),
-            workspace_id: "analytics".to_string(),
+            tenant_id: tenant_id.to_string(),
+            workspace_id: workspace_id.to_string(),
             notification_consumer: Arc::new(Mutex::new(notification_consumer)),
             auto_anti_entropy,
+            repair_automation: RepairAutomationConfig::default(),
+            repair_backlog: Arc::new(Mutex::new(RepairBacklogTracker::default())),
         })
     }
 
@@ -1134,6 +1542,19 @@ mod tests {
         old_snapshot
     }
 
+    fn rendered_metric_value(rendered: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+        rendered.lines().find_map(|line| {
+            if !line.starts_with(name)
+                || !labels
+                    .iter()
+                    .all(|(key, value)| line.contains(&format!(r#"{key}="{value}""#)))
+            {
+                return None;
+            }
+            line.rsplit_once(' ')?.1.parse::<f64>().ok()
+        })
+    }
+
     fn test_internal_auth_state() -> Arc<InternalAuthState> {
         let config = InternalOidcConfig::hs256_for_tests(
             "https://accounts.google.com",
@@ -1189,6 +1610,46 @@ mod tests {
         assert_eq!(
             request.effective_repair_scope(),
             RepairScope::CurrentHeadOnly
+        );
+    }
+
+    #[test]
+    fn test_repair_automation_config_defaults_to_enforce_current_head_only() {
+        let config =
+            RepairAutomationConfig::from_env_reader(|_| None).expect("default repair config");
+
+        assert_eq!(config.mode, RepairAutomationMode::Enforce);
+        assert_eq!(config.interval, Duration::from_secs(300));
+        assert_eq!(config.scope, RepairScope::CurrentHeadOnly);
+        assert_eq!(
+            config.domains,
+            vec![
+                CatalogDomain::Catalog,
+                CatalogDomain::Lineage,
+                CatalogDomain::Search,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_repair_automation_config_parses_enforce_full_scope_and_domains() {
+        let config = RepairAutomationConfig::from_env_reader(|key| match key {
+            "ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE" => Some("enforce".to_string()),
+            "ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS" => Some("42".to_string()),
+            "ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE" => Some("full".to_string()),
+            "ARCO_COMPACTOR_REPAIR_AUTOMATION_DOMAINS" => {
+                Some("search, catalog, search".to_string())
+            }
+            _ => None,
+        })
+        .expect("parse repair automation config");
+
+        assert_eq!(config.mode, RepairAutomationMode::Enforce);
+        assert_eq!(config.interval, Duration::from_secs(42));
+        assert_eq!(config.scope, RepairScope::Full);
+        assert_eq!(
+            config.domains,
+            vec![CatalogDomain::Search, CatalogDomain::Catalog]
         );
     }
 
@@ -1472,6 +1933,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_repair_automation_busy_refreshes_backlog_age_metrics() {
+        let handle = metrics::init_metrics();
+        let state = test_state_with_scope("busy-metrics-tenant", "busy-metrics-workspace");
+
+        {
+            let mut backlog = state.repair_backlog.lock().await;
+            let _ = backlog
+                .domains
+                .entry(CatalogDomain::Catalog)
+                .or_default()
+                .update(
+                    1,
+                    Some("missing_current_head_commit_record:state/catalog/commits/00000000000000000001.json".to_string()),
+                    Utc::now() - chrono::Duration::minutes(20),
+                );
+        }
+
+        let compaction_guard = state.compactor.compaction_lock.lock().await;
+        run_repair_automation_once(&state).await;
+        drop(compaction_guard);
+
+        let rendered = handle.render();
+        let labels = [
+            ("domain", CatalogDomain::Catalog.as_str()),
+            ("tenant_id", "busy-metrics-tenant"),
+            ("workspace_id", "busy-metrics-workspace"),
+        ];
+        let age_seconds = rendered_metric_value(
+            &rendered,
+            "arco_catalog_repair_backlog_age_seconds",
+            &labels,
+        )
+        .expect("backlog age metric");
+        assert!(
+            age_seconds >= 60.0,
+            "busy repair automation should refresh backlog age metrics, got {age_seconds} from {rendered}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_reconcile_endpoint_requires_internal_auth_when_enforced() {
         let router = build_router(test_state(), None, Some(test_internal_auth_state()));
         let response = router
@@ -1652,6 +2153,7 @@ async fn main() -> Result<()> {
             let scoped_storage = scoped.scoped_storage()?;
             let metrics_secret = normalize_metrics_secret(metrics_secret);
             let internal_auth = build_internal_auth()?;
+            let repair_automation = RepairAutomationConfig::from_env()?;
 
             // Initialize metrics before starting
             metrics::init_metrics();
@@ -1694,6 +2196,8 @@ async fn main() -> Result<()> {
                 workspace_id: scoped.workspace_id.clone(),
                 notification_consumer: Arc::new(Mutex::new(notification_consumer)),
                 auto_anti_entropy,
+                repair_automation: repair_automation.clone(),
+                repair_backlog: Arc::new(Mutex::new(RepairBacklogTracker::default())),
             });
 
             // Update compaction lag gauge periodically using last successful compaction as proxy.
@@ -1726,6 +2230,13 @@ async fn main() -> Result<()> {
             tokio::spawn(async move {
                 run_compaction_loop(state_clone, interval).await;
             });
+
+            if repair_automation.mode != RepairAutomationMode::Disabled {
+                let state_clone = Arc::clone(&state);
+                tokio::spawn(async move {
+                    run_repair_automation_loop(state_clone).await;
+                });
+            }
 
             // Start HTTP server
             let addr = SocketAddr::from(([0, 0, 0, 0], port));

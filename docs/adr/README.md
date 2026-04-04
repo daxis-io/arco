@@ -45,3 +45,6 @@ Each ADR follows this structure:
 | [030](adr-030-delta-uc-metastore.md) | Delta Lake + UC-Like Metastore/Catalog (Arco-Native) | Proposed |
 | [031](adr-031-unity-catalog-api-facade.md) | Unity Catalog OSS API Facade (UC Parity) | Proposed |
 | [032](adr-032-engine-boundaries.md) | Engine Boundaries and Split-Service Topology | Accepted |
+| [032](adr-032-immutable-manifest-pointers.md) | Immutable Manifest Snapshots + Pointer CAS | Accepted |
+| [033](adr-033-internal-durability-modes.md) | Internal Durability Modes for Orchestration Compaction | Proposed |
+| [034](adr-034-fenced-head-published-control-plane-transactions.md) | Fenced Head-Published Control-Plane Transactions | Proposed |

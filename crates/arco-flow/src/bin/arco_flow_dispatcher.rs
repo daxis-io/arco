@@ -17,7 +17,9 @@ use arco_core::{
     DEFAULT_DISPATCH_TASK_TIMEOUT_SECONDS, DEFAULT_TASK_TOKEN_TTL_SECONDS, ScopedStorage,
     TaskTokenConfig, mint_task_token,
 };
-use arco_flow::dispatch::cloud_tasks::{CloudTasksConfig, CloudTasksDispatcher};
+use arco_flow::dispatch::cloud_tasks::{
+    CloudTasksConfig, CloudTasksDispatcher, resolve_target_audience,
+};
 use arco_flow::dispatch::{EnqueueOptions, EnqueueResult};
 use arco_flow::error::{Error, Result};
 use arco_flow::orchestration::LedgerWriter;
@@ -26,6 +28,7 @@ use arco_flow::orchestration::controllers::{
     DispatchAction, DispatcherController, ReadyDispatchController, TimerAction, TimerController,
 };
 use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
+use arco_flow::orchestration::flow_service::append_events_and_compact;
 use arco_flow::orchestration::worker_contract::WorkerDispatchEnvelope;
 
 #[derive(Clone)]
@@ -34,11 +37,14 @@ struct AppState {
     workspace_id: String,
     compactor: MicroCompactor,
     ledger: LedgerWriter,
+    orch_compactor_url: Option<String>,
     cloud_tasks: Arc<CloudTasksDispatcher>,
     dispatch_target_url: String,
+    dispatch_target_audience: String,
     callback_base_url: String,
     task_token_config: TaskTokenConfig,
     timer_target_url: Option<String>,
+    timer_target_audience: Option<String>,
     timer_queue: Option<String>,
 }
 
@@ -151,7 +157,12 @@ async fn run_handler(
     }
 
     if !ready_events.is_empty() {
-        state.ledger.append_all(ready_events).await?;
+        append_events_and_compact(
+            &state.ledger,
+            state.orch_compactor_url.as_deref(),
+            ready_events,
+        )
+        .await?;
     }
 
     let outbox_rows: Vec<_> = fold_state.dispatch_outbox.values().cloned().collect();
@@ -218,7 +229,7 @@ async fn run_handler(
                 &state.dispatch_target_url,
                 body.as_bytes(),
                 options,
-                Some(state.dispatch_target_url.as_str()),
+                Some(state.dispatch_target_audience.as_str()),
                 None,
             )
             .await;
@@ -272,7 +283,12 @@ async fn run_handler(
     }
 
     if !dispatch_events.is_empty() {
-        state.ledger.append_all(dispatch_events).await?;
+        append_events_and_compact(
+            &state.ledger,
+            state.orch_compactor_url.as_deref(),
+            dispatch_events,
+        )
+        .await?;
     }
 
     let timer_rows: Vec<_> = fold_state.timers.values().cloned().collect();
@@ -339,7 +355,12 @@ async fn run_handler(
                 target_url,
                 &body,
                 options,
-                Some(target_url.as_str()),
+                Some(
+                    state
+                        .timer_target_audience
+                        .as_deref()
+                        .unwrap_or(target_url.as_str()),
+                ),
                 None,
             )
             .await;
@@ -393,7 +414,12 @@ async fn run_handler(
     }
 
     if !timer_events.is_empty() {
-        state.ledger.append_all(timer_events).await?;
+        append_events_and_compact(
+            &state.ledger,
+            state.orch_compactor_url.as_deref(),
+            timer_events,
+        )
+        .await?;
     }
 
     let summary = RunSummary {
@@ -535,17 +561,27 @@ async fn main() -> Result<()> {
     let workspace_id = required_env("ARCO_WORKSPACE_ID")?;
     let bucket = required_env("ARCO_STORAGE_BUCKET")?;
     let dispatch_target_url = required_env("ARCO_FLOW_DISPATCH_TARGET_URL")?;
+    let dispatch_target_audience_env = optional_env("ARCO_FLOW_DISPATCH_TARGET_AUDIENCE");
     let callback_base_url = required_env("ARCO_FLOW_CALLBACK_BASE_URL")?;
     let project_id = required_env("ARCO_GCP_PROJECT_ID")?;
     let location = required_env("ARCO_GCP_LOCATION")?;
     let queue_name =
         optional_env("ARCO_FLOW_QUEUE").unwrap_or_else(|| "arco-flow-dispatch".to_string());
+    let orch_compactor_url = optional_env("ARCO_FLOW_COMPACTOR_URL");
     let timer_target_url = optional_env("ARCO_FLOW_TIMER_TARGET_URL");
+    let timer_target_audience_env = optional_env("ARCO_FLOW_TIMER_TARGET_AUDIENCE");
     let timer_queue = optional_env("ARCO_FLOW_TIMER_QUEUE");
     let service_account_email = optional_env("ARCO_FLOW_SERVICE_ACCOUNT_EMAIL");
     let task_timeout_secs = task_timeout_seconds_from_env()?;
     let task_token_config = task_token_config_from_env(task_timeout_secs)?;
     let port = resolve_port()?;
+    let dispatch_target_audience = resolve_target_audience(
+        dispatch_target_audience_env.as_deref(),
+        &dispatch_target_url,
+    );
+    let timer_target_audience = timer_target_url.as_deref().map(|target_url| {
+        resolve_target_audience(timer_target_audience_env.as_deref(), target_url)
+    });
 
     let mut cloud_config = CloudTasksConfig::new(
         project_id,
@@ -577,11 +613,14 @@ async fn main() -> Result<()> {
         workspace_id,
         compactor: MicroCompactor::new(storage.clone()),
         ledger: LedgerWriter::new(storage),
+        orch_compactor_url,
         cloud_tasks: Arc::new(cloud_tasks),
         dispatch_target_url,
+        dispatch_target_audience,
         callback_base_url,
         task_token_config,
         timer_target_url,
+        timer_target_audience,
         timer_queue,
     };
 

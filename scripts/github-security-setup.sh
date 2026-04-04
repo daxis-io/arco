@@ -56,7 +56,7 @@ gh api "repos/${REPO}/rulesets" -X POST \
   -F name="protect-main" \
   -F target=branch \
   -F enforcement=active \
-  --input - << 'EOF'
+  --input - <<'EOF'
 {
   "conditions": {
     "ref_name": {
@@ -68,11 +68,11 @@ gh api "repos/${REPO}/rulesets" -X POST \
     {
       "type": "pull_request",
       "parameters": {
-        "required_approving_review_count": 1,
-        "dismiss_stale_reviews_on_push": true,
-        "require_code_owner_review": true,
+        "required_approving_review_count": 0,
+        "dismiss_stale_reviews_on_push": false,
+        "require_code_owner_review": false,
         "require_last_push_approval": false,
-        "required_review_thread_resolution": true
+        "required_review_thread_resolution": false
       }
     },
     {
@@ -92,7 +92,7 @@ echo ""
 echo "=== Phase 3.1a: Create dev Environment ==="
 
 gh api "repos/${REPO}/environments/dev" -X PUT \
-  --input - << 'EOF'
+  --input - <<'EOF'
 {
   "deployment_branch_policy": {
     "protected_branches": false,
@@ -109,7 +109,7 @@ echo ""
 echo "=== Phase 3.1b: Create prod Environment ==="
 
 gh api "repos/${REPO}/environments/prod" -X PUT \
-  --input - << 'EOF'
+  --input - <<'EOF'
 {
   "wait_timer": 5,
   "reviewers": [

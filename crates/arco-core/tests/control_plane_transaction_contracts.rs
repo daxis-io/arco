@@ -1,9 +1,9 @@
 //! Contract tests for shared control-plane transaction request and response types.
 //!
-//! These assertions lock in the ADR-034 PI-1 wire contract:
+//! These assertions lock in the ADR-034 PI-3 wire contract:
 //! canonical fenced fields are serialized, legacy orchestration `epoch`
-//! payloads remain accepted in compatibility mode, and responses surface
-//! visibility plus repair state.
+//! request aliases are rejected, and responses surface visibility plus
+//! repair state.
 
 #![allow(clippy::expect_used)]
 
@@ -45,8 +45,8 @@ fn sync_compact_response_includes_visibility_and_repair_status() {
 }
 
 #[test]
-fn orchestration_compact_request_accepts_legacy_epoch_alias() {
-    let request: OrchestrationCompactRequest = serde_json::from_str(
+fn orchestration_compact_request_rejects_legacy_epoch_alias() {
+    let err = serde_json::from_str::<OrchestrationCompactRequest>(
         r#"{
             "event_paths": ["ledger/orchestration/2026-03-28/01JTEST.json"],
             "epoch": 9,
@@ -54,22 +54,36 @@ fn orchestration_compact_request_accepts_legacy_epoch_alias() {
             "request_id": "req_legacy"
         }"#,
     )
-    .expect("deserialize");
+    .expect_err("legacy alias must be rejected");
 
-    assert_eq!(request.fencing_token, Some(9));
-    assert_eq!(
-        request.lock_path.as_deref(),
-        Some("locks/orchestration.compaction.lock.json")
+    assert!(
+        err.to_string().contains("epoch"),
+        "expected legacy alias error, got {err}"
     );
-    assert_eq!(request.request_id.as_deref(), Some("req_legacy"));
+}
+
+#[test]
+fn orchestration_compact_request_requires_canonical_fencing_fields() {
+    let err = serde_json::from_str::<OrchestrationCompactRequest>(
+        r#"{
+            "event_paths": ["ledger/orchestration/2026-03-28/01JTEST.json"],
+            "request_id": "req_missing_fence"
+        }"#,
+    )
+    .expect_err("fenced fields must be required");
+
+    assert!(
+        err.to_string().contains("fencing_token") || err.to_string().contains("lock_path"),
+        "expected missing fenced field error, got {err}"
+    );
 }
 
 #[test]
 fn orchestration_rebuild_request_serializes_canonical_fencing_field() {
     let request = OrchestrationRebuildRequest {
         rebuild_manifest_path: "state/orchestration/rebuilds/rebuild-01.json".to_string(),
-        fencing_token: Some(7),
-        lock_path: Some("locks/orchestration.compaction.lock.json".to_string()),
+        fencing_token: 7,
+        lock_path: "locks/orchestration.compaction.lock.json".to_string(),
         request_id: Some("req_rebuild".to_string()),
     };
 
@@ -80,6 +94,24 @@ fn orchestration_rebuild_request_serializes_canonical_fencing_field() {
         "locks/orchestration.compaction.lock.json"
     );
     assert!(json.get("epoch").is_none());
+}
+
+#[test]
+fn orchestration_rebuild_request_rejects_legacy_epoch_alias() {
+    let err = serde_json::from_str::<OrchestrationRebuildRequest>(
+        r#"{
+            "rebuild_manifest_path": "state/orchestration/rebuilds/rebuild-01.json",
+            "epoch": 7,
+            "lock_path": "locks/orchestration.compaction.lock.json",
+            "request_id": "req_rebuild_legacy"
+        }"#,
+    )
+    .expect_err("legacy alias must be rejected");
+
+    assert!(
+        err.to_string().contains("epoch"),
+        "expected legacy alias error, got {err}"
+    );
 }
 
 #[test]

@@ -23,12 +23,14 @@ use arco_flow::error::{Error, Result};
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::fold::TimerType as FoldTimerType;
 use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData, TimerType};
+use arco_flow::orchestration::flow_service::append_events_and_compact;
 
 #[derive(Clone)]
 struct AppState {
     tenant_id: String,
     workspace_id: String,
     ledger: LedgerWriter,
+    orch_compactor_url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -134,7 +136,12 @@ async fn timer_fired_handler(
         event.timestamp = fire_at;
     }
 
-    state.ledger.append(event).await?;
+    append_events_and_compact(
+        &state.ledger,
+        state.orch_compactor_url.as_deref(),
+        vec![event],
+    )
+    .await?;
 
     Ok(Json(TimerFiredResponse {
         acknowledged: true,
@@ -174,6 +181,10 @@ const fn map_timer_type(timer_type: FoldTimerType) -> TimerType {
 
 fn required_env(key: &str) -> Result<String> {
     std::env::var(key).map_err(|_| Error::configuration(format!("missing {key}")))
+}
+
+fn optional_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
 }
 
 fn resolve_port() -> Result<u16> {
@@ -254,6 +265,7 @@ async fn main() -> Result<()> {
     let workspace_id = required_env("ARCO_WORKSPACE_ID")?;
     let bucket = required_env("ARCO_STORAGE_BUCKET")?;
     let port = resolve_port()?;
+    let orch_compactor_url = optional_env("ARCO_FLOW_COMPACTOR_URL");
     let internal_auth = build_internal_auth()?;
 
     let backend = ObjectStoreBackend::from_bucket(&bucket)?;
@@ -264,6 +276,7 @@ async fn main() -> Result<()> {
         tenant_id,
         workspace_id,
         ledger: LedgerWriter::new(storage),
+        orch_compactor_url,
     };
 
     let timer_route = internal_auth.map_or_else(
@@ -295,6 +308,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use arco_core::MemoryBackend;
+    use arco_flow::orchestration::compactor::MicroCompactor;
 
     fn test_state() -> AppState {
         let backend = Arc::new(MemoryBackend::new());
@@ -303,7 +317,22 @@ mod tests {
             tenant_id: "tenant".to_string(),
             workspace_id: "workspace".to_string(),
             ledger: LedgerWriter::new(storage),
+            orch_compactor_url: None,
         }
+    }
+
+    fn test_state_with_storage() -> (AppState, ScopedStorage) {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("storage");
+        (
+            AppState {
+                tenant_id: "tenant".to_string(),
+                workspace_id: "workspace".to_string(),
+                ledger: LedgerWriter::new(storage.clone()),
+                orch_compactor_url: None,
+            },
+            storage,
+        )
     }
 
     #[tokio::test]
@@ -356,5 +385,33 @@ mod tests {
         )
         .await;
         assert!(duplicate.is_ok());
+    }
+
+    #[tokio::test]
+    async fn timer_fired_handler_makes_timer_visible_to_compactor_state() {
+        let (state, storage) = test_state_with_storage();
+        let request = TimerFiredRequest {
+            timer_id: "timer:retry:run2:task2:1:1700000000".to_string(),
+            timer_type: Some(FoldTimerType::Retry),
+            run_id: Some("run2".to_string()),
+            task_key: Some("task2".to_string()),
+            attempt: Some(1),
+            fire_at: Some(Utc::now()),
+        };
+
+        let response = timer_fired_handler(State(state), Json(request)).await;
+        assert!(
+            response.is_ok(),
+            "timer callback should succeed: {response:?}"
+        );
+
+        let compactor = MicroCompactor::new(storage);
+        let (_manifest, fold_state) = compactor.load_state().await.expect("load state");
+        assert!(
+            fold_state
+                .timers
+                .contains_key("timer:retry:run2:task2:1:1700000000"),
+            "timer callback writes must be immediately visible to orchestration readers"
+        );
     }
 }

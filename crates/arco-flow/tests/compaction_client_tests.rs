@@ -12,10 +12,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 
+use arco_core::Error as CoreError;
 use arco_core::VisibilityStatus;
-use arco_flow::compaction_client::{
-    compact_orchestration_events, compact_orchestration_events_fenced,
-};
+use arco_flow::compaction_client::compact_orchestration_events_fenced;
+use arco_flow::error::Error as FlowError;
 use arco_flow::orchestration_compaction::OrchestrationCompactRequest;
 
 #[derive(Clone, Copy)]
@@ -131,6 +131,32 @@ async fn start_test_server(
     (base_url, captured_request, handle)
 }
 
+async fn start_error_server(
+    status: StatusCode,
+    body: serde_json::Value,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let app = Router::new().route(
+        "/compact",
+        post(move || {
+            let status = status;
+            let body = body.clone();
+            async move { (status, Json(body)) }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr: SocketAddr = listener.local_addr().expect("listener addr");
+    let base_url = format!("http://{addr}");
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test server");
+    });
+
+    (base_url, handle)
+}
+
 #[tokio::test]
 async fn compaction_client_sends_static_bearer_token_when_configured() {
     let (base_url, _capture, _handle) = start_test_server(ServerMode::RequireAuthHeader).await;
@@ -142,8 +168,14 @@ async fn compaction_client_sends_static_bearer_token_when_configured() {
         base_url.trim_start_matches("http://")
     );
 
-    let result =
-        compact_orchestration_events(&authed_url, vec!["ledger/events/1.json".to_string()]).await;
+    let result = compact_orchestration_events_fenced(
+        &authed_url,
+        vec!["ledger/events/1.json".to_string()],
+        11,
+        "locks/orchestration.compaction.lock.json",
+        Some("req_auth"),
+    )
+    .await;
 
     #[cfg(any(feature = "gcp", feature = "test-utils"))]
     assert!(
@@ -171,8 +203,14 @@ async fn compaction_client_times_out_requests() {
     // Wrap in an outer timeout to avoid hanging if the client has no timeout.
     // The test expects the *client* to time out first (i.e., we get Ok(Err(..))).
     let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        compact_orchestration_events(&base_url, vec!["ledger/events/2.json".to_string()]),
+        Duration::from_secs(8),
+        compact_orchestration_events_fenced(
+            &base_url,
+            vec!["ledger/events/2.json".to_string()],
+            12,
+            "locks/orchestration.compaction.lock.json",
+            Some("req_timeout"),
+        ),
     )
     .await;
 
@@ -212,10 +250,10 @@ async fn compaction_client_sends_fencing_token_and_lock_path() {
             .expect("capture lock")
             .clone()
             .expect("captured request");
-        assert_eq!(request.fencing_token, Some(17));
+        assert_eq!(request.fencing_token, 17);
         assert_eq!(
-            request.lock_path.as_deref(),
-            Some("locks/orchestration.compaction.lock.json")
+            request.lock_path,
+            "locks/orchestration.compaction.lock.json"
         );
         assert_eq!(request.request_id.as_deref(), Some("req_fenced"));
     }
@@ -223,6 +261,47 @@ async fn compaction_client_sends_fencing_token_and_lock_path() {
     #[cfg(not(any(feature = "gcp", feature = "test-utils")))]
     {
         let err = response.expect_err("expected configuration error without gcp/test-utils");
+        assert!(
+            err.to_string()
+                .contains("orchestration compaction requires the 'gcp' feature"),
+            "unexpected error when gcp/test-utils feature is disabled: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn compaction_client_maps_conflict_status_to_precondition_failed() {
+    let (base_url, _handle) = start_error_server(
+        StatusCode::CONFLICT,
+        serde_json::json!({ "error": "stale fencing token" }),
+    )
+    .await;
+
+    let result = compact_orchestration_events_fenced(
+        &base_url,
+        vec!["ledger/events/4.json".to_string()],
+        19,
+        "locks/orchestration.compaction.lock.json",
+        Some("req_conflict"),
+    )
+    .await;
+
+    #[cfg(any(feature = "gcp", feature = "test-utils"))]
+    {
+        let err = result.expect_err("conflict response must fail");
+        assert!(
+            matches!(
+                err,
+                FlowError::Core(CoreError::PreconditionFailed { ref message })
+                    if message == "stale fencing token"
+            ),
+            "expected precondition-failed mapping, got: {err:?}"
+        );
+    }
+
+    #[cfg(not(any(feature = "gcp", feature = "test-utils")))]
+    {
+        let err = result.expect_err("expected configuration error without gcp/test-utils");
         assert!(
             err.to_string()
                 .contains("orchestration compaction requires the 'gcp' feature"),

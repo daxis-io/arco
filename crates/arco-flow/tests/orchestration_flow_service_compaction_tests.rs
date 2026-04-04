@@ -38,11 +38,7 @@ async fn compact_handler(
     *state.captured_request.lock().expect("capture lock") = Some(req.clone());
     let result = state
         .compactor
-        .compact_events_fenced(
-            req.event_paths,
-            req.fencing_token.expect("fencing token"),
-            req.lock_path.as_deref().expect("lock path"),
-        )
+        .compact_events_fenced(req.event_paths, req.fencing_token, &req.lock_path)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -218,10 +214,10 @@ async fn dispatcher_compacts_emitted_events_to_prevent_ledger_spam() -> Result<(
         .expect("capture lock")
         .clone()
         .expect("captured fenced request");
-    assert!(request.fencing_token.is_some());
+    assert!(request.fencing_token > 0);
     assert_eq!(
-        request.lock_path.as_deref(),
-        Some("locks/orchestration.compaction.lock.json")
+        request.lock_path,
+        "locks/orchestration.compaction.lock.json"
     );
     Ok(())
 }

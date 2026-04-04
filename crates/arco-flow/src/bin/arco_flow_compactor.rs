@@ -1202,6 +1202,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_endpoint_requires_auth_when_internal_auth_enforced() {
+        let router = build_router(test_state(), Some(test_internal_auth_state()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/compact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"event_paths":[],"fencing_token":7,"lock_path":"locks/orchestration.compaction.lock.json"}"#
+                            .to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rebuild_endpoint_requires_auth_when_internal_auth_enforced() {
+        let router = build_router(test_state(), Some(test_internal_auth_state()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/rebuild")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"rebuild_manifest_path":"state/orchestration/rebuilds/rebuild-01.json","fencing_token":7,"lock_path":"locks/orchestration.compaction.lock.json"}"#
+                            .to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn default_request_contract_rejects_compact_requests_without_fencing() {
         let router = build_router(test_state(), None);
 

@@ -29,6 +29,7 @@ use arco_flow::orchestration::controllers::{
 use arco_flow::orchestration::events::{
     OrchestrationEvent, OrchestrationEventData, TaskOutcome, TimerType as EventTimerType,
 };
+use arco_flow::orchestration::flow_service::append_events_and_compact;
 
 const DEFAULT_WORKER_QUEUE: &str = "default-queue";
 
@@ -38,6 +39,7 @@ struct AppState {
     workspace_id: String,
     compactor: MicroCompactor,
     ledger: LedgerWriter,
+    orch_compactor_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -172,7 +174,8 @@ async fn run_handler(
 
     summary.total_events = pending.len();
     if !pending.is_empty() {
-        state.ledger.append_all(pending).await?;
+        append_events_and_compact(&state.ledger, state.orch_compactor_url.as_deref(), pending)
+            .await?;
     }
 
     Ok(Json(summary))
@@ -350,6 +353,10 @@ fn required_env(key: &str) -> Result<String> {
     std::env::var(key).map_err(|_| Error::configuration(format!("missing {key}")))
 }
 
+fn optional_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
 fn resolve_port() -> Result<u16> {
     if let Ok(port) = std::env::var("PORT") {
         return port
@@ -381,6 +388,7 @@ async fn main() -> Result<()> {
     let workspace_id = required_env("ARCO_WORKSPACE_ID")?;
     let bucket = required_env("ARCO_STORAGE_BUCKET")?;
     let port = resolve_port()?;
+    let orch_compactor_url = optional_env("ARCO_FLOW_COMPACTOR_URL");
 
     let backend = ObjectStoreBackend::from_bucket(&bucket)?;
     let backend: Arc<dyn StorageBackend> = Arc::new(backend);
@@ -391,6 +399,7 @@ async fn main() -> Result<()> {
         workspace_id,
         compactor: MicroCompactor::new(storage.clone()),
         ledger: LedgerWriter::new(storage),
+        orch_compactor_url,
     };
 
     let app = Router::new()

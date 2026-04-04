@@ -305,8 +305,8 @@ impl MicroCompactor {
 
     /// Fenced rebuild path for callers that hold the orchestration compaction lock.
     ///
-    /// This preserves PI-1 compatibility with the existing stored rebuild manifest
-    /// workflow while validating the supplied lock path and fencing token.
+    /// This retains the stored rebuild manifest workflow while validating the
+    /// supplied lock path and fencing token against the canonical fenced contract.
     ///
     /// # Errors
     ///

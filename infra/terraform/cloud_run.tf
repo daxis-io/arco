@@ -117,6 +117,11 @@ resource "google_cloud_run_v2_service" "api" {
       }
 
       env {
+        name  = "ARCO_COMPACTOR_URL"
+        value = google_cloud_run_v2_service.compactor.uri
+      }
+
+      env {
         name  = "ARCO_ORCH_COMPACTOR_URL"
         value = google_cloud_run_v2_service.flow_compactor.uri
       }
@@ -252,6 +257,26 @@ resource "google_cloud_run_v2_service" "compactor" {
         value = var.environment
       }
 
+      env {
+        name  = "ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE"
+        value = var.compactor_repair_automation_mode
+      }
+
+      env {
+        name  = "ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS"
+        value = tostring(var.compactor_repair_automation_interval_secs)
+      }
+
+      env {
+        name  = "ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE"
+        value = var.compactor_repair_automation_scope
+      }
+
+      env {
+        name  = "ARCO_COMPACTOR_REPAIR_AUTOMATION_DOMAINS"
+        value = var.compactor_repair_automation_domains
+      }
+
       # Compaction interval (seconds)
       env {
         name  = "ARCO_COMPACTOR_INTERVAL_SECS"
@@ -353,17 +378,32 @@ resource "google_cloud_run_v2_service" "flow_compactor" {
 
       env {
         name  = "ARCO_TENANT_ID"
-        value = var.compactor_tenant_id
+        value = var.flow_tenant_id
       }
 
       env {
         name  = "ARCO_WORKSPACE_ID"
-        value = var.compactor_workspace_id
+        value = var.flow_workspace_id
       }
 
       env {
         name  = "ARCO_STORAGE_BUCKET"
         value = google_storage_bucket.catalog.name
+      }
+
+      env {
+        name  = "ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_MODE"
+        value = var.flow_compactor_repair_automation_mode
+      }
+
+      env {
+        name  = "ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS"
+        value = tostring(var.flow_compactor_repair_automation_interval_secs)
+      }
+
+      env {
+        name  = "ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_SCOPE"
+        value = var.flow_compactor_repair_automation_scope
       }
 
       env {
@@ -404,6 +444,7 @@ resource "google_cloud_run_v2_service" "flow_compactor" {
 # ============================================================================
 
 resource "google_cloud_run_v2_service" "flow_dispatcher" {
+  count    = local.flow_services_enabled ? 1 : 0
   name     = "arco-flow-dispatcher-${var.environment}"
   location = var.region
   project  = var.project_id
@@ -466,12 +507,12 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
 
       env {
         name  = "ARCO_TENANT_ID"
-        value = var.compactor_tenant_id
+        value = var.flow_tenant_id
       }
 
       env {
         name  = "ARCO_WORKSPACE_ID"
-        value = var.compactor_workspace_id
+        value = var.flow_workspace_id
       }
 
       env {
@@ -491,7 +532,12 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
 
       env {
         name  = "ARCO_FLOW_DISPATCH_TARGET_URL"
-        value = "${google_cloud_run_v2_service.flow_worker.uri}/dispatch"
+        value = local.flow_worker_dispatch_url
+      }
+
+      env {
+        name  = "ARCO_FLOW_DISPATCH_TARGET_AUDIENCE"
+        value = local.flow_worker_service_url
       }
 
       env {
@@ -500,15 +546,23 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
       }
 
       env {
+        name  = "ARCO_FLOW_CALLBACK_BASE_URL"
+        value = local.api_service_url
+      }
+
+      env {
         name  = "ARCO_FLOW_TIMER_QUEUE"
         value = var.flow_timer_queue_name
       }
 
       env {
-        name = "ARCO_FLOW_TIMER_TARGET_URL"
-        # Use Cloud Run deterministic URLs to avoid a Terraform self-reference cycle.
-        # See: https://cloud.google.com/run/docs/routing/ingress#deterministic_url
-        value = "https://arco-flow-dispatcher-${var.environment}-${local.project_number}.${var.region}.run.app/timer"
+        name  = "ARCO_FLOW_TIMER_TARGET_URL"
+        value = local.flow_timer_ingest_internal_url
+      }
+
+      env {
+        name  = "ARCO_FLOW_TIMER_TARGET_AUDIENCE"
+        value = local.flow_timer_ingest_service_url
       }
 
       env {
@@ -517,7 +571,7 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
       }
 
       env {
-        name  = "ARCO_ORCH_COMPACTOR_URL"
+        name  = "ARCO_FLOW_COMPACTOR_URL"
         value = google_cloud_run_v2_service.flow_compactor.uri
       }
     }
@@ -541,6 +595,7 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
 # ============================================================================
 
 resource "google_cloud_run_v2_service" "flow_sweeper" {
+  count    = local.flow_services_enabled ? 1 : 0
   name     = "arco-flow-sweeper-${var.environment}"
   location = var.region
   project  = var.project_id
@@ -603,12 +658,12 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
 
       env {
         name  = "ARCO_TENANT_ID"
-        value = var.compactor_tenant_id
+        value = var.flow_tenant_id
       }
 
       env {
         name  = "ARCO_WORKSPACE_ID"
-        value = var.compactor_workspace_id
+        value = var.flow_workspace_id
       }
 
       env {
@@ -628,7 +683,12 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
 
       env {
         name  = "ARCO_FLOW_DISPATCH_TARGET_URL"
-        value = "${google_cloud_run_v2_service.flow_worker.uri}/dispatch"
+        value = local.flow_worker_dispatch_url
+      }
+
+      env {
+        name  = "ARCO_FLOW_DISPATCH_TARGET_AUDIENCE"
+        value = local.flow_worker_service_url
       }
 
       env {
@@ -637,12 +697,17 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
       }
 
       env {
+        name  = "ARCO_FLOW_CALLBACK_BASE_URL"
+        value = local.api_service_url
+      }
+
+      env {
         name  = "ARCO_FLOW_SERVICE_ACCOUNT_EMAIL"
         value = google_service_account.flow_task_invoker.email
       }
 
       env {
-        name  = "ARCO_ORCH_COMPACTOR_URL"
+        name  = "ARCO_FLOW_COMPACTOR_URL"
         value = google_cloud_run_v2_service.flow_compactor.uri
       }
     }
@@ -666,6 +731,7 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
 # ============================================================================
 
 resource "google_cloud_run_v2_service" "flow_worker" {
+  count    = local.flow_services_enabled ? 1 : 0
   name     = "arco-flow-worker-${var.environment}"
   location = var.region
   project  = var.project_id
@@ -673,7 +739,7 @@ resource "google_cloud_run_v2_service" "flow_worker" {
   ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"
 
   template {
-    service_account = google_service_account.flow_worker.email
+    service_account = google_service_account.flow_worker[0].email
 
     scaling {
       min_instance_count = 0
@@ -733,12 +799,12 @@ resource "google_cloud_run_v2_service" "flow_worker" {
 
       env {
         name  = "ARCO_FLOW_TENANT_ID"
-        value = var.compactor_tenant_id
+        value = var.flow_tenant_id
       }
 
       env {
         name  = "ARCO_FLOW_WORKSPACE_ID"
-        value = var.compactor_workspace_id
+        value = var.flow_workspace_id
       }
 
       env {

@@ -41,9 +41,6 @@ Required env vars:
   API_IMAGE
   COMPACTOR_IMAGE
   FLOW_COMPACTOR_IMAGE
-  FLOW_DISPATCHER_IMAGE
-  FLOW_SWEEPER_IMAGE
-  FLOW_WORKER_IMAGE
 
 Optional env vars:
   REGION
@@ -51,6 +48,11 @@ Optional env vars:
   COMPACTOR_HEALTH_TIMEOUT
   API_HEALTH_TIMEOUT
   HEALTH_CHECK_INTERVAL
+  FLOW_AUTOMATION_RECONCILER_IMAGE
+  FLOW_DISPATCHER_IMAGE
+  FLOW_SWEEPER_IMAGE
+  FLOW_TIMER_INGEST_IMAGE
+  FLOW_WORKER_IMAGE
 EOF
 }
 
@@ -67,19 +69,96 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
 }
 
+tfvars_file_path() {
+  echo "${ROOT_DIR}/infra/terraform/environments/${ENVIRONMENT}.tfvars"
+}
+
+tfvars_string_value() {
+  local key="$1"
+  local tfvars_file
+  tfvars_file="$(tfvars_file_path)"
+
+  [[ -f "$tfvars_file" ]] || return 0
+
+  awk -F= -v key="$key" '
+    $1 ~ "^[[:space:]]*" key "[[:space:]]*$" {
+      value = $2
+      sub(/[[:space:]]*#.*/, "", value)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      if (value ~ /^".*"$/) {
+        sub(/^"/, "", value)
+        sub(/"$/, "", value)
+      }
+      print value
+      exit
+    }
+  ' "$tfvars_file"
+}
+
+effective_tfvar_value() {
+  local tfvar_name="$1"
+  local direct_env_name="${2:-}"
+  local tf_var_env_name="TF_VAR_${tfvar_name}"
+
+  if [[ -n "$direct_env_name" && -n "${!direct_env_name:-}" ]]; then
+    printf '%s' "${!direct_env_name}"
+    return 0
+  fi
+
+  if [[ -n "${!tf_var_env_name:-}" ]]; then
+    printf '%s' "${!tf_var_env_name}"
+    return 0
+  fi
+
+  tfvars_string_value "$tfvar_name"
+}
+
+export_tf_var_if_set() {
+  local tfvar_name="$1"
+  local env_var_name="$2"
+  local value="${!env_var_name:-}"
+
+  if [[ -n "$value" ]]; then
+    export "TF_VAR_${tfvar_name}=$value"
+  fi
+}
+
+validate_flow_core_config() {
+  local flow_tenant_id flow_workspace_id
+  local flow_dispatcher_image flow_sweeper_image flow_timer_ingest_image flow_worker_image
+  local flow_automation_reconciler_image
+
+  flow_tenant_id="$(effective_tfvar_value "flow_tenant_id")"
+  flow_workspace_id="$(effective_tfvar_value "flow_workspace_id")"
+  flow_dispatcher_image="$(effective_tfvar_value "flow_dispatcher_image" "FLOW_DISPATCHER_IMAGE")"
+  flow_sweeper_image="$(effective_tfvar_value "flow_sweeper_image" "FLOW_SWEEPER_IMAGE")"
+  flow_timer_ingest_image="$(effective_tfvar_value "flow_timer_ingest_image" "FLOW_TIMER_INGEST_IMAGE")"
+  flow_worker_image="$(effective_tfvar_value "flow_worker_image" "FLOW_WORKER_IMAGE")"
+  flow_automation_reconciler_image="$(effective_tfvar_value "flow_automation_reconciler_image" "FLOW_AUTOMATION_RECONCILER_IMAGE")"
+
+  if [[ -n "${flow_tenant_id}${flow_workspace_id}${flow_dispatcher_image}${flow_sweeper_image}${flow_timer_ingest_image}${flow_worker_image}" ]]; then
+    if [[ -z "$flow_tenant_id" || -z "$flow_workspace_id" || -z "$flow_dispatcher_image" || -z "$flow_sweeper_image" || -z "$flow_timer_ingest_image" || -z "$flow_worker_image" ]]; then
+      die "Flow control-plane config is partial. Set flow_tenant_id, flow_workspace_id, and flow dispatcher/sweeper/timer-ingest/worker images together."
+    fi
+  fi
+
+  if [[ -n "$flow_automation_reconciler_image" && (-z "$flow_tenant_id" || -z "$flow_workspace_id") ]]; then
+    die "Flow automation reconciler image requires flow_tenant_id and flow_workspace_id."
+  fi
+}
+
 validate_env() {
   [[ -z "${PROJECT_ID:-}" ]] && die "PROJECT_ID is required"
   [[ -z "${API_IMAGE:-}" ]] && die "API_IMAGE is required"
   [[ -z "${COMPACTOR_IMAGE:-}" ]] && die "COMPACTOR_IMAGE is required"
   [[ -z "${FLOW_COMPACTOR_IMAGE:-}" ]] && die "FLOW_COMPACTOR_IMAGE is required"
-  [[ -z "${FLOW_DISPATCHER_IMAGE:-}" ]] && die "FLOW_DISPATCHER_IMAGE is required"
-  [[ -z "${FLOW_SWEEPER_IMAGE:-}" ]] && die "FLOW_SWEEPER_IMAGE is required"
-  [[ -z "${FLOW_WORKER_IMAGE:-}" ]] && die "FLOW_WORKER_IMAGE is required"
 
   case "$ENVIRONMENT" in
-    dev|staging|prod) ;;
-    *) die "Invalid --env '$ENVIRONMENT' (expected dev|staging|prod)" ;;
+  dev | staging | prod) ;;
+  *) die "Invalid --env '$ENVIRONMENT' (expected dev|staging|prod)" ;;
   esac
+
+  validate_flow_core_config
 }
 
 start_run_proxy() {
@@ -209,9 +288,11 @@ deploy_terraform() {
   export TF_VAR_api_image="$API_IMAGE"
   export TF_VAR_compactor_image="$COMPACTOR_IMAGE"
   export TF_VAR_flow_compactor_image="$FLOW_COMPACTOR_IMAGE"
-  export TF_VAR_flow_dispatcher_image="$FLOW_DISPATCHER_IMAGE"
-  export TF_VAR_flow_sweeper_image="$FLOW_SWEEPER_IMAGE"
-  export TF_VAR_flow_worker_image="$FLOW_WORKER_IMAGE"
+  export_tf_var_if_set "flow_automation_reconciler_image" "FLOW_AUTOMATION_RECONCILER_IMAGE"
+  export_tf_var_if_set "flow_dispatcher_image" "FLOW_DISPATCHER_IMAGE"
+  export_tf_var_if_set "flow_sweeper_image" "FLOW_SWEEPER_IMAGE"
+  export_tf_var_if_set "flow_timer_ingest_image" "FLOW_TIMER_INGEST_IMAGE"
+  export_tf_var_if_set "flow_worker_image" "FLOW_WORKER_IMAGE"
   if [[ -n "${PROJECT_NUMBER:-}" ]]; then
     export TF_VAR_project_number="$PROJECT_NUMBER"
   else
@@ -247,9 +328,11 @@ deploy_terraform_remaining() {
   export TF_VAR_api_image="$API_IMAGE"
   export TF_VAR_compactor_image="$COMPACTOR_IMAGE"
   export TF_VAR_flow_compactor_image="$FLOW_COMPACTOR_IMAGE"
-  export TF_VAR_flow_dispatcher_image="$FLOW_DISPATCHER_IMAGE"
-  export TF_VAR_flow_sweeper_image="$FLOW_SWEEPER_IMAGE"
-  export TF_VAR_flow_worker_image="$FLOW_WORKER_IMAGE"
+  export_tf_var_if_set "flow_automation_reconciler_image" "FLOW_AUTOMATION_RECONCILER_IMAGE"
+  export_tf_var_if_set "flow_dispatcher_image" "FLOW_DISPATCHER_IMAGE"
+  export_tf_var_if_set "flow_sweeper_image" "FLOW_SWEEPER_IMAGE"
+  export_tf_var_if_set "flow_timer_ingest_image" "FLOW_TIMER_INGEST_IMAGE"
+  export_tf_var_if_set "flow_worker_image" "FLOW_WORKER_IMAGE"
   if [[ -n "${PROJECT_NUMBER:-}" ]]; then
     export TF_VAR_project_number="$PROJECT_NUMBER"
   else
@@ -270,26 +353,26 @@ main() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --env)
-        ENVIRONMENT="$2"
-        shift 2
-        ;;
-      --dry-run)
-        DRY_RUN=true
-        shift
-        ;;
-      --timeout)
-        COMPACTOR_HEALTH_TIMEOUT="$2"
-        shift 2
-        ;;
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      *)
-        usage
-        die "Unknown option: $1"
-        ;;
+    --env)
+      ENVIRONMENT="$2"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    --timeout)
+      COMPACTOR_HEALTH_TIMEOUT="$2"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      die "Unknown option: $1"
+      ;;
     esac
   done
 

@@ -164,6 +164,19 @@ impl CloudTasksConfig {
     }
 }
 
+/// Resolves the OIDC audience for an HTTP target.
+///
+/// Cloud Run expects the service root URL or a configured custom audience,
+/// which may differ from the path-qualified target URL used for the request.
+#[must_use]
+pub fn resolve_target_audience(configured: Option<&str>, target_url: &str) -> String {
+    configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(target_url)
+        .to_string()
+}
+
 // ============================================================================
 // GCP Feature-Gated Implementation
 // ============================================================================
@@ -825,7 +838,7 @@ pub use placeholder_impl::CloudTasksDispatcher;
 mod tests {
     use std::time::Duration;
 
-    use super::{CloudTasksConfig, CloudTasksDispatcher, RetryConfig};
+    use super::{CloudTasksConfig, CloudTasksDispatcher, RetryConfig, resolve_target_audience};
 
     #[test]
     fn config_queue_path() {
@@ -887,6 +900,33 @@ mod tests {
         .with_queue_retry_updates(false);
 
         assert!(!config.apply_queue_retry_config);
+    }
+
+    #[test]
+    fn resolve_target_audience_prefers_override() {
+        assert_eq!(
+            resolve_target_audience(
+                Some("https://override.run.app"),
+                "https://target.run.app/dispatch"
+            ),
+            "https://override.run.app"
+        );
+    }
+
+    #[test]
+    fn resolve_target_audience_falls_back_to_target_url() {
+        assert_eq!(
+            resolve_target_audience(None, "https://target.run.app/dispatch"),
+            "https://target.run.app/dispatch"
+        );
+    }
+
+    #[test]
+    fn resolve_target_audience_ignores_empty_override() {
+        assert_eq!(
+            resolve_target_audience(Some("   "), "https://target.run.app/dispatch"),
+            "https://target.run.app/dispatch"
+        );
     }
 
     #[cfg(not(feature = "gcp"))]

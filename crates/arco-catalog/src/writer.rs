@@ -396,6 +396,12 @@ pub struct CatalogTransactionCommit {
     pub repair_pending: bool,
 }
 
+#[derive(Debug, Clone)]
+struct DefaultCatalogOutcome {
+    catalog: CatalogRecord,
+    repair_pending: bool,
+}
+
 impl EventSource {
     /// Creates a new event source.
     #[must_use]
@@ -602,8 +608,24 @@ impl CatalogWriter {
         compactor: &Arc<dyn SyncCompactor>,
         opts: &WriteOptions,
     ) -> Result<CatalogRecord> {
+        Ok(self
+            .ensure_default_catalog_locked_with_result(guard, state, compactor, opts)
+            .await?
+            .catalog)
+    }
+
+    async fn ensure_default_catalog_locked_with_result(
+        &self,
+        guard: &crate::lock::LockGuard<dyn StorageBackend>,
+        state: &crate::state::CatalogState,
+        compactor: &Arc<dyn SyncCompactor>,
+        opts: &WriteOptions,
+    ) -> Result<DefaultCatalogOutcome> {
         if let Some(existing) = state.catalogs.iter().find(|c| c.name == "default") {
-            return Ok(existing.clone());
+            return Ok(DefaultCatalogOutcome {
+                catalog: existing.clone(),
+                repair_pending: false,
+            });
         }
 
         let now = Utc::now().timestamp_millis();
@@ -636,9 +658,12 @@ impl CatalogWriter {
             opts.request_id.clone(),
         );
 
-        compactor.sync_compact(request).await?;
+        let response = compactor.sync_compact(request).await?;
 
-        Ok(CatalogRecord::from(&default))
+        Ok(DefaultCatalogOutcome {
+            catalog: CatalogRecord::from(&default),
+            repair_pending: response.repair_pending,
+        })
     }
 
     // ========================================================================
@@ -1051,7 +1076,7 @@ impl CatalogWriter {
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
         let default_catalog = match self
-            .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+            .ensure_default_catalog_locked_with_result(&guard, &state, compactor, &opts)
             .await
         {
             Ok(catalog) => catalog,
@@ -1061,6 +1086,8 @@ impl CatalogWriter {
             }
         };
 
+        let default_catalog_repair_pending = default_catalog.repair_pending;
+        let default_catalog = default_catalog.catalog;
         let default_catalog_id = default_catalog.id.as_str();
         if state.namespaces.iter().any(|ns| {
             ns.name == name
@@ -1109,6 +1136,10 @@ impl CatalogWriter {
             compactor.sync_compact(request).await,
         )
         .await
+        .map(|mut commit| {
+            commit.repair_pending |= default_catalog_repair_pending;
+            commit
+        })
     }
 
     /// Updates a namespace's description.
@@ -1540,7 +1571,7 @@ impl CatalogWriter {
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
         let default_catalog = match self
-            .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+            .ensure_default_catalog_locked_with_result(&guard, &state, compactor, &opts)
             .await
         {
             Ok(catalog) => catalog,
@@ -1550,6 +1581,8 @@ impl CatalogWriter {
             }
         };
 
+        let default_catalog_repair_pending = default_catalog.repair_pending;
+        let default_catalog = default_catalog.catalog;
         let default_catalog_id = default_catalog.id.as_str();
         let ns = state
             .namespaces
@@ -1640,6 +1673,10 @@ impl CatalogWriter {
             compactor.sync_compact(request).await,
         )
         .await
+        .map(|mut commit| {
+            commit.repair_pending |= default_catalog_repair_pending;
+            commit
+        })
     }
 
     /// Registers a new table under a UC-like catalog + schema.
@@ -2013,7 +2050,7 @@ impl CatalogWriter {
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
         let default_catalog = match self
-            .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+            .ensure_default_catalog_locked_with_result(&guard, &state, compactor, &opts)
             .await
         {
             Ok(catalog) => catalog,
@@ -2023,6 +2060,8 @@ impl CatalogWriter {
             }
         };
 
+        let default_catalog_repair_pending = default_catalog.repair_pending;
+        let default_catalog = default_catalog.catalog;
         let default_catalog_id = default_catalog.id.as_str();
         let ns = state
             .namespaces
@@ -2100,6 +2139,10 @@ impl CatalogWriter {
             compactor.sync_compact(request).await,
         )
         .await
+        .map(|mut commit| {
+            commit.repair_pending |= default_catalog_repair_pending;
+            commit
+        })
     }
 
     /// Drops a table.
@@ -2261,7 +2304,7 @@ impl CatalogWriter {
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
         let default_catalog = match self
-            .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+            .ensure_default_catalog_locked_with_result(&guard, &state, compactor, &opts)
             .await
         {
             Ok(catalog) => catalog,
@@ -2271,6 +2314,8 @@ impl CatalogWriter {
             }
         };
 
+        let default_catalog_repair_pending = default_catalog.repair_pending;
+        let default_catalog = default_catalog.catalog;
         let default_catalog_id = default_catalog.id.as_str();
         let ns = state
             .namespaces
@@ -2323,6 +2368,10 @@ impl CatalogWriter {
             compactor.sync_compact(request).await,
         )
         .await
+        .map(|mut commit| {
+            commit.repair_pending |= default_catalog_repair_pending;
+            commit
+        })
     }
 
     /// Renames a table within the same namespace.

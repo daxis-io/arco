@@ -14,6 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
+use tonic::transport::Server as GrpcServer;
 use tower::ServiceBuilder;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -34,6 +35,7 @@ use crate::compactor_client::CompactorClient;
 use crate::config::{Config, CorsConfig};
 use crate::context::RequestContext;
 use crate::error::ApiError;
+use crate::grpc_transactions;
 use crate::rate_limit::RateLimitState;
 use arco_catalog::SyncCompactor;
 use arco_core::Result;
@@ -200,6 +202,12 @@ impl AppState {
     #[must_use]
     pub fn sensor_evaluator(&self) -> Arc<dyn SensorEvaluator> {
         Arc::clone(&self.sensor_evaluator)
+    }
+
+    /// Returns the shared rate-limit state.
+    #[must_use]
+    pub(crate) fn rate_limit(&self) -> Arc<RateLimitState> {
+        Arc::clone(&self.rate_limit)
     }
 
     /// Returns the audit event emitter.
@@ -436,7 +444,8 @@ fn api_error_to_unity_catalog_response(
 
 /// The Arco API server.
 ///
-/// Serves both HTTP and gRPC endpoints for catalog and orchestration.
+/// Serves the HTTP and gRPC API surfaces for catalog, orchestration, and
+/// transaction routes.
 pub struct Server {
     config: Config,
     storage: Arc<dyn arco_core::storage::StorageBackend>,
@@ -495,16 +504,22 @@ impl Server {
         &self.config
     }
 
-    /// Creates the router with all routes and middleware.
-    #[allow(clippy::cognitive_complexity)]
-    fn create_router(&self, credential_provider: Option<Arc<dyn CredentialProvider>>) -> Router {
-        let state = Arc::new(AppState::new_with_audit(
+    fn create_state(&self) -> Arc<AppState> {
+        Arc::new(AppState::new_with_audit(
             self.config.clone(),
             Arc::clone(&self.storage),
             Arc::clone(&self.sensor_evaluator),
             self.audit_emitter.clone(),
-        ));
+        ))
+    }
 
+    /// Creates the router with all routes and middleware.
+    #[allow(clippy::cognitive_complexity)]
+    fn create_router(
+        &self,
+        state: Arc<AppState>,
+        credential_provider: Option<Arc<dyn CredentialProvider>>,
+    ) -> Router {
         // Build CORS layer from config
         let cors = self.build_cors_layer();
 
@@ -761,8 +776,11 @@ impl Server {
             None
         };
 
-        let addr = SocketAddr::from(([0, 0, 0, 0], self.config.http_port));
-        let router = self.create_router(credential_provider);
+        let state = self.create_state();
+        let http_addr = SocketAddr::from(([0, 0, 0, 0], self.config.http_port));
+        let grpc_addr = SocketAddr::from(([0, 0, 0, 0], self.config.grpc_port));
+        let router = self.create_router(Arc::clone(&state), credential_provider);
+        let grpc_service = grpc_transactions::service(state);
 
         tracing::info!(
             http_port = self.config.http_port,
@@ -770,18 +788,38 @@ impl Server {
             "Starting Arco API server"
         );
 
-        let listener =
-            tokio::net::TcpListener::bind(addr)
-                .await
-                .map_err(|e| arco_core::Error::Internal {
-                    message: format!("failed to bind to {addr}: {e}"),
-                })?;
-
-        axum::serve(listener, router)
+        let http_listener = tokio::net::TcpListener::bind(http_addr)
             .await
             .map_err(|e| arco_core::Error::Internal {
-                message: format!("server error: {e}"),
+                message: format!("failed to bind HTTP listener to {http_addr}: {e}"),
             })?;
+
+        let grpc_listener = tokio::net::TcpListener::bind(grpc_addr)
+            .await
+            .map_err(|e| arco_core::Error::Internal {
+                message: format!("failed to bind gRPC listener to {grpc_addr}: {e}"),
+            })?;
+
+        tokio::try_join!(
+            async {
+                axum::serve(http_listener, router)
+                    .await
+                    .map_err(|e| arco_core::Error::Internal {
+                        message: format!("http server error: {e}"),
+                    })
+            },
+            async {
+                GrpcServer::builder()
+                    .add_service(grpc_service)
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+                        grpc_listener,
+                    ))
+                    .await
+                    .map_err(|e| arco_core::Error::Internal {
+                        message: format!("gRPC server error: {e}"),
+                    })
+            }
+        )?;
 
         Ok(())
     }
@@ -798,7 +836,8 @@ impl Server {
     /// Credential vending is disabled in test mode.
     #[doc(hidden)]
     pub fn test_router(&self) -> Router {
-        self.create_router(None)
+        let state = self.create_state();
+        self.create_router(state, None)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -920,6 +959,16 @@ impl Server {
                     ));
                 }
             }
+        }
+
+        if self.config.http_port != 0
+            && self.config.grpc_port != 0
+            && self.config.http_port == self.config.grpc_port
+        {
+            return Err(arco_core::Error::InvalidInput(
+                "http_port and grpc_port must differ when both are explicitly configured"
+                    .to_string(),
+            ));
         }
 
         Ok(())

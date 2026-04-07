@@ -1,8 +1,8 @@
 # Control-Plane Transactions Follow-Up
 
-This note tracks two transaction-runtime follow-ups that are explicit in the
-current repo state but were not called out clearly in the earlier plan and PI
-docs.
+This note records the two transaction-runtime follow-ups that were called out
+after the initial control-plane transaction landing and are now resolved in the
+current repo state.
 
 It is linked from `2026-03-30-control-plane-transactions.md` and is intended to
 ship alongside that plan update so the reference is not dangling.
@@ -11,58 +11,48 @@ ship alongside that plan update so the reference is not dangling.
 
 - Single-domain transaction runtime support exists for catalog and
   orchestration.
-- The currently shipped transport surface is HTTP-aligned axum endpoints using
-  the checked-in protobuf request/response envelopes.
-- `OrchestrationTxReceipt.commit_id` currently reuses the visible
-  `revision_ulid`.
+- The shipped transport surface now includes both the protobuf-aligned HTTP
+  routes and the tonic gRPC service generated from `transactions.proto`.
+- The gRPC transaction surface now reuses the same request-scope validation,
+  per-tenant rate limiting, request-id propagation, and request metrics path as
+  the HTTP transaction routes.
+- `OrchestrationTxReceipt.commit_id` now identifies an immutable orchestration
+  commit receipt artifact and is distinct from `revision_ulid`.
 
-## Follow-up 1: real tonic/gRPC transaction transport
-
-### Current behavior
-
-`transactions.proto` defines `ControlPlaneTransactionService`, but the checked-in
-runtime exposes the transaction APIs through HTTP/protobuf-aligned axum routes.
-`arco-api` still carries `grpc_port` configuration and crate-level gRPC wording,
-but there is no end-to-end tonic wiring for the transaction service in the
-current repo state.
-
-### Why this remains open
-
-The single-domain runtime work intentionally chose the smallest sound transport
-integration consistent with the active server architecture instead of adding a
-new tonic serving path in the same change.
-
-### Exit criteria
-
-1. Generate and wire a tonic service for `arco.v1.ControlPlaneTransactionService`.
-2. Register the transaction service on the API server alongside the existing
-   transport surface, or explicitly retire the HTTP-aligned transaction routes.
-3. Add transport tests proving `ApplyCatalogDdl`,
-   `GetCatalogTransaction`, `CommitOrchestrationBatch`, and
-   `GetOrchestrationTransaction` work through the chosen gRPC path.
-4. Document the supported transaction transport as a stable operator-facing
-   contract.
-
-## Follow-up 2: distinct orchestration commit identity
+## Resolution 1: tonic/gRPC transaction transport
 
 ### Current behavior
 
-`OrchestrationTxReceipt.commit_id` is populated from the visible manifest
-`revision_ulid`. This is a compatibility mapping, not proof that orchestration
-already exposes a distinct audit-chain commit artifact.
+`transactions.proto` again defines `ControlPlaneTransactionService`, `arco-proto`
+generates the tonic client/server modules, and `arco-api` serves the gRPC
+transport on `grpc_port` alongside the existing HTTP routes with the same
+request-id, auth, rate-limit, and metrics behavior used by the HTTP
+transaction endpoints.
 
-### Why this remains open
+### Evidence
 
-The current orchestration publish flow surfaces one stable visible revision
-identifier. It does not yet expose a separate commit identity that can fill
-`commit_id` independently from `revision_ulid`.
+- `crates/arco-api/src/grpc_transactions_tests.rs` exercises
+  `ApplyCatalogDdl`, `GetCatalogTransaction`, `CommitOrchestrationBatch`,
+  `GetOrchestrationTransaction`, `CommitRootTransaction`, and
+  `GetRootTransaction` through a real tonic server and generated client.
+- The same gRPC integration test file verifies production-mode bearer JWT auth
+  and per-tenant rate-limit/request-id metadata behavior on the gRPC transport.
+- `crates/arco-api/src/server.rs` binds both HTTP and gRPC listeners in the
+  runtime server.
 
-### Exit criteria
+## Resolution 2: distinct orchestration commit identity
 
-1. Decide whether orchestration needs a distinct transaction-visible commit
-   artifact beyond the manifest revision.
-2. If yes, surface that artifact from the orchestration runtime and use it for
-   `OrchestrationTxReceipt.commit_id`.
-3. Preserve `revision_ulid` as the visible manifest revision field.
-4. Update transaction tests and docs so callers can rely on the final receipt
-   identity semantics.
+### Current behavior
+
+Each successful orchestration transaction now mints a distinct `commit_id`,
+persists an immutable receipt at `commits/orchestration/{commit_id}.json`, and
+keeps `revision_ulid` as the separately visible manifest revision field.
+
+### Evidence
+
+- `crates/arco-api/src/control_plane_transactions.rs` now generates and writes
+  a separate orchestration commit receipt artifact before finalizing the visible
+  transaction record.
+- `crates/arco-api/tests/control_plane_transactions_api.rs` verifies that
+  `commit_id != revision_ulid`, that the immutable commit receipt exists, and
+  that idempotent replay returns the same `commit_id`.

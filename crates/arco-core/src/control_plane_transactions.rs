@@ -114,6 +114,12 @@ impl ControlPlaneTxPaths {
     pub fn root_commit_receipt(commit_id: &str) -> String {
         format!("commits/root/{commit_id}.json")
     }
+
+    /// Returns the immutable orchestration commit receipt path.
+    #[must_use]
+    pub fn orchestration_commit_receipt(commit_id: &str) -> String {
+        format!("commits/orchestration/{commit_id}.json")
+    }
 }
 
 /// Shared transaction record stored under `transactions/{domain}/{tx_id}.json`.

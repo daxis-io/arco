@@ -644,11 +644,10 @@ impl<'a> ControlPlaneTransactionService<'a> {
         };
 
         let visible_at = Utc::now();
+        let commit_id = Ulid::new().to_string();
         let receipt = OrchestrationTxReceipt {
             tx_id: tx_id.clone(),
-            // The current orchestration compactor surfaces one stable manifest revision ULID.
-            // Until a distinct audit-chain commit artifact exists, use that revision as commit_id.
-            commit_id: commit.manifest_revision.clone(),
+            commit_id: commit_id.clone(),
             manifest_id: commit.manifest_id.clone(),
             revision_ulid: commit.manifest_revision,
             delta_id: commit.delta_id.unwrap_or_default(),
@@ -657,13 +656,41 @@ impl<'a> ControlPlaneTransactionService<'a> {
             read_token: format!("orchestration:{}", commit.manifest_id),
             visible_at,
         };
+        let mut repair_pending = commit.repair_pending;
+        match self
+            .write_json(
+                &ControlPlaneTxPaths::orchestration_commit_receipt(&commit_id),
+                &receipt,
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+        {
+            Ok(WriteOutcome::Written) => {}
+            Ok(WriteOutcome::PreconditionFailed) => {
+                repair_pending = true;
+                tracing::warn!(
+                    tx_id,
+                    commit_id = %receipt.commit_id,
+                    "orchestration commit receipt already exists after visibility; leaving repair pending"
+                );
+            }
+            Err(error) => {
+                repair_pending = true;
+                tracing::warn!(
+                    error = ?error,
+                    tx_id,
+                    commit_id = %receipt.commit_id,
+                    "failed to persist orchestration commit receipt after visibility"
+                );
+            }
+        }
 
         self.finalize_visible(
             ControlPlaneTxDomain::Orchestration,
             &tx_id,
             commit.lock_path,
             commit.fencing_token,
-            commit.repair_pending,
+            repair_pending,
             visible_at,
             receipt.clone(),
         )
@@ -671,7 +698,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
 
         Ok(TxExecutionOutcome {
             receipt,
-            repair_pending: commit.repair_pending,
+            repair_pending,
         })
     }
 
@@ -1257,6 +1284,12 @@ impl OrchestrationBatchMutation {
         events: &[OrchestrationEventEnvelope],
         allow_inline_merge: bool,
     ) -> Result<Self, ApiError> {
+        if events.is_empty() {
+            return Err(ApiError::bad_request(
+                "orchestration batch must include at least one event",
+            ));
+        }
+
         if allow_inline_merge {
             return Err(ApiError::bad_request(
                 "CommitOrchestrationBatch allow_inline_merge is not supported",

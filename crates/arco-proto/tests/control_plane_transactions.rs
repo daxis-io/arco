@@ -258,6 +258,26 @@ fn commit_root_transaction_rejects_missing_mutation_kind() {
 }
 
 #[test]
+fn commit_root_transaction_rejects_empty_orchestration_events() {
+    let request = CommitRootTransactionRequest {
+        header: Some(sample_header()),
+        mutations: vec![DomainMutation {
+            kind: Some(domain_mutation::Kind::Orchestration(
+                OrchestrationBatchSpec {
+                    events: Vec::new(),
+                    allow_inline_merge: Some(false),
+                },
+            )),
+        }],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(ControlPlaneTransactionContractError::EmptyRootOrchestrationEvents(0))
+    );
+}
+
+#[test]
 fn commit_root_transaction_accepts_enum_backed_domain_usage() {
     let request = CommitRootTransactionRequest {
         header: Some(sample_header()),

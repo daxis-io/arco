@@ -25,10 +25,10 @@
 //!   /api/v1/namespaces/{ns}/tables - Table CRUD
 //!   /api/v1/lineage              - Lineage edge APIs
 //!   /api/v1/browser/urls         - Signed URL minting for browser reads
+//!   /api/v1/transactions         - Control-plane transaction routes
 //!
 //! gRPC:
-//!   arco.v1.CatalogService - Catalog operations
-//!   arco.v1.FlowService    - Orchestration operations
+//!   arco.v1.ControlPlaneTransactionService - Transaction commit and lookup APIs
 //! ```
 //!
 //! ## Example
@@ -56,6 +56,7 @@ pub mod config;
 pub mod context;
 pub(crate) mod control_plane_transactions;
 pub mod error;
+pub(crate) mod grpc_transactions;
 pub mod metrics;
 pub mod openapi;
 pub(crate) mod orchestration_compaction;

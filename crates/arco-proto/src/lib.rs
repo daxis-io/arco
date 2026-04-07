@@ -7,12 +7,21 @@
 #![allow(missing_docs)] // Generated code doesn't have docs
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
-#[allow(clippy::all, clippy::cargo, clippy::nursery, clippy::pedantic)]
+mod codec;
+#[allow(
+    unused_qualifications,
+    deprecated,
+    clippy::all,
+    clippy::cargo,
+    clippy::nursery,
+    clippy::pedantic
+)]
 mod generated {
     // Include generated code; all types are re-exported at crate root.
     include!(concat!(env!("OUT_DIR"), "/arco.v1.rs"));
 }
 
+pub use codec::{ProstCodec, ProstDecoder, ProstEncoder};
 pub use generated::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +80,7 @@ pub enum ControlPlaneTransactionContractError {
     MissingCatalogDdlOp,
     EmptyOrchestrationEvents,
     EmptyRootMutations,
+    EmptyRootOrchestrationEvents(usize),
     MissingRootMutationKind(usize),
 }
 
@@ -85,6 +95,12 @@ impl std::fmt::Display for ControlPlaneTransactionContractError {
             }
             Self::EmptyRootMutations => {
                 f.write_str("root transaction must include at least one mutation")
+            }
+            Self::EmptyRootOrchestrationEvents(index) => {
+                write!(
+                    f,
+                    "root orchestration mutation at index {index} must include at least one event"
+                )
             }
             Self::MissingRootMutationKind(index) => {
                 write!(f, "root mutation at index {index} must set kind")
@@ -197,6 +213,20 @@ impl CommitRootTransactionRequest {
             .position(|mutation| mutation.kind.is_none())
         {
             return Err(ControlPlaneTransactionContractError::MissingRootMutationKind(index));
+        }
+
+        if let Some(index) = self
+            .mutations
+            .iter()
+            .enumerate()
+            .find_map(|(index, mutation)| match mutation.kind.as_ref() {
+                Some(domain_mutation::Kind::Orchestration(spec)) if spec.events.is_empty() => {
+                    Some(index)
+                }
+                _ => None,
+            })
+        {
+            return Err(ControlPlaneTransactionContractError::EmptyRootOrchestrationEvents(index));
         }
 
         Ok(())

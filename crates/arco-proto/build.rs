@@ -13,9 +13,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let includes = ["../../proto"];
 
-    prost_build::Config::new()
+    tonic_prost_build::configure()
+        .codec_path("crate::ProstCodec")
         // Use BTreeMap for deterministic ordering in serde
-        .btree_map(["."])
+        .btree_map(".")
         // Add serde derives only to types that don't contain Timestamp
         // ID types
         .type_attribute(".arco.v1.TenantId", "#[derive(serde::Serialize, serde::Deserialize)]")

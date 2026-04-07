@@ -297,6 +297,25 @@ async fn load_root_commit_receipt(
     }
 }
 
+async fn load_orchestration_commit_receipt(
+    backend: Arc<dyn StorageBackend>,
+    commit_id: &str,
+) -> Result<Option<arco_core::control_plane_transactions::OrchestrationTxReceipt>> {
+    let storage = scoped_storage(backend);
+    match storage
+        .get_raw(&ControlPlaneTxPaths::orchestration_commit_receipt(
+            commit_id,
+        ))
+        .await
+    {
+        Ok(bytes) => serde_json::from_slice(bytes.as_ref())
+            .map(Some)
+            .context("decode orchestration commit receipt"),
+        Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn load_idempotency_record(
     backend: Arc<dyn StorageBackend>,
     domain: ControlPlaneTxDomain,
@@ -721,6 +740,7 @@ async fn commit_orchestration_batch_returns_visible_receipt_and_persists_lookup_
     assert!(!receipt.commit_id.is_empty());
     assert!(!receipt.manifest_id.is_empty());
     assert!(!receipt.revision_ulid.is_empty());
+    assert_ne!(receipt.commit_id, receipt.revision_ulid);
     assert!(!receipt.pointer_version.is_empty());
     assert_eq!(receipt.events_processed, 1);
     assert_eq!(
@@ -758,7 +778,7 @@ async fn commit_orchestration_batch_returns_visible_receipt_and_persists_lookup_
         Some(receipt.tx_id.as_str())
     );
 
-    let stored = load_orchestration_tx_record(backend, &receipt.tx_id).await?;
+    let stored = load_orchestration_tx_record(backend.clone(), &receipt.tx_id).await?;
     assert_eq!(stored.status, ControlPlaneTxStatus::Visible);
     assert_eq!(stored.request_id, "req-orch-01");
     assert_eq!(stored.idempotency_key, "idem-orch-01");
@@ -766,6 +786,13 @@ async fn commit_orchestration_batch_returns_visible_receipt_and_persists_lookup_
         stored.result.as_ref().map(|result| result.tx_id.as_str()),
         Some(receipt.tx_id.as_str())
     );
+
+    let commit_receipt = load_orchestration_commit_receipt(backend, &receipt.commit_id)
+        .await?
+        .context("orchestration commit receipt missing")?;
+    assert_eq!(commit_receipt.tx_id, receipt.tx_id);
+    assert_eq!(commit_receipt.commit_id, receipt.commit_id);
+    assert_eq!(commit_receipt.revision_ulid, receipt.revision_ulid);
 
     Ok(())
 }
@@ -797,15 +824,18 @@ async fn commit_orchestration_batch_replays_same_idempotency_key_and_rejects_has
     )
     .await?;
 
-    let first_tx = first_response
+    let first_receipt = first_response
         .receipt
-        .context("first orchestration receipt missing")?
-        .tx_id;
-    let replay_tx = replay_response
+        .context("first orchestration receipt missing")?;
+    let replay_receipt = replay_response
         .receipt
-        .context("replay orchestration receipt missing")?
-        .tx_id;
-    assert_eq!(first_tx, replay_tx, "idempotent replay must reuse tx_id");
+        .context("replay orchestration receipt missing")?;
+    assert_eq!(
+        first_receipt.tx_id, replay_receipt.tx_id,
+        "idempotent replay must reuse tx_id"
+    );
+    assert_eq!(first_receipt.commit_id, replay_receipt.commit_id);
+    assert_ne!(first_receipt.commit_id, first_receipt.revision_ulid);
 
     let (status, error) = post_error_json(
         router,
@@ -964,7 +994,8 @@ async fn commit_root_transaction_returns_visible_receipt_and_persists_lookup_rec
 }
 
 #[tokio::test]
-async fn commit_root_transaction_replays_same_idempotency_key() -> Result<()> {
+async fn commit_root_transaction_replays_same_idempotency_key_and_keeps_audit_receipt_stable()
+-> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = test_router_with_backend(backend.clone());
     let first = root_request(
@@ -1013,6 +1044,25 @@ async fn commit_root_transaction_replays_same_idempotency_key() -> Result<()> {
         first_receipt.super_manifest_path,
         replay_receipt.super_manifest_path
     );
+    let first_audit_receipt =
+        load_root_commit_receipt(backend.clone(), &first_receipt.root_commit_id)
+            .await?
+            .context("first replay audit receipt missing")?;
+    let replay_audit_receipt =
+        load_root_commit_receipt(backend.clone(), &replay_receipt.root_commit_id)
+            .await?
+            .context("replay audit receipt missing")?;
+    assert_eq!(first_audit_receipt.tx_id, first_receipt.tx_id);
+    assert_eq!(
+        first_audit_receipt.root_commit_id,
+        first_receipt.root_commit_id
+    );
+    assert_eq!(replay_audit_receipt.tx_id, replay_receipt.tx_id);
+    assert_eq!(
+        replay_audit_receipt.root_commit_id,
+        replay_receipt.root_commit_id
+    );
+    assert_eq!(first_audit_receipt, replay_audit_receipt);
 
     let idem =
         load_idempotency_record(backend, ControlPlaneTxDomain::Root, "idem-root-replay-01").await?;
@@ -1140,6 +1190,40 @@ async fn commit_root_transaction_retries_with_fresh_tx_id_after_super_manifest_f
         orchestration_commit.tx_id,
         first_orchestration_participant.tx_id
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_root_transaction_rejects_empty_orchestration_participant() -> Result<()> {
+    let router = test_router();
+    let mut request = root_request(
+        "idem-root-empty-orch-01",
+        "req-root-empty-orch-01",
+        "empty-orch-root",
+        "run-root-empty-orch-01",
+    );
+    let orchestration = request
+        .mutations
+        .get_mut(1)
+        .and_then(|mutation| mutation.kind.as_mut())
+        .and_then(|kind| match kind {
+            domain_mutation::Kind::Orchestration(spec) => Some(spec),
+            _ => None,
+        })
+        .context("root request orchestration mutation missing")?;
+    orchestration.events.clear();
+
+    let (status, error) = post_error_json(
+        router,
+        "/api/v1/transactions/commitRootTransaction",
+        &request,
+        "idem-root-empty-orch-01",
+        "req-root-empty-orch-01",
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["code"], "BAD_REQUEST");
 
     Ok(())
 }

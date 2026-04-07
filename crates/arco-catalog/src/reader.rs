@@ -131,6 +131,18 @@ pub struct CatalogReader {
     table_lookup_cache: RwLock<Option<TableLookupCache>>,
 }
 
+/// Explicit opt-in catalog read view pinned to one root transaction token.
+///
+/// This view resolves `root:{tx_id}` once, then reads the immutable catalog
+/// manifest referenced by that root super-manifest for all catalog-domain
+/// operations exposed here.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct PinnedCatalogReader<'a> {
+    reader: &'a CatalogReader,
+    catalog_manifest: CatalogDomainManifest,
+}
+
 #[derive(Debug, Clone)]
 struct TableLookupCache {
     snapshot_version: u64,
@@ -366,6 +378,45 @@ impl CatalogReader {
         })
     }
 
+    /// Resolves an explicit root read token into a pinned catalog read view.
+    ///
+    /// This is the opt-in path for root-token reads. It does not change the
+    /// default pointer-first behavior of [`CatalogReader`].
+    #[cfg(test)]
+    async fn pin_root_token(&self, read_token: &str) -> Result<PinnedCatalogReader<'_>> {
+        Ok(PinnedCatalogReader {
+            reader: self,
+            catalog_manifest: self
+                .read_catalog_manifest_for_root_token(read_token)
+                .await?,
+        })
+    }
+
+    async fn list_catalogs_from_catalog_manifest(
+        &self,
+        catalog_manifest: &CatalogDomainManifest,
+    ) -> Result<Vec<Catalog>> {
+        if catalog_manifest.snapshot_version == 0 {
+            return Ok(Vec::new());
+        }
+
+        let catalogs_path = CatalogPaths::snapshot_file(
+            CatalogDomain::Catalog,
+            catalog_manifest.snapshot_version,
+            "catalogs.parquet",
+        );
+
+        let records = match self.storage.get_raw(&catalogs_path).await {
+            Ok(bytes) => parquet_util::read_catalogs(&bytes)?,
+            Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+                Vec::new()
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        Ok(records.into_iter().map(Catalog::from).collect())
+    }
+
     async fn list_namespaces_from_catalog_manifest(
         &self,
         manifest: &CatalogDomainManifest,
@@ -385,6 +436,143 @@ impl CatalogReader {
 
         Ok(records.into_iter().map(Namespace::from).collect())
     }
+
+    async fn list_schemas_from_catalog_manifest(
+        &self,
+        catalog_manifest: &CatalogDomainManifest,
+        catalog: &str,
+    ) -> Result<Vec<Namespace>> {
+        if catalog_manifest.snapshot_version == 0 {
+            return Err(CatalogError::NotFound {
+                entity: "catalog".into(),
+                name: catalog.to_string(),
+            });
+        }
+
+        let catalogs = self
+            .list_catalogs_from_catalog_manifest(catalog_manifest)
+            .await?;
+
+        let default_catalog_id = catalogs
+            .iter()
+            .find(|c| c.name == "default")
+            .map(|c| c.id.as_str());
+        let requested_catalog_id = catalogs
+            .iter()
+            .find(|c| c.name == catalog)
+            .map(|c| c.id.as_str());
+
+        let effective_requested_catalog_id = if let Some(id) = requested_catalog_id {
+            Some(id)
+        } else if catalog == "default" {
+            default_catalog_id
+        } else {
+            return Err(CatalogError::NotFound {
+                entity: "catalog".into(),
+                name: catalog.to_string(),
+            });
+        };
+
+        let namespaces = self
+            .list_namespaces_from_catalog_manifest(catalog_manifest)
+            .await?;
+        Ok(namespaces
+            .into_iter()
+            .filter(|ns| match effective_requested_catalog_id {
+                Some(requested) => {
+                    ns.catalog_id.as_deref().or(default_catalog_id) == Some(requested)
+                }
+                None => ns.catalog_id.is_none(),
+            })
+            .collect())
+    }
+
+    async fn list_tables_for_namespace_id(
+        &self,
+        catalog_manifest: &CatalogDomainManifest,
+        namespace_id: &str,
+    ) -> Result<Vec<Table>> {
+        let tables_path = CatalogPaths::snapshot_file(
+            CatalogDomain::Catalog,
+            catalog_manifest.snapshot_version,
+            "tables.parquet",
+        );
+        let bytes = self.storage.get_raw(&tables_path).await?;
+        let records = parquet_util::read_tables(&bytes)?;
+
+        Ok(records
+            .into_iter()
+            .filter(|table| table.namespace_id == namespace_id)
+            .map(Table::from)
+            .collect())
+    }
+
+    async fn list_tables_from_catalog_manifest(
+        &self,
+        catalog_manifest: &CatalogDomainManifest,
+        namespace: &str,
+    ) -> Result<Vec<Table>> {
+        if catalog_manifest.snapshot_version == 0 {
+            return Err(CatalogError::NotFound {
+                entity: "namespace".into(),
+                name: namespace.to_string(),
+            });
+        }
+
+        let namespace_id = self
+            .list_namespaces_from_catalog_manifest(catalog_manifest)
+            .await?
+            .into_iter()
+            .find(|ns| ns.name == namespace)
+            .map(|ns| ns.id)
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "namespace".into(),
+                name: namespace.to_string(),
+            })?;
+
+        self.list_tables_for_namespace_id(catalog_manifest, namespace_id.as_str())
+            .await
+    }
+
+    async fn get_table_by_id_from_catalog_manifest(
+        &self,
+        catalog_manifest: &CatalogDomainManifest,
+        table_id: &str,
+    ) -> Result<Option<Table>> {
+        if catalog_manifest.snapshot_version == 0 {
+            return Ok(None);
+        }
+
+        let by_id = self
+            .table_lookup_by_id(catalog_manifest.snapshot_version)
+            .await?;
+
+        Ok(by_id.get(table_id).cloned())
+    }
+
+    async fn get_columns_from_catalog_manifest(
+        &self,
+        catalog_manifest: &CatalogDomainManifest,
+        table_id: &str,
+    ) -> Result<Vec<Column>> {
+        if catalog_manifest.snapshot_version == 0 {
+            return Ok(Vec::new());
+        }
+
+        let columns_path = CatalogPaths::snapshot_file(
+            CatalogDomain::Catalog,
+            catalog_manifest.snapshot_version,
+            "columns.parquet",
+        );
+        let bytes = self.storage.get_raw(&columns_path).await?;
+        let records = parquet_util::read_columns(&bytes)?;
+
+        Ok(records
+            .into_iter()
+            .filter(|column| column.table_id == table_id)
+            .map(Column::from)
+            .collect())
+    }
     // ========================================================================
     // Catalog Operations (UC-like model)
     // ========================================================================
@@ -396,26 +584,8 @@ impl CatalogReader {
     /// Returns an error if the manifest cannot be read or Parquet decoding fails.
     pub async fn list_catalogs(&self) -> Result<Vec<Catalog>> {
         let manifest = self.read_manifest().await?;
-
-        if manifest.catalog.snapshot_version == 0 {
-            return Ok(Vec::new());
-        }
-
-        let catalogs_path = CatalogPaths::snapshot_file(
-            CatalogDomain::Catalog,
-            manifest.catalog.snapshot_version,
-            "catalogs.parquet",
-        );
-
-        let records = match self.storage.get_raw(&catalogs_path).await {
-            Ok(bytes) => parquet_util::read_catalogs(&bytes)?,
-            Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
-                Vec::new()
-            }
-            Err(e) => return Err(e.into()),
-        };
-
-        Ok(records.into_iter().map(Catalog::from).collect())
+        self.list_catalogs_from_catalog_manifest(&manifest.catalog)
+            .await
     }
 
     /// Gets a catalog by name.
@@ -442,65 +612,8 @@ impl CatalogReader {
     /// Returns an error if the catalog doesn't exist or snapshot reads fail.
     pub async fn list_schemas(&self, catalog: &str) -> Result<Vec<Namespace>> {
         let manifest = self.read_manifest().await?;
-
-        if manifest.catalog.snapshot_version == 0 {
-            return Err(CatalogError::NotFound {
-                entity: "catalog".into(),
-                name: catalog.to_string(),
-            });
-        }
-
-        let catalogs_path = CatalogPaths::snapshot_file(
-            CatalogDomain::Catalog,
-            manifest.catalog.snapshot_version,
-            "catalogs.parquet",
-        );
-        let catalogs = match self.storage.get_raw(&catalogs_path).await {
-            Ok(bytes) => parquet_util::read_catalogs(&bytes)?,
-            Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
-                Vec::new()
-            }
-            Err(e) => return Err(e.into()),
-        };
-
-        let default_catalog_id = catalogs
-            .iter()
-            .find(|c| c.name == "default")
-            .map(|c| c.id.as_str());
-        let requested_catalog_id = catalogs
-            .iter()
-            .find(|c| c.name == catalog)
-            .map(|c| c.id.as_str());
-
-        let effective_requested_catalog_id = if let Some(id) = requested_catalog_id {
-            Some(id)
-        } else if catalog == "default" {
-            default_catalog_id
-        } else {
-            return Err(CatalogError::NotFound {
-                entity: "catalog".into(),
-                name: catalog.to_string(),
-            });
-        };
-
-        let ns_path = CatalogPaths::snapshot_file(
-            CatalogDomain::Catalog,
-            manifest.catalog.snapshot_version,
-            "namespaces.parquet",
-        );
-        let bytes = self.storage.get_raw(&ns_path).await?;
-        let records = parquet_util::read_namespaces(&bytes)?;
-
-        Ok(records
-            .into_iter()
-            .filter(|ns| match effective_requested_catalog_id {
-                Some(requested) => {
-                    ns.catalog_id.as_deref().or(default_catalog_id) == Some(requested)
-                }
-                None => ns.catalog_id.is_none(),
-            })
-            .map(Namespace::from)
-            .collect())
+        self.list_schemas_from_catalog_manifest(&manifest.catalog, catalog)
+            .await
     }
 
     /// Lists tables within a schema (namespace) inside the given catalog.
@@ -510,16 +623,9 @@ impl CatalogReader {
     /// Returns an error if the catalog or schema doesn't exist, or snapshot reads fail.
     pub async fn list_tables_in_schema(&self, catalog: &str, schema: &str) -> Result<Vec<Table>> {
         let manifest = self.read_manifest().await?;
-
-        if manifest.catalog.snapshot_version == 0 {
-            return Err(CatalogError::NotFound {
-                entity: "schema".into(),
-                name: format!("{catalog}.{schema}"),
-            });
-        }
-
-        let schemas = self.list_schemas(catalog).await?;
-        let namespace_id = schemas
+        let namespace_id = self
+            .list_schemas_from_catalog_manifest(&manifest.catalog, catalog)
+            .await?
             .iter()
             .find(|ns| ns.name == schema)
             .map(|ns| ns.id.clone())
@@ -527,20 +633,8 @@ impl CatalogReader {
                 entity: "schema".into(),
                 name: format!("{catalog}.{schema}"),
             })?;
-
-        let tables_path = CatalogPaths::snapshot_file(
-            CatalogDomain::Catalog,
-            manifest.catalog.snapshot_version,
-            "tables.parquet",
-        );
-        let bytes = self.storage.get_raw(&tables_path).await?;
-        let records = parquet_util::read_tables(&bytes)?;
-
-        Ok(records
-            .into_iter()
-            .filter(|t| t.namespace_id == namespace_id)
-            .map(Table::from)
-            .collect())
+        self.list_tables_for_namespace_id(&manifest.catalog, namespace_id.as_str())
+            .await
     }
 
     /// Gets a table by full UC-like name (catalog.schema.table).
@@ -608,7 +702,10 @@ impl CatalogReader {
     ///
     /// Returns an error if the snapshot cannot be read.
     pub async fn get_namespace(&self, name: &str) -> Result<Option<Namespace>> {
-        let namespaces = self.list_namespaces().await?;
+        let manifest = self.read_manifest().await?;
+        let namespaces = self
+            .list_namespaces_from_catalog_manifest(&manifest.catalog)
+            .await?;
         Ok(namespaces.into_iter().find(|ns| ns.name == name))
     }
 
@@ -627,46 +724,8 @@ impl CatalogReader {
     /// Returns an error if the namespace doesn't exist or the snapshot cannot be read.
     pub async fn list_tables(&self, namespace: &str) -> Result<Vec<Table>> {
         let manifest = self.read_manifest().await?;
-
-        if manifest.catalog.snapshot_version == 0 {
-            return Err(CatalogError::NotFound {
-                entity: "namespace".into(),
-                name: namespace.to_string(),
-            });
-        }
-
-        // First, find the namespace to get its ID
-        let ns_path = CatalogPaths::snapshot_file(
-            CatalogDomain::Catalog,
-            manifest.catalog.snapshot_version,
-            "namespaces.parquet",
-        );
-        let ns_bytes = self.storage.get_raw(&ns_path).await?;
-        let ns_records = parquet_util::read_namespaces(&ns_bytes)?;
-
-        let namespace_id = ns_records
-            .iter()
-            .find(|ns| ns.name == namespace)
-            .map(|ns| ns.id.clone())
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "namespace".into(),
-                name: namespace.to_string(),
-            })?;
-
-        // Read tables and filter by namespace_id
-        let tables_path = CatalogPaths::snapshot_file(
-            CatalogDomain::Catalog,
-            manifest.catalog.snapshot_version,
-            "tables.parquet",
-        );
-        let tables_bytes = self.storage.get_raw(&tables_path).await?;
-        let table_records = parquet_util::read_tables(&tables_bytes)?;
-
-        Ok(table_records
-            .into_iter()
-            .filter(|t| t.namespace_id == namespace_id)
-            .map(Table::from)
-            .collect())
+        self.list_tables_from_catalog_manifest(&manifest.catalog, namespace)
+            .await
     }
 
     /// Gets a table by namespace and name.
@@ -684,7 +743,10 @@ impl CatalogReader {
     ///
     /// Returns an error if the namespace doesn't exist or the snapshot cannot be read.
     pub async fn get_table(&self, namespace: &str, name: &str) -> Result<Option<Table>> {
-        let tables = self.list_tables(namespace).await?;
+        let manifest = self.read_manifest().await?;
+        let tables = self
+            .list_tables_from_catalog_manifest(&manifest.catalog, namespace)
+            .await?;
         Ok(tables.into_iter().find(|t| t.name == name))
     }
 
@@ -699,16 +761,8 @@ impl CatalogReader {
     /// Returns an error if snapshot reads fail.
     pub async fn get_table_by_id(&self, table_id: &str) -> Result<Option<Table>> {
         let manifest = self.read_manifest().await?;
-
-        if manifest.catalog.snapshot_version == 0 {
-            return Ok(None);
-        }
-
-        let by_id = self
-            .table_lookup_by_id(manifest.catalog.snapshot_version)
-            .await?;
-
-        Ok(by_id.get(table_id).cloned())
+        self.get_table_by_id_from_catalog_manifest(&manifest.catalog, table_id)
+            .await
     }
 
     /// Lists columns for a table by table ID.
@@ -720,24 +774,8 @@ impl CatalogReader {
     /// Returns an error if the snapshot cannot be read.
     pub async fn get_columns(&self, table_id: &str) -> Result<Vec<Column>> {
         let manifest = self.read_manifest().await?;
-
-        if manifest.catalog.snapshot_version == 0 {
-            return Ok(Vec::new());
-        }
-
-        let columns_path = CatalogPaths::snapshot_file(
-            CatalogDomain::Catalog,
-            manifest.catalog.snapshot_version,
-            "columns.parquet",
-        );
-        let bytes = self.storage.get_raw(&columns_path).await?;
-        let records = parquet_util::read_columns(&bytes)?;
-
-        Ok(records
-            .into_iter()
-            .filter(|c| c.table_id == table_id)
-            .map(Column::from)
-            .collect())
+        self.get_columns_from_catalog_manifest(&manifest.catalog, table_id)
+            .await
     }
 
     // ========================================================================
@@ -1089,6 +1127,44 @@ impl CatalogReader {
             }
             CatalogDomain::Search => Ok(manifest.search.snapshot),
         }
+    }
+}
+
+#[cfg(test)]
+impl PinnedCatalogReader<'_> {
+    /// Lists namespaces from the pinned catalog manifest.
+    pub async fn list_namespaces(&self) -> Result<Vec<Namespace>> {
+        self.reader
+            .list_namespaces_from_catalog_manifest(&self.catalog_manifest)
+            .await
+    }
+
+    /// Gets a namespace by name from the pinned catalog manifest.
+    pub async fn get_namespace(&self, name: &str) -> Result<Option<Namespace>> {
+        let namespaces = self.list_namespaces().await?;
+        Ok(namespaces
+            .into_iter()
+            .find(|namespace| namespace.name == name))
+    }
+
+    /// Lists tables in a namespace from the pinned catalog manifest.
+    pub async fn list_tables(&self, namespace: &str) -> Result<Vec<Table>> {
+        self.reader
+            .list_tables_from_catalog_manifest(&self.catalog_manifest, namespace)
+            .await
+    }
+
+    /// Gets a table by namespace and name from the pinned catalog manifest.
+    pub async fn get_table(&self, namespace: &str, name: &str) -> Result<Option<Table>> {
+        let tables = self.list_tables(namespace).await?;
+        Ok(tables.into_iter().find(|table| table.name == name))
+    }
+
+    /// Gets a table by table ID from the pinned catalog manifest.
+    pub async fn get_table_by_id(&self, table_id: &str) -> Result<Option<Table>> {
+        self.reader
+            .get_table_by_id_from_catalog_manifest(&self.catalog_manifest, table_id)
+            .await
     }
 }
 
@@ -1635,5 +1711,222 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["bronze"]
         );
+    }
+
+    #[tokio::test]
+    async fn test_pin_root_token_returns_pinned_catalog_view_without_following_current_pointer() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage =
+            ScopedStorage::new(backend, "test-tenant", "test-workspace").expect("storage");
+        let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+        let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_namespace("bronze", None, WriteOptions::default())
+            .await
+            .expect("create bronze namespace");
+        let bronze_events = writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "bronze".to_string(),
+                    name: "events".to_string(),
+                    description: None,
+                    location: None,
+                    format: None,
+                    columns: vec![column("event_id")],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register bronze.events");
+
+        let first_pointer_bytes = storage
+            .get_raw(&CatalogPaths::domain_manifest_pointer(
+                CatalogDomain::Catalog,
+            ))
+            .await
+            .expect("first pointer");
+        let first_pointer: DomainManifestPointer =
+            serde_json::from_slice(&first_pointer_bytes).expect("parse first pointer");
+        let first_manifest_bytes = storage
+            .get_raw(&first_pointer.manifest_path)
+            .await
+            .expect("first immutable catalog manifest");
+        let first_manifest: CatalogDomainManifest =
+            serde_json::from_slice(&first_manifest_bytes).expect("parse first manifest");
+
+        writer
+            .create_namespace("silver", None, WriteOptions::default())
+            .await
+            .expect("create silver namespace");
+        writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "bronze".to_string(),
+                    name: "sessions".to_string(),
+                    description: None,
+                    location: None,
+                    format: None,
+                    columns: vec![column("session_id")],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register bronze.sessions");
+
+        let reader = CatalogReader::new(storage.clone());
+        let mut current_namespaces = reader
+            .list_namespaces()
+            .await
+            .expect("list current namespaces");
+        current_namespaces.sort_by(|left, right| left.name.cmp(&right.name));
+        assert_eq!(
+            current_namespaces
+                .iter()
+                .map(|namespace| namespace.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bronze", "silver"]
+        );
+        let mut current_tables = reader
+            .list_tables("bronze")
+            .await
+            .expect("list current bronze tables");
+        current_tables.sort_by(|left, right| left.name.cmp(&right.name));
+        assert_eq!(
+            current_tables
+                .iter()
+                .map(|table| table.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["events", "sessions"]
+        );
+
+        let tx_id = "01JROOTPINNEDVIEW0000000001";
+        let super_manifest_path = ControlPlaneTxPaths::root_super_manifest(tx_id);
+        let commit_id = first_manifest
+            .last_commit_id
+            .clone()
+            .expect("catalog manifest commit id");
+        let root_manifest = RootTxManifest {
+            tx_id: tx_id.to_string(),
+            fencing_token: 1,
+            published_at: Utc::now(),
+            domains: BTreeMap::from([(
+                ControlPlaneTxDomain::Catalog,
+                RootTxManifestDomain {
+                    manifest_id: first_pointer.manifest_id.clone(),
+                    manifest_path: first_pointer.manifest_path.clone(),
+                    commit_id: commit_id.clone(),
+                },
+            )]),
+        };
+        storage
+            .put_raw(
+                &super_manifest_path,
+                Bytes::from(serde_json::to_vec(&root_manifest).expect("serialize root manifest")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write root super-manifest");
+
+        let visible_at = Utc::now();
+        let root_record = RootTxRecord {
+            tx_id: tx_id.to_string(),
+            kind: ControlPlaneTxKind::RootCommit,
+            status: ControlPlaneTxStatus::Visible,
+            repair_pending: false,
+            request_id: "req-root-reader-02".to_string(),
+            idempotency_key: "idem-root-reader-02".to_string(),
+            request_hash: "sha256:root-reader-pinned-view".to_string(),
+            lock_path: ControlPlaneTxPaths::root_lock(),
+            fencing_token: 1,
+            prepared_at: visible_at,
+            visible_at: Some(visible_at),
+            result: Some(RootTxReceipt {
+                tx_id: tx_id.to_string(),
+                root_commit_id: "01JROOTPINNEDVIEWCOMMIT0001".to_string(),
+                super_manifest_path: super_manifest_path.clone(),
+                domain_commits: vec![DomainCommit {
+                    domain: ControlPlaneTxDomain::Catalog,
+                    tx_id: "01JCATROOTPARTICIPANT0000002".to_string(),
+                    commit_id,
+                    manifest_id: first_pointer.manifest_id.clone(),
+                    manifest_path: first_pointer.manifest_path.clone(),
+                    read_token: format!("catalog:{}", first_pointer.manifest_id),
+                }],
+                read_token: format!("root:{tx_id}"),
+                visible_at,
+            }),
+        };
+        storage
+            .put_raw(
+                &ControlPlaneTxPaths::record(ControlPlaneTxDomain::Root, tx_id),
+                Bytes::from(serde_json::to_vec(&root_record).expect("serialize root tx record")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write root tx record");
+
+        let pinned = reader
+            .pin_root_token(&format!("root:{tx_id}"))
+            .await
+            .expect("pin root token");
+        let mut pinned_namespaces = pinned
+            .list_namespaces()
+            .await
+            .expect("list pinned namespaces");
+        pinned_namespaces.sort_by(|left, right| left.name.cmp(&right.name));
+        assert_eq!(
+            pinned_namespaces
+                .iter()
+                .map(|namespace| namespace.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bronze"]
+        );
+        assert!(
+            pinned
+                .get_namespace("silver")
+                .await
+                .expect("lookup pinned silver namespace")
+                .is_none()
+        );
+        let bronze_namespace = pinned
+            .get_namespace("bronze")
+            .await
+            .expect("lookup pinned bronze namespace")
+            .expect("bronze namespace exists");
+        assert_eq!(bronze_namespace.name, "bronze");
+
+        let mut pinned_tables = pinned
+            .list_tables("bronze")
+            .await
+            .expect("list pinned bronze tables");
+        pinned_tables.sort_by(|left, right| left.name.cmp(&right.name));
+        assert_eq!(
+            pinned_tables
+                .iter()
+                .map(|table| table.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["events"]
+        );
+        assert!(
+            pinned
+                .get_table("bronze", "sessions")
+                .await
+                .expect("lookup pinned bronze.sessions")
+                .is_none()
+        );
+        let pinned_events = pinned
+            .get_table("bronze", "events")
+            .await
+            .expect("lookup pinned bronze.events")
+            .expect("bronze.events exists");
+        assert_eq!(pinned_events.id, bronze_events.id);
+        let pinned_by_id = pinned
+            .get_table_by_id(&bronze_events.id)
+            .await
+            .expect("lookup pinned table by id")
+            .expect("bronze.events exists by id");
+        assert_eq!(pinned_by_id.name, "events");
     }
 }

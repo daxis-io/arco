@@ -47,6 +47,10 @@ fn control_plane_transaction_paths_are_stable() {
         ControlPlaneTxPaths::root_commit_receipt("01JROOTCOMMIT"),
         "commits/root/01JROOTCOMMIT.json"
     );
+    assert_eq!(
+        ControlPlaneTxPaths::orchestration_commit_receipt("01JORCHCOMMIT"),
+        "commits/orchestration/01JORCHCOMMIT.json"
+    );
 }
 
 #[test]

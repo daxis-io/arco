@@ -190,8 +190,10 @@ message CommitOrchestrationBatchResponse {
 // Orchestration batch success receipt pinned to one manifest head.
 message OrchestrationTxReceipt {
   string tx_id = 1;
+  // Immutable orchestration commit receipt identifier.
   string commit_id = 2;
   string manifest_id = 3;
+  // Visible orchestration manifest revision published for this commit.
   string revision_ulid = 4;
   string delta_id = 5;
   string pointer_version = 6;

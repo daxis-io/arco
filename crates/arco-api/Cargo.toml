@@ -51,6 +51,8 @@ reqwest = { workspace = true }
 
 # gRPC
 tonic = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
 
 # Serialization
 serde = { workspace = true }

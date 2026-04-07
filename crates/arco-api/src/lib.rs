@@ -53,6 +53,7 @@ pub(crate) mod audit;
 pub mod compactor_client;
 pub mod config;
 pub mod context;
+pub(crate) mod control_plane_transactions;
 pub mod error;
 pub mod metrics;
 pub mod openapi;

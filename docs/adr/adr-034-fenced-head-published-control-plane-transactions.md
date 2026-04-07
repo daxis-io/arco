@@ -12,9 +12,12 @@ durability modes for orchestration compaction. Catalog and orchestration now
 need one shared transaction model with a single commit point, aligned failure
 semantics, and explicit treatment of repairable post-commit side effects.
 
-The core requirement is that Parquet remains the immutable projection format,
-but visibility is defined by head publication. The commit point is the fenced
-CAS update of the mutable pointer, not the immutable Parquet write.
+The core requirement is that Parquet remains the immutable projection format.
+For catalog and orchestration, visibility is defined by head publication and
+the commit point is the fenced CAS update of the mutable pointer, not the
+immutable Parquet write. For optional root transactions, visibility is defined
+by finalizing the per-`tx_id` transaction record that points at an immutable
+tx-scoped super-manifest.
 
 This ADR applies that model to catalog and orchestration now, and defines an
 optional root-transaction extension for callers that later require a single
@@ -22,7 +25,7 @@ workspace-consistent cut across multiple domain heads.
 
 ## Decision
 
-Arco control-plane transactions use this shared protocol:
+Catalog and orchestration use this shared protocol:
 
 1. Acquire the domain lock and mint a fencing token.
 2. Read the current pointer and the immutable manifest snapshot it references.
@@ -33,8 +36,9 @@ Arco control-plane transactions use this shared protocol:
 7. Declare the transaction committed only when pointer CAS succeeds.
 8. Run audit-chain writes and legacy-mirror writes after commit as repairable side effects; they must not change a committed response into a failure.
 
-Readers are pointer-first and manifest-driven. They must not scan the ledger or
-list object storage for correctness.
+Ordinary readers are pointer-first and manifest-driven. Root-token readers are
+transaction-record-first and super-manifest-driven. Readers must not scan the
+ledger or list object storage for correctness.
 
 ### Object Keys and Internal APIs
 
@@ -149,32 +153,53 @@ Notes:
 #### Optional Root Transactions
 
 Use this only when a caller needs one workspace-consistent cut across multiple
-domain heads.
+domain heads. This is opt-in and pinned. It is not a moving workspace head.
 
 Canonical keys:
 
 ```text
 tenant={tenant}/workspace={workspace}/
-manifests/root.pointer.json
-manifests/root/{root_manifest_id}.json
-manifests/root.manifest.json                        # repairable legacy mirror
-manifests/root_transactions/{tx_id}.json           # idempotency/coordinator record
+locks/root.lock.json
+transactions/root/{tx_id}.json                     # mutable transaction record
+transactions/root/{tx_id}.manifest.json           # immutable super-manifest
+commits/root/{commit_id}.json                     # optional audit receipt
+manifests/root.manifest.json                      # existing catalog/bootstrap object
 ```
 
-Root snapshot shape:
+Root transaction record shape:
 
 ```json
 {
-  "root_manifest_id": "00000000000000000019",
-  "transaction_id": "018f....",
-  "epoch": 42,
-  "previous_root_manifest_path": "manifests/root/00000000000000000018.json",
-  "parent_hash": "sha256:...",
-  "catalog_manifest_path": "manifests/catalog/00000000000000000042.json",
-  "lineage_manifest_path": "manifests/lineage/00000000000000000009.json",
-  "executions_manifest_path": "manifests/executions/00000000000000000011.json",
-  "search_manifest_path": "manifests/search/00000000000000000012.json",
-  "orchestration_manifest_path": "state/orchestration/manifests/00000000000000000077.json",
+  "tx_id": "018f....",
+  "status": "VISIBLE",
+  "lock_path": "locks/root.lock.json",
+  "fencing_token": 42,
+  "visible_at": "2026-03-28T12:00:00Z",
+  "result": {
+    "super_manifest_path": "transactions/root/018f....manifest.json",
+    "read_token": "root:018f...."
+  }
+}
+```
+
+Root super-manifest shape:
+
+```json
+{
+  "tx_id": "018f....",
+  "fencing_token": 42,
+  "domains": {
+    "catalog": {
+      "manifest_path": "manifests/catalog/00000000000000000042.json",
+      "manifest_id": "00000000000000000042",
+      "commit_id": "01J...."
+    },
+    "orchestration": {
+      "manifest_path": "state/orchestration/manifests/00000000000000000077.json",
+      "manifest_id": "00000000000000000077",
+      "commit_id": "01J...."
+    }
+  },
   "published_at": "2026-03-28T12:00:00Z"
 }
 ```
@@ -184,13 +209,10 @@ Internal API:
 ```http
 POST /internal/root-transactions/commit
 {
-  "transaction_id": "018f....",                     // UUIDv7
+  "tx_id": "018f....",                              // UUIDv7
   "fencing_token": 42,
   "participants": {
     "catalog": "manifests/catalog/00000000000000000042.json",
-    "lineage": "manifests/lineage/00000000000000000009.json",
-    "executions": "manifests/executions/00000000000000000011.json",
-    "search": "manifests/search/00000000000000000012.json",
     "orchestration": "state/orchestration/manifests/00000000000000000077.json"
   },
   "request_id": "01J...."
@@ -200,9 +222,10 @@ POST /internal/root-transactions/commit
 ```json
 200 OK
 {
-  "root_manifest_id": "00000000000000000019",
-  "root_manifest_path": "manifests/root/00000000000000000019.json",
-  "pointer_version": "<object version>",
+  "tx_id": "018f....",
+  "root_commit_id": "01J....",
+  "super_manifest_path": "transactions/root/018f....manifest.json",
+  "read_token": "root:018f....",
   "visibility_status": "visible",
   "repair_pending": false
 }
@@ -210,12 +233,21 @@ POST /internal/root-transactions/commit
 
 Notes:
 
-- Create `manifests/root_transactions/{tx_id}.json` with `status="preparing"`
-  before root publish for idempotency.
-- Root pointer CAS is the visibility gate; the coordinator record is not on the
-  read path.
-- Domains omitted from `participants` are carried forward from the current root
-  head unchanged.
+- Create `transactions/root/{tx_id}.json` with `status="PREPARED"` before
+  writing the super-manifest.
+- Root visibility is defined by finalizing `transactions/root/{tx_id}.json` to
+  `status="VISIBLE"` after `transactions/root/{tx_id}.manifest.json` exists.
+- Root-token readers resolve the transaction record, then the immutable
+  super-manifest, then the referenced immutable domain manifests directly.
+- `manifests/root.manifest.json` remains the catalog/bootstrap object and is
+  not the root transaction source of truth.
+- The current shared root-transaction contract pins `catalog` and
+  `orchestration` domain commits only; it does not redefine the existing
+  catalog bootstrap root object into a cross-domain source of truth.
+- Ordinary catalog/orchestration readers remain domain-local; only root-token
+  readers get cross-domain atomicity.
+- Domains omitted from `participants` are omitted from that root token. There
+  is no implicit carry-forward from a global latest-root pointer.
 
 ### Failure-State Transitions
 
@@ -228,10 +260,10 @@ Notes:
 | Orchestration | event read or parquet write fails | unchanged | failure | retry compaction |
 | Orchestration | pointer CAS loses race | previous head remains visible | conflict/retry | retry with fresh head; orphan cleanup |
 | Orchestration | pointer CAS succeeds, mirror write fails | new head visible | success with `repair_pending=true` | reconciler repairs mirror |
-| Root tx | coordinator record create fails | unchanged | failure | retry with same `transaction_id` |
-| Root tx | root snapshot write fails | unchanged | failure | retry with same `transaction_id` |
-| Root tx | root pointer CAS loses race | previous root remains visible | conflict/retry | retry from fresh root; orphan snapshot GC |
-| Root tx | root pointer CAS succeeds, tx finalize/mirror fails | new root visible | success with `repair_pending=true` | reconciler finalizes tx record and mirror |
+| Root tx | tx record create fails | unchanged | failure | retry with same idempotency key |
+| Root tx | participant publish or super-manifest write fails before root visibility | failed root tx is marked `ABORTED`; root token not visible | failure | retry with same idempotency key; runtime claims a fresh root `tx_id` and reuses visible participant commits through root-derived participant idempotency keys |
+| Root tx | tx record/idempotency finalize loses one durable write | caller sees failure; surviving visible state is replay-repairable | retry same request | replay repairs the same `tx_id` from the cached visible record |
+| Root tx | tx record is `VISIBLE`, audit receipt write fails | root token visible | success with `repair_pending=true` | reconciler writes `commits/root/{commit_id}.json` |
 
 ### Test Plan
 
@@ -246,12 +278,16 @@ Notes:
   only; no ledger reads are required for correctness.
 - Orchestration persisted-but-not-visible mode is accepted only for explicit
   maintenance/rebuild paths.
-- Root transaction retries with the same `transaction_id` are idempotent and
-  return the same committed root head.
-- Root readers see all participant heads switch together; per-domain readers
-  remain unaffected.
-- CAS races leave old pointers visible and new immutable artifacts unreachable
-  but safe for GC.
+- Root transaction retries with the same idempotency key either repair the same
+  visible `tx_id` from cached finalize state or claim a fresh root `tx_id`
+  after a pre-visibility abort; participant commits are reused through
+  root-derived participant idempotency keys.
+- Root-token readers resolve the tx record, then the immutable super-manifest,
+  then the referenced immutable participant manifests directly.
+- Root-token readers see one pinned cross-domain cut; per-domain readers remain
+  unchanged and may observe ordinary pointer-flip windows independently.
+- `manifests/root.manifest.json` remains the bootstrap object for current
+  catalog readers and is not the root transaction correctness boundary.
 
 ### Assumptions and Defaults
 
@@ -265,11 +301,14 @@ Notes:
 
 ## Consequences
 
-- The pointer CAS becomes the single visibility and commit gate across control
-  plane domains.
+- Pointer CAS remains the visibility and commit gate for catalog and
+  orchestration.
+- Root transactions use per-`tx_id` record finalization plus an immutable
+  super-manifest, not a moving root pointer CAS.
 - Immutable artifact writes stay append-only, while legacy mirrors and audit
   chain writes move firmly into repairable post-commit work.
-- Reader correctness stays pointer-first and manifest-driven, avoiding ledger
-  scans and object-store listing as read-path correctness mechanisms.
+- Reader correctness stays manifest-driven: pointer-first for domain-local
+  readers and root-token-first for pinned cross-domain readers.
 - Cross-domain workspace-consistent cuts are possible without forcing root
-  coordination on every control-plane transaction.
+  coordination onto the common read path or turning root into a global
+  correctness boundary.

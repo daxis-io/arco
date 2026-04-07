@@ -241,6 +241,9 @@ message DomainMutation {
 }
 
 // Root transaction commit request for one pinned multi-domain view.
+//
+// Servers materialize one immutable tx-scoped super-manifest and return a root
+// read token. This API does not publish a moving global root pointer.
 message CommitRootTransactionRequest {
   RequestHeader header = 1;
   repeated DomainMutation mutations = 2;
@@ -262,7 +265,7 @@ message DomainCommit {
   string read_token = 6;
 }
 
-// Participant lock metadata surfaced by root transaction status.
+// Participant lock and manifest metadata surfaced by root transaction status.
 message RootTxParticipant {
   TransactionDomain domain = 1;
   string lock_path = 2;
@@ -271,19 +274,23 @@ message RootTxParticipant {
   string manifest_path = 5;
 }
 
-// Visible root transaction receipt pinned to one super-manifest.
+// Visible root transaction receipt pinned to one tx-scoped super-manifest.
 message RootTxReceipt {
   string tx_id = 1;
   string root_commit_id = 2;
-  string root_manifest_id = 3;
-  string root_manifest_path = 4;
-  string pointer_version = 5;
+  reserved 3, 5;
+  reserved "root_manifest_id", "pointer_version";
+  string super_manifest_path = 4;
   repeated DomainCommit domain_commits = 6;
   string read_token = 7;
   google.protobuf.Timestamp visible_at = 8;
 }
 
 // Root transaction status record surfaced to callers.
+//
+// Root-token readers resolve `tx_id` to the mutable transaction record, then
+// load `super_manifest_path`, then read the referenced immutable domain
+// manifests directly. Domain-local readers remain unchanged.
 message RootTxStatus {
   string tx_id = 1;
   TransactionStatus status = 2;
@@ -294,9 +301,9 @@ message RootTxStatus {
   uint64 fencing_token = 7;
   google.protobuf.Timestamp prepared_at = 8;
   google.protobuf.Timestamp visible_at = 9;
-  string root_manifest_id = 10;
-  string root_manifest_path = 11;
-  string pointer_version = 12;
+  reserved 10, 12;
+  reserved "root_manifest_id", "pointer_version";
+  string super_manifest_path = 11;
   bool repair_pending = 13;
   repeated RootTxParticipant domains = 14;
   RootTxReceipt result = 15;

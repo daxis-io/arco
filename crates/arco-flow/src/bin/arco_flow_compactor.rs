@@ -218,12 +218,15 @@ impl IntoResponse for ApiError {
     }
 }
 
+#[allow(clippy::panic)]
 fn init_metrics() -> PrometheusHandle {
     PROMETHEUS_HANDLE
         .get_or_init(|| {
             PrometheusBuilder::new()
                 .install_recorder()
-                .expect("install prometheus recorder for arco-flow-compactor")
+                .unwrap_or_else(|error| {
+                    panic!("failed to install prometheus recorder for arco-flow-compactor: {error}")
+                })
         })
         .clone()
 }

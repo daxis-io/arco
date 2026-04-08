@@ -185,6 +185,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
     }
 
     /// Commits a multi-domain root transaction and returns the visible receipt.
+    #[allow(clippy::too_many_lines)]
     pub async fn commit_root_transaction(
         &self,
         request: CommitRootTransactionRequest,
@@ -285,7 +286,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             let mut manifest_domains = BTreeMap::new();
 
             for mutation in mutations {
-                let participant_meta = self.root_participant_metadata(&meta, mutation.domain());
+                let participant_meta = Self::root_participant_metadata(&meta, mutation.domain());
                 match mutation {
                     RootMutation::Catalog(command) => {
                         let outcome = self
@@ -520,13 +521,13 @@ impl<'a> ControlPlaneTransactionService<'a> {
         self.store_prepared(ControlPlaneTxDomain::Catalog, &prepared)
             .await?;
 
-        let writer = self.catalog_writer()?;
+        let writer = self.catalog_writer();
         if let Err(error) = writer.initialize().await.map_err(ApiError::from) {
             self.abort_transaction(ControlPlaneTxDomain::Catalog, &tx_id)
                 .await;
             return Err(error);
         }
-        let options = self.catalog_write_options(meta);
+        let options = Self::catalog_write_options(meta);
         let commit = match command
             .apply(&writer, options)
             .await
@@ -570,6 +571,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute_orchestration_batch(
         &self,
         meta: &ResolvedRequestMetadata,
@@ -703,7 +705,6 @@ impl<'a> ControlPlaneTransactionService<'a> {
     }
 
     fn root_participant_metadata(
-        &self,
         meta: &ResolvedRequestMetadata,
         domain: ControlPlaneTxDomain,
     ) -> ResolvedRequestMetadata {
@@ -715,15 +716,15 @@ impl<'a> ControlPlaneTransactionService<'a> {
         }
     }
 
-    fn catalog_writer(&self) -> Result<CatalogWriter, ApiError> {
+    fn catalog_writer(&self) -> CatalogWriter {
         let compactor = self
             .state
             .sync_compactor()
             .unwrap_or_else(|| Arc::new(Tier1Compactor::new(self.storage.clone())));
-        Ok(CatalogWriter::new(self.storage.clone()).with_sync_compactor(compactor))
+        CatalogWriter::new(self.storage.clone()).with_sync_compactor(compactor)
     }
 
-    fn catalog_write_options(&self, meta: &ResolvedRequestMetadata) -> WriteOptions {
+    fn catalog_write_options(meta: &ResolvedRequestMetadata) -> WriteOptions {
         WriteOptions::default()
             .with_actor(format!("api:{}", meta.tenant))
             .with_request_id(meta.request_id.as_str())
@@ -892,7 +893,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         record: &ControlPlaneTxRecord<TResult>,
     ) -> Result<(), ApiError>
     where
-        TResult: Serialize,
+        TResult: Serialize + Sync,
     {
         let path = ControlPlaneTxPaths::record(domain, record.tx_id.as_str());
         match self
@@ -907,6 +908,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finalize_visible<TResult>(
         &self,
         domain: ControlPlaneTxDomain,
@@ -918,7 +920,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         result: TResult,
     ) -> Result<(), ApiError>
     where
-        TResult: Serialize + DeserializeOwned + Clone,
+        TResult: Serialize + DeserializeOwned + Clone + Send + Sync,
     {
         let path = ControlPlaneTxPaths::record(domain, tx_id);
         let mut record: ControlPlaneTxRecord<TResult> = self
@@ -942,7 +944,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         tx_id: &str,
     ) -> Result<(), ApiError>
     where
-        TResult: Serialize + DeserializeOwned + Clone,
+        TResult: Serialize + DeserializeOwned + Clone + Send + Sync,
     {
         let path = ControlPlaneTxPaths::record(domain, tx_id);
         let mut record: ControlPlaneTxRecord<TResult> = self
@@ -969,7 +971,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         record: &ControlPlaneTxRecord<TResult>,
     ) -> Result<(), ApiError>
     where
-        TResult: Serialize + DeserializeOwned + Clone,
+        TResult: Serialize + DeserializeOwned + Clone + Send + Sync,
     {
         let path = ControlPlaneTxPaths::record(domain, record.tx_id.as_str());
         let idem_path = ControlPlaneTxPaths::idempotency(domain, record.idempotency_key.as_str());
@@ -1023,7 +1025,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         existing: &ControlPlaneIdempotencyRecord,
     ) -> Result<ControlPlaneTxRecord<TResult>, ApiError>
     where
-        TResult: Serialize + DeserializeOwned + Clone,
+        TResult: Serialize + DeserializeOwned + Clone + Send + Sync,
     {
         if let Some(record) = self.load_record(domain, existing.tx_id.as_str()).await? {
             if record.status == ControlPlaneTxStatus::Visible {
@@ -1031,7 +1033,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             }
         }
 
-        let record = self.record_from_idempotency(existing)?.ok_or_else(|| {
+        let record = Self::record_from_idempotency(existing)?.ok_or_else(|| {
             ApiError::internal(format!(
                 "{domain} transaction record missing for tx_id '{}'",
                 existing.tx_id
@@ -1180,7 +1182,6 @@ impl<'a> ControlPlaneTransactionService<'a> {
     }
 
     fn record_from_idempotency<TResult>(
-        &self,
         record: &ControlPlaneIdempotencyRecord,
     ) -> Result<Option<ControlPlaneTxRecord<TResult>>, ApiError>
     where
@@ -1208,7 +1209,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         precondition: WritePrecondition,
     ) -> Result<WriteOutcome, ApiError>
     where
-        T: Serialize,
+        T: Serialize + Sync,
     {
         let payload = serde_json::to_vec(value)
             .map(Bytes::from)
@@ -1252,6 +1253,7 @@ enum CatalogMutation {
         columns: Vec<ColumnDefinition>,
         properties: BTreeMap<String, String>,
     },
+    #[allow(clippy::option_option)]
     AlterTable {
         namespace: String,
         name: String,
@@ -1767,11 +1769,11 @@ fn protobuf_timestamp_to_chrono(
     .ok_or_else(|| ApiError::bad_request("invalid protobuf timestamp"))
 }
 
-fn chrono_to_timestamp(timestamp: DateTime<Utc>) -> Option<prost_types::Timestamp> {
-    Some(prost_types::Timestamp {
+fn chrono_to_timestamp(timestamp: DateTime<Utc>) -> prost_types::Timestamp {
+    prost_types::Timestamp {
         seconds: timestamp.timestamp(),
         nanos: i32::try_from(timestamp.timestamp_subsec_nanos()).unwrap_or(i32::MAX),
-    })
+    }
 }
 
 fn catalog_receipt_to_proto(receipt: &CatalogTxReceipt) -> arco_proto::CatalogTxReceipt {
@@ -1783,7 +1785,7 @@ fn catalog_receipt_to_proto(receipt: &CatalogTxReceipt) -> arco_proto::CatalogTx
         snapshot_version: receipt.snapshot_version,
         pointer_version: receipt.pointer_version.clone(),
         read_token: receipt.read_token.clone(),
-        visible_at: chrono_to_timestamp(receipt.visible_at),
+        visible_at: Some(chrono_to_timestamp(receipt.visible_at)),
     }
 }
 
@@ -1799,7 +1801,7 @@ fn orchestration_receipt_to_proto(
         pointer_version: receipt.pointer_version.clone(),
         events_processed: receipt.events_processed,
         read_token: receipt.read_token.clone(),
-        visible_at: chrono_to_timestamp(receipt.visible_at),
+        visible_at: Some(chrono_to_timestamp(receipt.visible_at)),
     }
 }
 
@@ -1814,7 +1816,7 @@ fn root_receipt_to_proto(receipt: &RootTxReceipt) -> arco_proto::RootTxReceipt {
             .map(domain_commit_to_proto)
             .collect(),
         read_token: receipt.read_token.clone(),
-        visible_at: chrono_to_timestamp(receipt.visible_at),
+        visible_at: Some(chrono_to_timestamp(receipt.visible_at)),
     }
 }
 
@@ -1827,8 +1829,8 @@ fn catalog_status_to_proto(record: &CatalogTxRecord) -> CatalogTxStatus {
         request_hash: record.request_hash.clone(),
         lock_path: record.lock_path.clone(),
         fencing_token: record.fencing_token,
-        prepared_at: chrono_to_timestamp(record.prepared_at),
-        visible_at: record.visible_at.and_then(chrono_to_timestamp),
+        prepared_at: Some(chrono_to_timestamp(record.prepared_at)),
+        visible_at: record.visible_at.map(chrono_to_timestamp),
         result: record.result.as_ref().map(catalog_receipt_to_proto),
         repair_pending: record.repair_pending,
     }
@@ -1843,8 +1845,8 @@ fn orchestration_status_to_proto(record: &OrchestrationTxRecord) -> Orchestratio
         request_hash: record.request_hash.clone(),
         lock_path: record.lock_path.clone(),
         fencing_token: record.fencing_token,
-        prepared_at: chrono_to_timestamp(record.prepared_at),
-        visible_at: record.visible_at.and_then(chrono_to_timestamp),
+        prepared_at: Some(chrono_to_timestamp(record.prepared_at)),
+        visible_at: record.visible_at.map(chrono_to_timestamp),
         result: record.result.as_ref().map(orchestration_receipt_to_proto),
         repair_pending: record.repair_pending,
     }
@@ -1859,8 +1861,8 @@ fn root_status_to_proto(record: &RootTxRecord) -> RootTxStatus {
         request_hash: record.request_hash.clone(),
         lock_path: record.lock_path.clone(),
         fencing_token: record.fencing_token,
-        prepared_at: chrono_to_timestamp(record.prepared_at),
-        visible_at: record.visible_at.and_then(chrono_to_timestamp),
+        prepared_at: Some(chrono_to_timestamp(record.prepared_at)),
+        visible_at: record.visible_at.map(chrono_to_timestamp),
         super_manifest_path: record
             .result
             .as_ref()

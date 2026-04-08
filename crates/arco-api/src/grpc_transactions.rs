@@ -37,7 +37,7 @@ const RETRY_AFTER_HEADER: &str = "retry-after";
 
 /// Returns the generated tonic service for transaction RPCs.
 #[must_use]
-pub(crate) fn service(
+pub fn service(
     state: Arc<AppState>,
 ) -> ControlPlaneTransactionServiceServer<GrpcControlPlaneTransactionService> {
     ControlPlaneTransactionServiceServer::new(GrpcControlPlaneTransactionService { state })
@@ -45,7 +45,7 @@ pub(crate) fn service(
 
 /// Tonic transport adapter for transaction RPCs.
 #[derive(Debug, Clone)]
-pub(crate) struct GrpcControlPlaneTransactionService {
+pub struct GrpcControlPlaneTransactionService {
     state: Arc<AppState>,
 }
 
@@ -88,7 +88,7 @@ impl GrpcControlPlaneTransactionService {
                     crate::audit::REASON_INVALID_TOKEN
                 };
                 crate::audit::emit_auth_deny(self.state.as_ref(), &request_id, resource, reason);
-                Err(api_error_to_status(error))
+                Err(api_error_to_status(&error))
             }
         }
     }
@@ -163,7 +163,7 @@ fn insert_metadata_header(
     headers.insert(header_name, value);
 }
 
-fn api_error_to_status(error: ApiError) -> Status {
+fn api_error_to_status(error: &ApiError) -> Status {
     let code = match error.status() {
         axum::http::StatusCode::BAD_REQUEST | axum::http::StatusCode::UNPROCESSABLE_ENTITY => {
             Code::InvalidArgument
@@ -265,9 +265,7 @@ fn finalize_rpc<T>(
     start: Instant,
     result: Result<Response<T>, Status>,
 ) -> Result<Response<T>, Status> {
-    let code = result
-        .as_ref()
-        .map_or_else(|status| status.code(), |_| Code::Ok);
+    let code = result.as_ref().map_or_else(Status::code, |_| Code::Ok);
     crate::metrics::record_grpc_request(resource, code, start.elapsed().as_secs_f64());
     result
 }
@@ -293,11 +291,11 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
             );
             let _guard = span.enter();
             let service = ControlPlaneTransactionService::new(self.state.as_ref(), ctx.clone())
-                .map_err(api_error_to_status)?;
+                .map_err(|error| api_error_to_status(&error))?;
             let response = service
                 .apply_catalog_ddl(request.into_inner())
                 .await
-                .map_err(api_error_to_status)?;
+                .map_err(|error| api_error_to_status(&error))?;
             let mut response = Response::new(response);
             apply_success_metadata(&mut response, &ctx.request_id, rate_limit);
             Ok(response)
@@ -325,11 +323,11 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
             );
             let _guard = span.enter();
             let service = ControlPlaneTransactionService::new(self.state.as_ref(), ctx.clone())
-                .map_err(api_error_to_status)?;
+                .map_err(|error| api_error_to_status(&error))?;
             let response = service
                 .get_catalog_transaction(request.into_inner())
                 .await
-                .map_err(api_error_to_status)?;
+                .map_err(|error| api_error_to_status(&error))?;
             let mut response = Response::new(response);
             apply_success_metadata(&mut response, &ctx.request_id, rate_limit);
             Ok(response)
@@ -357,11 +355,11 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
             );
             let _guard = span.enter();
             let service = ControlPlaneTransactionService::new(self.state.as_ref(), ctx.clone())
-                .map_err(api_error_to_status)?;
+                .map_err(|error| api_error_to_status(&error))?;
             let response = service
                 .commit_orchestration_batch(request.into_inner())
                 .await
-                .map_err(api_error_to_status)?;
+                .map_err(|error| api_error_to_status(&error))?;
             let mut response = Response::new(response);
             apply_success_metadata(&mut response, &ctx.request_id, rate_limit);
             Ok(response)
@@ -390,11 +388,11 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
             );
             let _guard = span.enter();
             let service = ControlPlaneTransactionService::new(self.state.as_ref(), ctx.clone())
-                .map_err(api_error_to_status)?;
+                .map_err(|error| api_error_to_status(&error))?;
             let response = service
                 .get_orchestration_transaction(request.into_inner())
                 .await
-                .map_err(api_error_to_status)?;
+                .map_err(|error| api_error_to_status(&error))?;
             let mut response = Response::new(response);
             apply_success_metadata(&mut response, &ctx.request_id, rate_limit);
             Ok(response)
@@ -422,11 +420,11 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
             );
             let _guard = span.enter();
             let service = ControlPlaneTransactionService::new(self.state.as_ref(), ctx.clone())
-                .map_err(api_error_to_status)?;
+                .map_err(|error| api_error_to_status(&error))?;
             let response = service
                 .commit_root_transaction(request.into_inner())
                 .await
-                .map_err(api_error_to_status)?;
+                .map_err(|error| api_error_to_status(&error))?;
             let mut response = Response::new(response);
             apply_success_metadata(&mut response, &ctx.request_id, rate_limit);
             Ok(response)
@@ -454,11 +452,11 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
             );
             let _guard = span.enter();
             let service = ControlPlaneTransactionService::new(self.state.as_ref(), ctx.clone())
-                .map_err(api_error_to_status)?;
+                .map_err(|error| api_error_to_status(&error))?;
             let response = service
                 .get_root_transaction(request.into_inner())
                 .await
-                .map_err(api_error_to_status)?;
+                .map_err(|error| api_error_to_status(&error))?;
             let mut response = Response::new(response);
             apply_success_metadata(&mut response, &ctx.request_id, rate_limit);
             Ok(response)

@@ -15,7 +15,7 @@ semantics, and explicit treatment of repairable post-commit side effects.
 The core requirement is that Parquet remains the immutable projection format.
 For catalog and orchestration, visibility is defined by head publication and
 the commit point is the fenced CAS update of the mutable pointer, not the
-immutable Parquet write. For optional root transactions, visibility is defined
+immutable Parquet write. For opt-in root transactions, visibility is defined
 by finalizing the per-`tx_id` transaction record that points at an immutable
 tx-scoped super-manifest.
 
@@ -296,8 +296,9 @@ Notes:
 - Legacy mirror paths stay during migration, but they are explicitly repairable
   side effects, not commit prerequisites.
 - Catalog and orchestration remain per-domain serializable by default.
-- Root transactions are optional, disabled by default, and only needed for
-  callers that require workspace-consistent multi-domain reads.
+- Root transactions are opt-in per request, ship in the current transaction
+  runtime, and are only needed for callers that require workspace-consistent
+  multi-domain reads.
 
 ## Consequences
 

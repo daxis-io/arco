@@ -45,7 +45,9 @@ async fn compact_handler(
     Ok(Json(OrchestrationCompactionResponse {
         events_processed: result.events_processed,
         delta_id: result.delta_id,
+        manifest_id: result.manifest_id,
         manifest_revision: result.manifest_revision,
+        pointer_version: result.pointer_version,
         visibility_status: result.visibility_status.into(),
         repair_pending: false,
     }))

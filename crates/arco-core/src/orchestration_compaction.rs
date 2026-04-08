@@ -50,8 +50,16 @@ pub struct OrchestrationCompactionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta_id: Option<String>,
 
+    /// Visible immutable manifest identifier.
+    #[serde(default)]
+    pub manifest_id: String,
+
     /// New manifest revision identifier.
     pub manifest_revision: String,
+
+    /// Pointer object version returned by the visible CAS publish.
+    #[serde(default)]
+    pub pointer_version: String,
 
     /// Visibility outcome of this compaction request.
     pub visibility_status: VisibilityStatus,

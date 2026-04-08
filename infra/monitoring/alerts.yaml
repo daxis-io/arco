@@ -112,44 +112,26 @@ groups:
 
   - name: arco.control_plane
     rules:
-      - alert: ArcoControlPlaneRepairPending
-        expr: |
-          (sum(increase(arco_catalog_repair_pending_total[15m])) or vector(0))
-          +
-          (sum(increase(arco_flow_orch_repair_pending_total[15m])) or vector(0)) > 0
-        for: 5m
-        labels:
-          severity: warning
-          service: arco-control-plane
-        annotations:
-          summary: "Control-plane commit completed with repairable side effects"
-          description: |
-            A visible control-plane commit reported repair_pending in the last 15 minutes.
-            Pointer CAS already committed the head; run the control-plane reconcile dry run and
-            enforce repair if the current-head side effects are still missing.
-          runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
-
       - alert: ArcoControlPlaneRepairIssuesDetected
         expr: |
           (sum(increase(arco_catalog_reconciler_issues_total{repairable="true"}[15m])) or vector(0))
           +
-          (sum(increase(arco_flow_orch_reconciler_repair_issues_total[15m])) or vector(0)) > 0
+          (sum(increase(arco_flow_orch_reconciler_orphans_total[15m])) or vector(0)) > 0
         for: 5m
         labels:
           severity: warning
           service: arco-control-plane
         annotations:
-          summary: "Control-plane current-head repair issues detected"
+          summary: "Control-plane reconciliation cleanup issues detected"
           description: |
-            The control-plane reconciler detected repairable current-head issues in the last 15 minutes.
-            Readers remain pointer-first, but legacy mirrors or commit records may still need repair.
+            The control-plane reconciler detected repairable reconciliation work in the last
+            15 minutes. Reads remain pointer-driven, but orphan cleanup or catalog snapshot
+            cleanup may still be outstanding.
           runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
 
       - alert: ArcoControlPlaneReconcilerRepairFailures
         expr: |
-          (sum(increase(arco_catalog_reconciler_repairs_total{status="failed"}[15m])) or vector(0))
-          +
-          (sum(increase(arco_flow_orch_reconciler_repairs_total{status="failed"}[15m])) or vector(0)) > 0
+          (sum(increase(arco_catalog_reconciler_repairs_total{status="failed"}[15m])) or vector(0)) > 0
         for: 5m
         labels:
           severity: critical
@@ -157,9 +139,9 @@ groups:
         annotations:
           summary: "Control-plane reconciler repair failed"
           description: |
-            A current-head repair action failed in the last 15 minutes.
-            Readers continue to use the pointer-target manifest, but legacy mirrors or commit
-            records may remain missing until repair succeeds.
+            A catalog reconciliation cleanup action failed in the last 15 minutes.
+            Pointer-selected reads remain correct, but orphan snapshot cleanup may require manual
+            intervention until repair succeeds.
           runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
 
       - alert: ArcoControlPlaneRepairAutomationFailures
@@ -196,10 +178,10 @@ groups:
         annotations:
           summary: "Control-plane repair backlog age exceeded 15 minutes (domain={{ $labels.domain }}, mode={{ $labels.mode }}, scope={{ $labels.scope }})"
           description: |
-            Repairable current-head work has remained in the automated repair backlog for more than
-            15 minutes for domain={{ $labels.domain }}, mode={{ $labels.mode }},
-            scope={{ $labels.scope }}. Readers stay pointer-first, but side-effect repair is not
-            converging fast enough.
+            Repairable reconciliation work has remained in the automated repair backlog for more
+            than 15 minutes for domain={{ $labels.domain }}, mode={{ $labels.mode }},
+            scope={{ $labels.scope }}. Readers stay pointer-first, but cleanup is not converging
+            fast enough.
           runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
 
       - alert: ArcoControlPlaneRepairBacklogCountHigh
@@ -214,9 +196,9 @@ groups:
         annotations:
           summary: "Control-plane repair backlog is non-zero (domain={{ $labels.domain }}, mode={{ $labels.mode }}, scope={{ $labels.scope }})"
           description: |
-            Repairable current-head work has remained in the automated repair backlog for at least
-            15 minutes for domain={{ $labels.domain }}, mode={{ $labels.mode }},
-            scope={{ $labels.scope }}. Production cutover is not converged until the current-head
+            Repairable reconciliation work has remained in the automated repair backlog for at
+            least 15 minutes for domain={{ $labels.domain }}, mode={{ $labels.mode }},
+            scope={{ $labels.scope }}. Production cutover is not converged until the cleanup
             backlog returns to zero.
           runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
 
@@ -238,26 +220,10 @@ groups:
         annotations:
           summary: "Control-plane repair completion p95 exceeded 120 seconds (domain={{ $labels.domain }}, mode={{ $labels.mode }}, scope={{ $labels.scope }})"
           description: |
-            Automated current-head repair is taking longer than two minutes at p95 over the last
-            15 minutes for domain={{ $labels.domain }}, mode={{ $labels.mode }},
-            scope={{ $labels.scope }}. Treat this as production SLO degradation until repair
+            Automated reconciliation cleanup is taking longer than two minutes at p95 over the
+            last 15 minutes for domain={{ $labels.domain }}, mode={{ $labels.mode }},
+            scope={{ $labels.scope }}. Treat this as production SLO degradation until cleanup
             latency returns to normal.
-          runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
-
-      - alert: ArcoControlPlaneRepairPendingRateHigh
-        expr: |
-          (sum(increase(arco_catalog_repair_pending_total[1h])) or vector(0))
-          +
-          (sum(increase(arco_flow_orch_repair_pending_total[1h])) or vector(0)) > 3
-        for: 15m
-        labels:
-          severity: warning
-          service: arco-control-plane
-        annotations:
-          summary: "Control-plane repair_pending rate high"
-          description: |
-            More than three visible control-plane commits reported repair_pending in the last hour.
-            Investigate repeated repairable side effects before continuing or expanding production traffic.
           runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
 
       - alert: ArcoFlowStaleFenceRejects

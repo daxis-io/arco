@@ -2,7 +2,8 @@
 //!
 //! This module sketches the shared `transactions/...` layout for catalog,
 //! orchestration, and root visibility-scoped commits without changing the
-//! existing writers yet.
+//! existing writers yet. Catalog and orchestration remain pointer-published;
+//! root transactions use a tx-scoped record plus immutable super-manifest.
 
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
@@ -10,6 +11,8 @@ use std::fmt::{Display, Formatter};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+
+use crate::storage_keys::LockKey;
 
 /// Canonical control-plane transaction domains used in storage paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -59,7 +62,7 @@ pub enum ControlPlaneTxKind {
 pub enum ControlPlaneTxStatus {
     /// Immutable artifacts were staged but are not yet visible.
     Prepared,
-    /// The pointer or root gate was published and the transaction is visible.
+    /// The domain head or root read token is visible to readers.
     Visible,
     /// The transaction was terminated without becoming visible.
     Aborted,
@@ -94,10 +97,28 @@ impl ControlPlaneTxPaths {
         format!("{}/{}/{}.json", Self::PREFIX, domain.as_str(), tx_id)
     }
 
-    /// Returns the immutable root transaction manifest path.
+    /// Returns the canonical root lock path.
     #[must_use]
-    pub fn root_manifest(root_manifest_id: &str) -> String {
-        format!("{}/root/manifests/{}.json", Self::PREFIX, root_manifest_id)
+    pub fn root_lock() -> String {
+        LockKey::custom("root").to_string()
+    }
+
+    /// Returns the immutable tx-scoped root super-manifest path.
+    #[must_use]
+    pub fn root_super_manifest(tx_id: &str) -> String {
+        format!("{}/root/{tx_id}.manifest.json", Self::PREFIX)
+    }
+
+    /// Returns the optional root commit receipt path.
+    #[must_use]
+    pub fn root_commit_receipt(commit_id: &str) -> String {
+        format!("commits/root/{commit_id}.json")
+    }
+
+    /// Returns the immutable orchestration commit receipt path.
+    #[must_use]
+    pub fn orchestration_commit_receipt(commit_id: &str) -> String {
+        format!("commits/orchestration/{commit_id}.json")
     }
 }
 
@@ -206,21 +227,17 @@ pub struct RootTxReceipt {
     pub tx_id: String,
     /// Immutable root commit identifier.
     pub root_commit_id: String,
-    /// Immutable root manifest identifier.
-    pub root_manifest_id: String,
-    /// Immutable root transaction manifest path.
-    pub root_manifest_path: String,
-    /// Object-store version/etag observed for the root pointer CAS.
-    pub pointer_version: String,
+    /// Immutable tx-scoped root super-manifest path.
+    pub super_manifest_path: String,
     /// Domain commits published as part of the root transaction.
     pub domain_commits: Vec<DomainCommit>,
-    /// Pinned root read token, typically `root:{tx_id}`.
+    /// Pinned root read token, resolved via `transactions/root/{tx_id}.json`.
     pub read_token: String,
     /// Visibility timestamp.
     pub visible_at: DateTime<Utc>,
 }
 
-/// Pinned manifest reference for one domain inside a root transaction manifest.
+/// Pinned manifest reference for one domain inside a root super-manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RootTxManifestDomain {
@@ -232,22 +249,15 @@ pub struct RootTxManifestDomain {
     pub commit_id: String,
 }
 
-/// Immutable root transaction manifest used as a pinned multi-domain read token.
+/// Immutable tx-scoped root super-manifest used as a pinned multi-domain read token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RootTxManifest {
-    /// Immutable root manifest identifier.
-    pub root_manifest_id: String,
     /// Root transaction identifier.
     pub tx_id: String,
-    /// Fencing token used to publish this root head.
+    /// Fencing token used to finalize this root read token.
     pub fencing_token: u64,
-    /// Hash of the previous root head used for lineage and repair.
-    pub parent_hash: String,
-    /// Previous immutable root manifest path, if one existed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_root_manifest_path: Option<String>,
-    /// When the root head became visible.
+    /// When the root read token became visible.
     pub published_at: DateTime<Utc>,
     /// Pinned manifest references for participating domains.
     pub domains: BTreeMap<ControlPlaneTxDomain, RootTxManifestDomain>,
@@ -272,6 +282,9 @@ pub struct ControlPlaneIdempotencyRecord {
     /// When the claimed transaction became visible, if it did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visible_at: Option<DateTime<Utc>>,
+    /// Cached visible transaction record for replay/repair after partial finalize failures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_record: Option<serde_json::Value>,
 }
 
 /// Type alias for catalog transaction records.

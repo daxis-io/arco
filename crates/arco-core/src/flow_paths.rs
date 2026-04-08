@@ -18,7 +18,7 @@ impl FlowPaths {
     pub const FLOW_LEDGER_PREFIX: &str = "ledger/flow";
     /// Prefix for orchestration state objects.
     pub const ORCHESTRATION_STATE_PREFIX: &str = "state/orchestration";
-    /// Canonical orchestration manifest path.
+    /// Retired orchestration mutable-manifest compatibility path.
     pub const ORCHESTRATION_MANIFEST_PATH: &str = "state/orchestration/manifest.json";
 
     /// Canonical path for orchestration event objects.
@@ -39,7 +39,7 @@ impl FlowPaths {
         )
     }
 
-    /// Canonical orchestration manifest path.
+    /// Retired orchestration mutable-manifest compatibility path.
     #[must_use]
     pub const fn orchestration_manifest_path() -> &'static str {
         Self::ORCHESTRATION_MANIFEST_PATH

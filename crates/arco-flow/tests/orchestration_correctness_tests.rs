@@ -562,8 +562,7 @@ impl StorageBackend for FailOncePathBackend {
 }
 
 #[tokio::test]
-async fn test_compaction_replay_recovers_after_repair_pending_legacy_manifest_failure() -> Result<()>
-{
+async fn test_compaction_replay_succeeds_without_legacy_manifest_side_effects() -> Result<()> {
     let backend = Arc::new(FailOncePathBackend::new(
         "state/orchestration/manifest.json",
     ));
@@ -587,19 +586,19 @@ async fn test_compaction_replay_recovers_after_repair_pending_legacy_manifest_fa
         paths.push(path);
     }
 
-    // First compaction succeeds via pointer CAS but leaves the legacy manifest mirror repairable.
+    // First compaction succeeds via pointer CAS and should ignore removed legacy side effects.
     let first = compactor.compact_events(paths.clone()).await?;
     assert_eq!(first.visibility_status, CompactionVisibility::Visible);
     assert!(
-        first.repair_pending,
-        "legacy manifest mirror failure should surface as repair_pending"
+        !first.repair_pending,
+        "removed legacy side effects must not surface repair_pending"
     );
     assert!(
         storage
             .head_raw("state/orchestration/manifest.json")
             .await?
             .is_none(),
-        "legacy manifest mirror should remain absent after injected failure"
+        "legacy orchestration manifest should remain absent"
     );
 
     // Replay the same event set after restart; state must converge.

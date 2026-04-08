@@ -15,6 +15,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use metrics::{counter, describe_counter, describe_histogram, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use tonic::Code as GrpcCode;
 
 // ============================================================================
 // Metric Names (per plan Task 8.1)
@@ -94,6 +95,43 @@ pub(crate) fn endpoint_label<B>(request: &Request<B>) -> String {
     )
 }
 
+pub(crate) fn record_completed_request(
+    endpoint: &str,
+    method: &str,
+    status: &str,
+    status_class: &str,
+    duration_secs: f64,
+) {
+    let labels = [
+        ("endpoint", endpoint.to_string()),
+        ("method", method.to_string()),
+        ("status_class", status_class.to_string()),
+    ];
+
+    histogram!(API_REQUEST_DURATION, &labels).record(duration_secs);
+    counter!(API_REQUEST_TOTAL, &labels).increment(1);
+
+    if duration_secs > 1.0 {
+        tracing::warn!(
+            endpoint = %endpoint,
+            method = %method,
+            status = %status,
+            duration_secs = %duration_secs,
+            "Slow request detected"
+        );
+    }
+}
+
+pub(crate) fn record_grpc_request(endpoint: &str, code: GrpcCode, duration_secs: f64) {
+    record_completed_request(
+        endpoint,
+        "GRPC",
+        grpc_status_label(code),
+        grpc_status_class(code),
+        duration_secs,
+    );
+}
+
 /// Middleware that records request metrics.
 ///
 /// Captures:
@@ -113,26 +151,7 @@ pub async fn metrics_middleware(request: Request, next: Next) -> Response {
     let duration = start.elapsed().as_secs_f64();
     let status = response.status().as_u16().to_string();
     let status_class = status_class(response.status());
-
-    let labels = [
-        ("endpoint", path.clone()),
-        ("method", method.clone()),
-        ("status_class", status_class.to_string()),
-    ];
-
-    histogram!(API_REQUEST_DURATION, &labels).record(duration);
-    counter!(API_REQUEST_TOTAL, &labels).increment(1);
-
-    // Log slow requests (> 1s)
-    if duration > 1.0 {
-        tracing::warn!(
-            endpoint = %path,
-            method = %method,
-            status = %status,
-            duration_secs = %duration,
-            "Slow request detected"
-        );
-    }
+    record_completed_request(&path, &method, &status, status_class, duration);
 
     response
 }
@@ -146,6 +165,50 @@ fn status_class(status: StatusCode) -> &'static str {
         400..=499 => "4xx",
         500..=599 => "5xx",
         _ => "unknown",
+    }
+}
+
+fn grpc_status_class(code: GrpcCode) -> &'static str {
+    match code {
+        GrpcCode::Ok => "2xx",
+        GrpcCode::Cancelled
+        | GrpcCode::Unknown
+        | GrpcCode::InvalidArgument
+        | GrpcCode::DeadlineExceeded
+        | GrpcCode::NotFound
+        | GrpcCode::AlreadyExists
+        | GrpcCode::PermissionDenied
+        | GrpcCode::FailedPrecondition
+        | GrpcCode::Aborted
+        | GrpcCode::OutOfRange
+        | GrpcCode::Unauthenticated
+        | GrpcCode::ResourceExhausted => "4xx",
+        GrpcCode::Unimplemented
+        | GrpcCode::Internal
+        | GrpcCode::Unavailable
+        | GrpcCode::DataLoss => "5xx",
+    }
+}
+
+fn grpc_status_label(code: GrpcCode) -> &'static str {
+    match code {
+        GrpcCode::Ok => "OK",
+        GrpcCode::Cancelled => "CANCELLED",
+        GrpcCode::Unknown => "UNKNOWN",
+        GrpcCode::InvalidArgument => "INVALID_ARGUMENT",
+        GrpcCode::DeadlineExceeded => "DEADLINE_EXCEEDED",
+        GrpcCode::NotFound => "NOT_FOUND",
+        GrpcCode::AlreadyExists => "ALREADY_EXISTS",
+        GrpcCode::PermissionDenied => "PERMISSION_DENIED",
+        GrpcCode::ResourceExhausted => "RESOURCE_EXHAUSTED",
+        GrpcCode::FailedPrecondition => "FAILED_PRECONDITION",
+        GrpcCode::Aborted => "ABORTED",
+        GrpcCode::OutOfRange => "OUT_OF_RANGE",
+        GrpcCode::Unimplemented => "UNIMPLEMENTED",
+        GrpcCode::Internal => "INTERNAL",
+        GrpcCode::Unavailable => "UNAVAILABLE",
+        GrpcCode::DataLoss => "DATA_LOSS",
+        GrpcCode::Unauthenticated => "UNAUTHENTICATED",
     }
 }
 

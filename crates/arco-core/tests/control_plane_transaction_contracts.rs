@@ -33,6 +33,7 @@ fn sync_compact_response_includes_visibility_and_repair_status() {
     let response = SyncCompactResponse {
         manifest_version: "obj-version-7".to_string(),
         commit_ulid: "01JTESTCOMMIT".to_string(),
+        manifest_id: "00000000000000000007".to_string(),
         events_processed: 1,
         snapshot_version: 7,
         visibility_status: VisibilityStatus::Visible,
@@ -40,6 +41,7 @@ fn sync_compact_response_includes_visibility_and_repair_status() {
     };
 
     let json = serde_json::to_value(&response).expect("serialize");
+    assert_eq!(json["manifest_id"], "00000000000000000007");
     assert_eq!(json["visibility_status"], "visible");
     assert_eq!(json["repair_pending"], true);
 }
@@ -119,12 +121,16 @@ fn orchestration_compaction_response_includes_repair_pending() {
     let response = OrchestrationCompactionResponse {
         events_processed: 2,
         delta_id: Some("01JDELTA".to_string()),
+        manifest_id: "00000000000000000002".to_string(),
         manifest_revision: "01JMANIFEST".to_string(),
+        pointer_version: "ptr-2".to_string(),
         visibility_status: VisibilityStatus::Visible,
         repair_pending: true,
     };
 
     let json = serde_json::to_value(&response).expect("serialize");
+    assert_eq!(json["manifest_id"], "00000000000000000002");
+    assert_eq!(json["pointer_version"], "ptr-2");
     assert_eq!(json["visibility_status"], "visible");
     assert_eq!(json["repair_pending"], true);
 }

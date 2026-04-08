@@ -18,8 +18,8 @@ use tokio::runtime::Runtime;
 
 use arco_catalog::lock::LockInfo;
 use arco_catalog::manifest::{
-    CatalogDomainManifest, CommitRecord, ExecutionsManifest, LineageManifest, RootManifest,
-    SearchManifest, SnapshotInfo,
+    CatalogDomainManifest, DomainManifestPointer, ExecutionsManifest, LineageManifest,
+    RootManifest, SearchManifest, SnapshotInfo,
 };
 use arco_core::storage::ObjectStoreBackend;
 use arco_core::{CatalogDomain, CatalogPaths, Error as CoreError, ScopedStorage};
@@ -1323,7 +1323,9 @@ async fn verify_workspace(
     print!("  Domain manifests... ");
     let mut domain_errors = Vec::new();
     let catalog =
-        match read_json::<CatalogDomainManifest>(&storage, &root.catalog_manifest_path).await {
+        match read_resolved_json::<CatalogDomainManifest>(&storage, &root.catalog_manifest_path)
+            .await
+        {
             Ok(manifest) => Some(manifest),
             Err(e) => {
                 domain_errors.push(format!(
@@ -1333,18 +1335,21 @@ async fn verify_workspace(
                 None
             }
         };
-    let lineage = match read_json::<LineageManifest>(&storage, &root.lineage_manifest_path).await {
-        Ok(manifest) => Some(manifest),
-        Err(e) => {
-            domain_errors.push(format!(
-                "Lineage manifest ({}): {e}",
-                root.lineage_manifest_path
-            ));
-            None
-        }
-    };
+    let lineage =
+        match read_resolved_json::<LineageManifest>(&storage, &root.lineage_manifest_path).await {
+            Ok(manifest) => Some(manifest),
+            Err(e) => {
+                domain_errors.push(format!(
+                    "Lineage manifest ({}): {e}",
+                    root.lineage_manifest_path
+                ));
+                None
+            }
+        };
     let executions =
-        match read_json::<ExecutionsManifest>(&storage, &root.executions_manifest_path).await {
+        match read_resolved_json::<ExecutionsManifest>(&storage, &root.executions_manifest_path)
+            .await
+        {
             Ok(manifest) => Some(manifest),
             Err(e) => {
                 domain_errors.push(format!(
@@ -1354,16 +1359,17 @@ async fn verify_workspace(
                 None
             }
         };
-    let search = match read_json::<SearchManifest>(&storage, &root.search_manifest_path).await {
-        Ok(manifest) => Some(manifest),
-        Err(e) => {
-            domain_errors.push(format!(
-                "Search manifest ({}): {e}",
-                root.search_manifest_path
-            ));
-            None
-        }
-    };
+    let search =
+        match read_resolved_json::<SearchManifest>(&storage, &root.search_manifest_path).await {
+            Ok(manifest) => Some(manifest),
+            Err(e) => {
+                domain_errors.push(format!(
+                    "Search manifest ({}): {e}",
+                    root.search_manifest_path
+                ));
+                None
+            }
+        };
 
     if domain_errors.is_empty() {
         println!("[ok]");
@@ -1372,30 +1378,28 @@ async fn verify_workspace(
         errors.extend(domain_errors);
     }
 
-    print!("  Commit chain (catalog)... ");
-    if let Some(catalog) = &catalog {
-        if let Some(last_commit_id) = catalog.last_commit_id.as_deref() {
-            let (chain_errors, commit_count) = verify_commit_chain(&storage, last_commit_id).await;
-            if chain_errors.is_empty() {
-                if verbose {
-                    println!("[ok] {commit_count} commits");
-                } else {
-                    println!("[ok]");
-                }
+    print!("  Catalog manifest history... ");
+    if let Some((catalog_manifest_path, catalog)) = &catalog {
+        let (history_errors, manifest_count) =
+            verify_catalog_manifest_history(&storage, catalog_manifest_path, catalog).await;
+        if history_errors.is_empty() {
+            if verbose {
+                println!("[ok] {manifest_count} manifests");
             } else {
-                println!("[FAIL]");
-                errors.extend(chain_errors);
+                println!("[ok]");
             }
         } else {
-            println!("[ok] (no commits)");
+            println!("[FAIL]");
+            errors.extend(history_errors);
         }
     } else {
         println!("[SKIP]");
-        warnings.push("Catalog manifest missing; skipping commit chain verification".to_string());
+        warnings
+            .push("Catalog manifest missing; skipping manifest history verification".to_string());
     }
 
     print!("  Catalog snapshot... ");
-    if let Some(catalog) = &catalog {
+    if let Some((_, catalog)) = &catalog {
         let (snap_errors, snap_warnings) = verify_catalog_snapshot(&storage, catalog).await;
         if snap_errors.is_empty() {
             println!("[ok]");
@@ -1410,7 +1414,7 @@ async fn verify_workspace(
     }
 
     print!("  Lineage snapshot... ");
-    if let Some(lineage) = &lineage {
+    if let Some((_, lineage)) = &lineage {
         let (snap_errors, snap_warnings) = verify_lineage_snapshot(&storage, lineage).await;
         if snap_errors.is_empty() {
             println!("[ok]");
@@ -1425,7 +1429,7 @@ async fn verify_workspace(
     }
 
     print!("  Executions state... ");
-    if let Some(executions) = &executions {
+    if let Some((_, executions)) = &executions {
         let (exec_errors, exec_warnings) = verify_executions_state(&storage, executions).await;
         if exec_errors.is_empty() {
             println!("[ok]");
@@ -1440,7 +1444,7 @@ async fn verify_workspace(
     }
 
     print!("  Search state... ");
-    if let Some(search) = &search {
+    if let Some((_, search)) = &search {
         let (search_errors, search_warnings) = verify_search_state(search);
         if search_errors.is_empty() {
             println!("[ok]");
@@ -1468,7 +1472,7 @@ async fn verify_workspace(
 }
 
 fn check_root_paths(root: &RootManifest, warnings: &mut Vec<String>) {
-    let expected_catalog = CatalogPaths::domain_manifest(CatalogDomain::Catalog);
+    let expected_catalog = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
     if root.catalog_manifest_path != expected_catalog {
         warnings.push(format!(
             "Root manifest catalog path '{}' is not canonical (expected '{}')",
@@ -1476,7 +1480,7 @@ fn check_root_paths(root: &RootManifest, warnings: &mut Vec<String>) {
         ));
     }
 
-    let expected_lineage = CatalogPaths::domain_manifest(CatalogDomain::Lineage);
+    let expected_lineage = CatalogPaths::domain_manifest_pointer(CatalogDomain::Lineage);
     if root.lineage_manifest_path != expected_lineage {
         warnings.push(format!(
             "Root manifest lineage path '{}' is not canonical (expected '{}')",
@@ -1492,7 +1496,7 @@ fn check_root_paths(root: &RootManifest, warnings: &mut Vec<String>) {
         ));
     }
 
-    let expected_search = CatalogPaths::domain_manifest(CatalogDomain::Search);
+    let expected_search = CatalogPaths::domain_manifest_pointer(CatalogDomain::Search);
     if root.search_manifest_path != expected_search {
         warnings.push(format!(
             "Root manifest search path '{}' is not canonical (expected '{}')",
@@ -1760,83 +1764,60 @@ async fn verify_snapshot_files(storage: &ScopedStorage, snapshot: &SnapshotInfo)
     (errors, warnings)
 }
 
-async fn verify_commit_chain(
+async fn verify_catalog_manifest_history(
     storage: &ScopedStorage,
-    last_commit_id: &str,
+    current_manifest_path: &str,
+    current_manifest: &CatalogDomainManifest,
 ) -> (Vec<String>, usize) {
     let mut errors = Vec::new();
     let mut visited = HashSet::new();
-    let mut expected_hash: Option<String> = None;
-    let mut current = Some(last_commit_id.to_string());
-    let mut count = 0usize;
+    let mut manifest_path = current_manifest_path.to_string();
+    let mut manifest = current_manifest.clone();
+    let mut count = 1usize;
 
-    while let Some(commit_id) = current {
-        if !visited.insert(commit_id.clone()) {
-            errors.push(format!("Commit chain cycle detected at {commit_id}"));
+    visited.insert(manifest_path.clone());
+
+    while let Some(previous_path) = manifest.previous_manifest_path.clone() {
+        if !visited.insert(previous_path.clone()) {
+            errors.push(format!(
+                "Manifest history cycle detected at {previous_path}"
+            ));
             break;
         }
 
-        let path = CatalogPaths::commit(CatalogDomain::Catalog, &commit_id);
-        let bytes = match storage.get_raw(&path).await {
+        let bytes = match storage.get_raw(&previous_path).await {
             Ok(bytes) => bytes,
             Err(e) if is_not_found(&e) => {
-                errors.push(format!("Commit record missing: {path}"));
+                errors.push(format!("Previous manifest missing: {previous_path}"));
                 break;
             }
             Err(e) => {
-                errors.push(format!("Failed to read commit record '{path}': {e}"));
+                errors.push(format!("Failed to read manifest '{previous_path}': {e}"));
                 break;
             }
         };
 
-        let record: CommitRecord = match serde_json::from_slice(&bytes) {
-            Ok(record) => record,
+        let previous: CatalogDomainManifest = match serde_json::from_slice(&bytes) {
+            Ok(previous) => previous,
             Err(e) => {
-                errors.push(format!("Invalid commit JSON at '{}': {e}", path));
+                errors.push(format!(
+                    "Invalid catalog manifest JSON at '{}': {e}",
+                    previous_path
+                ));
                 break;
             }
         };
 
-        let actual_hash = record.compute_hash();
-        if let Some(expected) = expected_hash.as_deref() {
-            if expected != actual_hash {
-                let legacy_hash = sha256_prefixed(bytes.as_ref());
-                if expected == legacy_hash {
-                    errors.push(format!(
-                        "Commit hash mismatch for '{}': expected {}, got {} (matches legacy raw JSON hash)",
-                        path, expected, actual_hash
-                    ));
-                } else {
-                    errors.push(format!(
-                        "Commit hash mismatch for '{}': expected {}, got {}",
-                        path, expected, actual_hash
-                    ));
-                }
-            }
-        }
-
-        if record.commit_id != commit_id {
+        let previous_hash = sha256_prefixed(bytes.as_ref());
+        if let Err(e) = manifest.validate_succession(&previous, &previous_hash) {
             errors.push(format!(
-                "Commit ID mismatch at '{}': expected {}, found {}",
-                path, commit_id, record.commit_id
+                "Manifest history mismatch for '{}': {e}",
+                manifest_path
             ));
         }
 
-        if record.prev_commit_id.is_none() && record.prev_commit_hash.is_some() {
-            errors.push(format!(
-                "Commit '{}' has prev_commit_hash but no prev_commit_id",
-                commit_id
-            ));
-        }
-        if record.prev_commit_id.is_some() && record.prev_commit_hash.is_none() {
-            errors.push(format!(
-                "Commit '{}' has prev_commit_id but no prev_commit_hash",
-                commit_id
-            ));
-        }
-
-        expected_hash = record.prev_commit_hash.clone();
-        current = record.prev_commit_id.clone();
+        manifest_path = previous_path;
+        manifest = previous;
         count += 1;
     }
 
@@ -1913,6 +1894,24 @@ async fn read_json<T: DeserializeOwned>(storage: &ScopedStorage, path: &str) -> 
         .await
         .with_context(|| format!("Failed to read '{path}'"))?;
     serde_json::from_slice(&bytes).with_context(|| format!("Invalid JSON at '{path}'"))
+}
+
+async fn read_resolved_json<T: DeserializeOwned>(
+    storage: &ScopedStorage,
+    path: &str,
+) -> Result<(String, T)> {
+    let resolved_path = resolve_manifest_path(storage, path).await?;
+    let value = read_json::<T>(storage, &resolved_path).await?;
+    Ok((resolved_path, value))
+}
+
+async fn resolve_manifest_path(storage: &ScopedStorage, path: &str) -> Result<String> {
+    if path.ends_with(".pointer.json") {
+        let pointer = read_json::<DomainManifestPointer>(storage, path).await?;
+        Ok(pointer.manifest_path)
+    } else {
+        Ok(path.to_string())
+    }
 }
 
 fn join_snapshot_path(dir: &str, file: &str) -> String {

@@ -5,13 +5,10 @@ use arco_core::{ScopedStorage, VisibilityStatus};
 use arco_flow::compaction_client::compact_orchestration_events_fenced;
 use arco_flow::error::Error as FlowError;
 use arco_flow::orchestration::OrchestrationLedgerWriter;
-use arco_flow::orchestration::compactor::{
-    MicroCompactor, OrchestrationManifest, OrchestrationManifestPointer,
-};
+use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_flow::orchestration::events::OrchestrationEvent;
 use arco_flow::orchestration::ledger::LedgerWriter;
 use arco_flow::orchestration_compaction_lock_path;
-use arco_flow::orchestration_manifest_pointer_path;
 
 use crate::config::Config;
 use crate::error::ApiError;
@@ -91,17 +88,9 @@ pub async fn append_events_and_compact_with_result(
     request_id: Option<&str>,
 ) -> Result<OrchestrationCommitOutcome, ApiError> {
     if events.is_empty() {
-        return Ok(OrchestrationCommitOutcome {
-            event_paths: Vec::new(),
-            lock_path: orchestration_compaction_lock_path().to_string(),
-            fencing_token: 0,
-            manifest_id: String::new(),
-            manifest_revision: String::new(),
-            pointer_version: String::new(),
-            delta_id: None,
-            events_processed: 0,
-            repair_pending: false,
-        });
+        return Err(ApiError::bad_request(
+            "orchestration batch must include at least one event",
+        ));
     }
 
     let lock_path = orchestration_compaction_lock_path();
@@ -113,61 +102,43 @@ pub async fn append_events_and_compact_with_result(
     })?;
     let fencing_token = guard.fencing_token().sequence();
 
-    let event_paths: Vec<String> = events.iter().map(LedgerWriter::event_path).collect();
-    let ledger = LedgerWriter::new(storage.clone());
-    ledger
-        .append_all(events)
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to append orchestration events: {e}")))?;
-
-    let publish_result = compact_orchestration_events_with_fencing(
-        config,
-        storage.clone(),
-        event_paths.clone(),
-        fencing_token,
-        lock_path,
-        request_id,
-    )
-    .await?;
-
-    let pointer_meta = storage
-        .head_raw(orchestration_manifest_pointer_path())
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to read orchestration pointer head: {e}")))?
-        .ok_or_else(|| ApiError::internal("orchestration pointer missing after visible publish"))?;
-    let pointer_bytes = storage
-        .get_raw(orchestration_manifest_pointer_path())
-        .await
-        .map_err(|e| {
-            ApiError::internal(format!(
-                "failed to read orchestration manifest pointer after visible publish: {e}"
-            ))
+    let outcome = async {
+        let event_paths: Vec<String> = events.iter().map(LedgerWriter::event_path).collect();
+        let ledger = LedgerWriter::new(storage.clone());
+        ledger.append_all(events).await.map_err(|e| {
+            ApiError::internal(format!("failed to append orchestration events: {e}"))
         })?;
-    let pointer: OrchestrationManifestPointer = serde_json::from_slice(&pointer_bytes)
-        .map_err(|e| ApiError::internal(format!("failed to parse orchestration pointer: {e}")))?;
-    let manifest_bytes = storage.get_raw(&pointer.manifest_path).await.map_err(|e| {
-        ApiError::internal(format!(
-            "failed to read visible orchestration manifest '{}': {e}",
-            pointer.manifest_path
-        ))
-    })?;
-    let manifest: OrchestrationManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| ApiError::internal(format!("failed to parse orchestration manifest: {e}")))?;
+
+        let publish_result = compact_orchestration_events_with_fencing(
+            config,
+            storage.clone(),
+            event_paths.clone(),
+            fencing_token,
+            lock_path,
+            request_id,
+        )
+        .await?;
+
+        Ok::<_, ApiError>((event_paths, publish_result))
+    }
+    .await;
 
     if let Err(error) = guard.release().await {
         tracing::warn!(
             error = %error,
-            "failed to release orchestration compaction lock after successful compaction; relying on TTL cleanup"
+            "failed to release orchestration compaction lock after compaction; relying on TTL cleanup"
         );
     }
+
+    let (event_paths, publish_result) = outcome?;
 
     Ok(OrchestrationCommitOutcome {
         event_paths,
         lock_path: lock_path.to_string(),
         fencing_token,
-        manifest_id: manifest.manifest_id,
-        manifest_revision: manifest.revision_ulid,
-        pointer_version: pointer_meta.version,
+        manifest_id: publish_result.manifest_id,
+        manifest_revision: publish_result.manifest_revision,
+        pointer_version: publish_result.pointer_version,
         delta_id: publish_result.delta_id,
         events_processed: publish_result.events_processed,
         repair_pending: publish_result.repair_pending,
@@ -186,7 +157,9 @@ async fn compact_orchestration_events_with_fencing(
         return Ok(OrchestrationCompactionResult {
             events_processed: 0,
             delta_id: None,
+            manifest_id: String::new(),
             manifest_revision: String::new(),
+            pointer_version: String::new(),
             repair_pending: false,
             visibility_status: VisibilityStatus::Visible,
         });
@@ -213,7 +186,9 @@ async fn compact_orchestration_events_with_fencing(
     require_visible_compaction(OrchestrationCompactionResult {
         events_processed: result.events_processed,
         delta_id: result.delta_id,
+        manifest_id: result.manifest_id,
         manifest_revision: result.manifest_revision,
+        pointer_version: result.pointer_version,
         repair_pending: result.repair_pending,
         visibility_status: result.visibility_status.into(),
     })
@@ -224,7 +199,9 @@ async fn compact_orchestration_events_with_fencing(
 struct OrchestrationCompactionResult {
     events_processed: u32,
     delta_id: Option<String>,
+    manifest_id: String,
     manifest_revision: String,
+    pointer_version: String,
     repair_pending: bool,
     visibility_status: VisibilityStatus,
 }
@@ -236,7 +213,9 @@ impl From<arco_core::orchestration_compaction::OrchestrationCompactionResponse>
         Self {
             events_processed: value.events_processed,
             delta_id: value.delta_id,
+            manifest_id: value.manifest_id,
             manifest_revision: value.manifest_revision,
+            pointer_version: value.pointer_version,
             repair_pending: value.repair_pending,
             visibility_status: value.visibility_status,
         }
@@ -404,7 +383,9 @@ mod tests {
                         Json(OrchestrationCompactionResponse {
                             events_processed: 1,
                             delta_id: None,
+                            manifest_id: "00000000000000000001".to_string(),
                             manifest_revision: "manifest-rev".to_string(),
+                            pointer_version: "ptr-1".to_string(),
                             visibility_status: VisibilityStatus::Visible,
                             repair_pending: false,
                         }),
@@ -445,7 +426,9 @@ mod tests {
                             Json(serde_json::json!(OrchestrationCompactionResponse {
                                 events_processed: 1,
                                 delta_id: None,
+                                manifest_id: "00000000000000000001".to_string(),
                                 manifest_revision: "manifest-rev".to_string(),
+                                pointer_version: "ptr-1".to_string(),
                                 visibility_status: VisibilityStatus::Visible,
                                 repair_pending: false,
                             })),
@@ -479,7 +462,9 @@ mod tests {
                         Json(serde_json::json!(OrchestrationCompactionResponse {
                             events_processed: 1,
                             delta_id: None,
+                            manifest_id: "00000000000000000001".to_string(),
                             manifest_revision: "manifest-rev".to_string(),
+                            pointer_version: "ptr-1".to_string(),
                             visibility_status: VisibilityStatus::Visible,
                             repair_pending: false,
                         })),

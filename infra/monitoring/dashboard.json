@@ -95,23 +95,31 @@
       "description": "Recent SLO breach increments by SLO key"
     },
     {
-      "title": "Control-Plane Repair Pending (15m increase)",
+      "title": "Orchestration Cleanup Findings (15m increase)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
       "targets": [
         {
-          "expr": "sum(increase(arco_catalog_repair_pending_total[15m])) by (domain)",
-          "legendFormat": "catalog {{domain}}"
+          "expr": "sum(increase(arco_flow_orch_reconciler_orphans_total[15m])) by (reason)",
+          "legendFormat": "orphan {{reason}}"
         },
         {
-          "expr": "sum(increase(arco_flow_orch_repair_pending_total[15m]))",
-          "legendFormat": "orchestration"
+          "expr": "sum(increase(arco_flow_orch_reconciler_deletes_total[15m])) by (reason)",
+          "legendFormat": "delete {{reason}}"
+        },
+        {
+          "expr": "sum(increase(arco_flow_orch_reconciler_deferred_paths_total[15m])) by (reason)",
+          "legendFormat": "deferred {{reason}}"
+        },
+        {
+          "expr": "sum(increase(arco_flow_orch_reconciler_skipped_paths_total[15m])) by (reason)",
+          "legendFormat": "skipped {{reason}}"
         }
       ],
-      "description": "Visible pointer-CAS commits that still need repair of legacy mirrors or commit records"
+      "description": "Orchestration orphan discovery and cleanup activity over the last 15 minutes"
     },
     {
-      "title": "Control-Plane Reconcile Issues (15m increase)",
+      "title": "Control-Plane Reconcile Findings (15m increase)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
       "targets": [
@@ -120,14 +128,14 @@
           "legendFormat": "catalog {{domain}}"
         },
         {
-          "expr": "sum(increase(arco_flow_orch_reconciler_repair_issues_total[15m])) by (reason)",
+          "expr": "sum(increase(arco_flow_orch_reconciler_orphans_total[15m])) by (reason)",
           "legendFormat": "orch {{reason}}"
         }
       ],
-      "description": "Repairable current-head issues detected by catalog and orchestration reconciler dry runs"
+      "description": "Repairable catalog findings and orchestration orphan findings from reconciler activity"
     },
     {
-      "title": "Control-Plane Repairs (15m increase)",
+      "title": "Catalog Repairs / Orch Deletes (15m increase)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
       "targets": [
@@ -136,11 +144,11 @@
           "legendFormat": "catalog {{status}}"
         },
         {
-          "expr": "sum(increase(arco_flow_orch_reconciler_repairs_total[15m])) by (status)",
-          "legendFormat": "orch {{status}}"
+          "expr": "sum(increase(arco_flow_orch_reconciler_deletes_total[15m])) by (reason)",
+          "legendFormat": "orch delete {{reason}}"
         }
       ],
-      "description": "Repair attempts and outcomes for current-head reconciliation"
+      "description": "Catalog repair outcomes and orchestration cleanup deletes over the last 15 minutes"
     },
     {
       "title": "Stale Fence Rejects (15m increase)",
@@ -196,7 +204,7 @@
           "legendFormat": "orch {{domain}} {{mode}} {{scope}}"
         }
       ],
-      "description": "Current repair backlog size for catalog and orchestration current-head issues"
+      "description": "Current repair backlog size for catalog snapshot cleanup and orchestration orphan cleanup across repair scopes"
     },
     {
       "title": "Repair Backlog Age (seconds)",
@@ -212,7 +220,7 @@
           "legendFormat": "orch {{domain}} {{mode}} {{scope}}"
         }
       ],
-      "description": "Age of the current repair backlog, used to enforce production repair SLOs"
+      "description": "Age of the active repair backlog, used to enforce production cleanup SLOs"
     },
     {
       "title": "Repair Repeat Findings (15m increase)",

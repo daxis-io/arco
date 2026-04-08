@@ -117,13 +117,8 @@ pub mod names {
     /// Counter: Removed compatibility request shapes rejected by the orchestration compactor.
     pub const ORCH_COMPACTOR_REQUEST_CONTRACT_REJECTIONS_TOTAL: &str =
         "arco_flow_orch_compactor_request_contract_rejections_total";
-    /// Counter: Visible compaction commits that still require side-effect repair.
-    pub const ORCH_REPAIR_PENDING_TOTAL: &str = "arco_flow_orch_repair_pending_total";
     /// Counter: Orphan orchestration artifacts discovered by reconciliation.
     pub const ORCH_RECONCILER_ORPHANS_TOTAL: &str = "arco_flow_orch_reconciler_orphans_total";
-    /// Counter: Current-head repair issues discovered by orchestration reconciliation.
-    pub const ORCH_RECONCILER_REPAIR_ISSUES_TOTAL: &str =
-        "arco_flow_orch_reconciler_repair_issues_total";
     /// Counter: Repair actions attempted by orchestration reconciliation.
     pub const ORCH_RECONCILER_REPAIRS_TOTAL: &str = "arco_flow_orch_reconciler_repairs_total";
     /// Counter: Orchestration orphan objects deleted by reconciliation repair.
@@ -300,16 +295,8 @@ pub fn register_metrics() {
         "Removed compatibility request shapes rejected by the orchestration compactor"
     );
     describe_counter!(
-        names::ORCH_REPAIR_PENDING_TOTAL,
-        "Visible compaction commits that still require side-effect repair"
-    );
-    describe_counter!(
         names::ORCH_RECONCILER_ORPHANS_TOTAL,
         "Orphan orchestration artifacts discovered by reconciliation"
-    );
-    describe_counter!(
-        names::ORCH_RECONCILER_REPAIR_ISSUES_TOTAL,
-        "Current-head repair issues discovered by orchestration reconciliation"
     );
     describe_counter!(
         names::ORCH_RECONCILER_REPAIRS_TOTAL,

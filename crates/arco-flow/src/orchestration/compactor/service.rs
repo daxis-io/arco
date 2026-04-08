@@ -15,6 +15,9 @@ use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 use ulid::Ulid;
 
+use arco_core::control_plane_transactions::{
+    ControlPlaneTxDomain, ControlPlaneTxPaths, ControlPlaneTxStatus, RootTxManifest, RootTxRecord,
+};
 use arco_core::publish::{
     SnapshotPointerDurability, SnapshotPointerPublishOutcome, publish_snapshot_pointer_transaction,
 };
@@ -26,8 +29,7 @@ use crate::metrics::{labels as metric_labels, names as metric_names};
 use crate::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
 use crate::paths::{
     orchestration_base_snapshot_dir, orchestration_compaction_lock_path, orchestration_l0_dir,
-    orchestration_manifest_path, orchestration_manifest_pointer_path,
-    orchestration_manifest_snapshot_path,
+    orchestration_manifest_pointer_path, orchestration_manifest_snapshot_path,
 };
 
 use super::fold::{
@@ -91,24 +93,36 @@ impl From<CompactionVisibility> for arco_core::VisibilityStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PublishOutcome {
-    Visible { repair_pending: bool },
+    Visible {
+        pointer_version: String,
+        repair_pending: bool,
+    },
     PersistedNotVisible,
 }
 
 impl PublishOutcome {
-    const fn visibility_status(self) -> CompactionVisibility {
+    fn visibility_status(&self) -> CompactionVisibility {
         match self {
             Self::Visible { .. } => CompactionVisibility::Visible,
             Self::PersistedNotVisible => CompactionVisibility::PersistedNotVisible,
         }
     }
 
-    const fn repair_pending(self) -> bool {
+    fn repair_pending(&self) -> bool {
         match self {
-            Self::Visible { repair_pending } => repair_pending,
+            Self::Visible { repair_pending, .. } => *repair_pending,
             Self::PersistedNotVisible => false,
+        }
+    }
+
+    fn pointer_version(&self) -> Option<&str> {
+        match self {
+            Self::Visible {
+                pointer_version, ..
+            } => Some(pointer_version.as_str()),
+            Self::PersistedNotVisible => None,
         }
     }
 }
@@ -190,8 +204,12 @@ pub struct CompactionResult {
     pub events_processed: u32,
     /// Delta ID if any state was written.
     pub delta_id: Option<String>,
+    /// Visible immutable manifest identifier.
+    pub manifest_id: String,
     /// New manifest revision.
     pub manifest_revision: String,
+    /// Pointer object version returned by the visible CAS publish.
+    pub pointer_version: String,
     /// Visibility outcome for this compaction acknowledgement.
     pub visibility_status: CompactionVisibility,
     /// Whether post-commit side effects failed and require repair.
@@ -241,6 +259,26 @@ impl MicroCompactor {
         Ok((manifest, state))
     }
 
+    /// Loads orchestration state pinned to one visible root transaction token.
+    ///
+    /// This opt-in read path resolves `root:{tx_id}` through the visible root
+    /// transaction record and immutable super-manifest, then loads the
+    /// orchestration manifest captured in that pinned cut.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the root transaction is missing, not visible, or if
+    /// the pinned orchestration manifest/state cannot be read.
+    pub async fn load_state_for_root_token(
+        &self,
+        read_token: &str,
+    ) -> Result<(OrchestrationManifest, FoldState)> {
+        let manifest = self.read_manifest_for_root_token(read_token).await?;
+        let mut state = self.load_current_state(&manifest).await?;
+        state.tenant_secret.clone_from(&self.tenant_secret);
+        Ok((manifest, state))
+    }
+
     /// Runs micro-compaction for explicit event paths.
     ///
     /// This is the sync compaction path - events are passed explicitly,
@@ -272,14 +310,12 @@ impl MicroCompactor {
     pub async fn rebuild_from_ledger_manifest(
         &self,
         rebuild_manifest: LedgerRebuildManifest,
-        expected_epoch: Option<u64>,
     ) -> Result<CompactionResult> {
         let (manifest, _, _, _) = self.read_manifest_with_version().await?;
         let event_paths = rebuild_manifest
             .event_paths_after_watermark(&manifest.watermarks)
             .map_err(|message| Error::Core(arco_core::Error::InvalidInput(message)))?;
-        self.compact_events_with_epoch(event_paths, expected_epoch)
-            .await
+        self.compact_events(event_paths).await
     }
 
     /// Rebuilds orchestration projection state from a stored rebuild manifest JSON.
@@ -290,7 +326,6 @@ impl MicroCompactor {
     pub async fn rebuild_from_ledger_manifest_path(
         &self,
         rebuild_manifest_path: &str,
-        expected_epoch: Option<u64>,
     ) -> Result<CompactionResult> {
         let bytes = self.storage.get_raw(rebuild_manifest_path).await?;
         let rebuild_manifest: LedgerRebuildManifest =
@@ -299,8 +334,7 @@ impl MicroCompactor {
                     "failed to parse ledger rebuild manifest at {rebuild_manifest_path}: {e}"
                 )))
             })?;
-        self.rebuild_from_ledger_manifest(rebuild_manifest, expected_epoch)
-            .await
+        self.rebuild_from_ledger_manifest(rebuild_manifest).await
     }
 
     /// Fenced rebuild path for callers that hold the orchestration compaction lock.
@@ -367,45 +401,23 @@ impl MicroCompactor {
             .await
     }
 
-    /// Runs micro-compaction and validates the caller's lock epoch when supplied.
-    ///
-    /// # Arguments
-    /// * `event_paths` - Explicit paths to event files to process
-    /// * `expected_epoch` - Optional lock epoch associated with this write attempt
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if storage reads/writes fail, Parquet encoding fails,
-    /// or the supplied epoch is stale relative to the current pointer epoch.
-    #[tracing::instrument(skip(self, event_paths), fields(event_count = event_paths.len()))]
-    #[allow(clippy::too_many_lines)]
-    pub async fn compact_events_with_epoch(
-        &self,
-        event_paths: Vec<String>,
-        expected_epoch: Option<u64>,
-    ) -> Result<CompactionResult> {
-        self.compact_events_internal(event_paths, expected_epoch, None)
-            .await
-    }
-
     #[tracing::instrument(skip(self, event_paths), fields(event_count = event_paths.len()))]
     #[allow(clippy::too_many_lines)]
     async fn compact_events_internal(
         &self,
         event_paths: Vec<String>,
-        expected_epoch: Option<u64>,
+        fencing_token: Option<u64>,
         lock_path: Option<&str>,
     ) -> Result<CompactionResult> {
         let ack_started = Instant::now();
         'retry: for retry_attempt in 0..=COMPACTION_PUBLISH_RETRY_DELAYS_MS.len() {
-            self.validate_fencing_lock(expected_epoch, lock_path)
-                .await?;
+            self.validate_fencing_lock(fencing_token, lock_path).await?;
 
             // Load current manifest + version for CAS
             let (mut manifest, pointer_version, previous_pointer, previous_pointer_bytes) =
                 self.read_manifest_with_version().await?;
+            let mut visible_pointer_version = pointer_version.clone().unwrap_or_default();
             let previous_manifest = manifest.clone();
-            validate_expected_epoch(expected_epoch, previous_pointer.as_ref())?;
 
             if event_paths.is_empty() {
                 let mut visibility_status = CompactionVisibility::Visible;
@@ -418,7 +430,7 @@ impl MicroCompactor {
                             None,
                             previous_pointer.as_ref(),
                             previous_pointer_bytes.as_ref(),
-                            expected_epoch,
+                            fencing_token,
                             lock_path,
                         )
                         .await
@@ -426,6 +438,9 @@ impl MicroCompactor {
                         Ok(outcome) => {
                             visibility_status = outcome.visibility_status();
                             repair_pending = outcome.repair_pending();
+                            if let Some(pointer_version) = outcome.pointer_version() {
+                                visible_pointer_version = pointer_version.to_string();
+                            }
                         }
                         Err(publish_error) => {
                             if let Some(delay_ms) =
@@ -470,7 +485,9 @@ impl MicroCompactor {
                 return Ok(CompactionResult {
                     events_processed: 0,
                     delta_id: None,
+                    manifest_id: manifest.manifest_id,
                     manifest_revision: manifest.revision_ulid,
+                    pointer_version: visible_pointer_version,
                     visibility_status,
                     repair_pending,
                 });
@@ -640,18 +657,15 @@ impl MicroCompactor {
             let mut visibility_status = CompactionVisibility::Visible;
             let mut repair_pending = false;
             let manifest_revision = if manifest_changed {
-                let previous_manifest_path = previous_pointer.as_ref().map_or_else(
-                    || orchestration_manifest_path().to_string(),
-                    |p| p.manifest_path.clone(),
-                );
-
                 manifest.manifest_id =
                     next_manifest_id(&manifest.manifest_id).map_err(Error::serialization)?;
-                manifest.previous_manifest_path = Some(previous_manifest_path);
+                manifest.previous_manifest_path = previous_pointer
+                    .as_ref()
+                    .map(|pointer| pointer.manifest_path.clone());
                 let pointer_epoch = previous_pointer.as_ref().map_or(0, |p| p.epoch);
                 manifest.epoch = manifest.epoch.max(pointer_epoch);
-                if let Some(expected_epoch) = expected_epoch {
-                    manifest.epoch = manifest.epoch.max(expected_epoch);
+                if let Some(fencing_token) = fencing_token {
+                    manifest.epoch = manifest.epoch.max(fencing_token);
                 }
 
                 let new_revision = Ulid::new().to_string();
@@ -664,7 +678,7 @@ impl MicroCompactor {
                         pointer_version.as_deref(),
                         previous_pointer.as_ref(),
                         previous_pointer_bytes.as_ref(),
-                        expected_epoch,
+                        fencing_token,
                         lock_path,
                     )
                     .await
@@ -672,6 +686,9 @@ impl MicroCompactor {
                     Ok(outcome) => {
                         visibility_status = outcome.visibility_status();
                         repair_pending = outcome.repair_pending();
+                        if let Some(pointer_version) = outcome.pointer_version() {
+                            visible_pointer_version = pointer_version.to_string();
+                        }
                     }
                     Err(publish_error) => {
                         if let Some(delay_ms) =
@@ -721,7 +738,9 @@ impl MicroCompactor {
             return Ok(CompactionResult {
                 events_processed: u32::try_from(events.len()).unwrap_or(u32::MAX),
                 delta_id,
+                manifest_id: manifest.manifest_id,
                 manifest_revision,
+                pointer_version: visible_pointer_version,
                 visibility_status,
                 repair_pending,
             });
@@ -732,10 +751,10 @@ impl MicroCompactor {
 
     async fn validate_fencing_lock(
         &self,
-        expected_epoch: Option<u64>,
+        fencing_token: Option<u64>,
         lock_path: Option<&str>,
     ) -> Result<()> {
-        let (Some(expected_epoch), Some(lock_path)) = (expected_epoch, lock_path) else {
+        let (Some(fencing_token), Some(lock_path)) = (fencing_token, lock_path) else {
             return Ok(());
         };
 
@@ -756,7 +775,7 @@ impl MicroCompactor {
             .increment(1);
             return Err(Error::FencingLockUnavailable {
                 lock_path: lock_path.to_string(),
-                provided: expected_epoch,
+                provided: fencing_token,
             });
         };
 
@@ -768,11 +787,11 @@ impl MicroCompactor {
             .increment(1);
             return Err(Error::FencingLockUnavailable {
                 lock_path: lock_path.to_string(),
-                provided: expected_epoch,
+                provided: fencing_token,
             });
         }
 
-        if lock_info.sequence_number != expected_epoch {
+        if lock_info.sequence_number != fencing_token {
             counter!(
                 metric_names::ORCH_COMPACTOR_STALE_FENCING_REJECTS_TOTAL,
                 metric_labels::REASON => "stale_token".to_string(),
@@ -780,7 +799,7 @@ impl MicroCompactor {
             .increment(1);
             return Err(Error::StaleFencingToken {
                 expected: lock_info.sequence_number,
-                provided: expected_epoch,
+                provided: fencing_token,
             });
         }
 
@@ -804,13 +823,7 @@ impl MicroCompactor {
                     message: format!("failed to parse manifest pointer: {e}"),
                 })?;
 
-            let manifest_data = match self.storage.get_raw(&pointer.manifest_path).await {
-                Ok(data) => data,
-                Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
-                    self.storage.get_raw(orchestration_manifest_path()).await?
-                }
-                Err(e) => return Err(e.into()),
-            };
+            let manifest_data = self.storage.get_raw(&pointer.manifest_path).await?;
             let mut manifest: OrchestrationManifest = serde_json::from_slice(&manifest_data)
                 .map_err(|e| Error::Serialization {
                     message: format!("failed to parse manifest: {e}"),
@@ -827,23 +840,73 @@ impl MicroCompactor {
             ));
         }
 
-        let manifest_path = orchestration_manifest_path();
-        match self.storage.head_raw(manifest_path).await? {
-            Some(_) => {
-                let data = self.storage.get_raw(manifest_path).await?;
-                let manifest: OrchestrationManifest =
-                    serde_json::from_slice(&data).map_err(|e| Error::Serialization {
-                        message: format!("failed to parse manifest: {e}"),
-                    })?;
-                Ok((manifest, None, None, None))
-            }
-            None => Ok((
-                OrchestrationManifest::new(Ulid::new().to_string()),
-                None,
-                None,
-                None,
-            )),
+        let legacy_path = arco_core::FlowPaths::orchestration_manifest_path();
+        if self.storage.head_raw(legacy_path).await?.is_some() {
+            let manifest_data = self.storage.get_raw(legacy_path).await?;
+            let manifest: OrchestrationManifest =
+                serde_json::from_slice(&manifest_data).map_err(|e| Error::Serialization {
+                    message: format!("failed to parse legacy manifest: {e}"),
+                })?;
+            return Ok((manifest, None, None, None));
         }
+
+        Ok((
+            OrchestrationManifest::new(Ulid::new().to_string()),
+            None,
+            None,
+            None,
+        ))
+    }
+
+    async fn read_manifest_for_root_token(
+        &self,
+        read_token: &str,
+    ) -> Result<OrchestrationManifest> {
+        let tx_id = parse_root_read_token(read_token)?;
+        let tx_record_path = ControlPlaneTxPaths::record(ControlPlaneTxDomain::Root, tx_id);
+        let tx_record_bytes = self.storage.get_raw(&tx_record_path).await?;
+        let tx_record: RootTxRecord = serde_json::from_slice(&tx_record_bytes).map_err(|e| {
+            Error::serialization(format!("failed to parse root transaction record: {e}"))
+        })?;
+
+        if tx_record.status != ControlPlaneTxStatus::Visible {
+            return Err(Error::Core(arco_core::Error::PreconditionFailed {
+                message: format!("root transaction '{tx_id}' is not visible"),
+            }));
+        }
+
+        let super_manifest_path = tx_record
+            .result
+            .as_ref()
+            .map(|result| result.super_manifest_path.as_str())
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| {
+                Error::Core(arco_core::Error::Validation {
+                    message: format!(
+                        "visible root transaction '{tx_id}' is missing super_manifest_path"
+                    ),
+                })
+            })?;
+
+        let super_manifest_bytes = self.storage.get_raw(super_manifest_path).await?;
+        let super_manifest: RootTxManifest = serde_json::from_slice(&super_manifest_bytes)
+            .map_err(|e| {
+                Error::serialization(format!("failed to parse root super-manifest: {e}"))
+            })?;
+
+        let orchestration = super_manifest
+            .domains
+            .get(&ControlPlaneTxDomain::Orchestration)
+            .ok_or_else(|| {
+                Error::Core(arco_core::Error::resource_not_found(
+                    "root transaction domain",
+                    "orchestration",
+                ))
+            })?;
+
+        let manifest_bytes = self.storage.get_raw(&orchestration.manifest_path).await?;
+        serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| Error::serialization(format!("failed to parse pinned manifest: {e}")))
     }
 
     #[cfg(test)]
@@ -1235,7 +1298,7 @@ impl MicroCompactor {
         current_pointer_version: Option<&str>,
         previous_pointer: Option<&OrchestrationManifestPointer>,
         previous_pointer_bytes: Option<&Bytes>,
-        expected_epoch: Option<u64>,
+        fencing_token: Option<u64>,
         lock_path: Option<&str>,
     ) -> std::result::Result<PublishOutcome, PublishManifestError> {
         let snapshot_path = orchestration_manifest_snapshot_path(&manifest.manifest_id);
@@ -1273,11 +1336,6 @@ impl MicroCompactor {
             DurabilityMode::Visible => SnapshotPointerDurability::Visible,
             DurabilityMode::Persisted => SnapshotPointerDurability::Persisted,
         };
-        let legacy_json =
-            serde_json::to_string_pretty(manifest).map_err(|e| Error::Serialization {
-                message: format!("failed to serialize legacy manifest: {e}"),
-            })?;
-
         match publish_snapshot_pointer_transaction(
             &self.storage,
             &snapshot_path,
@@ -1285,10 +1343,10 @@ impl MicroCompactor {
             pointer_path,
             Bytes::from(pointer_json),
             current_pointer_version,
-            Some((orchestration_manifest_path(), Bytes::from(legacy_json))),
+            None,
             durability,
             async {
-                self.validate_fencing_lock(expected_epoch, lock_path)
+                self.validate_fencing_lock(fencing_token, lock_path)
                     .await
                     .map_err(encode_pre_pointer_publish_error)?;
 
@@ -1314,16 +1372,13 @@ impl MicroCompactor {
         )
         .await
         {
-            Ok(SnapshotPointerPublishOutcome::Visible { repair_pending, .. }) => {
-                if repair_pending {
-                    counter!(
-                        metric_names::ORCH_REPAIR_PENDING_TOTAL,
-                        metric_labels::REASON => "legacy_manifest_mirror".to_string(),
-                    )
-                    .increment(1);
-                }
-                Ok(PublishOutcome::Visible { repair_pending })
-            }
+            Ok(SnapshotPointerPublishOutcome::Visible {
+                pointer_version,
+                repair_pending,
+            }) => Ok(PublishOutcome::Visible {
+                pointer_version,
+                repair_pending,
+            }),
             Ok(SnapshotPointerPublishOutcome::PersistedNotVisible) => {
                 tracing::warn!(
                     manifest_id = %manifest.manifest_id,
@@ -1355,6 +1410,14 @@ impl MicroCompactor {
             Err(error) => Err(PublishManifestError::Other(Error::from(error))),
         }
     }
+}
+
+fn parse_root_read_token(read_token: &str) -> Result<&str> {
+    read_token.strip_prefix("root:").ok_or_else(|| {
+        Error::Core(arco_core::Error::InvalidInput(format!(
+            "invalid root read token '{read_token}'"
+        )))
+    })
 }
 
 /// Merges two fold states, preferring newer row versions.
@@ -1747,24 +1810,6 @@ fn delta_state_is_empty(state: &FoldState) -> bool {
         && state.schedule_ticks.is_empty()
 }
 
-fn validate_expected_epoch(
-    expected_epoch: Option<u64>,
-    pointer: Option<&OrchestrationManifestPointer>,
-) -> Result<()> {
-    let (Some(request_epoch), Some(pointer)) = (expected_epoch, pointer) else {
-        return Ok(());
-    };
-
-    if request_epoch < pointer.epoch {
-        return Err(Error::StaleFencingToken {
-            expected: pointer.epoch,
-            provided: request_epoch,
-        });
-    }
-
-    Ok(())
-}
-
 fn should_retry_l0_write_conflict(error: &Error, retry_attempt: usize) -> Option<u64> {
     match error {
         Error::Core(arco_core::Error::PreconditionFailed { message })
@@ -1975,7 +2020,7 @@ mod tests {
     use std::ops::Range;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use tokio::sync::{Barrier, Notify};
+    use tokio::sync::Barrier;
     use ulid::Ulid;
 
     async fn create_test_compactor() -> Result<(MicroCompactor, ScopedStorage)> {
@@ -1991,6 +2036,20 @@ mod tests {
         let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
         let compactor = MicroCompactor::new(storage.clone());
         Ok((compactor, storage))
+    }
+
+    async fn load_current_manifest(storage: &ScopedStorage) -> Result<OrchestrationManifest> {
+        let pointer_data = storage
+            .get_raw(orchestration_manifest_pointer_path())
+            .await?;
+        let pointer: OrchestrationManifestPointer =
+            serde_json::from_slice(&pointer_data).map_err(|e| Error::Serialization {
+                message: format!("failed to parse manifest pointer: {e}"),
+            })?;
+        let manifest_data = storage.get_raw(&pointer.manifest_path).await?;
+        serde_json::from_slice(&manifest_data).map_err(|e| Error::Serialization {
+            message: format!("failed to parse manifest: {e}"),
+        })
     }
 
     // Use deterministic event IDs to avoid parallel test flakiness.
@@ -2226,109 +2285,6 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct PreferredEpochSnapshotRaceBackend {
-        inner: MemoryBackend,
-        manifest_suffix: String,
-        preferred_epoch: u64,
-        race_barrier: Barrier,
-        preferred_committed: Notify,
-        preferred_committed_flag: AtomicBool,
-        race_hits: AtomicUsize,
-    }
-
-    impl PreferredEpochSnapshotRaceBackend {
-        fn new(manifest_suffix: impl Into<String>, preferred_epoch: u64) -> Self {
-            Self {
-                inner: MemoryBackend::new(),
-                manifest_suffix: manifest_suffix.into(),
-                preferred_epoch,
-                race_barrier: Barrier::new(2),
-                preferred_committed: Notify::new(),
-                preferred_committed_flag: AtomicBool::new(false),
-                race_hits: AtomicUsize::new(0),
-            }
-        }
-
-        fn race_epoch(
-            &self,
-            path: &str,
-            precondition: &WritePrecondition,
-            data: &Bytes,
-        ) -> Option<u64> {
-            if !path.ends_with(self.manifest_suffix.as_str())
-                || !matches!(precondition, WritePrecondition::DoesNotExist)
-            {
-                return None;
-            }
-
-            serde_json::from_slice::<OrchestrationManifest>(data.as_ref())
-                .ok()
-                .map(|manifest| manifest.epoch)
-        }
-    }
-
-    #[async_trait]
-    impl StorageBackend for PreferredEpochSnapshotRaceBackend {
-        async fn get(&self, path: &str) -> arco_core::error::Result<Bytes> {
-            self.inner.get(path).await
-        }
-
-        async fn get_range(
-            &self,
-            path: &str,
-            range: Range<u64>,
-        ) -> arco_core::error::Result<Bytes> {
-            self.inner.get_range(path, range).await
-        }
-
-        async fn put(
-            &self,
-            path: &str,
-            data: Bytes,
-            precondition: WritePrecondition,
-        ) -> arco_core::error::Result<WriteResult> {
-            if let Some(epoch) = self.race_epoch(path, &precondition, &data) {
-                if self.race_hits.fetch_add(1, Ordering::SeqCst) < 2 {
-                    self.race_barrier.wait().await;
-                    if epoch != self.preferred_epoch
-                        && !self.preferred_committed_flag.load(Ordering::SeqCst)
-                    {
-                        self.preferred_committed.notified().await;
-                    }
-                    let result = self.inner.put(path, data, precondition).await;
-                    if epoch == self.preferred_epoch {
-                        self.preferred_committed_flag.store(true, Ordering::SeqCst);
-                        self.preferred_committed.notify_waiters();
-                    }
-                    return result;
-                }
-            }
-
-            self.inner.put(path, data, precondition).await
-        }
-
-        async fn delete(&self, path: &str) -> arco_core::error::Result<()> {
-            self.inner.delete(path).await
-        }
-
-        async fn list(&self, prefix: &str) -> arco_core::error::Result<Vec<ObjectMeta>> {
-            self.inner.list(prefix).await
-        }
-
-        async fn head(&self, path: &str) -> arco_core::error::Result<Option<ObjectMeta>> {
-            self.inner.head(path).await
-        }
-
-        async fn signed_url(
-            &self,
-            path: &str,
-            expiry: Duration,
-        ) -> arco_core::error::Result<String> {
-            self.inner.signed_url(path, expiry).await
-        }
-    }
-
-    #[derive(Debug)]
     struct OneShotL0WriteConflictBackend {
         inner: MemoryBackend,
         pending_conflict: AtomicBool,
@@ -2352,74 +2308,6 @@ mod tests {
             path.contains("state/orchestration/l0/")
                 && matches!(precondition, WritePrecondition::DoesNotExist)
                 && self.pending_conflict.load(Ordering::SeqCst)
-        }
-    }
-
-    #[derive(Debug)]
-    struct LegacyManifestFailureBackend {
-        inner: MemoryBackend,
-        inject_once: AtomicBool,
-    }
-
-    impl LegacyManifestFailureBackend {
-        fn new() -> Self {
-            Self {
-                inner: MemoryBackend::new(),
-                inject_once: AtomicBool::new(true),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl StorageBackend for LegacyManifestFailureBackend {
-        async fn get(&self, path: &str) -> arco_core::error::Result<Bytes> {
-            self.inner.get(path).await
-        }
-
-        async fn get_range(
-            &self,
-            path: &str,
-            range: Range<u64>,
-        ) -> arco_core::error::Result<Bytes> {
-            self.inner.get_range(path, range).await
-        }
-
-        async fn put(
-            &self,
-            path: &str,
-            data: Bytes,
-            precondition: WritePrecondition,
-        ) -> arco_core::error::Result<WriteResult> {
-            if path.ends_with(orchestration_manifest_path())
-                && matches!(precondition, WritePrecondition::None)
-                && self.inject_once.swap(false, Ordering::SeqCst)
-            {
-                return Err(arco_core::Error::storage(format!(
-                    "injected orchestration legacy manifest write failure for {path}"
-                )));
-            }
-
-            self.inner.put(path, data, precondition).await
-        }
-
-        async fn delete(&self, path: &str) -> arco_core::error::Result<()> {
-            self.inner.delete(path).await
-        }
-
-        async fn list(&self, prefix: &str) -> arco_core::error::Result<Vec<ObjectMeta>> {
-            self.inner.list(prefix).await
-        }
-
-        async fn head(&self, path: &str) -> arco_core::error::Result<Option<ObjectMeta>> {
-            self.inner.head(path).await
-        }
-
-        async fn signed_url(
-            &self,
-            path: &str,
-            expiry: Duration,
-        ) -> arco_core::error::Result<String> {
-            self.inner.signed_url(path, expiry).await
         }
     }
 
@@ -2500,9 +2388,7 @@ mod tests {
             "exactly one racing compaction should publish a new delta"
         );
 
-        let manifest_data = storage.get_raw(orchestration_manifest_path()).await?;
-        let manifest: OrchestrationManifest =
-            serde_json::from_slice(&manifest_data).expect("parse manifest");
+        let manifest = load_current_manifest(&storage).await?;
         assert_eq!(manifest.manifest_id, "00000000000000000001");
         assert_eq!(manifest.l0_count, 1);
         assert_eq!(manifest.l0_deltas.len(), 1);
@@ -2511,47 +2397,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_events_retry_revalidates_expected_epoch() -> Result<()> {
-        let backend = Arc::new(PreferredEpochSnapshotRaceBackend::new(
+    async fn compact_events_fenced_retries_after_concurrent_manifest_snapshot_conflict()
+    -> Result<()> {
+        let backend = Arc::new(SnapshotRaceBackend::new(
             "state/orchestration/manifests/00000000000000000001.json",
-            2,
         ));
         let (winning_compactor, storage) =
             create_test_compactor_with_backend(backend.clone()).await?;
         let stale_compactor = MicroCompactor::new(storage.clone());
-
-        let mut manifest = OrchestrationManifest::new("01HQXYZ300REV");
-        manifest.manifest_id = "00000000000000000000".to_string();
-        manifest.epoch = 1;
-        winning_compactor
-            .publish_manifest(&manifest, None, None, None, None, None, None)
-            .await?;
-
         let event_paths = write_basic_compaction_events(&storage).await?;
+        let lock = DistributedLock::new(
+            storage.backend().clone(),
+            orchestration_compaction_lock_path(),
+        );
+        let guard = lock.acquire(Duration::from_secs(30), 1).await?;
+        let fencing_token = guard.fencing_token().sequence();
 
-        let (stale_result, winning_result) = tokio::time::timeout(Duration::from_secs(2), async {
+        let (result_a, result_b) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(
-                stale_compactor.compact_events_with_epoch(event_paths.clone(), Some(1)),
-                winning_compactor.compact_events_with_epoch(event_paths, Some(2)),
+                stale_compactor.compact_events_fenced(
+                    event_paths.clone(),
+                    fencing_token,
+                    orchestration_compaction_lock_path(),
+                ),
+                winning_compactor.compact_events_fenced(
+                    event_paths,
+                    fencing_token,
+                    orchestration_compaction_lock_path(),
+                ),
             )
         })
         .await
-        .expect("epoch-race compactors should not deadlock");
+        .expect("fenced racing compactors should not deadlock");
 
-        let stale_error = stale_result.expect_err("retry must revalidate a stale epoch");
+        let result_a = result_a?;
+        let result_b = result_b?;
         assert!(
-            matches!(
-                stale_error,
-                Error::StaleFencingToken {
-                    expected: 2,
-                    provided: 1,
-                }
-            ),
-            "expected typed stale token after retry, got {stale_error:?}"
-        );
-        assert!(
-            winning_result.is_ok(),
-            "higher epoch writer should publish successfully"
+            result_a.delta_id.is_some() ^ result_b.delta_id.is_some(),
+            "exactly one fenced racing compaction should publish a new delta"
         );
 
         Ok(())
@@ -2681,9 +2564,7 @@ mod tests {
             "expected one synthetic L0 conflict"
         );
 
-        let manifest_data = storage.get_raw(orchestration_manifest_path()).await?;
-        let manifest: OrchestrationManifest =
-            serde_json::from_slice(&manifest_data).expect("parse manifest");
+        let manifest = load_current_manifest(&storage).await?;
         assert_eq!(
             manifest.l0_count, 1,
             "retry should publish exactly one delta"
@@ -2699,9 +2580,8 @@ mod tests {
 
         compactor.compact_events(event_paths).await?;
 
-        let manifest_data = storage.get_raw(orchestration_manifest_path()).await?;
-        let manifest_json: serde_json::Value =
-            serde_json::from_slice(&manifest_data).expect("parse manifest json");
+        let manifest = load_current_manifest(&storage).await?;
+        let manifest_json = serde_json::to_value(&manifest).expect("manifest json");
 
         let runs_artifact = &manifest_json["l0_deltas"][0]["tables"]["runs"];
         assert!(
@@ -2751,9 +2631,7 @@ mod tests {
         let event_paths = write_basic_compaction_events(&storage).await?;
         compactor.compact_events(event_paths).await?;
 
-        let manifest_data = storage.get_raw(orchestration_manifest_path()).await?;
-        let manifest: OrchestrationManifest =
-            serde_json::from_slice(&manifest_data).expect("parse manifest");
+        let manifest = load_current_manifest(&storage).await?;
 
         assert!(
             manifest.base_snapshot.snapshot_id.is_some(),
@@ -2808,9 +2686,7 @@ mod tests {
         assert!(result.delta_id.is_some());
 
         // Verify manifest was updated
-        let manifest_data = storage.get_raw(orchestration_manifest_path()).await?;
-        let manifest: OrchestrationManifest =
-            serde_json::from_slice(&manifest_data).expect("parse");
+        let manifest = load_current_manifest(&storage).await?;
 
         assert_eq!(manifest.l0_count, 1);
         assert_eq!(manifest.l0_deltas.len(), 1);
@@ -3135,9 +3011,7 @@ mod tests {
             .compact_events(vec![path2.clone(), path1.clone()])
             .await?;
 
-        let manifest_data = storage.get_raw(orchestration_manifest_path()).await?;
-        let manifest: OrchestrationManifest =
-            serde_json::from_slice(&manifest_data).expect("parse");
+        let manifest = load_current_manifest(&storage).await?;
 
         let (expected_event, expected_path) = if event1_id > event2_id {
             (event1_id, path1)
@@ -3197,9 +3071,7 @@ mod tests {
 
         compactor.compact_events(vec![path3]).await?;
 
-        let manifest_data = storage.get_raw(orchestration_manifest_path()).await?;
-        let manifest: OrchestrationManifest =
-            serde_json::from_slice(&manifest_data).expect("parse");
+        let manifest = load_current_manifest(&storage).await?;
 
         let latest = manifest.l0_deltas.last().expect("delta");
         assert_eq!(latest.row_counts.runs, 0);
@@ -3356,35 +3228,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_with_stale_epoch_is_rejected() -> Result<()> {
-        let (compactor, _storage) = create_test_compactor().await?;
-
-        let mut manifest = OrchestrationManifest::new("01HQXYZ200REV");
-        manifest.manifest_id = "00000000000000000000".to_string();
-        manifest.epoch = 5;
-        compactor
-            .publish_manifest(&manifest, None, None, None, None, None, None)
-            .await?;
-
-        let error = compactor
-            .compact_events_with_epoch(vec![], Some(4))
-            .await
-            .expect_err("stale epoch must be rejected");
-        assert!(
-            matches!(
-                error,
-                Error::StaleFencingToken {
-                    expected: 5,
-                    provided: 4,
-                }
-            ),
-            "expected typed stale token error, got {error:?}"
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn publish_manifest_reports_persisted_not_visible_on_cas_loss() -> Result<()> {
         let backend = Arc::new(MemoryBackend::new());
         let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
@@ -3402,6 +3245,7 @@ mod tests {
         assert_eq!(
             base_outcome,
             PublishOutcome::Visible {
+                pointer_version: "1".to_string(),
                 repair_pending: false
             }
         );
@@ -3429,6 +3273,7 @@ mod tests {
         assert_eq!(
             winner_outcome,
             PublishOutcome::Visible {
+                pointer_version: "2".to_string(),
                 repair_pending: false
             }
         );
@@ -3453,14 +3298,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_events_returns_repair_pending_when_legacy_manifest_write_fails() -> Result<()>
+    async fn compact_events_does_not_create_legacy_manifest_or_report_repair_pending() -> Result<()>
     {
-        let backend = Arc::new(LegacyManifestFailureBackend::new());
-        let (compactor, storage) = create_test_compactor_with_backend(backend).await?;
+        let (compactor, storage) = create_test_compactor().await?;
 
         let result = compactor.compact_events(vec![]).await?;
         assert_eq!(result.visibility_status, CompactionVisibility::Visible);
-        assert!(result.repair_pending);
+        assert!(!result.repair_pending);
         assert!(
             storage
                 .head_raw(orchestration_manifest_pointer_path())
@@ -3470,10 +3314,50 @@ mod tests {
         );
         assert!(
             storage
-                .head_raw(orchestration_manifest_path())
+                .head_raw(arco_core::FlowPaths::orchestration_manifest_path())
                 .await?
                 .is_none(),
-            "legacy manifest mirror should remain repairable side effect"
+            "legacy orchestration manifest should not be created"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compact_events_bootstraps_pointer_from_legacy_manifest_without_resetting_state()
+    -> Result<()> {
+        let (compactor, storage) = create_test_compactor().await?;
+
+        let mut legacy = OrchestrationManifest::new("01HQLEGACYREV00000000000001");
+        legacy.manifest_id = "00000000000000000007".to_string();
+        legacy.epoch = 7;
+        legacy.watermarks.events_processed_through = Some("evt_legacy".to_string());
+        legacy.watermarks.last_visible_event_id = Some("evt_legacy".to_string());
+        legacy.watermarks.last_committed_event_id = Some("evt_legacy".to_string());
+        storage
+            .put_raw(
+                arco_core::FlowPaths::orchestration_manifest_path(),
+                Bytes::from(serde_json::to_vec(&legacy).expect("serialize legacy manifest")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+
+        let result = compactor.compact_events(vec![]).await?;
+        assert_eq!(result.visibility_status, CompactionVisibility::Visible);
+        assert_eq!(result.manifest_id, legacy.manifest_id);
+
+        let pointer_data = storage
+            .get_raw(orchestration_manifest_pointer_path())
+            .await?;
+        let pointer: OrchestrationManifestPointer =
+            serde_json::from_slice(&pointer_data).expect("parse pointer");
+        assert_eq!(pointer.manifest_id, legacy.manifest_id);
+
+        let current = load_current_manifest(&storage).await?;
+        assert_eq!(current.manifest_id, legacy.manifest_id);
+        assert_eq!(
+            current.watermarks.events_processed_through,
+            legacy.watermarks.events_processed_through
         );
 
         Ok(())

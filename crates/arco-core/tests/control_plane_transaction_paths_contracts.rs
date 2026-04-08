@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use arco_core::control_plane_transactions::{
     CatalogTxReceipt, ControlPlaneTxDomain, ControlPlaneTxKind, ControlPlaneTxPaths,
     ControlPlaneTxRecord, ControlPlaneTxStatus, DomainCommit, RootTxManifest, RootTxManifestDomain,
+    RootTxReceipt,
 };
 
 #[test]
@@ -37,9 +38,18 @@ fn control_plane_transaction_paths_are_stable() {
         ControlPlaneTxPaths::record(ControlPlaneTxDomain::Root, "01JTXROOT"),
         "transactions/root/01JTXROOT.json"
     );
+    assert_eq!(ControlPlaneTxPaths::root_lock(), "locks/root.lock.json");
     assert_eq!(
-        ControlPlaneTxPaths::root_manifest("01JTXROOT"),
-        "transactions/root/manifests/01JTXROOT.json"
+        ControlPlaneTxPaths::root_super_manifest("01JTXROOT"),
+        "transactions/root/01JTXROOT.manifest.json"
+    );
+    assert_eq!(
+        ControlPlaneTxPaths::root_commit_receipt("01JROOTCOMMIT"),
+        "commits/root/01JROOTCOMMIT.json"
+    );
+    assert_eq!(
+        ControlPlaneTxPaths::orchestration_commit_receipt("01JORCHCOMMIT"),
+        "commits/orchestration/01JORCHCOMMIT.json"
     );
 }
 
@@ -102,25 +112,18 @@ fn root_transaction_manifest_serializes_pinned_domain_heads() {
     );
 
     let manifest = RootTxManifest {
-        root_manifest_id: "00000000000000000019".to_string(),
         tx_id: "01JQROOT".to_string(),
         fencing_token: 42,
-        parent_hash: "sha256:root-parent".to_string(),
-        previous_root_manifest_path: Some(
-            "transactions/root/manifests/00000000000000000018.json".to_string(),
-        ),
         published_at: created_at,
         domains,
     };
 
     let json = serde_json::to_value(&manifest).expect("serialize");
-    assert_eq!(json["rootManifestId"], "00000000000000000019");
     assert_eq!(json["txId"], "01JQROOT");
     assert_eq!(json["fencingToken"], 42);
-    assert_eq!(
-        json["previousRootManifestPath"],
-        "transactions/root/manifests/00000000000000000018.json"
-    );
+    assert!(json.get("rootManifestId").is_none());
+    assert!(json.get("parentHash").is_none());
+    assert!(json.get("previousRootManifestPath").is_none());
     assert_eq!(json["domains"]["catalog"]["commitId"], "01JQCAT");
     assert_eq!(
         json["domains"]["orchestration"]["manifestPath"],
@@ -138,4 +141,20 @@ fn root_transaction_manifest_serializes_pinned_domain_heads() {
     let commit_json = serde_json::to_value(&commit).expect("serialize");
     assert_eq!(commit_json["domain"], "catalog");
     assert_eq!(commit_json["readToken"], "catalog:00000000000000000118");
+
+    let receipt = RootTxReceipt {
+        tx_id: "01JQROOT".to_string(),
+        root_commit_id: "01JQROOTCOMMIT".to_string(),
+        super_manifest_path: "transactions/root/01JQROOT.manifest.json".to_string(),
+        domain_commits: vec![commit],
+        read_token: "root:01JQROOT".to_string(),
+        visible_at: created_at,
+    };
+    let receipt_json = serde_json::to_value(&receipt).expect("serialize");
+    assert_eq!(
+        receipt_json["superManifestPath"],
+        "transactions/root/01JQROOT.manifest.json"
+    );
+    assert_eq!(receipt_json["readToken"], "root:01JQROOT");
+    assert!(receipt_json.get("pointerVersion").is_none());
 }

@@ -62,6 +62,44 @@ impl RequestContext {
     }
 }
 
+pub(crate) fn request_context_from_headers(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<RequestContext, ApiError> {
+    let request_id = request_id_from_headers(headers).unwrap_or_else(|| Ulid::new().to_string());
+    let idempotency_key = header_string(headers, "Idempotency-Key");
+
+    let debug_allowed = state.config.debug && state.config.posture.is_dev();
+
+    let (tenant, workspace, user_id, groups) = if debug_allowed {
+        let tenant = header_string(headers, "X-Tenant-Id").ok_or_else(|| {
+            ApiError::unauthorized("missing X-Tenant-Id header (debug mode)")
+                .with_request_id(request_id.clone())
+        })?;
+        let workspace = header_string(headers, "X-Workspace-Id").ok_or_else(|| {
+            ApiError::unauthorized("missing X-Workspace-Id header (debug mode)")
+                .with_request_id(request_id.clone())
+        })?;
+        let user_id = user_id_from_headers(headers);
+        let groups = groups_from_headers(headers);
+        (tenant, workspace, user_id, groups)
+    } else {
+        extract_from_jwt(headers, state, &request_id)?
+    };
+
+    let tenant = normalize_scope_id(&tenant, "tenant_id", &request_id)?;
+    let workspace = normalize_scope_id(&workspace, "workspace_id", &request_id)?;
+
+    Ok(RequestContext {
+        tenant,
+        workspace,
+        user_id,
+        groups,
+        request_id,
+        idempotency_key,
+    })
+}
+
 #[async_trait]
 impl FromRequestParts<Arc<AppState>> for RequestContext {
     type Rejection = ApiError;
@@ -74,42 +112,7 @@ impl FromRequestParts<Arc<AppState>> for RequestContext {
             return Ok(existing.clone());
         }
 
-        let headers = &parts.headers;
-
-        let request_id =
-            request_id_from_headers(headers).unwrap_or_else(|| Ulid::new().to_string());
-        let idempotency_key = header_string(headers, "Idempotency-Key");
-
-        let debug_allowed = state.config.debug && state.config.posture.is_dev();
-
-        let (tenant, workspace, user_id, groups) = if debug_allowed {
-            let tenant = header_string(headers, "X-Tenant-Id").ok_or_else(|| {
-                ApiError::unauthorized("missing X-Tenant-Id header (debug mode)")
-                    .with_request_id(request_id.clone())
-            })?;
-            let workspace = header_string(headers, "X-Workspace-Id").ok_or_else(|| {
-                ApiError::unauthorized("missing X-Workspace-Id header (debug mode)")
-                    .with_request_id(request_id.clone())
-            })?;
-            let user_id = user_id_from_headers(headers);
-            let groups = groups_from_headers(headers);
-            (tenant, workspace, user_id, groups)
-        } else {
-            extract_from_jwt(headers, state, &request_id)?
-        };
-
-        let tenant = normalize_scope_id(&tenant, "tenant_id", &request_id)?;
-        let workspace = normalize_scope_id(&workspace, "workspace_id", &request_id)?;
-
-        let ctx = Self {
-            tenant,
-            workspace,
-            user_id,
-            groups,
-            request_id,
-            idempotency_key,
-        };
-
+        let ctx = request_context_from_headers(&parts.headers, state)?;
         parts.extensions.insert(ctx.clone());
         Ok(ctx)
     }

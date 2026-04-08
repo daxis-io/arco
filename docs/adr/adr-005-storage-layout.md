@@ -19,11 +19,14 @@ Hardcoded paths scattered across codebase lead to divergence and bugs.
 ```text
 tenant={tenant}/workspace={workspace}/
 ├── manifests/
-│   ├── root.manifest.json           # Entry point - points to domain manifests
-│   ├── catalog.manifest.json        # Tier-1: namespaces/tables/columns
-│   ├── lineage.manifest.json        # Tier-1: lineage edges
+│   ├── root.manifest.json           # Bootstrap object - points to domain entry paths
+│   ├── catalog.pointer.json         # Tier-1 visibility pointer
+│   ├── lineage.pointer.json         # Tier-1 visibility pointer
 │   ├── executions.manifest.json     # Tier-2: run/task execution state
-│   └── search.manifest.json         # Tier-1: token postings
+│   ├── search.pointer.json          # Tier-1 visibility pointer
+│   ├── catalog/{manifest_id}.json   # Immutable Tier-1 manifests
+│   ├── lineage/{manifest_id}.json
+│   └── search/{manifest_id}.json
 ├── locks/
 │   ├── catalog.lock.json            # Distributed lock per domain
 │   ├── lineage.lock.json
@@ -31,7 +34,7 @@ tenant={tenant}/workspace={workspace}/
 │   └── search.lock.json
 ├── commits/
 │   └── {domain}/
-│       └── {commit_id}.json         # Per-domain commit chain (audit trail)
+│       └── {commit_id}.json         # Optional domain-specific receipts (for example root tx)
 ├── snapshots/
 │   ├── catalog/
 │   │   └── v{version}/
@@ -65,9 +68,9 @@ tenant={tenant}/workspace={workspace}/
    - Enables bucket policies per tenant
 
 2. **Domain Separation**: Each domain (`catalog`, `lineage`, `executions`, `search`) has:
-   - Its own manifest file
+   - Its own visibility entrypoint (`pointer` for catalog/lineage/search, manifest for executions)
    - Its own lock file
-   - Its own commit chain
+   - Its own immutable state history
    - Its own snapshots/ledger/state directories
 
 3. **Version Directories**: `v{version}/` for atomic visibility

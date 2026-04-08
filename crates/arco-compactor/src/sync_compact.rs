@@ -157,6 +157,7 @@ impl SyncCompactHandler {
             Ok(result) => Ok(SyncCompactResponse {
                 manifest_version: result.manifest_version,
                 commit_ulid: result.commit_ulid,
+                manifest_id: result.manifest_id,
                 events_processed: result.events_processed,
                 snapshot_version: result.snapshot_version,
                 visibility_status: result.visibility_status,

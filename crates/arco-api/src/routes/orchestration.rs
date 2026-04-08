@@ -44,7 +44,6 @@ use crate::paths::{
 use crate::routes::manifests::StoredManifest;
 use crate::server::AppState;
 use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
-use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::{
     BackfillChunkRow, BackfillRow, DepResolution, FoldState, MicroCompactor, PartitionStatusRow,
     RunRow, RunState as FoldRunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
@@ -60,6 +59,9 @@ use arco_flow::orchestration::run_key::{
     reserve_run_key,
 };
 use ulid::Ulid;
+
+#[cfg(test)]
+use arco_flow::orchestration::LedgerWriter;
 
 // ============================================================================
 // Request/Response Types

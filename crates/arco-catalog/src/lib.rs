@@ -13,10 +13,14 @@
 //!
 //! The catalog uses a two-tier consistency model:
 //!
-//! - **Tier 1 (Strong Consistency)**: Low-frequency DDL operations (create/drop)
-//!   use atomic snapshot + manifest writes for immediate consistency
+//! - **Tier 1 (Strong Consistency)**: API mutations append tier1 DDL events and
+//!   then synchronously compact/publish immutable manifest snapshots via
+//!   `CatalogWriter` + `SyncCompactor`
 //! - **Tier 2 (Eventual Consistency)**: High-volume operational facts (lineage events,
 //!   run metadata) are written to an append-only event log and periodically compacted
+//!
+//! `Tier1Writer` still exists for low-level/bootstrap flows and tests, but it is no
+//! longer the primary API write path.
 //!
 //! ## Storage Layout
 //!
@@ -25,12 +29,17 @@
 //!
 //! ```text
 //! tenant={tenant}/workspace={workspace}/
-//! ├── manifests/                    # Tier 1: Multi-file manifest structure
-//! │   ├── root.manifest.json        # Root manifest (points to domain manifests)
-//! │   ├── catalog.manifest.json     # Catalog state (locked writes)
-//! │   ├── lineage.manifest.json     # Lineage state (locked writes)
-//! │   ├── executions.manifest.json  # Execution state (compactor writes)
-//! │   └── search.manifest.json      # Search state (locked writes)
+//! ├── manifests/
+//! │   ├── root.manifest.json            # Stable entrypoint for readers
+//! │   ├── catalog.manifest.json         # Legacy compatibility mirror
+//! │   ├── catalog.pointer.json          # Immutable snapshot visibility gate
+//! │   ├── catalog/{manifest_id}.json    # Immutable catalog snapshots
+//! │   ├── lineage.manifest.json         # Legacy compatibility mirror
+//! │   ├── lineage.pointer.json
+//! │   ├── lineage/{manifest_id}.json
+//! │   ├── search.manifest.json          # Legacy compatibility mirror
+//! │   ├── search.pointer.json
+//! │   └── search/{manifest_id}.json
 //! ├── locks/
 //! │   ├── catalog.lock.json         # Distributed lock per domain
 //! │   ├── lineage.lock.json
@@ -47,21 +56,18 @@
 //! ## Example
 //!
 //! ```rust,ignore
-//! use arco_catalog::Tier1Writer;
+//! use std::sync::Arc;
+//!
+//! use arco_catalog::{CatalogWriter, Tier1Compactor};
 //! use arco_core::ScopedStorage;
 //!
 //! // Create workspace-scoped storage
 //! let storage = ScopedStorage::new(backend, "acme-corp", "production")?;
+//! let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
 //!
-//! // Initialize catalog manifests (idempotent)
-//! let writer = Tier1Writer::new(storage);
-//! writer.initialize().await?;
-//!
-//! // Update catalog with CAS semantics
-//! let commit = writer.update(|manifest| {
-//!     manifest.snapshot_version = 1;
-//!     Ok(())
-//! }).await?;
+//! // API writes go through the facade and publish immutable snapshots synchronously.
+//! let writer = CatalogWriter::new(storage).with_sync_compactor(compactor);
+//! // writer.create_namespace(...).await?;
 //! ```
 
 #![forbid(unsafe_code)]

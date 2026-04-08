@@ -160,6 +160,10 @@ impl Tier1Writer {
     ///
     /// Returns an error if the lock cannot be acquired, manifests are missing, or
     /// if the CAS update fails after all retries.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use CatalogWriter + SyncCompactor for API writes, or update_locked for low-level lock-held flows"
+    )]
     pub async fn update<F>(&self, mut update_fn: F) -> Result<CommitRecord>
     where
         F: FnMut(&mut CatalogDomainManifest) -> Result<()>,
@@ -539,6 +543,7 @@ fn sha256_prefixed(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use async_trait::async_trait;

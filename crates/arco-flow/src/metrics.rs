@@ -105,6 +105,28 @@ pub mod names {
     /// Gauge: Visibility lag measured as committed-vs-visible event skew.
     pub const ORCH_COMPACTOR_VISIBILITY_LAG_EVENTS: &str =
         "arco_flow_orch_compactor_visibility_lag_events";
+    /// Counter: Compactor manifest publish retries after classified races.
+    pub const ORCH_COMPACTOR_PUBLISH_RETRIES_TOTAL: &str =
+        "arco_flow_orch_compactor_publish_retries_total";
+    /// Counter: Immutable orchestration artifact overwrite attempts rejected.
+    pub const ORCH_COMPACTOR_OVERWRITE_REJECTS_TOTAL: &str =
+        "arco_flow_orch_compactor_overwrite_rejects_total";
+    /// Counter: Lock-backed fencing rejects during orchestration compaction.
+    pub const ORCH_COMPACTOR_STALE_FENCING_REJECTS_TOTAL: &str =
+        "arco_flow_orch_compactor_stale_fencing_rejects_total";
+    /// Counter: Orphan orchestration artifacts discovered by reconciliation.
+    pub const ORCH_RECONCILER_ORPHANS_TOTAL: &str = "arco_flow_orch_reconciler_orphans_total";
+    /// Counter: Orchestration orphan objects deleted by reconciliation repair.
+    pub const ORCH_RECONCILER_DELETES_TOTAL: &str = "arco_flow_orch_reconciler_deletes_total";
+    /// Counter: Total bytes deleted by orchestration reconciliation repair.
+    pub const ORCH_RECONCILER_DELETED_BYTES_TOTAL: &str =
+        "arco_flow_orch_reconciler_deleted_bytes_total";
+    /// Counter: Protected paths skipped during orchestration reconciliation repair.
+    pub const ORCH_RECONCILER_SKIPPED_PATHS_TOTAL: &str =
+        "arco_flow_orch_reconciler_skipped_paths_total";
+    /// Counter: Orphan paths deferred until the reconciliation quarantine window elapses.
+    pub const ORCH_RECONCILER_DEFERRED_PATHS_TOTAL: &str =
+        "arco_flow_orch_reconciler_deferred_paths_total";
 }
 
 /// Label keys used across metrics.
@@ -137,6 +159,8 @@ pub mod labels {
     pub const SENSOR_TYPE: &str = "sensor_type";
     /// Durability mode label.
     pub const DURABILITY_MODE: &str = "durability_mode";
+    /// Retry or failure reason label.
+    pub const REASON: &str = "reason";
 }
 
 /// High-level interface for recording orchestration metrics.

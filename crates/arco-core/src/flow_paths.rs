@@ -50,6 +50,12 @@ impl FlowPaths {
     pub fn orchestration_l0_dir(delta_id: &str) -> String {
         format!("{}/l0/{delta_id}", Self::ORCHESTRATION_STATE_PREFIX)
     }
+
+    /// Canonical path for orchestration base snapshot directory.
+    #[must_use]
+    pub fn orchestration_base_snapshot_dir(snapshot_id: &str) -> String {
+        format!("{}/base/{snapshot_id}", Self::ORCHESTRATION_STATE_PREFIX)
+    }
 }
 
 /// Canonical path builders for API non-catalog artifacts.

@@ -1,7 +1,5 @@
 # Control-Plane Transactions Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Add a transaction-oriented protobuf surface and shared Rust path/type scaffolding for catalog, orchestration, and root control-plane commits.
 
 **Architecture:** Introduce a dedicated `transactions.proto` that reuses `RequestHeader`, uses RPC-specific request/response envelopes, and models visibility-scoped transaction receipts/status lookups with explicit `repair_pending` state. Add shared `arco-core` transaction path builders plus serializable record/receipt structs that match the new `transactions/...` storage layout without changing existing runtime writers yet.

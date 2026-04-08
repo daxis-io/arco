@@ -4,54 +4,79 @@
 //! to the ledger and must promptly trigger micro-compaction so Parquet projections stay
 //! fresh for subsequent reconciliations.
 //!
-//! In cloud deployments, this is done via the `arco-flow-compactor` Cloud Run service:
-//! `POST {ARCO_ORCH_COMPACTOR_URL}/compact` with `{ "event_paths": [...] }`.
+//! In cloud deployments, this is done via the `arco-flow-compactor` Cloud Run service.
 
-#[cfg(any(feature = "gcp", feature = "test-utils"))]
-use serde::Serialize;
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
+use arco_core::orchestration_compaction::{
+    OrchestrationCompactRequest, OrchestrationCompactionResponse,
+};
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
+use std::sync::OnceLock;
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
+use std::time::Duration;
 
 use crate::error::{Error, Result};
 
-#[cfg(any(feature = "gcp", feature = "test-utils"))]
-#[derive(Debug, Serialize)]
-struct CompactRequest<'a> {
-    event_paths: &'a [String],
-}
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
+const METADATA_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Request compaction of the provided orchestration ledger event paths.
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
+/// Request orchestration compaction using caller-held fencing data.
 ///
-/// The compactor service is expected to be idempotent: re-compacting the same paths
-/// should be a no-op.
+/// This is the ADR-034 PI-1 internal write contract used by API and flow
+/// services when they append orchestration events while holding the shared
+/// compaction lock.
 ///
 /// # Errors
 ///
-/// Returns an error if the HTTP request fails or the service returns a non-success status.
-pub async fn compact_orchestration_events(url: &str, event_paths: Vec<String>) -> Result<()> {
+/// Returns an error if the HTTP request fails, the service returns a non-success
+/// status, or the response cannot be decoded.
+pub async fn compact_orchestration_events_fenced(
+    url: &str,
+    event_paths: Vec<String>,
+    fencing_token: u64,
+    lock_path: &str,
+    request_id: Option<&str>,
+) -> Result<OrchestrationCompactionResponse> {
     if event_paths.is_empty() {
-        return Ok(());
+        return Ok(OrchestrationCompactionResponse {
+            events_processed: 0,
+            delta_id: None,
+            manifest_revision: String::new(),
+            visibility_status: arco_core::VisibilityStatus::Visible,
+            repair_pending: false,
+        });
     }
 
-    compact_orchestration_events_impl(url, &event_paths).await
+    compact_orchestration_events_fenced_impl(
+        url,
+        &event_paths,
+        fencing_token,
+        lock_path,
+        request_id,
+    )
+    .await
 }
 
-#[cfg(any(feature = "gcp", feature = "test-utils"))]
-async fn compact_orchestration_events_impl(url: &str, event_paths: &[String]) -> Result<()> {
-    use std::time::Duration;
-
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
+async fn compact_orchestration_events_fenced_impl(
+    url: &str,
+    event_paths: &[String],
+    fencing_token: u64,
+    lock_path: &str,
+    request_id: Option<&str>,
+) -> Result<OrchestrationCompactionResponse> {
     const MAX_ATTEMPTS: usize = 3;
-    const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-    const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
-    const METADATA_TIMEOUT: Duration = Duration::from_secs(2);
-
-    let client = reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .map_err(|e| Error::dispatch(format!("failed to build HTTP client: {e}")))?;
+    let client = shared_http_client()?;
 
     let (endpoint, bearer_token) = build_compactor_endpoint(url)?;
-    let auth_header = build_auth_header(&client, &endpoint, bearer_token, METADATA_TIMEOUT).await?;
+    let auth_header = build_auth_header(client, &endpoint, bearer_token, METADATA_TIMEOUT).await?;
 
-    // Basic retry for transient failures / CAS conflicts surfaced as HTTP status codes.
+    // Basic retry for transient transport and server failures.
     let mut attempt = 0;
 
     loop {
@@ -59,7 +84,12 @@ async fn compact_orchestration_events_impl(url: &str, event_paths: &[String]) ->
 
         let mut request = client
             .post(&endpoint)
-            .json(&CompactRequest { event_paths })
+            .json(&OrchestrationCompactRequest {
+                event_paths: event_paths.to_vec(),
+                fencing_token,
+                lock_path: lock_path.to_string(),
+                request_id: request_id.map(str::to_string),
+            })
             .timeout(REQUEST_TIMEOUT);
 
         if let Some(auth_header) = auth_header.as_deref() {
@@ -69,13 +99,20 @@ async fn compact_orchestration_events_impl(url: &str, event_paths: &[String]) ->
         let response = request.send().await;
 
         match response {
-            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(resp) if resp.status().is_success() => {
+                return resp
+                    .json::<OrchestrationCompactionResponse>()
+                    .await
+                    .map_err(|e| {
+                        Error::dispatch(format!(
+                            "failed to decode orchestration compaction response: {e}"
+                        ))
+                    });
+            }
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-
-                let retryable =
-                    status.as_u16() == 409 || status.as_u16() == 429 || status.is_server_error();
+                let retryable = status.as_u16() == 429 || status.is_server_error();
 
                 if retryable && attempt < MAX_ATTEMPTS {
                     // Exponential backoff with a small deterministic cap.
@@ -87,9 +124,7 @@ async fn compact_orchestration_events_impl(url: &str, event_paths: &[String]) ->
                     continue;
                 }
 
-                return Err(Error::dispatch(format!(
-                    "orchestration compaction failed (status={status}): {body}"
-                )));
+                return Err(map_http_error(status, &body));
             }
             Err(err) => {
                 // Don't retry timeouts: failing fast avoids wedging controllers.
@@ -112,7 +147,57 @@ async fn compact_orchestration_events_impl(url: &str, event_paths: &[String]) ->
     }
 }
 
-#[cfg(any(feature = "gcp", feature = "test-utils"))]
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
+fn shared_http_client() -> Result<&'static reqwest::Client> {
+    static HTTP_CLIENT: OnceLock<std::result::Result<reqwest::Client, String>> = OnceLock::new();
+
+    match HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .map_err(|e| format!("failed to build HTTP client: {e}"))
+    }) {
+        Ok(client) => Ok(client),
+        Err(message) => Err(Error::dispatch(message.clone())),
+    }
+}
+
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
+fn map_http_error(status: reqwest::StatusCode, body: &str) -> Error {
+    let message = extract_error_message(status, body);
+
+    match status.as_u16() {
+        400 | 422 => Error::Core(arco_core::Error::InvalidInput(message)),
+        404 => Error::Core(arco_core::Error::NotFound(message)),
+        409 => Error::Core(arco_core::Error::PreconditionFailed { message }),
+        401 | 403 => Error::dispatch(format!(
+            "orchestration compaction authorization failed (status={status}): {message}"
+        )),
+        _ => Error::dispatch(format!(
+            "orchestration compaction failed (status={status}): {message}"
+        )),
+    }
+}
+
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
+fn extract_error_message(status: reqwest::StatusCode, body: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(message) = value.get("error").and_then(serde_json::Value::as_str) {
+            if !message.trim().is_empty() {
+                return message.trim().to_string();
+            }
+        }
+    }
+
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        format!("remote service returned HTTP {status}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
 fn build_compactor_endpoint(url: &str) -> Result<(String, Option<String>)> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| Error::configuration(format!("invalid orchestration compactor URL: {e}")))?;
@@ -130,7 +215,7 @@ fn build_compactor_endpoint(url: &str) -> Result<(String, Option<String>)> {
     Ok((endpoint, bearer_token))
 }
 
-#[cfg(any(feature = "gcp", feature = "test-utils"))]
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
 fn bearer_token_from_url(url: &reqwest::Url) -> Option<String> {
     let username = url.username();
     if username != "bearer" {
@@ -139,12 +224,12 @@ fn bearer_token_from_url(url: &reqwest::Url) -> Option<String> {
     url.password().map(str::to_string)
 }
 
-#[cfg(any(feature = "gcp", feature = "test-utils"))]
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
 async fn build_auth_header(
     client: &reqwest::Client,
     endpoint: &str,
     bearer_token: Option<String>,
-    metadata_timeout: std::time::Duration,
+    metadata_timeout: Duration,
 ) -> Result<Option<String>> {
     if let Some(token) = bearer_token {
         return Ok(Some(format!("Bearer {token}")));
@@ -162,7 +247,7 @@ async fn build_auth_header(
     Ok(Some(format!("Bearer {id_token}")))
 }
 
-#[cfg(any(feature = "gcp", feature = "test-utils"))]
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
 fn is_cloud_run_endpoint(endpoint: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(endpoint) else {
         return false;
@@ -179,11 +264,11 @@ fn is_cloud_run_endpoint(endpoint: &str) -> bool {
     host.ends_with(".run.app") || host.ends_with(".a.run.app")
 }
 
-#[cfg(any(feature = "gcp", feature = "test-utils"))]
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
 async fn fetch_gcp_identity_token(
     client: &reqwest::Client,
     audience: &str,
-    timeout: std::time::Duration,
+    timeout: Duration,
 ) -> Result<String> {
     // Works on Cloud Run, GCE, and GKE with metadata server enabled.
     let mut url = reqwest::Url::parse(
@@ -217,9 +302,22 @@ async fn fetch_gcp_identity_token(
         .map_err(|e| Error::dispatch(format!("metadata identity token read failed: {e}")))
 }
 
-#[cfg(not(any(feature = "gcp", feature = "test-utils")))]
-async fn compact_orchestration_events_impl(_url: &str, _event_paths: &[String]) -> Result<()> {
+#[cfg(not(any(feature = "gcp", feature = "test-utils", feature = "http-client")))]
+/// Request orchestration compaction using caller-held fencing data.
+///
+/// # Errors
+///
+/// Always returns a configuration error unless the `gcp`, `test-utils`,
+/// or `http-client`
+/// feature is enabled.
+pub async fn compact_orchestration_events_fenced(
+    _url: &str,
+    _event_paths: Vec<String>,
+    _fencing_token: u64,
+    _lock_path: &str,
+    _request_id: Option<&str>,
+) -> Result<arco_core::OrchestrationCompactionResponse> {
     Err(Error::configuration(
-        "orchestration compaction requires the 'gcp' feature",
+        "orchestration compaction requires the 'gcp', 'test-utils', or 'http-client' feature",
     ))
 }

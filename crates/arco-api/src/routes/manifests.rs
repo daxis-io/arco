@@ -25,7 +25,7 @@ use utoipa::ToSchema;
 
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
-use crate::orchestration_compaction::compact_orchestration_events;
+use crate::orchestration_compaction::append_events_and_compact;
 use crate::paths::{
     MANIFEST_IDEMPOTENCY_PREFIX, MANIFEST_LATEST_INDEX_PATH, MANIFEST_PREFIX,
     manifest_idempotency_path, manifest_path,
@@ -34,7 +34,6 @@ use crate::server::AppState;
 use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
-use arco_flow::orchestration::ledger::LedgerWriter;
 
 // ============================================================================
 // Request/Response Types
@@ -525,14 +524,7 @@ async fn upsert_schedule_definitions(
         return Ok(());
     }
 
-    let ledger = LedgerWriter::new(storage.clone());
-    let event_paths: Vec<String> = events.iter().map(LedgerWriter::event_path).collect();
-    ledger
-        .append_all(events)
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to append schedule events: {e}")))?;
-
-    compact_orchestration_events(&state.config, storage, event_paths).await?;
+    append_events_and_compact(&state.config, storage, events, None).await?;
 
     Ok(())
 }

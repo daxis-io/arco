@@ -442,6 +442,8 @@ pub enum SnapshotPointerPublishOutcome {
     Visible {
         /// Version token returned by the pointer CAS write.
         pointer_version: String,
+        /// Whether post-commit side effects failed and require repair.
+        repair_pending: bool,
     },
     /// Snapshot persisted but pointer CAS lost a race.
     PersistedNotVisible,
@@ -502,13 +504,23 @@ where
 
     match pointer_result {
         WriteResult::Success { version } => {
+            let mut repair_pending = false;
             if let Some((legacy_path, legacy_payload)) = legacy_mirror {
-                let _ = storage
+                if let Err(error) = storage
                     .put_raw(legacy_path, legacy_payload, WritePrecondition::None)
-                    .await?;
+                    .await
+                {
+                    repair_pending = true;
+                    tracing::warn!(
+                        path = %legacy_path,
+                        error = %error,
+                        "legacy mirror write failed after pointer CAS"
+                    );
+                }
             }
             Ok(SnapshotPointerPublishOutcome::Visible {
                 pointer_version: version,
+                repair_pending,
             })
         }
         WriteResult::PreconditionFailed { .. } => {
@@ -528,10 +540,75 @@ mod tests {
     use super::*;
     use crate::CatalogPaths;
     use crate::scoped_storage::ScopedStorage;
-    use crate::storage::MemoryBackend;
-    use crate::storage::StorageBackend;
     use crate::storage::WritePrecondition;
+    use crate::storage::{MemoryBackend, ObjectMeta, StorageBackend};
+    use async_trait::async_trait;
+    use std::ops::Range;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct LegacyMirrorFailureBackend {
+        inner: MemoryBackend,
+        legacy_path: String,
+        inject_once: AtomicBool,
+    }
+
+    impl LegacyMirrorFailureBackend {
+        fn new(legacy_path: impl Into<String>) -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                legacy_path: legacy_path.into(),
+                inject_once: AtomicBool::new(true),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for LegacyMirrorFailureBackend {
+        async fn get(&self, path: &str) -> Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> Result<WriteResult> {
+            if path.ends_with(&self.legacy_path)
+                && matches!(precondition, WritePrecondition::None)
+                && self.inject_once.swap(false, Ordering::SeqCst)
+            {
+                return Err(Error::storage(format!(
+                    "injected legacy mirror write failure for {path}"
+                )));
+            }
+
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(&self, path: &str, expiry: Duration) -> Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
 
     fn test_issuer() -> PermitIssuer {
         PermitIssuer::from_validated_token(FencingToken::new(42), "test-lock")
@@ -716,10 +793,57 @@ mod tests {
         .expect("publish outcome");
         assert!(matches!(
             outcome,
-            SnapshotPointerPublishOutcome::Visible { pointer_version } if !pointer_version.is_empty()
+            SnapshotPointerPublishOutcome::Visible {
+                pointer_version,
+                repair_pending: false,
+            } if !pointer_version.is_empty()
         ));
 
         let legacy = storage.get_raw(&legacy_path).await.expect("legacy exists");
         assert_eq!(legacy, snapshot_payload);
+    }
+
+    #[tokio::test]
+    async fn snapshot_pointer_publish_visible_sets_repair_pending_when_legacy_mirror_write_fails() {
+        let legacy_path = CatalogPaths::domain_manifest(crate::CatalogDomain::Catalog);
+        let backend = Arc::new(LegacyMirrorFailureBackend::new(legacy_path.clone()));
+        let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("scoped");
+
+        let pointer_path = CatalogPaths::domain_manifest_pointer(crate::CatalogDomain::Catalog);
+        let snapshot_payload = Bytes::from_static(b"{\"manifestId\":\"00000000000000000001\"}");
+
+        let outcome = publish_snapshot_pointer_transaction(
+            &storage,
+            "manifests/catalog/00000000000000000001.json",
+            snapshot_payload.clone(),
+            &pointer_path,
+            snapshot_payload.clone(),
+            None,
+            Some((legacy_path.as_str(), snapshot_payload.clone())),
+            SnapshotPointerDurability::Visible,
+            async { Ok(()) },
+        )
+        .await
+        .expect("publish outcome");
+
+        assert_eq!(
+            outcome,
+            SnapshotPointerPublishOutcome::Visible {
+                pointer_version: "1".to_string(),
+                repair_pending: true,
+            }
+        );
+        assert!(
+            storage
+                .head_raw(&pointer_path)
+                .await
+                .expect("pointer head")
+                .is_some(),
+            "pointer CAS must remain the commit point"
+        );
+        assert!(
+            matches!(storage.get_raw(&legacy_path).await, Err(Error::NotFound(_))),
+            "legacy mirror failure should be repairable, not fatal"
+        );
     }
 }

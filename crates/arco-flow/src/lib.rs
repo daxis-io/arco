@@ -73,6 +73,7 @@ pub(crate) mod paths;
 
 /// Remote orchestration compaction client for flow services.
 pub mod compaction_client;
+pub use arco_core::orchestration_compaction;
 
 pub mod dispatch;
 
@@ -95,8 +96,8 @@ pub mod store;
 pub mod task;
 pub mod task_key;
 
-/// Canonical orchestration compaction lock path used by flow/api components.
-pub use paths::orchestration_compaction_lock_path;
+/// Canonical orchestration storage paths used by flow/api components.
+pub use paths::{orchestration_compaction_lock_path, orchestration_manifest_pointer_path};
 
 /// Prelude module for convenient imports.
 pub mod prelude {

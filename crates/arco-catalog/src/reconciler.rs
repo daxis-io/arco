@@ -348,6 +348,7 @@ impl Reconciler {
     /// # Errors
     ///
     /// Returns an error if storage operations fail while attempting repairs.
+    #[allow(clippy::too_many_lines)]
     pub async fn repair_with_scope(
         &self,
         report: &ReconciliationReport,

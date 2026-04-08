@@ -178,6 +178,10 @@ impl Tier1Compactor {
             .await
     }
 
+    /// Performs Tier 1 compaction for the requested domain and event set.
+    ///
+    /// # Errors
+    ///
     /// Returns an error if validation fails, any event cannot be read, or
     /// manifest publishing fails.
     pub async fn sync_compact(

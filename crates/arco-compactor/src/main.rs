@@ -585,7 +585,7 @@ fn build_internal_auth() -> Result<Option<Arc<InternalAuthState>>> {
 
 async fn internal_auth_middleware(
     State(state): State<Arc<InternalAuthState>>,
-    request: axum::http::Request<Body>,
+    request: Request<Body>,
     next: Next,
 ) -> Response {
     match state.verifier.verify_headers(request.headers()).await {

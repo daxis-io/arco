@@ -19,6 +19,7 @@ pub fn orchestration_manifest_path() -> &'static str {
 }
 
 /// Returns the canonical orchestration manifest pointer path.
+#[must_use]
 pub fn orchestration_manifest_pointer_path() -> &'static str {
     ORCHESTRATION_MANIFEST_POINTER_PATH
 }

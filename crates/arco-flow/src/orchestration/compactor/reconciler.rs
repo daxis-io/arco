@@ -264,6 +264,7 @@ impl OrchestrationReconciler {
     /// # Errors
     ///
     /// Returns an error if storage reads or deletes fail.
+    #[allow(clippy::too_many_lines)]
     pub async fn repair_with_scope(
         &self,
         report: &OrchestrationReconciliationReport,

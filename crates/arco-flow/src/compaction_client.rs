@@ -74,7 +74,7 @@ async fn compact_orchestration_events_fenced_impl(
     let client = shared_http_client()?;
 
     let (endpoint, bearer_token) = build_compactor_endpoint(url)?;
-    let auth_header = build_auth_header(&client, &endpoint, bearer_token, METADATA_TIMEOUT).await?;
+    let auth_header = build_auth_header(client, &endpoint, bearer_token, METADATA_TIMEOUT).await?;
 
     // Basic retry for transient transport and server failures.
     let mut attempt = 0;

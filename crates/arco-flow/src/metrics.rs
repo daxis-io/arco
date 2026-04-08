@@ -203,6 +203,7 @@ pub struct FlowMetrics {
 }
 
 /// Registers flow metric descriptions when a metrics recorder is installed.
+#[allow(clippy::too_many_lines)]
 pub fn register_metrics() {
     describe_counter!(names::TASKS_TOTAL, "Total task state transitions");
     describe_histogram!(
@@ -559,6 +560,7 @@ pub fn record_orch_repair_automation_findings(mode: &str, scope: &str, findings:
 }
 
 /// Sets the current orchestration repair backlog count and age.
+#[allow(clippy::cast_precision_loss)] // Gauge values are operationally bounded.
 pub fn set_orch_repair_backlog(
     tenant_id: &str,
     workspace_id: &str,

@@ -1207,7 +1207,9 @@ async fn update_repair_backlog_metrics(
     let snapshot = {
         let mut tracker = state.repair_backlog.lock().await;
         let entry = tracker.domains.entry(domain).or_default();
-        entry.update(findings, fingerprint, Utc::now())
+        let snapshot = entry.update(findings, fingerprint, Utc::now());
+        drop(tracker);
+        snapshot
     };
     if snapshot.repeated_finding {
         arco_catalog::metrics::record_repair_repeat(
@@ -1258,6 +1260,7 @@ async fn refresh_repair_backlog_metrics(
     );
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_repair_automation_once(state: &Arc<ServiceState>) {
     if state.repair_automation.mode == RepairAutomationMode::Disabled {
         return;

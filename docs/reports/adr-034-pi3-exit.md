@@ -120,7 +120,10 @@ Intentionally not forced into PI-3:
   - no safe zero-dependency removal proof was available in this workspace
 - internal `expected_epoch` micro-compactor helpers remain for internal fenced/rebuild logic and
   tests; PI-3 removed request/client compatibility shims, not every internal epoch-bearing helper
-- root transactions remain out of scope for PI-3
+- the original PI-3 scope excluded root transactions
+  - current repo state now ships root commit/lookup plus pinned catalog and
+    orchestration read-token consumption as follow-on work outside the PI-3
+    rollout boundary
 
 ## Verification
 

@@ -12,9 +12,11 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 
+#[cfg(any(feature = "gcp", feature = "test-utils"))]
 use arco_core::Error as CoreError;
 use arco_core::VisibilityStatus;
 use arco_flow::compaction_client::compact_orchestration_events_fenced;
+#[cfg(any(feature = "gcp", feature = "test-utils"))]
 use arco_flow::error::Error as FlowError;
 use arco_flow::orchestration_compaction::OrchestrationCompactRequest;
 
@@ -46,7 +48,9 @@ async fn compact_handler(
                 arco_flow::orchestration_compaction::OrchestrationCompactionResponse {
                     events_processed: 0,
                     delta_id: None,
+                    manifest_id: String::new(),
                     manifest_revision: String::new(),
+                    pointer_version: String::new(),
                     visibility_status: VisibilityStatus::Visible,
                     repair_pending: false,
                 },
@@ -67,7 +71,9 @@ async fn compact_handler(
                         arco_flow::orchestration_compaction::OrchestrationCompactionResponse {
                             events_processed: 0,
                             delta_id: None,
+                            manifest_id: String::new(),
                             manifest_revision: String::new(),
+                            pointer_version: String::new(),
                             visibility_status: VisibilityStatus::Visible,
                             repair_pending: false,
                         },
@@ -94,7 +100,9 @@ async fn compact_handler(
             arco_flow::orchestration_compaction::OrchestrationCompactionResponse {
                 events_processed: u32::try_from(req.event_paths.len()).expect("event count fits"),
                 delta_id: None,
+                manifest_id: "00000000000000000001".to_string(),
                 manifest_revision: "manifest-test".to_string(),
+                pointer_version: "ptr-1".to_string(),
                 visibility_status: VisibilityStatus::Visible,
                 repair_pending: false,
             },
@@ -188,7 +196,7 @@ async fn compaction_client_sends_static_bearer_token_when_configured() {
         let err = result.expect_err("expected configuration error without gcp/test-utils feature");
         assert!(
             err.to_string()
-                .contains("orchestration compaction requires the 'gcp' feature"),
+                .contains("orchestration compaction requires the 'gcp', 'test-utils', or 'http-client' feature"),
             "unexpected error when gcp/test-utils feature is disabled: {err}"
         );
     }
@@ -227,8 +235,8 @@ async fn compaction_client_times_out_requests() {
 
 #[tokio::test]
 async fn compaction_client_sends_fencing_token_and_lock_path() {
-    let (base_url, capture, _handle) = start_test_server(ServerMode::CaptureRequest).await;
-    let capture = capture.expect("capture handle");
+    let (base_url, _captured_request, _handle) =
+        start_test_server(ServerMode::CaptureRequest).await;
 
     let response = compact_orchestration_events_fenced(
         &base_url,
@@ -241,11 +249,12 @@ async fn compaction_client_sends_fencing_token_and_lock_path() {
 
     #[cfg(any(feature = "gcp", feature = "test-utils"))]
     {
+        let captured_request = _captured_request.expect("capture handle");
         let response = response.expect("fenced compaction should succeed");
         assert_eq!(response.visibility_status.as_str(), "visible");
         assert!(!response.repair_pending);
 
-        let request = capture
+        let request = captured_request
             .lock()
             .expect("capture lock")
             .clone()
@@ -263,7 +272,7 @@ async fn compaction_client_sends_fencing_token_and_lock_path() {
         let err = response.expect_err("expected configuration error without gcp/test-utils");
         assert!(
             err.to_string()
-                .contains("orchestration compaction requires the 'gcp' feature"),
+                .contains("orchestration compaction requires the 'gcp', 'test-utils', or 'http-client' feature"),
             "unexpected error when gcp/test-utils feature is disabled: {err}"
         );
     }
@@ -304,7 +313,7 @@ async fn compaction_client_maps_conflict_status_to_precondition_failed() {
         let err = result.expect_err("expected configuration error without gcp/test-utils");
         assert!(
             err.to_string()
-                .contains("orchestration compaction requires the 'gcp' feature"),
+                .contains("orchestration compaction requires the 'gcp', 'test-utils', or 'http-client' feature"),
             "unexpected error when gcp/test-utils feature is disabled: {err}"
         );
     }

@@ -37,6 +37,8 @@ pub struct Tier1CompactionResult {
     pub manifest_version: String,
     /// Commit ULID for audit trail.
     pub commit_ulid: String,
+    /// Visible immutable manifest identifier.
+    pub manifest_id: String,
     /// Number of events processed.
     pub events_processed: usize,
     /// Snapshot version after compaction.
@@ -470,6 +472,7 @@ impl Tier1Compactor {
                     return Ok(Tier1CompactionResult {
                         manifest_version: version,
                         commit_ulid,
+                        manifest_id: manifest.manifest_id,
                         events_processed,
                         snapshot_version: manifest.snapshot_version,
                         visibility_status: VisibilityStatus::Visible,
@@ -708,6 +711,7 @@ impl Tier1Compactor {
                     return Ok(Tier1CompactionResult {
                         manifest_version: version,
                         commit_ulid,
+                        manifest_id: manifest.manifest_id,
                         events_processed,
                         snapshot_version: manifest.snapshot_version,
                         visibility_status: VisibilityStatus::Visible,
@@ -959,6 +963,7 @@ impl Tier1Compactor {
                     return Ok(Tier1CompactionResult {
                         manifest_version: version,
                         commit_ulid,
+                        manifest_id: manifest.manifest_id,
                         events_processed,
                         snapshot_version: manifest.snapshot_version,
                         visibility_status: VisibilityStatus::Visible,

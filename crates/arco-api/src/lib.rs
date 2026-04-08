@@ -12,8 +12,10 @@
 //!
 //! ## Design Principles
 //!
-//! This crate is a **thin composition layer** with no domain policy.
-//! All business logic lives in `arco-catalog` and `arco-flow`.
+//! This crate is primarily a composition layer, but it also owns the
+//! request-scoped control-plane transaction coordinator that composes
+//! `arco-catalog` and `arco-flow` into visible catalog, orchestration, and
+//! root transaction commits.
 //!
 //! ## Endpoints
 //!

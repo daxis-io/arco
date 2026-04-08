@@ -359,7 +359,9 @@ async fn compact_handler(
     let CompactionResult {
         events_processed,
         delta_id,
+        manifest_id,
         manifest_revision,
+        pointer_version,
         visibility_status,
         repair_pending,
     } = state
@@ -374,7 +376,9 @@ async fn compact_handler(
     Ok(Json(OrchestrationCompactionResponse {
         events_processed,
         delta_id,
+        manifest_id,
         manifest_revision,
+        pointer_version,
         visibility_status: visibility_status.into(),
         repair_pending,
     }))
@@ -402,7 +406,9 @@ async fn rebuild_handler(
     let CompactionResult {
         events_processed,
         delta_id,
+        manifest_id,
         manifest_revision,
+        pointer_version,
         visibility_status,
         repair_pending,
     } = state
@@ -417,7 +423,9 @@ async fn rebuild_handler(
     Ok(Json(OrchestrationCompactionResponse {
         events_processed,
         delta_id,
+        manifest_id,
         manifest_revision,
+        pointer_version,
         visibility_status: visibility_status.into(),
         repair_pending,
     }))

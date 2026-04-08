@@ -37,7 +37,7 @@ use arco_core::{CatalogDomain, CatalogPaths, DeltaPaths, ScopedStorage, TableFor
 use crate::error::{CatalogError, Result};
 use crate::event_writer::EventWriter;
 use crate::lock::DistributedLock;
-use crate::manifest::{CatalogDomainManifest, DomainManifestPointer, SnapshotInfo};
+use crate::manifest::SnapshotInfo;
 use crate::parquet_util::{
     CatalogRecord, ColumnRecord, LineageEdgeRecord, NamespaceRecord, TableRecord,
 };
@@ -539,44 +539,6 @@ impl CatalogWriter {
         }
     }
 
-    async fn read_catalog_transaction_commit(
-        &self,
-        event_id: String,
-        pointer_version: String,
-        fencing_token: u64,
-        repair_pending: bool,
-    ) -> Result<CatalogTransactionCommit> {
-        let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
-        let pointer_bytes = self.storage.get_raw(&pointer_path).await?;
-        let pointer: DomainManifestPointer =
-            serde_json::from_slice(&pointer_bytes).map_err(|e| CatalogError::Serialization {
-                message: format!("failed to parse catalog manifest pointer: {e}"),
-            })?;
-        let manifest_bytes = self.storage.get_raw(&pointer.manifest_path).await?;
-        let manifest: CatalogDomainManifest =
-            serde_json::from_slice(&manifest_bytes).map_err(|e| CatalogError::Serialization {
-                message: format!("failed to parse visible catalog manifest: {e}"),
-            })?;
-        let commit_id =
-            manifest
-                .last_commit_id
-                .clone()
-                .ok_or_else(|| CatalogError::InvariantViolation {
-                    message: "visible catalog manifest is missing last_commit_id".to_string(),
-                })?;
-
-        Ok(CatalogTransactionCommit {
-            event_id,
-            commit_id,
-            manifest_id: manifest.manifest_id,
-            snapshot_version: manifest.snapshot_version,
-            pointer_version,
-            lock_path: CatalogPaths::domain_lock(CatalogDomain::Catalog),
-            fencing_token,
-            repair_pending,
-        })
-    }
-
     async fn finish_catalog_transaction(
         &self,
         guard: crate::lock::LockGuard<dyn StorageBackend>,
@@ -584,18 +546,16 @@ impl CatalogWriter {
         result: Result<arco_core::sync_compact::SyncCompactResponse>,
     ) -> Result<CatalogTransactionCommit> {
         let fencing_token = guard.fencing_token().sequence();
-        let outcome = match result {
-            Ok(response) => {
-                self.read_catalog_transaction_commit(
-                    event_id,
-                    response.manifest_version,
-                    fencing_token,
-                    response.repair_pending,
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        };
+        let outcome = result.map(|response| CatalogTransactionCommit {
+            event_id,
+            commit_id: response.commit_ulid,
+            manifest_id: response.manifest_id,
+            snapshot_version: response.snapshot_version,
+            pointer_version: response.manifest_version,
+            lock_path: CatalogPaths::domain_lock(CatalogDomain::Catalog),
+            fencing_token,
+            repair_pending: response.repair_pending,
+        });
 
         guard.release().await?;
         outcome

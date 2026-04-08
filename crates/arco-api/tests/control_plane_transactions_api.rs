@@ -13,6 +13,7 @@ use prost::Message;
 use tower::ServiceExt;
 
 use arco_api::server::{Server, ServerBuilder};
+use arco_catalog::CatalogReader;
 use arco_core::catalog_event::CatalogEvent;
 use arco_core::catalog_paths::{CatalogDomain, CatalogPaths};
 use arco_core::control_plane_transactions::{
@@ -23,12 +24,14 @@ use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
 };
 use arco_core::{ControlPlaneTxDomain, ScopedStorage};
+use arco_flow::orchestration::compactor::MicroCompactor;
+use arco_flow::orchestration_manifest_pointer_path;
 use arco_proto::catalog_ddl_operation::Op as CatalogDdlOp;
 use arco_proto::{
-    ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CatalogColumnDefinition, CatalogDdlOperation,
-    CommitOrchestrationBatchRequest, CommitOrchestrationBatchResponse,
+    AlterTableOp, ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CatalogColumnDefinition,
+    CatalogDdlOperation, CommitOrchestrationBatchRequest, CommitOrchestrationBatchResponse,
     CommitRootTransactionRequest, CommitRootTransactionResponse, CreateNamespaceOp, DomainMutation,
-    GetCatalogTransactionRequest, GetCatalogTransactionResponse,
+    DropTableOp, GetCatalogTransactionRequest, GetCatalogTransactionResponse,
     GetOrchestrationTransactionRequest, GetOrchestrationTransactionResponse,
     GetRootTransactionRequest, GetRootTransactionResponse, OrchestrationBatchSpec,
     OrchestrationEventEnvelope, RegisterTableOp, RequestHeader, TenantId, TransactionDomain,
@@ -162,10 +165,24 @@ fn orchestration_request(
     request_id: &str,
     run_id: &str,
 ) -> CommitOrchestrationBatchRequest {
+    orchestration_request_with_event_id(
+        idempotency_key,
+        request_id,
+        run_id,
+        "01JTXORCH000000000000000001",
+    )
+}
+
+fn orchestration_request_with_event_id(
+    idempotency_key: &str,
+    request_id: &str,
+    run_id: &str,
+    event_id: &str,
+) -> CommitOrchestrationBatchRequest {
     CommitOrchestrationBatchRequest {
         header: Some(request_header(idempotency_key, request_id)),
         events: vec![OrchestrationEventEnvelope {
-            event_id: "01JTXORCH000000000000000001".to_string(),
+            event_id: event_id.to_string(),
             event_type: "RunTriggered".to_string(),
             event_version: 1,
             timestamp: Some(prost_types::Timestamp {
@@ -190,6 +207,74 @@ fn orchestration_request(
         }],
         require_visible: Some(true),
         allow_inline_merge: Some(false),
+    }
+}
+
+fn catalog_register_table_request(
+    idempotency_key: &str,
+    request_id: &str,
+    namespace: &str,
+    name: &str,
+) -> ApplyCatalogDdlRequest {
+    ApplyCatalogDdlRequest {
+        header: Some(request_header(idempotency_key, request_id)),
+        ddl: Some(CatalogDdlOperation {
+            op: Some(CatalogDdlOp::RegisterTable(RegisterTableOp {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                description: Some("control-plane transaction table".to_string()),
+                location: None,
+                format: None,
+                columns: vec![CatalogColumnDefinition {
+                    name: "id".to_string(),
+                    data_type: "STRING".to_string(),
+                    is_nullable: false,
+                    description: None,
+                }],
+                properties: Default::default(),
+            })),
+        }),
+        require_visible: Some(true),
+    }
+}
+
+fn catalog_alter_table_request(
+    idempotency_key: &str,
+    request_id: &str,
+    namespace: &str,
+    name: &str,
+    description: Option<&str>,
+) -> ApplyCatalogDdlRequest {
+    ApplyCatalogDdlRequest {
+        header: Some(request_header(idempotency_key, request_id)),
+        ddl: Some(CatalogDdlOperation {
+            op: Some(CatalogDdlOp::AlterTable(AlterTableOp {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                description: description.map(str::to_string),
+                location: None,
+                format: None,
+            })),
+        }),
+        require_visible: Some(true),
+    }
+}
+
+fn catalog_drop_table_request(
+    idempotency_key: &str,
+    request_id: &str,
+    namespace: &str,
+    name: &str,
+) -> ApplyCatalogDdlRequest {
+    ApplyCatalogDdlRequest {
+        header: Some(request_header(idempotency_key, request_id)),
+        ddl: Some(CatalogDdlOperation {
+            op: Some(CatalogDdlOp::DropTable(DropTableOp {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+            })),
+        }),
+        require_visible: Some(true),
     }
 }
 
@@ -602,6 +687,109 @@ impl StorageBackend for FailRootSuperManifestBackend {
     }
 }
 
+#[derive(Debug)]
+struct FailReadsAfterTriggerPutBackend {
+    inner: MemoryBackend,
+    trigger_path: String,
+    trigger_after_puts: usize,
+    fail_get_paths: Vec<String>,
+    fail_head_paths: Vec<String>,
+    trigger_seen: std::sync::atomic::AtomicBool,
+    trigger_puts_seen: std::sync::atomic::AtomicUsize,
+    remaining_failures: std::sync::atomic::AtomicUsize,
+}
+
+impl FailReadsAfterTriggerPutBackend {
+    fn new(
+        trigger_path: impl Into<String>,
+        trigger_after_puts: usize,
+        fail_get_paths: Vec<String>,
+        fail_head_paths: Vec<String>,
+        failures: usize,
+    ) -> Self {
+        Self {
+            inner: MemoryBackend::new(),
+            trigger_path: trigger_path.into(),
+            trigger_after_puts,
+            fail_get_paths,
+            fail_head_paths,
+            trigger_seen: std::sync::atomic::AtomicBool::new(false),
+            trigger_puts_seen: std::sync::atomic::AtomicUsize::new(0),
+            remaining_failures: std::sync::atomic::AtomicUsize::new(failures),
+        }
+    }
+
+    fn should_fail_path(&self, path: &str, candidates: &[String]) -> bool {
+        use std::sync::atomic::Ordering;
+
+        self.trigger_seen.load(Ordering::SeqCst)
+            && candidates.iter().any(|candidate| candidate == path)
+            && self.remaining_failures.load(Ordering::SeqCst) > 0
+    }
+
+    fn consume_failure(&self, path: &str) -> arco_core::Error {
+        use std::sync::atomic::Ordering;
+
+        self.remaining_failures.fetch_sub(1, Ordering::SeqCst);
+        arco_core::Error::storage(format!(
+            "injected post-visibility readback failure for {path}"
+        ))
+    }
+}
+
+#[async_trait]
+impl StorageBackend for FailReadsAfterTriggerPutBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        if self.should_fail_path(path, &self.fail_get_paths) {
+            return Err(self.consume_failure(path));
+        }
+
+        self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        use std::sync::atomic::Ordering;
+
+        let result = self.inner.put(path, data, precondition).await;
+        if path == self.trigger_path && matches!(result, Ok(WriteResult::Success { .. })) {
+            let puts_seen = self.trigger_puts_seen.fetch_add(1, Ordering::SeqCst) + 1;
+            if puts_seen >= self.trigger_after_puts {
+                self.trigger_seen.store(true, Ordering::SeqCst);
+            }
+        }
+        result
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        if self.should_fail_path(path, &self.fail_head_paths) {
+            return Err(self.consume_failure(path));
+        }
+
+        self.inner.head(path).await
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+}
+
 #[tokio::test]
 async fn apply_catalog_ddl_returns_visible_receipt_and_persists_lookup_record() -> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
@@ -715,6 +903,90 @@ async fn apply_catalog_ddl_replays_same_idempotency_key_and_rejects_hash_conflic
     .await?;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(error["code"], "CONFLICT");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn apply_catalog_ddl_registers_alters_and_drops_tables_via_transaction_layer() -> Result<()> {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let router = test_router_with_backend(backend.clone());
+
+    let create_namespace =
+        catalog_create_namespace_request("idem-cat-table-ns-01", "req-cat-table-ns-01", "ops");
+    let (_status, create_namespace_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router.clone(),
+        "/api/v1/transactions/applyCatalogDdl",
+        &create_namespace,
+        "idem-cat-table-ns-01",
+        "req-cat-table-ns-01",
+    )
+    .await?;
+    assert!(
+        create_namespace_response.receipt.is_some(),
+        "namespace receipt missing"
+    );
+
+    let register = catalog_register_table_request(
+        "idem-cat-table-reg-01",
+        "req-cat-table-reg-01",
+        "ops",
+        "events",
+    );
+    let (_status, register_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router.clone(),
+        "/api/v1/transactions/applyCatalogDdl",
+        &register,
+        "idem-cat-table-reg-01",
+        "req-cat-table-reg-01",
+    )
+    .await?;
+    let register_receipt = register_response
+        .receipt
+        .context("register table receipt missing")?;
+    let register_record = load_catalog_tx_record(backend.clone(), &register_receipt.tx_id).await?;
+    assert_eq!(register_record.status, ControlPlaneTxStatus::Visible);
+
+    let alter = catalog_alter_table_request(
+        "idem-cat-table-alt-01",
+        "req-cat-table-alt-01",
+        "ops",
+        "events",
+        Some("updated description"),
+    );
+    let (_status, alter_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router.clone(),
+        "/api/v1/transactions/applyCatalogDdl",
+        &alter,
+        "idem-cat-table-alt-01",
+        "req-cat-table-alt-01",
+    )
+    .await?;
+    let alter_receipt = alter_response
+        .receipt
+        .context("alter table receipt missing")?;
+    let alter_record = load_catalog_tx_record(backend.clone(), &alter_receipt.tx_id).await?;
+    assert_eq!(alter_record.status, ControlPlaneTxStatus::Visible);
+
+    let drop = catalog_drop_table_request(
+        "idem-cat-table-drop-01",
+        "req-cat-table-drop-01",
+        "ops",
+        "events",
+    );
+    let (_status, drop_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router,
+        "/api/v1/transactions/applyCatalogDdl",
+        &drop,
+        "idem-cat-table-drop-01",
+        "req-cat-table-drop-01",
+    )
+    .await?;
+    let drop_receipt = drop_response
+        .receipt
+        .context("drop table receipt missing")?;
+    let drop_record = load_catalog_tx_record(backend, &drop_receipt.tx_id).await?;
+    assert_eq!(drop_record.status, ControlPlaneTxStatus::Visible);
 
     Ok(())
 }
@@ -1074,6 +1346,132 @@ async fn commit_root_transaction_replays_same_idempotency_key_and_keeps_audit_re
 }
 
 #[tokio::test]
+async fn commit_root_transaction_exposes_pinned_catalog_and_orchestration_reads() -> Result<()> {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let router = test_router_with_backend(backend.clone());
+    let request = root_request(
+        "idem-root-read-01",
+        "req-root-read-01",
+        "root-pinned-catalog",
+        "run-root-read-01",
+    );
+
+    let (_status, response): (_, CommitRootTransactionResponse) = post_protobuf(
+        router.clone(),
+        "/api/v1/transactions/commitRootTransaction",
+        &request,
+        "idem-root-read-01",
+        "req-root-read-01",
+    )
+    .await?;
+
+    let receipt = response
+        .receipt
+        .context("root pinned read receipt missing")?;
+    let storage = scoped_storage(backend.clone());
+    let reader = CatalogReader::new(storage.clone());
+    let compactor = MicroCompactor::new(storage);
+
+    let pinned_namespaces = reader
+        .list_namespaces_for_root_token(&receipt.read_token)
+        .await?;
+    assert_eq!(
+        pinned_namespaces
+            .iter()
+            .map(|namespace| namespace.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["root-pinned-catalog"]
+    );
+
+    let (_pinned_manifest, pinned_state) = compactor
+        .load_state_for_root_token(&receipt.read_token)
+        .await?;
+    assert!(pinned_state.runs.contains_key("run-root-read-01"));
+
+    let current_catalog = catalog_create_namespace_request(
+        "idem-root-read-cat-current-01",
+        "req-root-read-cat-current-01",
+        "current-only-catalog",
+    );
+    let (_status, current_catalog_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router.clone(),
+        "/api/v1/transactions/applyCatalogDdl",
+        &current_catalog,
+        "idem-root-read-cat-current-01",
+        "req-root-read-cat-current-01",
+    )
+    .await?;
+    assert!(current_catalog_response.receipt.is_some());
+
+    let current_orchestration = orchestration_request(
+        "idem-root-read-orch-current-01",
+        "req-root-read-orch-current-01",
+        "run-current-read-01",
+    );
+    let current_orchestration = CommitOrchestrationBatchRequest {
+        events: orchestration_request_with_event_id(
+            "idem-root-read-orch-current-01",
+            "req-root-read-orch-current-01",
+            "run-current-read-01",
+            "01JTXORCH000000000000000002",
+        )
+        .events,
+        ..current_orchestration
+    };
+    let (_status, current_orchestration_response): (_, CommitOrchestrationBatchResponse) =
+        post_protobuf(
+            router,
+            "/api/v1/transactions/commitOrchestrationBatch",
+            &current_orchestration,
+            "idem-root-read-orch-current-01",
+            "req-root-read-orch-current-01",
+        )
+        .await?;
+    assert!(current_orchestration_response.receipt.is_some());
+
+    let mut current_namespaces = reader.list_namespaces().await?;
+    current_namespaces.sort_by(|left, right| left.name.cmp(&right.name));
+    assert_eq!(
+        current_namespaces
+            .iter()
+            .map(|namespace| namespace.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["current-only-catalog", "root-pinned-catalog"]
+    );
+
+    let (_current_manifest, current_state) = compactor.load_state().await?;
+    assert!(current_state.runs.contains_key("run-root-read-01"));
+    assert!(current_state.runs.contains_key("run-current-read-01"));
+
+    let pinned_namespaces_after_current = reader
+        .list_namespaces_for_root_token(&receipt.read_token)
+        .await?;
+    assert_eq!(
+        pinned_namespaces_after_current
+            .iter()
+            .map(|namespace| namespace.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["root-pinned-catalog"]
+    );
+
+    let (_pinned_manifest_after_current, pinned_state_after_current) = compactor
+        .load_state_for_root_token(&receipt.read_token)
+        .await?;
+    assert!(
+        pinned_state_after_current
+            .runs
+            .contains_key("run-root-read-01")
+    );
+    assert!(
+        !pinned_state_after_current
+            .runs
+            .contains_key("run-current-read-01")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn commit_root_transaction_propagates_repair_pending_when_root_commit_receipt_write_fails()
 -> Result<()> {
     let fail_prefix = format!("tenant={TENANT}/workspace={WORKSPACE}/commits/root/");
@@ -1339,6 +1737,68 @@ async fn apply_catalog_ddl_replays_from_cached_visible_record_after_finalize_wri
 }
 
 #[tokio::test]
+async fn apply_catalog_ddl_keeps_visible_success_when_pointer_readback_fails() -> Result<()> {
+    let pointer_path = format!(
+        "tenant={TENANT}/workspace={WORKSPACE}/{}",
+        CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog)
+    );
+    let backend: Arc<dyn StorageBackend> = Arc::new(FailReadsAfterTriggerPutBackend::new(
+        pointer_path.clone(),
+        2,
+        vec![pointer_path],
+        Vec::new(),
+        2,
+    ));
+    let router = test_router_with_backend(backend.clone());
+
+    let first = catalog_create_namespace_request(
+        "idem-cat-visible-boundary-01",
+        "req-cat-visible-boundary-01",
+        "visible-boundary",
+    );
+    let (_status, first_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router.clone(),
+        "/api/v1/transactions/applyCatalogDdl",
+        &first,
+        "idem-cat-visible-boundary-01",
+        "req-cat-visible-boundary-01",
+    )
+    .await?;
+
+    let first_receipt = first_response
+        .receipt
+        .context("catalog receipt missing after pointer readback failure")?;
+    let stored = load_catalog_tx_record(backend.clone(), &first_receipt.tx_id).await?;
+    assert_eq!(stored.status, ControlPlaneTxStatus::Visible);
+    assert_eq!(
+        stored.result.as_ref().map(|result| result.tx_id.as_str()),
+        Some(first_receipt.tx_id.as_str())
+    );
+
+    let replay = catalog_create_namespace_request(
+        "idem-cat-visible-boundary-01",
+        "req-cat-visible-boundary-02",
+        "visible-boundary",
+    );
+    let (_status, replay_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router,
+        "/api/v1/transactions/applyCatalogDdl",
+        &replay,
+        "idem-cat-visible-boundary-01",
+        "req-cat-visible-boundary-02",
+    )
+    .await?;
+
+    let replay_receipt = replay_response
+        .receipt
+        .context("catalog replay receipt missing after pointer readback failure")?;
+    assert_eq!(replay_receipt.tx_id, first_receipt.tx_id);
+    assert_eq!(replay_receipt.commit_id, first_receipt.commit_id);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn commit_orchestration_batch_marks_failed_attempt_aborted_and_retries_same_key() -> Result<()>
 {
     let fail_prefix = format!("tenant={TENANT}/workspace={WORKSPACE}/ledger/orchestration/");
@@ -1390,6 +1850,69 @@ async fn commit_orchestration_batch_marks_failed_attempt_aborted_and_retries_sam
         .context("orchestration retry receipt missing")?;
     assert_ne!(receipt.tx_id, first_idem.tx_id);
     assert!(!receipt.tx_id.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_orchestration_batch_keeps_visible_success_when_pointer_readback_fails() -> Result<()>
+{
+    let pointer_path = format!(
+        "tenant={TENANT}/workspace={WORKSPACE}/{}",
+        orchestration_manifest_pointer_path()
+    );
+    let backend: Arc<dyn StorageBackend> = Arc::new(FailReadsAfterTriggerPutBackend::new(
+        pointer_path.clone(),
+        1,
+        vec![pointer_path.clone()],
+        vec![pointer_path],
+        2,
+    ));
+    let router = test_router_with_backend(backend.clone());
+
+    let first = orchestration_request(
+        "idem-orch-visible-boundary-01",
+        "req-orch-visible-boundary-01",
+        "run-visible-boundary-01",
+    );
+    let (_status, first_response): (_, CommitOrchestrationBatchResponse) = post_protobuf(
+        router.clone(),
+        "/api/v1/transactions/commitOrchestrationBatch",
+        &first,
+        "idem-orch-visible-boundary-01",
+        "req-orch-visible-boundary-01",
+    )
+    .await?;
+
+    let first_receipt = first_response
+        .receipt
+        .context("orchestration receipt missing after pointer readback failure")?;
+    let stored = load_orchestration_tx_record(backend.clone(), &first_receipt.tx_id).await?;
+    assert_eq!(stored.status, ControlPlaneTxStatus::Visible);
+    assert_eq!(
+        stored.result.as_ref().map(|result| result.tx_id.as_str()),
+        Some(first_receipt.tx_id.as_str())
+    );
+
+    let replay = orchestration_request(
+        "idem-orch-visible-boundary-01",
+        "req-orch-visible-boundary-02",
+        "run-visible-boundary-01",
+    );
+    let (_status, replay_response): (_, CommitOrchestrationBatchResponse) = post_protobuf(
+        router,
+        "/api/v1/transactions/commitOrchestrationBatch",
+        &replay,
+        "idem-orch-visible-boundary-01",
+        "req-orch-visible-boundary-02",
+    )
+    .await?;
+
+    let replay_receipt = replay_response
+        .receipt
+        .context("orchestration replay receipt missing after pointer readback failure")?;
+    assert_eq!(replay_receipt.tx_id, first_receipt.tx_id);
+    assert_eq!(replay_receipt.commit_id, first_receipt.commit_id);
 
     Ok(())
 }

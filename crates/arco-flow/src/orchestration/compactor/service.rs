@@ -15,6 +15,9 @@ use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 use ulid::Ulid;
 
+use arco_core::control_plane_transactions::{
+    ControlPlaneTxDomain, ControlPlaneTxPaths, ControlPlaneTxStatus, RootTxManifest, RootTxRecord,
+};
 use arco_core::publish::{
     SnapshotPointerDurability, SnapshotPointerPublishOutcome, publish_snapshot_pointer_transaction,
 };
@@ -91,24 +94,36 @@ impl From<CompactionVisibility> for arco_core::VisibilityStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PublishOutcome {
-    Visible { repair_pending: bool },
+    Visible {
+        pointer_version: String,
+        repair_pending: bool,
+    },
     PersistedNotVisible,
 }
 
 impl PublishOutcome {
-    const fn visibility_status(self) -> CompactionVisibility {
+    fn visibility_status(&self) -> CompactionVisibility {
         match self {
             Self::Visible { .. } => CompactionVisibility::Visible,
             Self::PersistedNotVisible => CompactionVisibility::PersistedNotVisible,
         }
     }
 
-    const fn repair_pending(self) -> bool {
+    fn repair_pending(&self) -> bool {
         match self {
-            Self::Visible { repair_pending } => repair_pending,
+            Self::Visible { repair_pending, .. } => *repair_pending,
             Self::PersistedNotVisible => false,
+        }
+    }
+
+    fn pointer_version(&self) -> Option<&str> {
+        match self {
+            Self::Visible {
+                pointer_version, ..
+            } => Some(pointer_version.as_str()),
+            Self::PersistedNotVisible => None,
         }
     }
 }
@@ -190,8 +205,12 @@ pub struct CompactionResult {
     pub events_processed: u32,
     /// Delta ID if any state was written.
     pub delta_id: Option<String>,
+    /// Visible immutable manifest identifier.
+    pub manifest_id: String,
     /// New manifest revision.
     pub manifest_revision: String,
+    /// Pointer object version returned by the visible CAS publish.
+    pub pointer_version: String,
     /// Visibility outcome for this compaction acknowledgement.
     pub visibility_status: CompactionVisibility,
     /// Whether post-commit side effects failed and require repair.
@@ -236,6 +255,26 @@ impl MicroCompactor {
     /// Returns an error if the manifest or Parquet files cannot be read.
     pub async fn load_state(&self) -> Result<(OrchestrationManifest, FoldState)> {
         let (manifest, _, _, _) = self.read_manifest_with_version().await?;
+        let mut state = self.load_current_state(&manifest).await?;
+        state.tenant_secret.clone_from(&self.tenant_secret);
+        Ok((manifest, state))
+    }
+
+    /// Loads orchestration state pinned to one visible root transaction token.
+    ///
+    /// This opt-in read path resolves `root:{tx_id}` through the visible root
+    /// transaction record and immutable super-manifest, then loads the
+    /// orchestration manifest captured in that pinned cut.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the root transaction is missing, not visible, or if
+    /// the pinned orchestration manifest/state cannot be read.
+    pub async fn load_state_for_root_token(
+        &self,
+        read_token: &str,
+    ) -> Result<(OrchestrationManifest, FoldState)> {
+        let manifest = self.read_manifest_for_root_token(read_token).await?;
         let mut state = self.load_current_state(&manifest).await?;
         state.tenant_secret.clone_from(&self.tenant_secret);
         Ok((manifest, state))
@@ -404,6 +443,7 @@ impl MicroCompactor {
             // Load current manifest + version for CAS
             let (mut manifest, pointer_version, previous_pointer, previous_pointer_bytes) =
                 self.read_manifest_with_version().await?;
+            let mut visible_pointer_version = pointer_version.clone().unwrap_or_default();
             let previous_manifest = manifest.clone();
             validate_expected_epoch(expected_epoch, previous_pointer.as_ref())?;
 
@@ -426,6 +466,9 @@ impl MicroCompactor {
                         Ok(outcome) => {
                             visibility_status = outcome.visibility_status();
                             repair_pending = outcome.repair_pending();
+                            if let Some(pointer_version) = outcome.pointer_version() {
+                                visible_pointer_version = pointer_version.to_string();
+                            }
                         }
                         Err(publish_error) => {
                             if let Some(delay_ms) =
@@ -470,7 +513,9 @@ impl MicroCompactor {
                 return Ok(CompactionResult {
                     events_processed: 0,
                     delta_id: None,
+                    manifest_id: manifest.manifest_id,
                     manifest_revision: manifest.revision_ulid,
+                    pointer_version: visible_pointer_version,
                     visibility_status,
                     repair_pending,
                 });
@@ -672,6 +717,9 @@ impl MicroCompactor {
                     Ok(outcome) => {
                         visibility_status = outcome.visibility_status();
                         repair_pending = outcome.repair_pending();
+                        if let Some(pointer_version) = outcome.pointer_version() {
+                            visible_pointer_version = pointer_version.to_string();
+                        }
                     }
                     Err(publish_error) => {
                         if let Some(delay_ms) =
@@ -721,7 +769,9 @@ impl MicroCompactor {
             return Ok(CompactionResult {
                 events_processed: u32::try_from(events.len()).unwrap_or(u32::MAX),
                 delta_id,
+                manifest_id: manifest.manifest_id,
                 manifest_revision,
+                pointer_version: visible_pointer_version,
                 visibility_status,
                 repair_pending,
             });
@@ -844,6 +894,57 @@ impl MicroCompactor {
                 None,
             )),
         }
+    }
+
+    async fn read_manifest_for_root_token(
+        &self,
+        read_token: &str,
+    ) -> Result<OrchestrationManifest> {
+        let tx_id = parse_root_read_token(read_token)?;
+        let tx_record_path = ControlPlaneTxPaths::record(ControlPlaneTxDomain::Root, tx_id);
+        let tx_record_bytes = self.storage.get_raw(&tx_record_path).await?;
+        let tx_record: RootTxRecord = serde_json::from_slice(&tx_record_bytes).map_err(|e| {
+            Error::serialization(format!("failed to parse root transaction record: {e}"))
+        })?;
+
+        if tx_record.status != ControlPlaneTxStatus::Visible {
+            return Err(Error::Core(arco_core::Error::PreconditionFailed {
+                message: format!("root transaction '{tx_id}' is not visible"),
+            }));
+        }
+
+        let super_manifest_path = tx_record
+            .result
+            .as_ref()
+            .map(|result| result.super_manifest_path.as_str())
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| {
+                Error::Core(arco_core::Error::Validation {
+                    message: format!(
+                        "visible root transaction '{tx_id}' is missing super_manifest_path"
+                    ),
+                })
+            })?;
+
+        let super_manifest_bytes = self.storage.get_raw(super_manifest_path).await?;
+        let super_manifest: RootTxManifest = serde_json::from_slice(&super_manifest_bytes)
+            .map_err(|e| {
+                Error::serialization(format!("failed to parse root super-manifest: {e}"))
+            })?;
+
+        let orchestration = super_manifest
+            .domains
+            .get(&ControlPlaneTxDomain::Orchestration)
+            .ok_or_else(|| {
+                Error::Core(arco_core::Error::resource_not_found(
+                    "root transaction domain",
+                    "orchestration",
+                ))
+            })?;
+
+        let manifest_bytes = self.storage.get_raw(&orchestration.manifest_path).await?;
+        serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| Error::serialization(format!("failed to parse pinned manifest: {e}")))
     }
 
     #[cfg(test)]
@@ -1314,7 +1415,10 @@ impl MicroCompactor {
         )
         .await
         {
-            Ok(SnapshotPointerPublishOutcome::Visible { repair_pending, .. }) => {
+            Ok(SnapshotPointerPublishOutcome::Visible {
+                pointer_version,
+                repair_pending,
+            }) => {
                 if repair_pending {
                     counter!(
                         metric_names::ORCH_REPAIR_PENDING_TOTAL,
@@ -1322,7 +1426,10 @@ impl MicroCompactor {
                     )
                     .increment(1);
                 }
-                Ok(PublishOutcome::Visible { repair_pending })
+                Ok(PublishOutcome::Visible {
+                    pointer_version,
+                    repair_pending,
+                })
             }
             Ok(SnapshotPointerPublishOutcome::PersistedNotVisible) => {
                 tracing::warn!(
@@ -1355,6 +1462,14 @@ impl MicroCompactor {
             Err(error) => Err(PublishManifestError::Other(Error::from(error))),
         }
     }
+}
+
+fn parse_root_read_token(read_token: &str) -> Result<&str> {
+    read_token.strip_prefix("root:").ok_or_else(|| {
+        Error::Core(arco_core::Error::InvalidInput(format!(
+            "invalid root read token '{read_token}'"
+        )))
+    })
 }
 
 /// Merges two fold states, preferring newer row versions.
@@ -3402,6 +3517,7 @@ mod tests {
         assert_eq!(
             base_outcome,
             PublishOutcome::Visible {
+                pointer_version: "1".to_string(),
                 repair_pending: false
             }
         );
@@ -3429,6 +3545,7 @@ mod tests {
         assert_eq!(
             winner_outcome,
             PublishOutcome::Visible {
+                pointer_version: "2".to_string(),
                 repair_pending: false
             }
         );

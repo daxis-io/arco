@@ -248,9 +248,9 @@ message TaskOutput {
   // Published/readable output files. Empty until visibility is VISIBLE.
   repeated FileEntry files = 2;
 
-  // Published output statistics. Unset until visibility is VISIBLE.
-  optional int64 row_count = 3;
-  optional int64 byte_size = 4;
+  // Published output statistics. Only meaningful when visibility is VISIBLE.
+  int64 row_count = 3;
+  int64 byte_size = 4;
 
   // Visibility/readability of the output object.
   OutputVisibilityState visibility_state = 5;

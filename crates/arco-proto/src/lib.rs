@@ -41,7 +41,7 @@ impl std::fmt::Display for TaskOutputContractError {
                 f.write_str("task output visibility_state must not be UNSPECIFIED")
             }
             Self::PendingHasPublishedFields => f.write_str(
-                "pending task output must not include published files, stats, timestamp, or error",
+                "pending task output must not include published files, non-zero stats, timestamp, or error",
             ),
             Self::VisibleMissingFiles => {
                 f.write_str("visible task output must include at least one published file")
@@ -56,7 +56,7 @@ impl std::fmt::Display for TaskOutputContractError {
                 f.write_str("failed task output must include publish_error")
             }
             Self::FailedHasPublishedFields => f.write_str(
-                "failed task output must not include published files, stats, or timestamp",
+                "failed task output must not include published files, non-zero stats, or timestamp",
             ),
         }
     }
@@ -79,8 +79,8 @@ impl TaskOutput {
             }
             OutputVisibilityState::Pending => {
                 if !self.files.is_empty()
-                    || self.row_count.is_some()
-                    || self.byte_size.is_some()
+                    || self.row_count != 0
+                    || self.byte_size != 0
                     || self.published_at.is_some()
                     || self.publish_error.is_some()
                 {
@@ -105,8 +105,8 @@ impl TaskOutput {
                     return Err(TaskOutputContractError::FailedMissingPublishError);
                 }
                 if !self.files.is_empty()
-                    || self.row_count.is_some()
-                    || self.byte_size.is_some()
+                    || self.row_count != 0
+                    || self.byte_size != 0
                     || self.published_at.is_some()
                 {
                     return Err(TaskOutputContractError::FailedHasPublishedFields);
@@ -127,8 +127,8 @@ mod tests {
                 value: "mat_01HQXYZ".into(),
             }),
             files: Vec::new(),
-            row_count: None,
-            byte_size: None,
+            row_count: 0,
+            byte_size: 0,
             visibility_state: OutputVisibilityState::Pending as i32,
             published_at: None,
             publish_error: None,
@@ -189,8 +189,8 @@ mod tests {
     fn task_output_visibility_contract() {
         let output = pending_output();
 
-        assert!(output.row_count.is_none());
-        assert!(output.byte_size.is_none());
+        assert_eq!(output.row_count, 0);
+        assert_eq!(output.byte_size, 0);
         assert_eq!(
             output.visibility_state,
             OutputVisibilityState::Pending as i32
@@ -236,8 +236,8 @@ mod tests {
             content_hash: "abc123".into(),
             format: "parquet".into(),
         });
-        output.row_count = Some(0);
-        output.byte_size = Some(128);
+        output.row_count = 0;
+        output.byte_size = 128;
 
         assert_eq!(
             output.validate_contract(),
@@ -257,14 +257,14 @@ mod tests {
     }
 
     #[test]
-    fn task_output_contract_roundtrips_absent_vs_zero_stats() -> Result<(), prost::DecodeError> {
+    fn task_output_contract_roundtrips_zero_stats() -> Result<(), prost::DecodeError> {
         use prost::Message;
 
-        let absent_stats = pending_output();
-        let absent_encoded = absent_stats.encode_to_vec();
-        let absent_decoded = TaskOutput::decode(absent_encoded.as_slice())?;
-        assert_eq!(absent_decoded.row_count, None);
-        assert_eq!(absent_decoded.byte_size, None);
+        let pending_stats = pending_output();
+        let pending_encoded = pending_stats.encode_to_vec();
+        let pending_decoded = TaskOutput::decode(pending_encoded.as_slice())?;
+        assert_eq!(pending_decoded.row_count, 0);
+        assert_eq!(pending_decoded.byte_size, 0);
 
         let mut zero_stats = pending_output();
         zero_stats.visibility_state = OutputVisibilityState::Visible as i32;
@@ -275,16 +275,16 @@ mod tests {
             content_hash: "def456".into(),
             format: "parquet".into(),
         });
-        zero_stats.row_count = Some(0);
-        zero_stats.byte_size = Some(0);
+        zero_stats.row_count = 0;
+        zero_stats.byte_size = 0;
         zero_stats.published_at = Some(prost_types::Timestamp {
             seconds: 1_742_770_800,
             nanos: 0,
         });
         let zero_encoded = zero_stats.encode_to_vec();
         let zero_decoded = TaskOutput::decode(zero_encoded.as_slice())?;
-        assert_eq!(zero_decoded.row_count, Some(0));
-        assert_eq!(zero_decoded.byte_size, Some(0));
+        assert_eq!(zero_decoded.row_count, 0);
+        assert_eq!(zero_decoded.byte_size, 0);
 
         Ok(())
     }

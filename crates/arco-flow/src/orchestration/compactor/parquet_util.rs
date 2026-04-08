@@ -89,7 +89,7 @@ fn tasks_schema() -> Arc<Schema> {
         Field::new("ready_at", DataType::Int64, true),
         Field::new("asset_key", DataType::Utf8, true),
         Field::new("partition_key", DataType::Utf8, true),
-        Field::new("requires_visible_output", DataType::Boolean, false),
+        Field::new("requires_visible_output", DataType::Boolean, true),
         Field::new("materialization_id", DataType::Utf8, true),
         Field::new("output_visibility_state", DataType::Utf8, true),
         Field::new("published_at", DataType::Int64, true),

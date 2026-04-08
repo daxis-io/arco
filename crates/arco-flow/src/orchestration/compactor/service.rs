@@ -1247,17 +1247,16 @@ impl MicroCompactor {
             {
                 Err(PublishManifestError::ConcurrentWrite)
             }
-            Err(arco_core::Error::PreconditionFailed { message }) => decode_pre_pointer_publish_error(
-                &message,
-            )
-            .map_or_else(
-                || {
-                    Err(PublishManifestError::Other(Error::Core(
-                        arco_core::Error::PreconditionFailed { message },
-                    )))
-                },
-                |error| Err(PublishManifestError::Other(error)),
-            ),
+            Err(arco_core::Error::PreconditionFailed { message }) => {
+                decode_pre_pointer_publish_error(&message).map_or_else(
+                    || {
+                        Err(PublishManifestError::Other(Error::Core(
+                            arco_core::Error::PreconditionFailed { message },
+                        )))
+                    },
+                    |error| Err(PublishManifestError::Other(error)),
+                )
+            }
             Err(error) => Err(PublishManifestError::Other(Error::from(error))),
         }
     }

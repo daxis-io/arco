@@ -319,7 +319,7 @@ impl OrchestrationReconciler {
             visited_paths.insert(path);
         }
         let mut previous_manifest_path = manifest.previous_manifest_path.clone();
-        while let Some(path) = previous_manifest_path {
+        while let Some(path) = previous_manifest_path.clone() {
             if !visited_paths.insert(path.clone()) {
                 return Err(Error::storage(format!(
                     "cycle detected in orchestration manifest chain at {path}"

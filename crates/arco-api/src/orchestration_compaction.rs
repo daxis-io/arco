@@ -88,9 +88,17 @@ pub async fn append_events_and_compact_with_result(
     request_id: Option<&str>,
 ) -> Result<OrchestrationCommitOutcome, ApiError> {
     if events.is_empty() {
-        return Err(ApiError::bad_request(
-            "orchestration batch must include at least one event",
-        ));
+        return Ok(OrchestrationCommitOutcome {
+            event_paths: Vec::new(),
+            lock_path: orchestration_compaction_lock_path().to_string(),
+            fencing_token: 0,
+            manifest_id: String::new(),
+            manifest_revision: String::new(),
+            pointer_version: String::new(),
+            delta_id: None,
+            events_processed: 0,
+            repair_pending: false,
+        });
     }
 
     let lock_path = orchestration_compaction_lock_path();

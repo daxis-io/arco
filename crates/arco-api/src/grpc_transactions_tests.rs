@@ -421,6 +421,8 @@ async fn grpc_applies_rate_limits_and_returns_request_metadata() -> Result<()> {
             default_requests_per_minute: 1,
             url_minting_requests_per_minute: 1,
             burst_size: 1,
+            max_tenant_entries: 10_000,
+            tenant_entry_ttl_secs: 3600,
         },
         ..crate::config::Config::default()
     };

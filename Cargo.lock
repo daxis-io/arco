@@ -4509,7 +4509,7 @@ dependencies = [
  "itertools 0.14.0",
  "proc-macro2",
  "quote",
- "syn 2.0.111",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6147,7 +6147,7 @@ dependencies = [
  "prettyplease",
  "proc-macro2",
  "quote",
- "syn 2.0.111",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6161,7 +6161,7 @@ dependencies = [
  "prost-build",
  "prost-types 0.14.3",
  "quote",
- "syn 2.0.111",
+ "syn 2.0.117",
  "tempfile",
  "tonic-build",
 ]

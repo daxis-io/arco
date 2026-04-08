@@ -69,6 +69,7 @@ resource "google_cloud_run_v2_job_iam_member" "compactor_antientropy_invoker" {
 # ============================================================================
 
 resource "google_cloud_scheduler_job" "compactor_antientropy_trigger" {
+  count       = var.background_automation_enabled ? 1 : 0
   name        = "arco-compactor-antientropy-trigger-${var.environment}"
   project     = var.project_id
   region      = var.region

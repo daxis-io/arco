@@ -9,7 +9,7 @@
 *.swo
 *~
 
-# Local agent directories
+# Local directories
 .worktrees/
 
 # OS

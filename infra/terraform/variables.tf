@@ -139,6 +139,12 @@ variable "anti_entropy_schedule" {
   default     = "*/15 * * * *"
 }
 
+variable "background_automation_enabled" {
+  description = "Whether scheduled background automation and warm background services stay enabled"
+  type        = bool
+  default     = true
+}
+
 # ============================================================================
 # Cloud Run Configuration
 # ============================================================================

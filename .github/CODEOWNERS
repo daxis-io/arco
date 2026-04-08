@@ -1,25 +1,25 @@
 # Default owners for everything
-* @ethanurbanski
+* @ethan-tyler
 
 # Core crate - shared primitives
-/crates/arco-core/ @ethanurbanski
+/crates/arco-core/ @ethan-tyler
 
 # Catalog domain
-/crates/arco-catalog/ @ethanurbanski
+/crates/arco-catalog/ @ethan-tyler
 
 # Orchestration domain
-/crates/arco-flow/ @ethanurbanski
+/crates/arco-flow/ @ethan-tyler
 
 # API layer
-/crates/arco-api/ @ethanurbanski
+/crates/arco-api/ @ethan-tyler
 
 # Security-sensitive files
-/SECURITY.md @ethanurbanski
-/.github/workflows/ @ethanurbanski
-/deny.toml @ethanurbanski
+/SECURITY.md @ethan-tyler
+/.github/workflows/ @ethan-tyler
+/deny.toml @ethan-tyler
 
 # Infrastructure
-/infra/ @ethanurbanski
+/infra/ @ethan-tyler
 
 # Documentation
-/docs/ @ethanurbanski
+/docs/ @ethan-tyler

@@ -71,8 +71,7 @@ impl<T: Message> Encoder for ProstEncoder<T> {
 
     fn encode(&mut self, item: Self::Item, buf: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
         item.encode(buf)
-            .expect("prost message encoding only fails when the buffer is undersized");
-        Ok(())
+            .map_err(|error| Status::internal(format!("failed to encode prost message: {error}")))
     }
 
     fn buffer_settings(&self) -> BufferSettings {

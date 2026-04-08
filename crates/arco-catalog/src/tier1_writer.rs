@@ -401,9 +401,7 @@ impl Tier1Writer {
                 .validate_succession(&prev_catalog, &prev_raw_hash)
                 .map_err(|message| CatalogError::InvariantViolation { message })?;
 
-            let commit = self
-                .build_commit_record(&prev_catalog, &catalog, &commit_ulid)
-                .await?;
+            let commit = Self::build_commit_record(&prev_catalog, &catalog, &commit_ulid)?;
             catalog.last_commit_id = Some(commit.commit_id.clone());
 
             let catalog_bytes = json_bytes(&catalog)?;
@@ -504,7 +502,7 @@ impl Tier1Writer {
                 .storage
                 .put_raw(
                     &snapshot_manifest_path,
-                    Bytes::from(legacy_bytes),
+                    legacy_bytes,
                     WritePrecondition::DoesNotExist,
                 )
                 .await?
@@ -574,8 +572,7 @@ impl Tier1Writer {
     /// but they do not load or persist durable commit-record objects. The
     /// returned receipt therefore keeps `prev_commit_id` when available and
     /// leaves `prev_commit_hash` unset.
-    async fn build_commit_record(
-        &self,
+    fn build_commit_record(
         prev: &CatalogDomainManifest,
         next: &CatalogDomainManifest,
         commit_id: &str,

@@ -417,18 +417,6 @@ impl Reconciler {
                         }
                     }
                 }
-                IssueType::MissingCurrentHeadLegacyMirror
-                | IssueType::StaleCurrentHeadLegacyMirror
-                | IssueType::MissingCurrentHeadCommitRecord => {
-                    result.skipped_count += 1;
-                    if let Some(domain) = Self::parse_domain(&report.domain) {
-                        crate::metrics::record_reconciler_repair(
-                            domain,
-                            issue.issue_type.as_str(),
-                            "skipped",
-                        );
-                    }
-                }
                 _ => {
                     result.skipped_count += 1;
                     if let Some(domain) = Self::parse_domain(&report.domain) {

@@ -4970,8 +4970,7 @@ pub(crate) async fn list_runs(
                 row,
                 tasks_by_run
                     .get(row.run_id.as_str())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
+                    .map_or(&[], Vec::as_slice),
             ) == filter_state
         });
     }
@@ -5007,8 +5006,7 @@ pub(crate) async fn list_runs(
                 row,
                 tasks_by_run
                     .get(row.run_id.as_str())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
+                    .map_or(&[], Vec::as_slice),
             );
             RunListItem {
                 run_id: row.run_id.clone(),

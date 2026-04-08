@@ -641,6 +641,7 @@ impl OrchestrationEventData {
     }
 
     /// Returns the idempotency key for this event.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn idempotency_key(&self) -> String {
         match self {

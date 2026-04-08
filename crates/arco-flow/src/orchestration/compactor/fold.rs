@@ -1963,6 +1963,7 @@ impl FoldState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fold_task_output_visibility_changed(
         &mut self,
         run_id: &str,

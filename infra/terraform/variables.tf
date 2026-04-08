@@ -61,6 +61,12 @@ variable "flow_compactor_image" {
   default     = ""
 }
 
+variable "flow_automation_reconciler_image" {
+  description = "Container image for Arco Flow automation reconciler service"
+  type        = string
+  default     = ""
+}
+
 variable "flow_dispatcher_image" {
   description = "Container image for Arco Flow dispatcher service"
   type        = string
@@ -81,12 +87,6 @@ variable "flow_timer_ingest_image" {
 
 variable "flow_worker_image" {
   description = "Container image for Arco Flow worker service"
-  type        = string
-  default     = ""
-}
-
-variable "flow_dispatch_target_url" {
-  description = "Worker dispatch endpoint URL for Cloud Tasks dispatch callbacks"
   type        = string
   default     = ""
 }
@@ -143,6 +143,84 @@ variable "background_automation_enabled" {
   description = "Whether scheduled background automation and warm background services stay enabled"
   type        = bool
   default     = true
+}
+
+variable "compactor_repair_automation_mode" {
+  description = "Catalog compactor repair automation mode"
+  type        = string
+  default     = "enforce"
+
+  validation {
+    condition     = contains(["disabled", "dry_run", "enforce"], var.compactor_repair_automation_mode)
+    error_message = "compactor_repair_automation_mode must be one of: disabled, dry_run, enforce."
+  }
+}
+
+variable "compactor_repair_automation_interval_secs" {
+  description = "Catalog compactor repair automation cadence in seconds"
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.compactor_repair_automation_interval_secs > 0
+    error_message = "compactor_repair_automation_interval_secs must be greater than 0."
+  }
+}
+
+variable "compactor_repair_automation_scope" {
+  description = "Catalog compactor repair automation scope"
+  type        = string
+  default     = "full"
+
+  validation {
+    condition     = contains(["current_head_only", "full"], var.compactor_repair_automation_scope)
+    error_message = "compactor_repair_automation_scope must be one of: current_head_only, full."
+  }
+}
+
+variable "compactor_repair_automation_domains" {
+  description = "Comma-separated catalog domains to target with repair automation"
+  type        = string
+  default     = "catalog,lineage,search"
+}
+
+variable "flow_compactor_repair_automation_mode" {
+  description = "Orchestration compactor repair automation mode"
+  type        = string
+  default     = "enforce"
+
+  validation {
+    condition     = contains(["disabled", "dry_run", "enforce"], var.flow_compactor_repair_automation_mode)
+    error_message = "flow_compactor_repair_automation_mode must be one of: disabled, dry_run, enforce."
+  }
+}
+
+variable "flow_compactor_repair_automation_interval_secs" {
+  description = "Orchestration compactor repair automation cadence in seconds"
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.flow_compactor_repair_automation_interval_secs > 0
+    error_message = "flow_compactor_repair_automation_interval_secs must be greater than 0."
+  }
+}
+
+variable "flow_compactor_repair_automation_scope" {
+  description = "Orchestration compactor repair automation scope"
+  type        = string
+  default     = "full"
+
+  validation {
+    condition     = contains(["current_head_only", "full"], var.flow_compactor_repair_automation_scope)
+    error_message = "flow_compactor_repair_automation_scope must be one of: current_head_only, full."
+  }
+}
+
+variable "flow_automation_reconciler_schedule" {
+  description = "Cron schedule for the flow automation reconciler /run trigger"
+  type        = string
+  default     = "*/1 * * * *"
 }
 
 # ============================================================================

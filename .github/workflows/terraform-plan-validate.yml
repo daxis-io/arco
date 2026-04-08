@@ -36,15 +36,37 @@ jobs:
             -lock=false \
             -input=false \
             -no-color \
+            -out=/tmp/arco-base.tfplan \
             -var="project_id=test-project" \
             -var="project_number=123456789012" \
             -var="region=us-central1" \
             -var="environment=dev" \
             -var="api_image=example.com/arco-api:test" \
             -var="compactor_image=example.com/arco-compactor:test" \
+            -var="flow_compactor_image=example.com/arco-flow-compactor:test" \
             -var="compactor_tenant_id=test-tenant" \
             -var="compactor_workspace_id=test-workspace" \
+            -var="flow_tenant_id=flow-tenant" \
+            -var="flow_workspace_id=flow-workspace" \
             -var="jwt_secret_name="
+
+      - name: Verify Base Plan Keeps Flow Control Plane Disabled
+        run: |
+          terraform -chdir=infra/terraform show -json /tmp/arco-base.tfplan > /tmp/arco-base.tfplan.json
+          jq -e '
+            def planned_resources:
+              .planned_values.root_module
+              | recurse(.child_modules[]?)
+              | .resources[]?;
+            def resource_count($type; $name):
+              [planned_resources | select(.type == $type and .name == $name)] | length;
+
+            (resource_count("google_cloud_run_v2_service"; "flow_dispatcher") == 0) and
+            (resource_count("google_cloud_run_v2_service"; "flow_sweeper") == 0) and
+            (resource_count("google_cloud_run_v2_service"; "flow_timer_ingest") == 0) and
+            (resource_count("google_cloud_run_v2_service"; "flow_worker") == 0) and
+            (resource_count("google_cloud_run_v2_service"; "flow_automation_reconciler") == 0)
+          ' /tmp/arco-base.tfplan.json >/dev/null
 
       - name: Terraform Plan (Flow-Enabled Vars, No Refresh)
         env:
@@ -55,18 +77,96 @@ jobs:
             -lock=false \
             -input=false \
             -no-color \
+            -out=/tmp/arco-flow.tfplan \
             -var="project_id=test-project" \
             -var="project_number=123456789012" \
             -var="region=us-central1" \
             -var="environment=dev" \
             -var="api_image=example.com/arco-api:test" \
             -var="compactor_image=example.com/arco-compactor:test" \
-            -var="compactor_tenant_id=test-tenant" \
-            -var="compactor_workspace_id=test-workspace" \
+            -var="flow_compactor_image=example.com/arco-flow-compactor:test" \
+            -var="flow_automation_reconciler_image=example.com/arco-flow-automation-reconciler:test" \
+            -var="compactor_tenant_id=compactor-tenant" \
+            -var="compactor_workspace_id=compactor-workspace" \
             -var="jwt_secret_name=" \
             -var="flow_dispatcher_image=example.com/arco-flow-dispatcher:test" \
             -var="flow_sweeper_image=example.com/arco-flow-sweeper:test" \
             -var="flow_timer_ingest_image=example.com/arco-flow-timer-ingest:test" \
-            -var="flow_dispatch_target_url=https://worker.internal.example/dispatch" \
-            -var="flow_tenant_id=test-tenant" \
-            -var="flow_workspace_id=test-workspace"
+            -var="flow_worker_image=example.com/arco-flow-worker:test" \
+            -var="flow_tenant_id=flow-tenant" \
+            -var="flow_workspace_id=flow-workspace"
+
+      - name: Verify Flow Cutover Wiring In Plan
+        run: |
+          terraform -chdir=infra/terraform show -json /tmp/arco-flow.tfplan > /tmp/arco-flow.tfplan.json
+          jq -e '
+            def planned_resources:
+              .planned_values.root_module
+              | recurse(.child_modules[]?)
+              | .resources[]?;
+            def resource($type; $name):
+              first(planned_resources | select(.type == $type and .name == $name));
+            def resource_count($type; $name):
+              [planned_resources | select(.type == $type and .name == $name)] | length;
+            def env_names($service):
+              resource("google_cloud_run_v2_service"; $service)
+              | [.values.template[0].containers[0].env[]?.name];
+            def env_values($service):
+              resource("google_cloud_run_v2_service"; $service)
+              | reduce .values.template[0].containers[0].env[]? as $env ({}; . + {($env.name): ($env.value // "")});
+            def service_account($service):
+              resource("google_cloud_run_v2_service"; $service)
+              | .values.template[0].service_account;
+            def scheduler_audience($job):
+              resource("google_cloud_scheduler_job"; $job)
+              | .values.http_target[0].oidc_token[0].audience;
+            def iam_member($name):
+              resource("google_cloud_run_v2_service_iam_member"; $name)
+              | .values.member;
+
+            (env_names("api") | index("ARCO_COMPACTOR_URL")) and
+            (env_names("api") | index("ARCO_ORCH_COMPACTOR_URL")) and
+            (env_names("compactor") | index("ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE")) and
+            (env_names("compactor") | index("ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS")) and
+            (env_names("compactor") | index("ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE")) and
+            (env_names("compactor") | index("ARCO_COMPACTOR_REPAIR_AUTOMATION_DOMAINS")) and
+            ((env_values("compactor").ARCO_TENANT_ID // "compactor-tenant") == "compactor-tenant") and
+            ((env_values("compactor").ARCO_WORKSPACE_ID // "compactor-workspace") == "compactor-workspace") and
+            (env_names("flow_compactor") | index("ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_MODE")) and
+            (env_names("flow_compactor") | index("ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS")) and
+            (env_names("flow_compactor") | index("ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_SCOPE")) and
+            ((env_values("flow_compactor").ARCO_TENANT_ID // "") == "flow-tenant") and
+            ((env_values("flow_compactor").ARCO_WORKSPACE_ID // "") == "flow-workspace") and
+            (env_names("flow_dispatcher") | index("ARCO_FLOW_COMPACTOR_URL")) and
+            (env_names("flow_dispatcher") | index("ARCO_FLOW_CALLBACK_BASE_URL")) and
+            ((env_values("flow_dispatcher").ARCO_TENANT_ID // "") == "flow-tenant") and
+            ((env_values("flow_dispatcher").ARCO_WORKSPACE_ID // "") == "flow-workspace") and
+            ((env_values("flow_dispatcher").ARCO_FLOW_DISPATCH_TARGET_URL // "") | endswith("/dispatch")) and
+            ((env_values("flow_dispatcher").ARCO_FLOW_DISPATCH_TARGET_AUDIENCE // "") | endswith(".run.app")) and
+            ((env_values("flow_dispatcher").ARCO_FLOW_TIMER_TARGET_URL // "") | endswith("/internal/timers/fired")) and
+            ((env_values("flow_dispatcher").ARCO_FLOW_TIMER_TARGET_AUDIENCE // "") | endswith(".run.app")) and
+            (env_names("flow_sweeper") | index("ARCO_FLOW_COMPACTOR_URL")) and
+            (env_names("flow_sweeper") | index("ARCO_FLOW_CALLBACK_BASE_URL")) and
+            ((env_values("flow_sweeper").ARCO_TENANT_ID // "") == "flow-tenant") and
+            ((env_values("flow_sweeper").ARCO_WORKSPACE_ID // "") == "flow-workspace") and
+            ((env_values("flow_sweeper").ARCO_FLOW_DISPATCH_TARGET_URL // "") | endswith("/dispatch")) and
+            ((env_values("flow_sweeper").ARCO_FLOW_DISPATCH_TARGET_AUDIENCE // "") | endswith(".run.app")) and
+            (env_names("flow_timer_ingest") | index("ARCO_FLOW_COMPACTOR_URL")) and
+            ((env_values("flow_timer_ingest").ARCO_TENANT_ID // "") == "flow-tenant") and
+            ((env_values("flow_timer_ingest").ARCO_WORKSPACE_ID // "") == "flow-workspace") and
+            ((env_values("flow_timer_ingest").ARCO_INTERNAL_AUTH_AUDIENCE // "") == "https://arco-flow-timer-ingest-dev-123456789012.us-central1.run.app") and
+            (env_names("flow_automation_reconciler") | index("ARCO_FLOW_COMPACTOR_URL")) and
+            ((env_values("flow_automation_reconciler").ARCO_TENANT_ID // "") == "flow-tenant") and
+            ((env_values("flow_automation_reconciler").ARCO_WORKSPACE_ID // "") == "flow-workspace") and
+            (service_account("flow_dispatcher") == "arco-flow-controller-dev@test-project.iam.gserviceaccount.com") and
+            (service_account("flow_sweeper") == "arco-flow-controller-dev@test-project.iam.gserviceaccount.com") and
+            ((env_values("flow_worker").ARCO_FLOW_TENANT_ID // "") == "flow-tenant") and
+            ((env_values("flow_worker").ARCO_FLOW_WORKSPACE_ID // "") == "flow-workspace") and
+            (scheduler_audience("flow_dispatcher_run") == "https://arco-flow-dispatcher-dev-123456789012.us-central1.run.app") and
+            (scheduler_audience("flow_sweeper_run") == "https://arco-flow-sweeper-dev-123456789012.us-central1.run.app") and
+            (scheduler_audience("flow_automation_reconciler_run") == "https://arco-flow-automation-reconciler-dev-123456789012.us-central1.run.app") and
+            (iam_member("flow_tasks_timer_ingest_invoker") == "serviceAccount:arco-flow-task-invoker-dev@test-project.iam.gserviceaccount.com") and
+            (iam_member("flow_tasks_worker_invoker") == "serviceAccount:arco-flow-task-invoker-dev@test-project.iam.gserviceaccount.com") and
+            (resource_count("google_service_account"; "flow_dispatcher") == 0) and
+            (resource_count("google_service_account"; "flow_sweeper") == 0)
+          ' /tmp/arco-flow.tfplan.json >/dev/null

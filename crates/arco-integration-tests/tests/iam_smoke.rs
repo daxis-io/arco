@@ -218,9 +218,10 @@ async fn test_api_can_write_locks() {
     let _ = backend.delete(&full_path).await;
 }
 
-/// Test that API can write to commits/ prefix.
+/// Test that API can write to root commit-receipt objects under `commits/`.
 ///
-/// Commit records (audit trail) are created by API.
+/// Catalog commit-chain files are retired, but root transaction receipts still
+/// write under `commits/root/`.
 #[tokio::test]
 #[ignore = "requires deployed IAM with API credentials"]
 async fn test_api_can_write_commits() {
@@ -228,9 +229,9 @@ async fn test_api_can_write_commits() {
 
     let backend = Arc::new(ObjectStoreBackend::gcs(&bucket).expect("Failed to create GCS backend"));
 
-    // Write to commits/ prefix
+    // Write to the still-active root receipt prefix.
     let commit_id = format!("iam-smoke-{}", Ulid::new());
-    let commit_path = format!("commits/catalog/{commit_id}.json");
+    let commit_path = format!("commits/root/{commit_id}.json");
     let full_path = scoped_path(&tenant, &workspace, &commit_path);
 
     let result = backend

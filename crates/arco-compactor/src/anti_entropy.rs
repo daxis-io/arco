@@ -38,7 +38,8 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
 use arco_catalog::manifest::{
-    CatalogDomainManifest, ExecutionsManifest, LineageManifest, RootManifest, SearchManifest,
+    CatalogDomainManifest, DomainManifestPointer, ExecutionsManifest, LineageManifest,
+    RootManifest, SearchManifest,
 };
 use arco_core::error::Error as CoreError;
 use arco_core::scoped_storage::ScopedStorage;
@@ -459,60 +460,125 @@ impl AntiEntropyJob {
                 })
             }
             CatalogDomain::Catalog => {
-                let data = self
-                    .storage
-                    .get_raw(&root.catalog_manifest_path)
-                    .await
-                    .map_err(|e| AntiEntropyError::WatermarkError {
-                        message: format!("failed to read catalog manifest: {e}"),
-                    })?;
-                let manifest: CatalogDomainManifest =
-                    serde_json::from_slice(&data).map_err(|e| {
-                        AntiEntropyError::WatermarkError {
-                            message: format!("failed to parse catalog manifest: {e}"),
-                        }
-                    })?;
+                let manifest: CatalogDomainManifest = self
+                    .read_tier1_manifest(CatalogDomain::Catalog, "catalog manifest")
+                    .await?;
                 Ok(DomainWatermark {
                     watermark_event_id: manifest.watermark_event_id.clone(),
                     last_compaction_at: Some(manifest.updated_at),
                 })
             }
             CatalogDomain::Lineage => {
-                let data = self
-                    .storage
-                    .get_raw(&root.lineage_manifest_path)
-                    .await
-                    .map_err(|e| AntiEntropyError::WatermarkError {
-                        message: format!("failed to read lineage manifest: {e}"),
-                    })?;
-                let manifest: LineageManifest = serde_json::from_slice(&data).map_err(|e| {
-                    AntiEntropyError::WatermarkError {
-                        message: format!("failed to parse lineage manifest: {e}"),
-                    }
-                })?;
+                let manifest: LineageManifest = self
+                    .read_tier1_manifest(CatalogDomain::Lineage, "lineage manifest")
+                    .await?;
                 Ok(DomainWatermark {
                     watermark_event_id: manifest.watermark_event_id.clone(),
                     last_compaction_at: Some(manifest.updated_at),
                 })
             }
             CatalogDomain::Search => {
-                let data = self
-                    .storage
-                    .get_raw(&root.search_manifest_path)
-                    .await
-                    .map_err(|e| AntiEntropyError::WatermarkError {
-                        message: format!("failed to read search manifest: {e}"),
-                    })?;
-                let manifest: SearchManifest = serde_json::from_slice(&data).map_err(|e| {
-                    AntiEntropyError::WatermarkError {
-                        message: format!("failed to parse search manifest: {e}"),
-                    }
-                })?;
+                let manifest: SearchManifest = self
+                    .read_tier1_manifest(CatalogDomain::Search, "search manifest")
+                    .await?;
                 Ok(DomainWatermark {
                     watermark_event_id: manifest.watermark_event_id.clone(),
                     last_compaction_at: Some(manifest.updated_at),
                 })
             }
+        }
+    }
+
+    async fn read_tier1_manifest<T>(
+        &self,
+        domain: CatalogDomain,
+        label: &str,
+    ) -> Result<T, AntiEntropyError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let resolved_path = self.resolve_tier1_manifest_path(domain).await?;
+        let data = self.storage.get_raw(&resolved_path).await.map_err(|e| {
+            AntiEntropyError::WatermarkError {
+                message: format!("failed to read {label}: {e}"),
+            }
+        })?;
+        serde_json::from_slice(&data).map_err(|e| AntiEntropyError::WatermarkError {
+            message: format!("failed to parse {label}: {e}"),
+        })
+    }
+
+    async fn resolve_tier1_manifest_path(
+        &self,
+        domain: CatalogDomain,
+    ) -> Result<String, AntiEntropyError> {
+        let root = self.read_root_manifest().await?;
+        let root_path = match domain {
+            CatalogDomain::Catalog => root.catalog_manifest_path,
+            CatalogDomain::Lineage => root.lineage_manifest_path,
+            CatalogDomain::Search => root.search_manifest_path,
+            CatalogDomain::Executions => unreachable!("executions is not tier-1"),
+        };
+        let pointer_path = CatalogPaths::domain_manifest_pointer(domain);
+        let legacy_path = CatalogPaths::domain_manifest(domain);
+
+        if self
+            .storage
+            .head_raw(&pointer_path)
+            .await
+            .map_err(|e| AntiEntropyError::WatermarkError {
+                message: format!("failed to inspect manifest pointer: {e}"),
+            })?
+            .is_some()
+        {
+            let pointer_bytes = self.storage.get_raw(&pointer_path).await.map_err(|e| {
+                AntiEntropyError::WatermarkError {
+                    message: format!("failed to read manifest pointer: {e}"),
+                }
+            })?;
+            let pointer: DomainManifestPointer =
+                serde_json::from_slice(&pointer_bytes).map_err(|e| {
+                    AntiEntropyError::WatermarkError {
+                        message: format!("failed to parse manifest pointer: {e}"),
+                    }
+                })?;
+            return Ok(pointer.manifest_path);
+        }
+
+        if root_path.ends_with(".manifest.json") {
+            return Ok(root_path);
+        }
+
+        match self.storage.get_raw(&root_path).await {
+            Ok(pointer_bytes) => {
+                let pointer: DomainManifestPointer = serde_json::from_slice(&pointer_bytes)
+                    .map_err(|e| AntiEntropyError::WatermarkError {
+                        message: format!("failed to parse manifest pointer: {e}"),
+                    })?;
+                Ok(pointer.manifest_path)
+            }
+            Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => {
+                if self
+                    .storage
+                    .head_raw(&legacy_path)
+                    .await
+                    .map_err(|e| AntiEntropyError::WatermarkError {
+                        message: format!("failed to inspect legacy manifest fallback: {e}"),
+                    })?
+                    .is_some()
+                {
+                    Ok(legacy_path.to_string())
+                } else {
+                    Err(AntiEntropyError::WatermarkError {
+                        message: format!(
+                            "failed to resolve tier-1 manifest: pointer '{root_path}' and legacy fallback '{legacy_path}' are both missing"
+                        ),
+                    })
+                }
+            }
+            Err(e) => Err(AntiEntropyError::WatermarkError {
+                message: format!("failed to read manifest pointer: {e}"),
+            }),
         }
     }
 
@@ -842,7 +908,13 @@ mod tests {
             )
             .await?;
 
-        let search_manifest_path = CatalogPaths::domain_manifest(CatalogDomain::Search);
+        let root_bytes = storage.get_raw(CatalogPaths::ROOT_MANIFEST).await?;
+        let mut root: RootManifest = serde_json::from_slice(&root_bytes)?;
+        root.normalize_paths();
+
+        let search_pointer_bytes = storage.get_raw(&root.search_manifest_path).await?;
+        let search_pointer: DomainManifestPointer = serde_json::from_slice(&search_pointer_bytes)?;
+        let search_manifest_path = search_pointer.manifest_path;
         let search_manifest_bytes = storage.get_raw(&search_manifest_path).await?;
         let mut search_manifest: SearchManifest = serde_json::from_slice(&search_manifest_bytes)?;
         search_manifest.watermark_event_id = Some("zzzz".to_string());

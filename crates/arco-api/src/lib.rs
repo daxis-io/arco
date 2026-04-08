@@ -1,19 +1,21 @@
 //! # arco-api
 //!
-//! HTTP composition layer for the Arco serverless lakehouse infrastructure.
+//! HTTP/gRPC composition layer for the Arco serverless lakehouse infrastructure.
 //!
 //! This crate provides the API surface for Arco, handling:
 //!
 //! - **Authentication**: Tenant/workspace/user identity from JWTs (user claim defaults to `sub`,
 //!   configurable via `ARCO_JWT_USER_CLAIM`)
-//! - **Routing**: HTTP endpoint configuration
+//! - **Routing**: HTTP and gRPC endpoint configuration
 //! - **Service Wiring**: Composition of catalog and flow services
 //! - **Observability**: Metrics, tracing, and health checks
 //!
 //! ## Design Principles
 //!
-//! This crate is a **thin composition layer** with no domain policy.
-//! All business logic lives in `arco-catalog` and `arco-flow`.
+//! This crate is primarily a composition layer, but it also owns the
+//! request-scoped control-plane transaction coordinator that composes
+//! `arco-catalog` and `arco-flow` into visible catalog, orchestration, and
+//! root transaction commits.
 //!
 //! ## Endpoints
 //!
@@ -25,9 +27,10 @@
 //!   /api/v1/namespaces/{ns}/tables - Table CRUD
 //!   /api/v1/lineage              - Lineage edge APIs
 //!   /api/v1/browser/urls         - Signed URL minting for browser reads
+//!   /api/v1/transactions         - Control-plane transaction routes
 //!
-//! Note:
-//!   `grpc_port` is currently reserved for future use; this crate serves HTTP only.
+//! gRPC:
+//!   arco.v1.ControlPlaneTransactionService - Transaction commit and lookup APIs
 //! ```
 //!
 //! ## Example
@@ -53,7 +56,9 @@ pub(crate) mod audit;
 pub mod compactor_client;
 pub mod config;
 pub mod context;
+pub(crate) mod control_plane_transactions;
 pub mod error;
+pub(crate) mod grpc_transactions;
 pub mod metrics;
 pub mod openapi;
 pub(crate) mod orchestration_compaction;

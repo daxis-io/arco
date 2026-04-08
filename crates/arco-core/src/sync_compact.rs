@@ -59,6 +59,9 @@ pub struct SyncCompactResponse {
     /// Commit ULID for audit trail.
     pub commit_ulid: String,
 
+    /// Visible immutable manifest identifier.
+    pub manifest_id: String,
+
     /// Number of events processed.
     pub events_processed: usize,
 

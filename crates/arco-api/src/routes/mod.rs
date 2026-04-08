@@ -11,6 +11,7 @@ pub mod query;
 pub mod query_data;
 pub mod tables;
 pub mod tasks;
+pub mod transactions;
 pub mod uc;
 
 use std::sync::Arc;
@@ -31,6 +32,7 @@ pub fn api_v1_routes() -> Router<Arc<AppState>> {
         .merge(query_data::routes())
         .merge(delta::routes())
         .merge(orchestration::routes())
+        .merge(transactions::routes())
         .merge(manifests::routes())
 }
 

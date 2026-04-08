@@ -1,0 +1,323 @@
+// proto/arco/v1/transactions.proto
+syntax = "proto3";
+package arco.v1;
+
+option java_multiple_files = true;
+option java_package = "com.arco.v1";
+option go_package = "github.com/daxis-io/arco/proto/arco/v1";
+
+import "google/protobuf/timestamp.proto";
+import "arco/v1/common.proto";
+import "arco/v1/request.proto";
+
+// Transaction-oriented API surface for control-plane writes that only
+// acknowledge once the new domain head is visible to readers.
+service ControlPlaneTransactionService {
+  // Applies one catalog DDL mutation and returns the visible receipt.
+  rpc ApplyCatalogDdl(ApplyCatalogDdlRequest) returns (ApplyCatalogDdlResponse);
+
+  // Looks up a catalog transaction by tx_id.
+  rpc GetCatalogTransaction(GetCatalogTransactionRequest)
+      returns (GetCatalogTransactionResponse);
+
+  // Commits an orchestration event batch and returns the visible receipt.
+  rpc CommitOrchestrationBatch(CommitOrchestrationBatchRequest)
+      returns (CommitOrchestrationBatchResponse);
+
+  // Looks up an orchestration transaction by tx_id.
+  rpc GetOrchestrationTransaction(GetOrchestrationTransactionRequest)
+      returns (GetOrchestrationTransactionResponse);
+
+  // Commits a multi-domain root transaction scoped to one pinned read token.
+  rpc CommitRootTransaction(CommitRootTransactionRequest)
+      returns (CommitRootTransactionResponse);
+
+  // Looks up a root transaction by tx_id.
+  rpc GetRootTransaction(GetRootTransactionRequest)
+      returns (GetRootTransactionResponse);
+}
+
+// Shared transaction status for prepared/visible/aborted state records.
+enum TransactionStatus {
+  TRANSACTION_STATUS_UNSPECIFIED = 0;
+  TRANSACTION_STATUS_PREPARED = 1;
+  TRANSACTION_STATUS_VISIBLE = 2;
+  TRANSACTION_STATUS_ABORTED = 3;
+}
+
+// Canonical control-plane domains surfaced by transaction APIs.
+enum TransactionDomain {
+  TRANSACTION_DOMAIN_UNSPECIFIED = 0;
+  TRANSACTION_DOMAIN_CATALOG = 1;
+  TRANSACTION_DOMAIN_ORCHESTRATION = 2;
+  TRANSACTION_DOMAIN_ROOT = 3;
+}
+
+// Lookup request for an existing catalog transaction.
+message GetCatalogTransactionRequest {
+  RequestHeader header = 1;
+  string tx_id = 2;
+}
+
+// Reusable catalog DDL operation envelope.
+message CatalogDdlOperation {
+  oneof op {
+    CreateNamespaceOp create_namespace = 1;
+    RegisterTableOp register_table = 2;
+    AlterTableOp alter_table = 3;
+    DropTableOp drop_table = 4;
+  }
+}
+
+// Namespace creation operation.
+message CreateNamespaceOp {
+  string name = 1;
+  optional string description = 2;
+  map<string, string> properties = 3;
+}
+
+// Column definition for catalog table registration.
+message CatalogColumnDefinition {
+  string name = 1;
+  string data_type = 2;
+  bool is_nullable = 3;
+  optional string description = 4;
+}
+
+// Table registration operation.
+message RegisterTableOp {
+  string namespace = 1;
+  string name = 2;
+  optional string description = 3;
+  optional string location = 4;
+  optional AssetFormat format = 5;
+  repeated CatalogColumnDefinition columns = 6;
+  map<string, string> properties = 7;
+}
+
+// Sparse table alteration operation.
+message AlterTableOp {
+  string namespace = 1;
+  string name = 2;
+  optional string description = 3;
+  optional string location = 4;
+  optional AssetFormat format = 5;
+}
+
+// Table drop operation.
+message DropTableOp {
+  string namespace = 1;
+  string name = 2;
+}
+
+// Visible catalog DDL request.
+message ApplyCatalogDdlRequest {
+  RequestHeader header = 1;
+  CatalogDdlOperation ddl = 2;
+  // Servers should treat unset as true for external callers.
+  optional bool require_visible = 20;
+}
+
+// Catalog DDL response envelope with transport-only repair state.
+message ApplyCatalogDdlResponse {
+  CatalogTxReceipt receipt = 1;
+  bool repair_pending = 2;
+}
+
+// Catalog transaction success receipt pinned to one manifest head.
+message CatalogTxReceipt {
+  string tx_id = 1;
+  string event_id = 2;
+  string commit_id = 3;
+  string manifest_id = 4;
+  uint64 snapshot_version = 5;
+  string pointer_version = 6;
+  string read_token = 7;
+  google.protobuf.Timestamp visible_at = 8;
+}
+
+// Catalog transaction status record surfaced to callers.
+message CatalogTxStatus {
+  string tx_id = 1;
+  TransactionStatus status = 2;
+  string request_id = 3;
+  string idempotency_key = 4;
+  string request_hash = 5;
+  string lock_path = 6;
+  uint64 fencing_token = 7;
+  google.protobuf.Timestamp prepared_at = 8;
+  google.protobuf.Timestamp visible_at = 9;
+  CatalogTxReceipt result = 10;
+  bool repair_pending = 11;
+}
+
+// Catalog lookup response envelope.
+message GetCatalogTransactionResponse {
+  CatalogTxStatus status = 1;
+}
+
+// Opaque orchestration event envelope.
+//
+// The payload remains JSON bytes for now so the transaction API can carry the
+// existing orchestration event model without forcing a second event schema.
+message OrchestrationEventEnvelope {
+  string event_id = 1;
+  string event_type = 2;
+  uint32 event_version = 3;
+  google.protobuf.Timestamp timestamp = 4;
+  string source = 5;
+  string idempotency_key = 6;
+  optional string correlation_id = 7;
+  optional string causation_id = 8;
+  bytes payload_json = 9;
+}
+
+// Visible orchestration batch commit request.
+message CommitOrchestrationBatchRequest {
+  RequestHeader header = 1;
+  repeated OrchestrationEventEnvelope events = 2;
+  // Servers should treat unset as true for external callers.
+  optional bool require_visible = 3;
+  optional bool allow_inline_merge = 4;
+}
+
+// Orchestration batch response envelope with transport-only repair state.
+message CommitOrchestrationBatchResponse {
+  OrchestrationTxReceipt receipt = 1;
+  bool repair_pending = 2;
+}
+
+// Orchestration batch success receipt pinned to one manifest head.
+message OrchestrationTxReceipt {
+  string tx_id = 1;
+  // Immutable orchestration commit receipt identifier.
+  string commit_id = 2;
+  string manifest_id = 3;
+  // Visible orchestration manifest revision published for this commit.
+  string revision_ulid = 4;
+  string delta_id = 5;
+  string pointer_version = 6;
+  uint32 events_processed = 7;
+  string read_token = 8;
+  google.protobuf.Timestamp visible_at = 9;
+}
+
+// Orchestration transaction status record surfaced to callers.
+message OrchestrationTxStatus {
+  string tx_id = 1;
+  TransactionStatus status = 2;
+  string request_id = 3;
+  string idempotency_key = 4;
+  string request_hash = 5;
+  string lock_path = 6;
+  uint64 fencing_token = 7;
+  google.protobuf.Timestamp prepared_at = 8;
+  google.protobuf.Timestamp visible_at = 9;
+  OrchestrationTxReceipt result = 10;
+  bool repair_pending = 11;
+}
+
+// Lookup request for an existing orchestration transaction.
+message GetOrchestrationTransactionRequest {
+  RequestHeader header = 1;
+  string tx_id = 2;
+}
+
+// Orchestration lookup response envelope.
+message GetOrchestrationTransactionResponse {
+  OrchestrationTxStatus status = 1;
+}
+
+// Reusable orchestration batch spec for root transactions.
+message OrchestrationBatchSpec {
+  repeated OrchestrationEventEnvelope events = 1;
+  optional bool allow_inline_merge = 2;
+}
+
+// One participant mutation inside a root transaction.
+message DomainMutation {
+  oneof kind {
+    CatalogDdlOperation catalog = 1;
+    OrchestrationBatchSpec orchestration = 2;
+  }
+}
+
+// Root transaction commit request for one pinned multi-domain view.
+//
+// Servers materialize one immutable tx-scoped super-manifest and return a root
+// read token. This API does not publish a moving global root pointer.
+message CommitRootTransactionRequest {
+  RequestHeader header = 1;
+  repeated DomainMutation mutations = 2;
+}
+
+// Root commit response envelope with transport-only repair state.
+message CommitRootTransactionResponse {
+  RootTxReceipt receipt = 1;
+  bool repair_pending = 2;
+}
+
+// Per-domain commit metadata returned from a root transaction.
+message DomainCommit {
+  TransactionDomain domain = 1;
+  string tx_id = 2;
+  string commit_id = 3;
+  string manifest_id = 4;
+  string manifest_path = 5;
+  string read_token = 6;
+}
+
+// Participant lock and manifest metadata surfaced by root transaction status.
+message RootTxParticipant {
+  TransactionDomain domain = 1;
+  string lock_path = 2;
+  string tx_id = 3;
+  string manifest_id = 4;
+  string manifest_path = 5;
+}
+
+// Visible root transaction receipt pinned to one tx-scoped super-manifest.
+message RootTxReceipt {
+  string tx_id = 1;
+  string root_commit_id = 2;
+  reserved 3, 5;
+  reserved "root_manifest_id", "pointer_version";
+  string super_manifest_path = 4;
+  repeated DomainCommit domain_commits = 6;
+  string read_token = 7;
+  google.protobuf.Timestamp visible_at = 8;
+}
+
+// Root transaction status record surfaced to callers.
+//
+// Root-token readers resolve `tx_id` to the mutable transaction record, then
+// load `super_manifest_path`, then read the referenced immutable domain
+// manifests directly. Domain-local readers remain unchanged.
+message RootTxStatus {
+  string tx_id = 1;
+  TransactionStatus status = 2;
+  string request_id = 3;
+  string idempotency_key = 4;
+  string request_hash = 5;
+  string lock_path = 6;
+  uint64 fencing_token = 7;
+  google.protobuf.Timestamp prepared_at = 8;
+  google.protobuf.Timestamp visible_at = 9;
+  reserved 10, 12;
+  reserved "root_manifest_id", "pointer_version";
+  string super_manifest_path = 11;
+  bool repair_pending = 13;
+  repeated RootTxParticipant domains = 14;
+  RootTxReceipt result = 15;
+}
+
+// Lookup request for an existing root transaction.
+message GetRootTransactionRequest {
+  RequestHeader header = 1;
+  string tx_id = 2;
+}
+
+// Root lookup response envelope.
+message GetRootTransactionResponse {
+  RootTxStatus status = 1;
+}

@@ -46,7 +46,9 @@ pub async fn compact_orchestration_events_fenced(
         return Ok(OrchestrationCompactionResponse {
             events_processed: 0,
             delta_id: None,
+            manifest_id: String::new(),
             manifest_revision: String::new(),
+            pointer_version: String::new(),
             visibility_status: arco_core::VisibilityStatus::Visible,
             repair_pending: false,
         });

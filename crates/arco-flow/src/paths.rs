@@ -13,11 +13,6 @@ pub fn flow_event_path(domain: &str, date: &str, event_id: &str) -> String {
     FlowPaths::flow_event_path(domain, date, event_id)
 }
 
-/// Returns the canonical orchestration manifest path.
-pub fn orchestration_manifest_path() -> &'static str {
-    FlowPaths::orchestration_manifest_path()
-}
-
 /// Returns the canonical orchestration manifest pointer path.
 #[must_use]
 pub fn orchestration_manifest_pointer_path() -> &'static str {

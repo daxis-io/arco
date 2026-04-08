@@ -66,9 +66,6 @@ pub const EVENT_WRITER_SEQUENCE: &str = "arco_event_writer_sequence_allocation_t
 // ADR-034 Repair Metrics
 // ============================================================================
 
-/// Visible commits with repairable side-effect failures.
-pub const REPAIR_PENDING: &str = "arco_catalog_repair_pending_total";
-
 /// Reconciler issues discovered by domain/type.
 pub const RECONCILER_ISSUES: &str = "arco_catalog_reconciler_issues_total";
 
@@ -119,10 +116,6 @@ pub fn register_metrics() {
     describe_counter!(
         IDEMPOTENCY_TAKEOVER,
         "Total idempotency marker takeover attempts by result"
-    );
-    describe_counter!(
-        REPAIR_PENDING,
-        "Total visible commits that require repair of post-commit side effects"
     );
     describe_counter!(
         RECONCILER_ISSUES,
@@ -256,16 +249,6 @@ pub fn record_idempotency_takeover(operation: &str, result: &str) {
 // ============================================================================
 // ADR-034 Repair Metric Recording
 // ============================================================================
-
-/// Records a visible commit that still needs side-effect repair.
-pub fn record_repair_pending(domain: CatalogDomain, reason: &str) {
-    counter!(
-        REPAIR_PENDING,
-        "domain" => domain.as_str().to_string(),
-        "reason" => reason.to_string()
-    )
-    .increment(1);
-}
 
 /// Records a reconciler issue discovery.
 pub fn record_reconciler_issue(domain: CatalogDomain, issue_type: &str, repairable: bool) {

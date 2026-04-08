@@ -87,7 +87,7 @@ impl Default for RepairAutomationConfig {
         Self {
             mode: RepairAutomationMode::Enforce,
             interval: Duration::from_secs(300),
-            scope: OrchestrationRepairScope::CurrentHeadOnly,
+            scope: OrchestrationRepairScope::Full,
         }
     }
 }
@@ -164,8 +164,7 @@ struct ReconcileRequest {
 
 impl ReconcileRequest {
     fn effective_repair_scope(&self) -> OrchestrationRepairScope {
-        self.repair_scope
-            .unwrap_or(OrchestrationRepairScope::CurrentHeadOnly)
+        self.repair_scope.unwrap_or(OrchestrationRepairScope::Full)
     }
 }
 
@@ -359,7 +358,9 @@ async fn compact_handler(
     let CompactionResult {
         events_processed,
         delta_id,
+        manifest_id,
         manifest_revision,
+        pointer_version,
         visibility_status,
         repair_pending,
     } = state
@@ -374,7 +375,9 @@ async fn compact_handler(
     Ok(Json(OrchestrationCompactionResponse {
         events_processed,
         delta_id,
+        manifest_id,
         manifest_revision,
+        pointer_version,
         visibility_status: visibility_status.into(),
         repair_pending,
     }))
@@ -402,7 +405,9 @@ async fn rebuild_handler(
     let CompactionResult {
         events_processed,
         delta_id,
+        manifest_id,
         manifest_revision,
+        pointer_version,
         visibility_status,
         repair_pending,
     } = state
@@ -417,7 +422,9 @@ async fn rebuild_handler(
     Ok(Json(OrchestrationCompactionResponse {
         events_processed,
         delta_id,
+        manifest_id,
         manifest_revision,
+        pointer_version,
         visibility_status: visibility_status.into(),
         repair_pending,
     }))
@@ -1014,13 +1021,13 @@ mod tests {
     }
 
     #[test]
-    fn repair_automation_config_defaults_to_enforce_current_head_only() {
+    fn repair_automation_config_defaults_to_enforce_full_scope() {
         let config =
             RepairAutomationConfig::from_env_reader(|_| None).expect("default repair config");
 
         assert_eq!(config.mode, RepairAutomationMode::Enforce);
         assert_eq!(config.interval, std::time::Duration::from_secs(300));
-        assert_eq!(config.scope, OrchestrationRepairScope::CurrentHeadOnly);
+        assert_eq!(config.scope, OrchestrationRepairScope::Full);
     }
 
     #[test]
@@ -1067,7 +1074,7 @@ mod tests {
         assert!(!request.repair);
         assert_eq!(
             request.effective_repair_scope(),
-            OrchestrationRepairScope::CurrentHeadOnly
+            OrchestrationRepairScope::Full
         );
     }
 
@@ -1121,7 +1128,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_endpoint_defaults_to_current_head_only_scope() {
+    async fn reconcile_endpoint_defaults_to_full_scope() {
         let state = test_state();
         let orphan_manifest_path = seed_orphaned_orchestration_manifest(&state).await;
         let router = build_router(state.clone(), None);
@@ -1138,6 +1145,13 @@ mod tests {
             .await
             .expect("request failed");
         assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read reconcile body");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("deserialize reconcile body");
+        assert_eq!(payload["repair_result"]["deferred_paths"], 1);
+        assert_eq!(payload["repair_result"]["skipped_paths"], 0);
         assert!(
             state
                 .storage
@@ -1145,7 +1159,7 @@ mod tests {
                 .await
                 .expect("head orphan manifest")
                 .is_some(),
-            "default orchestration reconcile repair scope must not delete generic cleanup candidates"
+            "default orchestration reconcile repair scope must include generic cleanup work and defer deletion until the quarantine expires"
         );
     }
 

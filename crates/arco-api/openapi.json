@@ -4,8 +4,8 @@
     "title": "Arco API",
     "description": "Arco catalog REST API (M4/M5)",
     "contact": {
-      "name": "Daxis",
-      "email": "engineering@daxis.io"
+      "name": "Ethan Urbanski",
+      "email": "ethan@daxistech.io"
     },
     "license": {
       "name": "Apache-2.0",

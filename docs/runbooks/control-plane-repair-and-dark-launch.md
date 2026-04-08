@@ -7,8 +7,8 @@ This runbook covers ADR-034 PI-3 operations for:
 - production cutover verification and rollback
 
 The read path remains pointer-first and manifest-driven throughout these procedures. Pointer CAS
-remains the only commit point. Legacy mirrors and catalog commit records remain repairable side
-effects, not commit prerequisites.
+remains the only commit point. Catalog and orchestration no longer write legacy mutable mirrors or
+catalog commit-chain files as part of visible commits.
 
 ## Production Contract
 
@@ -69,6 +69,10 @@ Repair automation defaults in PI-3:
 These env vars are read once during service startup. Apply changes through the deployment mechanism
 for the affected service and restart or redeploy before running the probes below.
 
+After legacy current-head side-effect removal, `current_head_only` is retained for request/config
+compatibility but should stay empty in steady state. Use `repairScope=full` when operators need
+generic orphan cleanup.
+
 ## Preconditions
 
 - Target the intended production tenant or workspace only after PI-3 code is deployed everywhere in
@@ -85,12 +89,12 @@ curl -fsS http://$ARCO_FLOW_COMPACTOR_HOST/health
 
 ## Metrics To Watch
 
-- `arco_catalog_repair_pending_total`
-- `arco_flow_orch_repair_pending_total`
 - `arco_catalog_reconciler_issues_total`
 - `arco_catalog_reconciler_repairs_total`
-- `arco_flow_orch_reconciler_repair_issues_total`
-- `arco_flow_orch_reconciler_repairs_total`
+- `arco_flow_orch_reconciler_orphans_total`
+- `arco_flow_orch_reconciler_deletes_total`
+- `arco_flow_orch_reconciler_deferred_paths_total`
+- `arco_flow_orch_reconciler_skipped_paths_total`
 - `arco_catalog_repair_automation_runs_total`
 - `arco_flow_orch_repair_automation_runs_total`
 - `arco_catalog_repair_backlog_count`
@@ -106,61 +110,59 @@ curl -fsS http://$ARCO_FLOW_COMPACTOR_HOST/health
 
 Related active alerts in `infra/monitoring/alerts.yaml`:
 
-- `ArcoControlPlaneRepairPending`
 - `ArcoControlPlaneRepairIssuesDetected`
 - `ArcoControlPlaneReconcilerRepairFailures`
 - `ArcoControlPlaneRepairAutomationFailures`
 - `ArcoControlPlaneRepairBacklogAgeHigh`
 - `ArcoControlPlaneRepairBacklogCountHigh`
 - `ArcoControlPlaneRepairCompletionLatencyHigh`
-- `ArcoControlPlaneRepairPendingRateHigh`
 - `ArcoFlowStaleFenceRejects`
 - `ArcoFlowCompactorCompatibilityRegression`
 
 ## Reconcile Commands
 
-Dry-run current-head repair state:
+Dry-run pointer-resolved cleanup state:
 
 ```bash
 curl -fsS http://$ARCO_COMPACTOR_HOST/internal/reconcile \
   -H 'Content-Type: application/json' \
-  -d '{"domain":"catalog","repair":false}' | jq
+  -d '{"domain":"catalog","repair":false,"repairScope":"full"}' | jq
 
 curl -fsS http://$ARCO_COMPACTOR_HOST/internal/reconcile \
   -H 'Content-Type: application/json' \
-  -d '{"domain":"lineage","repair":false}' | jq
+  -d '{"domain":"lineage","repair":false,"repairScope":"full"}' | jq
 
 curl -fsS http://$ARCO_COMPACTOR_HOST/internal/reconcile \
   -H 'Content-Type: application/json' \
-  -d '{"domain":"search","repair":false}' | jq
+  -d '{"domain":"search","repair":false,"repairScope":"full"}' | jq
 
 curl -fsS http://$ARCO_FLOW_COMPACTOR_HOST/internal/reconcile \
   -H 'Content-Type: application/json' \
-  -d '{"repair":false,"repairScope":"current_head_only"}' | jq
+  -d '{"repair":false,"repairScope":"full"}' | jq
 ```
 
-Enforce current-head repair explicitly:
+Enforce cleanup explicitly:
 
 ```bash
 curl -fsS http://$ARCO_COMPACTOR_HOST/internal/reconcile \
   -H 'Content-Type: application/json' \
-  -d '{"domain":"catalog","repair":true,"repairScope":"current_head_only"}' | jq
+  -d '{"domain":"catalog","repair":true,"repairScope":"full"}' | jq
 
 curl -fsS http://$ARCO_COMPACTOR_HOST/internal/reconcile \
   -H 'Content-Type: application/json' \
-  -d '{"domain":"lineage","repair":true,"repairScope":"current_head_only"}' | jq
+  -d '{"domain":"lineage","repair":true,"repairScope":"full"}' | jq
 
 curl -fsS http://$ARCO_COMPACTOR_HOST/internal/reconcile \
   -H 'Content-Type: application/json' \
-  -d '{"domain":"search","repair":true,"repairScope":"current_head_only"}' | jq
+  -d '{"domain":"search","repair":true,"repairScope":"full"}' | jq
 
 curl -fsS http://$ARCO_FLOW_COMPACTOR_HOST/internal/reconcile \
   -H 'Content-Type: application/json' \
-  -d '{"repair":true,"repairScope":"current_head_only"}' | jq
+  -d '{"repair":true,"repairScope":"full"}' | jq
 ```
 
-Use `repairScope=full` only for explicit cleanup work; PI-3 production posture keeps automation on
-`current_head_only`.
+`repairScope=current_head_only` remains accepted for compatibility, but it should no longer find
+new work after legacy mirror and catalog commit-record removal.
 
 ## Production Cutover Sequence
 
@@ -168,12 +170,12 @@ Use `repairScope=full` only for explicit cleanup work; PI-3 production posture k
 
 ```bash
 export ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE=enforce
-export ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE=current_head_only
+export ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE=full
 export ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS=300
 export ARCO_COMPACTOR_REPAIR_AUTOMATION_DOMAINS=catalog,lineage,search
 
 export ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_MODE=enforce
-export ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_SCOPE=current_head_only
+export ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_SCOPE=full
 export ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS=300
 ```
 
@@ -196,8 +198,8 @@ curl -fsS http://$ARCO_FLOW_COMPACTOR_HOST/health
 - `arco_flow_sweeper`
 - `arco_flow_timer_ingest`
 
-5. Run the dry-run reconcile commands. Any current-head issues should either be absent or drain to
-zero quickly under enforce automation.
+5. Run the dry-run reconcile commands. Any cleanup findings should be limited to orphaned immutable
+artifacts or stale directories and should drain under the intended repair scope.
 
 6. Confirm green production state:
 
@@ -207,10 +209,10 @@ zero quickly under enforce automation.
 - repair backlog count returns to zero
 - repair backlog age stays below 900 seconds
 - repair completion p95 stays below 120 seconds
-- visible commits with `repair_pending=true` stay at three or fewer per hour
 - pointer-target heads advance and readers observe the new head without relying on mutable mirrors
+- catalog/orchestration visible commits do not recreate removed compatibility artifacts
 
-7. If any current-head side effects remain pending after the deployment, run the explicit enforce
+7. If any reconciliation cleanup remains pending after the deployment, run the explicit enforce
 commands above and do not continue expanding traffic until the backlog is clear.
 
 ## Rollback Sequence
@@ -232,10 +234,10 @@ If the removed compatibility request path itself is the problem:
 
 1. Pause or scale down the writer deployment that is failing.
 2. Keep readers unchanged; do not attempt pointer rollback.
-3. Run the dry-run reconcile commands to understand any outstanding repairable side effects.
+3. Run the dry-run reconcile commands to understand any outstanding reconciliation cleanup.
 4. If a compatibility fallback is required, roll back `arco-flow-compactor` and the affected
    writers to the last PI-2-compatible release. This is a temporary escape hatch only.
-5. Re-run dry-run and enforce repair until current-head side effects converge.
+5. Re-run dry-run and enforce repair until cleanup findings converge.
 6. Resume traffic only after the compatibility-dependent caller is either upgraded to PI-3 fenced
    requests or the temporary rollback deployment is explicitly accepted.
 
@@ -245,7 +247,6 @@ If the removed compatibility request path itself is the problem:
 - any increment of `arco_flow_orch_compactor_request_contract_rejections_total` is a regression,
   not informational telemetry
 - stale fencing rejects should remain zero outside of intentional drills
-- repair automation should keep current-head legacy side effects converged without widening into
-  generic cleanup
-- legacy mirrors and commit records remain repairable side effects until a later phase proves safe
-  removal
+- repair automation should focus on pointer-resolved orphan cleanup rather than removed current-head
+  mirror or commit-record side effects
+- legacy catalog/orchestration mirror writes and catalog commit-chain writes should remain absent

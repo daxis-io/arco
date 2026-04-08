@@ -1,12 +1,9 @@
 //! Physically multi-file manifest structure per architecture docs.
 //!
 //! The catalog uses separate manifest files to reduce contention:
-//! - `root.manifest.json`: Pointers to domain manifests
-//! - `catalog.manifest.json`: Legacy compatibility path for catalog domain
-//! - `lineage.manifest.json`: Legacy compatibility path for lineage domain
-//! - `executions.manifest.json`: Legacy compatibility path for executions domain
-//! - `search.manifest.json`: Legacy compatibility path for search domain
-//! - `{domain}.pointer.json`: CAS-updated visibility pointer per domain
+//! - `root.manifest.json`: Bootstrap object containing per-domain head references
+//! - `executions.manifest.json`: Mutable Tier-2 manifest for executions
+//! - `{domain}.pointer.json`: CAS-updated visibility pointer per Tier-1 domain
 //! - `{domain}/{manifest_id}.json`: Immutable manifest snapshots
 //!
 //! Each domain manifest is a separate file that can be updated independently.
@@ -16,10 +13,7 @@
 //! ```text
 //! tenant={tenant}/workspace={workspace}/manifests/
 //! ├── root.manifest.json        # Root pointer to domain manifests
-//! ├── catalog.manifest.json     # Legacy compatibility mirror
-//! ├── lineage.manifest.json     # Legacy compatibility mirror
-//! ├── executions.manifest.json  # Legacy compatibility mirror
-//! ├── search.manifest.json      # Legacy compatibility mirror
+//! ├── executions.manifest.json  # Mutable Tier-2 manifest
 //! ├── catalog.pointer.json      # Visibility pointer
 //! ├── lineage.pointer.json      # Visibility pointer
 //! ├── executions.pointer.json   # Visibility pointer
@@ -193,11 +187,12 @@ impl DomainManifestPointer {
 // Root Manifest (pointer to domain manifests)
 // ============================================================================
 
-/// Root manifest containing only paths to domain manifests.
+/// Root manifest containing bootstrap references for per-domain heads.
 ///
-/// This is the entry point - readers load this first, then fetch
-/// domain manifests as needed. Critically, this contains NO embedded
-/// content, just paths.
+/// This is the entry point - readers load this first, then resolve the
+/// canonical per-domain head objects. For pointer-published Tier-1 domains,
+/// the stored fields may reference pointer objects instead of mutable manifest
+/// mirrors. Critically, this contains NO embedded content, just paths.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RootManifest {
@@ -233,7 +228,7 @@ impl RootManifest {
     pub fn new() -> Self {
         Self {
             version: 1,
-            catalog_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Catalog),
+            catalog_manifest_path: CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
             lineage_manifest_path: Self::default_lineage_manifest_path(),
             executions_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Executions),
             search_manifest_path: Self::default_search_manifest_path(),
@@ -242,11 +237,11 @@ impl RootManifest {
     }
 
     fn default_lineage_manifest_path() -> String {
-        CatalogPaths::domain_manifest(CatalogDomain::Lineage)
+        CatalogPaths::domain_manifest_pointer(CatalogDomain::Lineage)
     }
 
     fn default_search_manifest_path() -> String {
-        CatalogPaths::domain_manifest(CatalogDomain::Search)
+        CatalogPaths::domain_manifest_pointer(CatalogDomain::Search)
     }
 
     /// Normalizes legacy manifest paths to canonical paths.
@@ -261,14 +256,28 @@ impl RootManifest {
     }
 
     fn normalize_manifest_path(path: &str) -> String {
-        let Some(domain) = path
-            .strip_prefix("manifests/")
-            .and_then(|p| p.strip_suffix(".manifest.json"))
-        else {
+        let Some(domain) = path.strip_prefix("manifests/") else {
             return path.to_string();
         };
+        if let Some(domain) = domain.strip_suffix(".manifest.json") {
+            return CatalogPaths::domain_manifest_str(domain);
+        }
+        if let Some(domain) = domain.strip_suffix(".pointer.json") {
+            return format!(
+                "manifests/{}.pointer.json",
+                normalize_manifest_domain(domain)
+            );
+        }
+        path.to_string()
+    }
+}
 
-        CatalogPaths::domain_manifest_str(domain)
+fn normalize_manifest_domain(domain: &str) -> String {
+    match domain {
+        "core" => "catalog".to_string(),
+        "execution" => "executions".to_string(),
+        "governance" => "search".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -1169,11 +1178,11 @@ mod tests {
         assert_eq!(root.version, 1);
         assert_eq!(
             root.catalog_manifest_path,
-            CatalogPaths::domain_manifest(CatalogDomain::Catalog)
+            CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog)
         );
         assert_eq!(
             root.lineage_manifest_path,
-            CatalogPaths::domain_manifest(CatalogDomain::Lineage)
+            CatalogPaths::domain_manifest_pointer(CatalogDomain::Lineage)
         );
         assert_eq!(
             root.executions_manifest_path,
@@ -1181,7 +1190,7 @@ mod tests {
         );
         assert_eq!(
             root.search_manifest_path,
-            CatalogPaths::domain_manifest(CatalogDomain::Search)
+            CatalogPaths::domain_manifest_pointer(CatalogDomain::Search)
         );
     }
 
@@ -1189,10 +1198,10 @@ mod tests {
     fn test_root_manifest_roundtrip() {
         let root = RootManifest {
             version: 1,
-            catalog_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Catalog),
-            lineage_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Lineage),
+            catalog_manifest_path: CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
+            lineage_manifest_path: CatalogPaths::domain_manifest_pointer(CatalogDomain::Lineage),
             executions_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Executions),
-            search_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Search),
+            search_manifest_path: CatalogPaths::domain_manifest_pointer(CatalogDomain::Search),
             updated_at: Utc::now(),
         };
 
@@ -1225,12 +1234,12 @@ mod tests {
         );
         assert_eq!(
             parsed.lineage_manifest_path,
-            CatalogPaths::domain_manifest(CatalogDomain::Lineage),
+            CatalogPaths::domain_manifest_pointer(CatalogDomain::Lineage),
             "missing lineage path should default"
         );
         assert_eq!(
             parsed.search_manifest_path,
-            CatalogPaths::domain_manifest(CatalogDomain::Search),
+            CatalogPaths::domain_manifest_pointer(CatalogDomain::Search),
             "missing search path should default"
         );
     }

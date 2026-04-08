@@ -15,12 +15,11 @@
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
@@ -33,30 +32,6 @@ use arco_catalog::tier1_events::CatalogDdlEvent;
 use arco_catalog::write_options::WriteOptions;
 use arco_catalog::{CatalogWriter, Tier1Compactor, Tier1Writer};
 use arco_core::CatalogDomain;
-
-fn init_metrics() -> PrometheusHandle {
-    static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
-
-    PROMETHEUS_HANDLE
-        .get_or_init(|| {
-            PrometheusBuilder::new()
-                .install_recorder()
-                .expect("install prometheus recorder for failure injection tests")
-        })
-        .clone()
-}
-
-fn assert_metric_lines_contain(metrics: &str, name: &str, needle: &str) {
-    let lines: Vec<&str> = metrics
-        .lines()
-        .filter(|line| line.starts_with(name))
-        .collect();
-    assert!(!lines.is_empty(), "missing metric {name} in {metrics}");
-    assert!(
-        lines.iter().any(|line| line.contains(needle)),
-        "missing {needle} on metric {name} in {metrics}"
-    );
-}
 
 // ============================================================================
 // FailingBackend - Configurable failure injection
@@ -444,11 +419,10 @@ async fn tier1_lock_failure_does_not_corrupt_state() {
     );
 }
 
-/// Test that legacy mirror failures after pointer CAS return success with repair pending.
+/// Test that visible sync compaction no longer writes the legacy mutable manifest mirror.
 #[tokio::test]
-async fn sync_compact_returns_repair_pending_when_legacy_mirror_write_fails() {
-    let handle = init_metrics();
-    let backend = Arc::new(FailingBackend::new());
+async fn sync_compact_does_not_create_legacy_manifest_mirror_or_report_repair_pending() {
+    let backend = Arc::new(MemoryBackend::new());
     let storage =
         ScopedStorage::new(backend.clone(), TEST_TENANT, TEST_WORKSPACE).expect("scoped storage");
     let tier1_writer = Tier1Writer::new(storage.clone());
@@ -474,13 +448,6 @@ async fn sync_compact_returns_repair_pending_when_legacy_mirror_write_fails() {
         .expect("append event");
     let event_path = format!("ledger/catalog/{}.json", event_id);
 
-    let legacy_manifest_path = scoped_path(
-        TEST_TENANT,
-        TEST_WORKSPACE,
-        "manifests/catalog.manifest.json",
-    );
-    backend.fail_on_write(&legacy_manifest_path);
-
     let compactor = Tier1Compactor::new(storage.clone());
     let result = compactor
         .sync_compact(
@@ -488,10 +455,31 @@ async fn sync_compact_returns_repair_pending_when_legacy_mirror_write_fails() {
             vec![event_path],
             guard.fencing_token().sequence(),
         )
-        .await
-        .expect("sync compact should still succeed after commit");
+        .await;
 
-    assert!(result.repair_pending);
+    guard.release().await.expect("release catalog lock");
+    let result = result.expect("sync compact should succeed");
+
+    assert!(
+        !result.repair_pending,
+        "removed legacy side effects must not surface repair_pending"
+    );
+    assert!(
+        storage
+            .head_raw("manifests/catalog.manifest.json")
+            .await
+            .expect("head legacy manifest")
+            .is_none(),
+        "legacy mutable catalog manifest should not be created"
+    );
+    assert!(
+        storage
+            .head_raw(&format!("commits/catalog/{}.json", result.commit_ulid))
+            .await
+            .expect("head catalog commit record")
+            .is_none(),
+        "legacy catalog commit record should not be created"
+    );
 
     let reader = arco_catalog::CatalogReader::new(storage);
     let namespace = reader
@@ -500,13 +488,6 @@ async fn sync_compact_returns_repair_pending_when_legacy_mirror_write_fails() {
         .expect("read namespace")
         .expect("namespace visible");
     assert_eq!(namespace.name, "repair-pending-ns");
-
-    let metrics = handle.render();
-    assert_metric_lines_contain(
-        &metrics,
-        arco_catalog::metrics::REPAIR_PENDING,
-        "reason=\"legacy_manifest_mirror\"",
-    );
 }
 
 // ============================================================================

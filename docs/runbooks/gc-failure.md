@@ -100,9 +100,9 @@ gsutil cat gs://BUCKET/tenant=TENANT/workspace=WORKSPACE/manifests/executions.ma
 # List snapshot versions
 gsutil ls gs://BUCKET/tenant=TENANT/workspace=WORKSPACE/snapshots/catalog/
 
-# Check current manifest points to which version
-gsutil cat gs://BUCKET/tenant=TENANT/workspace=WORKSPACE/manifests/catalog.manifest.json \
-  | jq '.snapshotPath'
+# Check the current pointer target, then inspect that immutable manifest
+gsutil cat gs://BUCKET/tenant=TENANT/workspace=WORKSPACE/manifests/catalog.pointer.json \
+  | jq '.manifestPath'
 ```
 
 **Resolution**:

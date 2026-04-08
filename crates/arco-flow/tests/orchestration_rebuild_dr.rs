@@ -25,7 +25,6 @@ use arco_flow::orchestration::events::{
 const TENANT: &str = "tenant";
 const WORKSPACE: &str = "workspace";
 const POINTER_PATH: &str = "state/orchestration/manifest.pointer.json";
-const LEGACY_MANIFEST_PATH: &str = "state/orchestration/manifest.json";
 
 #[derive(Debug)]
 struct ListTrackingBackend {
@@ -270,13 +269,6 @@ async fn rebuild_remains_correct_with_stale_watermark_and_without_ledger_listing
         .put_raw(
             &pointer.manifest_path,
             Bytes::from(serde_json::to_vec(&manifest).expect("serialize manifest")),
-            WritePrecondition::None,
-        )
-        .await?;
-    storage
-        .put_raw(
-            LEGACY_MANIFEST_PATH,
-            Bytes::from(serde_json::to_vec(&manifest).expect("serialize legacy manifest")),
             WritePrecondition::None,
         )
         .await?;

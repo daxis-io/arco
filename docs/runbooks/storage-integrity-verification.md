@@ -4,9 +4,9 @@
 
 This runbook covers running storage integrity checks against live Arco workspaces. The `cargo xtask verify-integrity` command validates:
 
-- **Root manifest**: Exists and points to valid domain manifests
-- **Domain manifests**: Catalog, lineage, executions, search manifests are well-formed
-- **Commit chain**: All commit records link correctly back to genesis
+- **Root manifest**: Exists and points to canonical pointer/manifest entrypoints
+- **Domain manifests**: Pointer-resolved catalog, lineage, executions, and search manifests are well-formed
+- **Manifest history**: Catalog immutable manifest ancestry links correctly through `previous_manifest_path`
 - **Snapshot files**: Checksums match, sizes are correct, no missing files
 - **Lock freshness**: No stale/expired locks blocking operations
 
@@ -15,8 +15,8 @@ This runbook covers running storage integrity checks against live Arco workspace
 | Check | What It Validates | Severity If Failed |
 |-------|-------------------|-------------------|
 | Root manifest | Entry point exists | Critical |
-| Domain manifests | All 4 domains readable | Critical |
-| Commit chain | Hash chain integrity | Critical |
+| Domain manifests | Pointer-resolved heads readable | Critical |
+| Catalog manifest history | Immutable predecessor chain integrity | Critical |
 | Snapshot files | Data integrity | Critical |
 | Lock freshness | No stale locks | Warning (< 1h), Error (> 1h) |
 
@@ -74,7 +74,7 @@ cargo xtask verify-integrity --tenant=acme-corp --workspace=production
 
 ### Verbose Mode
 
-Show detailed output including active locks and commit counts:
+Show detailed output including active locks and manifest-history depth:
 
 ```bash
 cargo xtask verify-integrity \
@@ -112,7 +112,7 @@ Verifying catalog integrity...
   Bucket: gs://arco-production
   Root manifest... [ok]
   Domain manifests... [ok]
-  Commit chain (catalog)... [ok] 47 commits
+  Catalog manifest history... [ok] 47 manifests
   Catalog snapshot... [ok]
   Lineage snapshot... [ok]
   Executions state... [ok]
@@ -143,24 +143,28 @@ gsutil ls gs://BUCKET/tenant=TENANT/workspace=WORKSPACE/manifests/
 # Contact platform team for workspace bootstrap
 ```
 
-#### 2. Commit Chain Broken
+#### 2. Catalog Manifest History Broken
 
 ```
-Commit chain (catalog)... [FAIL]
+Catalog manifest history... [FAIL]
 Errors:
-  - Commit record missing: commits/catalog/abc123.json
-  - Commit hash mismatch for 'commits/catalog/def456.json': expected sha256:xxx, got sha256:yyy
+  - Previous manifest missing: manifests/catalog/00000000000000000041.json
+  - Manifest history mismatch for 'manifests/catalog/00000000000000000042.json': parent hash mismatch: expected sha256:xxx, got sha256:yyy (concurrent modification detected)
 ```
 
-**Cause**: Storage corruption, incomplete write, or manual tampering.
+**Cause**: Storage corruption, incomplete immutable-manifest upload, or manual tampering.
 
 **Resolution**:
-1. Check if commit file exists but is corrupted:
+1. Inspect the missing or mismatched immutable manifest:
    ```bash
-   gsutil cat gs://BUCKET/.../commits/catalog/abc123.json
+   gsutil cat gs://BUCKET/.../manifests/catalog/00000000000000000041.json
    ```
-2. If missing, check GCS versioning for recovery
-3. If hash mismatch, data may be corrupted - escalate to platform team
+2. Verify the current pointer target:
+   ```bash
+   gsutil cat gs://BUCKET/.../manifests/catalog.pointer.json
+   ```
+3. If an intermediate immutable manifest is missing, check object-store versioning and repair
+   from a known-good predecessor or rebuild path before resuming writes
 
 #### 3. Snapshot Checksum Mismatch
 

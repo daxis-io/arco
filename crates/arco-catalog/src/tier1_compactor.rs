@@ -5,15 +5,13 @@ use std::collections::HashSet;
 use bytes::Bytes;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 use thiserror::Error;
 use ulid::Ulid;
 
 use arco_core::lock::DistributedLock;
 use arco_core::publish::Publisher;
 use arco_core::storage::{StorageBackend, WriteResult};
-use arco_core::storage_keys::{CommitKey, ManifestKey};
-use arco_core::storage_traits::CommitPutStore;
+use arco_core::storage_keys::ManifestKey;
 use arco_core::sync_compact::SyncCompactRequest;
 use arco_core::{
     CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths, ScopedStorage, VisibilityStatus,
@@ -21,8 +19,8 @@ use arco_core::{
 
 use crate::error::{CatalogError, Result as CatalogResult};
 use crate::manifest::{
-    CatalogDomainManifest, CommitRecord, DomainManifestPointer, LineageManifest, RootManifest,
-    SearchManifest, compute_manifest_hash, next_manifest_id,
+    CatalogDomainManifest, DomainManifestPointer, LineageManifest, SearchManifest,
+    compute_manifest_hash, next_manifest_id,
 };
 use crate::parquet_util::SearchPostingRecord;
 use crate::sync_compact_permit_issuer;
@@ -274,53 +272,36 @@ impl Tier1Compactor {
         let publisher = Publisher::new(&self.storage);
 
         for attempt in 1..=self.cas_max_retries {
-            let mut root: RootManifest = read_json(&self.storage, CatalogPaths::ROOT_MANIFEST)
-                .await
-                .map_err(map_processing_error)?;
-            root.normalize_paths();
-
             let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
             let pointer_meta = self
                 .storage
                 .head_raw(&pointer_path)
                 .await
+                .map_err(map_processing_error)?
+                .ok_or_else(|| Tier1CompactionError::ProcessingError {
+                    message: "missing catalog manifest pointer".to_string(),
+                })?;
+            let pointer_bytes = self
+                .storage
+                .get_raw(&pointer_path)
+                .await
                 .map_err(map_processing_error)?;
-
-            let (pointer_expected_version, pointer_parent_hash, previous_manifest_path, prev_bytes) =
-                if let Some(pointer_meta) = pointer_meta {
-                    let pointer_bytes = self
-                        .storage
-                        .get_raw(&pointer_path)
-                        .await
-                        .map_err(map_processing_error)?;
-                    let pointer: DomainManifestPointer =
-                        serde_json::from_slice(&pointer_bytes).map_err(map_processing_error)?;
-                    if fencing_token < pointer.epoch {
-                        return Err(Tier1CompactionError::StaleFencingToken {
-                            expected: pointer.epoch,
-                            provided: fencing_token,
-                        });
-                    }
-                    (
-                        Some(pointer_meta.version),
-                        Some(compute_manifest_hash(&pointer_bytes)),
-                        pointer.manifest_path.clone(),
-                        self.storage
-                            .get_raw(&pointer.manifest_path)
-                            .await
-                            .map_err(map_processing_error)?,
-                    )
-                } else {
-                    (
-                        None,
-                        None,
-                        root.catalog_manifest_path.clone(),
-                        self.storage
-                            .get_raw(&root.catalog_manifest_path)
-                            .await
-                            .map_err(map_processing_error)?,
-                    )
-                };
+            let pointer: DomainManifestPointer =
+                serde_json::from_slice(&pointer_bytes).map_err(map_processing_error)?;
+            if fencing_token < pointer.epoch {
+                return Err(Tier1CompactionError::StaleFencingToken {
+                    expected: pointer.epoch,
+                    provided: fencing_token,
+                });
+            }
+            let pointer_expected_version = Some(pointer_meta.version);
+            let pointer_parent_hash = Some(compute_manifest_hash(&pointer_bytes));
+            let previous_manifest_path = pointer.manifest_path.clone();
+            let prev_bytes = self
+                .storage
+                .get_raw(&pointer.manifest_path)
+                .await
+                .map_err(map_processing_error)?;
 
             let prev_raw_hash = compute_manifest_hash(&prev_bytes);
             let mut manifest: CatalogDomainManifest =
@@ -355,16 +336,18 @@ impl Tier1Compactor {
             manifest.previous_manifest_path = Some(previous_manifest_path.clone());
             manifest.writer_session_id = Some(issuer.resource().to_string());
             manifest.watermark_event_id.clone_from(&last_event_id);
-            manifest.manifest_id = next_manifest_id(&prev_manifest.manifest_id)
-                .map_err(|message| Tier1CompactionError::ProcessingError { message })?;
+            manifest.manifest_id = next_available_manifest_id(
+                &self.storage,
+                CatalogDomain::Catalog,
+                &prev_manifest.manifest_id,
+            )
+            .await?;
 
             manifest
                 .validate_succession(&prev_manifest, &prev_raw_hash)
                 .map_err(|message| Tier1CompactionError::ProcessingError { message })?;
 
-            let commit =
-                build_commit_record(&self.storage, &prev_manifest, &manifest, &commit_ulid).await?;
-            manifest.last_commit_id = Some(commit.commit_id.clone());
+            manifest.last_commit_id = Some(commit_ulid.clone());
 
             let manifest_bytes = serde_json::to_vec(&manifest).map_err(map_processing_error)?;
             let snapshot_manifest_path = CatalogPaths::domain_manifest_snapshot(
@@ -430,45 +413,6 @@ impl Tier1Compactor {
                 .map_err(map_publish_error)?
             {
                 WriteResult::Success { version } => {
-                    let mut repair_pending = false;
-
-                    // Legacy migration shim: keep mutable manifest path readable.
-                    if let Err(error) = self
-                        .storage
-                        .put_raw(
-                            &root.catalog_manifest_path,
-                            Bytes::from(manifest_bytes),
-                            arco_core::WritePrecondition::None,
-                        )
-                        .await
-                    {
-                        repair_pending = true;
-                        crate::metrics::record_repair_pending(
-                            CatalogDomain::Catalog,
-                            "legacy_manifest_mirror",
-                        );
-                        tracing::warn!(
-                            domain = %CatalogDomain::Catalog.as_str(),
-                            manifest_path = %root.catalog_manifest_path,
-                            error = %error,
-                            "catalog legacy manifest mirror write failed after pointer CAS"
-                        );
-                    }
-                    if let Err(error) =
-                        persist_commit_record(&self.storage, CatalogDomain::Catalog, &commit).await
-                    {
-                        repair_pending = true;
-                        crate::metrics::record_repair_pending(
-                            CatalogDomain::Catalog,
-                            "commit_record",
-                        );
-                        tracing::warn!(
-                            domain = %CatalogDomain::Catalog.as_str(),
-                            commit_ulid = %commit_ulid,
-                            error = %error,
-                            "catalog commit record write failed after pointer CAS"
-                        );
-                    }
                     return Ok(Tier1CompactionResult {
                         manifest_version: version,
                         commit_ulid,
@@ -476,7 +420,7 @@ impl Tier1Compactor {
                         events_processed,
                         snapshot_version: manifest.snapshot_version,
                         visibility_status: VisibilityStatus::Visible,
-                        repair_pending,
+                        repair_pending: false,
                     });
                 }
                 WriteResult::PreconditionFailed { .. } => {
@@ -512,53 +456,36 @@ impl Tier1Compactor {
         let publisher = Publisher::new(&self.storage);
 
         for attempt in 1..=self.cas_max_retries {
-            let mut root: RootManifest = read_json(&self.storage, CatalogPaths::ROOT_MANIFEST)
-                .await
-                .map_err(map_processing_error)?;
-            root.normalize_paths();
-
             let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Lineage);
             let pointer_meta = self
                 .storage
                 .head_raw(&pointer_path)
                 .await
+                .map_err(map_processing_error)?
+                .ok_or_else(|| Tier1CompactionError::ProcessingError {
+                    message: "missing lineage manifest pointer".to_string(),
+                })?;
+            let pointer_bytes = self
+                .storage
+                .get_raw(&pointer_path)
+                .await
                 .map_err(map_processing_error)?;
-
-            let (pointer_expected_version, pointer_parent_hash, previous_manifest_path, prev_bytes) =
-                if let Some(pointer_meta) = pointer_meta {
-                    let pointer_bytes = self
-                        .storage
-                        .get_raw(&pointer_path)
-                        .await
-                        .map_err(map_processing_error)?;
-                    let pointer: DomainManifestPointer =
-                        serde_json::from_slice(&pointer_bytes).map_err(map_processing_error)?;
-                    if fencing_token < pointer.epoch {
-                        return Err(Tier1CompactionError::StaleFencingToken {
-                            expected: pointer.epoch,
-                            provided: fencing_token,
-                        });
-                    }
-                    (
-                        Some(pointer_meta.version),
-                        Some(compute_manifest_hash(&pointer_bytes)),
-                        pointer.manifest_path.clone(),
-                        self.storage
-                            .get_raw(&pointer.manifest_path)
-                            .await
-                            .map_err(map_processing_error)?,
-                    )
-                } else {
-                    (
-                        None,
-                        None,
-                        root.lineage_manifest_path.clone(),
-                        self.storage
-                            .get_raw(&root.lineage_manifest_path)
-                            .await
-                            .map_err(map_processing_error)?,
-                    )
-                };
+            let pointer: DomainManifestPointer =
+                serde_json::from_slice(&pointer_bytes).map_err(map_processing_error)?;
+            if fencing_token < pointer.epoch {
+                return Err(Tier1CompactionError::StaleFencingToken {
+                    expected: pointer.epoch,
+                    provided: fencing_token,
+                });
+            }
+            let pointer_expected_version = Some(pointer_meta.version);
+            let pointer_parent_hash = Some(compute_manifest_hash(&pointer_bytes));
+            let previous_manifest_path = pointer.manifest_path.clone();
+            let prev_bytes = self
+                .storage
+                .get_raw(&pointer.manifest_path)
+                .await
+                .map_err(map_processing_error)?;
 
             let prev_raw_hash = compute_manifest_hash(&prev_bytes);
             let mut manifest: LineageManifest =
@@ -593,17 +520,18 @@ impl Tier1Compactor {
             manifest.previous_manifest_path = Some(previous_manifest_path.clone());
             manifest.writer_session_id = Some(issuer.resource().to_string());
             manifest.watermark_event_id.clone_from(&last_event_id);
-            manifest.manifest_id = next_manifest_id(&prev_manifest.manifest_id)
-                .map_err(|message| Tier1CompactionError::ProcessingError { message })?;
+            manifest.manifest_id = next_available_manifest_id(
+                &self.storage,
+                CatalogDomain::Lineage,
+                &prev_manifest.manifest_id,
+            )
+            .await?;
 
             manifest
                 .validate_succession(&prev_manifest, &prev_raw_hash)
                 .map_err(|message| Tier1CompactionError::ProcessingError { message })?;
 
-            let commit =
-                build_lineage_commit_record(&self.storage, &prev_manifest, &manifest, &commit_ulid)
-                    .await?;
-            manifest.last_commit_id = Some(commit.commit_id.clone());
+            manifest.last_commit_id = Some(commit_ulid.clone());
 
             let manifest_bytes = serde_json::to_vec(&manifest).map_err(map_processing_error)?;
             let snapshot_manifest_path = CatalogPaths::domain_manifest_snapshot(
@@ -669,45 +597,6 @@ impl Tier1Compactor {
                 .map_err(map_publish_error)?
             {
                 WriteResult::Success { version } => {
-                    let mut repair_pending = false;
-
-                    // Legacy migration shim: keep mutable manifest path readable.
-                    if let Err(error) = self
-                        .storage
-                        .put_raw(
-                            &root.lineage_manifest_path,
-                            Bytes::from(manifest_bytes),
-                            arco_core::WritePrecondition::None,
-                        )
-                        .await
-                    {
-                        repair_pending = true;
-                        crate::metrics::record_repair_pending(
-                            CatalogDomain::Lineage,
-                            "legacy_manifest_mirror",
-                        );
-                        tracing::warn!(
-                            domain = %CatalogDomain::Lineage.as_str(),
-                            manifest_path = %root.lineage_manifest_path,
-                            error = %error,
-                            "lineage legacy manifest mirror write failed after pointer CAS"
-                        );
-                    }
-                    if let Err(error) =
-                        persist_commit_record(&self.storage, CatalogDomain::Lineage, &commit).await
-                    {
-                        repair_pending = true;
-                        crate::metrics::record_repair_pending(
-                            CatalogDomain::Lineage,
-                            "commit_record",
-                        );
-                        tracing::warn!(
-                            domain = %CatalogDomain::Lineage.as_str(),
-                            commit_ulid = %commit_ulid,
-                            error = %error,
-                            "lineage commit record write failed after pointer CAS"
-                        );
-                    }
                     return Ok(Tier1CompactionResult {
                         manifest_version: version,
                         commit_ulid,
@@ -715,7 +604,7 @@ impl Tier1Compactor {
                         events_processed,
                         snapshot_version: manifest.snapshot_version,
                         visibility_status: VisibilityStatus::Visible,
-                        repair_pending,
+                        repair_pending: false,
                     });
                 }
                 WriteResult::PreconditionFailed { .. } => {
@@ -752,66 +641,46 @@ impl Tier1Compactor {
         let publisher = Publisher::new(&self.storage);
 
         for attempt in 1..=self.cas_max_retries {
-            let mut root: RootManifest = read_json(&self.storage, CatalogPaths::ROOT_MANIFEST)
-                .await
-                .map_err(map_processing_error)?;
-            root.normalize_paths();
-
             let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Search);
             let pointer_meta = self
                 .storage
                 .head_raw(&pointer_path)
                 .await
+                .map_err(map_processing_error)?
+                .ok_or_else(|| Tier1CompactionError::ProcessingError {
+                    message: "missing search manifest pointer".to_string(),
+                })?;
+            let pointer_bytes = self
+                .storage
+                .get_raw(&pointer_path)
+                .await
                 .map_err(map_processing_error)?;
-
-            let (pointer_expected_version, pointer_parent_hash, previous_manifest_path, prev_bytes) =
-                if let Some(pointer_meta) = pointer_meta {
-                    let pointer_bytes = self
-                        .storage
-                        .get_raw(&pointer_path)
-                        .await
-                        .map_err(map_processing_error)?;
-                    let pointer: DomainManifestPointer =
-                        serde_json::from_slice(&pointer_bytes).map_err(map_processing_error)?;
-                    if fencing_token < pointer.epoch {
-                        return Err(Tier1CompactionError::StaleFencingToken {
-                            expected: pointer.epoch,
-                            provided: fencing_token,
-                        });
-                    }
-                    (
-                        Some(pointer_meta.version),
-                        Some(compute_manifest_hash(&pointer_bytes)),
-                        pointer.manifest_path.clone(),
-                        self.storage
-                            .get_raw(&pointer.manifest_path)
-                            .await
-                            .map_err(map_processing_error)?,
-                    )
-                } else {
-                    (
-                        None,
-                        None,
-                        root.search_manifest_path.clone(),
-                        self.storage
-                            .get_raw(&root.search_manifest_path)
-                            .await
-                            .map_err(map_processing_error)?,
-                    )
-                };
+            let pointer: DomainManifestPointer =
+                serde_json::from_slice(&pointer_bytes).map_err(map_processing_error)?;
+            if fencing_token < pointer.epoch {
+                return Err(Tier1CompactionError::StaleFencingToken {
+                    expected: pointer.epoch,
+                    provided: fencing_token,
+                });
+            }
+            let pointer_expected_version = Some(pointer_meta.version);
+            let pointer_parent_hash = Some(compute_manifest_hash(&pointer_bytes));
+            let previous_manifest_path = pointer.manifest_path.clone();
+            let prev_bytes = self
+                .storage
+                .get_raw(&pointer.manifest_path)
+                .await
+                .map_err(map_processing_error)?;
 
             let prev_raw_hash = compute_manifest_hash(&prev_bytes);
             let mut manifest: SearchManifest =
                 serde_json::from_slice(&prev_bytes).map_err(map_processing_error)?;
             let prev_manifest = manifest.clone();
 
-            let catalog_manifest_path = resolve_manifest_path(
-                &self.storage,
-                CatalogDomain::Catalog,
-                &root.catalog_manifest_path,
-            )
-            .await
-            .map_err(map_processing_error)?;
+            let catalog_manifest_path =
+                resolve_manifest_path(&self.storage, CatalogDomain::Catalog)
+                    .await
+                    .map_err(map_processing_error)?;
             let catalog_bytes = self
                 .storage
                 .get_raw(&catalog_manifest_path)
@@ -845,17 +714,18 @@ impl Tier1Compactor {
             manifest.previous_manifest_path = Some(previous_manifest_path.clone());
             manifest.writer_session_id = Some(issuer.resource().to_string());
             manifest.watermark_event_id.clone_from(&last_event_id);
-            manifest.manifest_id = next_manifest_id(&prev_manifest.manifest_id)
-                .map_err(|message| Tier1CompactionError::ProcessingError { message })?;
+            manifest.manifest_id = next_available_manifest_id(
+                &self.storage,
+                CatalogDomain::Search,
+                &prev_manifest.manifest_id,
+            )
+            .await?;
 
             manifest
                 .validate_succession(&prev_manifest, &prev_raw_hash)
                 .map_err(|message| Tier1CompactionError::ProcessingError { message })?;
 
-            let commit =
-                build_search_commit_record(&self.storage, &prev_manifest, &manifest, &commit_ulid)
-                    .await?;
-            manifest.last_commit_id = Some(commit.commit_id.clone());
+            manifest.last_commit_id = Some(commit_ulid.clone());
 
             let manifest_bytes = serde_json::to_vec(&manifest).map_err(map_processing_error)?;
             let snapshot_manifest_path = CatalogPaths::domain_manifest_snapshot(
@@ -921,45 +791,6 @@ impl Tier1Compactor {
                 .map_err(map_publish_error)?
             {
                 WriteResult::Success { version } => {
-                    let mut repair_pending = false;
-
-                    // Legacy migration shim: keep mutable manifest path readable.
-                    if let Err(error) = self
-                        .storage
-                        .put_raw(
-                            &root.search_manifest_path,
-                            Bytes::from(manifest_bytes),
-                            arco_core::WritePrecondition::None,
-                        )
-                        .await
-                    {
-                        repair_pending = true;
-                        crate::metrics::record_repair_pending(
-                            CatalogDomain::Search,
-                            "legacy_manifest_mirror",
-                        );
-                        tracing::warn!(
-                            domain = %CatalogDomain::Search.as_str(),
-                            manifest_path = %root.search_manifest_path,
-                            error = %error,
-                            "search legacy manifest mirror write failed after pointer CAS"
-                        );
-                    }
-                    if let Err(error) =
-                        persist_commit_record(&self.storage, CatalogDomain::Search, &commit).await
-                    {
-                        repair_pending = true;
-                        crate::metrics::record_repair_pending(
-                            CatalogDomain::Search,
-                            "commit_record",
-                        );
-                        tracing::warn!(
-                            domain = %CatalogDomain::Search.as_str(),
-                            commit_ulid = %commit_ulid,
-                            error = %error,
-                            "search commit record write failed after pointer CAS"
-                        );
-                    }
                     return Ok(Tier1CompactionResult {
                         manifest_version: version,
                         commit_ulid,
@@ -967,7 +798,7 @@ impl Tier1Compactor {
                         events_processed,
                         snapshot_version: manifest.snapshot_version,
                         visibility_status: VisibilityStatus::Visible,
-                        repair_pending,
+                        repair_pending: false,
                     });
                 }
                 WriteResult::PreconditionFailed { .. } => {
@@ -1510,143 +1341,6 @@ async fn revalidate_lock(
     Ok(())
 }
 
-async fn persist_commit_record(
-    storage: &ScopedStorage,
-    domain: CatalogDomain,
-    commit: &CommitRecord,
-) -> Result<(), Tier1CompactionError> {
-    let key = CommitKey::record(domain, &commit.commit_id);
-    let bytes = serde_json::to_vec(commit).map_err(map_processing_error)?;
-
-    match storage
-        .put_commit(&key, Bytes::from(bytes))
-        .await
-        .map_err(map_processing_error)?
-    {
-        WriteResult::Success { .. } => Ok(()),
-        WriteResult::PreconditionFailed { .. } => Err(Tier1CompactionError::PublishFailed {
-            message: format!("commit already exists: {}", commit.commit_id),
-        }),
-    }
-}
-
-async fn build_commit_record(
-    storage: &ScopedStorage,
-    prev: &CatalogDomainManifest,
-    next: &CatalogDomainManifest,
-    commit_id: &str,
-) -> Result<CommitRecord, Tier1CompactionError> {
-    let payload_hash = sha256_prefixed(&serde_json::to_vec(next).map_err(map_processing_error)?);
-    let prev_commit_id = prev.last_commit_id.clone();
-
-    let prev_commit_hash = match &prev_commit_id {
-        Some(id) => {
-            let path = CatalogPaths::commit(CatalogDomain::Catalog, id);
-            match storage.get_raw(&path).await {
-                Ok(bytes) => {
-                    let record: CommitRecord =
-                        serde_json::from_slice(&bytes).map_err(map_processing_error)?;
-                    Some(record.compute_hash())
-                }
-                Err(arco_core::Error::NotFound(_)) => None,
-                Err(e) => {
-                    return Err(Tier1CompactionError::ProcessingError {
-                        message: format!("failed to read commit '{path}': {e}"),
-                    });
-                }
-            }
-        }
-        None => None,
-    };
-
-    Ok(CommitRecord {
-        commit_id: commit_id.to_string(),
-        prev_commit_id,
-        prev_commit_hash,
-        operation: "SyncCompact".into(),
-        payload_hash,
-        created_at: Utc::now(),
-    })
-}
-
-async fn build_lineage_commit_record(
-    storage: &ScopedStorage,
-    prev: &LineageManifest,
-    next: &LineageManifest,
-    commit_id: &str,
-) -> Result<CommitRecord, Tier1CompactionError> {
-    let payload_hash = sha256_prefixed(&serde_json::to_vec(next).map_err(map_processing_error)?);
-    let prev_commit_id = prev.last_commit_id.clone();
-
-    let prev_commit_hash = match &prev_commit_id {
-        Some(id) => {
-            let path = CatalogPaths::commit(CatalogDomain::Lineage, id);
-            match storage.get_raw(&path).await {
-                Ok(bytes) => {
-                    let record: CommitRecord =
-                        serde_json::from_slice(&bytes).map_err(map_processing_error)?;
-                    Some(record.compute_hash())
-                }
-                Err(arco_core::Error::NotFound(_)) => None,
-                Err(e) => {
-                    return Err(Tier1CompactionError::ProcessingError {
-                        message: format!("failed to read commit '{path}': {e}"),
-                    });
-                }
-            }
-        }
-        None => None,
-    };
-
-    Ok(CommitRecord {
-        commit_id: commit_id.to_string(),
-        prev_commit_id,
-        prev_commit_hash,
-        operation: "SyncCompact".into(),
-        payload_hash,
-        created_at: Utc::now(),
-    })
-}
-
-async fn build_search_commit_record(
-    storage: &ScopedStorage,
-    prev: &SearchManifest,
-    next: &SearchManifest,
-    commit_id: &str,
-) -> Result<CommitRecord, Tier1CompactionError> {
-    let payload_hash = sha256_prefixed(&serde_json::to_vec(next).map_err(map_processing_error)?);
-    let prev_commit_id = prev.last_commit_id.clone();
-
-    let prev_commit_hash = match &prev_commit_id {
-        Some(id) => {
-            let path = CatalogPaths::commit(CatalogDomain::Search, id);
-            match storage.get_raw(&path).await {
-                Ok(bytes) => {
-                    let record: CommitRecord =
-                        serde_json::from_slice(&bytes).map_err(map_processing_error)?;
-                    Some(record.compute_hash())
-                }
-                Err(arco_core::Error::NotFound(_)) => None,
-                Err(e) => {
-                    return Err(Tier1CompactionError::ProcessingError {
-                        message: format!("failed to read commit '{path}': {e}"),
-                    });
-                }
-            }
-        }
-        None => None,
-    };
-
-    Ok(CommitRecord {
-        commit_id: commit_id.to_string(),
-        prev_commit_id,
-        prev_commit_hash,
-        operation: "SyncCompact".into(),
-        payload_hash,
-        created_at: Utc::now(),
-    })
-}
-
 fn next_commit_ulid(previous: Option<&str>) -> Result<String, Tier1CompactionError> {
     let candidate = Ulid::new();
 
@@ -1671,37 +1365,39 @@ fn next_commit_ulid(previous: Option<&str>) -> Result<String, Tier1CompactionErr
     Ok(next.to_string())
 }
 
+async fn next_available_manifest_id(
+    storage: &ScopedStorage,
+    domain: CatalogDomain,
+    previous_manifest_id: &str,
+) -> Result<String, Tier1CompactionError> {
+    let mut candidate = next_manifest_id(previous_manifest_id)
+        .map_err(|message| Tier1CompactionError::ProcessingError { message })?;
+    loop {
+        let candidate_path = CatalogPaths::domain_manifest_snapshot(domain, &candidate);
+        if storage
+            .head_raw(&candidate_path)
+            .await
+            .map_err(map_publish_error)?
+            .is_none()
+        {
+            return Ok(candidate);
+        }
+        candidate = next_manifest_id(&candidate)
+            .map_err(|message| Tier1CompactionError::ProcessingError { message })?;
+    }
+}
+
 async fn resolve_manifest_path(
     storage: &ScopedStorage,
     domain: CatalogDomain,
-    legacy_path: &str,
 ) -> CatalogResult<String> {
     let pointer_path = CatalogPaths::domain_manifest_pointer(domain);
-    let Some(_) = storage.head_raw(&pointer_path).await? else {
-        return Ok(legacy_path.to_string());
-    };
-
     let pointer_bytes = storage.get_raw(&pointer_path).await?;
     let pointer: DomainManifestPointer =
         serde_json::from_slice(&pointer_bytes).map_err(|e| CatalogError::Serialization {
             message: format!("parse JSON at {pointer_path}: {e}"),
         })?;
     Ok(pointer.manifest_path)
-}
-
-async fn read_json<T: serde::de::DeserializeOwned>(
-    storage: &ScopedStorage,
-    path: &str,
-) -> CatalogResult<T> {
-    let bytes = storage.get_raw(path).await?;
-    serde_json::from_slice(&bytes).map_err(|e| CatalogError::Serialization {
-        message: format!("parse JSON at {path}: {e}"),
-    })
-}
-
-fn sha256_prefixed(bytes: &[u8]) -> String {
-    let hash = sha2::Sha256::digest(bytes);
-    format!("sha256:{}", hex::encode(hash))
 }
 
 fn map_processing_error<E: std::fmt::Display>(err: E) -> Tier1CompactionError {
@@ -1769,13 +1465,6 @@ mod tests {
             .await
             .expect("snapshot");
 
-        let root_bytes = storage
-            .get_raw(CatalogPaths::ROOT_MANIFEST)
-            .await
-            .expect("root manifest");
-        let mut root: RootManifest = serde_json::from_slice(&root_bytes).expect("parse root");
-        root.normalize_paths();
-
         let catalog_manifest = CatalogDomainManifest {
             manifest_id: crate::manifest::format_manifest_id(snapshot.version),
             epoch: 0,
@@ -1792,9 +1481,17 @@ mod tests {
             updated_at: Utc::now(),
         };
         let catalog_bytes = serde_json::to_vec(&catalog_manifest).expect("serialize catalog");
+        let catalog_pointer_bytes = storage
+            .get_raw(&CatalogPaths::domain_manifest_pointer(
+                CatalogDomain::Catalog,
+            ))
+            .await
+            .expect("catalog pointer");
+        let catalog_pointer: DomainManifestPointer =
+            serde_json::from_slice(&catalog_pointer_bytes).expect("parse catalog pointer");
         storage
             .put_raw(
-                &root.catalog_manifest_path,
+                &catalog_pointer.manifest_path,
                 Bytes::from(catalog_bytes),
                 WritePrecondition::None,
             )
@@ -1815,8 +1512,16 @@ mod tests {
             .await
             .expect("search compaction");
 
+        let search_pointer_bytes = storage
+            .get_raw(&CatalogPaths::domain_manifest_pointer(
+                CatalogDomain::Search,
+            ))
+            .await
+            .expect("search pointer");
+        let search_pointer: DomainManifestPointer =
+            serde_json::from_slice(&search_pointer_bytes).expect("parse search pointer");
         let search_bytes = storage
-            .get_raw(&root.search_manifest_path)
+            .get_raw(&search_pointer.manifest_path)
             .await
             .expect("search manifest");
         let search_manifest: SearchManifest =

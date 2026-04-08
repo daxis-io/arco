@@ -34,7 +34,7 @@ Catalog and orchestration use this shared protocol:
 5. Write the new immutable manifest snapshot with `manifest_id`, `previous_manifest_path`, `parent_hash`, `epoch`/`fencing_token`, and a monotonic `commit_ulid`.
 6. CAS the mutable pointer from the old object version to the new immutable manifest path.
 7. Declare the transaction committed only when pointer CAS succeeds.
-8. Run audit-chain writes and legacy-mirror writes after commit as repairable side effects; they must not change a committed response into a failure.
+8. Do not add post-commit legacy mirror or catalog commit-record writes to the success path.
 
 Ordinary readers are pointer-first and manifest-driven. Root-token readers are
 transaction-record-first and super-manifest-driven. Readers must not scan the
@@ -56,8 +56,6 @@ snapshots/catalog/v{snapshot_version}/tables.parquet
 snapshots/catalog/v{snapshot_version}/columns.parquet
 manifests/catalog.pointer.json
 manifests/catalog/{manifest_id}.json
-manifests/catalog.manifest.json              # repairable legacy mirror
-commits/catalog/{commit_id}.json            # repairable audit chain
 ```
 
 Internal API:
@@ -87,8 +85,9 @@ POST /internal/sync-compact
 Notes:
 
 - `visibility_status` is always `visible` for catalog Tier-1 writes.
-- `repair_pending=true` means pointer CAS committed but commit-record and/or
-  legacy-mirror repair is still outstanding.
+- Visible catalog commits no longer create `manifests/catalog.manifest.json` or
+  `commits/catalog/{commit_id}.json`; `repair_pending` is therefore `false` for this path in the
+  current runtime.
 
 #### Orchestration
 
@@ -100,7 +99,6 @@ locks/orchestration.compaction.lock.json
 ledger/orchestration/{yyyy-mm-dd}/{event_id}.json
 state/orchestration/manifest.pointer.json
 state/orchestration/manifests/{manifest_id}.json
-state/orchestration/manifest.json                   # repairable legacy mirror
 state/orchestration/base/{snapshot_id}/{table}.{hash}.parquet
 state/orchestration/l0/{delta_id}/{table}.{hash}.parquet
 state/orchestration/rebuilds/{rebuild_id}.json
@@ -149,6 +147,8 @@ Notes:
 - Controller/API-triggered compaction must require
   `visibility_status="visible"` for success.
 - `persisted_not_visible` remains internal-only for recovery/maintenance flows.
+- Visible orchestration commits no longer create `state/orchestration/manifest.json`; the current
+  runtime therefore reports `repair_pending=false` for removed legacy-manifest side effects.
 
 #### Optional Root Transactions
 
@@ -256,10 +256,10 @@ Notes:
 | Catalog | ledger append fails | unchanged | failure | retry append |
 | Catalog | immutable snapshot or manifest snapshot write fails | unchanged | failure | retry safely |
 | Catalog | pointer CAS loses race | previous head remains visible | conflict/retry | orphan snapshot GC |
-| Catalog | pointer CAS succeeds, audit/mirror write fails | new head visible | success with `repair_pending=true` | reconciler writes commit/mirror |
+| Catalog | pointer CAS succeeds | new head visible | success with `repair_pending=false` | none |
 | Orchestration | event read or parquet write fails | unchanged | failure | retry compaction |
 | Orchestration | pointer CAS loses race | previous head remains visible | conflict/retry | retry with fresh head; orphan cleanup |
-| Orchestration | pointer CAS succeeds, mirror write fails | new head visible | success with `repair_pending=true` | reconciler repairs mirror |
+| Orchestration | pointer CAS succeeds | new head visible | success with `repair_pending=false` | none |
 | Root tx | tx record create fails | unchanged | failure | retry with same idempotency key |
 | Root tx | participant publish or super-manifest write fails before root visibility | failed root tx is marked `ABORTED`; root token not visible | failure | retry with same idempotency key; runtime claims a fresh root `tx_id` and reuses visible participant commits through root-derived participant idempotency keys |
 | Root tx | tx record/idempotency finalize loses one durable write | caller sees failure; surviving visible state is replay-repairable | retry same request | replay repairs the same `tx_id` from the cached visible record |
@@ -269,15 +269,15 @@ Notes:
 
 - Catalog publish commits only when `manifests/catalog.pointer.json` CAS succeeds;
   stale fencing tokens are rejected.
-- Catalog post-commit failures in `commits/catalog/{commit_id}.json` or
-  `manifests/catalog.manifest.json` return success with `repair_pending=true`,
-  never failure after visibility.
+- Catalog visible commits do not create `commits/catalog/{commit_id}.json` or
+  `manifests/catalog.manifest.json`.
 - Orchestration `/compact` rejects missing, expired, stale, or non-canonical
   lock inputs.
 - Orchestration readers reconstruct state from base snapshot plus L0 deltas
   only; no ledger reads are required for correctness.
 - Orchestration persisted-but-not-visible mode is accepted only for explicit
   maintenance/rebuild paths.
+- Visible orchestration commits do not create `state/orchestration/manifest.json`.
 - Root transaction retries with the same idempotency key either repair the same
   visible `tx_id` from cached finalize state or claim a fresh root `tx_id`
   after a pre-visibility abort; participant commits are reused through
@@ -293,8 +293,8 @@ Notes:
 
 - This ADR remains one unified decision, not split ADRs.
 - Internal service APIs may evolve; external end-user APIs remain unchanged.
-- Legacy mirror paths stay during migration, but they are explicitly repairable
-  side effects, not commit prerequisites.
+- `manifests/root.manifest.json` remains the bootstrap object; catalog/lineage/search root fields
+  now point at pointer paths while deserialize compatibility for older root JSON is retained.
 - Catalog and orchestration remain per-domain serializable by default.
 - Root transactions are opt-in per request, ship in the current transaction
   runtime, and are only needed for callers that require workspace-consistent
@@ -306,8 +306,8 @@ Notes:
   orchestration.
 - Root transactions use per-`tx_id` record finalization plus an immutable
   super-manifest, not a moving root pointer CAS.
-- Immutable artifact writes stay append-only, while legacy mirrors and audit
-  chain writes move firmly into repairable post-commit work.
+- Immutable artifact writes stay append-only, and removed catalog/orchestration compatibility
+  artifacts are no longer part of visible commit success.
 - Reader correctness stays manifest-driven: pointer-first for domain-local
   readers and root-token-first for pinned cross-domain readers.
 - Cross-domain workspace-consistent cuts are possible without forcing root

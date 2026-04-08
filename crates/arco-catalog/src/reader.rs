@@ -191,15 +191,15 @@ impl CatalogReader {
         let mut root = root;
         root.normalize_paths();
 
-        // Read domain manifests in parallel, preferring pointer-resolved immutable snapshots.
+        // Read domain manifests in parallel from pointer-resolved immutable snapshots.
         let (catalog_bytes, lineage_bytes, executions_bytes, search_bytes) = tokio::join!(
-            self.read_domain_manifest_bytes(CatalogDomain::Catalog, &root.catalog_manifest_path),
-            self.read_domain_manifest_bytes(CatalogDomain::Lineage, &root.lineage_manifest_path),
+            self.read_domain_manifest_bytes(CatalogDomain::Catalog, None),
+            self.read_domain_manifest_bytes(CatalogDomain::Lineage, None),
             self.read_domain_manifest_bytes(
                 CatalogDomain::Executions,
-                &root.executions_manifest_path
+                Some(&root.executions_manifest_path)
             ),
-            self.read_domain_manifest_bytes(CatalogDomain::Search, &root.search_manifest_path),
+            self.read_domain_manifest_bytes(CatalogDomain::Search, None),
         );
 
         let catalog: CatalogDomainManifest =
@@ -301,32 +301,25 @@ impl CatalogReader {
     async fn read_domain_manifest_bytes(
         &self,
         domain: CatalogDomain,
-        legacy_path: &str,
+        executions_path: Option<&str>,
     ) -> Result<bytes::Bytes> {
-        let pointer_path = CatalogPaths::domain_manifest_pointer(domain);
-        match self.storage.get_raw(&pointer_path).await {
-            Ok(pointer_bytes) => {
-                let pointer: DomainManifestPointer = serde_json::from_slice(&pointer_bytes)
-                    .map_err(|e| CatalogError::Serialization {
-                        message: format!("failed to parse manifest pointer at {pointer_path}: {e}"),
-                    })?;
-
-                match self.storage.get_raw(&pointer.manifest_path).await {
-                    Ok(bytes) => Ok(bytes),
-                    Err(
-                        arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. },
-                    ) => {
-                        // Migration fallback: pointer exists but immutable snapshot is unavailable.
-                        self.storage.get_raw(legacy_path).await.map_err(Into::into)
-                    }
-                    Err(e) => Err(e.into()),
-                }
-            }
-            Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
-                self.storage.get_raw(legacy_path).await.map_err(Into::into)
-            }
-            Err(e) => Err(e.into()),
+        if domain == CatalogDomain::Executions {
+            let path = executions_path.ok_or_else(|| CatalogError::InvariantViolation {
+                message: "executions manifest path is required".to_string(),
+            })?;
+            return self.storage.get_raw(path).await.map_err(Into::into);
         }
+
+        let pointer_path = CatalogPaths::domain_manifest_pointer(domain);
+        let pointer_bytes = self.storage.get_raw(&pointer_path).await?;
+        let pointer: DomainManifestPointer =
+            serde_json::from_slice(&pointer_bytes).map_err(|e| CatalogError::Serialization {
+                message: format!("failed to parse manifest pointer at {pointer_path}: {e}"),
+            })?;
+        self.storage
+            .get_raw(&pointer.manifest_path)
+            .await
+            .map_err(Into::into)
     }
 
     async fn read_catalog_manifest_for_root_token(
@@ -1330,12 +1323,13 @@ mod tests {
         let writer = Tier1Writer::new(storage.clone());
         writer.initialize().await.expect("init");
 
-        let root_bytes = storage
-            .get_raw(CatalogPaths::ROOT_MANIFEST)
+        let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Search);
+        let pointer_bytes = storage
+            .get_raw(&pointer_path)
             .await
-            .expect("root manifest");
-        let mut root: RootManifest = serde_json::from_slice(&root_bytes).expect("root parse");
-        root.normalize_paths();
+            .expect("search pointer");
+        let current_pointer: DomainManifestPointer =
+            serde_json::from_slice(&pointer_bytes).expect("pointer parse");
 
         let snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Search, 1);
         let mut snapshot = SnapshotInfo::new(1, snapshot_path.clone());
@@ -1348,10 +1342,16 @@ mod tests {
         });
 
         let search_bytes = storage
-            .get_raw(&root.search_manifest_path)
+            .get_raw(&current_pointer.manifest_path)
             .await
             .expect("search manifest");
         let mut search: SearchManifest = serde_json::from_slice(&search_bytes).expect("parse");
+        let manifest_id = crate::manifest::format_manifest_id(1);
+        let manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Search, &manifest_id);
+        search.manifest_id = manifest_id.clone();
+        search.epoch = 1;
+        search.previous_manifest_path = Some(current_pointer.manifest_path);
         search.snapshot_version = 1;
         search.base_path = snapshot_path;
         search.snapshot = Some(snapshot);
@@ -1360,12 +1360,29 @@ mod tests {
         let search_payload = serde_json::to_vec(&search).expect("serialize");
         storage
             .put_raw(
-                &root.search_manifest_path,
+                &manifest_path,
                 Bytes::from(search_payload),
-                WritePrecondition::None,
+                WritePrecondition::DoesNotExist,
             )
             .await
             .expect("write search manifest");
+        storage
+            .put_raw(
+                &pointer_path,
+                Bytes::from(
+                    serde_json::to_vec(&DomainManifestPointer {
+                        manifest_id,
+                        manifest_path,
+                        epoch: 1,
+                        parent_pointer_hash: None,
+                        updated_at: Utc::now(),
+                    })
+                    .expect("serialize pointer"),
+                ),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write pointer");
 
         let reader = CatalogReader::new(storage);
         let paths = reader
@@ -1390,19 +1407,26 @@ mod tests {
         let writer = Tier1Writer::new(storage.clone());
         writer.initialize().await.expect("init");
 
-        let root_bytes = storage
-            .get_raw(CatalogPaths::ROOT_MANIFEST)
+        let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+        let pointer_bytes = storage
+            .get_raw(&pointer_path)
             .await
-            .expect("root manifest");
-        let mut root: RootManifest = serde_json::from_slice(&root_bytes).expect("root parse");
-        root.normalize_paths();
+            .expect("catalog pointer");
+        let current_pointer: DomainManifestPointer =
+            serde_json::from_slice(&pointer_bytes).expect("pointer parse");
 
         let catalog_bytes = storage
-            .get_raw(&root.catalog_manifest_path)
+            .get_raw(&current_pointer.manifest_path)
             .await
             .expect("catalog manifest");
         let mut catalog: CatalogDomainManifest =
             serde_json::from_slice(&catalog_bytes).expect("catalog parse");
+        let manifest_id = crate::manifest::format_manifest_id(1);
+        let manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, &manifest_id);
+        catalog.manifest_id = manifest_id.clone();
+        catalog.epoch = 1;
+        catalog.previous_manifest_path = Some(current_pointer.manifest_path);
         catalog.snapshot_version = 1;
         catalog.snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1);
         catalog.snapshot = None;
@@ -1411,12 +1435,29 @@ mod tests {
         let catalog_payload = serde_json::to_vec(&catalog).expect("serialize");
         storage
             .put_raw(
-                &root.catalog_manifest_path,
+                &manifest_path,
                 Bytes::from(catalog_payload),
-                WritePrecondition::None,
+                WritePrecondition::DoesNotExist,
             )
             .await
             .expect("write catalog manifest");
+        storage
+            .put_raw(
+                &pointer_path,
+                Bytes::from(
+                    serde_json::to_vec(&DomainManifestPointer {
+                        manifest_id,
+                        manifest_path,
+                        epoch: 1,
+                        parent_pointer_hash: None,
+                        updated_at: Utc::now(),
+                    })
+                    .expect("serialize pointer"),
+                ),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write pointer");
 
         let reader = CatalogReader::new(storage);
         let paths = reader

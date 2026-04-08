@@ -430,71 +430,6 @@ async fn load_catalog_ledger_event_source(
 }
 
 #[derive(Debug)]
-struct FailPathBackend {
-    inner: MemoryBackend,
-    fail_path: String,
-    remaining_failures: std::sync::atomic::AtomicUsize,
-}
-
-impl FailPathBackend {
-    fn new(fail_path: impl Into<String>, failures: usize) -> Self {
-        Self {
-            inner: MemoryBackend::new(),
-            fail_path: fail_path.into(),
-            remaining_failures: std::sync::atomic::AtomicUsize::new(failures),
-        }
-    }
-}
-
-#[async_trait]
-impl StorageBackend for FailPathBackend {
-    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
-        self.inner.get(path).await
-    }
-
-    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
-        self.inner.get_range(path, range).await
-    }
-
-    async fn put(
-        &self,
-        path: &str,
-        data: Bytes,
-        precondition: WritePrecondition,
-    ) -> arco_core::Result<WriteResult> {
-        use std::sync::atomic::Ordering;
-
-        if path == self.fail_path && matches!(&precondition, WritePrecondition::None) {
-            let remaining = self.remaining_failures.load(Ordering::SeqCst);
-            if remaining > 0 {
-                self.remaining_failures.fetch_sub(1, Ordering::SeqCst);
-                return Err(arco_core::Error::storage(format!(
-                    "injected failure for {path}"
-                )));
-            }
-        }
-
-        self.inner.put(path, data, precondition).await
-    }
-
-    async fn delete(&self, path: &str) -> arco_core::Result<()> {
-        self.inner.delete(path).await
-    }
-
-    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
-        self.inner.list(prefix).await
-    }
-
-    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
-        self.inner.head(path).await
-    }
-
-    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
-        self.inner.signed_url(path, expiry).await
-    }
-}
-
-#[derive(Debug)]
 struct FailPrefixBackend {
     inner: MemoryBackend,
     fail_prefix: String,
@@ -1742,9 +1677,12 @@ async fn apply_catalog_ddl_keeps_visible_success_when_pointer_readback_fails() -
         "tenant={TENANT}/workspace={WORKSPACE}/{}",
         CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog)
     );
+    // Fresh catalog DDL bootstraps the v0 pointer, publishes the default catalog,
+    // then publishes the requested namespace. Trigger after the third pointer put
+    // so the injected read failure lands after visibility rather than mid-commit.
     let backend: Arc<dyn StorageBackend> = Arc::new(FailReadsAfterTriggerPutBackend::new(
         pointer_path.clone(),
-        2,
+        3,
         vec![pointer_path],
         Vec::new(),
         2,
@@ -2026,11 +1964,8 @@ async fn apply_catalog_ddl_propagates_actor_to_catalog_ledger_events() -> Result
 }
 
 #[tokio::test]
-async fn apply_catalog_ddl_propagates_repair_pending_when_legacy_mirror_write_fails() -> Result<()>
-{
-    let fail_path =
-        format!("tenant={TENANT}/workspace={WORKSPACE}/manifests/catalog.manifest.json");
-    let backend: Arc<dyn StorageBackend> = Arc::new(FailPathBackend::new(fail_path, 1));
+async fn apply_catalog_ddl_does_not_create_legacy_catalog_manifest_mirror() -> Result<()> {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = test_router_with_backend(backend.clone());
     let request =
         catalog_create_namespace_request("idem-cat-repair-01", "req-cat-repair-01", "repairing");
@@ -2045,21 +1980,32 @@ async fn apply_catalog_ddl_propagates_repair_pending_when_legacy_mirror_write_fa
     .await?;
 
     let receipt = response.receipt.context("catalog repair receipt missing")?;
-    assert!(response.repair_pending);
+    assert!(
+        !response.repair_pending,
+        "catalog visible commits should not report repair_pending after legacy side-effect removal"
+    );
 
-    let stored = load_catalog_tx_record(backend, &receipt.tx_id).await?;
+    let stored = load_catalog_tx_record(backend.clone(), &receipt.tx_id).await?;
     assert_eq!(stored.status, ControlPlaneTxStatus::Visible);
-    assert!(stored.repair_pending);
+    assert!(!stored.repair_pending);
+    assert!(
+        backend
+            .head(&format!(
+                "tenant={TENANT}/workspace={WORKSPACE}/{}",
+                CatalogPaths::domain_manifest(CatalogDomain::Catalog)
+            ))
+            .await?
+            .is_none(),
+        "catalog legacy mutable manifest should not be created"
+    );
 
     Ok(())
 }
 
 #[tokio::test]
-async fn commit_orchestration_batch_propagates_repair_pending_when_legacy_mirror_write_fails()
+async fn commit_orchestration_batch_does_not_create_legacy_orchestration_manifest_mirror()
 -> Result<()> {
-    let fail_path =
-        format!("tenant={TENANT}/workspace={WORKSPACE}/state/orchestration/manifest.json");
-    let backend: Arc<dyn StorageBackend> = Arc::new(FailPathBackend::new(fail_path, 1));
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = test_router_with_backend(backend.clone());
     let request =
         orchestration_request("idem-orch-repair-01", "req-orch-repair-01", "run-repair-01");
@@ -2076,11 +2022,23 @@ async fn commit_orchestration_batch_propagates_repair_pending_when_legacy_mirror
     let receipt = response
         .receipt
         .context("orchestration repair receipt missing")?;
-    assert!(response.repair_pending);
+    assert!(
+        !response.repair_pending,
+        "orchestration visible commits should not report repair_pending after legacy side-effect removal"
+    );
 
-    let stored = load_orchestration_tx_record(backend, &receipt.tx_id).await?;
+    let stored = load_orchestration_tx_record(backend.clone(), &receipt.tx_id).await?;
     assert_eq!(stored.status, ControlPlaneTxStatus::Visible);
-    assert!(stored.repair_pending);
+    assert!(!stored.repair_pending);
+    assert!(
+        backend
+            .head(&format!(
+                "tenant={TENANT}/workspace={WORKSPACE}/state/orchestration/manifest.json"
+            ))
+            .await?
+            .is_none(),
+        "orchestration legacy mutable manifest should not be created"
+    );
 
     Ok(())
 }

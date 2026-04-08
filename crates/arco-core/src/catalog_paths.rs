@@ -10,10 +10,10 @@
 //! tenant={tenant}/workspace={workspace}/
 //! ├── manifests/
 //! │   ├── root.manifest.json
-//! │   ├── catalog.manifest.json          # Legacy compatibility path
-//! │   ├── lineage.manifest.json          # Legacy compatibility path
-//! │   ├── executions.manifest.json       # Legacy compatibility path
-//! │   ├── search.manifest.json           # Legacy compatibility path
+//! │   ├── catalog.manifest.json          # Retired compatibility path
+//! │   ├── lineage.manifest.json          # Retired compatibility path
+//! │   ├── executions.manifest.json       # Current executions manifest path
+//! │   ├── search.manifest.json           # Retired compatibility path
 //! │   ├── catalog.pointer.json
 //! │   ├── lineage.pointer.json
 //! │   ├── executions.pointer.json
@@ -103,8 +103,8 @@ impl std::fmt::Display for CatalogDomain {
 ///
 /// assert_eq!(CatalogPaths::ROOT_MANIFEST, "manifests/root.manifest.json");
 /// assert_eq!(
-///     CatalogPaths::domain_manifest(CatalogDomain::Catalog),
-///     "manifests/catalog.manifest.json"
+///     CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
+///     "manifests/catalog.pointer.json"
 /// );
 /// ```
 pub struct CatalogPaths;
@@ -121,7 +121,7 @@ impl CatalogPaths {
     // Manifest Paths
     // =========================================================================
 
-    /// Returns the manifest path for a domain.
+    /// Returns the mutable manifest compatibility path for a domain.
     #[must_use]
     pub fn domain_manifest(domain: CatalogDomain) -> String {
         format!("manifests/{}.manifest.json", domain.as_str())

@@ -6,13 +6,13 @@ Accepted
 
 ## Context
 
-Catalog and orchestration state currently rely on mutable manifest objects. This
-creates avoidable contention, weak forensic history, and stale-writer risk during
-failover. We need a commit primitive that is:
+Catalog and orchestration state previously relied on mutable manifest objects.
+This created avoidable contention, weak forensic history, and stale-writer risk
+during failover. We need a commit primitive that is:
 
 1. Object-store friendly (append-only immutable writes + conditional swap).
 2. Explicitly fenceable by epoch.
-3. Backward compatible during migration.
+3. Backward compatible during migration and bootstrap replay.
 
 ## Decision
 
@@ -27,15 +27,16 @@ operational work.
 
 Catalog domains:
 
-- Legacy compatibility path: `manifests/{domain}.manifest.json`
 - Pointer: `manifests/{domain}.pointer.json`
 - Immutable snapshots: `manifests/{domain}/{manifest_id}.json`
+- Retired compatibility path: `manifests/{domain}.manifest.json` (no longer written for catalog,
+  lineage, or search)
 
 Orchestration:
 
-- Legacy compatibility path: `state/orchestration/manifest.json`
 - Pointer: `state/orchestration/manifest.pointer.json`
 - Immutable snapshots: `state/orchestration/manifests/{manifest_id}.json`
+- Retired compatibility path: `state/orchestration/manifest.json` (no longer written)
 
 ### Manifest IDs
 
@@ -45,14 +46,14 @@ Orchestration:
 
 ### Publish protocol
 
-1. Read current pointer (or fallback legacy manifest if pointer missing).
+1. Read current pointer and resolve its immutable manifest snapshot.
 2. Build next immutable manifest snapshot with:
    - `manifest_id`
    - `epoch`
    - `previous_manifest_path`
 3. Write immutable snapshot with `DoesNotExist`.
 4. CAS-update pointer using object version preconditions.
-5. Keep a compatibility mirror write to the legacy mutable manifest path during migration.
+5. Do not write the retired mutable compatibility path as part of success.
 
 ### Epoch fencing
 
@@ -62,8 +63,8 @@ Orchestration:
 
 ### Reader behavior
 
-- Readers first resolve pointer and then load immutable snapshot.
-- If pointer is absent, readers fallback to legacy path.
+- Readers resolve the pointer and then load the immutable snapshot it names.
+- Legacy mutable manifests are no longer part of the correctness path.
 
 ## Consequences
 
@@ -85,8 +86,9 @@ Orchestration:
 5. Snapshot IDs are strictly monotonic fixed-width decimals per domain.
 6. Epoch is monotonic across pointers and published snapshots for each domain.
 7. Writer epochs behind pointer epoch are rejected as stale.
-8. Readers are pointer-first with legacy fallback while migration remains active.
-9. Legacy stable manifest paths are mirrored on successful publish until old readers are retired.
+8. Readers are pointer-first; mutable legacy manifests are not required for correctness.
+9. `root.manifest.json` may retain field aliases for backward-compatible parsing, but new root
+   manifests point catalog/lineage/search at pointer paths.
 10. Snapshot GC never deletes currently pointer-targeted snapshots.
 
 ## Migration Compatibility Matrix
@@ -94,8 +96,8 @@ Orchestration:
 | Writer | Reader | Outcome |
 |---|---|---|
 | Legacy (mutable manifest only) | Legacy | Baseline behavior |
-| Legacy | New (pointer-first + fallback) | Reads via fallback; no break |
-| New (snapshot + pointer + legacy mirror) | Legacy | Reads mirrored legacy manifest |
+| Legacy | New (pointer-first + compatibility parsing) | Reads can still succeed while bootstrap is migrated |
+| New (snapshot + pointer only) | Legacy | Legacy direct-domain readers break; retired by ADR-034 cleanup |
 | New | New | Pointer-selected immutable snapshots |
 
 ## Failure-State Truth Table
@@ -104,14 +106,13 @@ Orchestration:
 |---|---|---|---|
 | Fail | Not attempted | No new state visible | Retry publish |
 | Success | Fail (CAS race) | Previous pointer remains visible | Safe orphan snapshot; reconciler/GC cleanup |
-| Success | Success | New state visible atomically | Continue post-commit bookkeeping |
-| Success | Success + post-commit side-effect fail | New state visible | Reconciler repairs bookkeeping/idempotent side-effects |
+| Success | Success | New state visible atomically | Continue |
 
 ## Rollback Playbook
 
-1. Freeze rollout to new writers (switch config to legacy write path only).
-2. Keep readers in pointer-first mode with legacy fallback enabled.
-3. Verify root + domain legacy manifests are current and readable.
+1. Freeze rollout to new writers.
+2. Keep readers pointer-first.
+3. Verify root manifest and domain pointers resolve to readable immutable manifests.
 4. Disable pointer CAS publishing for affected domains.
 5. Run reconciler and orphan snapshot sweeper in dry-run, then enforce mode.
-6. Resume legacy-only writes until corrective patch is deployed.
+6. Resume writes only after corrective patching; do not rely on retired mutable manifests.

@@ -16,14 +16,17 @@ Using a single manifest creates lock contention: lineage writes happening "as ta
 
 ### Four Domain Manifests
 
-Split catalog state into four independent domains, each with its own manifest and lock:
+Split catalog state into four independent domains, each with its own publish entrypoint and lock:
 
-| Domain | Manifest | Lock | Update Rate | Contents |
-|--------|----------|------|-------------|----------|
-| catalog | `catalog.manifest.json` | `catalog.lock.json` | Low (DDL) | Namespaces, tables, columns |
-| lineage | `lineage.manifest.json` | `lineage.lock.json` | Medium | Lineage edges, dependency graph |
+| Domain | Root Entry Path | Lock | Update Rate | Contents |
+|--------|-----------------|------|-------------|----------|
+| catalog | `catalog.pointer.json` | `catalog.lock.json` | Low (DDL) | Namespaces, tables, columns |
+| lineage | `lineage.pointer.json` | `lineage.lock.json` | Medium | Lineage edges, dependency graph |
 | executions | `executions.manifest.json` | `executions.lock.json` | High (Tier-2) | Run/task execution state |
-| search | `search.manifest.json` | `search.lock.json` | Low (rebuild) | Token postings index |
+| search | `search.pointer.json` | `search.lock.json` | Low (rebuild) | Token postings index |
+
+Catalog, lineage, and search publish immutable manifests under
+`manifests/{domain}/{manifest_id}.json` and expose visibility through the pointer path named above.
 
 ### Root Manifest as Entry Point
 
@@ -32,15 +35,17 @@ The `root.manifest.json` is the **only stable contract** for external readers:
 ```json
 {
   "version": 1,
-  "catalog_manifest_path": "manifests/catalog.manifest.json",
-  "lineage_manifest_path": "manifests/lineage.manifest.json",
+  "catalog_manifest_path": "manifests/catalog.pointer.json",
+  "lineage_manifest_path": "manifests/lineage.pointer.json",
   "executions_manifest_path": "manifests/executions.manifest.json",
-  "search_manifest_path": "manifests/search.manifest.json",
+  "search_manifest_path": "manifests/search.pointer.json",
   "updated_at": "2025-01-15T10:00:00Z"
 }
 ```
 
-Readers MUST start from root manifest and follow paths to domain manifests. This decouples filenames from client code.
+Readers MUST start from root manifest and follow paths to the per-domain visibility entrypoint. This
+decouples filenames from client code and lets catalog/lineage/search readers resolve immutable
+manifest snapshots through pointers.
 
 ### Migration Strategy (from current naming)
 

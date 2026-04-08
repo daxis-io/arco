@@ -495,16 +495,16 @@ impl GarbageCollector {
         // Read root manifest to find domain manifests
         let root = self.read_root_manifest().await?;
         let catalog_manifest_path = self
-            .resolve_domain_manifest_path(CatalogDomain::Catalog, &root.catalog_manifest_path)
+            .current_tier1_manifest_path(CatalogDomain::Catalog)
             .await?;
         let lineage_manifest_path = self
-            .resolve_domain_manifest_path(CatalogDomain::Lineage, &root.lineage_manifest_path)
+            .current_tier1_manifest_path(CatalogDomain::Lineage)
             .await?;
         let executions_manifest_path = self
             .resolve_domain_manifest_path(CatalogDomain::Executions, &root.executions_manifest_path)
             .await?;
         let search_manifest_path = self
-            .resolve_domain_manifest_path(CatalogDomain::Search, &root.search_manifest_path)
+            .current_tier1_manifest_path(CatalogDomain::Search)
             .await?;
 
         // Catalog domain
@@ -712,24 +712,21 @@ impl GarbageCollector {
         domain: CatalogDomain,
         legacy_path: &str,
     ) -> Result<String> {
-        let pointer_path = CatalogPaths::domain_manifest_pointer(domain);
-        match self.storage.get_raw(&pointer_path).await {
-            Ok(pointer_bytes) => {
-                let pointer: DomainManifestPointer = serde_json::from_slice(&pointer_bytes)
-                    .map_err(|e| CatalogError::Serialization {
-                        message: format!("failed to parse JSON at {pointer_path}: {e}"),
-                    })?;
-                match self.storage.head_raw(&pointer.manifest_path).await {
-                    Ok(Some(_)) => Ok(pointer.manifest_path),
-                    Ok(None) => Ok(legacy_path.to_string()),
-                    Err(e) => Err(CatalogError::from(e)),
-                }
-            }
-            Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
-                Ok(legacy_path.to_string())
-            }
-            Err(e) => Err(CatalogError::from(e)),
+        if domain == CatalogDomain::Executions {
+            Ok(legacy_path.to_string())
+        } else {
+            self.current_tier1_manifest_path(domain).await
         }
+    }
+
+    async fn current_tier1_manifest_path(&self, domain: CatalogDomain) -> Result<String> {
+        let pointer_path = CatalogPaths::domain_manifest_pointer(domain);
+        let pointer_bytes = self.storage.get_raw(&pointer_path).await?;
+        let pointer: DomainManifestPointer =
+            serde_json::from_slice(&pointer_bytes).map_err(|e| CatalogError::Serialization {
+                message: format!("failed to parse JSON at {pointer_path}: {e}"),
+            })?;
+        Ok(pointer.manifest_path)
     }
 }
 
@@ -914,17 +911,10 @@ mod tests {
         let tier1_writer = crate::Tier1Writer::new(storage.clone());
         tier1_writer.initialize().await.expect("init");
 
-        let root_bytes = storage
-            .get_raw(CatalogPaths::ROOT_MANIFEST)
-            .await
-            .expect("read root");
-        let mut root: RootManifest = serde_json::from_slice(&root_bytes).expect("parse root");
-        root.normalize_paths();
-
         let legacy_manifest = catalog_manifest_for_version(1, 1, "legacy.parquet", 1);
         storage
             .put_raw(
-                &root.catalog_manifest_path,
+                &CatalogPaths::domain_manifest(CatalogDomain::Catalog),
                 Bytes::from(serde_json::to_vec(&legacy_manifest).expect("serialize legacy")),
                 WritePrecondition::None,
             )
@@ -954,7 +944,7 @@ mod tests {
             .put_raw(
                 &CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
                 Bytes::from(serde_json::to_vec(&pointer).expect("serialize pointer")),
-                WritePrecondition::DoesNotExist,
+                WritePrecondition::None,
             )
             .await
             .expect("write pointer");
@@ -984,17 +974,10 @@ mod tests {
         let tier1_writer = crate::Tier1Writer::new(storage.clone());
         tier1_writer.initialize().await.expect("init");
 
-        let root_bytes = storage
-            .get_raw(CatalogPaths::ROOT_MANIFEST)
-            .await
-            .expect("read root");
-        let mut root: RootManifest = serde_json::from_slice(&root_bytes).expect("parse root");
-        root.normalize_paths();
-
         let legacy_manifest = catalog_manifest_for_version(1, 1, "legacy.parquet", 1);
         storage
             .put_raw(
-                &root.catalog_manifest_path,
+                &CatalogPaths::domain_manifest(CatalogDomain::Catalog),
                 Bytes::from(serde_json::to_vec(&legacy_manifest).expect("serialize legacy")),
                 WritePrecondition::None,
             )
@@ -1024,7 +1007,7 @@ mod tests {
             .put_raw(
                 &CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
                 Bytes::from(serde_json::to_vec(&pointer).expect("serialize pointer")),
-                WritePrecondition::DoesNotExist,
+                WritePrecondition::None,
             )
             .await
             .expect("write pointer");

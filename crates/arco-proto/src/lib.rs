@@ -350,8 +350,11 @@ mod tests {
             path: "s3://bucket/output.parquet".into(),
             size_bytes: 128,
             row_count: 0,
-            content_hash: "abc123".into(),
-            format: "parquet".into(),
+            content_digest: Some(FileHash {
+                algorithm: HashAlgorithm::Sha256 as i32,
+                digest: vec![0xAB; 32],
+            }),
+            file_format: FileFormat::Parquet as i32,
         });
         output.row_count = 0;
         output.byte_size = 128;
@@ -389,12 +392,15 @@ mod tests {
             path: "s3://bucket/output.parquet".into(),
             size_bytes: 0,
             row_count: 0,
-            content_hash: "def456".into(),
-            format: "parquet".into(),
+            content_digest: Some(FileHash {
+                algorithm: HashAlgorithm::Sha256 as i32,
+                digest: vec![0xCD; 32],
+            }),
+            file_format: FileFormat::Parquet as i32,
         });
         zero_stats.row_count = 0;
         zero_stats.byte_size = 0;
-        zero_stats.published_at = Some(prost_types::Timestamp {
+        zero_stats.published_at = Some(pbjson_types::Timestamp {
             seconds: 1_742_770_800,
             nanos: 0,
         });

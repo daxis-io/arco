@@ -201,7 +201,7 @@ async fn compact_orchestration_events_with_fencing(
             request_id,
         )
         .await
-        .map_err(map_flow_compaction_error)?;
+        .map_err(|error| map_flow_compaction_error(&error))?;
         return require_visible_compaction(response);
     }
 
@@ -209,7 +209,7 @@ async fn compact_orchestration_events_with_fencing(
     let result = compactor
         .compact_events_fenced(event_paths, fencing_token, lock_path)
         .await
-        .map_err(map_flow_compaction_error)?;
+        .map_err(|error| map_flow_compaction_error(&error))?;
     require_visible_compaction(OrchestrationCompactionResult {
         events_processed: result.events_processed,
         delta_id: result.delta_id,
@@ -257,7 +257,7 @@ fn require_visible_compaction(
     )))
 }
 
-fn map_flow_compaction_error(error: FlowError) -> ApiError {
+fn map_flow_compaction_error(error: &FlowError) -> ApiError {
     match error {
         FlowError::StaleFencingToken { .. }
         | FlowError::FencingLockUnavailable { .. }

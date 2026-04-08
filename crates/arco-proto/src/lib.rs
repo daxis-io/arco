@@ -272,8 +272,10 @@ mod tests {
         let pk: PartitionKey = serde_json::from_str(fixture).expect("v2 fixture should parse");
         let encoded = pk.encode_to_vec();
         let decoded = PartitionKey::decode(encoded.as_slice())?;
-        let original: JsonValue = serde_json::from_str(fixture).expect("fixture should be valid JSON");
-        let decoded_json = serde_json::to_value(&decoded).expect("decoded partition key should serialize");
+        let original: JsonValue =
+            serde_json::from_str(fixture).expect("fixture should be valid JSON");
+        let decoded_json =
+            serde_json::to_value(&decoded).expect("decoded partition key should serialize");
 
         assert_eq!(decoded_json, original);
         Ok(())

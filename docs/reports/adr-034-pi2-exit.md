@@ -4,6 +4,11 @@
 
 PI-2 repo scope is complete.
 
+Historical note as of April 8, 2026: this report records the PI-2 canary-state recommendation.
+The later PI-3 cleanup changed the steady-state repair automation default from
+`current_head_only` to `full`; use `docs/reports/adr-034-pi3-exit.md` and
+`docs/runbooks/control-plane-repair-and-dark-launch.md` for the current repo-side contract.
+
 Delivered in this change set:
 
 - active orchestration writer and flow-service callsites now use the shared fenced append-and-compact contract

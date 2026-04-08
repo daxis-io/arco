@@ -53,7 +53,7 @@ Repair automation defaults in PI-3:
 - `ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS`
   - default: `300`
 - `ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_SCOPE`
-  - default: `current_head_only`
+  - default: `full`
   - supported values: `current_head_only`, `full`
 - `ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE`
   - default: `enforce`
@@ -61,7 +61,7 @@ Repair automation defaults in PI-3:
 - `ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS`
   - default: `300`
 - `ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE`
-  - default: `current_head_only`
+  - default: `full`
   - supported values: `current_head_only`, `full`
 - `ARCO_COMPACTOR_REPAIR_AUTOMATION_DOMAINS`
   - default: `catalog,lineage,search`
@@ -69,9 +69,9 @@ Repair automation defaults in PI-3:
 These env vars are read once during service startup. Apply changes through the deployment mechanism
 for the affected service and restart or redeploy before running the probes below.
 
-After legacy current-head side-effect removal, `current_head_only` is retained for request/config
-compatibility but should stay empty in steady state. Use `repairScope=full` when operators need
-generic orphan cleanup.
+After legacy current-head side-effect removal, `full` is the production default because generic
+orphan cleanup is the remaining steady-state work. `current_head_only` is retained only for
+request/config compatibility and should stay empty in steady state.
 
 ## Preconditions
 

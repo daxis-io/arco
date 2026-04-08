@@ -109,43 +109,52 @@ impl Tier1Writer {
             .await
             .map_err(CatalogError::from)?;
 
-        let mut root = RootManifest::new();
+        let mut root = match self.storage.get_raw(CatalogPaths::ROOT_MANIFEST).await {
+            Ok(bytes) => serde_json::from_slice::<RootManifest>(&bytes).map_err(|e| {
+                CatalogError::Serialization {
+                    message: format!("parse JSON at {}: {e}", CatalogPaths::ROOT_MANIFEST),
+                }
+            })?,
+            Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+                RootManifest::new()
+            }
+            Err(error) => return Err(CatalogError::from(error)),
+        };
+        let legacy_root = root.clone();
         root.normalize_paths();
-        self.ensure_json_exists(CatalogPaths::ROOT_MANIFEST, &root)
-            .await?;
-
-        self.ensure_json_exists(
-            &CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, INITIAL_MANIFEST_ID),
+        self.bootstrap_tier1_manifest(
+            CatalogDomain::Catalog,
+            &legacy_root.catalog_manifest_path,
             &CatalogDomainManifest::new(),
+            |manifest: &CatalogDomainManifest| manifest.manifest_id.as_str(),
+            |manifest: &CatalogDomainManifest| manifest.fencing_token.unwrap_or(manifest.epoch),
         )
         .await?;
-        self.ensure_json_exists(
-            &CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
-            &DomainManifestPointer::new(CatalogDomain::Catalog),
-        )
-        .await?;
-        self.ensure_json_exists(
-            &CatalogPaths::domain_manifest_snapshot(CatalogDomain::Lineage, INITIAL_MANIFEST_ID),
+        self.bootstrap_tier1_manifest(
+            CatalogDomain::Lineage,
+            &legacy_root.lineage_manifest_path,
             &LineageManifest::new(),
+            |manifest: &LineageManifest| manifest.manifest_id.as_str(),
+            |manifest: &LineageManifest| manifest.fencing_token.unwrap_or(manifest.epoch),
         )
         .await?;
-        self.ensure_json_exists(
-            &CatalogPaths::domain_manifest_pointer(CatalogDomain::Lineage),
-            &DomainManifestPointer::new(CatalogDomain::Lineage),
+        self.bootstrap_tier1_manifest(
+            CatalogDomain::Search,
+            &legacy_root.search_manifest_path,
+            &SearchManifest::new(),
+            |manifest: &SearchManifest| manifest.manifest_id.as_str(),
+            |manifest: &SearchManifest| manifest.fencing_token.unwrap_or(manifest.epoch),
         )
         .await?;
+        self.storage
+            .put_raw(
+                CatalogPaths::ROOT_MANIFEST,
+                json_bytes(&root)?,
+                WritePrecondition::None,
+            )
+            .await?;
         self.ensure_json_exists(&root.executions_manifest_path, &ExecutionsManifest::new())
             .await?;
-        self.ensure_json_exists(
-            &CatalogPaths::domain_manifest_snapshot(CatalogDomain::Search, INITIAL_MANIFEST_ID),
-            &SearchManifest::new(),
-        )
-        .await?;
-        self.ensure_json_exists(
-            &CatalogPaths::domain_manifest_pointer(CatalogDomain::Search),
-            &DomainManifestPointer::new(CatalogDomain::Search),
-        )
-        .await?;
 
         guard.release().await.map_err(CatalogError::from)
     }
@@ -465,6 +474,67 @@ impl Tier1Writer {
         }
     }
 
+    async fn bootstrap_tier1_manifest<T, FManifestId, FEpoch>(
+        &self,
+        domain: CatalogDomain,
+        legacy_root_path: &str,
+        default_manifest: &T,
+        manifest_id: FManifestId,
+        epoch: FEpoch,
+    ) -> Result<()>
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + Sync,
+        FManifestId: Fn(&T) -> &str,
+        FEpoch: Fn(&T) -> u64,
+    {
+        let pointer_path = CatalogPaths::domain_manifest_pointer(domain);
+        if self.storage.head_raw(&pointer_path).await?.is_some() {
+            return Ok(());
+        }
+
+        let legacy_path = legacy_manifest_candidate_path(domain, legacy_root_path);
+        if let Some(legacy_bytes) = self.get_raw_if_exists(&legacy_path).await? {
+            let manifest: T =
+                serde_json::from_slice(&legacy_bytes).map_err(|e| CatalogError::Serialization {
+                    message: format!("parse JSON at {legacy_path}: {e}"),
+                })?;
+            let snapshot_manifest_path =
+                CatalogPaths::domain_manifest_snapshot(domain, manifest_id(&manifest));
+            match self
+                .storage
+                .put_raw(
+                    &snapshot_manifest_path,
+                    Bytes::from(legacy_bytes),
+                    WritePrecondition::DoesNotExist,
+                )
+                .await?
+            {
+                WriteResult::Success { .. } | WriteResult::PreconditionFailed { .. } => {}
+            }
+            self.ensure_json_exists(
+                &pointer_path,
+                &DomainManifestPointer {
+                    manifest_id: manifest_id(&manifest).to_string(),
+                    manifest_path: snapshot_manifest_path,
+                    epoch: epoch(&manifest),
+                    parent_pointer_hash: None,
+                    updated_at: Utc::now(),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+
+        self.ensure_json_exists(
+            &CatalogPaths::domain_manifest_snapshot(domain, INITIAL_MANIFEST_ID),
+            default_manifest,
+        )
+        .await?;
+        self.ensure_json_exists(&pointer_path, &DomainManifestPointer::new(domain))
+            .await?;
+        Ok(())
+    }
+
     async fn read_json<T>(&self, path: &str) -> Result<T>
     where
         T: serde::de::DeserializeOwned,
@@ -488,10 +558,22 @@ impl Tier1Writer {
         self.read_json(&pointer.manifest_path).await
     }
 
+    async fn get_raw_if_exists(&self, path: &str) -> Result<Option<Bytes>> {
+        match self.storage.get_raw(path).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+                Ok(None)
+            }
+            Err(error) => Err(CatalogError::from(error)),
+        }
+    }
+
     /// Builds a commit record for an update operation.
     ///
-    /// If the previous manifest has a `last_commit_id`, this method loads that
-    /// commit record from storage and computes its hash for the tamper-evident chain.
+    /// Current Tier-1 writes thread through `last_commit_id` for correlation,
+    /// but they do not load or persist durable commit-record objects. The
+    /// returned receipt therefore keeps `prev_commit_id` when available and
+    /// leaves `prev_commit_hash` unset.
     async fn build_commit_record(
         &self,
         prev: &CatalogDomainManifest,
@@ -533,6 +615,17 @@ fn next_commit_ulid(previous: Option<&str>) -> Result<String> {
             message: "commit_ulid overflow while generating monotonic successor".to_string(),
         })?;
     Ok(next.to_string())
+}
+
+fn legacy_manifest_candidate_path(domain: CatalogDomain, root_path: &str) -> String {
+    if let Some(domain) = root_path
+        .strip_prefix("manifests/")
+        .and_then(|path| path.strip_suffix(".manifest.json"))
+    {
+        return CatalogPaths::domain_manifest_str(domain);
+    }
+
+    CatalogPaths::domain_manifest(domain)
 }
 
 async fn next_available_manifest_id(
@@ -724,6 +817,129 @@ mod tests {
 
         writer.initialize().await?;
         writer.initialize().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_initialize_migrates_legacy_tier1_heads_to_pointers() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+
+        let legacy_root = RootManifest {
+            version: 1,
+            catalog_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Catalog),
+            lineage_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Lineage),
+            executions_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Executions),
+            search_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Search),
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                CatalogPaths::ROOT_MANIFEST,
+                json_bytes(&legacy_root)?,
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+
+        let mut legacy_catalog = CatalogDomainManifest::new();
+        legacy_catalog.manifest_id = "00000000000000000007".to_string();
+        legacy_catalog.snapshot_version = 7;
+        legacy_catalog.snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 7);
+        storage
+            .put_raw(
+                &CatalogPaths::domain_manifest(CatalogDomain::Catalog),
+                json_bytes(&legacy_catalog)?,
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+
+        let mut legacy_lineage = LineageManifest::new();
+        legacy_lineage.manifest_id = "00000000000000000003".to_string();
+        legacy_lineage.snapshot_version = 3;
+        legacy_lineage.edges_path = CatalogPaths::snapshot_dir(CatalogDomain::Lineage, 3);
+        storage
+            .put_raw(
+                &CatalogPaths::domain_manifest(CatalogDomain::Lineage),
+                json_bytes(&legacy_lineage)?,
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+
+        let mut legacy_search = SearchManifest::new();
+        legacy_search.manifest_id = "00000000000000000005".to_string();
+        legacy_search.snapshot_version = 5;
+        legacy_search.base_path = CatalogPaths::snapshot_dir(CatalogDomain::Search, 5);
+        storage
+            .put_raw(
+                &CatalogPaths::domain_manifest(CatalogDomain::Search),
+                json_bytes(&legacy_search)?,
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await?;
+
+        let root_bytes = storage.get_raw(CatalogPaths::ROOT_MANIFEST).await?;
+        let root: RootManifest = parse_json(&root_bytes)?;
+        assert_eq!(
+            root.catalog_manifest_path,
+            CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog)
+        );
+        assert_eq!(
+            root.lineage_manifest_path,
+            CatalogPaths::domain_manifest_pointer(CatalogDomain::Lineage)
+        );
+        assert_eq!(
+            root.search_manifest_path,
+            CatalogPaths::domain_manifest_pointer(CatalogDomain::Search)
+        );
+
+        let catalog_pointer: DomainManifestPointer = parse_json(
+            &storage
+                .get_raw(&CatalogPaths::domain_manifest_pointer(
+                    CatalogDomain::Catalog,
+                ))
+                .await?,
+        )?;
+        let migrated_catalog: CatalogDomainManifest =
+            parse_json(&storage.get_raw(&catalog_pointer.manifest_path).await?)?;
+        assert_eq!(migrated_catalog.manifest_id, legacy_catalog.manifest_id);
+        assert_eq!(
+            migrated_catalog.snapshot_version,
+            legacy_catalog.snapshot_version
+        );
+
+        let lineage_pointer: DomainManifestPointer = parse_json(
+            &storage
+                .get_raw(&CatalogPaths::domain_manifest_pointer(
+                    CatalogDomain::Lineage,
+                ))
+                .await?,
+        )?;
+        let migrated_lineage: LineageManifest =
+            parse_json(&storage.get_raw(&lineage_pointer.manifest_path).await?)?;
+        assert_eq!(migrated_lineage.manifest_id, legacy_lineage.manifest_id);
+        assert_eq!(
+            migrated_lineage.snapshot_version,
+            legacy_lineage.snapshot_version
+        );
+
+        let search_pointer: DomainManifestPointer = parse_json(
+            &storage
+                .get_raw(&CatalogPaths::domain_manifest_pointer(
+                    CatalogDomain::Search,
+                ))
+                .await?,
+        )?;
+        let migrated_search: SearchManifest =
+            parse_json(&storage.get_raw(&search_pointer.manifest_path).await?)?;
+        assert_eq!(migrated_search.manifest_id, legacy_search.manifest_id);
+        assert_eq!(
+            migrated_search.snapshot_version,
+            legacy_search.snapshot_version
+        );
 
         Ok(())
     }

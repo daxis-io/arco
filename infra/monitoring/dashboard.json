@@ -204,7 +204,7 @@
           "legendFormat": "orch {{domain}} {{mode}} {{scope}}"
         }
       ],
-      "description": "Current repair backlog size for catalog and orchestration current-head issues"
+      "description": "Current repair backlog size for catalog snapshot cleanup and orchestration orphan cleanup across repair scopes"
     },
     {
       "title": "Repair Backlog Age (seconds)",
@@ -220,7 +220,7 @@
           "legendFormat": "orch {{domain}} {{mode}} {{scope}}"
         }
       ],
-      "description": "Age of the current repair backlog, used to enforce production repair SLOs"
+      "description": "Age of the active repair backlog, used to enforce production cleanup SLOs"
     },
     {
       "title": "Repair Repeat Findings (15m increase)",

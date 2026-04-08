@@ -73,21 +73,21 @@ tests:
   - name: control_plane_pi3_repair_automation_alerts_fire
     interval: 1m
     input_series:
-      - series: 'arco_catalog_repair_automation_runs_total{domain="catalog",mode="enforce",scope="current_head_only",status="repair_failed"}'
+      - series: 'arco_catalog_repair_automation_runs_total{domain="catalog",mode="enforce",scope="full",status="repair_failed"}'
         values: "0 0 1 1 1 1 1 1 1 2 2 2 2 2 2 2 2 2 2 2"
-      - series: 'arco_catalog_repair_backlog_age_seconds{domain="catalog",mode="enforce",scope="current_head_only",tenant_id="acme",workspace_id="prod"}'
+      - series: 'arco_catalog_repair_backlog_age_seconds{domain="catalog",mode="enforce",scope="full",tenant_id="acme",workspace_id="prod"}'
         values: "0 0 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200 1200"
-      - series: 'arco_flow_orch_repair_backlog_count{domain="orchestration",mode="enforce",scope="current_head_only",tenant_id="acme",workspace_id="prod"}'
+      - series: 'arco_flow_orch_repair_backlog_count{domain="orchestration",mode="enforce",scope="full",tenant_id="acme",workspace_id="prod"}'
         values: "0 0 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2"
-      - series: 'arco_catalog_repair_completion_latency_seconds_bucket{domain="catalog",mode="enforce",scope="current_head_only",le="30"}'
+      - series: 'arco_catalog_repair_completion_latency_seconds_bucket{domain="catalog",mode="enforce",scope="full",le="30"}'
         values: "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
-      - series: 'arco_catalog_repair_completion_latency_seconds_bucket{domain="catalog",mode="enforce",scope="current_head_only",le="60"}'
+      - series: 'arco_catalog_repair_completion_latency_seconds_bucket{domain="catalog",mode="enforce",scope="full",le="60"}'
         values: "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
-      - series: 'arco_catalog_repair_completion_latency_seconds_bucket{domain="catalog",mode="enforce",scope="current_head_only",le="120"}'
+      - series: 'arco_catalog_repair_completion_latency_seconds_bucket{domain="catalog",mode="enforce",scope="full",le="120"}'
         values: "0 0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 34 36"
-      - series: 'arco_catalog_repair_completion_latency_seconds_bucket{domain="catalog",mode="enforce",scope="current_head_only",le="300"}'
+      - series: 'arco_catalog_repair_completion_latency_seconds_bucket{domain="catalog",mode="enforce",scope="full",le="300"}'
         values: "0 0 10 20 30 40 50 60 70 80 90 100 110 120 130 140 150 160 170 180"
-      - series: 'arco_catalog_repair_completion_latency_seconds_bucket{domain="catalog",mode="enforce",scope="current_head_only",le="+Inf"}'
+      - series: 'arco_catalog_repair_completion_latency_seconds_bucket{domain="catalog",mode="enforce",scope="full",le="+Inf"}'
         values: "0 0 10 20 30 40 50 60 70 80 90 100 110 120 130 140 150 160 170 180"
     alert_rule_test:
       - eval_time: 18m
@@ -96,15 +96,15 @@ tests:
           - exp_labels:
               domain: catalog
               mode: enforce
-              scope: current_head_only
+              scope: full
               severity: critical
               service: arco-control-plane
             exp_annotations:
-              summary: "Control-plane repair automation failed (domain=catalog, mode=enforce, scope=current_head_only)"
+              summary: "Control-plane repair automation failed (domain=catalog, mode=enforce, scope=full)"
               description: |
                 The automated control-plane repair executor reported a failed check, repair, or recheck
                 in the last 15 minutes for domain=catalog, mode=enforce,
-                scope=current_head_only. Manual dry-run and enforce repair may be required before the
+                scope=full. Manual dry-run and enforce repair may be required before the
                 backlog can drain.
               runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
       - eval_time: 18m
@@ -113,15 +113,15 @@ tests:
           - exp_labels:
               domain: catalog
               mode: enforce
-              scope: current_head_only
+              scope: full
               severity: warning
               service: arco-control-plane
             exp_annotations:
-              summary: "Control-plane repair backlog age exceeded 15 minutes (domain=catalog, mode=enforce, scope=current_head_only)"
+              summary: "Control-plane repair backlog age exceeded 15 minutes (domain=catalog, mode=enforce, scope=full)"
               description: |
                 Repairable reconciliation work has remained in the automated repair backlog for more
                 than 15 minutes for domain=catalog, mode=enforce,
-                scope=current_head_only. Readers stay pointer-first, but cleanup is not converging
+                scope=full. Readers stay pointer-first, but cleanup is not converging
                 fast enough.
               runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
       - eval_time: 18m
@@ -130,15 +130,15 @@ tests:
           - exp_labels:
               domain: orchestration
               mode: enforce
-              scope: current_head_only
+              scope: full
               severity: warning
               service: arco-control-plane
             exp_annotations:
-              summary: "Control-plane repair backlog is non-zero (domain=orchestration, mode=enforce, scope=current_head_only)"
+              summary: "Control-plane repair backlog is non-zero (domain=orchestration, mode=enforce, scope=full)"
               description: |
                 Repairable reconciliation work has remained in the automated repair backlog for at
                 least 15 minutes for domain=orchestration, mode=enforce,
-                scope=current_head_only. Production cutover is not converged until the cleanup
+                scope=full. Production cutover is not converged until the cleanup
                 backlog returns to zero.
               runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
       - eval_time: 18m
@@ -147,14 +147,14 @@ tests:
           - exp_labels:
               domain: catalog
               mode: enforce
-              scope: current_head_only
+              scope: full
               severity: warning
               service: arco-control-plane
             exp_annotations:
-              summary: "Control-plane repair completion p95 exceeded 120 seconds (domain=catalog, mode=enforce, scope=current_head_only)"
+              summary: "Control-plane repair completion p95 exceeded 120 seconds (domain=catalog, mode=enforce, scope=full)"
               description: |
                 Automated reconciliation cleanup is taking longer than two minutes at p95 over the
                 last 15 minutes for domain=catalog, mode=enforce,
-                scope=current_head_only. Treat this as production SLO degradation until cleanup
+                scope=full. Treat this as production SLO degradation until cleanup
                 latency returns to normal.
               runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"

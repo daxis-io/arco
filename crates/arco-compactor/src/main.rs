@@ -126,7 +126,7 @@ impl Default for RepairAutomationConfig {
         Self {
             mode: RepairAutomationMode::Enforce,
             interval: Duration::from_secs(300),
-            scope: RepairScope::CurrentHeadOnly,
+            scope: RepairScope::Full,
             domains: vec![
                 CatalogDomain::Catalog,
                 CatalogDomain::Lineage,
@@ -557,7 +557,7 @@ struct ReconcileRequest {
 
 impl ReconcileRequest {
     fn effective_repair_scope(&self) -> RepairScope {
-        self.repair_scope.unwrap_or(RepairScope::CurrentHeadOnly)
+        self.repair_scope.unwrap_or(RepairScope::Full)
     }
 }
 
@@ -1514,14 +1514,31 @@ mod tests {
             parent_hash: None,
             updated_at: Utc::now(),
         };
+        let manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, &manifest.manifest_id);
         storage
             .put_raw(
-                &root.catalog_manifest_path,
+                &manifest_path,
                 Bytes::from(serde_json::to_vec(&manifest).expect("serialize manifest")),
                 WritePrecondition::None,
             )
             .await
             .expect("write manifest");
+        let pointer = arco_catalog::manifest::DomainManifestPointer {
+            manifest_id: manifest.manifest_id.clone(),
+            manifest_path,
+            epoch: manifest.fencing_token.unwrap_or(manifest.epoch),
+            parent_pointer_hash: None,
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                &root.catalog_manifest_path,
+                Bytes::from(serde_json::to_vec(&pointer).expect("serialize pointer")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write pointer");
         storage
             .put_raw(
                 &CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "current.parquet"),
@@ -1606,24 +1623,21 @@ mod tests {
     }
 
     #[test]
-    fn test_reconcile_request_defaults_to_current_head_only_scope() {
+    fn test_reconcile_request_defaults_to_full_scope() {
         let request: ReconcileRequest =
             serde_json::from_str(r#"{"domain":"catalog","repair":true}"#)
                 .expect("parse reconcile request");
-        assert_eq!(
-            request.effective_repair_scope(),
-            RepairScope::CurrentHeadOnly
-        );
+        assert_eq!(request.effective_repair_scope(), RepairScope::Full);
     }
 
     #[test]
-    fn test_repair_automation_config_defaults_to_enforce_current_head_only() {
+    fn test_repair_automation_config_defaults_to_enforce_full_scope() {
         let config =
             RepairAutomationConfig::from_env_reader(|_| None).expect("default repair config");
 
         assert_eq!(config.mode, RepairAutomationMode::Enforce);
         assert_eq!(config.interval, Duration::from_secs(300));
-        assert_eq!(config.scope, RepairScope::CurrentHeadOnly);
+        assert_eq!(config.scope, RepairScope::Full);
         assert_eq!(
             config.domains,
             vec![
@@ -1874,7 +1888,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reconcile_endpoint_defaults_to_current_head_only_scope() {
+    async fn test_reconcile_endpoint_defaults_to_full_scope() {
         let state = test_state();
         let old_snapshot = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
         let router = build_router(state.clone(), None, None);
@@ -1899,8 +1913,8 @@ mod tests {
                 .head_raw(&old_snapshot)
                 .await
                 .expect("head old snapshot")
-                .is_some(),
-            "default reconcile repair scope must not delete generic cleanup candidates"
+                .is_none(),
+            "default reconcile repair scope must clean up generic candidates"
         );
     }
 

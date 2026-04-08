@@ -215,7 +215,7 @@ async fn rebuild_from_ledger_manifest_reproduces_equivalent_projection_state() -
         ],
     };
     rebuild_compactor
-        .rebuild_from_ledger_manifest(rebuild_manifest, None)
+        .rebuild_from_ledger_manifest(rebuild_manifest)
         .await?;
 
     let (baseline_manifest, baseline_state) = baseline_compactor.load_state().await?;
@@ -286,7 +286,7 @@ async fn rebuild_remains_correct_with_stale_watermark_and_without_ledger_listing
         event_paths: vec![first_path.clone(), second_path.clone(), third_path.clone()],
     };
     compactor
-        .rebuild_from_ledger_manifest(rebuild_manifest, None)
+        .rebuild_from_ledger_manifest(rebuild_manifest)
         .await?;
 
     assert_eq!(backend.list_calls(), 0, "rebuild must not list ledger");
@@ -313,12 +313,9 @@ async fn rebuild_rejects_invalid_event_paths_as_invalid_input() {
     let compactor = MicroCompactor::new(storage);
 
     let error = compactor
-        .rebuild_from_ledger_manifest(
-            LedgerRebuildManifest {
-                event_paths: vec!["ledger/orchestration/2026-02-21/".to_string()],
-            },
-            None,
-        )
+        .rebuild_from_ledger_manifest(LedgerRebuildManifest {
+            event_paths: vec!["ledger/orchestration/2026-02-21/".to_string()],
+        })
         .await
         .expect_err("invalid event path must be rejected");
 
@@ -345,7 +342,7 @@ async fn rebuild_manifest_parse_error_is_invalid_input() {
         .expect("write malformed rebuild manifest");
 
     let error = compactor
-        .rebuild_from_ledger_manifest_path(rebuild_manifest_path, None)
+        .rebuild_from_ledger_manifest_path(rebuild_manifest_path)
         .await
         .expect_err("invalid manifest payload must be rejected");
 

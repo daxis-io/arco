@@ -4,6 +4,10 @@
 
 PI-1 scope is complete in-repo.
 
+Historical note as of April 8, 2026: this report captures the staged compatibility rollout that
+preceded fenced-only PI-3. Current production guidance lives in
+`docs/reports/adr-034-pi3-exit.md` and `docs/runbooks/control-plane-repair-and-dark-launch.md`.
+
 Completed in this change set:
 
 - catalog sync-compaction server paths now honor the shared request contract

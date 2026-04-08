@@ -24,7 +24,9 @@ use arco_api::routes;
 use arco_api::server::{AppState, ServerBuilder};
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::MicroCompactor;
-use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData, TaskOutcome};
+use arco_flow::orchestration::events::{
+    OrchestrationEvent, OrchestrationEventData, OutputVisibilityState, TaskOutcome,
+};
 
 fn test_router() -> axum::Router {
     ServerBuilder::new().debug(true).build().test_router()
@@ -1793,6 +1795,23 @@ async fn parity_m1_rerun_from_failure_rejects_succeeded_parent() -> Result<()> {
                     },
                 );
                 event.timestamp = base + Duration::milliseconds(1);
+                event
+            },
+            {
+                let mut event = OrchestrationEvent::new(
+                    &ctx.tenant,
+                    &ctx.workspace,
+                    OrchestrationEventData::TaskOutputVisibilityChanged {
+                        run_id: parent_run_id.clone(),
+                        task_key: "analytics.a".to_string(),
+                        attempt: 1,
+                        attempt_id: attempt_id.clone(),
+                        visibility_state: OutputVisibilityState::Visible,
+                        published_at: Some(base + Duration::milliseconds(2)),
+                        publish_error: None,
+                    },
+                );
+                event.timestamp = base + Duration::milliseconds(2);
                 event
             },
         ],

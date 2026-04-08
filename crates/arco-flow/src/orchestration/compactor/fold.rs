@@ -20,9 +20,9 @@ use serde_json::Value;
 
 use crate::metrics::{labels as metrics_labels, names as metrics_names};
 use crate::orchestration::events::{
-    BackfillState, ChunkState, OrchestrationEvent, OrchestrationEventData, PartitionSelector,
-    RunRequest, SensorEvalStatus, SensorStatus, SourceRef, TaskDef, TaskOutcome, TickStatus,
-    TimerType as EventTimerType, TriggerSource,
+    BackfillState, ChunkState, OrchestrationEvent, OrchestrationEventData, OutputVisibilityState,
+    PartitionSelector, RunRequest, SensorEvalStatus, SensorStatus, SourceRef, TaskDef, TaskOutcome,
+    TickStatus, TimerType as EventTimerType, TriggerSource,
 };
 
 /// Task state machine states.
@@ -430,9 +430,21 @@ pub struct TaskRow {
     /// Partition key (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partition_key: Option<String>,
+    /// Whether this task requires visible output before the run is publicly successful.
+    #[serde(default)]
+    pub requires_visible_output: bool,
     /// Materialization identifier from worker output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub materialization_id: Option<String>,
+    /// Current output visibility state for successful output-producing tasks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_visibility_state: Option<OutputVisibilityState>,
+    /// When output became visible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<DateTime<Utc>>,
+    /// Publish failure, if output failed to become visible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish_error: Option<String>,
     /// Delta table identifier from execution output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta_table: Option<String>,
@@ -1236,6 +1248,27 @@ impl FoldState {
                     &event.workspace_id,
                 );
             }
+            OrchestrationEventData::TaskOutputVisibilityChanged {
+                run_id,
+                task_key,
+                attempt,
+                attempt_id,
+                visibility_state,
+                published_at,
+                publish_error,
+            } => {
+                self.fold_task_output_visibility_changed(
+                    run_id,
+                    task_key,
+                    *attempt,
+                    attempt_id,
+                    *visibility_state,
+                    *published_at,
+                    publish_error.as_deref(),
+                    &event.event_id,
+                    event.timestamp,
+                );
+            }
             OrchestrationEventData::DispatchRequested {
                 run_id,
                 task_key,
@@ -1644,7 +1677,11 @@ impl FoldState {
                 },
                 asset_key: task_def.asset_key.clone(),
                 partition_key: task_def.partition_key.clone(),
+                requires_visible_output: task_def.requires_visible_output,
                 materialization_id: None,
+                output_visibility_state: None,
+                published_at: None,
+                publish_error: None,
                 delta_table: None,
                 delta_version: None,
                 delta_partition: None,
@@ -1808,10 +1845,17 @@ impl FoldState {
 
                 task.materialization_id
                     .clone_from(&metadata.materialization_id);
+                task.output_visibility_state = None;
+                task.published_at = None;
+                task.publish_error = None;
                 task.delta_table.clone_from(&metadata.delta_table);
                 task.delta_version = metadata.delta_version;
                 task.delta_partition.clone_from(&metadata.delta_partition);
                 task.execution_lineage_ref = Some(lineage_ref);
+            } else if outcome != TaskOutcome::Succeeded {
+                task.output_visibility_state = None;
+                task.published_at = None;
+                task.publish_error = None;
             }
 
             // Update run counters
@@ -1915,6 +1959,57 @@ impl FoldState {
                     &timestamp,
                     event_id,
                 );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fold_task_output_visibility_changed(
+        &mut self,
+        run_id: &str,
+        task_key: &str,
+        attempt: u32,
+        attempt_id: &str,
+        visibility_state: OutputVisibilityState,
+        published_at: Option<DateTime<Utc>>,
+        publish_error: Option<&str>,
+        event_id: &str,
+        timestamp: DateTime<Utc>,
+    ) {
+        let key = (run_id.to_string(), task_key.to_string());
+
+        let Some(task) = self.tasks.get_mut(&key) else {
+            return;
+        };
+
+        let is_current_attempt =
+            task.attempt == attempt && task.attempt_id.as_deref() == Some(attempt_id);
+        if !is_current_attempt || task.state != TaskState::Succeeded {
+            return;
+        }
+
+        if matches!(
+            task.output_visibility_state,
+            Some(OutputVisibilityState::Visible | OutputVisibilityState::Failed)
+        ) && task.output_visibility_state != Some(visibility_state)
+        {
+            return;
+        }
+
+        task.output_visibility_state = Some(visibility_state);
+        task.row_version = event_id.to_string();
+        match visibility_state {
+            OutputVisibilityState::Pending => {
+                task.published_at = None;
+                task.publish_error = None;
+            }
+            OutputVisibilityState::Visible => {
+                task.published_at = Some(published_at.unwrap_or(timestamp));
+                task.publish_error = None;
+            }
+            OutputVisibilityState::Failed => {
+                task.published_at = None;
+                task.publish_error = publish_error.map(ToString::to_string);
             }
         }
     }
@@ -3251,7 +3346,8 @@ pub fn merge_backfill_chunk_rows(rows: Vec<BackfillChunkRow>) -> Option<Backfill
 mod tests {
     use super::*;
     use crate::orchestration::events::{
-        OrchestrationEventData, SourceRef, TimerType as EventTimerType, TriggerInfo, TriggerSource,
+        OrchestrationEventData, OutputVisibilityState, SourceRef, TimerType as EventTimerType,
+        TriggerInfo, TriggerSource,
     };
     use ulid::Ulid;
 
@@ -3335,6 +3431,53 @@ mod tests {
         })
     }
 
+    fn task_finished_success_with_materialization(
+        run_id: &str,
+        task_key: &str,
+        attempt: u32,
+        attempt_id: &str,
+        materialization_id: &str,
+    ) -> OrchestrationEvent {
+        make_event(OrchestrationEventData::TaskFinished {
+            run_id: run_id.to_string(),
+            task_key: task_key.to_string(),
+            attempt,
+            attempt_id: attempt_id.to_string(),
+            worker_id: "worker-01".to_string(),
+            outcome: TaskOutcome::Succeeded,
+            materialization_id: Some(materialization_id.to_string()),
+            error_message: None,
+            output: None,
+            error: None,
+            metrics: None,
+            cancelled_during_phase: None,
+            partial_progress: None,
+            asset_key: Some(task_key.to_string()),
+            partition_key: Some("2026-03-24".to_string()),
+            code_version: Some("sha-123".to_string()),
+        })
+    }
+
+    fn task_output_visibility_changed_event(
+        run_id: &str,
+        task_key: &str,
+        attempt: u32,
+        attempt_id: &str,
+        visibility_state: OutputVisibilityState,
+        published_at: Option<DateTime<Utc>>,
+        publish_error: Option<&str>,
+    ) -> OrchestrationEvent {
+        make_event(OrchestrationEventData::TaskOutputVisibilityChanged {
+            run_id: run_id.to_string(),
+            task_key: task_key.to_string(),
+            attempt,
+            attempt_id: attempt_id.to_string(),
+            visibility_state,
+            published_at,
+            publish_error: publish_error.map(ToString::to_string),
+        })
+    }
+
     fn dispatch_requested_event(
         run_id: &str,
         task_key: &str,
@@ -3398,6 +3541,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 3,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
                 TaskDef {
                     key: "transform".into(),
@@ -3406,6 +3550,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 3,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
                 TaskDef {
                     key: "load".into(),
@@ -3414,6 +3559,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 3,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
             ],
         ));
@@ -3479,6 +3625,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 3,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
                 TaskDef {
                     key: "B".into(),
@@ -3487,6 +3634,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 3,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
             ],
         );
@@ -3517,6 +3665,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 3,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
                 TaskDef {
                     key: "B".into(),
@@ -3525,6 +3674,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 3,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
             ],
         ));
@@ -3574,6 +3724,7 @@ mod tests {
                 partition_key: None,
                 max_attempts: 1,
                 heartbeat_timeout_sec: 300,
+                requires_visible_output: false,
             }],
         ));
 
@@ -3618,6 +3769,7 @@ mod tests {
                 partition_key: None,
                 max_attempts: 3,
                 heartbeat_timeout_sec: 300,
+                requires_visible_output: false,
             }],
         ));
 
@@ -3682,6 +3834,7 @@ mod tests {
                 partition_key: None,
                 max_attempts: 3,
                 heartbeat_timeout_sec: 300,
+                requires_visible_output: false,
             }],
         ));
 
@@ -3709,6 +3862,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 1,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
                 TaskDef {
                     key: "B".into(),
@@ -3717,6 +3871,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 1,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
                 TaskDef {
                     key: "C".into(),
@@ -3725,6 +3880,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 1,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
             ],
         ));
@@ -3790,6 +3946,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 1,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
                 TaskDef {
                     key: "B".into(),
@@ -3798,6 +3955,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 1,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
             ],
         ));
@@ -3853,6 +4011,221 @@ mod tests {
         assert!(TaskState::Cancelled.is_terminal());
     }
 
+    #[test]
+    fn test_successful_required_output_remains_ungated_without_visibility_event() {
+        let mut state = FoldState::new();
+        let attempt_id = Ulid::new().to_string();
+
+        state.fold_event(&run_triggered_event("run1"));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "analytics.daily".into(),
+                depends_on: vec![],
+                asset_key: Some("analytics.daily".into()),
+                partition_key: Some("2026-03-24".into()),
+                max_attempts: 1,
+                heartbeat_timeout_sec: 300,
+                requires_visible_output: true,
+            }],
+        ));
+
+        state.fold_event(&task_started_event(
+            "run1",
+            "analytics.daily",
+            1,
+            &attempt_id,
+        ));
+        state.fold_event(&task_finished_success_with_materialization(
+            "run1",
+            "analytics.daily",
+            1,
+            &attempt_id,
+            "mat_01",
+        ));
+
+        let task = state
+            .tasks
+            .get(&("run1".into(), "analytics.daily".into()))
+            .unwrap();
+        assert_eq!(task.state, TaskState::Succeeded);
+        assert!(task.output_visibility_state.is_none());
+        assert!(task.published_at.is_none());
+        assert!(task.publish_error.is_none());
+    }
+
+    #[test]
+    fn test_output_visibility_event_updates_required_output_state() {
+        let mut state = FoldState::new();
+        let attempt_id = Ulid::new().to_string();
+        let published_at = Utc::now();
+
+        state.fold_event(&run_triggered_event("run1"));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "analytics.daily".into(),
+                depends_on: vec![],
+                asset_key: Some("analytics.daily".into()),
+                partition_key: Some("2026-03-24".into()),
+                max_attempts: 1,
+                heartbeat_timeout_sec: 300,
+                requires_visible_output: true,
+            }],
+        ));
+        state.fold_event(&task_started_event(
+            "run1",
+            "analytics.daily",
+            1,
+            &attempt_id,
+        ));
+        state.fold_event(&task_finished_success_with_materialization(
+            "run1",
+            "analytics.daily",
+            1,
+            &attempt_id,
+            "mat_01",
+        ));
+
+        state.fold_event(&task_output_visibility_changed_event(
+            "run1",
+            "analytics.daily",
+            1,
+            &attempt_id,
+            OutputVisibilityState::Visible,
+            Some(published_at),
+            None,
+        ));
+
+        let task = state
+            .tasks
+            .get(&("run1".into(), "analytics.daily".into()))
+            .unwrap();
+        assert_eq!(
+            task.output_visibility_state,
+            Some(OutputVisibilityState::Visible)
+        );
+        assert_eq!(task.published_at, Some(published_at));
+        assert!(task.publish_error.is_none());
+    }
+
+    #[test]
+    fn test_output_visibility_event_does_not_regress_visible_task_back_to_pending() {
+        let mut state = FoldState::new();
+        let attempt_id = Ulid::new().to_string();
+        let visible_at = Utc::now();
+
+        state.fold_event(&run_triggered_event("run1"));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "analytics.daily".into(),
+                depends_on: vec![],
+                asset_key: Some("analytics.daily".into()),
+                partition_key: Some("2026-03-24".into()),
+                max_attempts: 1,
+                heartbeat_timeout_sec: 300,
+                requires_visible_output: true,
+            }],
+        ));
+        state.fold_event(&task_started_event(
+            "run1",
+            "analytics.daily",
+            1,
+            &attempt_id,
+        ));
+        state.fold_event(&task_finished_success_with_materialization(
+            "run1",
+            "analytics.daily",
+            1,
+            &attempt_id,
+            "mat_01",
+        ));
+        state.fold_event(&task_output_visibility_changed_event(
+            "run1",
+            "analytics.daily",
+            1,
+            &attempt_id,
+            OutputVisibilityState::Visible,
+            Some(visible_at),
+            None,
+        ));
+
+        state.fold_event(&task_output_visibility_changed_event(
+            "run1",
+            "analytics.daily",
+            1,
+            &attempt_id,
+            OutputVisibilityState::Pending,
+            None,
+            None,
+        ));
+
+        let task = state
+            .tasks
+            .get(&("run1".into(), "analytics.daily".into()))
+            .unwrap();
+        assert_eq!(
+            task.output_visibility_state,
+            Some(OutputVisibilityState::Visible)
+        );
+        assert_eq!(task.published_at, Some(visible_at));
+        assert!(task.publish_error.is_none());
+    }
+
+    #[test]
+    fn test_stale_output_visibility_event_is_rejected() {
+        let mut state = FoldState::new();
+        let attempt_1_id = Ulid::new().to_string();
+        let attempt_2_id = Ulid::new().to_string();
+
+        state.fold_event(&run_triggered_event("run1"));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "analytics.daily".into(),
+                depends_on: vec![],
+                asset_key: Some("analytics.daily".into()),
+                partition_key: Some("2026-03-24".into()),
+                max_attempts: 2,
+                heartbeat_timeout_sec: 300,
+                requires_visible_output: true,
+            }],
+        ));
+        state.fold_event(&task_started_event(
+            "run1",
+            "analytics.daily",
+            1,
+            &attempt_1_id,
+        ));
+        state.fold_event(&task_started_event(
+            "run1",
+            "analytics.daily",
+            2,
+            &attempt_2_id,
+        ));
+
+        state.fold_event(&task_output_visibility_changed_event(
+            "run1",
+            "analytics.daily",
+            1,
+            &attempt_1_id,
+            OutputVisibilityState::Failed,
+            None,
+            Some("publisher exhausted retries"),
+        ));
+
+        let task = state
+            .tasks
+            .get(&("run1".into(), "analytics.daily".into()))
+            .unwrap();
+        assert_eq!(task.attempt, 2);
+        assert_eq!(task.attempt_id.as_deref(), Some(attempt_2_id.as_str()));
+        assert_eq!(task.state, TaskState::Running);
+        assert!(task.output_visibility_state.is_none());
+        assert!(task.publish_error.is_none());
+    }
+
     // ========================================================================
     // Merge Function Tests
     // ========================================================================
@@ -3875,7 +4248,11 @@ mod tests {
             ready_at: None,
             asset_key: None,
             partition_key: None,
+            requires_visible_output: false,
             materialization_id: None,
+            output_visibility_state: None,
+            published_at: None,
+            publish_error: None,
             delta_table: None,
             delta_version: None,
             delta_partition: None,
@@ -4140,6 +4517,7 @@ mod tests {
                 partition_key: None,
                 max_attempts: 3,
                 heartbeat_timeout_sec: 300,
+                requires_visible_output: false,
             }],
         ));
 
@@ -4573,6 +4951,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 3,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
                 TaskDef {
                     key: "B".into(),
@@ -4581,6 +4960,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 3,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
                 TaskDef {
                     key: "C".into(),
@@ -4589,6 +4969,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 3,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
             ],
         ));
@@ -4650,6 +5031,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 3,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
                 TaskDef {
                     key: "B".into(),
@@ -4658,6 +5040,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 3,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
             ],
         ));
@@ -4709,6 +5092,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 1,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
                 TaskDef {
                     key: "B".into(),
@@ -4717,6 +5101,7 @@ mod tests {
                     partition_key: None,
                     max_attempts: 1,
                     heartbeat_timeout_sec: 300,
+                    requires_visible_output: false,
                 },
             ],
         ));
@@ -5493,6 +5878,7 @@ mod tests {
                 partition_key: Some("2025-01-15".into()),
                 max_attempts: 1,
                 heartbeat_timeout_sec: 300,
+                requires_visible_output: true,
             }],
         ));
 
@@ -5537,6 +5923,7 @@ mod tests {
                 partition_key: Some("2025-01-15".into()),
                 max_attempts: 1,
                 heartbeat_timeout_sec: 300,
+                requires_visible_output: true,
             }],
         ));
 
@@ -5589,6 +5976,7 @@ mod tests {
                 partition_key: Some("2025-01-15".into()),
                 max_attempts: 3,
                 heartbeat_timeout_sec: 300,
+                requires_visible_output: true,
             }],
         ));
 
@@ -5623,6 +6011,7 @@ mod tests {
                 partition_key: Some("2025-01-15".into()),
                 max_attempts: 1,
                 heartbeat_timeout_sec: 300,
+                requires_visible_output: true,
             }],
         ));
         state.fold_event(&task_started_event("run2", "extract", 1, &attempt_id_2));

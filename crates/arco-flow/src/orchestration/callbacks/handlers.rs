@@ -10,11 +10,14 @@ use chrono::Utc;
 
 use super::types::{
     CallbackError, CallbackResult, HeartbeatRequest, HeartbeatResponse, TaskCompletedRequest,
-    TaskCompletedResponse, TaskStartedRequest, TaskStartedResponse, WorkerOutcome,
+    TaskCompletedResponse, TaskOutputVisibilityState, TaskStartedRequest, TaskStartedResponse,
+    WorkerOutcome,
 };
 use crate::metrics::{labels as metrics_labels, names as metrics_names};
 use crate::orchestration::OrchestrationLedgerWriter;
-use crate::orchestration::events::{OrchestrationEvent, OrchestrationEventData, TaskOutcome};
+use crate::orchestration::events::{
+    OrchestrationEvent, OrchestrationEventData, OutputVisibilityState, TaskOutcome,
+};
 
 /// Context for callback handlers.
 pub struct CallbackContext<W: OrchestrationLedgerWriter, V: TaskTokenValidator> {
@@ -125,6 +128,14 @@ fn record_callback_metrics<T>(handler: &str, result: &CallbackResult<T>) {
 fn finish_callback<T>(handler: &str, result: CallbackResult<T>) -> CallbackResult<T> {
     record_callback_metrics(handler, &result);
     result
+}
+
+fn map_output_visibility_state(state: TaskOutputVisibilityState) -> OutputVisibilityState {
+    match state {
+        TaskOutputVisibilityState::Pending => OutputVisibilityState::Pending,
+        TaskOutputVisibilityState::Visible => OutputVisibilityState::Visible,
+        TaskOutputVisibilityState::Failed => OutputVisibilityState::Failed,
+    }
 }
 
 /// Handles the `/v1/tasks/{task_id}/started` callback.
@@ -619,6 +630,8 @@ where
     };
 
     // Emit TaskFinished event
+    let finished_at = completed_at.unwrap_or_else(Utc::now);
+
     let mut event = OrchestrationEvent::new(
         &ctx.tenant_id,
         &ctx.workspace_id,
@@ -641,13 +654,49 @@ where
             code_version: state.code_version.clone(),
         },
     );
-    event.timestamp = completed_at.unwrap_or_else(Utc::now);
+    event.timestamp = finished_at;
 
     if let Err(e) = ctx.ledger.write_event(&event).await {
         return finish_callback(
             "task_completed",
             CallbackResult::InternalError(format!("Failed to write event: {e}")),
         );
+    }
+
+    if outcome == TaskOutcome::Succeeded {
+        if let Some(visibility_state) = request_output
+            .as_ref()
+            .and_then(|output| output.output_visibility_state)
+        {
+            let mut visibility_event = OrchestrationEvent::new(
+                &ctx.tenant_id,
+                &ctx.workspace_id,
+                OrchestrationEventData::TaskOutputVisibilityChanged {
+                    run_id: state.run_id.clone(),
+                    task_key: task_id.to_string(),
+                    attempt,
+                    attempt_id: state.attempt_id.clone(),
+                    visibility_state: map_output_visibility_state(visibility_state),
+                    published_at: request_output
+                        .as_ref()
+                        .and_then(|output| output.published_at),
+                    publish_error: request_output
+                        .as_ref()
+                        .and_then(|output| output.publish_error.clone()),
+                },
+            );
+            visibility_event.timestamp = request_output
+                .as_ref()
+                .and_then(|output| output.published_at)
+                .unwrap_or(finished_at);
+
+            if let Err(e) = ctx.ledger.write_event(&visibility_event).await {
+                return finish_callback(
+                    "task_completed",
+                    CallbackResult::InternalError(format!("Failed to write event: {e}")),
+                );
+            }
+        }
     }
 
     // Determine final state string
@@ -1218,6 +1267,9 @@ mod tests {
                 delta_table: Some("analytics.daily".to_string()),
                 delta_version: Some(17),
                 delta_partition: Some("2025-01-15".to_string()),
+                output_visibility_state: None,
+                published_at: None,
+                publish_error: None,
             }),
             error: None,
             metrics: None,
@@ -1270,6 +1322,79 @@ mod tests {
             );
         } else {
             panic!("Expected TaskFinished event");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_task_completed_emits_visibility_event_when_output_reports_visibility() {
+        let ledger = Arc::new(MockLedger::default());
+        let validator = Arc::new(MockTokenValidator::allow_all());
+        let ctx = CallbackContext::new(ledger.clone(), validator, "tenant-1", "workspace-1");
+
+        let mut lookup = MockTaskLookup::new();
+        lookup.add_task(
+            "task-1",
+            TaskState {
+                state: "RUNNING".to_string(),
+                attempt: 1,
+                attempt_id: "att-1".to_string(),
+                run_id: "run-1".to_string(),
+                asset_key: Some("analytics.daily".to_string()),
+                partition_key: Some("2025-01-15".to_string()),
+                code_version: Some("v1.2.3".to_string()),
+                cancel_requested: false,
+            },
+        );
+
+        let published_at = Utc::now();
+        let request = TaskCompletedRequest {
+            attempt: 1,
+            attempt_id: "att-1".to_string(),
+            worker_id: "worker-abc".to_string(),
+            traceparent: None,
+            outcome: WorkerOutcome::Succeeded,
+            completed_at: Some(Utc::now()),
+            output: Some(super::super::types::TaskOutput {
+                materialization_id: Some("mat-123".to_string()),
+                row_count: Some(1000),
+                byte_size: Some(1024),
+                output_path: None,
+                delta_table: Some("analytics.daily".to_string()),
+                delta_version: Some(17),
+                delta_partition: Some("2025-01-15".to_string()),
+                output_visibility_state: Some(TaskOutputVisibilityState::Pending),
+                published_at: Some(published_at),
+                publish_error: None,
+            }),
+            error: None,
+            metrics: None,
+            cancelled_during_phase: None,
+            partial_progress: None,
+        };
+
+        let result = handle_task_completed(&ctx, "task-1", "token", request, &lookup).await;
+        match result {
+            CallbackResult::Ok(response) => {
+                assert!(response.acknowledged);
+                assert_eq!(response.final_state, "SUCCEEDED");
+            }
+            other => panic!("Expected Ok, got {:?}", other),
+        }
+
+        let events = ledger.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "TaskFinished");
+        assert_eq!(events[1].event_type, "TaskOutputVisibilityChanged");
+        if let OrchestrationEventData::TaskOutputVisibilityChanged {
+            visibility_state,
+            published_at: emitted_published_at,
+            ..
+        } = &events[1].data
+        {
+            assert_eq!(*visibility_state, OutputVisibilityState::Pending);
+            assert_eq!(*emitted_published_at, Some(published_at));
+        } else {
+            panic!("Expected TaskOutputVisibilityChanged event");
         }
     }
 
@@ -1405,6 +1530,9 @@ mod tests {
                 delta_table: None,
                 delta_version: None,
                 delta_partition: None,
+                output_visibility_state: None,
+                published_at: None,
+                publish_error: None,
             }),
             error: Some(super::super::types::TaskError {
                 category: super::super::types::ErrorCategory::Infrastructure,

@@ -196,6 +196,7 @@ async fn run_dispatch_callback_path_advances_task_state() {
                 partition_key: None,
                 max_attempts: 3,
                 heartbeat_timeout_sec: 300,
+                requires_visible_output: false,
             }],
         },
     );
@@ -373,6 +374,9 @@ async fn run_dispatch_callback_path_advances_task_state() {
                 delta_table: Some("analytics.extract".to_string()),
                 delta_version: Some(42),
                 delta_partition: Some("date=2025-01-15".to_string()),
+                output_visibility_state: None,
+                published_at: None,
+                publish_error: None,
             }),
             error: None,
             metrics: None,

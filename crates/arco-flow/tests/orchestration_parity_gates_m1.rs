@@ -268,6 +268,7 @@ fn default_task_def(key: &str, depends_on: Vec<&str>) -> TaskDef {
         partition_key: None,
         max_attempts: 3,
         heartbeat_timeout_sec: 60,
+        requires_visible_output: false,
     }
 }
 

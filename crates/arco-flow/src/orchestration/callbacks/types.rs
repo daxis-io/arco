@@ -141,6 +141,18 @@ pub enum WorkerOutcome {
     Cancelled,
 }
 
+/// Worker-reported output visibility state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TaskOutputVisibilityState {
+    /// Output exists but is not consumable yet.
+    Pending,
+    /// Output is published and consumable.
+    Visible,
+    /// Output failed to become visible.
+    Failed,
+}
+
 /// Output from a successful task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -166,6 +178,15 @@ pub struct TaskOutput {
     /// Delta partition for lineage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta_partition: Option<String>,
+    /// Output visibility state, when the worker/runtime can report it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_visibility_state: Option<TaskOutputVisibilityState>,
+    /// When output became visible, if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<DateTime<Utc>>,
+    /// Publish failure details, if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish_error: Option<String>,
 }
 
 /// Error details from a failed task.
@@ -452,6 +473,9 @@ mod tests {
                 delta_table: Some("analytics.daily".to_string()),
                 delta_version: Some(17),
                 delta_partition: Some("date=2025-01-15".to_string()),
+                output_visibility_state: Some(TaskOutputVisibilityState::Visible),
+                published_at: Some(Utc::now()),
+                publish_error: None,
             }),
             error: None,
             metrics: Some(TaskMetrics {
@@ -476,6 +500,10 @@ mod tests {
         assert_eq!(output.delta_table.as_deref(), Some("analytics.daily"));
         assert_eq!(output.delta_version, Some(17));
         assert_eq!(output.delta_partition.as_deref(), Some("date=2025-01-15"));
+        assert_eq!(
+            output.output_visibility_state,
+            Some(TaskOutputVisibilityState::Visible)
+        );
     }
 
     #[test]

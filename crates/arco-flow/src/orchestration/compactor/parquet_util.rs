@@ -42,8 +42,8 @@ use super::fold::{
 };
 use crate::error::{Error, Result};
 use crate::orchestration::events::{
-    BackfillState, ChunkState, PartitionSelector, RunRequest, SensorEvalStatus, SensorStatus,
-    TaskOutcome, TickStatus, TriggerSource,
+    BackfillState, ChunkState, OutputVisibilityState, PartitionSelector, RunRequest,
+    SensorEvalStatus, SensorStatus, TaskOutcome, TickStatus, TriggerSource,
 };
 
 // ============================================================================
@@ -89,7 +89,11 @@ fn tasks_schema() -> Arc<Schema> {
         Field::new("ready_at", DataType::Int64, true),
         Field::new("asset_key", DataType::Utf8, true),
         Field::new("partition_key", DataType::Utf8, true),
+        Field::new("requires_visible_output", DataType::Boolean, true),
         Field::new("materialization_id", DataType::Utf8, true),
+        Field::new("output_visibility_state", DataType::Utf8, true),
+        Field::new("published_at", DataType::Int64, true),
+        Field::new("publish_error", DataType::Utf8, true),
         Field::new("delta_table", DataType::Utf8, true),
         Field::new("delta_version", DataType::Int64, true),
         Field::new("delta_partition", DataType::Utf8, true),
@@ -590,9 +594,32 @@ pub fn write_tasks(rows: &[TaskRow]) -> Result<Bytes> {
             .map(|r| r.partition_key.as_deref())
             .collect::<Vec<_>>(),
     );
+    let requires_visible_output = BooleanArray::from(
+        rows.iter()
+            .map(|r| r.requires_visible_output)
+            .collect::<Vec<_>>(),
+    );
     let materialization_ids = StringArray::from(
         rows.iter()
             .map(|r| r.materialization_id.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let output_visibility_states = StringArray::from(
+        rows.iter()
+            .map(|r| {
+                r.output_visibility_state
+                    .map(output_visibility_state_to_str)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let published_at = Int64Array::from(
+        rows.iter()
+            .map(|r| r.published_at.map(|t| t.timestamp_millis()))
+            .collect::<Vec<_>>(),
+    );
+    let publish_errors = StringArray::from(
+        rows.iter()
+            .map(|r| r.publish_error.as_deref())
             .collect::<Vec<_>>(),
     );
     let delta_tables = StringArray::from(
@@ -636,7 +663,11 @@ pub fn write_tasks(rows: &[TaskRow]) -> Result<Bytes> {
             Arc::new(ready_at),
             Arc::new(asset_keys),
             Arc::new(partition_keys),
+            Arc::new(requires_visible_output),
             Arc::new(materialization_ids),
+            Arc::new(output_visibility_states),
+            Arc::new(published_at),
+            Arc::new(publish_errors),
             Arc::new(delta_tables),
             Arc::new(delta_versions),
             Arc::new(delta_partitions),
@@ -1966,7 +1997,11 @@ pub fn read_tasks(bytes: &Bytes) -> Result<Vec<TaskRow>> {
         let ready_at = col_i64(&batch, "ready_at")?;
         let asset_key = col_string_opt(&batch, "asset_key");
         let partition_key = col_string_opt(&batch, "partition_key");
+        let requires_visible_output = col_bool_opt(&batch, "requires_visible_output");
         let materialization_id = col_string_opt(&batch, "materialization_id");
+        let output_visibility_state = col_string_opt(&batch, "output_visibility_state");
+        let published_at = col_i64_opt(&batch, "published_at");
+        let publish_error = col_string_opt(&batch, "publish_error");
         let delta_table = col_string_opt(&batch, "delta_table");
         let delta_version = col_i64_opt(&batch, "delta_version");
         let delta_partition = col_string_opt(&batch, "delta_partition");
@@ -2033,7 +2068,29 @@ pub fn read_tasks(bytes: &Bytes) -> Result<Vec<TaskRow>> {
                         Some(col.value(row).to_string())
                     }
                 }),
+                requires_visible_output: requires_visible_output
+                    .is_some_and(|col| !col.is_null(row) && col.value(row)),
                 materialization_id: materialization_id.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                output_visibility_state: match output_visibility_state.as_ref() {
+                    Some(col) if !col.is_null(row) => {
+                        Some(str_to_output_visibility_state(col.value(row))?)
+                    }
+                    _ => None,
+                },
+                published_at: published_at.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(millis_to_datetime(col.value(row)))
+                    }
+                }),
+                publish_error: publish_error.as_ref().and_then(|col| {
                     if col.is_null(row) {
                         None
                     } else {
@@ -2949,6 +3006,25 @@ fn str_to_task_state(s: &str) -> Result<TaskState> {
     }
 }
 
+fn output_visibility_state_to_str(state: OutputVisibilityState) -> &'static str {
+    match state {
+        OutputVisibilityState::Pending => "PENDING",
+        OutputVisibilityState::Visible => "VISIBLE",
+        OutputVisibilityState::Failed => "FAILED",
+    }
+}
+
+fn str_to_output_visibility_state(s: &str) -> Result<OutputVisibilityState> {
+    match s {
+        "PENDING" => Ok(OutputVisibilityState::Pending),
+        "VISIBLE" => Ok(OutputVisibilityState::Visible),
+        "FAILED" => Ok(OutputVisibilityState::Failed),
+        _ => Err(Error::parquet(format!(
+            "unknown output visibility state '{s}'"
+        ))),
+    }
+}
+
 fn task_outcome_to_str(outcome: TaskOutcome) -> &'static str {
     match outcome {
         TaskOutcome::Succeeded => "SUCCEEDED",
@@ -3106,6 +3182,7 @@ fn str_to_chunk_state(s: &str) -> Result<ChunkState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::events::OutputVisibilityState;
     use chrono::{TimeZone, Utc};
 
     #[test]
@@ -3309,7 +3386,11 @@ mod tests {
             ready_at: Some(Utc::now()),
             asset_key: Some("analytics.extract".to_string()),
             partition_key: None,
+            requires_visible_output: true,
             materialization_id: Some("mat_01".to_string()),
+            output_visibility_state: Some(OutputVisibilityState::Pending),
+            published_at: None,
+            publish_error: None,
             delta_table: Some("analytics.extract".to_string()),
             delta_version: Some(9),
             delta_partition: Some("date=2025-01-15".to_string()),
@@ -3330,6 +3411,89 @@ mod tests {
             Some("date=2025-01-15")
         );
         assert!(parsed[0].started_at.is_some());
+    }
+
+    #[test]
+    fn test_tasks_roundtrip_preserves_output_visibility() {
+        let published_at = Utc.with_ymd_and_hms(2026, 3, 24, 12, 0, 0).unwrap();
+        let rows = vec![
+            TaskRow {
+                run_id: "run_visible".to_string(),
+                task_key: "visible_task".to_string(),
+                state: TaskState::Succeeded,
+                attempt: 1,
+                attempt_id: Some("att_visible".to_string()),
+                started_at: None,
+                completed_at: Some(published_at),
+                error_message: None,
+                deps_total: 0,
+                deps_satisfied_count: 0,
+                max_attempts: 1,
+                heartbeat_timeout_sec: 300,
+                last_heartbeat_at: None,
+                ready_at: None,
+                asset_key: Some("analytics.visible".to_string()),
+                partition_key: Some("2026-03-24".to_string()),
+                requires_visible_output: true,
+                materialization_id: Some("mat_visible".to_string()),
+                output_visibility_state: Some(OutputVisibilityState::Visible),
+                published_at: Some(published_at),
+                publish_error: None,
+                delta_table: Some("analytics.visible".to_string()),
+                delta_version: Some(42),
+                delta_partition: Some("date=2026-03-24".to_string()),
+                execution_lineage_ref: Some("{\"runId\":\"run_visible\"}".to_string()),
+                row_version: "01HQXYZ901".to_string(),
+            },
+            TaskRow {
+                run_id: "run_failed".to_string(),
+                task_key: "failed_task".to_string(),
+                state: TaskState::Succeeded,
+                attempt: 1,
+                attempt_id: Some("att_failed".to_string()),
+                started_at: None,
+                completed_at: Some(published_at),
+                error_message: None,
+                deps_total: 0,
+                deps_satisfied_count: 0,
+                max_attempts: 1,
+                heartbeat_timeout_sec: 300,
+                last_heartbeat_at: None,
+                ready_at: None,
+                asset_key: Some("analytics.failed".to_string()),
+                partition_key: Some("2026-03-24".to_string()),
+                requires_visible_output: true,
+                materialization_id: Some("mat_failed".to_string()),
+                output_visibility_state: Some(OutputVisibilityState::Failed),
+                published_at: None,
+                publish_error: Some("publisher exhausted retries".to_string()),
+                delta_table: Some("analytics.failed".to_string()),
+                delta_version: Some(7),
+                delta_partition: Some("date=2026-03-24".to_string()),
+                execution_lineage_ref: Some("{\"runId\":\"run_failed\"}".to_string()),
+                row_version: "01HQXYZ902".to_string(),
+            },
+        ];
+
+        let bytes = write_tasks(&rows).expect("write");
+        let parsed = read_tasks(&bytes).expect("read");
+
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.iter().all(|row| row.requires_visible_output));
+        assert_eq!(
+            parsed[0].output_visibility_state,
+            Some(OutputVisibilityState::Visible)
+        );
+        assert_eq!(parsed[0].published_at, Some(published_at));
+        assert!(parsed[0].publish_error.is_none());
+        assert_eq!(
+            parsed[1].output_visibility_state,
+            Some(OutputVisibilityState::Failed)
+        );
+        assert_eq!(
+            parsed[1].publish_error.as_deref(),
+            Some("publisher exhausted retries")
+        );
     }
 
     #[test]
@@ -3596,6 +3760,10 @@ mod tests {
                 Arc::new(Int64Array::from(vec![None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(BooleanArray::from(vec![false])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(Int64Array::from(vec![None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 Arc::new(Int64Array::from(vec![None])),
@@ -3609,6 +3777,47 @@ mod tests {
         let bytes = write_single_batch(schema, &batch).expect("write");
         let err = read_tasks(&bytes).unwrap_err();
         assert!(err.to_string().contains("unknown task state"));
+    }
+
+    #[test]
+    fn test_read_tasks_rejects_unknown_output_visibility_state() {
+        let schema = Arc::new(task_schema());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("run_01")])),
+                Arc::new(StringArray::from(vec![Some("extract")])),
+                Arc::new(StringArray::from(vec![Some("SUCCEEDED")])),
+                Arc::new(UInt32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![0])),
+                Arc::new(UInt32Array::from(vec![3])),
+                Arc::new(UInt32Array::from(vec![300])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(BooleanArray::from(vec![true])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec![Some("UNKNOWN_VISIBILITY")])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(Int64Array::from(vec![None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec![Some("01A")])),
+            ],
+        )
+        .expect("record batch");
+
+        let bytes = write_single_batch(schema, &batch).expect("write");
+        let err = read_tasks(&bytes).unwrap_err();
+        assert!(err.to_string().contains("unknown output visibility state"));
     }
 
     #[test]

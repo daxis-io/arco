@@ -52,8 +52,9 @@ use arco_flow::orchestration::compactor::{
 };
 use arco_flow::orchestration::controllers::{PubSubMessage, PushSensorHandler};
 use arco_flow::orchestration::events::{
-    BackfillState, ChunkState, OrchestrationEvent, OrchestrationEventData, PartitionSelector,
-    RunRequest, SensorEvalStatus, SensorStatus, TaskDef, TickStatus, TriggerInfo,
+    BackfillState, ChunkState, OrchestrationEvent, OrchestrationEventData, OutputVisibilityState,
+    PartitionSelector, RunRequest, SensorEvalStatus, SensorStatus, TaskDef, TickStatus,
+    TriggerInfo,
 };
 use arco_flow::orchestration::run_key::{
     FingerprintPolicy, ReservationResult, RunKeyReservation, get_reservation, reservation_path,
@@ -328,6 +329,18 @@ pub enum RunStateResponse {
     TimedOut,
 }
 
+/// Task output visibility summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TaskOutputVisibilityStateResponse {
+    /// Output exists but is not consumable yet.
+    Pending,
+    /// Output is visible and consumable.
+    Visible,
+    /// Output permanently failed to become visible.
+    Failed,
+}
+
 /// Full run details response.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -406,6 +419,15 @@ pub struct TaskSummary {
     /// Skip attribution for tasks skipped due to upstream outcomes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skip_attribution: Option<TaskSkipAttributionResponse>,
+    /// Output visibility state for required-output tasks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_visibility_state: Option<TaskOutputVisibilityStateResponse>,
+    /// When output became visible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<DateTime<Utc>>,
+    /// Publish failure details for output visibility failures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish_error: Option<String>,
 }
 
 /// Retry attribution details for a task.
@@ -1764,6 +1786,7 @@ fn task_defs_for_rerun(
             partition_key: task_row.partition_key.clone(),
             max_attempts: task_row.max_attempts,
             heartbeat_timeout_sec: task_row.heartbeat_timeout_sec,
+            requires_visible_output: task_row.requires_visible_output,
         });
     }
 
@@ -2337,11 +2360,63 @@ fn map_run_state(state: FoldRunState) -> RunStateResponse {
     }
 }
 
-fn map_run_row_state(run: &RunRow) -> RunStateResponse {
+fn map_output_visibility_state(state: OutputVisibilityState) -> TaskOutputVisibilityStateResponse {
+    match state {
+        OutputVisibilityState::Pending => TaskOutputVisibilityStateResponse::Pending,
+        OutputVisibilityState::Visible => TaskOutputVisibilityStateResponse::Visible,
+        OutputVisibilityState::Failed => TaskOutputVisibilityStateResponse::Failed,
+    }
+}
+
+fn task_has_failed_required_output(task: &TaskRow) -> bool {
+    task.requires_visible_output
+        && task.state == FoldTaskState::Succeeded
+        && task.output_visibility_state == Some(OutputVisibilityState::Failed)
+}
+
+fn task_has_pending_required_output(task: &TaskRow) -> bool {
+    task.requires_visible_output
+        && task.state == FoldTaskState::Succeeded
+        && task.output_visibility_state == Some(OutputVisibilityState::Pending)
+}
+
+fn map_run_row_state(run: &RunRow, tasks: &[&TaskRow]) -> RunStateResponse {
     if run.cancel_requested && !run.state.is_terminal() {
         return RunStateResponse::Cancelling;
     }
+    if run.state == FoldRunState::Cancelled {
+        return RunStateResponse::Cancelled;
+    }
+    if run.state == FoldRunState::Failed
+        || tasks
+            .iter()
+            .any(|task| task_has_failed_required_output(task))
+    {
+        return RunStateResponse::Failed;
+    }
+    if run.state == FoldRunState::Succeeded
+        && tasks
+            .iter()
+            .any(|task| task_has_pending_required_output(task))
+    {
+        return RunStateResponse::Running;
+    }
     map_run_state(run.state)
+}
+
+fn public_run_completed_at(
+    state: RunStateResponse,
+    completed_at: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    match state {
+        RunStateResponse::Pending | RunStateResponse::Running | RunStateResponse::Cancelling => {
+            None
+        }
+        RunStateResponse::Succeeded
+        | RunStateResponse::Failed
+        | RunStateResponse::Cancelled
+        | RunStateResponse::TimedOut => completed_at,
+    }
 }
 
 fn map_task_state(state: FoldTaskState) -> TaskStateResponse {
@@ -3855,7 +3930,12 @@ pub(crate) async fn trigger_run(
             match load_orchestration_state(&ctx, &state).await {
                 Ok(fold_state) => {
                     if let Some(run) = fold_state.runs.get(&existing.run_id) {
-                        run_state = map_run_row_state(run);
+                        let tasks: Vec<&TaskRow> = fold_state
+                            .tasks
+                            .values()
+                            .filter(|task| task.run_id == existing.run_id)
+                            .collect();
+                        run_state = map_run_row_state(run, &tasks);
                         run_found = true;
                     }
                 }
@@ -4010,7 +4090,12 @@ pub(crate) async fn trigger_run(
                 match load_orchestration_state(&ctx, &state).await {
                     Ok(fold_state) => {
                         if let Some(run) = fold_state.runs.get(&existing.run_id) {
-                            run_state = map_run_row_state(run);
+                            let tasks: Vec<&TaskRow> = fold_state
+                                .tasks
+                                .values()
+                                .filter(|task| task.run_id == existing.run_id)
+                                .collect();
+                            run_state = map_run_row_state(run, &tasks);
                             run_found = true;
                         }
                     }
@@ -4366,7 +4451,12 @@ pub(crate) async fn rerun_run(
 
             if let Ok(fold_state) = load_orchestration_state(&ctx, &state).await {
                 if let Some(run) = fold_state.runs.get(&existing.run_id) {
-                    run_state = map_run_row_state(run);
+                    let tasks: Vec<&TaskRow> = fold_state
+                        .tasks
+                        .values()
+                        .filter(|task| task.run_id == existing.run_id)
+                        .collect();
+                    run_state = map_run_row_state(run, &tasks);
                     run_found = true;
                 }
             }
@@ -4791,20 +4881,25 @@ pub(crate) async fn get_run(
             delta_partition: row.delta_partition.clone(),
             retry_attribution: task_retry_attribution(row),
             skip_attribution: task_skip_attribution(row, &skip_attribution_index),
+            output_visibility_state: row.output_visibility_state.map(map_output_visibility_state),
+            published_at: row.published_at,
+            publish_error: row.publish_error.clone(),
         })
         .collect::<Vec<_>>();
 
     let (parent_run_id, rerun_kind) = lineage_from_labels(&run.labels);
     let rerun_reason = rerun_kind.map(|kind| rerun_reason_for_kind(kind).to_string());
 
+    let public_state = map_run_row_state(run, &tasks);
+
     let response = RunResponse {
         run_id: run.run_id.clone(),
         workspace_id,
         plan_id: run.plan_id.clone(),
-        state: map_run_row_state(run),
+        state: public_state,
         created_at: run.triggered_at,
         started_at,
-        completed_at: run.completed_at,
+        completed_at: public_run_completed_at(public_state, run.completed_at),
         tasks: task_summaries,
         task_counts,
         labels: run.labels.clone(),
@@ -4860,10 +4955,24 @@ pub(crate) async fn list_runs(
         )));
     }
     let fold_state = load_orchestration_state(&ctx, &state).await?;
+    let mut tasks_by_run: HashMap<String, Vec<&TaskRow>> = HashMap::new();
+    for task in fold_state.tasks.values() {
+        tasks_by_run
+            .entry(task.run_id.clone())
+            .or_default()
+            .push(task);
+    }
 
     let mut runs: Vec<&RunRow> = fold_state.runs.values().collect();
     if let Some(filter_state) = query.state {
-        runs.retain(|row| map_run_row_state(row) == filter_state);
+        runs.retain(|row| {
+            map_run_row_state(
+                row,
+                tasks_by_run
+                    .get(row.run_id.as_str())
+                    .map_or(&[], Vec::as_slice),
+            ) == filter_state
+        });
     }
 
     runs.sort_by(|a, b| b.triggered_at.cmp(&a.triggered_at));
@@ -4893,11 +5002,17 @@ pub(crate) async fn list_runs(
         .iter()
         .map(|row| {
             let (parent_run_id, rerun_kind) = lineage_from_labels(&row.labels);
+            let public_state = map_run_row_state(
+                row,
+                tasks_by_run
+                    .get(row.run_id.as_str())
+                    .map_or(&[], Vec::as_slice),
+            );
             RunListItem {
                 run_id: row.run_id.clone(),
-                state: map_run_row_state(row),
+                state: public_state,
                 created_at: row.triggered_at,
-                completed_at: row.completed_at,
+                completed_at: public_run_completed_at(public_state, row.completed_at),
                 task_count: row.tasks_total,
                 tasks_succeeded: row.tasks_succeeded,
                 tasks_failed: row.tasks_failed,
@@ -6698,6 +6813,137 @@ mod tests {
         let json = serde_json::to_string(&response).expect("serialize");
         assert!(json.contains("\"runId\":\"run_123\""));
         assert!(json.contains("\"state\":\"RUNNING\""));
+    }
+
+    fn visibility_run_row(state: FoldRunState) -> RunRow {
+        RunRow {
+            run_id: "run_123".to_string(),
+            plan_id: "plan_123".to_string(),
+            state,
+            run_key: None,
+            labels: HashMap::new(),
+            code_version: None,
+            cancel_requested: false,
+            tasks_total: 1,
+            tasks_completed: 1,
+            tasks_succeeded: 1,
+            tasks_failed: 0,
+            tasks_skipped: 0,
+            tasks_cancelled: 0,
+            triggered_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            row_version: "01HQXYZ123".to_string(),
+        }
+    }
+
+    fn visibility_task_row(
+        requires_visible_output: bool,
+        visibility_state: Option<OutputVisibilityState>,
+        publish_error: Option<&str>,
+    ) -> TaskRow {
+        TaskRow {
+            run_id: "run_123".to_string(),
+            task_key: "analytics.daily".to_string(),
+            state: FoldTaskState::Succeeded,
+            attempt: 1,
+            attempt_id: Some("att-1".to_string()),
+            started_at: None,
+            completed_at: Some(Utc::now()),
+            error_message: None,
+            deps_total: 0,
+            deps_satisfied_count: 0,
+            max_attempts: 1,
+            heartbeat_timeout_sec: 300,
+            last_heartbeat_at: None,
+            ready_at: None,
+            asset_key: Some("analytics.daily".to_string()),
+            partition_key: Some("2026-03-24".to_string()),
+            requires_visible_output,
+            materialization_id: Some("mat_01".to_string()),
+            output_visibility_state: visibility_state,
+            published_at: Some(Utc::now()),
+            publish_error: publish_error.map(ToString::to_string),
+            delta_table: Some("analytics.daily".to_string()),
+            delta_version: Some(7),
+            delta_partition: Some("date=2026-03-24".to_string()),
+            execution_lineage_ref: Some("{\"runId\":\"run_123\"}".to_string()),
+            row_version: "01HQXYZ124".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_map_run_row_state_keeps_succeeded_run_running_while_required_output_pending() {
+        let run = visibility_run_row(FoldRunState::Succeeded);
+        let task = visibility_task_row(true, Some(OutputVisibilityState::Pending), None);
+
+        assert_eq!(map_run_row_state(&run, &[&task]), RunStateResponse::Running);
+    }
+
+    #[test]
+    fn test_map_run_row_state_fails_when_required_output_failed() {
+        let run = visibility_run_row(FoldRunState::Succeeded);
+        let task = visibility_task_row(
+            true,
+            Some(OutputVisibilityState::Failed),
+            Some("publisher exhausted retries"),
+        );
+
+        assert_eq!(map_run_row_state(&run, &[&task]), RunStateResponse::Failed);
+    }
+
+    #[test]
+    fn test_map_run_row_state_succeeds_only_when_required_output_visible() {
+        let run = visibility_run_row(FoldRunState::Succeeded);
+        let task = visibility_task_row(true, Some(OutputVisibilityState::Visible), None);
+
+        assert_eq!(
+            map_run_row_state(&run, &[&task]),
+            RunStateResponse::Succeeded
+        );
+    }
+
+    #[test]
+    fn test_map_run_row_state_treats_missing_visibility_as_succeeded_until_event_arrives() {
+        let run = visibility_run_row(FoldRunState::Succeeded);
+        let task = visibility_task_row(true, None, None);
+
+        assert_eq!(
+            map_run_row_state(&run, &[&task]),
+            RunStateResponse::Succeeded
+        );
+    }
+
+    #[test]
+    fn test_public_run_completed_at_clears_timestamp_for_non_terminal_public_state() {
+        let completed_at = Some(Utc::now());
+
+        assert!(public_run_completed_at(RunStateResponse::Running, completed_at).is_none());
+    }
+
+    #[test]
+    fn test_task_summary_serialization_includes_output_visibility() {
+        let summary = TaskSummary {
+            task_key: "analytics.daily".to_string(),
+            asset_key: Some("analytics.daily".to_string()),
+            state: TaskStateResponse::Succeeded,
+            attempt: 1,
+            started_at: None,
+            completed_at: Some(Utc::now()),
+            error_message: None,
+            execution_lineage_ref: None,
+            delta_table: None,
+            delta_version: None,
+            delta_partition: None,
+            retry_attribution: None,
+            skip_attribution: None,
+            output_visibility_state: Some(TaskOutputVisibilityStateResponse::Failed),
+            published_at: None,
+            publish_error: Some("publisher exhausted retries".to_string()),
+        };
+
+        let json = serde_json::to_string(&summary).expect("serialize");
+        assert!(json.contains("\"outputVisibilityState\":\"FAILED\""));
+        assert!(json.contains("\"publishError\":\"publisher exhausted retries\""));
     }
 
     #[test]

@@ -2,12 +2,12 @@
 syntax = "proto3";
 package arco.v1;
 
+import "arco/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/daxis-io/arco/proto/arco/v1";
 option java_multiple_files = true;
 option java_package = "com.arco.v1";
-option go_package = "github.com/daxis-io/arco/proto/arco/v1";
-
-import "google/protobuf/timestamp.proto";
-import "arco/v1/common.proto";
 
 // ============================================================================
 // Plan Domain
@@ -71,7 +71,10 @@ enum TaskOperation {
   TASK_OPERATION_UNSPECIFIED = 0;
   TASK_OPERATION_MATERIALIZE = 1;
   TASK_OPERATION_CHECK = 2;
-  TASK_OPERATION_BACKFILL = 3;
+  // Deprecated semantic: use TRIGGER_TYPE_BACKFILL plus run/task metadata
+  // for historical execution context. Backfill-triggered runs should still
+  // use TASK_OPERATION_MATERIALIZE for data-writing tasks.
+  TASK_OPERATION_BACKFILL = 3 [deprecated = true];
 }
 
 // Semantic identity for a task (asset + partition + operation).
@@ -142,14 +145,19 @@ message Run {
 
 // Run state machine states.
 // Per orchestration design: reliable run state management with recovery.
+//
+// Output visibility is tracked separately on TaskExecution.output.
+// Consumers that need consumability should inspect required task outputs
+// alongside the run state; by convention, materialize tasks are the
+// required-output-producing task kind.
 enum RunState {
   RUN_STATE_UNSPECIFIED = 0;
-  RUN_STATE_PENDING = 1;     // Created, waiting to start
-  RUN_STATE_RUNNING = 2;     // Actively executing tasks
-  RUN_STATE_SUCCEEDED = 3;   // All tasks completed successfully
-  RUN_STATE_FAILED = 4;      // One or more tasks failed
-  RUN_STATE_CANCELLED = 5;   // Cancelled by user or system
-  RUN_STATE_TIMED_OUT = 6;   // Exceeded maximum duration
+  RUN_STATE_PENDING = 1; // Created, waiting to start
+  RUN_STATE_RUNNING = 2; // Actively executing tasks
+  RUN_STATE_SUCCEEDED = 3; // Run completed successfully
+  RUN_STATE_FAILED = 4; // Run completed with failure
+  RUN_STATE_CANCELLED = 5; // Cancelled by user or system
+  RUN_STATE_TIMED_OUT = 6; // Exceeded maximum duration
 }
 
 // How the run was triggered.
@@ -170,10 +178,10 @@ message RunTrigger {
 // Trigger type enum.
 enum TriggerType {
   TRIGGER_TYPE_UNSPECIFIED = 0;
-  TRIGGER_TYPE_MANUAL = 1;      // User-initiated
-  TRIGGER_TYPE_SCHEDULED = 2;   // Cron/schedule-based
-  TRIGGER_TYPE_SENSOR = 3;      // Event-driven (e.g., file arrival)
-  TRIGGER_TYPE_BACKFILL = 4;    // Historical data backfill
+  TRIGGER_TYPE_MANUAL = 1; // User-initiated
+  TRIGGER_TYPE_SCHEDULED = 2; // Cron/schedule-based
+  TRIGGER_TYPE_SENSOR = 3; // Event-driven (e.g., file arrival)
+  TRIGGER_TYPE_BACKFILL = 4; // Historical data backfill
 }
 
 // ============================================================================
@@ -199,10 +207,11 @@ message TaskExecution {
   // Worker that executed this task
   string worker_id = 7;
 
-  // Output reference (if succeeded)
+  // Output object once a stable materialization ID exists.
+  // Presence does not imply the output is readable; check `output.visibility_state`.
   TaskOutput output = 8;
 
-  // Error information (if failed)
+  // Execution error information (if failed)
   TaskError error = 9;
 
   // Execution metrics
@@ -218,29 +227,54 @@ message TaskExecution {
 // Task execution state machine.
 enum TaskState {
   TASK_STATE_UNSPECIFIED = 0;
-  TASK_STATE_PENDING = 1;      // Waiting for dependencies
-  TASK_STATE_QUEUED = 2;       // Ready, waiting for worker
-  TASK_STATE_RUNNING = 3;      // Actively executing
-  TASK_STATE_SUCCEEDED = 4;    // Completed successfully
-  TASK_STATE_FAILED = 5;       // Failed (may retry)
-  TASK_STATE_SKIPPED = 6;      // Skipped (upstream failed)
-  TASK_STATE_CANCELLED = 7;    // Cancelled
+  TASK_STATE_PENDING = 1; // Waiting for dependencies
+  TASK_STATE_QUEUED = 2; // Ready, waiting for worker
+  TASK_STATE_RUNNING = 3; // Actively executing
+  TASK_STATE_SUCCEEDED = 4; // Worker completed successfully; output visibility may still be pending
+  TASK_STATE_FAILED = 5; // Failed (may retry)
+  TASK_STATE_SKIPPED = 6; // Skipped (upstream failed)
+  TASK_STATE_CANCELLED = 7; // Cancelled
 }
 
 // Task output reference.
+//
+// This models a trackable output object once Arco has allocated a stable
+// materialization ID. Visibility is tracked separately from worker execution
+// so clients can distinguish "work finished" from "output is readable."
 message TaskOutput {
   // Materialization ID for output tracking
   MaterializationId materialization_id = 1;
 
-  // Output files
+  // Published/readable output files. Empty until visibility is VISIBLE.
   repeated FileEntry files = 2;
 
-  // Output statistics
+  // Published output statistics. Only meaningful when visibility is VISIBLE.
   int64 row_count = 3;
   int64 byte_size = 4;
+
+  // Visibility/readability of the output object.
+  OutputVisibilityState visibility_state = 5;
+
+  // When the output became published/readable.
+  google.protobuf.Timestamp published_at = 6;
+
+  // Publish error information after retries are exhausted.
+  TaskError publish_error = 7;
 }
 
 // FileEntry is defined in common.proto
+
+// Visibility state for a task output.
+//
+// `_UNSPECIFIED` is tolerated only for legacy/backfilled data during migration.
+// New writers must emit PENDING, VISIBLE, or FAILED whenever TaskExecution.output
+// is present.
+enum OutputVisibilityState {
+  OUTPUT_VISIBILITY_STATE_UNSPECIFIED = 0;
+  OUTPUT_VISIBILITY_STATE_PENDING = 1;
+  OUTPUT_VISIBILITY_STATE_VISIBLE = 2;
+  OUTPUT_VISIBILITY_STATE_FAILED = 3;
+}
 
 // Task error information.
 message TaskError {
@@ -260,10 +294,10 @@ message TaskError {
 // Task error categories.
 enum TaskErrorCategory {
   TASK_ERROR_CATEGORY_UNSPECIFIED = 0;
-  TASK_ERROR_CATEGORY_USER_CODE = 1;       // Error in user asset code
-  TASK_ERROR_CATEGORY_DATA_QUALITY = 2;    // Schema mismatch, constraint violation
-  TASK_ERROR_CATEGORY_INFRASTRUCTURE = 3;  // Network, storage, timeout
-  TASK_ERROR_CATEGORY_CONFIGURATION = 4;   // Invalid config or missing secrets
+  TASK_ERROR_CATEGORY_USER_CODE = 1; // Error in user asset code
+  TASK_ERROR_CATEGORY_DATA_QUALITY = 2; // Schema mismatch, constraint violation
+  TASK_ERROR_CATEGORY_INFRASTRUCTURE = 3; // Network, storage, timeout
+  TASK_ERROR_CATEGORY_CONFIGURATION = 4; // Invalid config or missing secrets
 }
 
 // Task execution metrics.

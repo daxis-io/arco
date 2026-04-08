@@ -4,8 +4,8 @@
     "title": "Arco API",
     "description": "Arco catalog REST API (M4/M5)",
     "contact": {
-      "name": "Ethan Urbanski",
-      "email": "ethan@daxistech.io"
+      "name": "Daxis",
+      "email": "engineering@daxis.io"
     },
     "license": {
       "name": "Apache-2.0",
@@ -7407,6 +7407,32 @@
             ],
             "description": "Output path."
           },
+          "outputVisibilityState": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TaskOutputVisibilityState",
+                "description": "Output visibility state, when the worker/runtime can report it."
+              }
+            ]
+          },
+          "publishError": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Publish failure details, if applicable."
+          },
+          "publishedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When output became visible, if applicable."
+          },
           "rowCount": {
             "type": [
               "integer",
@@ -7417,6 +7443,24 @@
             "minimum": 0
           }
         }
+      },
+      "TaskOutputVisibilityState": {
+        "type": "string",
+        "description": "Worker-reported output visibility state.",
+        "enum": [
+          "PENDING",
+          "VISIBLE",
+          "FAILED"
+        ]
+      },
+      "TaskOutputVisibilityStateResponse": {
+        "type": "string",
+        "description": "Task output visibility summary.",
+        "enum": [
+          "PENDING",
+          "VISIBLE",
+          "FAILED"
+        ]
       },
       "TaskRetryAttributionResponse": {
         "type": "object",
@@ -7593,6 +7637,32 @@
               "null"
             ],
             "description": "Deterministic execution lineage reference for successful materializations."
+          },
+          "outputVisibilityState": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TaskOutputVisibilityStateResponse",
+                "description": "Output visibility state for required-output tasks."
+              }
+            ]
+          },
+          "publishError": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Publish failure details for output visibility failures."
+          },
+          "publishedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When output became visible."
           },
           "retryAttribution": {
             "oneOf": [

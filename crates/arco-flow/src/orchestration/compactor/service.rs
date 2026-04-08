@@ -351,11 +351,17 @@ impl MicroCompactor {
                             if let Some(delay_ms) =
                                 should_retry_publish_error(&publish_error, retry_attempt)
                             {
+                                let Some(reason) = publish_error.retry_reason() else {
+                                    debug_assert!(
+                                        false,
+                                        "retryable publish error must carry a retry reason"
+                                    );
+                                    wait_for_publish_retry(delay_ms).await;
+                                    continue 'retry;
+                                };
                                 record_compaction_publish_retry(
                                     self.durability_mode,
-                                    publish_error
-                                        .retry_reason()
-                                        .expect("retryable publish error must have reason"),
+                                    reason,
                                     retry_attempt + 1,
                                     delay_ms,
                                 );
@@ -586,11 +592,17 @@ impl MicroCompactor {
                         if let Some(delay_ms) =
                             should_retry_publish_error(&publish_error, retry_attempt)
                         {
+                            let Some(reason) = publish_error.retry_reason() else {
+                                debug_assert!(
+                                    false,
+                                    "retryable publish error must carry a retry reason"
+                                );
+                                wait_for_publish_retry(delay_ms).await;
+                                continue 'retry;
+                            };
                             record_compaction_publish_retry(
                                 self.durability_mode,
-                                publish_error
-                                    .retry_reason()
-                                    .expect("retryable publish error must have reason"),
+                                reason,
                                 retry_attempt + 1,
                                 delay_ms,
                             );
@@ -1129,6 +1141,7 @@ impl MicroCompactor {
     }
 
     /// Publishes a new manifest version.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn publish_manifest(
         &self,
         manifest: &OrchestrationManifest,
@@ -1234,15 +1247,17 @@ impl MicroCompactor {
             {
                 Err(PublishManifestError::ConcurrentWrite)
             }
-            Err(arco_core::Error::PreconditionFailed { message }) => {
-                if let Some(error) = decode_pre_pointer_publish_error(&message) {
-                    Err(PublishManifestError::Other(error))
-                } else {
+            Err(arco_core::Error::PreconditionFailed { message }) => decode_pre_pointer_publish_error(
+                &message,
+            )
+            .map_or_else(
+                || {
                     Err(PublishManifestError::Other(Error::Core(
                         arco_core::Error::PreconditionFailed { message },
                     )))
-                }
-            }
+                },
+                |error| Err(PublishManifestError::Other(error)),
+            ),
             Err(error) => Err(PublishManifestError::Other(Error::from(error))),
         }
     }

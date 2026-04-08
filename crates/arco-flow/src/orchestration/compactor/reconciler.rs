@@ -170,6 +170,7 @@ impl OrchestrationReconciler {
     /// # Errors
     ///
     /// Returns an error if storage reads or deletes fail.
+    #[allow(clippy::too_many_lines)]
     pub async fn repair(
         &self,
         report: &OrchestrationReconciliationReport,
@@ -330,7 +331,7 @@ impl OrchestrationReconciler {
                 protected.manifest_paths.insert(path.clone());
             }
             Self::protect_manifest_artifacts(&manifest, &mut protected);
-            previous_manifest_path = manifest.previous_manifest_path.clone();
+            previous_manifest_path.clone_from(&manifest.previous_manifest_path);
         }
 
         Ok(protected)

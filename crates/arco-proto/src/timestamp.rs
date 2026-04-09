@@ -30,7 +30,8 @@ impl From<DateTime<Utc>> for Timestamp {
     fn from(value: DateTime<Utc>) -> Self {
         Self {
             seconds: value.timestamp(),
-            nanos: value.timestamp_subsec_nanos() as i32,
+            nanos: i32::try_from(value.timestamp_subsec_nanos())
+                .unwrap_or_else(|_| unreachable!("chrono nanoseconds always fit in i32")),
         }
     }
 }
@@ -65,7 +66,7 @@ impl Serialize for Timestamp {
 
 struct TimestampVisitor;
 
-impl<'de> Visitor<'de> for TimestampVisitor {
+impl Visitor<'_> for TimestampVisitor {
     type Value = Timestamp;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -1,93 +1,75 @@
-//! Contract tests for generated control-plane transaction protobuf messages.
+//! Contract tests for the authoritative control-plane protobuf surface.
 
 #![allow(clippy::expect_used)]
 
 use prost::Message;
 
-use arco_proto::{
-    ApplyCatalogDdlRequest, CatalogDdlOperation as CatalogDdlEnvelope, OrchestrationBatchSpec,
+use arco_proto::ControlPlaneTransactionContractError;
+use arco_proto::arco::catalog::v1::{
+    Catalog, CatalogDdlOperation, Column, ColumnDefinition, CreateCatalogOp, CreateSchemaOp,
+    DropTableOp, LineageEdge, RegisterTableOp, RenameTableOp, Schema, Table, UpdateTableOp,
+    catalog_ddl_operation,
 };
-use arco_proto::{
-    ApplyCatalogDdlResponse, CatalogDdlOperation, CatalogTxReceipt, CatalogTxStatus,
+use arco_proto::arco::common::v1::TableFormat;
+use arco_proto::arco::controlplane::v1::{
+    ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CatalogTxReceipt, CatalogTxStatus,
     CommitOrchestrationBatchRequest, CommitOrchestrationBatchResponse,
-    CommitRootTransactionRequest, CommitRootTransactionResponse,
-    ControlPlaneTransactionContractError, DomainCommit, DomainMutation,
+    CommitRootTransactionRequest, CommitRootTransactionResponse, DomainCommit, DomainMutation,
     GetCatalogTransactionRequest, GetCatalogTransactionResponse,
     GetOrchestrationTransactionRequest, GetOrchestrationTransactionResponse,
-    GetRootTransactionRequest, GetRootTransactionResponse, OrchestrationEventEnvelope,
-    OrchestrationTxReceipt, OrchestrationTxStatus, RequestHeader, RootTxReceipt, RootTxStatus,
-    TenantId, TransactionDomain, TransactionStatus, WorkspaceId, domain_mutation,
+    GetRootTransactionRequest, GetRootTransactionResponse, OrchestrationBatchSpec,
+    OrchestrationTxReceipt, OrchestrationTxStatus, RootTxReceipt, RootTxStatus, TransactionDomain,
+    TransactionStatus, domain_mutation,
+};
+use arco_proto::arco::orchestration::v1::{
+    OrchestrationEventEnvelope, RunRequested, RunTriggered, TaskCallbackOutput, TaskError,
+    TaskErrorCategory, TaskFinished, TaskOutcome, TriggerInfo, orchestration_event_envelope,
 };
 
 #[test]
 fn control_plane_transaction_messages_compile_and_roundtrip_basic_fields() {
-    let header = RequestHeader {
-        tenant_id: Some(TenantId {
-            value: "acme".to_string(),
-        }),
-        workspace_id: Some(WorkspaceId {
-            value: "prod".to_string(),
-        }),
-        trace_parent: "00-abc-def-01".to_string(),
-        idempotency_key: "idem-01".to_string(),
-        request_time: None,
-        request_id: "req-01".to_string(),
-    };
-
     let request = ApplyCatalogDdlRequest {
-        header: Some(header.clone()),
         ddl: Some(CatalogDdlOperation {
-            op: Some(arco_proto::catalog_ddl_operation::Op::DropTable(
-                arco_proto::DropTableOp {
-                    namespace: "raw".to_string(),
-                    name: "events".to_string(),
-                },
-            )),
+            op: Some(catalog_ddl_operation::Op::CreateSchema(CreateSchemaOp {
+                catalog_name: "default".to_string(),
+                schema_name: "raw".to_string(),
+                description: Some("raw landing schema".to_string()),
+            })),
         }),
-        require_visible: Some(true),
     };
 
     let orchestration = CommitOrchestrationBatchRequest {
-        header: Some(header.clone()),
-        events: vec![OrchestrationEventEnvelope {
-            event_id: "01JEVT".to_string(),
-            event_type: "RunRequested".to_string(),
-            event_version: 1,
-            timestamp: None,
-            source: "arco-flow/acme/prod".to_string(),
-            idempotency_key: "run:req-01".to_string(),
-            correlation_id: Some("run-01".to_string()),
-            causation_id: None,
-            payload_json: br#"{"runId":"run-01"}"#.to_vec(),
-        }],
-        require_visible: Some(true),
-        allow_inline_merge: Some(false),
+        events: vec![sample_run_requested_event()],
     };
 
     let root = CommitRootTransactionRequest {
-        header: Some(header.clone()),
-        mutations: vec![DomainMutation {
-            kind: Some(domain_mutation::Kind::Catalog(CatalogDdlOperation {
-                op: Some(arco_proto::catalog_ddl_operation::Op::DropTable(
-                    arco_proto::DropTableOp {
-                        namespace: "raw".to_string(),
-                        name: "events".to_string(),
+        mutations: vec![
+            DomainMutation {
+                kind: Some(domain_mutation::Kind::Catalog(CatalogDdlOperation {
+                    op: Some(catalog_ddl_operation::Op::DropTable(DropTableOp {
+                        catalog_name: "default".to_string(),
+                        schema_name: "raw".to_string(),
+                        table_name: "events".to_string(),
+                    })),
+                })),
+            },
+            DomainMutation {
+                kind: Some(domain_mutation::Kind::Orchestration(
+                    OrchestrationBatchSpec {
+                        events: vec![sample_run_triggered_event()],
                     },
                 )),
-            })),
-        }],
+            },
+        ],
     };
 
     let catalog_lookup = GetCatalogTransactionRequest {
-        header: Some(header.clone()),
         tx_id: "01JQTX".to_string(),
     };
     let orchestration_lookup = GetOrchestrationTransactionRequest {
-        header: Some(header.clone()),
         tx_id: "01JQORCHTX".to_string(),
     };
     let root_lookup = GetRootTransactionRequest {
-        header: Some(header.clone()),
         tx_id: "01JQROOTTX".to_string(),
     };
 
@@ -109,15 +91,13 @@ fn control_plane_transaction_messages_compile_and_roundtrip_basic_fields() {
         status: Some(CatalogTxStatus {
             tx_id: "01JQTX".to_string(),
             status: TransactionStatus::Visible as i32,
-            repair_pending: true,
-            request_id: "req-01".to_string(),
-            idempotency_key: "idem-01".to_string(),
             request_hash: "sha256:req".to_string(),
             lock_path: "locks/catalog.lock.json".to_string(),
             fencing_token: 42,
             prepared_at: None,
             visible_at: None,
             result: Some(receipt),
+            repair_pending: true,
         }),
     };
     let orchestration_response = CommitOrchestrationBatchResponse {
@@ -138,15 +118,13 @@ fn control_plane_transaction_messages_compile_and_roundtrip_basic_fields() {
         status: Some(OrchestrationTxStatus {
             tx_id: "01JQORCHTX".to_string(),
             status: TransactionStatus::Visible as i32,
-            repair_pending: false,
-            request_id: "req-01".to_string(),
-            idempotency_key: "idem-01".to_string(),
             request_hash: "sha256:orch".to_string(),
             lock_path: "locks/orchestration.compaction.lock.json".to_string(),
             fencing_token: 7,
             prepared_at: None,
             visible_at: None,
             result: None,
+            repair_pending: false,
         }),
     };
     let root_response = CommitRootTransactionResponse {
@@ -171,9 +149,6 @@ fn control_plane_transaction_messages_compile_and_roundtrip_basic_fields() {
         status: Some(RootTxStatus {
             tx_id: "01JQROOTTX".to_string(),
             status: TransactionStatus::Visible as i32,
-            repair_pending: true,
-            request_id: "req-01".to_string(),
-            idempotency_key: "idem-01".to_string(),
             request_hash: "sha256:root".to_string(),
             lock_path: "locks/root.lock.json".to_string(),
             fencing_token: 11,
@@ -182,32 +157,146 @@ fn control_plane_transaction_messages_compile_and_roundtrip_basic_fields() {
             super_manifest_path: "transactions/root/01JQROOTTX.manifest.json".to_string(),
             domains: Vec::new(),
             result: None,
+            repair_pending: true,
         }),
     };
 
-    assert!(request.header.is_some());
     assert!(request.ddl.is_some());
     assert_eq!(orchestration.events.len(), 1);
-    assert_eq!(root.mutations.len(), 1);
+    assert_eq!(root.mutations.len(), 2);
     assert_eq!(catalog_lookup.tx_id, "01JQTX");
     assert_eq!(orchestration_lookup.tx_id, "01JQORCHTX");
     assert_eq!(root_lookup.tx_id, "01JQROOTTX");
     assert!(catalog_response.receipt.is_some());
-    assert_eq!(catalog_response.repair_pending, true);
     assert!(catalog_status.status.is_some());
     assert!(orchestration_response.receipt.is_some());
     assert!(orchestration_status.status.is_some());
     assert!(root_response.receipt.is_some());
-    assert_eq!(root_response.repair_pending, true);
     assert!(root_status.status.is_some());
+}
+
+#[test]
+fn catalog_surface_uses_canonical_catalog_schema_table_nouns_and_plain_string_ids() {
+    let catalog = Catalog {
+        id: "cat_01".to_string(),
+        name: "default".to_string(),
+        description: Some("default catalog".to_string()),
+        created_at: None,
+        updated_at: None,
+    };
+    let schema = Schema {
+        id: "sch_01".to_string(),
+        catalog_id: "cat_01".to_string(),
+        name: "raw".to_string(),
+        description: Some("raw landing schema".to_string()),
+        created_at: None,
+        updated_at: None,
+    };
+    let table = Table {
+        id: "tbl_01".to_string(),
+        schema_id: "sch_01".to_string(),
+        name: "events".to_string(),
+        description: Some("raw events".to_string()),
+        location: Some("s3://bucket/raw/events".to_string()),
+        format: TableFormat::Delta as i32,
+        created_at: None,
+        updated_at: None,
+    };
+    let column = Column {
+        id: "col_01".to_string(),
+        table_id: "tbl_01".to_string(),
+        name: "event_id".to_string(),
+        data_type: "string".to_string(),
+        is_nullable: false,
+        ordinal: 0,
+        description: None,
+    };
+    let edge = LineageEdge {
+        id: "edge_01".to_string(),
+        source_table_id: "tbl_upstream".to_string(),
+        target_table_id: "tbl_01".to_string(),
+        edge_type: "depends_on".to_string(),
+        run_id: Some("run_01".to_string()),
+        created_at: None,
+    };
+
+    assert_eq!(catalog.id, "cat_01");
+    assert_eq!(schema.catalog_id, "cat_01");
+    assert_eq!(table.schema_id, "sch_01");
+    assert_eq!(column.table_id, "tbl_01");
+    assert_eq!(edge.target_table_id, "tbl_01");
+}
+
+#[test]
+fn catalog_ddl_surface_covers_authoritative_operations() {
+    let create_catalog = CatalogDdlOperation {
+        op: Some(catalog_ddl_operation::Op::CreateCatalog(CreateCatalogOp {
+            name: "default".to_string(),
+            description: None,
+        })),
+    };
+    let create_schema = CatalogDdlOperation {
+        op: Some(catalog_ddl_operation::Op::CreateSchema(CreateSchemaOp {
+            catalog_name: "default".to_string(),
+            schema_name: "raw".to_string(),
+            description: None,
+        })),
+    };
+    let register_table = CatalogDdlOperation {
+        op: Some(catalog_ddl_operation::Op::RegisterTable(RegisterTableOp {
+            catalog_name: "default".to_string(),
+            schema_name: "raw".to_string(),
+            table_name: "events".to_string(),
+            description: Some("raw events".to_string()),
+            location: Some("s3://bucket/raw/events".to_string()),
+            format: TableFormat::Delta as i32,
+            columns: vec![ColumnDefinition {
+                name: "event_id".to_string(),
+                data_type: "string".to_string(),
+                is_nullable: false,
+                ordinal: 0,
+                description: None,
+            }],
+        })),
+    };
+    let update_table = CatalogDdlOperation {
+        op: Some(catalog_ddl_operation::Op::UpdateTable(UpdateTableOp {
+            catalog_name: "default".to_string(),
+            schema_name: "raw".to_string(),
+            table_name: "events".to_string(),
+            description: Some("curated raw events".to_string()),
+            location: Some("s3://bucket/curated/events".to_string()),
+            format: Some(TableFormat::Iceberg as i32),
+        })),
+    };
+    let drop_table = CatalogDdlOperation {
+        op: Some(catalog_ddl_operation::Op::DropTable(DropTableOp {
+            catalog_name: "default".to_string(),
+            schema_name: "raw".to_string(),
+            table_name: "events".to_string(),
+        })),
+    };
+    let rename_table = CatalogDdlOperation {
+        op: Some(catalog_ddl_operation::Op::RenameTable(RenameTableOp {
+            catalog_name: "default".to_string(),
+            schema_name: "raw".to_string(),
+            old_table_name: "events".to_string(),
+            new_table_name: "events_v2".to_string(),
+        })),
+    };
+
+    assert!(create_catalog.op.is_some());
+    assert!(create_schema.op.is_some());
+    assert!(register_table.op.is_some());
+    assert!(update_table.op.is_some());
+    assert!(drop_table.op.is_some());
+    assert!(rename_table.op.is_some());
 }
 
 #[test]
 fn apply_catalog_ddl_rejects_missing_operation() {
     let request = ApplyCatalogDdlRequest {
-        header: Some(sample_header()),
-        ddl: Some(CatalogDdlEnvelope { op: None }),
-        require_visible: Some(true),
+        ddl: Some(CatalogDdlOperation { op: None }),
     };
 
     assert_eq!(
@@ -218,12 +307,7 @@ fn apply_catalog_ddl_rejects_missing_operation() {
 
 #[test]
 fn commit_orchestration_batch_rejects_empty_events() {
-    let request = CommitOrchestrationBatchRequest {
-        header: Some(sample_header()),
-        events: Vec::new(),
-        require_visible: Some(true),
-        allow_inline_merge: Some(false),
-    };
+    let request = CommitOrchestrationBatchRequest { events: Vec::new() };
 
     assert_eq!(
         request.validate_contract(),
@@ -234,7 +318,6 @@ fn commit_orchestration_batch_rejects_empty_events() {
 #[test]
 fn commit_root_transaction_rejects_empty_mutations() {
     let request = CommitRootTransactionRequest {
-        header: Some(sample_header()),
         mutations: Vec::new(),
     };
 
@@ -247,7 +330,6 @@ fn commit_root_transaction_rejects_empty_mutations() {
 #[test]
 fn commit_root_transaction_rejects_missing_mutation_kind() {
     let request = CommitRootTransactionRequest {
-        header: Some(sample_header()),
         mutations: vec![DomainMutation { kind: None }],
     };
 
@@ -260,13 +342,9 @@ fn commit_root_transaction_rejects_missing_mutation_kind() {
 #[test]
 fn commit_root_transaction_rejects_empty_orchestration_events() {
     let request = CommitRootTransactionRequest {
-        header: Some(sample_header()),
         mutations: vec![DomainMutation {
             kind: Some(domain_mutation::Kind::Orchestration(
-                OrchestrationBatchSpec {
-                    events: Vec::new(),
-                    allow_inline_merge: Some(false),
-                },
+                OrchestrationBatchSpec { events: Vec::new() },
             )),
         }],
     };
@@ -278,30 +356,16 @@ fn commit_root_transaction_rejects_empty_orchestration_events() {
 }
 
 #[test]
-fn commit_root_transaction_accepts_enum_backed_domain_usage() {
-    let request = CommitRootTransactionRequest {
-        header: Some(sample_header()),
-        mutations: vec![DomainMutation {
-            kind: Some(domain_mutation::Kind::Orchestration(
-                OrchestrationBatchSpec {
-                    events: vec![OrchestrationEventEnvelope {
-                        event_id: "01JEVT".to_string(),
-                        event_type: "RunRequested".to_string(),
-                        event_version: 1,
-                        timestamp: None,
-                        source: "arco-flow/acme/prod".to_string(),
-                        idempotency_key: "run:req-01".to_string(),
-                        correlation_id: None,
-                        causation_id: None,
-                        payload_json: br#"{"runId":"run-01"}"#.to_vec(),
-                    }],
-                    allow_inline_merge: Some(false),
-                },
-            )),
-        }],
-    };
+fn typed_orchestration_envelope_roundtrips_without_payload_json() {
+    let envelope = sample_task_finished_event();
+    let encoded = envelope.encode_to_vec();
+    let decoded =
+        OrchestrationEventEnvelope::decode(encoded.as_slice()).expect("decode typed envelope");
 
-    assert_eq!(request.validate_contract(), Ok(()));
+    assert!(matches!(
+        decoded.event,
+        Some(orchestration_event_envelope::Event::TaskFinished(_))
+    ));
 }
 
 #[test]
@@ -329,18 +393,120 @@ fn root_super_manifest_path_preserves_legacy_wire_tags() {
     assert_eq!(status.encode_to_vec(), encode_string_field(11, path));
 }
 
-fn sample_header() -> RequestHeader {
-    RequestHeader {
-        tenant_id: Some(TenantId {
-            value: "acme".to_string(),
-        }),
-        workspace_id: Some(WorkspaceId {
-            value: "prod".to_string(),
-        }),
-        trace_parent: "00-abc-def-01".to_string(),
-        idempotency_key: "idem-01".to_string(),
-        request_time: None,
-        request_id: "req-01".to_string(),
+fn sample_run_requested_event() -> OrchestrationEventEnvelope {
+    OrchestrationEventEnvelope {
+        event_id: "01JEVT".to_string(),
+        event_version: 1,
+        timestamp: None,
+        source: "arco-flow/acme/prod".to_string(),
+        idempotency_key: "run:req-01".to_string(),
+        correlation_id: Some("run-01".to_string()),
+        causation_id: None,
+        event: Some(orchestration_event_envelope::Event::RunRequested(
+            RunRequested {
+                run_key: "sched:daily:2026-04-09".to_string(),
+                request_fingerprint: "sha256:req".to_string(),
+                asset_selection: vec!["default.raw.events".to_string()],
+                partition_selection: vec!["date=d:2026-04-09".to_string()],
+                trigger: Some(TriggerInfo {
+                    trigger: Some(
+                        arco_proto::arco::orchestration::v1::trigger_info::Trigger::Schedule(
+                            arco_proto::arco::orchestration::v1::ScheduleTrigger {
+                                schedule_id: "sched_01".to_string(),
+                                tick_id: Some("tick_01".to_string()),
+                            },
+                        ),
+                    ),
+                }),
+                labels: Default::default(),
+            },
+        )),
+    }
+}
+
+fn sample_run_triggered_event() -> OrchestrationEventEnvelope {
+    OrchestrationEventEnvelope {
+        event_id: "01JRUN".to_string(),
+        event_version: 1,
+        timestamp: None,
+        source: "arco-flow/acme/prod".to_string(),
+        idempotency_key: "run:manual:req-01".to_string(),
+        correlation_id: Some("run-01".to_string()),
+        causation_id: None,
+        event: Some(orchestration_event_envelope::Event::RunTriggered(
+            RunTriggered {
+                run_id: "run-01".to_string(),
+                plan_id: "plan-01".to_string(),
+                trigger: Some(TriggerInfo {
+                    trigger: Some(
+                        arco_proto::arco::orchestration::v1::trigger_info::Trigger::Manual(
+                            arco_proto::arco::orchestration::v1::ManualTrigger {
+                                user_id: "user_01".to_string(),
+                                request_id: None,
+                            },
+                        ),
+                    ),
+                }),
+                root_assets: vec!["default.raw.events".to_string()],
+                run_key: Some("manual:req-01".to_string()),
+                labels: Default::default(),
+                code_version: Some("git:abc123".to_string()),
+            },
+        )),
+    }
+}
+
+fn sample_task_finished_event() -> OrchestrationEventEnvelope {
+    OrchestrationEventEnvelope {
+        event_id: "01JTFIN".to_string(),
+        event_version: 1,
+        timestamp: None,
+        source: "arco-flow/acme/prod".to_string(),
+        idempotency_key: "finished:run-01:extract:1".to_string(),
+        correlation_id: Some("run-01".to_string()),
+        causation_id: None,
+        event: Some(orchestration_event_envelope::Event::TaskFinished(
+            TaskFinished {
+                run_id: "run-01".to_string(),
+                task_key: "extract".to_string(),
+                attempt: 1,
+                attempt_id: "attempt-01".to_string(),
+                worker_id: "worker-01".to_string(),
+                outcome: TaskOutcome::Succeeded as i32,
+                callback_output: Some(TaskCallbackOutput {
+                    materialization_id: Some("mat_01".to_string()),
+                    row_count: Some(5),
+                    byte_size: Some(128),
+                    output_path: Some("s3://bucket/output/part-000.parquet".to_string()),
+                    delta_table: Some("default.raw.events".to_string()),
+                    delta_version: Some(7),
+                    delta_partition: Some("date=d:2026-04-09".to_string()),
+                }),
+                error: Some(TaskError {
+                    category: TaskErrorCategory::UserCode as i32,
+                    message: "boom".to_string(),
+                    detail: None,
+                    retryable: Some(false),
+                }),
+                metrics: None,
+                cancelled_during_phase: None,
+                partial_progress_json: None,
+                asset_key: Some("default.raw.events".to_string()),
+                partition_key: Some(arco_proto::arco::common::v1::PartitionKey {
+                    dimensions: vec![arco_proto::arco::common::v1::PartitionDimension {
+                        name: "date".to_string(),
+                        value: Some(arco_proto::arco::common::v1::ScalarValue {
+                            value: Some(
+                                arco_proto::arco::common::v1::scalar_value::Value::DateValue(
+                                    "2026-04-09".to_string(),
+                                ),
+                            ),
+                        }),
+                    }],
+                }),
+                code_version: Some("git:abc123".to_string()),
+            },
+        )),
     }
 }
 

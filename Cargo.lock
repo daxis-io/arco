@@ -463,12 +463,12 @@ dependencies = [
 name = "arco-proto"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "http",
- "prost 0.13.5",
- "prost-types 0.13.5",
  "pbjson",
  "pbjson-build",
- "pbjson-types",
+ "prost 0.13.5",
+ "prost-types 0.13.5",
  "serde",
  "serde_json",
  "tonic",
@@ -4252,23 +4252,8 @@ checksum = "6eea3058763d6e656105d1403cb04e0a41b7bbac6362d413e7c33be0c32279c9"
 dependencies = [
  "heck 0.5.0",
  "itertools 0.13.0",
- "prost",
- "prost-types",
-]
-
-[[package]]
-name = "pbjson-types"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e54e5e7bfb1652f95bc361d76f3c780d8e526b134b85417e774166ee941f0887"
-dependencies = [
- "bytes",
- "chrono",
- "pbjson",
- "pbjson-build",
- "prost",
- "prost-build",
- "serde",
+ "prost 0.13.5",
+ "prost-types 0.13.5",
 ]
 
 [[package]]

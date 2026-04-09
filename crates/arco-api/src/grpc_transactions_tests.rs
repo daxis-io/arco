@@ -25,7 +25,7 @@ use arco_proto::{
     ApplyCatalogDdlRequest, CatalogDdlOperation, CommitOrchestrationBatchRequest,
     CommitRootTransactionRequest, CreateNamespaceOp, DomainMutation, GetCatalogTransactionRequest,
     GetOrchestrationTransactionRequest, GetRootTransactionRequest, OrchestrationBatchSpec,
-    OrchestrationEventEnvelope, RequestHeader, TenantId, TransactionStatus, WorkspaceId,
+    OrchestrationEventEnvelope, RequestHeader, TenantId, Timestamp, TransactionStatus, WorkspaceId,
 };
 
 const TENANT: &str = "test-tenant";
@@ -75,7 +75,7 @@ fn orchestration_request(
             event_id: "01JTXORCH000000000000000001".to_string(),
             event_type: "RunTriggered".to_string(),
             event_version: 1,
-            timestamp: Some(prost_types::Timestamp {
+            timestamp: Some(Timestamp {
                 seconds: 1_776_000_000,
                 nanos: 0,
             }),

@@ -8,6 +8,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod codec;
+mod timestamp;
 #[allow(
     unused_qualifications,
     deprecated,
@@ -26,6 +27,7 @@ mod generated {
 
 pub use codec::{ProstCodec, ProstDecoder, ProstEncoder};
 pub use generated::*;
+pub use timestamp::Timestamp;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOutputContractError {
@@ -400,7 +402,7 @@ mod tests {
         });
         zero_stats.row_count = 0;
         zero_stats.byte_size = 0;
-        zero_stats.published_at = Some(pbjson_types::Timestamp {
+        zero_stats.published_at = Some(Timestamp {
             seconds: 1_742_770_800,
             nanos: 0,
         });

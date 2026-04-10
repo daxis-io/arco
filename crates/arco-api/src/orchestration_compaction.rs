@@ -763,4 +763,25 @@ mod tests {
         let (_manifest, state) = compactor.load_state().await.expect("load state");
         assert!(state.runs.contains_key("run_release_failure"));
     }
+
+    #[test]
+    fn require_visible_compaction_rejects_persisted_not_visible_results() {
+        let error = require_visible_compaction(OrchestrationCompactionResult {
+            events_processed: 1,
+            delta_id: None,
+            manifest_id: "00000000000000000001".to_string(),
+            manifest_revision: "manifest-rev".to_string(),
+            pointer_version: "ptr-1".to_string(),
+            repair_pending: false,
+            visibility_status: VisibilityStatus::PersistedNotVisible,
+        })
+        .expect_err("non-visible orchestration compaction must fail the API contract");
+
+        assert!(
+            error
+                .message()
+                .contains("orchestration compaction did not become visible"),
+            "unexpected visible-contract error: {error:?}"
+        );
+    }
 }

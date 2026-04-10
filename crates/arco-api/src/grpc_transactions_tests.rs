@@ -15,17 +15,25 @@ use tonic::transport::{Channel, Endpoint, Server};
 use super::service;
 use crate::server::AppState;
 use crate::{config::Posture, rate_limit::RateLimitConfig};
+use arco_catalog::CatalogReader;
 use arco_core::control_plane_transactions::ControlPlaneTxPaths;
 use arco_core::storage::{MemoryBackend, StorageBackend};
 use arco_core::{ControlPlaneTxDomain, ScopedStorage};
-use arco_proto::catalog_ddl_operation::Op as CatalogDdlOp;
-use arco_proto::control_plane_transaction_service_client::ControlPlaneTransactionServiceClient;
-use arco_proto::domain_mutation;
-use arco_proto::{
-    ApplyCatalogDdlRequest, CatalogDdlOperation, CommitOrchestrationBatchRequest,
-    CommitRootTransactionRequest, CreateNamespaceOp, DomainMutation, GetCatalogTransactionRequest,
-    GetOrchestrationTransactionRequest, GetRootTransactionRequest, OrchestrationBatchSpec,
-    OrchestrationEventEnvelope, RequestHeader, TenantId, TransactionStatus, WorkspaceId,
+use arco_proto::arco::catalog::v1::{
+    CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp, RegisterTableOp,
+    RenameTableOp, catalog_ddl_operation,
+};
+use arco_proto::arco::common::v1::TableFormat;
+use arco_proto::arco::controlplane::v1::{
+    ApplyCatalogDdlRequest, CommitOrchestrationBatchRequest, CommitRootTransactionRequest,
+    DomainMutation, GetCatalogTransactionRequest, GetOrchestrationTransactionRequest,
+    GetRootTransactionRequest, OrchestrationBatchSpec, TransactionStatus,
+    control_plane_transaction_service_client::ControlPlaneTransactionServiceClient,
+    domain_mutation,
+};
+use arco_proto::arco::orchestration::v1::{
+    ManualTrigger, OrchestrationEventEnvelope, RunTriggered, TriggerInfo,
+    orchestration_event_envelope, trigger_info,
 };
 
 const TENANT: &str = "test-tenant";
@@ -35,32 +43,95 @@ const TEST_JWT_ISSUER: &str = "https://issuer.example";
 const TEST_JWT_AUDIENCE: &str = "arco-api";
 const TEST_USER_ID: &str = "grpc-tester";
 
-fn request_header(idempotency_key: &str, request_id: &str) -> RequestHeader {
-    RequestHeader {
-        tenant_id: Some(TenantId {
-            value: TENANT.to_string(),
+fn catalog_request(idempotency_key: &str, request_id: &str, name: &str) -> ApplyCatalogDdlRequest {
+    catalog_create_schema_request(idempotency_key, request_id, "default", name)
+}
+
+fn catalog_create_catalog_request(
+    idempotency_key: &str,
+    request_id: &str,
+    name: &str,
+) -> ApplyCatalogDdlRequest {
+    let _ = idempotency_key;
+    let _ = request_id;
+    ApplyCatalogDdlRequest {
+        ddl: Some(CatalogDdlOperation {
+            op: Some(catalog_ddl_operation::Op::CreateCatalog(CreateCatalogOp {
+                name: name.to_string(),
+                description: Some("grpc transaction catalog".to_string()),
+            })),
         }),
-        workspace_id: Some(WorkspaceId {
-            value: WORKSPACE.to_string(),
-        }),
-        trace_parent: String::new(),
-        idempotency_key: idempotency_key.to_string(),
-        request_time: None,
-        request_id: request_id.to_string(),
     }
 }
 
-fn catalog_request(idempotency_key: &str, request_id: &str, name: &str) -> ApplyCatalogDdlRequest {
+fn catalog_create_schema_request(
+    idempotency_key: &str,
+    request_id: &str,
+    catalog_name: &str,
+    schema_name: &str,
+) -> ApplyCatalogDdlRequest {
+    let _ = idempotency_key;
+    let _ = request_id;
     ApplyCatalogDdlRequest {
-        header: Some(request_header(idempotency_key, request_id)),
         ddl: Some(CatalogDdlOperation {
-            op: Some(CatalogDdlOp::CreateNamespace(CreateNamespaceOp {
-                name: name.to_string(),
+            op: Some(catalog_ddl_operation::Op::CreateSchema(CreateSchemaOp {
+                catalog_name: catalog_name.to_string(),
+                schema_name: schema_name.to_string(),
                 description: Some("grpc transaction test".to_string()),
-                properties: Default::default(),
             })),
         }),
-        require_visible: Some(true),
+    }
+}
+
+fn catalog_register_table_request(
+    idempotency_key: &str,
+    request_id: &str,
+    catalog_name: &str,
+    schema_name: &str,
+    table_name: &str,
+) -> ApplyCatalogDdlRequest {
+    let _ = idempotency_key;
+    let _ = request_id;
+    ApplyCatalogDdlRequest {
+        ddl: Some(CatalogDdlOperation {
+            op: Some(catalog_ddl_operation::Op::RegisterTable(RegisterTableOp {
+                catalog_name: catalog_name.to_string(),
+                schema_name: schema_name.to_string(),
+                table_name: table_name.to_string(),
+                description: Some("grpc transaction table".to_string()),
+                location: None,
+                format: TableFormat::Unspecified as i32,
+                columns: vec![ColumnDefinition {
+                    name: "id".to_string(),
+                    data_type: "STRING".to_string(),
+                    is_nullable: false,
+                    ordinal: 0,
+                    description: None,
+                }],
+            })),
+        }),
+    }
+}
+
+fn catalog_rename_table_request(
+    idempotency_key: &str,
+    request_id: &str,
+    catalog_name: &str,
+    schema_name: &str,
+    old_table_name: &str,
+    new_table_name: &str,
+) -> ApplyCatalogDdlRequest {
+    let _ = idempotency_key;
+    let _ = request_id;
+    ApplyCatalogDdlRequest {
+        ddl: Some(CatalogDdlOperation {
+            op: Some(catalog_ddl_operation::Op::RenameTable(RenameTableOp {
+                catalog_name: catalog_name.to_string(),
+                schema_name: schema_name.to_string(),
+                old_table_name: old_table_name.to_string(),
+                new_table_name: new_table_name.to_string(),
+            })),
+        }),
     }
 }
 
@@ -69,11 +140,11 @@ fn orchestration_request(
     request_id: &str,
     run_id: &str,
 ) -> CommitOrchestrationBatchRequest {
+    let _ = idempotency_key;
+    let _ = request_id;
     CommitOrchestrationBatchRequest {
-        header: Some(request_header(idempotency_key, request_id)),
         events: vec![OrchestrationEventEnvelope {
             event_id: "01JTXORCH000000000000000001".to_string(),
-            event_type: "RunTriggered".to_string(),
             event_version: 1,
             timestamp: Some(prost_types::Timestamp {
                 seconds: 1_776_000_000,
@@ -83,20 +154,23 @@ fn orchestration_request(
             idempotency_key: format!("event:{run_id}"),
             correlation_id: Some(run_id.to_string()),
             causation_id: None,
-            payload_json: serde_json::to_vec(&serde_json::json!({
-                "run_id": run_id,
-                "plan_id": format!("plan-{run_id}"),
-                "trigger": {
-                    "type": "manual",
-                    "user_id": "tester"
+            event: Some(orchestration_event_envelope::Event::RunTriggered(
+                RunTriggered {
+                    run_id: run_id.to_string(),
+                    plan_id: format!("plan-{run_id}"),
+                    trigger: Some(TriggerInfo {
+                        trigger: Some(trigger_info::Trigger::Manual(ManualTrigger {
+                            user_id: "tester".to_string(),
+                            request_id: None,
+                        })),
+                    }),
+                    root_assets: Vec::new(),
+                    run_key: Some(format!("manual:{run_id}")),
+                    labels: Default::default(),
+                    code_version: None,
                 },
-                "root_assets": [],
-                "labels": {}
-            }))
-            .expect("serialize orchestration payload"),
+            )),
         }],
-        require_visible: Some(true),
-        allow_inline_merge: Some(false),
     }
 }
 
@@ -107,14 +181,13 @@ fn root_request(
     run_id: &str,
 ) -> CommitRootTransactionRequest {
     CommitRootTransactionRequest {
-        header: Some(request_header(idempotency_key, request_id)),
         mutations: vec![
             DomainMutation {
                 kind: Some(domain_mutation::Kind::Catalog(CatalogDdlOperation {
-                    op: Some(CatalogDdlOp::CreateNamespace(CreateNamespaceOp {
-                        name: namespace.to_string(),
+                    op: Some(catalog_ddl_operation::Op::CreateSchema(CreateSchemaOp {
+                        catalog_name: "default".to_string(),
+                        schema_name: namespace.to_string(),
                         description: Some("grpc root transaction test".to_string()),
-                        properties: Default::default(),
                     })),
                 })),
             },
@@ -122,7 +195,6 @@ fn root_request(
                 kind: Some(domain_mutation::Kind::Orchestration(
                     OrchestrationBatchSpec {
                         events: orchestration_request(idempotency_key, request_id, run_id).events,
-                        allow_inline_merge: Some(false),
                     },
                 )),
             },
@@ -293,10 +365,6 @@ async fn grpc_apply_catalog_ddl_and_lookup_round_trip() -> Result<()> {
     assert!(load_catalog_tx_exists(backend, &receipt.tx_id).await?);
 
     let lookup = GetCatalogTransactionRequest {
-        header: Some(request_header(
-            "idem-grpc-cat-lookup-01",
-            "req-grpc-cat-lookup-01",
-        )),
         tx_id: receipt.tx_id.clone(),
     };
     let lookup = client
@@ -311,6 +379,85 @@ async fn grpc_apply_catalog_ddl_and_lookup_round_trip() -> Result<()> {
         .into_inner();
     let status = lookup.status.context("grpc catalog status missing")?;
     assert_eq!(status.status, TransactionStatus::Visible as i32);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn grpc_apply_catalog_ddl_supports_create_catalog_and_rename_table() -> Result<()> {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let (mut client, handle) = spawn_grpc_client(backend.clone()).await?;
+
+    client
+        .apply_catalog_ddl(attach_transport_metadata(
+            catalog_create_catalog_request("idem-grpc-uc-cat-01", "req-grpc-uc-cat-01", "governed"),
+            TENANT,
+            WORKSPACE,
+            "idem-grpc-uc-cat-01",
+            "req-grpc-uc-cat-01",
+        ))
+        .await?;
+    client
+        .apply_catalog_ddl(attach_transport_metadata(
+            catalog_create_schema_request(
+                "idem-grpc-uc-schema-01",
+                "req-grpc-uc-schema-01",
+                "governed",
+                "bronze",
+            ),
+            TENANT,
+            WORKSPACE,
+            "idem-grpc-uc-schema-01",
+            "req-grpc-uc-schema-01",
+        ))
+        .await?;
+    client
+        .apply_catalog_ddl(attach_transport_metadata(
+            catalog_register_table_request(
+                "idem-grpc-uc-reg-01",
+                "req-grpc-uc-reg-01",
+                "governed",
+                "bronze",
+                "events",
+            ),
+            TENANT,
+            WORKSPACE,
+            "idem-grpc-uc-reg-01",
+            "req-grpc-uc-reg-01",
+        ))
+        .await?;
+    client
+        .apply_catalog_ddl(attach_transport_metadata(
+            catalog_rename_table_request(
+                "idem-grpc-uc-rename-01",
+                "req-grpc-uc-rename-01",
+                "governed",
+                "bronze",
+                "events",
+                "events_curated",
+            ),
+            TENANT,
+            WORKSPACE,
+            "idem-grpc-uc-rename-01",
+            "req-grpc-uc-rename-01",
+        ))
+        .await?;
+
+    let reader = CatalogReader::new(scoped_storage(backend));
+    assert!(reader.get_catalog("governed").await?.is_some());
+    assert!(
+        reader
+            .get_table_in_schema("governed", "bronze", "events")
+            .await?
+            .is_none()
+    );
+    assert!(
+        reader
+            .get_table_in_schema("governed", "bronze", "events_curated")
+            .await?
+            .is_some()
+    );
 
     handle.abort();
     Ok(())
@@ -339,10 +486,6 @@ async fn grpc_commit_orchestration_batch_and_lookup_round_trip() -> Result<()> {
     assert_ne!(receipt.commit_id, receipt.revision_ulid);
 
     let lookup = GetOrchestrationTransactionRequest {
-        header: Some(request_header(
-            "idem-grpc-orch-lookup-01",
-            "req-grpc-orch-lookup-01",
-        )),
         tx_id: receipt.tx_id,
     };
     let lookup = client
@@ -388,10 +531,6 @@ async fn grpc_commit_root_transaction_and_lookup_round_trip() -> Result<()> {
     assert_eq!(receipt.domain_commits.len(), 2);
 
     let lookup = GetRootTransactionRequest {
-        header: Some(request_header(
-            "idem-grpc-root-lookup-01",
-            "req-grpc-root-lookup-01",
-        )),
         tx_id: receipt.tx_id,
     };
     let lookup = client

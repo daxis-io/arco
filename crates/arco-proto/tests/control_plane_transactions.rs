@@ -4,7 +4,6 @@
 
 use prost::Message;
 
-use arco_proto::ControlPlaneTransactionContractError;
 use arco_proto::arco::catalog::v1::{
     Catalog, CatalogDdlOperation, Column, ColumnDefinition, CreateCatalogOp, CreateSchemaOp,
     DropTableOp, LineageEdge, RegisterTableOp, RenameTableOp, Schema, Table, UpdateTableOp,
@@ -25,6 +24,7 @@ use arco_proto::arco::orchestration::v1::{
     OrchestrationEventEnvelope, RunRequested, RunTriggered, TaskCallbackOutput, TaskError,
     TaskErrorCategory, TaskFinished, TaskOutcome, TriggerInfo, orchestration_event_envelope,
 };
+use arco_proto::{ControlPlaneTransactionContractError, OrchestrationEventContractError};
 
 #[test]
 fn control_plane_transaction_messages_compile_and_roundtrip_basic_fields() {
@@ -316,6 +316,63 @@ fn commit_orchestration_batch_rejects_empty_events() {
 }
 
 #[test]
+fn commit_orchestration_batch_rejects_missing_event_kind() {
+    let mut event = sample_run_requested_event();
+    event.event = None;
+    let request = CommitOrchestrationBatchRequest {
+        events: vec![event],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(
+            ControlPlaneTransactionContractError::InvalidOrchestrationEvent(
+                0,
+                OrchestrationEventContractError::MissingEventKind,
+            )
+        )
+    );
+}
+
+#[test]
+fn commit_orchestration_batch_rejects_missing_event_timestamp() {
+    let mut event = sample_run_requested_event();
+    event.timestamp = None;
+    let request = CommitOrchestrationBatchRequest {
+        events: vec![event],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(
+            ControlPlaneTransactionContractError::InvalidOrchestrationEvent(
+                0,
+                OrchestrationEventContractError::MissingTimestamp,
+            )
+        )
+    );
+}
+
+#[test]
+fn commit_orchestration_batch_rejects_empty_event_identifiers() {
+    let mut event = sample_run_requested_event();
+    event.event_id.clear();
+    let request = CommitOrchestrationBatchRequest {
+        events: vec![event],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(
+            ControlPlaneTransactionContractError::InvalidOrchestrationEvent(
+                0,
+                OrchestrationEventContractError::EmptyEventId,
+            )
+        )
+    );
+}
+
+#[test]
 fn commit_root_transaction_rejects_empty_mutations() {
     let request = CommitRootTransactionRequest {
         mutations: Vec::new(),
@@ -340,6 +397,22 @@ fn commit_root_transaction_rejects_missing_mutation_kind() {
 }
 
 #[test]
+fn commit_root_transaction_rejects_missing_catalog_operation() {
+    let request = CommitRootTransactionRequest {
+        mutations: vec![DomainMutation {
+            kind: Some(domain_mutation::Kind::Catalog(CatalogDdlOperation {
+                op: None,
+            })),
+        }],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(ControlPlaneTransactionContractError::MissingRootCatalogDdlOp(0,))
+    );
+}
+
+#[test]
 fn commit_root_transaction_rejects_empty_orchestration_events() {
     let request = CommitRootTransactionRequest {
         mutations: vec![DomainMutation {
@@ -352,6 +425,32 @@ fn commit_root_transaction_rejects_empty_orchestration_events() {
     assert_eq!(
         request.validate_contract(),
         Err(ControlPlaneTransactionContractError::EmptyRootOrchestrationEvents(0))
+    );
+}
+
+#[test]
+fn commit_root_transaction_rejects_invalid_nested_orchestration_events() {
+    let mut event = sample_run_triggered_event();
+    event.idempotency_key.clear();
+    let request = CommitRootTransactionRequest {
+        mutations: vec![DomainMutation {
+            kind: Some(domain_mutation::Kind::Orchestration(
+                OrchestrationBatchSpec {
+                    events: vec![event],
+                },
+            )),
+        }],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(
+            ControlPlaneTransactionContractError::InvalidRootOrchestrationEvent(
+                0,
+                0,
+                OrchestrationEventContractError::EmptyIdempotencyKey,
+            ),
+        )
     );
 }
 
@@ -397,7 +496,10 @@ fn sample_run_requested_event() -> OrchestrationEventEnvelope {
     OrchestrationEventEnvelope {
         event_id: "01JEVT".to_string(),
         event_version: 1,
-        timestamp: None,
+        timestamp: Some(prost_types::Timestamp {
+            seconds: 1_776_000_000,
+            nanos: 0,
+        }),
         source: "arco-flow/acme/prod".to_string(),
         idempotency_key: "run:req-01".to_string(),
         correlation_id: Some("run-01".to_string()),
@@ -428,7 +530,10 @@ fn sample_run_triggered_event() -> OrchestrationEventEnvelope {
     OrchestrationEventEnvelope {
         event_id: "01JRUN".to_string(),
         event_version: 1,
-        timestamp: None,
+        timestamp: Some(prost_types::Timestamp {
+            seconds: 1_776_000_001,
+            nanos: 0,
+        }),
         source: "arco-flow/acme/prod".to_string(),
         idempotency_key: "run:manual:req-01".to_string(),
         correlation_id: Some("run-01".to_string()),
@@ -460,7 +565,10 @@ fn sample_task_finished_event() -> OrchestrationEventEnvelope {
     OrchestrationEventEnvelope {
         event_id: "01JTFIN".to_string(),
         event_version: 1,
-        timestamp: None,
+        timestamp: Some(prost_types::Timestamp {
+            seconds: 1_776_000_002,
+            nanos: 0,
+        }),
         source: "arco-flow/acme/prod".to_string(),
         idempotency_key: "finished:run-01:extract:1".to_string(),
         correlation_id: Some("run-01".to_string()),

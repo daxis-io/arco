@@ -260,7 +260,14 @@ impl RootManifest {
             return path.to_string();
         };
         if let Some(domain) = domain.strip_suffix(".manifest.json") {
-            return CatalogPaths::domain_manifest_str(domain);
+            let normalized = normalize_manifest_domain(domain);
+            return match normalized.as_str() {
+                "catalog" => CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
+                "lineage" => CatalogPaths::domain_manifest_pointer(CatalogDomain::Lineage),
+                "executions" => CatalogPaths::domain_manifest(CatalogDomain::Executions),
+                "search" => CatalogPaths::domain_manifest_pointer(CatalogDomain::Search),
+                _ => format!("manifests/{normalized}.manifest.json"),
+            };
         }
         if let Some(domain) = domain.strip_suffix(".pointer.json") {
             return format!(
@@ -329,7 +336,7 @@ pub struct CatalogDomainManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watermark_event_id: Option<String>,
 
-    /// Last commit ID for hash chain integrity.
+    /// Most recent returned commit ID for correlation and compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_commit_id: Option<String>,
 
@@ -751,7 +758,7 @@ pub struct LineageManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_ulid: Option<String>,
 
-    /// Last commit ID for audit trail.
+    /// Most recent returned commit ID for correlation and compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_commit_id: Option<String>,
 
@@ -901,7 +908,7 @@ pub struct SearchManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_ulid: Option<String>,
 
-    /// Last commit ID for audit trail.
+    /// Most recent returned commit ID for correlation and compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_commit_id: Option<String>,
 
@@ -1002,25 +1009,26 @@ impl Default for SearchManifest {
 pub type GovernanceManifest = SearchManifest;
 
 // ============================================================================
-// Commit Record (hash chain for audit trail)
+// Commit Record (returned metadata with optional hash-chain helpers)
 // ============================================================================
 
-/// Commit record for hash chain integrity.
+/// Commit metadata returned from catalog update operations.
 ///
-/// Per architecture: enables audit trail and rollback verification.
-/// Each commit references the previous commit's hash, forming an
-/// unbreakable chain that can be verified for tampering.
+/// Current Tier-1 writes return commit IDs for correlation but do not persist
+/// durable commit-record objects. `prev_commit_id` therefore reflects the
+/// previous returned commit when known, while `prev_commit_hash` is only
+/// populated when callers explicitly construct a chained record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommitRecord {
     /// Unique commit ID (ULID).
     pub commit_id: String,
 
-    /// Previous commit ID (None for first commit).
+    /// Previous returned commit ID when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prev_commit_id: Option<String>,
 
-    /// Previous commit hash (for chain verification).
+    /// Optional predecessor hash for explicitly chained records.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prev_commit_hash: Option<String>,
 
@@ -1055,8 +1063,9 @@ struct CommitHashInput<'a> {
 impl CommitRecord {
     /// Computes the hash of this commit for chain verification.
     ///
-    /// The hash includes `prev_commit_hash` to form an unbreakable chain.
-    /// Uses canonical JSON serialization to ensure unambiguous byte encoding.
+    /// If `prev_commit_hash` is present, the hash covers it as part of an
+    /// explicit successor chain. Uses canonical JSON serialization to ensure
+    /// unambiguous byte encoding.
     ///
     /// # Panics
     ///
@@ -1080,6 +1089,9 @@ impl CommitRecord {
     }
 
     /// Creates a new commit as a successor to a previous commit.
+    ///
+    /// This helper is for callers that want an explicit chained record; the
+    /// default Tier-1 writer path does not persist predecessor commit records.
     #[must_use]
     pub fn new_successor(
         prev: &Self,

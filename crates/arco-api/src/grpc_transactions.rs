@@ -7,11 +7,11 @@ use axum::http::{HeaderMap, HeaderValue};
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Code, Request, Response, Status};
 
-use arco_proto::control_plane_transaction_service_server::{
+use arco_proto::arco::controlplane::v1::control_plane_transaction_service_server::{
     ControlPlaneTransactionService as ControlPlaneTransactionGrpc,
     ControlPlaneTransactionServiceServer,
 };
-use arco_proto::{
+use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CommitOrchestrationBatchRequest,
     CommitOrchestrationBatchResponse, CommitRootTransactionRequest, CommitRootTransactionResponse,
     GetCatalogTransactionRequest, GetCatalogTransactionResponse,
@@ -278,7 +278,8 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
         &self,
         request: Request<ApplyCatalogDdlRequest>,
     ) -> Result<Response<ApplyCatalogDdlResponse>, Status> {
-        const RESOURCE: &str = "/arco.v1.ControlPlaneTransactionService/ApplyCatalogDdl";
+        const RESOURCE: &str =
+            "/arco.controlplane.v1.ControlPlaneTransactionService/ApplyCatalogDdl";
         let start = Instant::now();
         let result = async {
             let (ctx, rate_limit) = self
@@ -310,7 +311,8 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
         &self,
         request: Request<GetCatalogTransactionRequest>,
     ) -> Result<Response<GetCatalogTransactionResponse>, Status> {
-        const RESOURCE: &str = "/arco.v1.ControlPlaneTransactionService/GetCatalogTransaction";
+        const RESOURCE: &str =
+            "/arco.controlplane.v1.ControlPlaneTransactionService/GetCatalogTransaction";
         let start = Instant::now();
         let result = async {
             let (ctx, rate_limit) = self
@@ -342,7 +344,8 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
         &self,
         request: Request<CommitOrchestrationBatchRequest>,
     ) -> Result<Response<CommitOrchestrationBatchResponse>, Status> {
-        const RESOURCE: &str = "/arco.v1.ControlPlaneTransactionService/CommitOrchestrationBatch";
+        const RESOURCE: &str =
+            "/arco.controlplane.v1.ControlPlaneTransactionService/CommitOrchestrationBatch";
         let start = Instant::now();
         let result = async {
             let (ctx, rate_limit) = self
@@ -375,7 +378,7 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
         request: Request<GetOrchestrationTransactionRequest>,
     ) -> Result<Response<GetOrchestrationTransactionResponse>, Status> {
         const RESOURCE: &str =
-            "/arco.v1.ControlPlaneTransactionService/GetOrchestrationTransaction";
+            "/arco.controlplane.v1.ControlPlaneTransactionService/GetOrchestrationTransaction";
         let start = Instant::now();
         let result = async {
             let (ctx, rate_limit) = self
@@ -407,7 +410,8 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
         &self,
         request: Request<CommitRootTransactionRequest>,
     ) -> Result<Response<CommitRootTransactionResponse>, Status> {
-        const RESOURCE: &str = "/arco.v1.ControlPlaneTransactionService/CommitRootTransaction";
+        const RESOURCE: &str =
+            "/arco.controlplane.v1.ControlPlaneTransactionService/CommitRootTransaction";
         let start = Instant::now();
         let result = async {
             let (ctx, rate_limit) = self
@@ -439,7 +443,8 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
         &self,
         request: Request<GetRootTransactionRequest>,
     ) -> Result<Response<GetRootTransactionResponse>, Status> {
-        const RESOURCE: &str = "/arco.v1.ControlPlaneTransactionService/GetRootTransaction";
+        const RESOURCE: &str =
+            "/arco.controlplane.v1.ControlPlaneTransactionService/GetRootTransaction";
         let start = Instant::now();
         let result = async {
             let (ctx, rate_limit) = self

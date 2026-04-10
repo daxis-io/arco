@@ -66,6 +66,8 @@ pub mod arco {
     }
 }
 
+// Temporary compatibility re-exports while downstream crates finish migrating to
+// the nested `arco::<domain>::v1` public surface.
 pub use arco::catalog::v1::*;
 pub use arco::common::v1::*;
 pub use arco::controlplane::v1::*;
@@ -125,8 +127,11 @@ pub enum ControlPlaneTransactionContractError {
     MissingCatalogDdl,
     MissingCatalogDdlOp,
     EmptyOrchestrationEvents,
+    InvalidOrchestrationEvent(usize, OrchestrationEventContractError),
     EmptyRootMutations,
+    MissingRootCatalogDdlOp(usize),
     EmptyRootOrchestrationEvents(usize),
+    InvalidRootOrchestrationEvent(usize, usize, OrchestrationEventContractError),
     MissingRootMutationKind(usize),
 }
 
@@ -138,13 +143,31 @@ impl std::fmt::Display for ControlPlaneTransactionContractError {
             Self::EmptyOrchestrationEvents => {
                 f.write_str("orchestration batch must include at least one event")
             }
+            Self::InvalidOrchestrationEvent(index, error) => {
+                write!(
+                    f,
+                    "orchestration event at index {index} is invalid: {error}"
+                )
+            }
             Self::EmptyRootMutations => {
                 f.write_str("root transaction must include at least one mutation")
+            }
+            Self::MissingRootCatalogDdlOp(index) => {
+                write!(
+                    f,
+                    "root catalog mutation at index {index} must set catalog DDL operation"
+                )
             }
             Self::EmptyRootOrchestrationEvents(index) => {
                 write!(
                     f,
                     "root orchestration mutation at index {index} must include at least one event"
+                )
+            }
+            Self::InvalidRootOrchestrationEvent(mutation_index, event_index, error) => {
+                write!(
+                    f,
+                    "root orchestration mutation at index {mutation_index} has invalid event at index {event_index}: {error}"
                 )
             }
             Self::MissingRootMutationKind(index) => {
@@ -155,6 +178,29 @@ impl std::fmt::Display for ControlPlaneTransactionContractError {
 }
 
 impl std::error::Error for ControlPlaneTransactionContractError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrchestrationEventContractError {
+    EmptyEventId,
+    MissingTimestamp,
+    EmptySource,
+    EmptyIdempotencyKey,
+    MissingEventKind,
+}
+
+impl std::fmt::Display for OrchestrationEventContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyEventId => f.write_str("event_id is required"),
+            Self::MissingTimestamp => f.write_str("timestamp is required"),
+            Self::EmptySource => f.write_str("source is required"),
+            Self::EmptyIdempotencyKey => f.write_str("idempotency_key is required"),
+            Self::MissingEventKind => f.write_str("event payload is required"),
+        }
+    }
+}
+
+impl std::error::Error for OrchestrationEventContractError {}
 
 impl TaskOutput {
     pub fn validate_contract(&self) -> Result<(), TaskOutputContractError> {
@@ -230,6 +276,16 @@ impl CommitOrchestrationBatchRequest {
             return Err(ControlPlaneTransactionContractError::EmptyOrchestrationEvents);
         }
 
+        if let Some((index, error)) =
+            self.events.iter().enumerate().find_map(|(index, event)| {
+                event.validate_contract().err().map(|error| (index, error))
+            })
+        {
+            return Err(
+                ControlPlaneTransactionContractError::InvalidOrchestrationEvent(index, error),
+            );
+        }
+
         Ok(())
     }
 }
@@ -248,18 +304,68 @@ impl CommitRootTransactionRequest {
             return Err(ControlPlaneTransactionContractError::MissingRootMutationKind(index));
         }
 
-        if let Some(index) = self
-            .mutations
-            .iter()
-            .enumerate()
-            .find_map(|(index, mutation)| match mutation.kind.as_ref() {
-                Some(domain_mutation::Kind::Orchestration(spec)) if spec.events.is_empty() => {
-                    Some(index)
+        for (index, mutation) in self.mutations.iter().enumerate() {
+            match mutation.kind.as_ref() {
+                Some(domain_mutation::Kind::Catalog(operation)) => {
+                    if operation.op.is_none() {
+                        return Err(
+                            ControlPlaneTransactionContractError::MissingRootCatalogDdlOp(index),
+                        );
+                    }
                 }
-                _ => None,
-            })
-        {
-            return Err(ControlPlaneTransactionContractError::EmptyRootOrchestrationEvents(index));
+                Some(domain_mutation::Kind::Orchestration(spec)) => {
+                    if spec.events.is_empty() {
+                        return Err(
+                            ControlPlaneTransactionContractError::EmptyRootOrchestrationEvents(
+                                index,
+                            ),
+                        );
+                    }
+
+                    if let Some((event_index, error)) =
+                        spec.events
+                            .iter()
+                            .enumerate()
+                            .find_map(|(event_index, event)| {
+                                event
+                                    .validate_contract()
+                                    .err()
+                                    .map(|error| (event_index, error))
+                            })
+                    {
+                        return Err(
+                            ControlPlaneTransactionContractError::InvalidRootOrchestrationEvent(
+                                index,
+                                event_index,
+                                error,
+                            ),
+                        );
+                    }
+                }
+                None => unreachable!("checked above"),
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl OrchestrationEventEnvelope {
+    pub fn validate_contract(&self) -> Result<(), OrchestrationEventContractError> {
+        if self.event_id.is_empty() {
+            return Err(OrchestrationEventContractError::EmptyEventId);
+        }
+        if self.timestamp.is_none() {
+            return Err(OrchestrationEventContractError::MissingTimestamp);
+        }
+        if self.source.is_empty() {
+            return Err(OrchestrationEventContractError::EmptySource);
+        }
+        if self.idempotency_key.is_empty() {
+            return Err(OrchestrationEventContractError::EmptyIdempotencyKey);
+        }
+        if self.event.is_none() {
+            return Err(OrchestrationEventContractError::MissingEventKind);
         }
 
         Ok(())

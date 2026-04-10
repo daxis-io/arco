@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use prost::Message;
 
-use arco_proto::{
+use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, CommitOrchestrationBatchRequest, CommitRootTransactionRequest,
     GetCatalogTransactionRequest, GetOrchestrationTransactionRequest, GetRootTransactionRequest,
 };

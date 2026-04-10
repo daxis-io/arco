@@ -170,7 +170,7 @@ variable "compactor_repair_automation_interval_secs" {
 variable "compactor_repair_automation_scope" {
   description = "Catalog compactor repair automation scope"
   type        = string
-  default     = "current_head_only"
+  default     = "full"
 
   validation {
     condition     = contains(["current_head_only", "full"], var.compactor_repair_automation_scope)
@@ -209,7 +209,7 @@ variable "flow_compactor_repair_automation_interval_secs" {
 variable "flow_compactor_repair_automation_scope" {
   description = "Orchestration compactor repair automation scope"
   type        = string
-  default     = "current_head_only"
+  default     = "full"
 
   validation {
     condition     = contains(["current_head_only", "full"], var.flow_compactor_repair_automation_scope)

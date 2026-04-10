@@ -749,6 +749,97 @@ impl CatalogWriter {
         Ok(catalog)
     }
 
+    /// Creates a new catalog and returns visible commit metadata for transaction APIs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::create_catalog`].
+    pub async fn create_catalog_transaction(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        opts: WriteOptions,
+    ) -> Result<CatalogTransactionCommit> {
+        if let Some(expected) = &opts.if_match {
+            let manifest = self.tier1.read_manifest().await?;
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let catalog = Catalog {
+            id: Uuid::now_v7().to_string(),
+            name: name.to_string(),
+            description: description.map(String::from),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let compactor = self.sync_compactor()?;
+        let guard = self
+            .tier1
+            .acquire_lock(self.lock_ttl, self.lock_max_retries)
+            .await?;
+
+        let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+
+        if state.catalogs.iter().any(|existing| existing.name == name) {
+            guard.release().await?;
+            return Err(CatalogError::AlreadyExists {
+                entity: "catalog".into(),
+                name: name.to_string(),
+            });
+        }
+
+        let event = CatalogDdlEventV2::CatalogCreated {
+            catalog: CatalogRecord::from(&catalog),
+        };
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
+            .await?;
+        let event_id_string = event_id.to_string();
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
+
+        self.finish_catalog_transaction(
+            guard,
+            event_id_string,
+            compactor.sync_compact(request).await,
+        )
+        .await
+    }
+
     // ========================================================================
     // Namespaces (Tier 1 - catalog domain)
     // ========================================================================
@@ -868,6 +959,124 @@ impl CatalogWriter {
         let result = compactor.sync_compact(request).await;
         guard.release().await?;
         result.map(|_| namespace)
+    }
+
+    /// Creates a schema and returns visible commit metadata for transaction APIs.
+    ///
+    /// For the `default` catalog, this reuses the legacy namespace transaction path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::create_schema`].
+    pub async fn create_schema_transaction(
+        &self,
+        catalog: &str,
+        schema: &str,
+        description: Option<&str>,
+        opts: WriteOptions,
+    ) -> Result<CatalogTransactionCommit> {
+        if catalog == "default" {
+            return self
+                .create_namespace_transaction(schema, description, opts)
+                .await;
+        }
+
+        if let Some(expected) = &opts.if_match {
+            let manifest = self.tier1.read_manifest().await?;
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+
+        let compactor = self.sync_compactor()?;
+        let guard = self
+            .tier1
+            .acquire_lock(self.lock_ttl, self.lock_max_retries)
+            .await?;
+
+        let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+
+        let Some(catalog_record) = state.catalogs.iter().find(|record| record.name == catalog)
+        else {
+            guard.release().await?;
+            return Err(CatalogError::NotFound {
+                entity: "catalog".into(),
+                name: catalog.to_string(),
+            });
+        };
+
+        let default_catalog_id = state
+            .catalogs
+            .iter()
+            .find(|record| record.name == "default")
+            .map(|record| record.id.as_str());
+        let catalog_id = catalog_record.id.as_str();
+        if state.namespaces.iter().any(|namespace| {
+            namespace.name == schema
+                && namespace.catalog_id.as_deref().or(default_catalog_id) == Some(catalog_id)
+        }) {
+            guard.release().await?;
+            return Err(CatalogError::AlreadyExists {
+                entity: "namespace".into(),
+                name: schema.to_string(),
+            });
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let namespace = Namespace {
+            id: Uuid::now_v7().to_string(),
+            catalog_id: Some(catalog_record.id.clone()),
+            name: schema.to_string(),
+            description: description.map(String::from),
+            created_at: now,
+            updated_at: now,
+        };
+        let event = CatalogDdlEvent::NamespaceCreated {
+            namespace: NamespaceRecord::from(&namespace),
+        };
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
+            .await?;
+        let event_id_string = event_id.to_string();
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
+
+        self.finish_catalog_transaction(
+            guard,
+            event_id_string,
+            compactor.sync_compact(request).await,
+        )
+        .await
     }
 
     /// Creates a new namespace.
@@ -1814,6 +2023,177 @@ impl CatalogWriter {
         result.map(|_| table)
     }
 
+    /// Registers a table in a catalog/schema and returns visible commit metadata.
+    ///
+    /// For the `default` catalog, this reuses the legacy namespace transaction path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::register_table_in_schema`].
+    #[allow(clippy::too_many_lines)]
+    pub async fn register_table_in_schema_transaction(
+        &self,
+        catalog: &str,
+        schema: &str,
+        req: RegisterTableInSchemaRequest,
+        opts: WriteOptions,
+    ) -> Result<CatalogTransactionCommit> {
+        if catalog == "default" {
+            return self
+                .register_table_transaction(
+                    RegisterTableRequest {
+                        namespace: schema.to_string(),
+                        name: req.name,
+                        description: req.description,
+                        location: req.location,
+                        format: req.format,
+                        columns: req.columns,
+                    },
+                    opts,
+                )
+                .await;
+        }
+
+        if let Some(expected) = &opts.if_match {
+            let manifest = self.tier1.read_manifest().await?;
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+
+        let compactor = self.sync_compactor()?;
+        let guard = self
+            .tier1
+            .acquire_lock(self.lock_ttl, self.lock_max_retries)
+            .await?;
+
+        let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+
+        let Some(catalog_record) = state.catalogs.iter().find(|record| record.name == catalog)
+        else {
+            guard.release().await?;
+            return Err(CatalogError::NotFound {
+                entity: "catalog".into(),
+                name: catalog.to_string(),
+            });
+        };
+
+        let default_catalog_id = state
+            .catalogs
+            .iter()
+            .find(|record| record.name == "default")
+            .map(|record| record.id.as_str());
+        let catalog_id = catalog_record.id.as_str();
+        let namespace = state
+            .namespaces
+            .iter()
+            .find(|candidate| {
+                candidate.name == schema
+                    && candidate.catalog_id.as_deref().or(default_catalog_id) == Some(catalog_id)
+            })
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "schema".into(),
+                name: format!("{catalog}.{schema}"),
+            })?;
+        let namespace_id = namespace.id.clone();
+
+        if state
+            .tables
+            .iter()
+            .any(|table| table.namespace_id == namespace_id && table.name == req.name)
+        {
+            guard.release().await?;
+            return Err(CatalogError::AlreadyExists {
+                entity: "table".into(),
+                name: format!("{catalog}.{schema}.{}", req.name),
+            });
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let table_id = Uuid::now_v7().to_string();
+        let table_format = normalize_new_table_format(req.format.as_deref())?;
+        let table_format_kind = TableFormat::parse(&table_format).map_err(CatalogError::from)?;
+        let table_location = normalize_table_location_for_write(
+            table_format_kind,
+            req.location.clone(),
+            self.storage.tenant_id(),
+            self.storage.workspace_id(),
+        )?;
+
+        let table = Table {
+            id: table_id.clone(),
+            namespace_id: namespace_id.clone(),
+            name: req.name.clone(),
+            description: req.description.clone(),
+            location: table_location,
+            format: Some(table_format),
+            created_at: now,
+            updated_at: now,
+        };
+        let columns: Vec<ColumnRecord> = req
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(ordinal, col_def)| ColumnRecord {
+                id: Uuid::now_v7().to_string(),
+                table_id: table_id.clone(),
+                name: col_def.name.clone(),
+                data_type: col_def.data_type.clone(),
+                is_nullable: col_def.is_nullable,
+                ordinal: ordinal as i32,
+                description: col_def.description.clone(),
+            })
+            .collect();
+
+        let event = CatalogDdlEvent::TableRegistered {
+            table: TableRecord::from(&table),
+            columns,
+        };
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
+            .await?;
+        let event_id_string = event_id.to_string();
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
+
+        self.finish_catalog_transaction(
+            guard,
+            event_id_string,
+            compactor.sync_compact(request).await,
+        )
+        .await
+    }
+
     /// Updates a table.
     ///
     /// # Errors
@@ -2105,6 +2485,155 @@ impl CatalogWriter {
         })
     }
 
+    /// Updates a table in a catalog/schema and returns visible commit metadata.
+    ///
+    /// For the `default` catalog, this reuses the legacy namespace transaction path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::update_table`].
+    #[allow(clippy::too_many_lines)]
+    pub async fn update_table_in_schema_transaction(
+        &self,
+        catalog: &str,
+        schema: &str,
+        name: &str,
+        patch: TablePatch,
+        opts: WriteOptions,
+    ) -> Result<CatalogTransactionCommit> {
+        if catalog == "default" {
+            return self
+                .update_table_transaction(schema, name, patch, opts)
+                .await;
+        }
+
+        if let Some(expected) = &opts.if_match {
+            let manifest = self.tier1.read_manifest().await?;
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+
+        let compactor = self.sync_compactor()?;
+        let guard = self
+            .tier1
+            .acquire_lock(self.lock_ttl, self.lock_max_retries)
+            .await?;
+
+        let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+        let mut state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+
+        let Some(catalog_record) = state.catalogs.iter().find(|record| record.name == catalog)
+        else {
+            guard.release().await?;
+            return Err(CatalogError::NotFound {
+                entity: "catalog".into(),
+                name: catalog.to_string(),
+            });
+        };
+
+        let default_catalog_id = state
+            .catalogs
+            .iter()
+            .find(|record| record.name == "default")
+            .map(|record| record.id.as_str());
+        let catalog_id = catalog_record.id.as_str();
+        let namespace = state
+            .namespaces
+            .iter()
+            .find(|candidate| {
+                candidate.name == schema
+                    && candidate.catalog_id.as_deref().or(default_catalog_id) == Some(catalog_id)
+            })
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "schema".into(),
+                name: format!("{catalog}.{schema}"),
+            })?;
+        let namespace_id = &namespace.id;
+
+        let table_rec = state
+            .tables
+            .iter_mut()
+            .find(|table| &table.namespace_id == namespace_id && table.name == name)
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "table".into(),
+                name: format!("{catalog}.{schema}.{name}"),
+            })?;
+
+        let now = Utc::now().timestamp_millis();
+        table_rec.updated_at = now;
+        if let Some(description) = patch.description {
+            table_rec.description = description;
+        }
+        if let Some(location) = patch.location {
+            table_rec.location = location;
+        }
+        if let Some(format) = patch.format {
+            table_rec.format = normalize_table_format_patch(format)?;
+        }
+
+        let effective_format = table_rec
+            .format
+            .as_deref()
+            .map(TableFormat::parse)
+            .transpose()
+            .map_err(CatalogError::from)?;
+        if effective_format == Some(TableFormat::Delta) {
+            table_rec.location = normalize_table_location_for_write(
+                TableFormat::Delta,
+                table_rec.location.clone(),
+                self.storage.tenant_id(),
+                self.storage.workspace_id(),
+            )?;
+        }
+
+        let event = CatalogDdlEvent::TableUpdated {
+            table: table_rec.clone(),
+        };
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
+            .await?;
+        let event_id_string = event_id.to_string();
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
+
+        self.finish_catalog_transaction(
+            guard,
+            event_id_string,
+            compactor.sync_compact(request).await,
+        )
+        .await
+    }
+
     /// Drops a table.
     ///
     /// # Errors
@@ -2332,6 +2861,127 @@ impl CatalogWriter {
             commit.repair_pending |= default_catalog_repair_pending;
             commit
         })
+    }
+
+    /// Drops a table in a catalog/schema and returns visible commit metadata.
+    ///
+    /// For the `default` catalog, this reuses the legacy namespace transaction path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::drop_table`].
+    pub async fn drop_table_in_schema_transaction(
+        &self,
+        catalog: &str,
+        schema: &str,
+        name: &str,
+        opts: WriteOptions,
+    ) -> Result<CatalogTransactionCommit> {
+        if catalog == "default" {
+            return self.drop_table_transaction(schema, name, opts).await;
+        }
+
+        if let Some(expected) = &opts.if_match {
+            let manifest = self.tier1.read_manifest().await?;
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+
+        let compactor = self.sync_compactor()?;
+        let guard = self
+            .tier1
+            .acquire_lock(self.lock_ttl, self.lock_max_retries)
+            .await?;
+
+        let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+
+        let Some(catalog_record) = state.catalogs.iter().find(|record| record.name == catalog)
+        else {
+            guard.release().await?;
+            return Err(CatalogError::NotFound {
+                entity: "catalog".into(),
+                name: catalog.to_string(),
+            });
+        };
+
+        let default_catalog_id = state
+            .catalogs
+            .iter()
+            .find(|record| record.name == "default")
+            .map(|record| record.id.as_str());
+        let catalog_id = catalog_record.id.as_str();
+        let namespace = state
+            .namespaces
+            .iter()
+            .find(|candidate| {
+                candidate.name == schema
+                    && candidate.catalog_id.as_deref().or(default_catalog_id) == Some(catalog_id)
+            })
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "schema".into(),
+                name: format!("{catalog}.{schema}"),
+            })?;
+        let namespace_id = namespace.id.clone();
+
+        let table_idx = state
+            .tables
+            .iter()
+            .position(|table| table.namespace_id == namespace_id && table.name == name)
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "table".into(),
+                name: format!("{catalog}.{schema}.{name}"),
+            })?;
+        let table_id = state.tables[table_idx].id.clone();
+
+        let event = CatalogDdlEvent::TableDropped {
+            table_id,
+            namespace_id,
+            table_name: name.to_string(),
+        };
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
+            .await?;
+        let event_id_string = event_id.to_string();
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
+
+        self.finish_catalog_transaction(
+            guard,
+            event_id_string,
+            compactor.sync_compact(request).await,
+        )
+        .await
     }
 
     /// Renames a table within the same namespace.
@@ -2569,6 +3219,170 @@ impl CatalogWriter {
             format: table.format.clone(),
             created_at: table.created_at,
             updated_at: now,
+        })
+    }
+
+    /// Renames a table in a catalog/schema and returns visible commit metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The target catalog or schema doesn't exist
+    /// - The source table doesn't exist
+    /// - A different table with the destination name already exists
+    /// - Lock acquisition or storage operations fail
+    #[allow(clippy::too_many_lines)]
+    pub async fn rename_table_in_schema_transaction(
+        &self,
+        catalog: &str,
+        schema: &str,
+        old_name: &str,
+        new_name: &str,
+        opts: WriteOptions,
+    ) -> Result<CatalogTransactionCommit> {
+        if let Some(expected) = &opts.if_match {
+            let manifest = self.tier1.read_manifest().await?;
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+
+        let compactor = self.sync_compactor()?;
+        let guard = self
+            .tier1
+            .acquire_lock(self.lock_ttl, self.lock_max_retries)
+            .await?;
+
+        let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+
+        let (catalog_id, repair_pending) = if catalog == "default" {
+            match self
+                .ensure_default_catalog_locked_with_result(&guard, &state, compactor, &opts)
+                .await
+            {
+                Ok(outcome) => (outcome.catalog.id, outcome.repair_pending),
+                Err(err) => {
+                    guard.release().await?;
+                    return Err(err);
+                }
+            }
+        } else {
+            let Some(catalog_record) = state.catalogs.iter().find(|record| record.name == catalog)
+            else {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "catalog".into(),
+                    name: catalog.to_string(),
+                });
+            };
+            (catalog_record.id.clone(), false)
+        };
+
+        // Bridge legacy `NULL` catalog_id namespaces onto whichever default catalog
+        // ID is authoritative for this transaction, even if the default catalog was
+        // bootstrapped after we loaded the pre-transaction snapshot.
+        let default_catalog_id = if catalog == "default" {
+            Some(catalog_id.as_str())
+        } else {
+            state
+                .catalogs
+                .iter()
+                .find(|record| record.name == "default")
+                .map(|record| record.id.as_str())
+        };
+        let namespace = state
+            .namespaces
+            .iter()
+            .find(|candidate| {
+                candidate.name == schema
+                    && candidate.catalog_id.as_deref().or(default_catalog_id)
+                        == Some(catalog_id.as_str())
+            })
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "schema".into(),
+                name: format!("{catalog}.{schema}"),
+            })?;
+        let namespace_id = namespace.id.clone();
+
+        let Some(table) = state
+            .tables
+            .iter()
+            .find(|candidate| candidate.namespace_id == namespace_id && candidate.name == old_name)
+        else {
+            guard.release().await?;
+            return Err(CatalogError::NotFound {
+                entity: "table".into(),
+                name: format!("{catalog}.{schema}.{old_name}"),
+            });
+        };
+        let table_id = table.id.clone();
+
+        if old_name != new_name
+            && state.tables.iter().any(|candidate| {
+                candidate.namespace_id == namespace_id && candidate.name == new_name
+            })
+        {
+            guard.release().await?;
+            return Err(CatalogError::AlreadyExists {
+                entity: "table".into(),
+                name: format!("{catalog}.{schema}.{new_name}"),
+            });
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let event = CatalogDdlEvent::TableRenamed {
+            table_id,
+            namespace_id,
+            old_name: old_name.to_string(),
+            new_name: new_name.to_string(),
+            updated_at: now,
+        };
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
+            .await?;
+        let event_id_string = event_id.to_string();
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
+
+        self.finish_catalog_transaction(
+            guard,
+            event_id_string,
+            compactor.sync_compact(request).await,
+        )
+        .await
+        .map(|mut commit| {
+            commit.repair_pending |= repair_pending;
+            commit
         })
     }
 

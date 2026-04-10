@@ -4,7 +4,7 @@
 
 **Goal:** Harden orchestration compaction against concurrent manifest publish races without relying on fragile storage error strings.
 
-**Architecture:** Keep the existing manifest snapshot plus pointer publish flow, but classify publish race outcomes at the `publish_manifest` boundary with a typed internal error. Retry `compact_events_with_epoch` from a fresh manifest/state load with bounded attempts and epoch validation on each pass so the retry observes the winner's state instead of republishing stale state.
+**Architecture:** Keep the existing manifest snapshot plus pointer publish flow, but classify publish race outcomes at the `publish_manifest` boundary with a typed internal error. Retry the internal compaction path from a fresh manifest/state load with bounded attempts and re-validate the supplied fencing lock before each publish attempt so the retry observes the winner's state instead of republishing stale state.
 
 **Tech Stack:** Rust, `cargo test`, `arco-flow` orchestration compactor, `arco-core` storage backends, `metrics` crate.
 
@@ -20,14 +20,14 @@
 ## Verification Matrix
 
 - `cargo test -p arco-flow compact_events_retries_after_concurrent_manifest_snapshot_conflict -- --nocapture`
-- `cargo test -p arco-flow compact_events_retry_revalidates_expected_epoch -- --nocapture`
+- `cargo test -p arco-flow compact_events_fenced_retries_after_concurrent_manifest_snapshot_conflict -- --nocapture`
 - `cargo test -p arco-flow publish_manifest_uses_cas -- --nocapture`
 - `cargo test -p arco-flow publish_manifest_reports_persisted_not_visible_on_cas_loss -- --nocapture`
 - `cargo test -p arco-flow 'orchestration::compactor::service::tests::' -- --nocapture`
 
 ## Acceptance Criteria
 
-- `compact_events_with_epoch` retries boundedly after a concurrent immutable snapshot conflict.
+- The active compaction path retries boundedly after a concurrent immutable snapshot conflict.
 - Retry classification is based on typed publish errors emitted from `publish_manifest`, not storage message strings.
-- Each retry re-reads manifest state and re-validates `expected_epoch` against the current pointer epoch.
+- Each retry re-reads manifest state and re-validates the fencing lock before pointer publish.
 - Retry attempts emit tracing and increment a dedicated compactor retry metric.

@@ -1,5 +1,9 @@
 # ADR-034 PI-2 Adoption Inventory
 
+Historical note as of April 8, 2026: this inventory records the PI-2 rollout snapshot. The later
+PI-3 cleanup changed the steady-state repair automation default to `full` and removed the
+compatibility helpers called out below.
+
 ## Scope And Method
 
 This inventory is repo-grounded. It was produced from targeted searches over the active writer and
@@ -89,17 +93,17 @@ Orchestration:
 
 ## Compatibility-Only Callsites Left For PI-3
 
-These are intentionally retained compatibility shims, not active PI-2 writer targets:
+This section is historical PI-2 inventory. Those compatibility surfaces were removed by the later
+PI-3 cleanup:
 
 - `crates/arco-flow/src/bin/arco_flow_compactor.rs`
-  - `compact_events_with_epoch(...)`
-  - `rebuild_from_ledger_manifest_path(...)`
-  - both remain for compatibility-mode requests and legacy callers until PI-3 removal
+  - the old unfenced `compact_events_with_epoch(...)` and
+    `rebuild_from_ledger_manifest_path(...)` helper framing is no longer present
+  - active runtime entrypoints are the canonical fenced helpers
 - `crates/arco-flow/src/compaction_client.rs`
-  - `compact_orchestration_events(...)`
-  - unfenced client shim retained for compatibility callers; fenced clients use `compact_orchestration_events_fenced(...)`
+  - the unfenced `compact_orchestration_events(...)` shim was removed
 - stored/public `epoch` field alias
-  - compatibility alias remains in service behavior until PI-3 cleanup
+  - the compatibility alias was removed from active request handling
 
 ## Intentionally Deferred Items
 

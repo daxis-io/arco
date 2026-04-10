@@ -6,353 +6,40 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use axum::body::Body;
-use axum::http::{Method, Request, StatusCode, header};
+use axum::http::StatusCode;
 use bytes::Bytes;
-use prost::Message;
-use tower::ServiceExt;
 
-use arco_api::server::{Server, ServerBuilder};
 use arco_catalog::CatalogReader;
+use arco_core::ControlPlaneTxDomain;
 use arco_core::catalog_event::CatalogEvent;
 use arco_core::catalog_paths::{CatalogDomain, CatalogPaths};
 use arco_core::control_plane_transactions::{
-    CatalogTxRecord, ControlPlaneIdempotencyRecord, ControlPlaneTxPaths, ControlPlaneTxStatus,
-    OrchestrationTxRecord, RootTxManifest, RootTxReceipt, RootTxRecord,
+    ControlPlaneTxPaths, ControlPlaneTxStatus, RootTxManifest, RootTxReceipt,
 };
 use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
 };
-use arco_core::{ControlPlaneTxDomain, ScopedStorage};
 use arco_flow::orchestration::compactor::MicroCompactor;
-use arco_flow::orchestration_manifest_pointer_path;
-use arco_proto::catalog_ddl_operation::Op as CatalogDdlOp;
-use arco_proto::{
-    AlterTableOp, ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CatalogColumnDefinition,
-    CatalogDdlOperation, CommitOrchestrationBatchRequest, CommitOrchestrationBatchResponse,
-    CommitRootTransactionRequest, CommitRootTransactionResponse, CreateNamespaceOp, DomainMutation,
-    DropTableOp, GetCatalogTransactionRequest, GetCatalogTransactionResponse,
-    GetOrchestrationTransactionRequest, GetOrchestrationTransactionResponse,
-    GetRootTransactionRequest, GetRootTransactionResponse, OrchestrationBatchSpec,
-    OrchestrationEventEnvelope, RegisterTableOp, RequestHeader, TenantId, TransactionDomain,
-    TransactionStatus, WorkspaceId, domain_mutation,
+use arco_proto::arco::catalog::v1::CatalogDdlOperation;
+use arco_proto::arco::controlplane::v1::{
+    ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CommitOrchestrationBatchRequest,
+    CommitOrchestrationBatchResponse, CommitRootTransactionResponse, GetCatalogTransactionRequest,
+    GetCatalogTransactionResponse, GetOrchestrationTransactionRequest,
+    GetOrchestrationTransactionResponse, GetRootTransactionRequest, GetRootTransactionResponse,
+    TransactionDomain, TransactionStatus, domain_mutation,
 };
+#[path = "support/control_plane_transactions.rs"]
+mod support;
 
-const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";
-const TENANT: &str = "test-tenant";
-const WORKSPACE: &str = "test-workspace";
-
-fn test_router() -> axum::Router {
-    ServerBuilder::new().debug(true).build().test_router()
-}
-
-fn test_router_with_backend(backend: Arc<dyn StorageBackend>) -> axum::Router {
-    test_router_with_config_backend(arco_api::config::Config::default(), backend)
-}
-
-fn test_router_with_config_backend(
-    mut config: arco_api::config::Config,
-    backend: Arc<dyn StorageBackend>,
-) -> axum::Router {
-    config.debug = true;
-    Server::with_storage_backend(config, backend).test_router()
-}
-
-fn request_header(idempotency_key: &str, request_id: &str) -> RequestHeader {
-    RequestHeader {
-        tenant_id: Some(TenantId {
-            value: TENANT.to_string(),
-        }),
-        workspace_id: Some(WorkspaceId {
-            value: WORKSPACE.to_string(),
-        }),
-        trace_parent: String::new(),
-        idempotency_key: idempotency_key.to_string(),
-        request_time: None,
-        request_id: request_id.to_string(),
-    }
-}
-
-fn protobuf_request<T: Message>(
-    path: &str,
-    message: &T,
-    idempotency_key: &str,
-    request_id: &str,
-) -> Result<Request<Body>> {
-    Request::builder()
-        .method(Method::POST)
-        .uri(path)
-        .header("X-Tenant-Id", TENANT)
-        .header("X-Workspace-Id", WORKSPACE)
-        .header("Idempotency-Key", idempotency_key)
-        .header("X-Request-Id", request_id)
-        .header(header::CONTENT_TYPE, CONTENT_TYPE_PROTOBUF)
-        .body(Body::from(message.encode_to_vec()))
-        .context("build protobuf request")
-}
-
-async fn post_protobuf<TReq, TResp>(
-    router: axum::Router,
-    path: &str,
-    message: &TReq,
-    idempotency_key: &str,
-    request_id: &str,
-) -> Result<(StatusCode, TResp)>
-where
-    TReq: Message,
-    TResp: Message + Default,
-{
-    let request = protobuf_request(path, message, idempotency_key, request_id)?;
-    let response = router.oneshot(request).await.map_err(|err| match err {})?;
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
-        .await
-        .context("read protobuf response body")?;
-    assert_eq!(status, StatusCode::OK, "expected success, body={body:?}");
-    assert_eq!(content_type, CONTENT_TYPE_PROTOBUF);
-    let decoded = TResp::decode(body.as_ref()).context("decode protobuf response")?;
-    Ok((status, decoded))
-}
-
-async fn post_error_json<TReq: Message>(
-    router: axum::Router,
-    path: &str,
-    message: &TReq,
-    idempotency_key: &str,
-    request_id: &str,
-) -> Result<(StatusCode, serde_json::Value)> {
-    let request = protobuf_request(path, message, idempotency_key, request_id)?;
-    let response = router.oneshot(request).await.map_err(|err| match err {})?;
-    let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
-        .await
-        .context("read error response body")?;
-    let json = serde_json::from_slice(&body).with_context(|| {
-        format!(
-            "parse JSON error response (status={status}): {}",
-            String::from_utf8_lossy(&body)
-        )
-    })?;
-    Ok((status, json))
-}
-
-fn catalog_create_namespace_request(
-    idempotency_key: &str,
-    request_id: &str,
-    name: &str,
-) -> ApplyCatalogDdlRequest {
-    ApplyCatalogDdlRequest {
-        header: Some(request_header(idempotency_key, request_id)),
-        ddl: Some(CatalogDdlOperation {
-            op: Some(CatalogDdlOp::CreateNamespace(CreateNamespaceOp {
-                name: name.to_string(),
-                description: Some("control-plane transaction test".to_string()),
-                properties: Default::default(),
-            })),
-        }),
-        require_visible: Some(true),
-    }
-}
-
-fn orchestration_request(
-    idempotency_key: &str,
-    request_id: &str,
-    run_id: &str,
-) -> CommitOrchestrationBatchRequest {
-    orchestration_request_with_event_id(
-        idempotency_key,
-        request_id,
-        run_id,
-        "01JTXORCH000000000000000001",
-    )
-}
-
-fn orchestration_request_with_event_id(
-    idempotency_key: &str,
-    request_id: &str,
-    run_id: &str,
-    event_id: &str,
-) -> CommitOrchestrationBatchRequest {
-    CommitOrchestrationBatchRequest {
-        header: Some(request_header(idempotency_key, request_id)),
-        events: vec![OrchestrationEventEnvelope {
-            event_id: event_id.to_string(),
-            event_type: "RunTriggered".to_string(),
-            event_version: 1,
-            timestamp: Some(prost_types::Timestamp {
-                seconds: 1_776_000_000,
-                nanos: 0,
-            }),
-            source: format!("arco-flow/{TENANT}/{WORKSPACE}"),
-            idempotency_key: format!("event:{run_id}"),
-            correlation_id: Some(run_id.to_string()),
-            causation_id: None,
-            payload_json: serde_json::to_vec(&serde_json::json!({
-                "run_id": run_id,
-                "plan_id": format!("plan-{run_id}"),
-                "trigger": {
-                    "type": "manual",
-                    "user_id": "tester"
-                },
-                "root_assets": [],
-                "labels": {}
-            }))
-            .expect("serialize orchestration payload"),
-        }],
-        require_visible: Some(true),
-        allow_inline_merge: Some(false),
-    }
-}
-
-fn catalog_register_table_request(
-    idempotency_key: &str,
-    request_id: &str,
-    namespace: &str,
-    name: &str,
-) -> ApplyCatalogDdlRequest {
-    ApplyCatalogDdlRequest {
-        header: Some(request_header(idempotency_key, request_id)),
-        ddl: Some(CatalogDdlOperation {
-            op: Some(CatalogDdlOp::RegisterTable(RegisterTableOp {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-                description: Some("control-plane transaction table".to_string()),
-                location: None,
-                format: None,
-                columns: vec![CatalogColumnDefinition {
-                    name: "id".to_string(),
-                    data_type: "STRING".to_string(),
-                    is_nullable: false,
-                    description: None,
-                }],
-                properties: Default::default(),
-            })),
-        }),
-        require_visible: Some(true),
-    }
-}
-
-fn catalog_alter_table_request(
-    idempotency_key: &str,
-    request_id: &str,
-    namespace: &str,
-    name: &str,
-    description: Option<&str>,
-) -> ApplyCatalogDdlRequest {
-    ApplyCatalogDdlRequest {
-        header: Some(request_header(idempotency_key, request_id)),
-        ddl: Some(CatalogDdlOperation {
-            op: Some(CatalogDdlOp::AlterTable(AlterTableOp {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-                description: description.map(str::to_string),
-                location: None,
-                format: None,
-            })),
-        }),
-        require_visible: Some(true),
-    }
-}
-
-fn catalog_drop_table_request(
-    idempotency_key: &str,
-    request_id: &str,
-    namespace: &str,
-    name: &str,
-) -> ApplyCatalogDdlRequest {
-    ApplyCatalogDdlRequest {
-        header: Some(request_header(idempotency_key, request_id)),
-        ddl: Some(CatalogDdlOperation {
-            op: Some(CatalogDdlOp::DropTable(DropTableOp {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-            })),
-        }),
-        require_visible: Some(true),
-    }
-}
-
-fn root_request(
-    idempotency_key: &str,
-    request_id: &str,
-    namespace: &str,
-    run_id: &str,
-) -> CommitRootTransactionRequest {
-    CommitRootTransactionRequest {
-        header: Some(request_header(idempotency_key, request_id)),
-        mutations: vec![
-            DomainMutation {
-                kind: Some(domain_mutation::Kind::Catalog(CatalogDdlOperation {
-                    op: Some(CatalogDdlOp::CreateNamespace(CreateNamespaceOp {
-                        name: namespace.to_string(),
-                        description: Some("root transaction namespace".to_string()),
-                        properties: Default::default(),
-                    })),
-                })),
-            },
-            DomainMutation {
-                kind: Some(domain_mutation::Kind::Orchestration(
-                    OrchestrationBatchSpec {
-                        events: orchestration_request(idempotency_key, request_id, run_id).events,
-                        allow_inline_merge: Some(false),
-                    },
-                )),
-            },
-        ],
-    }
-}
-
-fn scoped_storage(backend: Arc<dyn StorageBackend>) -> ScopedStorage {
-    ScopedStorage::new(backend, TENANT, WORKSPACE).expect("scoped storage")
-}
-
-async fn load_catalog_tx_record(
-    backend: Arc<dyn StorageBackend>,
-    tx_id: &str,
-) -> Result<CatalogTxRecord> {
-    let storage = scoped_storage(backend);
-    let bytes = storage
-        .get_raw(&ControlPlaneTxPaths::record(
-            ControlPlaneTxDomain::Catalog,
-            tx_id,
-        ))
-        .await?;
-    serde_json::from_slice(bytes.as_ref()).context("decode catalog tx record")
-}
-
-async fn load_orchestration_tx_record(
-    backend: Arc<dyn StorageBackend>,
-    tx_id: &str,
-) -> Result<OrchestrationTxRecord> {
-    let storage = scoped_storage(backend);
-    let bytes = storage
-        .get_raw(&ControlPlaneTxPaths::record(
-            ControlPlaneTxDomain::Orchestration,
-            tx_id,
-        ))
-        .await?;
-    serde_json::from_slice(bytes.as_ref()).context("decode orchestration tx record")
-}
-
-async fn load_root_tx_record(
-    backend: Arc<dyn StorageBackend>,
-    tx_id: &str,
-) -> Result<RootTxRecord> {
-    let storage = scoped_storage(backend);
-    let bytes = storage
-        .get_raw(&ControlPlaneTxPaths::record(
-            ControlPlaneTxDomain::Root,
-            tx_id,
-        ))
-        .await?;
-    serde_json::from_slice(bytes.as_ref()).context("decode root tx record")
-}
+use support::{
+    TENANT, WORKSPACE, catalog_alter_table_request, catalog_create_catalog_request,
+    catalog_create_namespace_request, catalog_create_schema_request, catalog_drop_table_request,
+    catalog_register_table_in_schema_request, catalog_register_table_request,
+    catalog_rename_table_request, load_catalog_tx_record, load_idempotency_record,
+    load_orchestration_tx_record, load_root_tx_record, orchestration_request,
+    orchestration_request_with_event_id, post_error_json, post_protobuf, root_request,
+    scoped_storage, test_router, test_router_with_backend, test_router_with_config_backend,
+};
 
 async fn load_root_super_manifest(
     backend: Arc<dyn StorageBackend>,
@@ -399,18 +86,6 @@ async fn load_orchestration_commit_receipt(
         Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => Ok(None),
         Err(error) => Err(error.into()),
     }
-}
-
-async fn load_idempotency_record(
-    backend: Arc<dyn StorageBackend>,
-    domain: ControlPlaneTxDomain,
-    idempotency_key: &str,
-) -> Result<ControlPlaneIdempotencyRecord> {
-    let storage = scoped_storage(backend);
-    let bytes = storage
-        .get_raw(&ControlPlaneTxPaths::idempotency(domain, idempotency_key))
-        .await?;
-    serde_json::from_slice(bytes.as_ref()).context("decode idempotency record")
 }
 
 async fn load_catalog_ledger_event_source(
@@ -465,71 +140,6 @@ impl StorageBackend for FailPrefixBackend {
         use std::sync::atomic::Ordering;
 
         if path.starts_with(&self.fail_prefix) {
-            let remaining = self.remaining_failures.load(Ordering::SeqCst);
-            if remaining > 0 {
-                self.remaining_failures.fetch_sub(1, Ordering::SeqCst);
-                return Err(arco_core::Error::storage(format!(
-                    "injected failure for {path} with precondition {precondition:?}"
-                )));
-            }
-        }
-
-        self.inner.put(path, data, precondition).await
-    }
-
-    async fn delete(&self, path: &str) -> arco_core::Result<()> {
-        self.inner.delete(path).await
-    }
-
-    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
-        self.inner.list(prefix).await
-    }
-
-    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
-        self.inner.head(path).await
-    }
-
-    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
-        self.inner.signed_url(path, expiry).await
-    }
-}
-
-#[derive(Debug)]
-struct FailPrefixOnNoneBackend {
-    inner: MemoryBackend,
-    fail_prefix: String,
-    remaining_failures: std::sync::atomic::AtomicUsize,
-}
-
-impl FailPrefixOnNoneBackend {
-    fn new(fail_prefix: impl Into<String>, failures: usize) -> Self {
-        Self {
-            inner: MemoryBackend::new(),
-            fail_prefix: fail_prefix.into(),
-            remaining_failures: std::sync::atomic::AtomicUsize::new(failures),
-        }
-    }
-}
-
-#[async_trait]
-impl StorageBackend for FailPrefixOnNoneBackend {
-    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
-        self.inner.get(path).await
-    }
-
-    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
-        self.inner.get_range(path, range).await
-    }
-
-    async fn put(
-        &self,
-        path: &str,
-        data: Bytes,
-        precondition: WritePrecondition,
-    ) -> arco_core::Result<WriteResult> {
-        use std::sync::atomic::Ordering;
-
-        if path.starts_with(&self.fail_prefix) && matches!(&precondition, WritePrecondition::None) {
             let remaining = self.remaining_failures.load(Ordering::SeqCst);
             if remaining > 0 {
                 self.remaining_failures.fetch_sub(1, Ordering::SeqCst);
@@ -622,109 +232,6 @@ impl StorageBackend for FailRootSuperManifestBackend {
     }
 }
 
-#[derive(Debug)]
-struct FailReadsAfterTriggerPutBackend {
-    inner: MemoryBackend,
-    trigger_path: String,
-    trigger_after_puts: usize,
-    fail_get_paths: Vec<String>,
-    fail_head_paths: Vec<String>,
-    trigger_seen: std::sync::atomic::AtomicBool,
-    trigger_puts_seen: std::sync::atomic::AtomicUsize,
-    remaining_failures: std::sync::atomic::AtomicUsize,
-}
-
-impl FailReadsAfterTriggerPutBackend {
-    fn new(
-        trigger_path: impl Into<String>,
-        trigger_after_puts: usize,
-        fail_get_paths: Vec<String>,
-        fail_head_paths: Vec<String>,
-        failures: usize,
-    ) -> Self {
-        Self {
-            inner: MemoryBackend::new(),
-            trigger_path: trigger_path.into(),
-            trigger_after_puts,
-            fail_get_paths,
-            fail_head_paths,
-            trigger_seen: std::sync::atomic::AtomicBool::new(false),
-            trigger_puts_seen: std::sync::atomic::AtomicUsize::new(0),
-            remaining_failures: std::sync::atomic::AtomicUsize::new(failures),
-        }
-    }
-
-    fn should_fail_path(&self, path: &str, candidates: &[String]) -> bool {
-        use std::sync::atomic::Ordering;
-
-        self.trigger_seen.load(Ordering::SeqCst)
-            && candidates.iter().any(|candidate| candidate == path)
-            && self.remaining_failures.load(Ordering::SeqCst) > 0
-    }
-
-    fn consume_failure(&self, path: &str) -> arco_core::Error {
-        use std::sync::atomic::Ordering;
-
-        self.remaining_failures.fetch_sub(1, Ordering::SeqCst);
-        arco_core::Error::storage(format!(
-            "injected post-visibility readback failure for {path}"
-        ))
-    }
-}
-
-#[async_trait]
-impl StorageBackend for FailReadsAfterTriggerPutBackend {
-    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
-        if self.should_fail_path(path, &self.fail_get_paths) {
-            return Err(self.consume_failure(path));
-        }
-
-        self.inner.get(path).await
-    }
-
-    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
-        self.inner.get_range(path, range).await
-    }
-
-    async fn put(
-        &self,
-        path: &str,
-        data: Bytes,
-        precondition: WritePrecondition,
-    ) -> arco_core::Result<WriteResult> {
-        use std::sync::atomic::Ordering;
-
-        let result = self.inner.put(path, data, precondition).await;
-        if path == self.trigger_path && matches!(result, Ok(WriteResult::Success { .. })) {
-            let puts_seen = self.trigger_puts_seen.fetch_add(1, Ordering::SeqCst) + 1;
-            if puts_seen >= self.trigger_after_puts {
-                self.trigger_seen.store(true, Ordering::SeqCst);
-            }
-        }
-        result
-    }
-
-    async fn delete(&self, path: &str) -> arco_core::Result<()> {
-        self.inner.delete(path).await
-    }
-
-    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
-        self.inner.list(prefix).await
-    }
-
-    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
-        if self.should_fail_path(path, &self.fail_head_paths) {
-            return Err(self.consume_failure(path));
-        }
-
-        self.inner.head(path).await
-    }
-
-    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
-        self.inner.signed_url(path, expiry).await
-    }
-}
-
 #[tokio::test]
 async fn apply_catalog_ddl_returns_visible_receipt_and_persists_lookup_record() -> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
@@ -753,7 +260,6 @@ async fn apply_catalog_ddl_returns_visible_receipt_and_persists_lookup_record() 
     assert!(!response.repair_pending);
 
     let lookup = GetCatalogTransactionRequest {
-        header: Some(request_header("idem-cat-lookup-01", "req-cat-lookup-01")),
         tx_id: receipt.tx_id.clone(),
     };
     let (_status, lookup_response): (_, GetCatalogTransactionResponse) = post_protobuf(
@@ -766,8 +272,6 @@ async fn apply_catalog_ddl_returns_visible_receipt_and_persists_lookup_record() 
     .await?;
     let status = lookup_response.status.context("catalog status missing")?;
     assert_eq!(status.status, TransactionStatus::Visible as i32);
-    assert_eq!(status.request_id, "req-cat-01");
-    assert_eq!(status.idempotency_key, "idem-cat-01");
     assert!(status.request_hash.starts_with("sha256:"));
     assert!(!status.lock_path.is_empty());
     assert!(status.fencing_token > 0);
@@ -927,6 +431,115 @@ async fn apply_catalog_ddl_registers_alters_and_drops_tables_via_transaction_lay
 }
 
 #[tokio::test]
+async fn apply_catalog_ddl_creates_catalogs_and_renames_tables_via_transaction_layer() -> Result<()>
+{
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let router = test_router_with_backend(backend.clone());
+
+    let create_catalog =
+        catalog_create_catalog_request("idem-cat-uc-cat-01", "req-cat-uc-cat-01", "governed");
+    let (_status, create_catalog_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router.clone(),
+        "/api/v1/transactions/applyCatalogDdl",
+        &create_catalog,
+        "idem-cat-uc-cat-01",
+        "req-cat-uc-cat-01",
+    )
+    .await?;
+    assert!(
+        create_catalog_response.receipt.is_some(),
+        "catalog receipt missing"
+    );
+
+    let create_schema = catalog_create_schema_request(
+        "idem-cat-uc-schema-01",
+        "req-cat-uc-schema-01",
+        "governed",
+        "bronze",
+    );
+    let (_status, create_schema_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router.clone(),
+        "/api/v1/transactions/applyCatalogDdl",
+        &create_schema,
+        "idem-cat-uc-schema-01",
+        "req-cat-uc-schema-01",
+    )
+    .await?;
+    assert!(
+        create_schema_response.receipt.is_some(),
+        "schema receipt missing"
+    );
+
+    let register = catalog_register_table_in_schema_request(
+        "idem-cat-uc-reg-01",
+        "req-cat-uc-reg-01",
+        "governed",
+        "bronze",
+        "events",
+    );
+    let (_status, register_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router.clone(),
+        "/api/v1/transactions/applyCatalogDdl",
+        &register,
+        "idem-cat-uc-reg-01",
+        "req-cat-uc-reg-01",
+    )
+    .await?;
+    let register_receipt = register_response
+        .receipt
+        .context("register table receipt missing")?;
+
+    let rename = catalog_rename_table_request(
+        "idem-cat-uc-rename-01",
+        "req-cat-uc-rename-01",
+        "governed",
+        "bronze",
+        "events",
+        "events_curated",
+    );
+    let (_status, rename_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router,
+        "/api/v1/transactions/applyCatalogDdl",
+        &rename,
+        "idem-cat-uc-rename-01",
+        "req-cat-uc-rename-01",
+    )
+    .await?;
+    let rename_receipt = rename_response
+        .receipt
+        .context("rename table receipt missing")?;
+
+    let reader = CatalogReader::new(scoped_storage(backend.clone()));
+    let catalog = reader
+        .get_catalog("governed")
+        .await?
+        .context("created catalog missing from reader")?;
+    assert_eq!(catalog.name, "governed");
+
+    let old_table = reader
+        .get_table_in_schema("governed", "bronze", "events")
+        .await?;
+    assert!(
+        old_table.is_none(),
+        "old table name should no longer resolve"
+    );
+
+    let renamed_table = reader
+        .get_table_in_schema("governed", "bronze", "events_curated")
+        .await?
+        .context("renamed table missing from reader")?;
+    assert_eq!(renamed_table.name, "events_curated");
+
+    let register_record = load_catalog_tx_record(backend.clone(), &register_receipt.tx_id).await?;
+    assert_eq!(register_record.status, ControlPlaneTxStatus::Visible);
+
+    let rename_record = load_catalog_tx_record(backend, &rename_receipt.tx_id).await?;
+    assert_eq!(rename_record.status, ControlPlaneTxStatus::Visible);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn commit_orchestration_batch_returns_visible_receipt_and_persists_lookup_record()
 -> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
@@ -957,7 +570,6 @@ async fn commit_orchestration_batch_returns_visible_receipt_and_persists_lookup_
     assert!(!response.repair_pending);
 
     let lookup = GetOrchestrationTransactionRequest {
-        header: Some(request_header("idem-orch-lookup-01", "req-orch-lookup-01")),
         tx_id: receipt.tx_id.clone(),
     };
     let (_status, lookup_response): (_, GetOrchestrationTransactionResponse) = post_protobuf(
@@ -972,8 +584,6 @@ async fn commit_orchestration_batch_returns_visible_receipt_and_persists_lookup_
         .status
         .context("orchestration status missing")?;
     assert_eq!(status.status, TransactionStatus::Visible as i32);
-    assert_eq!(status.request_id, "req-orch-01");
-    assert_eq!(status.idempotency_key, "idem-orch-01");
     assert!(status.request_hash.starts_with("sha256:"));
     assert!(!status.lock_path.is_empty());
     assert!(status.fencing_token > 0);
@@ -1127,7 +737,6 @@ async fn commit_root_transaction_returns_visible_receipt_and_persists_lookup_rec
     );
 
     let lookup = GetRootTransactionRequest {
-        header: Some(request_header("idem-root-lookup-01", "req-root-lookup-01")),
         tx_id: receipt.tx_id.clone(),
     };
     let (_status, lookup_response): (_, GetRootTransactionResponse) = post_protobuf(
@@ -1141,8 +750,6 @@ async fn commit_root_transaction_returns_visible_receipt_and_persists_lookup_rec
 
     let status = lookup_response.status.context("root status missing")?;
     assert_eq!(status.status, TransactionStatus::Visible as i32);
-    assert_eq!(status.request_id, "req-root-01");
-    assert_eq!(status.idempotency_key, "idem-root-01");
     assert!(status.request_hash.starts_with("sha256:"));
     assert_eq!(status.lock_path, "locks/root.lock.json");
     assert!(status.fencing_token > 0);
@@ -1612,131 +1219,6 @@ async fn apply_catalog_ddl_retries_same_key_after_missing_tx_record_is_stale() -
 }
 
 #[tokio::test]
-async fn apply_catalog_ddl_replays_from_cached_visible_record_after_finalize_write_failure()
--> Result<()> {
-    let fail_prefix = format!("tenant={TENANT}/workspace={WORKSPACE}/transactions/catalog/");
-    let backend: Arc<dyn StorageBackend> = Arc::new(FailPrefixOnNoneBackend::new(fail_prefix, 1));
-    let router = test_router_with_backend(backend.clone());
-
-    let first = catalog_create_namespace_request(
-        "idem-cat-finalize-cache-01",
-        "req-cat-finalize-cache-01",
-        "cached-visible",
-    );
-    let (status, _) = post_error_json(
-        router.clone(),
-        "/api/v1/transactions/applyCatalogDdl",
-        &first,
-        "idem-cat-finalize-cache-01",
-        "req-cat-finalize-cache-01",
-    )
-    .await?;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-
-    let idem = load_idempotency_record(
-        backend.clone(),
-        ControlPlaneTxDomain::Catalog,
-        "idem-cat-finalize-cache-01",
-    )
-    .await?;
-    assert!(idem.visible_at.is_some());
-    assert!(idem.tx_record.is_some());
-
-    let second = catalog_create_namespace_request(
-        "idem-cat-finalize-cache-01",
-        "req-cat-finalize-cache-02",
-        "cached-visible",
-    );
-    let (_status, response): (_, ApplyCatalogDdlResponse) = post_protobuf(
-        router,
-        "/api/v1/transactions/applyCatalogDdl",
-        &second,
-        "idem-cat-finalize-cache-01",
-        "req-cat-finalize-cache-02",
-    )
-    .await?;
-
-    let receipt = response
-        .receipt
-        .context("catalog cached replay receipt missing")?;
-    assert_eq!(receipt.tx_id, idem.tx_id);
-
-    let stored = load_catalog_tx_record(backend, &receipt.tx_id).await?;
-    assert_eq!(stored.status, ControlPlaneTxStatus::Visible);
-    assert_eq!(
-        stored.result.as_ref().map(|result| result.tx_id.as_str()),
-        Some(receipt.tx_id.as_str())
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn apply_catalog_ddl_keeps_visible_success_when_pointer_readback_fails() -> Result<()> {
-    let pointer_path = format!(
-        "tenant={TENANT}/workspace={WORKSPACE}/{}",
-        CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog)
-    );
-    // Fresh catalog DDL bootstraps the v0 pointer, publishes the default catalog,
-    // then publishes the requested namespace. Trigger after the third pointer put
-    // so the injected read failure lands after visibility rather than mid-commit.
-    let backend: Arc<dyn StorageBackend> = Arc::new(FailReadsAfterTriggerPutBackend::new(
-        pointer_path.clone(),
-        3,
-        vec![pointer_path],
-        Vec::new(),
-        2,
-    ));
-    let router = test_router_with_backend(backend.clone());
-
-    let first = catalog_create_namespace_request(
-        "idem-cat-visible-boundary-01",
-        "req-cat-visible-boundary-01",
-        "visible-boundary",
-    );
-    let (_status, first_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
-        router.clone(),
-        "/api/v1/transactions/applyCatalogDdl",
-        &first,
-        "idem-cat-visible-boundary-01",
-        "req-cat-visible-boundary-01",
-    )
-    .await?;
-
-    let first_receipt = first_response
-        .receipt
-        .context("catalog receipt missing after pointer readback failure")?;
-    let stored = load_catalog_tx_record(backend.clone(), &first_receipt.tx_id).await?;
-    assert_eq!(stored.status, ControlPlaneTxStatus::Visible);
-    assert_eq!(
-        stored.result.as_ref().map(|result| result.tx_id.as_str()),
-        Some(first_receipt.tx_id.as_str())
-    );
-
-    let replay = catalog_create_namespace_request(
-        "idem-cat-visible-boundary-01",
-        "req-cat-visible-boundary-02",
-        "visible-boundary",
-    );
-    let (_status, replay_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
-        router,
-        "/api/v1/transactions/applyCatalogDdl",
-        &replay,
-        "idem-cat-visible-boundary-01",
-        "req-cat-visible-boundary-02",
-    )
-    .await?;
-
-    let replay_receipt = replay_response
-        .receipt
-        .context("catalog replay receipt missing after pointer readback failure")?;
-    assert_eq!(replay_receipt.tx_id, first_receipt.tx_id);
-    assert_eq!(replay_receipt.commit_id, first_receipt.commit_id);
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn commit_orchestration_batch_marks_failed_attempt_aborted_and_retries_same_key() -> Result<()>
 {
     let fail_prefix = format!("tenant={TENANT}/workspace={WORKSPACE}/ledger/orchestration/");
@@ -1793,89 +1275,15 @@ async fn commit_orchestration_batch_marks_failed_attempt_aborted_and_retries_sam
 }
 
 #[tokio::test]
-async fn commit_orchestration_batch_keeps_visible_success_when_pointer_readback_fails() -> Result<()>
-{
-    let pointer_path = format!(
-        "tenant={TENANT}/workspace={WORKSPACE}/{}",
-        orchestration_manifest_pointer_path()
-    );
-    let backend: Arc<dyn StorageBackend> = Arc::new(FailReadsAfterTriggerPutBackend::new(
-        pointer_path.clone(),
-        1,
-        vec![pointer_path.clone()],
-        vec![pointer_path],
-        2,
-    ));
-    let router = test_router_with_backend(backend.clone());
-
-    let first = orchestration_request(
-        "idem-orch-visible-boundary-01",
-        "req-orch-visible-boundary-01",
-        "run-visible-boundary-01",
-    );
-    let (_status, first_response): (_, CommitOrchestrationBatchResponse) = post_protobuf(
-        router.clone(),
-        "/api/v1/transactions/commitOrchestrationBatch",
-        &first,
-        "idem-orch-visible-boundary-01",
-        "req-orch-visible-boundary-01",
-    )
-    .await?;
-
-    let first_receipt = first_response
-        .receipt
-        .context("orchestration receipt missing after pointer readback failure")?;
-    let stored = load_orchestration_tx_record(backend.clone(), &first_receipt.tx_id).await?;
-    assert_eq!(stored.status, ControlPlaneTxStatus::Visible);
-    assert_eq!(
-        stored.result.as_ref().map(|result| result.tx_id.as_str()),
-        Some(first_receipt.tx_id.as_str())
-    );
-
-    let replay = orchestration_request(
-        "idem-orch-visible-boundary-01",
-        "req-orch-visible-boundary-02",
-        "run-visible-boundary-01",
-    );
-    let (_status, replay_response): (_, CommitOrchestrationBatchResponse) = post_protobuf(
-        router,
-        "/api/v1/transactions/commitOrchestrationBatch",
-        &replay,
-        "idem-orch-visible-boundary-01",
-        "req-orch-visible-boundary-02",
-    )
-    .await?;
-
-    let replay_receipt = replay_response
-        .receipt
-        .context("orchestration replay receipt missing after pointer readback failure")?;
-    assert_eq!(replay_receipt.tx_id, first_receipt.tx_id);
-    assert_eq!(replay_receipt.commit_id, first_receipt.commit_id);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn apply_catalog_ddl_rejects_unsupported_namespace_and_table_properties() -> Result<()> {
+async fn apply_catalog_ddl_rejects_missing_catalog_operation() -> Result<()> {
     let router = test_router();
-
-    let namespace_request = ApplyCatalogDdlRequest {
-        header: Some(request_header("idem-cat-props-01", "req-cat-props-01")),
-        ddl: Some(CatalogDdlOperation {
-            op: Some(CatalogDdlOp::CreateNamespace(CreateNamespaceOp {
-                name: "props-ns".to_string(),
-                description: Some("namespace properties unsupported".to_string()),
-                properties: [("owner".to_string(), "platform".to_string())]
-                    .into_iter()
-                    .collect(),
-            })),
-        }),
-        require_visible: Some(true),
+    let request = ApplyCatalogDdlRequest {
+        ddl: Some(CatalogDdlOperation { op: None }),
     };
     let (status, error) = post_error_json(
-        router.clone(),
+        router,
         "/api/v1/transactions/applyCatalogDdl",
-        &namespace_request,
+        &request,
         "idem-cat-props-01",
         "req-cat-props-01",
     )
@@ -1883,48 +1291,15 @@ async fn apply_catalog_ddl_rejects_unsupported_namespace_and_table_properties() 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error["code"], "BAD_REQUEST");
 
-    let table_request = ApplyCatalogDdlRequest {
-        header: Some(request_header("idem-cat-props-02", "req-cat-props-02")),
-        ddl: Some(CatalogDdlOperation {
-            op: Some(CatalogDdlOp::RegisterTable(RegisterTableOp {
-                namespace: "analytics".to_string(),
-                name: "events".to_string(),
-                description: Some("table properties unsupported".to_string()),
-                location: None,
-                format: None,
-                columns: vec![CatalogColumnDefinition {
-                    name: "id".to_string(),
-                    data_type: "STRING".to_string(),
-                    is_nullable: false,
-                    description: None,
-                }],
-                properties: [("quality".to_string(), "gold".to_string())]
-                    .into_iter()
-                    .collect(),
-            })),
-        }),
-        require_visible: Some(true),
-    };
-    let (status, error) = post_error_json(
-        router,
-        "/api/v1/transactions/applyCatalogDdl",
-        &table_request,
-        "idem-cat-props-02",
-        "req-cat-props-02",
-    )
-    .await?;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(error["code"], "BAD_REQUEST");
-
     Ok(())
 }
 
 #[tokio::test]
-async fn commit_orchestration_batch_rejects_unsupported_allow_inline_merge() -> Result<()> {
+async fn commit_orchestration_batch_rejects_missing_event_payload() -> Result<()> {
     let router = test_router();
     let mut request =
         orchestration_request("idem-orch-inline-01", "req-orch-inline-01", "run-inline-01");
-    request.allow_inline_merge = Some(true);
+    request.events[0].event = None;
 
     let (status, error) = post_error_json(
         router,

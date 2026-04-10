@@ -2,7 +2,7 @@
 
 ## Status
 
-PI-3 repo-side scope is complete in-tree.
+PI-3 repo-side scope is complete in-tree as of April 8, 2026.
 
 PI-3 remains a repo-side cutover only from this workspace. Live production rollout was not executed
 here because deployment hosts and credentials are unavailable in this shell.
@@ -41,8 +41,13 @@ Repo-grounded outcome:
 - API orchestration writes no longer degrade into append-only behavior when
   `ARCO_ORCH_COMPACTOR_URL` is unset; they now fall back to inline fenced compaction and still
   require visible publication
+- visible catalog and orchestration commits no longer recreate legacy mutable mirrors or catalog
+  commit-chain artifacts
 - catalog and orchestration repair automation defaults are now production-grade:
-  `enforce`, `current_head_only`, `300s` cadence
+  `enforce`, `full`, `300s` cadence
+- internal unfenced `expected_epoch` micro-compactor helpers were removed
+  - active runtime entrypoints are the unfenced local helpers and the canonical fenced helpers that
+    validate `fencing_token` plus `lock_path`
 - production alerts, dashboards, and runbooks now treat compatibility-path usage as a regression,
   not informational telemetry
 
@@ -67,11 +72,11 @@ Repo-grounded outcome:
 Required runtime controls:
 
 - `ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE=enforce`
-- `ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE=current_head_only`
+- `ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE=full`
 - `ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS=300`
 - `ARCO_COMPACTOR_REPAIR_AUTOMATION_DOMAINS=catalog,lineage,search`
 - `ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_MODE=enforce`
-- `ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_SCOPE=current_head_only`
+- `ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_SCOPE=full`
 - `ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS=300`
 - API deployment config:
   - `ARCO_COMPACTOR_URL` for catalog writers
@@ -95,8 +100,9 @@ Cutover order:
 6. Run dry-run reconcile on catalog and orchestration.
 7. Confirm repair backlog count returns to zero, backlog age stays below `900s`, repair p95 stays
    below `120s`, `repair_pending=true` remains at three or fewer per hour, stale-fence rejects stay
-   quiet, and `ArcoFlowCompactorCompatibilityRegression` stays quiet.
-8. If needed, run explicit enforce reconcile until current-head side effects converge before
+   quiet, `ArcoFlowCompactorCompatibilityRegression` stays quiet, and removed legacy artifacts do
+   not reappear.
+8. If needed, run explicit enforce reconcile until generic orphan cleanup converges before
    expanding traffic.
 
 Rollback order:
@@ -104,8 +110,8 @@ Rollback order:
 1. Do not attempt pointer rollback after a visible CAS commit.
 2. If repair automation is unhealthy, drop both compactors to `dry_run` first and redeploy.
 3. Pause or scale down the writer deployment that is failing.
-4. Run dry-run reconcile to enumerate outstanding repairable current-head side effects.
-5. Run enforce reconcile until current-head repair backlog converges.
+4. Run dry-run reconcile to enumerate outstanding orphan cleanup and stale artifact findings.
+5. Run enforce reconcile until the cleanup backlog converges.
 6. If a removed compatibility path is still required, roll back `arco-flow-compactor` and the
    affected writers to the last PI-2-compatible release as a temporary escape hatch only.
 7. Resume traffic only after the compatibility-dependent caller is upgraded or the temporary
@@ -113,74 +119,66 @@ Rollback order:
 
 ## Remaining Deferred Cleanup
 
-Intentionally not forced into PI-3:
+No additional repo-side PI-3 cleanup remains identified in this workspace.
 
-- legacy mirrors and catalog commit-record side effects remain repairable side effects
-  - repo evidence still shows active code and tests depending on legacy mirror presence and repair
-  - no safe zero-dependency removal proof was available in this workspace
-- internal `expected_epoch` micro-compactor helpers remain for internal fenced/rebuild logic and
-  tests; PI-3 removed request/client compatibility shims, not every internal epoch-bearing helper
-- the original PI-3 scope excluded root transactions
-  - current repo state now ships root commit/lookup plus pinned catalog and
-    orchestration read-token consumption as follow-on work outside the PI-3
-    rollout boundary
+The remaining blocker is operational:
+
+- live production deployment/runtime access is still required to execute the cutover packet and
+  validate the production gates
 
 ## Verification
 
 Verification commands run for PI-3:
 
 ```bash
-cargo fmt --all
-CARGO_TARGET_DIR=/tmp/arco-pi3-api cargo test -p arco-core
-CARGO_TARGET_DIR=/tmp/arco-pi3-api cargo test -p arco-catalog
-CARGO_TARGET_DIR=/tmp/arco-pi3-api cargo test -p arco-compactor
-CARGO_TARGET_DIR=/tmp/arco-pi3-api cargo test -p arco-flow --features test-utils
-CARGO_TARGET_DIR=/tmp/arco-pi3-api cargo test -p arco-api --lib
+cargo fmt --all --check
+cargo test -p arco-core -- --nocapture
+cargo test -p arco-catalog -- --nocapture
+cargo test -p arco-compactor -- --nocapture
+cargo test -p arco-flow --features test-utils -- --nocapture
+cargo test -p arco-api --test control_plane_transactions_api -- --nocapture
+cargo test -p arco-api grpc_transactions -- --nocapture
 promtool check rules infra/monitoring/alerts.yaml
 promtool test rules infra/monitoring/tests/control_plane_repair_alerts.test.yaml
-promtool test rules infra/monitoring/tests/observability_gate4_alert_drill.test.yaml
-promtool test rules infra/monitoring/tests/observability_orch_alert_drill.test.yaml
 ```
 
 Observed results:
 
-- `cargo fmt --all` exited `0`
-- `CARGO_TARGET_DIR=/tmp/arco-pi3-api cargo test -p arco-core` exited `0`
-- `CARGO_TARGET_DIR=/tmp/arco-pi3-api cargo test -p arco-catalog` exited `0`
-- `CARGO_TARGET_DIR=/tmp/arco-pi3-api cargo test -p arco-compactor` exited `0`
-- `CARGO_TARGET_DIR=/tmp/arco-pi3-api cargo test -p arco-flow --features test-utils` exited `0`
-- `CARGO_TARGET_DIR=/tmp/arco-pi3-api cargo test -p arco-api --lib` exited `0`
-- `promtool check rules infra/monitoring/alerts.yaml` reported `SUCCESS: 24 rules found`
+- `cargo fmt --all --check` exited `0`
+- `cargo test -p arco-core -- --nocapture` exited `0`
+- `cargo test -p arco-catalog -- --nocapture` exited `0`
+- `cargo test -p arco-compactor -- --nocapture` exited `0`
+- `cargo test -p arco-flow --features test-utils -- --nocapture` exited `0`
+- `cargo test -p arco-api --test control_plane_transactions_api -- --nocapture` exited `0`
+- `cargo test -p arco-api grpc_transactions -- --nocapture` exited `0`
+- `promtool check rules infra/monitoring/alerts.yaml` reported `SUCCESS: 22 rules found`
 - `promtool test rules infra/monitoring/tests/control_plane_repair_alerts.test.yaml` reported
   `SUCCESS`
-- `promtool test rules infra/monitoring/tests/observability_gate4_alert_drill.test.yaml`
-  reported `SUCCESS`
-- `promtool test rules infra/monitoring/tests/observability_orch_alert_drill.test.yaml`
-  reported `SUCCESS`
 
 Targeted regression checks added for PI-3:
 
 - legacy orchestration `epoch` request shapes are rejected by shared contract tests
 - removed request shapes are rejected and metered by `arco-flow-compactor`
-- repair automation defaults to `enforce` plus `current_head_only`
+- repair automation defaults to `enforce` plus `full`
 - API orchestration writes remain visible even without `ARCO_ORCH_COMPACTOR_URL`
+- unfenced `expected_epoch` helpers are removed while fenced retry coverage remains in place
 
 Additional targeted local checks:
 
-- `CARGO_TARGET_DIR=/tmp/arco-pi3-core cargo test -p arco-core repair_backlog_entry -- --nocapture`
-  passed after the prerequisite `repair_backlog` module fix
-- `CARGO_TARGET_DIR=/tmp/arco-pi3-api cargo test -p arco-api --lib append_events_and_compact_makes_inline_writes_visible_without_remote_compactor -- --nocapture`
-  passed after the API inline fenced fallback change
+- `cargo test -p arco-flow rebuild_from_ledger_manifest_reproduces_equivalent_projection_state -- --nocapture`
+  passed after removing the unfenced rebuild `expected_epoch` parameter
+- `cargo test -p arco-flow compact_events_fenced_retries_after_concurrent_manifest_snapshot_conflict -- --nocapture`
+  passed after switching retry coverage to the active fenced compaction path
 
 ## External Blockers
 
-Live production rollout could not be executed here because the required deployment/runtime access
-is absent in this shell.
+Live production rollout still could not be executed from this shell after the April 8, 2026
+repo-side verification pass because the required runtime target inputs are incomplete.
 
 Concrete missing inputs:
 
 - no production `ARCO_COMPACTOR_HOST`
 - no production `ARCO_FLOW_COMPACTOR_HOST`
-- no `ARCO_INTERNAL_ID_TOKEN`
-- no deployment credentials for API, catalog compactor, or flow-compactor services
-- no host-level or platform-level access to restart/redeploy those services from this workspace
+- no `ARCO_INTERNAL_ID_TOKEN` in this shell for auth-protected reconcile calls
+- no configured Cloud Run region or equivalent service-target mapping for the compactor services in
+  this shell (`gcloud config get-value run/region` returned `(unset)`)

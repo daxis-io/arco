@@ -16,6 +16,7 @@ cargo test -p arco-catalog --test protocol_invariants -- --nocapture
 cargo test -p arco-flow --test orchestration_protocol_invariants -- --nocapture
 cargo test -p arco-api --test root_transaction_protocol -- --nocapture
 cargo test -p arco-api --test visible_contracts -- --nocapture
+cargo test -p arco-compactor -- --nocapture
 ```
 
 Observed results:
@@ -26,6 +27,7 @@ Observed results:
 - `arco-flow` orchestration protocol invariants: passed
 - `arco-api` root replay protocol: passed
 - `arco-api` visible contracts: passed
+- `arco-compactor` operational smoke and handler boundary tests: passed
 - Fresh `CARGO_TARGET_DIR=target-codex-review cargo check -p arco-api --lib`: passed
 
 ## Invariant Matrix
@@ -51,6 +53,8 @@ Observed results:
 | Controller/API orchestration compaction rejects `visibility_status != "visible"` | `require_visible_compaction_rejects_persisted_not_visible_results` in `crates/arco-api/src/orchestration_compaction.rs` | `arco-api` unit test lane | Landed |
 | Root replay repairs the missing tx-record durable side from visible idempotency cache without listing | `replay_repairs_missing_root_tx_record_from_visible_idempotency_without_listing` in `crates/arco-api/tests/root_transaction_protocol.rs` | `arco-api` test lane | Landed |
 | Root replay repairs the missing visible idempotency durable side from the visible tx record without listing | `replay_repairs_missing_visible_idempotency_from_root_tx_record_without_listing` in `crates/arco-api/tests/root_transaction_protocol.rs` | `arco-api` test lane | Landed |
+| Compactor reconcile defaults stay on full repair scope | `test_reconcile_request_defaults_to_full_scope`, `test_reconcile_endpoint_defaults_to_full_scope`, `test_reconcile_endpoint_full_scope_repairs_cleanup_items` in `crates/arco-compactor/src/main.rs` | `arco-compactor` test lane | Landed |
+| Anti-entropy remains the only list-authorized compactor path | `test_sync_compact_handler_does_not_require_list_permission`, `test_anti_entropy_handler_is_the_only_list_authorized_path` in `crates/arco-compactor/src/main.rs` | `arco-compactor` test lane | Landed |
 
 ## Execution Lanes
 
@@ -62,6 +66,7 @@ Observed results:
 | Orchestration invariants | `cargo test -p arco-flow --test orchestration_protocol_invariants -- --nocapture` |
 | API root protocol | `cargo test -p arco-api --test root_transaction_protocol -- --nocapture` |
 | API visible-only contracts | `cargo test -p arco-api --test visible_contracts -- --nocapture` |
+| Compactor operational smoke | `cargo test -p arco-compactor -- --nocapture` |
 
 ## Notes
 

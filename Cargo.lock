@@ -292,6 +292,7 @@ dependencies = [
  "anyhow",
  "arco-catalog",
  "arco-core",
+ "async-trait",
  "axum 0.7.9",
  "bytes",
  "chrono",

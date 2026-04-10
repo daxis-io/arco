@@ -1413,11 +1413,14 @@ async fn run_repair_automation_loop(state: Arc<ServiceState>) {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::ops::Range;
 
     use super::*;
     use arco_catalog::{CatalogDomainManifest, RootManifest};
-    use arco_core::storage::MemoryBackend;
+    use arco_core::error::Error as CoreError;
+    use arco_core::storage::{MemoryBackend, ObjectMeta, StorageBackend, WriteResult};
     use arco_core::{CatalogPaths, WritePrecondition};
+    use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use bytes::Bytes;
@@ -1427,8 +1430,62 @@ mod tests {
         test_state_with_scope("acme", "analytics")
     }
 
+    #[derive(Debug, Default)]
+    struct ListDeniedBackend {
+        inner: MemoryBackend,
+    }
+
+    #[async_trait]
+    impl StorageBackend for ListDeniedBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            Err(CoreError::storage(format!(
+                "list() is reserved for anti-entropy smoke tests: {prefix}"
+            )))
+        }
+
+        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
     fn test_state_with_scope(tenant_id: &str, workspace_id: &str) -> Arc<ServiceState> {
         let storage = Arc::new(MemoryBackend::new());
+        test_state_with_backend_and_scope(storage, tenant_id, workspace_id)
+    }
+
+    fn test_state_with_backend_and_scope<B>(
+        storage: Arc<B>,
+        tenant_id: &str,
+        workspace_id: &str,
+    ) -> Arc<ServiceState>
+    where
+        B: StorageBackend,
+    {
         let scoped_storage =
             ScopedStorage::new(storage, tenant_id, workspace_id).expect("scoped storage");
         let compactor_state = Arc::new(CompactorState::new(60));
@@ -1812,6 +1869,97 @@ mod tests {
                 .expect("head old snapshot")
                 .is_none(),
             "full reconcile repair scope must delete generic cleanup candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_compact_handler_does_not_require_list_permission() {
+        let state = test_state_with_backend_and_scope(
+            Arc::new(ListDeniedBackend::default()),
+            "list-denied-tenant",
+            "list-denied-workspace",
+        );
+        let router = build_router(state, None, None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/sync-compact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "domain": "catalog",
+                            "event_paths": ["ledger/catalog/01JFXYZ.json"],
+                            "fencing_token": 1,
+                            "lock_path": "locks/not-the-canonical-lock.json"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read response body");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse sync-compact response");
+        assert_eq!(json["error"], "validation_error");
+        assert!(
+            !json["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("list() is reserved"),
+            "sync-compact smoke should not depend on bucket list permission: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_anti_entropy_handler_is_the_only_list_authorized_path() {
+        let state = test_state_with_backend_and_scope(
+            Arc::new(ListDeniedBackend::default()),
+            "list-denied-tenant",
+            "list-denied-workspace",
+        );
+        let _ = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
+        let router = build_router(state, None, None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/anti-entropy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "domain": "catalog",
+                            "tenant_id": "list-denied-tenant",
+                            "workspace_id": "list-denied-workspace",
+                            "max_objects_per_run": 1
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read response body");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse anti-entropy response");
+        assert_eq!(json["error"], "anti_entropy_failed");
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("list() is reserved"),
+            "anti-entropy smoke should fail specifically on list permission boundary: {json}"
         );
     }
 

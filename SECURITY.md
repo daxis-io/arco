@@ -6,9 +6,10 @@ The Arco maintainers take security seriously. We appreciate your efforts to resp
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.x.x   | :white_check_mark: |
+| 1.x.x   | :white_check_mark: |
+| 0.x.x   | :x: |
 
-Once we reach 1.0, we will maintain security updates for the current major version and one prior major version.
+We maintain security updates for the current major version and one prior major version when a prior supported major exists.
 
 ## Reporting a Vulnerability
 

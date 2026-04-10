@@ -1,6 +1,6 @@
 [package]
 name = "arco-test-utils"
-version = "0.1.0"
+version = "1.4.0"
 edition = "2024"
 description = "Shared test utilities for Arco integration tests"
 publish = false

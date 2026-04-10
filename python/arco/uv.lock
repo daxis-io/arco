@@ -35,7 +35,7 @@ wheels = [
 
 [[package]]
 name = "arco-flow"
-version = "0.1.0a0"
+version = "1.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

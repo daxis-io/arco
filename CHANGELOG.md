@@ -6,10 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [1.4.0] - 2026-04-10
 ### Added
-- Server-side SQL query endpoint at `/api/v1/query` backed by DataFusion (Arrow IPC or JSON output).
+- Server-side SQL query endpoint at `/api/v1/query` backed by DataFusion with Arrow IPC or JSON output.
+- Control-plane transaction APIs and flow cutover wiring for orchestration callback workflows landed on `main`.
+- Orchestration output visibility lifecycle coverage now spans the API, worker callbacks, and flow execution surfaces.
 ### Changed
+- Promoted workspace, SDK, and release metadata to the `1.x` line while reserving planned protobuf-breaking contract changes for `2.0.0`.
 - Refreshed `README.md`, `RELEASE.md`, and release-note templates to align with mdBook-first docs and CI/release artifact policy.
+### Fixed
+- Hardened orchestration compactor publication and control-plane repair publication paths on the release line.
 
 ## [0.1.4] - 2026-02-18
 ### Fixed

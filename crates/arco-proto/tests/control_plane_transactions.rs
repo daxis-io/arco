@@ -21,8 +21,10 @@ use arco_proto::arco::controlplane::v1::{
     TransactionStatus, domain_mutation,
 };
 use arco_proto::arco::orchestration::v1::{
-    OrchestrationEventEnvelope, RunRequested, RunTriggered, TaskCallbackOutput, TaskError,
-    TaskErrorCategory, TaskFinished, TaskOutcome, TriggerInfo, orchestration_event_envelope,
+    BackfillTrigger, ManualTrigger, MaterializationTrigger, OrchestrationEventEnvelope,
+    RunRequested, RunTriggered, ScheduleTrigger, SensorTrigger, TaskCallbackOutput, TaskError,
+    TaskErrorCategory, TaskFinished, TaskOutcome, TriggerInfo, WebhookTrigger,
+    orchestration_event_envelope, trigger_info,
 };
 use arco_proto::{ControlPlaneTransactionContractError, OrchestrationEventContractError};
 
@@ -373,6 +375,235 @@ fn commit_orchestration_batch_rejects_empty_event_identifiers() {
 }
 
 #[test]
+fn commit_orchestration_batch_rejects_run_requested_manual_trigger_without_request_id() {
+    let mut event = sample_run_requested_event();
+    event.event = Some(orchestration_event_envelope::Event::RunRequested(
+        RunRequested {
+            trigger: Some(TriggerInfo {
+                trigger: Some(trigger_info::Trigger::Manual(ManualTrigger {
+                    user_id: "user_01".to_string(),
+                    request_id: None,
+                })),
+            }),
+            ..sample_run_requested()
+        },
+    ));
+
+    let request = CommitOrchestrationBatchRequest {
+        events: vec![event],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(
+            ControlPlaneTransactionContractError::InvalidOrchestrationEvent(
+                0,
+                OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "manual.request_id",
+                ),
+            ),
+        )
+    );
+}
+
+#[test]
+fn commit_orchestration_batch_rejects_run_requested_schedule_trigger_without_tick_id() {
+    let mut event = sample_run_requested_event();
+    event.event = Some(orchestration_event_envelope::Event::RunRequested(
+        RunRequested {
+            trigger: Some(TriggerInfo {
+                trigger: Some(trigger_info::Trigger::Schedule(ScheduleTrigger {
+                    schedule_id: "sched_01".to_string(),
+                    tick_id: None,
+                })),
+            }),
+            ..sample_run_requested()
+        },
+    ));
+
+    let request = CommitOrchestrationBatchRequest {
+        events: vec![event],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(
+            ControlPlaneTransactionContractError::InvalidOrchestrationEvent(
+                0,
+                OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "schedule.tick_id",
+                ),
+            ),
+        )
+    );
+}
+
+#[test]
+fn commit_orchestration_batch_rejects_run_requested_sensor_trigger_without_eval_id() {
+    let mut event = sample_run_requested_event();
+    event.event = Some(orchestration_event_envelope::Event::RunRequested(
+        RunRequested {
+            trigger: Some(TriggerInfo {
+                trigger: Some(trigger_info::Trigger::Sensor(SensorTrigger {
+                    sensor_id: "sensor_01".to_string(),
+                    cursor: Some("cursor-01".to_string()),
+                    eval_id: None,
+                })),
+            }),
+            ..sample_run_requested()
+        },
+    ));
+
+    let request = CommitOrchestrationBatchRequest {
+        events: vec![event],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(
+            ControlPlaneTransactionContractError::InvalidOrchestrationEvent(
+                0,
+                OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "sensor.eval_id",
+                ),
+            ),
+        )
+    );
+}
+
+#[test]
+fn commit_orchestration_batch_rejects_run_requested_backfill_trigger_without_chunk_id() {
+    let mut event = sample_run_requested_event();
+    event.event = Some(orchestration_event_envelope::Event::RunRequested(
+        RunRequested {
+            trigger: Some(TriggerInfo {
+                trigger: Some(trigger_info::Trigger::Backfill(BackfillTrigger {
+                    backfill_id: "backfill_01".to_string(),
+                    chunk_id: None,
+                })),
+            }),
+            ..sample_run_requested()
+        },
+    ));
+
+    let request = CommitOrchestrationBatchRequest {
+        events: vec![event],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(
+            ControlPlaneTransactionContractError::InvalidOrchestrationEvent(
+                0,
+                OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "backfill.chunk_id",
+                ),
+            ),
+        )
+    );
+}
+
+#[test]
+fn commit_orchestration_batch_rejects_run_requested_materialization_trigger() {
+    let mut event = sample_run_requested_event();
+    event.event = Some(orchestration_event_envelope::Event::RunRequested(
+        RunRequested {
+            trigger: Some(TriggerInfo {
+                trigger: Some(trigger_info::Trigger::Materialization(
+                    MaterializationTrigger {
+                        upstream_materialization_id: "mat_01".to_string(),
+                    },
+                )),
+            }),
+            ..sample_run_requested()
+        },
+    ));
+
+    let request = CommitOrchestrationBatchRequest {
+        events: vec![event],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(
+            ControlPlaneTransactionContractError::InvalidOrchestrationEvent(
+                0,
+                OrchestrationEventContractError::UnsupportedTriggerKind(
+                    "run_requested",
+                    "materialization",
+                ),
+            ),
+        )
+    );
+}
+
+#[test]
+fn commit_orchestration_batch_rejects_run_requested_webhook_trigger() {
+    let mut event = sample_run_requested_event();
+    event.event = Some(orchestration_event_envelope::Event::RunRequested(
+        RunRequested {
+            trigger: Some(TriggerInfo {
+                trigger: Some(trigger_info::Trigger::Webhook(WebhookTrigger {
+                    webhook_id: "webhook_01".to_string(),
+                })),
+            }),
+            ..sample_run_requested()
+        },
+    ));
+
+    let request = CommitOrchestrationBatchRequest {
+        events: vec![event],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(
+            ControlPlaneTransactionContractError::InvalidOrchestrationEvent(
+                0,
+                OrchestrationEventContractError::UnsupportedTriggerKind("run_requested", "webhook",),
+            ),
+        )
+    );
+}
+
+#[test]
+fn commit_orchestration_batch_rejects_run_triggered_backfill_trigger() {
+    let mut event = sample_run_triggered_event();
+    event.event = Some(orchestration_event_envelope::Event::RunTriggered(
+        RunTriggered {
+            trigger: Some(TriggerInfo {
+                trigger: Some(trigger_info::Trigger::Backfill(BackfillTrigger {
+                    backfill_id: "backfill_01".to_string(),
+                    chunk_id: Some("chunk_01".to_string()),
+                })),
+            }),
+            ..sample_run_triggered()
+        },
+    ));
+
+    let request = CommitOrchestrationBatchRequest {
+        events: vec![event],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(
+            ControlPlaneTransactionContractError::InvalidOrchestrationEvent(
+                0,
+                OrchestrationEventContractError::UnsupportedTriggerKind(
+                    "run_triggered",
+                    "backfill",
+                ),
+            ),
+        )
+    );
+}
+
+#[test]
 fn commit_root_transaction_rejects_empty_mutations() {
     let request = CommitRootTransactionRequest {
         mutations: Vec::new(),
@@ -505,23 +736,7 @@ fn sample_run_requested_event() -> OrchestrationEventEnvelope {
         correlation_id: Some("run-01".to_string()),
         causation_id: None,
         event: Some(orchestration_event_envelope::Event::RunRequested(
-            RunRequested {
-                run_key: "sched:daily:2026-04-09".to_string(),
-                request_fingerprint: "sha256:req".to_string(),
-                asset_selection: vec!["default.raw.events".to_string()],
-                partition_selection: vec!["date=d:2026-04-09".to_string()],
-                trigger: Some(TriggerInfo {
-                    trigger: Some(
-                        arco_proto::arco::orchestration::v1::trigger_info::Trigger::Schedule(
-                            arco_proto::arco::orchestration::v1::ScheduleTrigger {
-                                schedule_id: "sched_01".to_string(),
-                                tick_id: Some("tick_01".to_string()),
-                            },
-                        ),
-                    ),
-                }),
-                labels: Default::default(),
-            },
+            sample_run_requested(),
         )),
     }
 }
@@ -539,25 +754,41 @@ fn sample_run_triggered_event() -> OrchestrationEventEnvelope {
         correlation_id: Some("run-01".to_string()),
         causation_id: None,
         event: Some(orchestration_event_envelope::Event::RunTriggered(
-            RunTriggered {
-                run_id: "run-01".to_string(),
-                plan_id: "plan-01".to_string(),
-                trigger: Some(TriggerInfo {
-                    trigger: Some(
-                        arco_proto::arco::orchestration::v1::trigger_info::Trigger::Manual(
-                            arco_proto::arco::orchestration::v1::ManualTrigger {
-                                user_id: "user_01".to_string(),
-                                request_id: None,
-                            },
-                        ),
-                    ),
-                }),
-                root_assets: vec!["default.raw.events".to_string()],
-                run_key: Some("manual:req-01".to_string()),
-                labels: Default::default(),
-                code_version: Some("git:abc123".to_string()),
-            },
+            sample_run_triggered(),
         )),
+    }
+}
+
+fn sample_run_requested() -> RunRequested {
+    RunRequested {
+        run_key: "sched:daily:2026-04-09".to_string(),
+        request_fingerprint: "sha256:req".to_string(),
+        asset_selection: vec!["default.raw.events".to_string()],
+        partition_selection: vec!["date=d:2026-04-09".to_string()],
+        trigger: Some(TriggerInfo {
+            trigger: Some(trigger_info::Trigger::Schedule(ScheduleTrigger {
+                schedule_id: "sched_01".to_string(),
+                tick_id: Some("tick_01".to_string()),
+            })),
+        }),
+        labels: Default::default(),
+    }
+}
+
+fn sample_run_triggered() -> RunTriggered {
+    RunTriggered {
+        run_id: "run-01".to_string(),
+        plan_id: "plan-01".to_string(),
+        trigger: Some(TriggerInfo {
+            trigger: Some(trigger_info::Trigger::Manual(ManualTrigger {
+                user_id: "user_01".to_string(),
+                request_id: None,
+            })),
+        }),
+        root_assets: vec!["default.raw.events".to_string()],
+        run_key: Some("manual:req-01".to_string()),
+        labels: Default::default(),
+        code_version: Some("git:abc123".to_string()),
     }
 }
 

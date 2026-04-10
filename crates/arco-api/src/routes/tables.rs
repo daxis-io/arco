@@ -283,10 +283,12 @@ pub(crate) async fn register_table(
     let columns: Vec<arco_catalog::ColumnDefinition> = req
         .columns
         .iter()
-        .map(|c| arco_catalog::ColumnDefinition {
+        .enumerate()
+        .map(|(ordinal, c)| arco_catalog::ColumnDefinition {
             name: c.name.clone(),
             data_type: c.data_type.clone(),
             is_nullable: c.nullable,
+            ordinal: ordinal as i32,
             description: c.description.clone(),
         })
         .collect();

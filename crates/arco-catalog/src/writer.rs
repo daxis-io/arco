@@ -351,6 +351,8 @@ pub struct ColumnDefinition {
     pub data_type: String,
     /// Whether the column is nullable.
     pub is_nullable: bool,
+    /// Column ordinal position (0-indexed).
+    pub ordinal: i32,
     /// Optional description.
     pub description: Option<String>,
 }
@@ -1654,14 +1656,13 @@ impl CatalogWriter {
         let columns: Vec<ColumnRecord> = req
             .columns
             .iter()
-            .enumerate()
-            .map(|(ordinal, col_def)| ColumnRecord {
+            .map(|col_def| ColumnRecord {
                 id: Uuid::now_v7().to_string(),
                 table_id: table_id.clone(),
                 name: col_def.name.clone(),
                 data_type: col_def.data_type.clone(),
                 is_nullable: col_def.is_nullable,
-                ordinal: ordinal as i32,
+                ordinal: col_def.ordinal,
                 description: col_def.description.clone(),
             })
             .collect();
@@ -1803,14 +1804,13 @@ impl CatalogWriter {
         let columns: Vec<ColumnRecord> = req
             .columns
             .iter()
-            .enumerate()
-            .map(|(ordinal, col_def)| ColumnRecord {
+            .map(|col_def| ColumnRecord {
                 id: Uuid::now_v7().to_string(),
                 table_id: table_id.clone(),
                 name: col_def.name.clone(),
                 data_type: col_def.data_type.clone(),
                 is_nullable: col_def.is_nullable,
-                ordinal: ordinal as i32,
+                ordinal: col_def.ordinal,
                 description: col_def.description.clone(),
             })
             .collect();
@@ -1984,14 +1984,13 @@ impl CatalogWriter {
         let columns: Vec<ColumnRecord> = req
             .columns
             .iter()
-            .enumerate()
-            .map(|(ordinal, col_def)| ColumnRecord {
+            .map(|col_def| ColumnRecord {
                 id: Uuid::now_v7().to_string(),
                 table_id: table_id.clone(),
                 name: col_def.name.clone(),
                 data_type: col_def.data_type.clone(),
                 is_nullable: col_def.is_nullable,
-                ordinal: ordinal as i32,
+                ordinal: col_def.ordinal,
                 description: col_def.description.clone(),
             })
             .collect();
@@ -2153,14 +2152,13 @@ impl CatalogWriter {
         let columns: Vec<ColumnRecord> = req
             .columns
             .iter()
-            .enumerate()
-            .map(|(ordinal, col_def)| ColumnRecord {
+            .map(|col_def| ColumnRecord {
                 id: Uuid::now_v7().to_string(),
                 table_id: table_id.clone(),
                 name: col_def.name.clone(),
                 data_type: col_def.data_type.clone(),
                 is_nullable: col_def.is_nullable,
-                ordinal: ordinal as i32,
+                ordinal: col_def.ordinal,
                 description: col_def.description.clone(),
             })
             .collect();
@@ -3782,12 +3780,14 @@ mod tests {
                             name: "id".to_string(),
                             data_type: "STRING".to_string(),
                             is_nullable: false,
+                            ordinal: 0,
                             description: Some("Primary key".to_string()),
                         },
                         ColumnDefinition {
                             name: "email".to_string(),
                             data_type: "STRING".to_string(),
                             is_nullable: true,
+                            ordinal: 1,
                             description: None,
                         },
                     ],

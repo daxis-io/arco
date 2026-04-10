@@ -790,10 +790,12 @@ pub(crate) async fn register_table_in_schema(
     let columns = req
         .columns
         .into_iter()
-        .map(|c| arco_catalog::ColumnDefinition {
+        .enumerate()
+        .map(|(ordinal, c)| arco_catalog::ColumnDefinition {
             name: c.name,
             data_type: c.data_type,
             is_nullable: c.nullable,
+            ordinal: ordinal as i32,
             description: c.description,
         })
         .collect();

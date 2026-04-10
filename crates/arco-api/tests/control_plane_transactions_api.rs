@@ -20,7 +20,7 @@ use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
 };
 use arco_flow::orchestration::compactor::MicroCompactor;
-use arco_proto::arco::catalog::v1::CatalogDdlOperation;
+use arco_proto::arco::catalog::v1::{CatalogDdlOperation, ColumnDefinition};
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CommitOrchestrationBatchRequest,
     CommitOrchestrationBatchResponse, CommitRootTransactionResponse, GetCatalogTransactionRequest,
@@ -34,7 +34,8 @@ mod support;
 use support::{
     TENANT, WORKSPACE, catalog_alter_table_request, catalog_create_catalog_request,
     catalog_create_namespace_request, catalog_create_schema_request, catalog_drop_table_request,
-    catalog_register_table_in_schema_request, catalog_register_table_request,
+    catalog_register_table_in_schema_request,
+    catalog_register_table_in_schema_request_with_columns, catalog_register_table_request,
     catalog_rename_table_request, load_catalog_tx_record, load_idempotency_record,
     load_orchestration_tx_record, load_root_tx_record, orchestration_request,
     orchestration_request_with_event_id, post_error_json, post_protobuf, root_request,
@@ -535,6 +536,80 @@ async fn apply_catalog_ddl_creates_catalogs_and_renames_tables_via_transaction_l
 
     let rename_record = load_catalog_tx_record(backend, &rename_receipt.tx_id).await?;
     assert_eq!(rename_record.status, ControlPlaneTxStatus::Visible);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn apply_catalog_ddl_preserves_proto_column_ordinals_via_transaction_layer() -> Result<()> {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let router = test_router_with_backend(backend.clone());
+
+    let create_namespace = catalog_create_namespace_request(
+        "idem-cat-ordinal-ns-01",
+        "req-cat-ordinal-ns-01",
+        "ordinals",
+    );
+    let (_status, create_namespace_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router.clone(),
+        "/api/v1/transactions/applyCatalogDdl",
+        &create_namespace,
+        "idem-cat-ordinal-ns-01",
+        "req-cat-ordinal-ns-01",
+    )
+    .await?;
+    assert!(
+        create_namespace_response.receipt.is_some(),
+        "namespace receipt missing"
+    );
+
+    let register = catalog_register_table_in_schema_request_with_columns(
+        "idem-cat-ordinal-reg-01",
+        "req-cat-ordinal-reg-01",
+        "default",
+        "ordinals",
+        "events",
+        vec![
+            ColumnDefinition {
+                name: "event_ts".to_string(),
+                data_type: "TIMESTAMP".to_string(),
+                is_nullable: false,
+                ordinal: 10,
+                description: Some("event time".to_string()),
+            },
+            ColumnDefinition {
+                name: "event_id".to_string(),
+                data_type: "STRING".to_string(),
+                is_nullable: false,
+                ordinal: 5,
+                description: Some("event identifier".to_string()),
+            },
+        ],
+    );
+    let (_status, register_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router,
+        "/api/v1/transactions/applyCatalogDdl",
+        &register,
+        "idem-cat-ordinal-reg-01",
+        "req-cat-ordinal-reg-01",
+    )
+    .await?;
+    assert!(
+        register_response.receipt.is_some(),
+        "register table receipt missing"
+    );
+
+    let reader = CatalogReader::new(scoped_storage(backend));
+    let table = reader
+        .get_table_in_schema("default", "ordinals", "events")
+        .await?
+        .context("registered table missing from reader")?;
+    let columns = reader.get_columns(&table.id).await?;
+    let ordinals = columns
+        .iter()
+        .map(|column| (column.name.as_str(), column.ordinal))
+        .collect::<Vec<_>>();
+    assert_eq!(ordinals, vec![("event_id", 5), ("event_ts", 10)]);
 
     Ok(())
 }

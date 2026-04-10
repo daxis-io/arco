@@ -14,9 +14,10 @@ use arco_catalog::manifest::{CatalogDomainManifest, DomainManifestPointer};
 use arco_catalog::parquet_util::{
     NamespaceRecord, TableRecord, write_catalogs, write_columns, write_namespaces, write_tables,
 };
+use arco_catalog::writer::CatalogTransactionCommit;
 use arco_catalog::{
-    CatalogReader, CatalogWriter, ColumnDefinition, RegisterTableRequest, Tier1Compactor,
-    Tier1Writer, WriteOptions,
+    CatalogReader, CatalogWriter, ColumnDefinition, RegisterTableInSchemaRequest,
+    RegisterTableRequest, TablePatch, Tier1Compactor, Tier1Writer, WriteOptions,
 };
 use arco_core::control_plane_transactions::{
     ControlPlaneTxDomain, ControlPlaneTxKind, ControlPlaneTxPaths, ControlPlaneTxStatus,
@@ -49,8 +50,33 @@ fn test_column(name: &str) -> ColumnDefinition {
         name: name.to_string(),
         data_type: "STRING".to_string(),
         is_nullable: false,
+        ordinal: 0,
         description: None,
     }
+}
+
+async fn assert_visible_commit(storage: &ScopedStorage, commit: &CatalogTransactionCommit) {
+    let (pointer, manifest, pointer_version) = current_catalog_pointer(storage).await;
+    assert!(
+        !commit.event_id.is_empty(),
+        "transaction helper must return a ledger event identifier"
+    );
+    assert_eq!(commit.manifest_id, pointer.manifest_id);
+    assert_eq!(commit.snapshot_version, manifest.snapshot_version);
+    assert_eq!(commit.pointer_version, pointer_version);
+    assert_eq!(
+        manifest.last_commit_id.as_deref(),
+        Some(commit.commit_id.as_str()),
+        "receipt commit id must match the visible immutable manifest head"
+    );
+    assert_eq!(
+        commit.lock_path,
+        CatalogPaths::domain_lock(CatalogDomain::Catalog)
+    );
+    assert!(
+        commit.fencing_token > 0,
+        "transaction helper must report the held fencing token"
+    );
 }
 
 async fn current_catalog_pointer(
@@ -538,6 +564,334 @@ async fn default_catalog_rename_transaction_bridges_legacy_null_catalog_namespac
         .expect("lookup renamed table")
         .expect("renamed table exists");
     assert_eq!(renamed.name, "new_name");
+}
+
+#[tokio::test]
+async fn default_catalog_transaction_helpers_publish_visible_round_trip_state() {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = scoped_storage(backend);
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+
+    let schema_commit = writer
+        .create_schema_transaction(
+            "default",
+            "analytics",
+            Some("default schema"),
+            WriteOptions::default(),
+        )
+        .await
+        .expect("create default schema transaction");
+    assert_visible_commit(&storage, &schema_commit).await;
+
+    let reader = CatalogReader::new(storage.clone());
+    let default_catalog = reader
+        .get_catalog("default")
+        .await
+        .expect("get default catalog")
+        .expect("default catalog exists");
+    let namespace = reader
+        .get_namespace("analytics")
+        .await
+        .expect("get default namespace")
+        .expect("default namespace exists");
+    assert_eq!(
+        namespace.catalog_id.as_deref(),
+        Some(default_catalog.id.as_str())
+    );
+
+    let register_commit = writer
+        .register_table_in_schema_transaction(
+            "default",
+            "analytics",
+            RegisterTableInSchemaRequest {
+                name: "events".to_string(),
+                description: Some("event log".to_string()),
+                location: None,
+                format: Some("iceberg".to_string()),
+                columns: vec![test_column("event_id")],
+            },
+            WriteOptions::default(),
+        )
+        .await
+        .expect("register default table transaction");
+    assert_visible_commit(&storage, &register_commit).await;
+
+    let table = reader
+        .get_table("analytics", "events")
+        .await
+        .expect("get default table")
+        .expect("default table exists");
+    assert_eq!(table.description.as_deref(), Some("event log"));
+    assert_eq!(
+        reader
+            .get_table_in_schema("default", "analytics", "events")
+            .await
+            .expect("get table through uc-like reader")
+            .map(|table| table.id),
+        Some(table.id.clone())
+    );
+    let columns = reader
+        .get_columns(&table.id)
+        .await
+        .expect("get default table columns");
+    assert_eq!(columns.len(), 1);
+    assert_eq!(columns[0].name, "event_id");
+
+    let update_commit = writer
+        .update_table_in_schema_transaction(
+            "default",
+            "analytics",
+            "events",
+            TablePatch {
+                description: Some(Some("patched default table".to_string())),
+                ..TablePatch::default()
+            },
+            WriteOptions::default(),
+        )
+        .await
+        .expect("update default table transaction");
+    assert_visible_commit(&storage, &update_commit).await;
+
+    let updated = reader
+        .get_table("analytics", "events")
+        .await
+        .expect("get updated default table")
+        .expect("updated default table exists");
+    assert_eq!(
+        updated.description.as_deref(),
+        Some("patched default table")
+    );
+
+    let rename_commit = writer
+        .rename_table_in_schema_transaction(
+            "default",
+            "analytics",
+            "events",
+            "events_v2",
+            WriteOptions::default(),
+        )
+        .await
+        .expect("rename default table transaction");
+    assert_visible_commit(&storage, &rename_commit).await;
+
+    assert!(
+        reader
+            .get_table("analytics", "events")
+            .await
+            .expect("lookup old default table")
+            .is_none()
+    );
+    let renamed = reader
+        .get_table("analytics", "events_v2")
+        .await
+        .expect("lookup renamed default table")
+        .expect("renamed default table exists");
+    assert_eq!(renamed.name, "events_v2");
+
+    let drop_commit = writer
+        .drop_table_in_schema_transaction(
+            "default",
+            "analytics",
+            "events_v2",
+            WriteOptions::default(),
+        )
+        .await
+        .expect("drop default table transaction");
+    assert_visible_commit(&storage, &drop_commit).await;
+    assert!(
+        reader
+            .get_table("analytics", "events_v2")
+            .await
+            .expect("lookup dropped default table")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn named_catalog_transaction_helpers_round_trip_and_preserve_catalog_scope() {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = scoped_storage(backend);
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+
+    let default_schema_commit = writer
+        .create_schema_transaction("default", "analytics", None, WriteOptions::default())
+        .await
+        .expect("create default analytics schema");
+    assert_visible_commit(&storage, &default_schema_commit).await;
+
+    let default_register_commit = writer
+        .register_table_in_schema_transaction(
+            "default",
+            "analytics",
+            RegisterTableInSchemaRequest {
+                name: "events".to_string(),
+                description: Some("default events".to_string()),
+                location: None,
+                format: Some("iceberg".to_string()),
+                columns: vec![test_column("event_id")],
+            },
+            WriteOptions::default(),
+        )
+        .await
+        .expect("register default analytics table");
+    assert_visible_commit(&storage, &default_register_commit).await;
+
+    let catalog_commit = writer
+        .create_catalog_transaction("warehouse", Some("named catalog"), WriteOptions::default())
+        .await
+        .expect("create named catalog transaction");
+    assert_visible_commit(&storage, &catalog_commit).await;
+
+    let schema_commit = writer
+        .create_schema_transaction(
+            "warehouse",
+            "analytics",
+            Some("warehouse analytics schema"),
+            WriteOptions::default(),
+        )
+        .await
+        .expect("create named catalog schema transaction");
+    assert_visible_commit(&storage, &schema_commit).await;
+
+    let register_commit = writer
+        .register_table_in_schema_transaction(
+            "warehouse",
+            "analytics",
+            RegisterTableInSchemaRequest {
+                name: "events".to_string(),
+                description: Some("warehouse events".to_string()),
+                location: None,
+                format: Some("iceberg".to_string()),
+                columns: vec![test_column("warehouse_event_id")],
+            },
+            WriteOptions::default(),
+        )
+        .await
+        .expect("register named catalog table transaction");
+    assert_visible_commit(&storage, &register_commit).await;
+
+    let reader = CatalogReader::new(storage.clone());
+    let warehouse_catalog = reader
+        .get_catalog("warehouse")
+        .await
+        .expect("get warehouse catalog")
+        .expect("warehouse catalog exists");
+    let warehouse_schema = reader
+        .list_schemas("warehouse")
+        .await
+        .expect("list warehouse schemas")
+        .into_iter()
+        .find(|namespace| namespace.name == "analytics")
+        .expect("warehouse analytics schema exists");
+    assert_eq!(
+        warehouse_schema.catalog_id.as_deref(),
+        Some(warehouse_catalog.id.as_str())
+    );
+
+    let default_table = reader
+        .get_table_in_schema("default", "analytics", "events")
+        .await
+        .expect("get default scoped table")
+        .expect("default scoped table exists");
+    let warehouse_table = reader
+        .get_table_in_schema("warehouse", "analytics", "events")
+        .await
+        .expect("get warehouse scoped table")
+        .expect("warehouse scoped table exists");
+    assert_ne!(default_table.id, warehouse_table.id);
+    assert_eq!(default_table.description.as_deref(), Some("default events"));
+    assert_eq!(
+        warehouse_table.description.as_deref(),
+        Some("warehouse events")
+    );
+
+    let update_commit = writer
+        .update_table_in_schema_transaction(
+            "warehouse",
+            "analytics",
+            "events",
+            TablePatch {
+                description: Some(Some("warehouse events patched".to_string())),
+                ..TablePatch::default()
+            },
+            WriteOptions::default(),
+        )
+        .await
+        .expect("update named catalog table transaction");
+    assert_visible_commit(&storage, &update_commit).await;
+    assert_eq!(
+        reader
+            .get_table_in_schema("warehouse", "analytics", "events")
+            .await
+            .expect("get patched warehouse table")
+            .expect("patched warehouse table exists")
+            .description
+            .as_deref(),
+        Some("warehouse events patched")
+    );
+    assert_eq!(
+        reader
+            .get_table_in_schema("default", "analytics", "events")
+            .await
+            .expect("re-read default scoped table")
+            .expect("default scoped table still exists")
+            .description
+            .as_deref(),
+        Some("default events")
+    );
+
+    let rename_commit = writer
+        .rename_table_in_schema_transaction(
+            "warehouse",
+            "analytics",
+            "events",
+            "events_curated",
+            WriteOptions::default(),
+        )
+        .await
+        .expect("rename named catalog table transaction");
+    assert_visible_commit(&storage, &rename_commit).await;
+    assert!(
+        reader
+            .get_table_in_schema("warehouse", "analytics", "events")
+            .await
+            .expect("lookup old warehouse table")
+            .is_none()
+    );
+    assert!(
+        reader
+            .get_table_in_schema("default", "analytics", "events")
+            .await
+            .expect("lookup default table after warehouse rename")
+            .is_some()
+    );
+
+    let drop_commit = writer
+        .drop_table_in_schema_transaction(
+            "warehouse",
+            "analytics",
+            "events_curated",
+            WriteOptions::default(),
+        )
+        .await
+        .expect("drop named catalog table transaction");
+    assert_visible_commit(&storage, &drop_commit).await;
+    assert!(
+        reader
+            .get_table_in_schema("warehouse", "analytics", "events_curated")
+            .await
+            .expect("lookup dropped warehouse table")
+            .is_none()
+    );
+    assert!(
+        reader
+            .get_table_in_schema("default", "analytics", "events")
+            .await
+            .expect("default table after warehouse drop")
+            .is_some()
+    );
 }
 
 #[tokio::test]

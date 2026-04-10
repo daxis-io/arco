@@ -560,11 +560,13 @@ impl CatalogReader {
         let bytes = self.storage.get_raw(&columns_path).await?;
         let records = parquet_util::read_columns(&bytes)?;
 
-        Ok(records
+        let mut columns = records
             .into_iter()
             .filter(|column| column.table_id == table_id)
             .map(Column::from)
-            .collect())
+            .collect::<Vec<_>>();
+        columns.sort_by_key(|column| column.ordinal);
+        Ok(columns)
     }
     // ========================================================================
     // Catalog Operations (UC-like model)
@@ -1255,6 +1257,7 @@ mod tests {
             name: name.to_string(),
             data_type: "STRING".to_string(),
             is_nullable: true,
+            ordinal: 0,
             description: None,
         }
     }

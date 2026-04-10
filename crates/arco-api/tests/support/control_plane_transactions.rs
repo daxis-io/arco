@@ -190,6 +190,30 @@ pub fn catalog_register_table_in_schema_request(
     schema_name: &str,
     table_name: &str,
 ) -> ApplyCatalogDdlRequest {
+    catalog_register_table_in_schema_request_with_columns(
+        idempotency_key,
+        request_id,
+        catalog_name,
+        schema_name,
+        table_name,
+        vec![ColumnDefinition {
+            name: "id".to_string(),
+            data_type: "STRING".to_string(),
+            is_nullable: false,
+            ordinal: 0,
+            description: None,
+        }],
+    )
+}
+
+pub fn catalog_register_table_in_schema_request_with_columns(
+    idempotency_key: &str,
+    request_id: &str,
+    catalog_name: &str,
+    schema_name: &str,
+    table_name: &str,
+    columns: Vec<ColumnDefinition>,
+) -> ApplyCatalogDdlRequest {
     let _ = idempotency_key;
     let _ = request_id;
     ApplyCatalogDdlRequest {
@@ -201,13 +225,7 @@ pub fn catalog_register_table_in_schema_request(
                 description: Some("control-plane transaction table".to_string()),
                 location: None,
                 format: TableFormat::Unspecified as i32,
-                columns: vec![ColumnDefinition {
-                    name: "id".to_string(),
-                    data_type: "STRING".to_string(),
-                    is_nullable: false,
-                    ordinal: 0,
-                    description: None,
-                }],
+                columns,
             })),
         }),
     }

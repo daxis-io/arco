@@ -1350,6 +1350,7 @@ impl CatalogMutation {
                         name: column.name.clone(),
                         data_type: column.data_type.clone(),
                         is_nullable: column.is_nullable,
+                        ordinal: column.ordinal,
                         description: column.description.clone(),
                     })
                     .collect(),
@@ -1439,6 +1440,7 @@ impl CatalogMutation {
                     "name": column.name,
                     "data_type": column.data_type,
                     "is_nullable": column.is_nullable,
+                    "ordinal": column.ordinal,
                     "description": column.description,
                 })).collect::<Vec<_>>(),
             }),

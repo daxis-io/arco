@@ -186,6 +186,10 @@ pub enum OrchestrationEventContractError {
     EmptySource,
     EmptyIdempotencyKey,
     MissingEventKind,
+    MissingTriggerInfo(&'static str),
+    MissingTriggerKind(&'static str),
+    MissingTriggerField(&'static str, &'static str),
+    UnsupportedTriggerKind(&'static str, &'static str),
 }
 
 impl std::fmt::Display for OrchestrationEventContractError {
@@ -196,6 +200,21 @@ impl std::fmt::Display for OrchestrationEventContractError {
             Self::EmptySource => f.write_str("source is required"),
             Self::EmptyIdempotencyKey => f.write_str("idempotency_key is required"),
             Self::MissingEventKind => f.write_str("event payload is required"),
+            Self::MissingTriggerInfo(event_name) => {
+                write!(f, "{event_name} trigger is required")
+            }
+            Self::MissingTriggerKind(event_name) => {
+                write!(f, "{event_name} trigger.kind is required")
+            }
+            Self::MissingTriggerField(event_name, field_name) => {
+                write!(f, "{event_name} trigger field {field_name} is required")
+            }
+            Self::UnsupportedTriggerKind(event_name, trigger_kind) => {
+                write!(
+                    f,
+                    "{event_name} trigger kind {trigger_kind} is not supported"
+                )
+            }
         }
     }
 }
@@ -368,7 +387,102 @@ impl OrchestrationEventEnvelope {
             return Err(OrchestrationEventContractError::MissingEventKind);
         }
 
+        match self.event.as_ref().expect("checked above") {
+            orchestration_event_envelope::Event::RunRequested(event) => {
+                validate_run_requested_trigger(event)?
+            }
+            orchestration_event_envelope::Event::RunTriggered(event) => {
+                validate_run_triggered_trigger(event)?
+            }
+            _ => {}
+        }
+
         Ok(())
+    }
+}
+
+fn required_trigger<'a>(
+    event_name: &'static str,
+    trigger: &'a Option<TriggerInfo>,
+) -> Result<&'a trigger_info::Trigger, OrchestrationEventContractError> {
+    let trigger_info =
+        trigger
+            .as_ref()
+            .ok_or(OrchestrationEventContractError::MissingTriggerInfo(
+                event_name,
+            ))?;
+    trigger_info
+        .trigger
+        .as_ref()
+        .ok_or(OrchestrationEventContractError::MissingTriggerKind(
+            event_name,
+        ))
+}
+
+fn validate_run_requested_trigger(
+    event: &RunRequested,
+) -> Result<(), OrchestrationEventContractError> {
+    match required_trigger("run_requested", &event.trigger)? {
+        trigger_info::Trigger::Manual(manual) => {
+            if manual.request_id.is_none() {
+                return Err(OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "manual.request_id",
+                ));
+            }
+            Ok(())
+        }
+        trigger_info::Trigger::Schedule(schedule) => {
+            if schedule.tick_id.is_none() {
+                return Err(OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "schedule.tick_id",
+                ));
+            }
+            Ok(())
+        }
+        trigger_info::Trigger::Sensor(sensor) => {
+            if sensor.eval_id.is_none() {
+                return Err(OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "sensor.eval_id",
+                ));
+            }
+            Ok(())
+        }
+        trigger_info::Trigger::Backfill(backfill) => {
+            if backfill.chunk_id.is_none() {
+                return Err(OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "backfill.chunk_id",
+                ));
+            }
+            Ok(())
+        }
+        trigger_info::Trigger::Materialization(_) => {
+            Err(OrchestrationEventContractError::UnsupportedTriggerKind(
+                "run_requested",
+                "materialization",
+            ))
+        }
+        trigger_info::Trigger::Webhook(_) => Err(
+            OrchestrationEventContractError::UnsupportedTriggerKind("run_requested", "webhook"),
+        ),
+    }
+}
+
+fn validate_run_triggered_trigger(
+    event: &RunTriggered,
+) -> Result<(), OrchestrationEventContractError> {
+    match required_trigger("run_triggered", &event.trigger)? {
+        trigger_info::Trigger::Backfill(_) => Err(
+            OrchestrationEventContractError::UnsupportedTriggerKind("run_triggered", "backfill"),
+        ),
+        trigger_info::Trigger::Manual(_)
+        | trigger_info::Trigger::Schedule(_)
+        | trigger_info::Trigger::Materialization(_)
+        | trigger_info::Trigger::Webhook(_)
+        | trigger_info::Trigger::Sensor(_) => Ok(()),
     }
 }
 

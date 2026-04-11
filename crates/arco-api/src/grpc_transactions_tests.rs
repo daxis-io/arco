@@ -8,9 +8,9 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::Code;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint, Server};
+use tonic::Code;
 
 use super::service;
 use crate::server::AppState;
@@ -20,20 +20,20 @@ use arco_core::control_plane_transactions::ControlPlaneTxPaths;
 use arco_core::storage::{MemoryBackend, StorageBackend};
 use arco_core::{ControlPlaneTxDomain, ScopedStorage};
 use arco_proto::arco::catalog::v1::{
-    CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp, RegisterTableOp,
-    RenameTableOp, catalog_ddl_operation,
+    catalog_ddl_operation, CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp,
+    RegisterTableOp, RenameTableOp,
 };
 use arco_proto::arco::common::v1::TableFormat;
 use arco_proto::arco::controlplane::v1::{
-    ApplyCatalogDdlRequest, CommitOrchestrationBatchRequest, CommitRootTransactionRequest,
-    DomainMutation, GetCatalogTransactionRequest, GetOrchestrationTransactionRequest,
-    GetRootTransactionRequest, OrchestrationBatchSpec, TransactionStatus,
     control_plane_transaction_service_client::ControlPlaneTransactionServiceClient,
-    domain_mutation,
+    domain_mutation, ApplyCatalogDdlRequest, CommitOrchestrationBatchRequest,
+    CommitRootTransactionRequest, DomainMutation, GetCatalogTransactionRequest,
+    GetOrchestrationTransactionRequest, GetRootTransactionRequest, OrchestrationBatchSpec,
+    TransactionStatus,
 };
 use arco_proto::arco::orchestration::v1::{
-    ManualTrigger, OrchestrationEventEnvelope, RunTriggered, TriggerInfo,
-    orchestration_event_envelope, trigger_info,
+    orchestration_event_envelope, trigger_info, ManualTrigger, OrchestrationEventEnvelope,
+    RunTriggered, TriggerInfo,
 };
 
 const TENANT: &str = "test-tenant";
@@ -177,7 +177,7 @@ fn orchestration_request(
 fn root_request(
     idempotency_key: &str,
     request_id: &str,
-    namespace: &str,
+    schema_name: &str,
     run_id: &str,
 ) -> CommitRootTransactionRequest {
     CommitRootTransactionRequest {
@@ -186,8 +186,8 @@ fn root_request(
                 kind: Some(domain_mutation::Kind::Catalog(CatalogDdlOperation {
                     op: Some(catalog_ddl_operation::Op::CreateSchema(CreateSchemaOp {
                         catalog_name: "default".to_string(),
-                        schema_name: namespace.to_string(),
-                        description: Some("grpc root transaction test".to_string()),
+                        schema_name: schema_name.to_string(),
+                        description: Some("grpc root transaction schema".to_string()),
                     })),
                 })),
             },
@@ -284,6 +284,28 @@ fn attach_transport_metadata<T>(
     request
 }
 
+fn attach_lookup_metadata<T>(
+    request: T,
+    tenant: &str,
+    workspace: &str,
+    request_id: &str,
+) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(request);
+    request.metadata_mut().insert(
+        "x-tenant-id",
+        MetadataValue::try_from(tenant).expect("tenant metadata"),
+    );
+    request.metadata_mut().insert(
+        "x-workspace-id",
+        MetadataValue::try_from(workspace).expect("workspace metadata"),
+    );
+    request.metadata_mut().insert(
+        "x-request-id",
+        MetadataValue::try_from(request_id).expect("request-id metadata"),
+    );
+    request
+}
+
 fn attach_transport_auth_metadata<T>(
     request: T,
     idempotency_key: &str,
@@ -368,11 +390,10 @@ async fn grpc_apply_catalog_ddl_and_lookup_round_trip() -> Result<()> {
         tx_id: receipt.tx_id.clone(),
     };
     let lookup = client
-        .get_catalog_transaction(attach_transport_metadata(
+        .get_catalog_transaction(attach_lookup_metadata(
             lookup,
             TENANT,
             WORKSPACE,
-            "idem-grpc-cat-lookup-01",
             "req-grpc-cat-lookup-01",
         ))
         .await?
@@ -446,18 +467,14 @@ async fn grpc_apply_catalog_ddl_supports_create_catalog_and_rename_table() -> Re
 
     let reader = CatalogReader::new(scoped_storage(backend));
     assert!(reader.get_catalog("governed").await?.is_some());
-    assert!(
-        reader
-            .get_table_in_schema("governed", "bronze", "events")
-            .await?
-            .is_none()
-    );
-    assert!(
-        reader
-            .get_table_in_schema("governed", "bronze", "events_curated")
-            .await?
-            .is_some()
-    );
+    assert!(reader
+        .get_table_in_schema("governed", "bronze", "events")
+        .await?
+        .is_none());
+    assert!(reader
+        .get_table_in_schema("governed", "bronze", "events_curated")
+        .await?
+        .is_some());
 
     handle.abort();
     Ok(())
@@ -489,11 +506,10 @@ async fn grpc_commit_orchestration_batch_and_lookup_round_trip() -> Result<()> {
         tx_id: receipt.tx_id,
     };
     let lookup = client
-        .get_orchestration_transaction(attach_transport_metadata(
+        .get_orchestration_transaction(attach_lookup_metadata(
             lookup,
             TENANT,
             WORKSPACE,
-            "idem-grpc-orch-lookup-01",
             "req-grpc-orch-lookup-01",
         ))
         .await?
@@ -534,11 +550,10 @@ async fn grpc_commit_root_transaction_and_lookup_round_trip() -> Result<()> {
         tx_id: receipt.tx_id,
     };
     let lookup = client
-        .get_root_transaction(attach_transport_metadata(
+        .get_root_transaction(attach_lookup_metadata(
             lookup,
             TENANT,
             WORKSPACE,
-            "idem-grpc-root-lookup-01",
             "req-grpc-root-lookup-01",
         ))
         .await?

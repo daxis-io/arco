@@ -3,13 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use base64::Engine as _;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use prost::Message;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Serialize;
-use serde::de::DeserializeOwned;
 use ulid::Ulid;
 
 use arco_catalog::idempotency::canonical_request_hash;
@@ -18,7 +16,6 @@ use arco_catalog::writer::CatalogTransactionCommit;
 use arco_catalog::{
     CatalogWriter, ColumnDefinition, RegisterTableInSchemaRequest, TablePatch, Tier1Compactor,
 };
-use arco_core::ScopedStorage;
 use arco_core::catalog_paths::{CatalogDomain, CatalogPaths};
 use arco_core::control_plane_transactions::{
     CatalogTxReceipt, CatalogTxRecord, ControlPlaneIdempotencyRecord, ControlPlaneTxDomain,
@@ -26,9 +23,10 @@ use arco_core::control_plane_transactions::{
     DomainCommit, OrchestrationTxReceipt, OrchestrationTxRecord, RootTxManifest,
     RootTxManifestDomain, RootTxReceipt, RootTxRecord,
 };
-use arco_core::lock::{DEFAULT_LOCK_TTL, DistributedLock};
+use arco_core::lock::{DistributedLock, DEFAULT_LOCK_TTL};
 use arco_core::partition::{PartitionKey as CorePartitionKey, ScalarValue as CoreScalarValue};
 use arco_core::storage::WritePrecondition;
+use arco_core::ScopedStorage;
 use arco_flow::orchestration::events::{
     BackfillState, OrchestrationEvent, OrchestrationEventData, PartitionSelector, RunRequest,
     SensorEvalStatus, SourceRef, TaskDef as RuntimeTaskDef, TaskOutcome as RuntimeTaskOutcome,
@@ -37,25 +35,26 @@ use arco_flow::orchestration::events::{
 };
 use arco_flow::orchestration_compaction_lock_path;
 use arco_proto::arco::catalog::v1::{
-    CatalogDdlOperation, CreateCatalogOp, CreateSchemaOp, DropTableOp, RegisterTableOp,
-    RenameTableOp, UpdateTableOp, catalog_ddl_operation,
+    catalog_ddl_operation, CatalogDdlOperation, CreateCatalogOp, CreateSchemaOp, DropTableOp,
+    RegisterTableOp, RenameTableOp, UpdateTableOp,
 };
 use arco_proto::arco::common::v1::{
-    PartitionKey as ProtoPartitionKey, ScalarValue as ProtoScalarValue,
-    TableFormat as ProtoTableFormat, scalar_value,
+    scalar_value, PartitionKey as ProtoPartitionKey, ScalarValue as ProtoScalarValue,
+    TableFormat as ProtoTableFormat,
 };
 use arco_proto::arco::controlplane::v1::{
-    ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CatalogTxReceipt as ProtoCatalogTxReceipt,
-    CatalogTxStatus, CommitOrchestrationBatchRequest, CommitOrchestrationBatchResponse,
-    CommitRootTransactionRequest, CommitRootTransactionResponse, DomainCommit as ProtoDomainCommit,
-    DomainMutation, GetCatalogTransactionRequest, GetCatalogTransactionResponse,
-    GetOrchestrationTransactionRequest, GetOrchestrationTransactionResponse,
-    GetRootTransactionRequest, GetRootTransactionResponse, OrchestrationBatchSpec,
-    OrchestrationTxReceipt as ProtoOrchestrationTxReceipt, OrchestrationTxStatus,
-    RootTxParticipant, RootTxReceipt as ProtoRootTxReceipt, RootTxStatus, TransactionDomain,
-    TransactionStatus, domain_mutation,
+    domain_mutation, ApplyCatalogDdlRequest, ApplyCatalogDdlResponse,
+    CatalogTxReceipt as ProtoCatalogTxReceipt, CatalogTxStatus, CommitOrchestrationBatchRequest,
+    CommitOrchestrationBatchResponse, CommitRootTransactionRequest, CommitRootTransactionResponse,
+    DomainCommit as ProtoDomainCommit, DomainMutation, GetCatalogTransactionRequest,
+    GetCatalogTransactionResponse, GetOrchestrationTransactionRequest,
+    GetOrchestrationTransactionResponse, GetRootTransactionRequest, GetRootTransactionResponse,
+    OrchestrationBatchSpec, OrchestrationTxReceipt as ProtoOrchestrationTxReceipt,
+    OrchestrationTxStatus, RootTxParticipant, RootTxReceipt as ProtoRootTxReceipt, RootTxStatus,
+    TransactionDomain, TransactionStatus,
 };
 use arco_proto::arco::orchestration::v1::{
+    orchestration_event_envelope, partition_selector, trigger_info, trigger_source,
     BackfillState as ProtoBackfillState, OrchestrationEventEnvelope,
     PartitionSelector as ProtoPartitionSelector, RunRequest as ProtoRunRequest,
     RunTriggered as ProtoRunTriggered, SensorEvalStatus as ProtoSensorEvalStatus,
@@ -63,8 +62,7 @@ use arco_proto::arco::orchestration::v1::{
     TaskError as ProtoTaskError, TaskErrorCategory as ProtoTaskErrorCategory,
     TaskMetrics as ProtoTaskMetrics, TaskOutcome as ProtoTaskOutcome,
     TickStatus as ProtoTickStatus, TimerType as ProtoTimerType, TriggerInfo as ProtoTriggerInfo,
-    TriggerSource as ProtoTriggerSource, orchestration_event_envelope, partition_selector,
-    trigger_info, trigger_source,
+    TriggerSource as ProtoTriggerSource,
 };
 
 use crate::context::RequestContext;
@@ -204,7 +202,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             }
         }
 
-        let request_hash = root_request_hash(&mutations)?;
+        let request_hash = root_request_hash(&mutations, &meta)?;
         let claim = self
             .claim_idempotency(
                 ControlPlaneTxDomain::Root,
@@ -561,8 +559,8 @@ impl<'a> ControlPlaneTransactionService<'a> {
         meta: &ResolvedRequestMetadata,
         batch: OrchestrationBatchMutation,
     ) -> Result<TxExecutionOutcome<OrchestrationTxReceipt>, ApiError> {
-        let request_hash = batch.request_hash()?;
         let events = batch.events(meta)?;
+        let request_hash = batch.request_hash_for_events(&events)?;
         let claim = self
             .claim_idempotency(
                 ControlPlaneTxDomain::Orchestration,
@@ -1250,16 +1248,29 @@ impl OrchestrationBatchMutation {
         })
     }
 
-    fn request_hash_value(&self) -> serde_json::Value {
-        serde_json::json!({
-            "events": self.events.iter().map(orchestration_event_hash_value).collect::<Vec<_>>(),
+    fn request_hash_value(
+        &self,
+        meta: &ResolvedRequestMetadata,
+    ) -> Result<serde_json::Value, ApiError> {
+        let events = self.events(meta)?;
+        Self::request_hash_value_for_events(&events)
+    }
+
+    fn request_hash_for_events(&self, events: &[OrchestrationEvent]) -> Result<String, ApiError> {
+        prefixed_request_hash(&Self::request_hash_value_for_events(events)?).map_err(|error| {
+            ApiError::bad_request(format!("failed to hash orchestration request: {error}"))
         })
     }
 
-    fn request_hash(&self) -> Result<String, ApiError> {
-        prefixed_request_hash(&self.request_hash_value()).map_err(|error| {
-            ApiError::bad_request(format!("failed to hash orchestration request: {error}"))
-        })
+    fn request_hash_value_for_events(
+        events: &[OrchestrationEvent],
+    ) -> Result<serde_json::Value, ApiError> {
+        let events = serde_json::to_value(events).map_err(|error| {
+            ApiError::internal(format!(
+                "failed to serialize orchestration events for hashing: {error}"
+            ))
+        })?;
+        Ok(serde_json::json!({ "events": events }))
     }
 
     fn events(&self, meta: &ResolvedRequestMetadata) -> Result<Vec<OrchestrationEvent>, ApiError> {
@@ -1296,7 +1307,10 @@ impl RootMutation {
         }
     }
 
-    fn request_hash_value(&self) -> Result<serde_json::Value, ApiError> {
+    fn request_hash_value(
+        &self,
+        meta: &ResolvedRequestMetadata,
+    ) -> Result<serde_json::Value, ApiError> {
         match self {
             Self::Catalog(mutation) => Ok(serde_json::json!({
                 "domain": "catalog",
@@ -1304,7 +1318,7 @@ impl RootMutation {
             })),
             Self::Orchestration(batch) => Ok(serde_json::json!({
                 "domain": "orchestration",
-                "request": batch.request_hash_value(),
+                "request": batch.request_hash_value(meta)?,
             })),
         }
     }
@@ -1542,20 +1556,14 @@ impl CatalogMutation {
                 schema_name,
                 description,
             } => {
-                if catalog_name == "default" {
-                    writer
-                        .create_namespace_transaction(schema_name, description.as_deref(), options)
-                        .await
-                } else {
-                    writer
-                        .create_schema_transaction(
-                            catalog_name,
-                            schema_name,
-                            description.as_deref(),
-                            options,
-                        )
-                        .await
-                }
+                writer
+                    .create_schema_transaction(
+                        catalog_name,
+                        schema_name,
+                        description.as_deref(),
+                        options,
+                    )
+                    .await
             }
             Self::RegisterTable {
                 catalog_name,
@@ -1694,43 +1702,14 @@ fn parse_table_format(value: i32) -> Result<Option<String>, ApiError> {
     Ok(table_format_string(format))
 }
 
-fn orchestration_event_hash_value(event: &OrchestrationEventEnvelope) -> serde_json::Value {
-    serde_json::json!({
-        "event_kind": event.event.as_ref().map(orchestration_event_kind_name),
-        "wire_payload": base64::engine::general_purpose::STANDARD.encode(event.encode_to_vec()),
-    })
-}
-
-fn orchestration_event_kind_name(event: &orchestration_event_envelope::Event) -> &'static str {
-    match event {
-        orchestration_event_envelope::Event::RunTriggered(_) => "RunTriggered",
-        orchestration_event_envelope::Event::PlanCreated(_) => "PlanCreated",
-        orchestration_event_envelope::Event::RunCancelRequested(_) => "RunCancelRequested",
-        orchestration_event_envelope::Event::TaskStarted(_) => "TaskStarted",
-        orchestration_event_envelope::Event::TaskHeartbeat(_) => "TaskHeartbeat",
-        orchestration_event_envelope::Event::TaskFinished(_) => "TaskFinished",
-        orchestration_event_envelope::Event::DispatchRequested(_) => "DispatchRequested",
-        orchestration_event_envelope::Event::TimerRequested(_) => "TimerRequested",
-        orchestration_event_envelope::Event::DispatchEnqueued(_) => "DispatchEnqueued",
-        orchestration_event_envelope::Event::TimerEnqueued(_) => "TimerEnqueued",
-        orchestration_event_envelope::Event::TimerFired(_) => "TimerFired",
-        orchestration_event_envelope::Event::ScheduleDefinitionUpserted(_) => {
-            "ScheduleDefinitionUpserted"
-        }
-        orchestration_event_envelope::Event::ScheduleTicked(_) => "ScheduleTicked",
-        orchestration_event_envelope::Event::SensorEvaluated(_) => "SensorEvaluated",
-        orchestration_event_envelope::Event::RunRequested(_) => "RunRequested",
-        orchestration_event_envelope::Event::BackfillCreated(_) => "BackfillCreated",
-        orchestration_event_envelope::Event::BackfillChunkPlanned(_) => "BackfillChunkPlanned",
-        orchestration_event_envelope::Event::BackfillStateChanged(_) => "BackfillStateChanged",
-    }
-}
-
-fn root_request_hash(mutations: &[RootMutation]) -> Result<String, ApiError> {
+fn root_request_hash(
+    mutations: &[RootMutation],
+    meta: &ResolvedRequestMetadata,
+) -> Result<String, ApiError> {
     let value = serde_json::json!({
         "mutations": mutations
             .iter()
-            .map(RootMutation::request_hash_value)
+            .map(|mutation| mutation.request_hash_value(meta))
             .collect::<Result<Vec<_>, _>>()?,
     });
     prefixed_request_hash(&value)

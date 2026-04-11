@@ -7,13 +7,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode, header};
+use axum::http::{header, Method, Request, StatusCode};
 use bytes::Bytes;
 use prost::Message;
 use tower::ServiceExt;
 
 use arco_api::server::{Server, ServerBuilder};
-use arco_core::ScopedStorage;
 use arco_core::control_plane_transactions::{
     CatalogTxRecord, ControlPlaneIdempotencyRecord, ControlPlaneTxDomain, ControlPlaneTxPaths,
     OrchestrationTxRecord, RootTxRecord,
@@ -21,18 +20,19 @@ use arco_core::control_plane_transactions::{
 use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
 };
+use arco_core::ScopedStorage;
 use arco_proto::arco::catalog::v1::{
-    CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp, DropTableOp,
-    RegisterTableOp, RenameTableOp, UpdateTableOp, catalog_ddl_operation,
+    catalog_ddl_operation, CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp,
+    DropTableOp, RegisterTableOp, RenameTableOp, UpdateTableOp,
 };
 use arco_proto::arco::common::v1::TableFormat;
 use arco_proto::arco::controlplane::v1::{
-    ApplyCatalogDdlRequest, CommitOrchestrationBatchRequest, CommitRootTransactionRequest,
-    DomainMutation, OrchestrationBatchSpec, domain_mutation,
+    domain_mutation, ApplyCatalogDdlRequest, CommitOrchestrationBatchRequest,
+    CommitRootTransactionRequest, DomainMutation, OrchestrationBatchSpec,
 };
 use arco_proto::arco::orchestration::v1::{
-    ManualTrigger, OrchestrationEventEnvelope, RunTriggered, TriggerInfo,
-    orchestration_event_envelope, trigger_info,
+    orchestration_event_envelope, trigger_info, ManualTrigger, OrchestrationEventEnvelope,
+    RunTriggered, TriggerInfo,
 };
 
 pub const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";
@@ -61,14 +61,34 @@ pub fn protobuf_request<T: Message>(
     idempotency_key: &str,
     request_id: &str,
 ) -> Result<Request<Body>> {
-    Request::builder()
+    protobuf_request_with_transport_idempotency(path, message, Some(idempotency_key), request_id)
+}
+
+pub fn protobuf_request_without_idempotency<T: Message>(
+    path: &str,
+    message: &T,
+    request_id: &str,
+) -> Result<Request<Body>> {
+    protobuf_request_with_transport_idempotency(path, message, None, request_id)
+}
+
+fn protobuf_request_with_transport_idempotency<T: Message>(
+    path: &str,
+    message: &T,
+    idempotency_key: Option<&str>,
+    request_id: &str,
+) -> Result<Request<Body>> {
+    let mut builder = Request::builder()
         .method(Method::POST)
         .uri(path)
         .header("X-Tenant-Id", TENANT)
         .header("X-Workspace-Id", WORKSPACE)
-        .header("Idempotency-Key", idempotency_key)
         .header("X-Request-Id", request_id)
-        .header(header::CONTENT_TYPE, CONTENT_TYPE_PROTOBUF)
+        .header(header::CONTENT_TYPE, CONTENT_TYPE_PROTOBUF);
+    if let Some(idempotency_key) = idempotency_key {
+        builder = builder.header("Idempotency-Key", idempotency_key);
+    }
+    builder
         .body(Body::from(message.encode_to_vec()))
         .context("build protobuf request")
 }
@@ -85,6 +105,30 @@ where
     TResp: Message + Default,
 {
     let request = protobuf_request(path, message, idempotency_key, request_id)?;
+    decode_protobuf_response(router, request).await
+}
+
+pub async fn post_protobuf_without_idempotency<TReq, TResp>(
+    router: axum::Router,
+    path: &str,
+    message: &TReq,
+    request_id: &str,
+) -> Result<(StatusCode, TResp)>
+where
+    TReq: Message,
+    TResp: Message + Default,
+{
+    let request = protobuf_request_without_idempotency(path, message, request_id)?;
+    decode_protobuf_response(router, request).await
+}
+
+async fn decode_protobuf_response<TResp>(
+    router: axum::Router,
+    request: Request<Body>,
+) -> Result<(StatusCode, TResp)>
+where
+    TResp: Message + Default,
+{
     let response = router.oneshot(request).await.map_err(|err| match err {})?;
     let status = response.status();
     let content_type = response
@@ -124,12 +168,12 @@ pub async fn post_error_json<TReq: Message>(
     Ok((status, json))
 }
 
-pub fn catalog_create_namespace_request(
+pub fn catalog_create_default_schema_request(
     idempotency_key: &str,
     request_id: &str,
-    name: &str,
+    schema_name: &str,
 ) -> ApplyCatalogDdlRequest {
-    catalog_create_schema_request(idempotency_key, request_id, "default", name)
+    catalog_create_schema_request(idempotency_key, request_id, "default", schema_name)
 }
 
 pub fn catalog_create_catalog_request(
@@ -171,15 +215,15 @@ pub fn catalog_create_schema_request(
 pub fn catalog_register_table_request(
     idempotency_key: &str,
     request_id: &str,
-    namespace: &str,
-    name: &str,
+    schema_name: &str,
+    table_name: &str,
 ) -> ApplyCatalogDdlRequest {
     catalog_register_table_in_schema_request(
         idempotency_key,
         request_id,
         "default",
-        namespace,
-        name,
+        schema_name,
+        table_name,
     )
 }
 
@@ -231,11 +275,11 @@ pub fn catalog_register_table_in_schema_request_with_columns(
     }
 }
 
-pub fn catalog_alter_table_request(
+pub fn catalog_update_table_request(
     idempotency_key: &str,
     request_id: &str,
-    namespace: &str,
-    name: &str,
+    schema_name: &str,
+    table_name: &str,
     description: Option<&str>,
 ) -> ApplyCatalogDdlRequest {
     let _ = idempotency_key;
@@ -244,8 +288,8 @@ pub fn catalog_alter_table_request(
         ddl: Some(CatalogDdlOperation {
             op: Some(catalog_ddl_operation::Op::UpdateTable(UpdateTableOp {
                 catalog_name: "default".to_string(),
-                schema_name: namespace.to_string(),
-                table_name: name.to_string(),
+                schema_name: schema_name.to_string(),
+                table_name: table_name.to_string(),
                 description: description.map(str::to_string),
                 location: None,
                 format: None,
@@ -257,8 +301,8 @@ pub fn catalog_alter_table_request(
 pub fn catalog_drop_table_request(
     idempotency_key: &str,
     request_id: &str,
-    namespace: &str,
-    name: &str,
+    schema_name: &str,
+    table_name: &str,
 ) -> ApplyCatalogDdlRequest {
     let _ = idempotency_key;
     let _ = request_id;
@@ -266,8 +310,8 @@ pub fn catalog_drop_table_request(
         ddl: Some(CatalogDdlOperation {
             op: Some(catalog_ddl_operation::Op::DropTable(DropTableOp {
                 catalog_name: "default".to_string(),
-                schema_name: namespace.to_string(),
-                table_name: name.to_string(),
+                schema_name: schema_name.to_string(),
+                table_name: table_name.to_string(),
             })),
         }),
     }
@@ -350,7 +394,7 @@ pub fn orchestration_request_with_event_id(
 pub fn root_request(
     idempotency_key: &str,
     request_id: &str,
-    namespace: &str,
+    schema_name: &str,
     run_id: &str,
 ) -> CommitRootTransactionRequest {
     let _ = idempotency_key;
@@ -360,8 +404,8 @@ pub fn root_request(
                 kind: Some(domain_mutation::Kind::Catalog(CatalogDdlOperation {
                     op: Some(catalog_ddl_operation::Op::CreateSchema(CreateSchemaOp {
                         catalog_name: "default".to_string(),
-                        schema_name: namespace.to_string(),
-                        description: Some("root transaction namespace".to_string()),
+                        schema_name: schema_name.to_string(),
+                        description: Some("root transaction schema".to_string()),
                     })),
                 })),
             },

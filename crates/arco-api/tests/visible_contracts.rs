@@ -9,29 +9,29 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::http::StatusCode;
 
-use arco_core::ControlPlaneTxDomain;
 use arco_core::catalog_paths::{CatalogDomain, CatalogPaths};
 use arco_core::control_plane_transactions::ControlPlaneTxStatus;
 use arco_core::storage::StorageBackend;
+use arco_core::ControlPlaneTxDomain;
 use arco_flow::orchestration_manifest_pointer_path;
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlResponse, CommitOrchestrationBatchResponse,
 };
 use support::{
-    FailPrefixOnNoneBackend, FailReadsAfterTriggerPutBackend, TENANT, WORKSPACE,
-    catalog_create_namespace_request, load_catalog_tx_record, load_idempotency_record,
+    catalog_create_default_schema_request, load_catalog_tx_record, load_idempotency_record,
     load_orchestration_tx_record, orchestration_request, post_error_json, post_protobuf,
-    test_router_with_backend,
+    test_router_with_backend, FailPrefixOnNoneBackend, FailReadsAfterTriggerPutBackend, TENANT,
+    WORKSPACE,
 };
 
 #[tokio::test]
-async fn apply_catalog_ddl_replays_from_cached_visible_record_after_finalize_write_failure()
--> Result<()> {
+async fn apply_catalog_ddl_replays_from_cached_visible_record_after_finalize_write_failure(
+) -> Result<()> {
     let fail_prefix = format!("tenant={TENANT}/workspace={WORKSPACE}/transactions/catalog/");
     let backend: Arc<dyn StorageBackend> = Arc::new(FailPrefixOnNoneBackend::new(fail_prefix, 1));
     let router = test_router_with_backend(backend.clone());
 
-    let first = catalog_create_namespace_request(
+    let first = catalog_create_default_schema_request(
         "idem-cat-finalize-cache-01",
         "req-cat-finalize-cache-01",
         "cached-visible",
@@ -55,7 +55,7 @@ async fn apply_catalog_ddl_replays_from_cached_visible_record_after_finalize_wri
     assert!(idem.visible_at.is_some());
     assert!(idem.tx_record.is_some());
 
-    let replay = catalog_create_namespace_request(
+    let replay = catalog_create_default_schema_request(
         "idem-cat-finalize-cache-01",
         "req-cat-finalize-cache-02",
         "cached-visible",
@@ -99,7 +99,7 @@ async fn apply_catalog_ddl_keeps_visible_success_when_pointer_readback_fails() -
     ));
     let router = test_router_with_backend(backend.clone());
 
-    let first = catalog_create_namespace_request(
+    let first = catalog_create_default_schema_request(
         "idem-cat-visible-boundary-01",
         "req-cat-visible-boundary-01",
         "visible-boundary",
@@ -123,7 +123,7 @@ async fn apply_catalog_ddl_keeps_visible_success_when_pointer_readback_fails() -
         Some(first_receipt.tx_id.as_str())
     );
 
-    let replay = catalog_create_namespace_request(
+    let replay = catalog_create_default_schema_request(
         "idem-cat-visible-boundary-01",
         "req-cat-visible-boundary-02",
         "visible-boundary",

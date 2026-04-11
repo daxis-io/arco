@@ -10,7 +10,6 @@ use axum::http::StatusCode;
 use bytes::Bytes;
 
 use arco_catalog::CatalogReader;
-use arco_core::ControlPlaneTxDomain;
 use arco_core::catalog_event::CatalogEvent;
 use arco_core::catalog_paths::{CatalogDomain, CatalogPaths};
 use arco_core::control_plane_transactions::{
@@ -19,27 +18,29 @@ use arco_core::control_plane_transactions::{
 use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
 };
+use arco_core::ControlPlaneTxDomain;
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_proto::arco::catalog::v1::{CatalogDdlOperation, ColumnDefinition};
 use arco_proto::arco::controlplane::v1::{
-    ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CommitOrchestrationBatchRequest,
-    CommitOrchestrationBatchResponse, CommitRootTransactionResponse, GetCatalogTransactionRequest,
-    GetCatalogTransactionResponse, GetOrchestrationTransactionRequest,
-    GetOrchestrationTransactionResponse, GetRootTransactionRequest, GetRootTransactionResponse,
-    TransactionDomain, TransactionStatus, domain_mutation,
+    domain_mutation, ApplyCatalogDdlRequest, ApplyCatalogDdlResponse,
+    CommitOrchestrationBatchRequest, CommitOrchestrationBatchResponse,
+    CommitRootTransactionResponse, GetCatalogTransactionRequest, GetCatalogTransactionResponse,
+    GetOrchestrationTransactionRequest, GetOrchestrationTransactionResponse,
+    GetRootTransactionRequest, GetRootTransactionResponse, TransactionDomain, TransactionStatus,
 };
 #[path = "support/control_plane_transactions.rs"]
 mod support;
 
 use support::{
-    TENANT, WORKSPACE, catalog_alter_table_request, catalog_create_catalog_request,
-    catalog_create_namespace_request, catalog_create_schema_request, catalog_drop_table_request,
+    catalog_create_catalog_request, catalog_create_default_schema_request,
+    catalog_create_schema_request, catalog_drop_table_request,
     catalog_register_table_in_schema_request,
     catalog_register_table_in_schema_request_with_columns, catalog_register_table_request,
-    catalog_rename_table_request, load_catalog_tx_record, load_idempotency_record,
-    load_orchestration_tx_record, load_root_tx_record, orchestration_request,
-    orchestration_request_with_event_id, post_error_json, post_protobuf, root_request,
-    scoped_storage, test_router, test_router_with_backend, test_router_with_config_backend,
+    catalog_rename_table_request, catalog_update_table_request, load_catalog_tx_record,
+    load_idempotency_record, load_orchestration_tx_record, load_root_tx_record,
+    orchestration_request, orchestration_request_with_event_id, post_error_json, post_protobuf,
+    post_protobuf_without_idempotency, root_request, scoped_storage, test_router,
+    test_router_with_backend, test_router_with_config_backend, TENANT, WORKSPACE,
 };
 
 async fn load_root_super_manifest(
@@ -237,7 +238,7 @@ impl StorageBackend for FailRootSuperManifestBackend {
 async fn apply_catalog_ddl_returns_visible_receipt_and_persists_lookup_record() -> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = test_router_with_backend(backend.clone());
-    let request = catalog_create_namespace_request("idem-cat-01", "req-cat-01", "analytics");
+    let request = catalog_create_default_schema_request("idem-cat-01", "req-cat-01", "analytics");
 
     let (_status, response): (_, ApplyCatalogDdlResponse) = post_protobuf(
         router.clone(),
@@ -263,14 +264,14 @@ async fn apply_catalog_ddl_returns_visible_receipt_and_persists_lookup_record() 
     let lookup = GetCatalogTransactionRequest {
         tx_id: receipt.tx_id.clone(),
     };
-    let (_status, lookup_response): (_, GetCatalogTransactionResponse) = post_protobuf(
-        router,
-        "/api/v1/transactions/getCatalogTransaction",
-        &lookup,
-        "idem-cat-lookup-01",
-        "req-cat-lookup-01",
-    )
-    .await?;
+    let (_status, lookup_response): (_, GetCatalogTransactionResponse) =
+        post_protobuf_without_idempotency(
+            router,
+            "/api/v1/transactions/getCatalogTransaction",
+            &lookup,
+            "req-cat-lookup-01",
+        )
+        .await?;
     let status = lookup_response.status.context("catalog status missing")?;
     assert_eq!(status.status, TransactionStatus::Visible as i32);
     assert!(status.request_hash.starts_with("sha256:"));
@@ -300,11 +301,11 @@ async fn apply_catalog_ddl_returns_visible_receipt_and_persists_lookup_record() 
 async fn apply_catalog_ddl_replays_same_idempotency_key_and_rejects_hash_conflicts() -> Result<()> {
     let router = test_router();
     let first =
-        catalog_create_namespace_request("idem-cat-replay-01", "req-cat-replay-01", "bronze");
+        catalog_create_default_schema_request("idem-cat-replay-01", "req-cat-replay-01", "bronze");
     let second =
-        catalog_create_namespace_request("idem-cat-replay-01", "req-cat-replay-02", "bronze");
+        catalog_create_default_schema_request("idem-cat-replay-01", "req-cat-replay-02", "bronze");
     let conflicting =
-        catalog_create_namespace_request("idem-cat-replay-01", "req-cat-replay-03", "silver");
+        catalog_create_default_schema_request("idem-cat-replay-01", "req-cat-replay-03", "silver");
 
     let (_status, first_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
         router.clone(),
@@ -348,23 +349,24 @@ async fn apply_catalog_ddl_replays_same_idempotency_key_and_rejects_hash_conflic
 }
 
 #[tokio::test]
-async fn apply_catalog_ddl_registers_alters_and_drops_tables_via_transaction_layer() -> Result<()> {
+async fn apply_catalog_ddl_registers_updates_and_drops_tables_via_transaction_layer() -> Result<()>
+{
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = test_router_with_backend(backend.clone());
 
-    let create_namespace =
-        catalog_create_namespace_request("idem-cat-table-ns-01", "req-cat-table-ns-01", "ops");
-    let (_status, create_namespace_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+    let create_schema =
+        catalog_create_default_schema_request("idem-cat-table-ns-01", "req-cat-table-ns-01", "ops");
+    let (_status, create_schema_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
         router.clone(),
         "/api/v1/transactions/applyCatalogDdl",
-        &create_namespace,
+        &create_schema,
         "idem-cat-table-ns-01",
         "req-cat-table-ns-01",
     )
     .await?;
     assert!(
-        create_namespace_response.receipt.is_some(),
-        "namespace receipt missing"
+        create_schema_response.receipt.is_some(),
+        "schema receipt missing"
     );
 
     let register = catalog_register_table_request(
@@ -387,26 +389,26 @@ async fn apply_catalog_ddl_registers_alters_and_drops_tables_via_transaction_lay
     let register_record = load_catalog_tx_record(backend.clone(), &register_receipt.tx_id).await?;
     assert_eq!(register_record.status, ControlPlaneTxStatus::Visible);
 
-    let alter = catalog_alter_table_request(
+    let update = catalog_update_table_request(
         "idem-cat-table-alt-01",
         "req-cat-table-alt-01",
         "ops",
         "events",
         Some("updated description"),
     );
-    let (_status, alter_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+    let (_status, update_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
         router.clone(),
         "/api/v1/transactions/applyCatalogDdl",
-        &alter,
+        &update,
         "idem-cat-table-alt-01",
         "req-cat-table-alt-01",
     )
     .await?;
-    let alter_receipt = alter_response
+    let update_receipt = update_response
         .receipt
-        .context("alter table receipt missing")?;
-    let alter_record = load_catalog_tx_record(backend.clone(), &alter_receipt.tx_id).await?;
-    assert_eq!(alter_record.status, ControlPlaneTxStatus::Visible);
+        .context("update table receipt missing")?;
+    let update_record = load_catalog_tx_record(backend.clone(), &update_receipt.tx_id).await?;
+    assert_eq!(update_record.status, ControlPlaneTxStatus::Visible);
 
     let drop = catalog_drop_table_request(
         "idem-cat-table-drop-01",
@@ -545,22 +547,22 @@ async fn apply_catalog_ddl_preserves_proto_column_ordinals_via_transaction_layer
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = test_router_with_backend(backend.clone());
 
-    let create_namespace = catalog_create_namespace_request(
+    let create_schema = catalog_create_default_schema_request(
         "idem-cat-ordinal-ns-01",
         "req-cat-ordinal-ns-01",
         "ordinals",
     );
-    let (_status, create_namespace_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+    let (_status, create_schema_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
         router.clone(),
         "/api/v1/transactions/applyCatalogDdl",
-        &create_namespace,
+        &create_schema,
         "idem-cat-ordinal-ns-01",
         "req-cat-ordinal-ns-01",
     )
     .await?;
     assert!(
-        create_namespace_response.receipt.is_some(),
-        "namespace receipt missing"
+        create_schema_response.receipt.is_some(),
+        "schema receipt missing"
     );
 
     let register = catalog_register_table_in_schema_request_with_columns(
@@ -615,8 +617,8 @@ async fn apply_catalog_ddl_preserves_proto_column_ordinals_via_transaction_layer
 }
 
 #[tokio::test]
-async fn commit_orchestration_batch_returns_visible_receipt_and_persists_lookup_record()
--> Result<()> {
+async fn commit_orchestration_batch_returns_visible_receipt_and_persists_lookup_record(
+) -> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = test_router_with_backend(backend.clone());
     let request = orchestration_request("idem-orch-01", "req-orch-01", "run-orch-01");
@@ -647,14 +649,14 @@ async fn commit_orchestration_batch_returns_visible_receipt_and_persists_lookup_
     let lookup = GetOrchestrationTransactionRequest {
         tx_id: receipt.tx_id.clone(),
     };
-    let (_status, lookup_response): (_, GetOrchestrationTransactionResponse) = post_protobuf(
-        router,
-        "/api/v1/transactions/getOrchestrationTransaction",
-        &lookup,
-        "idem-orch-lookup-01",
-        "req-orch-lookup-01",
-    )
-    .await?;
+    let (_status, lookup_response): (_, GetOrchestrationTransactionResponse) =
+        post_protobuf_without_idempotency(
+            router,
+            "/api/v1/transactions/getOrchestrationTransaction",
+            &lookup,
+            "req-orch-lookup-01",
+        )
+        .await?;
     let status = lookup_response
         .status
         .context("orchestration status missing")?;
@@ -690,8 +692,8 @@ async fn commit_orchestration_batch_returns_visible_receipt_and_persists_lookup_
 }
 
 #[tokio::test]
-async fn commit_orchestration_batch_replays_same_idempotency_key_and_rejects_hash_conflicts()
--> Result<()> {
+async fn commit_orchestration_batch_replays_same_idempotency_key_and_rejects_hash_conflicts(
+) -> Result<()> {
     let router = test_router();
     let first = orchestration_request("idem-orch-replay-01", "req-orch-replay-01", "run-replay-01");
     let second =
@@ -739,6 +741,43 @@ async fn commit_orchestration_batch_replays_same_idempotency_key_and_rejects_has
     .await?;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(error["code"], "CONFLICT");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_orchestration_batch_replays_semantically_equivalent_typed_events() -> Result<()> {
+    let router = test_router();
+    let first = orchestration_request("idem-orch-typed-01", "req-orch-typed-01", "run-typed-01");
+    let mut replay =
+        orchestration_request("idem-orch-typed-01", "req-orch-typed-02", "run-typed-01");
+    replay.events[0].correlation_id = None;
+
+    let (_status, first_response): (_, CommitOrchestrationBatchResponse) = post_protobuf(
+        router.clone(),
+        "/api/v1/transactions/commitOrchestrationBatch",
+        &first,
+        "idem-orch-typed-01",
+        "req-orch-typed-01",
+    )
+    .await?;
+    let (_status, replay_response): (_, CommitOrchestrationBatchResponse) = post_protobuf(
+        router,
+        "/api/v1/transactions/commitOrchestrationBatch",
+        &replay,
+        "idem-orch-typed-01",
+        "req-orch-typed-02",
+    )
+    .await?;
+
+    let first_receipt = first_response
+        .receipt
+        .context("first typed orchestration receipt missing")?;
+    let replay_receipt = replay_response
+        .receipt
+        .context("replay typed orchestration receipt missing")?;
+    assert_eq!(first_receipt.tx_id, replay_receipt.tx_id);
+    assert_eq!(first_receipt.commit_id, replay_receipt.commit_id);
 
     Ok(())
 }
@@ -814,14 +853,14 @@ async fn commit_root_transaction_returns_visible_receipt_and_persists_lookup_rec
     let lookup = GetRootTransactionRequest {
         tx_id: receipt.tx_id.clone(),
     };
-    let (_status, lookup_response): (_, GetRootTransactionResponse) = post_protobuf(
-        router,
-        "/api/v1/transactions/getRootTransaction",
-        &lookup,
-        "idem-root-lookup-01",
-        "req-root-lookup-01",
-    )
-    .await?;
+    let (_status, lookup_response): (_, GetRootTransactionResponse) =
+        post_protobuf_without_idempotency(
+            router,
+            "/api/v1/transactions/getRootTransaction",
+            &lookup,
+            "req-root-lookup-01",
+        )
+        .await?;
 
     let status = lookup_response.status.context("root status missing")?;
     assert_eq!(status.status, TransactionStatus::Visible as i32);
@@ -883,8 +922,8 @@ async fn commit_root_transaction_returns_visible_receipt_and_persists_lookup_rec
 }
 
 #[tokio::test]
-async fn commit_root_transaction_replays_same_idempotency_key_and_keeps_audit_receipt_stable()
--> Result<()> {
+async fn commit_root_transaction_replays_same_idempotency_key_and_keeps_audit_receipt_stable(
+) -> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = test_router_with_backend(backend.clone());
     let first = root_request(
@@ -963,6 +1002,62 @@ async fn commit_root_transaction_replays_same_idempotency_key_and_keeps_audit_re
 }
 
 #[tokio::test]
+async fn commit_root_transaction_replays_semantically_equivalent_typed_orchestration_participants(
+) -> Result<()> {
+    let router = test_router();
+    let first = root_request(
+        "idem-root-typed-01",
+        "req-root-typed-01",
+        "typed-root",
+        "run-root-typed-01",
+    );
+    let mut replay = root_request(
+        "idem-root-typed-01",
+        "req-root-typed-02",
+        "typed-root",
+        "run-root-typed-01",
+    );
+    let orchestration = replay
+        .mutations
+        .get_mut(1)
+        .and_then(|mutation| mutation.kind.as_mut())
+        .and_then(|kind| match kind {
+            domain_mutation::Kind::Orchestration(spec) => Some(spec),
+            _ => None,
+        })
+        .context("root request orchestration mutation missing")?;
+    orchestration.events[0].correlation_id = None;
+
+    let (_status, first_response): (_, CommitRootTransactionResponse) = post_protobuf(
+        router.clone(),
+        "/api/v1/transactions/commitRootTransaction",
+        &first,
+        "idem-root-typed-01",
+        "req-root-typed-01",
+    )
+    .await?;
+    let (_status, replay_response): (_, CommitRootTransactionResponse) = post_protobuf(
+        router,
+        "/api/v1/transactions/commitRootTransaction",
+        &replay,
+        "idem-root-typed-01",
+        "req-root-typed-02",
+    )
+    .await?;
+
+    let first_receipt = first_response
+        .receipt
+        .context("first typed root receipt missing")?;
+    let replay_receipt = replay_response
+        .receipt
+        .context("replay typed root receipt missing")?;
+    assert_eq!(first_receipt.tx_id, replay_receipt.tx_id);
+    assert_eq!(first_receipt.root_commit_id, replay_receipt.root_commit_id);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn commit_root_transaction_exposes_pinned_catalog_and_orchestration_reads() -> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = test_router_with_backend(backend.clone());
@@ -1005,7 +1100,7 @@ async fn commit_root_transaction_exposes_pinned_catalog_and_orchestration_reads(
         .await?;
     assert!(pinned_state.runs.contains_key("run-root-read-01"));
 
-    let current_catalog = catalog_create_namespace_request(
+    let current_catalog = catalog_create_default_schema_request(
         "idem-root-read-cat-current-01",
         "req-root-read-cat-current-01",
         "current-only-catalog",
@@ -1074,23 +1169,19 @@ async fn commit_root_transaction_exposes_pinned_catalog_and_orchestration_reads(
     let (_pinned_manifest_after_current, pinned_state_after_current) = compactor
         .load_state_for_root_token(&receipt.read_token)
         .await?;
-    assert!(
-        pinned_state_after_current
-            .runs
-            .contains_key("run-root-read-01")
-    );
-    assert!(
-        !pinned_state_after_current
-            .runs
-            .contains_key("run-current-read-01")
-    );
+    assert!(pinned_state_after_current
+        .runs
+        .contains_key("run-root-read-01"));
+    assert!(!pinned_state_after_current
+        .runs
+        .contains_key("run-current-read-01"));
 
     Ok(())
 }
 
 #[tokio::test]
-async fn commit_root_transaction_propagates_repair_pending_when_root_commit_receipt_write_fails()
--> Result<()> {
+async fn commit_root_transaction_propagates_repair_pending_when_root_commit_receipt_write_fails(
+) -> Result<()> {
     let fail_prefix = format!("tenant={TENANT}/workspace={WORKSPACE}/commits/root/");
     let backend: Arc<dyn StorageBackend> = Arc::new(FailPrefixBackend::new(fail_prefix, 1));
     let router = test_router_with_backend(backend.clone());
@@ -1126,8 +1217,8 @@ async fn commit_root_transaction_propagates_repair_pending_when_root_commit_rece
 }
 
 #[tokio::test]
-async fn commit_root_transaction_retries_with_fresh_tx_id_after_super_manifest_failure()
--> Result<()> {
+async fn commit_root_transaction_retries_with_fresh_tx_id_after_super_manifest_failure(
+) -> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(FailRootSuperManifestBackend::new(1));
     let router = test_router_with_backend(backend.clone());
     let first = root_request(
@@ -1251,7 +1342,7 @@ async fn apply_catalog_ddl_retries_same_key_after_missing_tx_record_is_stale() -
     config.idempotency_stale_timeout_secs = 0;
     let router = test_router_with_config_backend(config, backend.clone());
 
-    let first = catalog_create_namespace_request(
+    let first = catalog_create_default_schema_request(
         "idem-cat-stale-missing-01",
         "req-cat-stale-missing-01",
         "stale-missing",
@@ -1266,7 +1357,7 @@ async fn apply_catalog_ddl_retries_same_key_after_missing_tx_record_is_stale() -
     .await?;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 
-    let second = catalog_create_namespace_request(
+    let second = catalog_create_default_schema_request(
         "idem-cat-stale-missing-01",
         "req-cat-stale-missing-02",
         "stale-missing",
@@ -1395,7 +1486,7 @@ async fn apply_catalog_ddl_propagates_actor_to_catalog_ledger_events() -> Result
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = test_router_with_backend(backend.clone());
     let request =
-        catalog_create_namespace_request("idem-cat-actor-01", "req-cat-actor-01", "actor");
+        catalog_create_default_schema_request("idem-cat-actor-01", "req-cat-actor-01", "actor");
 
     let (_status, response): (_, ApplyCatalogDdlResponse) = post_protobuf(
         router,
@@ -1417,8 +1508,11 @@ async fn apply_catalog_ddl_propagates_actor_to_catalog_ledger_events() -> Result
 async fn apply_catalog_ddl_does_not_create_legacy_catalog_manifest_mirror() -> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = test_router_with_backend(backend.clone());
-    let request =
-        catalog_create_namespace_request("idem-cat-repair-01", "req-cat-repair-01", "repairing");
+    let request = catalog_create_default_schema_request(
+        "idem-cat-repair-01",
+        "req-cat-repair-01",
+        "repairing",
+    );
 
     let (_status, response): (_, ApplyCatalogDdlResponse) = post_protobuf(
         router,
@@ -1453,8 +1547,8 @@ async fn apply_catalog_ddl_does_not_create_legacy_catalog_manifest_mirror() -> R
 }
 
 #[tokio::test]
-async fn commit_orchestration_batch_does_not_create_legacy_orchestration_manifest_mirror()
--> Result<()> {
+async fn commit_orchestration_batch_does_not_create_legacy_orchestration_manifest_mirror(
+) -> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = test_router_with_backend(backend.clone());
     let request =

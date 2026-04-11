@@ -45,6 +45,7 @@ check_regex() {
 
 check_literal "${WORKFLOW_PATH}" "RELEASE_TAG: \${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}" "Workflow resolves RELEASE_TAG from dispatch input or pushed tag ref"
 check_literal "${WORKFLOW_PATH}" "ref: \${{ env.RELEASE_TAG }}" "Workflow checks out exact release tag ref"
+check_literal "${WORKFLOW_PATH}" "sudo apt-get install -y ripgrep" "Workflow installs ripgrep so tagged snapshot scripts remain runnable"
 check_literal "${WORKFLOW_PATH}" "name: Wait for release-tag CI success" "Workflow waits for successful tag CI before publishing SBOM"
 check_literal "${WORKFLOW_PATH}" "actions/workflows/ci.yml/runs?event=push&per_page=100" "Workflow queries CI workflow runs by commit SHA"
 check_literal "${WORKFLOW_PATH}" "actions/runs/\${run_id}/jobs?per_page=100" "Workflow checks CI jobs for Release Tag Discipline result"

@@ -38,9 +38,13 @@ pub use backfill_events::{BackfillState, ChunkState, PartitionSelector};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashMap;
 use ulid::Ulid;
+
+use crate::orchestration::callbacks::{
+    TaskError as CallbackTaskError, TaskMetrics as CallbackTaskMetrics,
+    TaskOutput as CallbackTaskOutput,
+};
 
 /// Orchestration event envelope.
 ///
@@ -327,21 +331,21 @@ pub enum OrchestrationEventData {
         /// Error message if failed.
         #[serde(skip_serializing_if = "Option::is_none")]
         error_message: Option<String>,
-        /// Full output payload (serialized).
+        /// Worker callback output payload.
         #[serde(skip_serializing_if = "Option::is_none")]
-        output: Option<Value>,
-        /// Full error payload (serialized).
+        output: Option<CallbackTaskOutput>,
+        /// Worker callback error payload.
         #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<Value>,
-        /// Execution metrics payload (serialized).
+        error: Option<CallbackTaskError>,
+        /// Worker callback metrics payload.
         #[serde(skip_serializing_if = "Option::is_none")]
-        metrics: Option<Value>,
+        metrics: Option<CallbackTaskMetrics>,
         /// Phase when cancellation occurred (if CANCELLED).
         #[serde(skip_serializing_if = "Option::is_none")]
         cancelled_during_phase: Option<String>,
-        /// Partial progress payload for cancellation.
+        /// Partial progress payload for cancellation, serialized once at the callback boundary.
         #[serde(skip_serializing_if = "Option::is_none")]
-        partial_progress: Option<Value>,
+        partial_progress_json: Option<String>,
         /// Asset key if this task materialized an asset partition.
         #[serde(skip_serializing_if = "Option::is_none")]
         asset_key: Option<String>,
@@ -995,7 +999,7 @@ mod tests {
             error: None,
             metrics: None,
             cancelled_during_phase: None,
-            partial_progress: None,
+            partial_progress_json: None,
             asset_key: None,
             partition_key: None,
             code_version: None,

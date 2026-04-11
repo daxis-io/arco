@@ -363,6 +363,7 @@ name = "arco-flow"
 version = "0.1.0"
 dependencies = [
  "arco-core",
+ "arco-proto",
  "arrow 54.3.1",
  "async-trait",
  "axum 0.7.9",
@@ -384,6 +385,7 @@ dependencies = [
  "parquet 54.3.1",
  "petgraph 0.7.1",
  "proptest",
+ "prost-types 0.13.5",
  "reqwest",
  "serde",
  "serde_json",

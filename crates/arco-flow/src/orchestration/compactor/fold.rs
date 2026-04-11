@@ -16,9 +16,9 @@ use std::collections::{HashMap, VecDeque};
 
 use chrono::{DateTime, Utc};
 use metrics::counter;
-use serde_json::Value;
 
 use crate::metrics::{labels as metrics_labels, names as metrics_names};
+use crate::orchestration::callbacks::TaskOutput as CallbackTaskOutput;
 use crate::orchestration::events::{
     BackfillState, ChunkState, OrchestrationEvent, OrchestrationEventData, PartitionSelector,
     RunRequest, SensorEvalStatus, SensorStatus, SourceRef, TaskDef, TaskOutcome, TickStatus,
@@ -92,26 +92,6 @@ struct ExecutionMetadata {
     delta_table: Option<String>,
     delta_version: Option<i64>,
     delta_partition: Option<String>,
-}
-
-fn json_string_field(value: &Value, keys: &[&str]) -> Option<String> {
-    let obj = value.as_object()?;
-    keys.iter()
-        .find_map(|key| obj.get(*key))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-}
-
-fn json_i64_field(value: &Value, keys: &[&str]) -> Option<i64> {
-    let obj = value.as_object()?;
-    let raw = keys.iter().find_map(|key| obj.get(*key))?;
-    match raw {
-        Value::Number(num) => num
-            .as_i64()
-            .or_else(|| num.as_u64().and_then(|v| i64::try_from(v).ok())),
-        Value::String(text) => text.parse::<i64>().ok(),
-        _ => None,
-    }
 }
 
 /// Extracts an orchestration event ID from a ledger path.
@@ -1741,7 +1721,7 @@ impl FoldState {
         outcome: TaskOutcome,
         materialization_id: Option<&str>,
         error_message: Option<String>,
-        output: Option<&Value>,
+        output: Option<&CallbackTaskOutput>,
         asset_key: Option<&str>,
         partition_key: Option<&str>,
         code_version: Option<&str>,
@@ -2684,7 +2664,7 @@ impl FoldState {
 
     fn extract_execution_metadata(
         materialization_id: Option<&str>,
-        output: Option<&Value>,
+        output: Option<&CallbackTaskOutput>,
         partition_key: Option<&str>,
     ) -> ExecutionMetadata {
         let mut metadata = ExecutionMetadata {
@@ -2694,21 +2674,12 @@ impl FoldState {
 
         if let Some(output) = output {
             if metadata.materialization_id.is_none() {
-                metadata.materialization_id =
-                    json_string_field(output, &["materializationId", "materialization_id"]);
+                metadata.materialization_id = output.materialization_id.clone();
             }
 
-            metadata.delta_table = json_string_field(output, &["deltaTable", "delta_table"]);
-            metadata.delta_version = json_i64_field(output, &["deltaVersion", "delta_version"]);
-            metadata.delta_partition = json_string_field(
-                output,
-                &[
-                    "deltaPartition",
-                    "delta_partition",
-                    "partitionKey",
-                    "partition_key",
-                ],
-            );
+            metadata.delta_table = output.delta_table.clone();
+            metadata.delta_version = output.delta_version;
+            metadata.delta_partition = output.delta_partition.clone();
         }
 
         if metadata.delta_partition.is_none() {
@@ -3313,7 +3284,7 @@ mod tests {
             error: None,
             metrics: None,
             cancelled_during_phase: None,
-            partial_progress: None,
+            partial_progress_json: None,
             asset_key: asset_key.map(ToString::to_string),
             partition_key: partition_key.map(ToString::to_string),
             code_version: None,

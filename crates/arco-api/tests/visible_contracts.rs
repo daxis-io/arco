@@ -9,24 +9,24 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::http::StatusCode;
 
+use arco_core::ControlPlaneTxDomain;
 use arco_core::catalog_paths::{CatalogDomain, CatalogPaths};
 use arco_core::control_plane_transactions::ControlPlaneTxStatus;
 use arco_core::storage::StorageBackend;
-use arco_core::ControlPlaneTxDomain;
 use arco_flow::orchestration_manifest_pointer_path;
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlResponse, CommitOrchestrationBatchResponse,
 };
 use support::{
+    FailPrefixOnNoneBackend, FailReadsAfterTriggerPutBackend, TENANT, WORKSPACE,
     catalog_create_default_schema_request, load_catalog_tx_record, load_idempotency_record,
     load_orchestration_tx_record, orchestration_request, post_error_json, post_protobuf,
-    test_router_with_backend, FailPrefixOnNoneBackend, FailReadsAfterTriggerPutBackend, TENANT,
-    WORKSPACE,
+    test_router_with_backend,
 };
 
 #[tokio::test]
-async fn apply_catalog_ddl_replays_from_cached_visible_record_after_finalize_write_failure(
-) -> Result<()> {
+async fn apply_catalog_ddl_replays_from_cached_visible_record_after_finalize_write_failure()
+-> Result<()> {
     let fail_prefix = format!("tenant={TENANT}/workspace={WORKSPACE}/transactions/catalog/");
     let backend: Arc<dyn StorageBackend> = Arc::new(FailPrefixOnNoneBackend::new(fail_prefix, 1));
     let router = test_router_with_backend(backend.clone());

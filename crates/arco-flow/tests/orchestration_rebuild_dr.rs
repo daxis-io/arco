@@ -152,7 +152,7 @@ fn task_finished(event_id: &str, run_id: &str, attempt_id: &str) -> Orchestratio
             error: None,
             metrics: None,
             cancelled_during_phase: None,
-            partial_progress: None,
+            partial_progress_json: None,
             asset_key: None,
             partition_key: None,
             code_version: None,

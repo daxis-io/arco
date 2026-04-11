@@ -8,9 +8,9 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::Code;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, Endpoint, Server};
-use tonic::Code;
 
 use super::service;
 use crate::server::AppState;
@@ -20,20 +20,20 @@ use arco_core::control_plane_transactions::ControlPlaneTxPaths;
 use arco_core::storage::{MemoryBackend, StorageBackend};
 use arco_core::{ControlPlaneTxDomain, ScopedStorage};
 use arco_proto::arco::catalog::v1::{
-    catalog_ddl_operation, CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp,
-    RegisterTableOp, RenameTableOp,
+    CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp, RegisterTableOp,
+    RenameTableOp, catalog_ddl_operation,
 };
 use arco_proto::arco::common::v1::TableFormat;
 use arco_proto::arco::controlplane::v1::{
+    ApplyCatalogDdlRequest, CommitOrchestrationBatchRequest, CommitRootTransactionRequest,
+    DomainMutation, GetCatalogTransactionRequest, GetOrchestrationTransactionRequest,
+    GetRootTransactionRequest, OrchestrationBatchSpec, TransactionStatus,
     control_plane_transaction_service_client::ControlPlaneTransactionServiceClient,
-    domain_mutation, ApplyCatalogDdlRequest, CommitOrchestrationBatchRequest,
-    CommitRootTransactionRequest, DomainMutation, GetCatalogTransactionRequest,
-    GetOrchestrationTransactionRequest, GetRootTransactionRequest, OrchestrationBatchSpec,
-    TransactionStatus,
+    domain_mutation,
 };
 use arco_proto::arco::orchestration::v1::{
-    orchestration_event_envelope, trigger_info, ManualTrigger, OrchestrationEventEnvelope,
-    RunTriggered, TriggerInfo,
+    ManualTrigger, OrchestrationEventEnvelope, RunTriggered, TaskError, TaskErrorCategory,
+    TaskFinished, TaskOutcome, TriggerInfo, orchestration_event_envelope, trigger_info,
 };
 
 const TENANT: &str = "test-tenant";
@@ -168,6 +168,52 @@ fn orchestration_request(
                     run_key: Some(format!("manual:{run_id}")),
                     labels: Default::default(),
                     code_version: None,
+                },
+            )),
+        }],
+    }
+}
+
+fn orchestration_failure_request(
+    idempotency_key: &str,
+    request_id: &str,
+    run_id: &str,
+) -> CommitOrchestrationBatchRequest {
+    let _ = idempotency_key;
+    let _ = request_id;
+    CommitOrchestrationBatchRequest {
+        events: vec![OrchestrationEventEnvelope {
+            event_id: "01JTXORCH0000000000000000F1".to_string(),
+            event_version: 1,
+            timestamp: Some(prost_types::Timestamp {
+                seconds: 1_776_000_100,
+                nanos: 0,
+            }),
+            source: format!("arco-flow/{TENANT}/{WORKSPACE}"),
+            idempotency_key: format!("event:{run_id}:task-finished"),
+            correlation_id: Some(run_id.to_string()),
+            causation_id: None,
+            event: Some(orchestration_event_envelope::Event::TaskFinished(
+                TaskFinished {
+                    run_id: run_id.to_string(),
+                    task_key: "extract".to_string(),
+                    attempt: 1,
+                    attempt_id: "attempt-01".to_string(),
+                    worker_id: "arco_flow_automation_reconciler".to_string(),
+                    outcome: TaskOutcome::Failed as i32,
+                    callback_output: None,
+                    error: Some(TaskError {
+                        category: TaskErrorCategory::Unknown as i32,
+                        message: "heartbeat timed out".to_string(),
+                        detail: None,
+                        retryable: None,
+                    }),
+                    metrics: None,
+                    cancelled_during_phase: None,
+                    partial_progress_json: None,
+                    asset_key: Some("default.raw.events".to_string()),
+                    partition_key: None,
+                    code_version: Some("git:test".to_string()),
                 },
             )),
         }],
@@ -467,14 +513,18 @@ async fn grpc_apply_catalog_ddl_supports_create_catalog_and_rename_table() -> Re
 
     let reader = CatalogReader::new(scoped_storage(backend));
     assert!(reader.get_catalog("governed").await?.is_some());
-    assert!(reader
-        .get_table_in_schema("governed", "bronze", "events")
-        .await?
-        .is_none());
-    assert!(reader
-        .get_table_in_schema("governed", "bronze", "events_curated")
-        .await?
-        .is_some());
+    assert!(
+        reader
+            .get_table_in_schema("governed", "bronze", "events")
+            .await?
+            .is_none()
+    );
+    assert!(
+        reader
+            .get_table_in_schema("governed", "bronze", "events_curated")
+            .await?
+            .is_some()
+    );
 
     handle.abort();
     Ok(())
@@ -515,6 +565,51 @@ async fn grpc_commit_orchestration_batch_and_lookup_round_trip() -> Result<()> {
         .await?
         .into_inner();
     let status = lookup.status.context("grpc orchestration status missing")?;
+    assert_eq!(status.status, TransactionStatus::Visible as i32);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn grpc_commit_orchestration_batch_accepts_task_finished_failure_events() -> Result<()> {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let (mut client, handle) = spawn_grpc_client(backend).await?;
+    let request = orchestration_failure_request(
+        "idem-grpc-orch-failure-01",
+        "req-grpc-orch-failure-01",
+        "run-grpc-orch-failure-01",
+    );
+
+    let response = client
+        .commit_orchestration_batch(attach_transport_metadata(
+            request,
+            TENANT,
+            WORKSPACE,
+            "idem-grpc-orch-failure-01",
+            "req-grpc-orch-failure-01",
+        ))
+        .await?
+        .into_inner();
+    let receipt = response
+        .receipt
+        .context("grpc orchestration failure receipt missing")?;
+
+    let lookup = GetOrchestrationTransactionRequest {
+        tx_id: receipt.tx_id,
+    };
+    let lookup = client
+        .get_orchestration_transaction(attach_lookup_metadata(
+            lookup,
+            TENANT,
+            WORKSPACE,
+            "req-grpc-orch-failure-lookup-01",
+        ))
+        .await?
+        .into_inner();
+    let status = lookup
+        .status
+        .context("grpc orchestration failure status missing")?;
     assert_eq!(status.status, TransactionStatus::Visible as i32);
 
     handle.abort();

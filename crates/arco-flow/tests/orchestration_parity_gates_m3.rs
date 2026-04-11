@@ -4,9 +4,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{TimeZone, Utc};
-use serde_json::json;
-
+use arco_flow::orchestration::callbacks::TaskOutput as CallbackTaskOutput;
 use arco_flow::orchestration::compactor::FoldState;
 use arco_flow::orchestration::compactor::fold::PartitionStatusRow;
 use arco_flow::orchestration::controllers::partition_status::{
@@ -15,6 +13,7 @@ use arco_flow::orchestration::controllers::partition_status::{
 use arco_flow::orchestration::events::{
     OrchestrationEvent, OrchestrationEventData, SourceRef, TaskDef, TaskOutcome, TriggerInfo,
 };
+use chrono::{TimeZone, Utc};
 
 fn make_partition(
     asset_key: &str,
@@ -209,16 +208,19 @@ fn parity_m3_successful_materialization_links_execution_lineage_to_delta_version
             outcome: TaskOutcome::Succeeded,
             materialization_id: Some("mat_lineage_q3".to_string()),
             error_message: None,
-            output: Some(json!({
-                "materializationId": "mat_lineage_q3",
-                "deltaTable": "analytics.daily",
-                "deltaVersion": 42,
-                "deltaPartition": partition_key,
-            })),
+            output: Some(CallbackTaskOutput {
+                materialization_id: Some("mat_lineage_q3".to_string()),
+                row_count: None,
+                byte_size: None,
+                output_path: None,
+                delta_table: Some("analytics.daily".to_string()),
+                delta_version: Some(42),
+                delta_partition: Some(partition_key.to_string()),
+            }),
             error: None,
             metrics: None,
             cancelled_during_phase: None,
-            partial_progress: None,
+            partial_progress_json: None,
             asset_key: Some(task_key.to_string()),
             partition_key: Some(partition_key.to_string()),
             code_version: Some("code_v1".to_string()),

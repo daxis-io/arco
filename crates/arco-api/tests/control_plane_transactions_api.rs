@@ -10,6 +10,7 @@ use axum::http::StatusCode;
 use bytes::Bytes;
 
 use arco_catalog::CatalogReader;
+use arco_core::ControlPlaneTxDomain;
 use arco_core::catalog_event::CatalogEvent;
 use arco_core::catalog_paths::{CatalogDomain, CatalogPaths};
 use arco_core::control_plane_transactions::{
@@ -18,21 +19,21 @@ use arco_core::control_plane_transactions::{
 use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
 };
-use arco_core::ControlPlaneTxDomain;
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_proto::arco::catalog::v1::{CatalogDdlOperation, ColumnDefinition};
 use arco_proto::arco::controlplane::v1::{
-    domain_mutation, ApplyCatalogDdlRequest, ApplyCatalogDdlResponse,
-    CommitOrchestrationBatchRequest, CommitOrchestrationBatchResponse,
-    CommitRootTransactionResponse, GetCatalogTransactionRequest, GetCatalogTransactionResponse,
-    GetOrchestrationTransactionRequest, GetOrchestrationTransactionResponse,
-    GetRootTransactionRequest, GetRootTransactionResponse, TransactionDomain, TransactionStatus,
+    ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CommitOrchestrationBatchRequest,
+    CommitOrchestrationBatchResponse, CommitRootTransactionResponse, GetCatalogTransactionRequest,
+    GetCatalogTransactionResponse, GetOrchestrationTransactionRequest,
+    GetOrchestrationTransactionResponse, GetRootTransactionRequest, GetRootTransactionResponse,
+    TransactionDomain, TransactionStatus, domain_mutation,
 };
+use arco_proto::arco::orchestration::v1::{orchestration_event_envelope, trigger_info};
 #[path = "support/control_plane_transactions.rs"]
 mod support;
 
 use support::{
-    catalog_create_catalog_request, catalog_create_default_schema_request,
+    TENANT, WORKSPACE, catalog_create_catalog_request, catalog_create_default_schema_request,
     catalog_create_schema_request, catalog_drop_table_request,
     catalog_register_table_in_schema_request,
     catalog_register_table_in_schema_request_with_columns, catalog_register_table_request,
@@ -40,7 +41,7 @@ use support::{
     load_idempotency_record, load_orchestration_tx_record, load_root_tx_record,
     orchestration_request, orchestration_request_with_event_id, post_error_json, post_protobuf,
     post_protobuf_without_idempotency, root_request, scoped_storage, test_router,
-    test_router_with_backend, test_router_with_config_backend, TENANT, WORKSPACE,
+    test_router_with_backend, test_router_with_config_backend,
 };
 
 async fn load_root_super_manifest(
@@ -617,8 +618,8 @@ async fn apply_catalog_ddl_preserves_proto_column_ordinals_via_transaction_layer
 }
 
 #[tokio::test]
-async fn commit_orchestration_batch_returns_visible_receipt_and_persists_lookup_record(
-) -> Result<()> {
+async fn commit_orchestration_batch_returns_visible_receipt_and_persists_lookup_record()
+-> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = test_router_with_backend(backend.clone());
     let request = orchestration_request("idem-orch-01", "req-orch-01", "run-orch-01");
@@ -692,8 +693,8 @@ async fn commit_orchestration_batch_returns_visible_receipt_and_persists_lookup_
 }
 
 #[tokio::test]
-async fn commit_orchestration_batch_replays_same_idempotency_key_and_rejects_hash_conflicts(
-) -> Result<()> {
+async fn commit_orchestration_batch_replays_same_idempotency_key_and_rejects_hash_conflicts()
+-> Result<()> {
     let router = test_router();
     let first = orchestration_request("idem-orch-replay-01", "req-orch-replay-01", "run-replay-01");
     let second =
@@ -767,6 +768,58 @@ async fn commit_orchestration_batch_replays_semantically_equivalent_typed_events
         &replay,
         "idem-orch-typed-01",
         "req-orch-typed-02",
+    )
+    .await?;
+
+    let first_receipt = first_response
+        .receipt
+        .context("first typed orchestration receipt missing")?;
+    let replay_receipt = replay_response
+        .receipt
+        .context("replay typed orchestration receipt missing")?;
+    assert_eq!(first_receipt.tx_id, replay_receipt.tx_id);
+    assert_eq!(first_receipt.commit_id, replay_receipt.commit_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_orchestration_batch_replays_semantically_equivalent_manual_trigger_request_id()
+-> Result<()> {
+    let router = test_router();
+    let first = orchestration_request("idem-orch-typed-02", "req-orch-typed-03", "run-typed-02");
+    let mut replay =
+        orchestration_request("idem-orch-typed-02", "req-orch-typed-04", "run-typed-02");
+    let manual_trigger = replay
+        .events
+        .get_mut(0)
+        .and_then(|event| event.event.as_mut())
+        .and_then(|event| match event {
+            orchestration_event_envelope::Event::RunTriggered(event) => event.trigger.as_mut(),
+            _ => None,
+        })
+        .and_then(|trigger| trigger.trigger.as_mut())
+        .and_then(|trigger| match trigger {
+            trigger_info::Trigger::Manual(manual) => Some(manual),
+            _ => None,
+        })
+        .context("manual trigger missing from orchestration replay event")?;
+    manual_trigger.request_id = Some("manual-request-typed-02".to_string());
+
+    let (_status, first_response): (_, CommitOrchestrationBatchResponse) = post_protobuf(
+        router.clone(),
+        "/api/v1/transactions/commitOrchestrationBatch",
+        &first,
+        "idem-orch-typed-02",
+        "req-orch-typed-03",
+    )
+    .await?;
+    let (_status, replay_response): (_, CommitOrchestrationBatchResponse) = post_protobuf(
+        router,
+        "/api/v1/transactions/commitOrchestrationBatch",
+        &replay,
+        "idem-orch-typed-02",
+        "req-orch-typed-04",
     )
     .await?;
 
@@ -922,8 +975,8 @@ async fn commit_root_transaction_returns_visible_receipt_and_persists_lookup_rec
 }
 
 #[tokio::test]
-async fn commit_root_transaction_replays_same_idempotency_key_and_keeps_audit_receipt_stable(
-) -> Result<()> {
+async fn commit_root_transaction_replays_same_idempotency_key_and_keeps_audit_receipt_stable()
+-> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = test_router_with_backend(backend.clone());
     let first = root_request(
@@ -1002,8 +1055,8 @@ async fn commit_root_transaction_replays_same_idempotency_key_and_keeps_audit_re
 }
 
 #[tokio::test]
-async fn commit_root_transaction_replays_semantically_equivalent_typed_orchestration_participants(
-) -> Result<()> {
+async fn commit_root_transaction_replays_semantically_equivalent_typed_orchestration_participants()
+-> Result<()> {
     let router = test_router();
     let first = root_request(
         "idem-root-typed-01",
@@ -1169,19 +1222,23 @@ async fn commit_root_transaction_exposes_pinned_catalog_and_orchestration_reads(
     let (_pinned_manifest_after_current, pinned_state_after_current) = compactor
         .load_state_for_root_token(&receipt.read_token)
         .await?;
-    assert!(pinned_state_after_current
-        .runs
-        .contains_key("run-root-read-01"));
-    assert!(!pinned_state_after_current
-        .runs
-        .contains_key("run-current-read-01"));
+    assert!(
+        pinned_state_after_current
+            .runs
+            .contains_key("run-root-read-01")
+    );
+    assert!(
+        !pinned_state_after_current
+            .runs
+            .contains_key("run-current-read-01")
+    );
 
     Ok(())
 }
 
 #[tokio::test]
-async fn commit_root_transaction_propagates_repair_pending_when_root_commit_receipt_write_fails(
-) -> Result<()> {
+async fn commit_root_transaction_propagates_repair_pending_when_root_commit_receipt_write_fails()
+-> Result<()> {
     let fail_prefix = format!("tenant={TENANT}/workspace={WORKSPACE}/commits/root/");
     let backend: Arc<dyn StorageBackend> = Arc::new(FailPrefixBackend::new(fail_prefix, 1));
     let router = test_router_with_backend(backend.clone());
@@ -1217,8 +1274,8 @@ async fn commit_root_transaction_propagates_repair_pending_when_root_commit_rece
 }
 
 #[tokio::test]
-async fn commit_root_transaction_retries_with_fresh_tx_id_after_super_manifest_failure(
-) -> Result<()> {
+async fn commit_root_transaction_retries_with_fresh_tx_id_after_super_manifest_failure()
+-> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(FailRootSuperManifestBackend::new(1));
     let router = test_router_with_backend(backend.clone());
     let first = root_request(
@@ -1547,8 +1604,8 @@ async fn apply_catalog_ddl_does_not_create_legacy_catalog_manifest_mirror() -> R
 }
 
 #[tokio::test]
-async fn commit_orchestration_batch_does_not_create_legacy_orchestration_manifest_mirror(
-) -> Result<()> {
+async fn commit_orchestration_batch_does_not_create_legacy_orchestration_manifest_mirror()
+-> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = test_router_with_backend(backend.clone());
     let request =

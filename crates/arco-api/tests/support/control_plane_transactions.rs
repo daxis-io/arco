@@ -7,12 +7,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::body::Body;
-use axum::http::{header, Method, Request, StatusCode};
+use axum::http::{Method, Request, StatusCode, header};
 use bytes::Bytes;
 use prost::Message;
 use tower::ServiceExt;
 
 use arco_api::server::{Server, ServerBuilder};
+use arco_core::ScopedStorage;
 use arco_core::control_plane_transactions::{
     CatalogTxRecord, ControlPlaneIdempotencyRecord, ControlPlaneTxDomain, ControlPlaneTxPaths,
     OrchestrationTxRecord, RootTxRecord,
@@ -20,19 +21,18 @@ use arco_core::control_plane_transactions::{
 use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
 };
-use arco_core::ScopedStorage;
 use arco_proto::arco::catalog::v1::{
-    catalog_ddl_operation, CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp,
-    DropTableOp, RegisterTableOp, RenameTableOp, UpdateTableOp,
+    CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp, DropTableOp,
+    RegisterTableOp, RenameTableOp, UpdateTableOp, catalog_ddl_operation,
 };
 use arco_proto::arco::common::v1::TableFormat;
 use arco_proto::arco::controlplane::v1::{
-    domain_mutation, ApplyCatalogDdlRequest, CommitOrchestrationBatchRequest,
-    CommitRootTransactionRequest, DomainMutation, OrchestrationBatchSpec,
+    ApplyCatalogDdlRequest, CommitOrchestrationBatchRequest, CommitRootTransactionRequest,
+    DomainMutation, OrchestrationBatchSpec, domain_mutation,
 };
 use arco_proto::arco::orchestration::v1::{
-    orchestration_event_envelope, trigger_info, ManualTrigger, OrchestrationEventEnvelope,
-    RunTriggered, TriggerInfo,
+    ManualTrigger, OrchestrationEventEnvelope, RunTriggered, TriggerInfo,
+    orchestration_event_envelope, trigger_info,
 };
 
 pub const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";

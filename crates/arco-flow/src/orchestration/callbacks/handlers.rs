@@ -574,18 +574,7 @@ where
         .as_ref()
         .and_then(|o| o.materialization_id.clone());
     let error_message = request_error.as_ref().map(|e| e.message.clone());
-    let output = match &request_output {
-        Some(value) => match serde_json::to_value(value) {
-            Ok(payload) => Some(payload),
-            Err(e) => {
-                return finish_callback(
-                    "task_completed",
-                    CallbackResult::InternalError(format!("Failed to serialize task output: {e}")),
-                );
-            }
-        },
-        None => None,
-    };
+    let output = request_output;
     let error_payload = request_error.as_ref().map(|value| {
         let mut normalized = value.clone();
         if normalized.retryable.is_none() {
@@ -593,25 +582,17 @@ where
         }
         normalized
     });
-    let error = match error_payload.as_ref() {
-        Some(value) => match serde_json::to_value(value) {
+    let error = error_payload;
+    let metrics = request_metrics;
+    let partial_progress_json = match &partial_progress {
+        Some(value) => match serde_json::to_string(value) {
             Ok(payload) => Some(payload),
             Err(e) => {
                 return finish_callback(
                     "task_completed",
-                    CallbackResult::InternalError(format!("Failed to serialize task error: {e}")),
-                );
-            }
-        },
-        None => None,
-    };
-    let metrics = match &request_metrics {
-        Some(value) => match serde_json::to_value(value) {
-            Ok(payload) => Some(payload),
-            Err(e) => {
-                return finish_callback(
-                    "task_completed",
-                    CallbackResult::InternalError(format!("Failed to serialize task metrics: {e}")),
+                    CallbackResult::InternalError(format!(
+                        "Failed to serialize partial progress JSON: {e}"
+                    )),
                 );
             }
         },
@@ -635,7 +616,7 @@ where
             error,
             metrics,
             cancelled_during_phase,
-            partial_progress,
+            partial_progress_json,
             asset_key: state.asset_key.clone(),
             partition_key: state.partition_key.clone(),
             code_version: state.code_version.clone(),
@@ -1252,22 +1233,9 @@ mod tests {
             assert_eq!(code_version.as_deref(), Some("v1.2.3"));
 
             let output = output.as_ref().expect("expected task output payload");
-            assert_eq!(
-                output.get("deltaTable").and_then(serde_json::Value::as_str),
-                Some("analytics.daily")
-            );
-            assert_eq!(
-                output
-                    .get("deltaVersion")
-                    .and_then(serde_json::Value::as_i64),
-                Some(17)
-            );
-            assert_eq!(
-                output
-                    .get("deltaPartition")
-                    .and_then(serde_json::Value::as_str),
-                Some("2025-01-15")
-            );
+            assert_eq!(output.delta_table.as_deref(), Some("analytics.daily"));
+            assert_eq!(output.delta_version, Some(17));
+            assert_eq!(output.delta_partition.as_deref(), Some("2025-01-15"));
         } else {
             panic!("Expected TaskFinished event");
         }

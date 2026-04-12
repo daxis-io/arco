@@ -48,7 +48,7 @@ from arco_flow.types import (
     unique,
 )
 
-__version__ = "1.4.0"
+__version__ = "0.1.5"
 
 __all__ = [
     "AssetContext",

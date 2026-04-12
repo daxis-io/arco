@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "arco-api"
-version = "1.4.0"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "arco-catalog",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "arco-catalog"
-version = "1.4.0"
+version = "0.1.5"
 dependencies = [
  "arco-core",
  "arrow 54.3.1",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "arco-cli"
-version = "1.4.0"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "arco-compactor"
-version = "1.4.0"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "arco-catalog",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "arco-core"
-version = "1.4.0"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "base64",
@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "arco-delta"
-version = "1.4.0"
+version = "0.1.5"
 dependencies = [
  "arco-core",
  "async-trait",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "arco-flow"
-version = "1.4.0"
+version = "0.1.5"
 dependencies = [
  "arco-core",
  "arrow 54.3.1",
@@ -399,7 +399,7 @@ dependencies = [
 
 [[package]]
 name = "arco-iceberg"
-version = "1.4.0"
+version = "0.1.5"
 dependencies = [
  "arco-catalog",
  "arco-core",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "arco-integration-tests"
-version = "1.4.0"
+version = "0.1.5"
 dependencies = [
  "arco-api",
  "arco-catalog",
@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "arco-proto"
-version = "1.4.0"
+version = "0.1.5"
 dependencies = [
  "http",
  "prost 0.13.5",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "arco-test-utils"
-version = "1.4.0"
+version = "0.1.5"
 dependencies = [
  "arco-catalog",
  "arco-core",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "arco-uc"
-version = "1.4.0"
+version = "0.1.5"
 dependencies = [
  "arco-catalog",
  "arco-core",
@@ -7108,7 +7108,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "1.4.0"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "arco-catalog",

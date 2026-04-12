@@ -22,7 +22,12 @@ unmaintained = "workspace"
 # Temporary: `RUSTSEC-2026-0009` requires `time >=0.3.47`, which currently
 # requires Rust 1.88 while CI is pinned to Rust 1.85.
 # Remove once the workspace toolchain is upgraded.
-ignore = ["RUSTSEC-2026-0009"]
+# Temporary: `RUSTSEC-2026-0097` affects upstream crates (`datafusion`,
+# `object_store`, `iceberg`, `governor`, `ulid`, `proptest`) that still pull
+# vulnerable `rand` lines. The advisory requires a custom `log` logger calling
+# `rand::rng()`/`thread_rng()`, and this workspace does not define one.
+# Remove once those upstream dependencies move to fixed rand releases.
+ignore = ["RUSTSEC-2026-0009", "RUSTSEC-2026-0097"]
 
 [licenses]
 # All licenses not in 'allow' are denied by default (cargo-deny 0.18+)

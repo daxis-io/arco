@@ -7,13 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.4.0] - 2026-04-10
+## [0.1.5] - 2026-04-11
 ### Added
 - Server-side SQL query endpoint at `/api/v1/query` backed by DataFusion with Arrow IPC or JSON output.
 - Control-plane transaction APIs and flow cutover wiring for orchestration callback workflows landed on `main`.
 - Orchestration output visibility lifecycle coverage now spans the API, worker callbacks, and flow execution surfaces.
 ### Changed
-- Promoted workspace, SDK, and release metadata to the `1.x` line while reserving planned protobuf-breaking contract changes for `2.0.0`.
+- Promoted workspace, SDK, and release metadata to `0.1.5` while reserving planned protobuf-breaking contract changes for `2.0.0`.
 - Refreshed `README.md`, `RELEASE.md`, and release-note templates to align with mdBook-first docs and CI/release artifact policy.
 ### Fixed
 - Hardened orchestration compactor publication and control-plane repair publication paths on the release line.

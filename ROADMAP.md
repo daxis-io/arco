@@ -17,7 +17,7 @@ This roadmap is directional and may evolve as architecture and operational feedb
 
 ## Longer Term
 
-- Hold public APIs stable through the `1.x` line and stage planned protobuf-breaking contract changes for `2.0`.
+- Hold public APIs stable through the `0.1.x` line and stage planned protobuf-breaking contract changes for `2.0.0`.
 - Expand ecosystem integrations where they align with core architecture.
 - Continue performance and operability work driven by measurable SLOs.
 

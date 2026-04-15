@@ -30,6 +30,13 @@ jobs:
           fetch-depth: 0
           ref: ${{ env.RELEASE_TAG }}
 
+      - name: Install release tooling for tagged snapshots
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ripgrep
+          fi
+
       - name: Resolve and validate release tag context
         run: |
           if [ -z "${RELEASE_TAG}" ]; then
@@ -82,8 +89,31 @@ jobs:
               ' <<<"${runs_payload}"
             )
 
+            release_tag_run_count="$(
+              jq -r --arg sha "${TAG_COMMIT_SHA}" --arg release_tag "${RELEASE_TAG}" '
+                .workflow_runs
+                | map(select(.head_sha == $sha and .head_branch == $release_tag))
+                | length
+              ' <<<"${runs_payload}"
+            )"
+
             found_success="false"
             for run_id in "${run_ids[@]}"; do
+              run_head_branch="$(
+                jq -r --argjson run_id "${run_id}" '
+                  .workflow_runs[] | select(.id == $run_id) | .head_branch // empty
+                ' <<<"${runs_payload}" | head -n 1
+              )"
+              run_conclusion="$(
+                jq -r --argjson run_id "${run_id}" '
+                  .workflow_runs[] | select(.id == $run_id) | .conclusion // empty
+                ' <<<"${runs_payload}" | head -n 1
+              )"
+
+              if [ "${release_tag_run_count}" -gt 0 ] && [ "${run_head_branch}" != "${RELEASE_TAG}" ]; then
+                continue
+              fi
+
               jobs_payload="$(curl -fsSL \
                 -H "Authorization: Bearer ${GH_TOKEN}" \
                 -H "Accept: application/vnd.github+json" \
@@ -96,6 +126,12 @@ jobs:
 
               if [ "${discipline_conclusion}" = "success" ]; then
                 echo "release-tag discipline passed in CI run ${run_id}"
+                found_success="true"
+                break
+              fi
+
+              if [ "${release_tag_run_count}" -eq 0 ] && [ -z "${discipline_conclusion}" ] && [ "${run_conclusion}" = "success" ]; then
+                echo "release-tag discipline job not present in CI run ${run_id}; falling back to successful CI run conclusion"
                 found_success="true"
                 break
               fi

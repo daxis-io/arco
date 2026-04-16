@@ -31,7 +31,7 @@
 
 ## Versioning Strategy
 
-- Package version in path: `arco.v1`, `arco.v2`
+- Package version in path: `arco.catalog.v1`, `arco.orchestration.v1`
 - Minor changes: add fields, add enum values
 - Major version bump: structural changes requiring new package
 

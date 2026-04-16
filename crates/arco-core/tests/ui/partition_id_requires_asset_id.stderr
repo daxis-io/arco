@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/partition_id_requires_asset_id.rs:12:33
+   |
+12 |     let _ = PartitionId::derive("table-01", &pk);
+   |             ------------------- ^^^^^^^^^^ expected `&AssetId`, found `&str`
+   |             |
+   |             arguments to this function are incorrect
+   |
+   = note: expected reference `&AssetId`
+              found reference `&'static str`
+note: associated function defined here
+  --> src/partition.rs
+   |
+   |     pub fn derive(asset_id: &AssetId, partition_key: &PartitionKey) -> Self {
+   |            ^^^^^^

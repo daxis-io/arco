@@ -686,7 +686,7 @@ fn commit_root_transaction_rejects_invalid_nested_orchestration_events() {
 }
 
 #[test]
-fn typed_orchestration_envelope_roundtrips_without_payload_json() {
+fn typed_orchestration_envelope_roundtrips_with_variant_payloads() {
     let envelope = sample_task_finished_event();
     let encoded = envelope.encode_to_vec();
     let decoded =

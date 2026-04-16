@@ -87,14 +87,14 @@ fn normalize_table_location_for_write(
 // Domain Types (returned from write operations)
 // ============================================================================
 
-/// A namespace in the catalog.
+/// A schema in the catalog.
 #[derive(Debug, Clone)]
-pub struct Namespace {
-    /// Unique namespace ID (UUID v7).
+pub struct Schema {
+    /// Unique schema ID (UUID v7).
     pub id: String,
-    /// Parent catalog ID (UUID v7). Null implies legacy/default catalog.
+    /// Parent catalog ID (UUID v7).
     pub catalog_id: Option<String>,
-    /// Namespace name (unique within workspace).
+    /// Schema name (unique within its catalog).
     pub name: String,
     /// Optional description.
     pub description: Option<String>,
@@ -103,6 +103,12 @@ pub struct Namespace {
     /// Last update timestamp (milliseconds since epoch).
     pub updated_at: i64,
 }
+
+/// Backward-compatible alias for the legacy namespace terminology.
+///
+/// TODO: remove this alias after downstream consumers complete the
+/// `Namespace` -> `Schema` migration.
+pub type Namespace = Schema;
 
 /// A catalog in the metastore.
 #[derive(Debug, Clone)]
@@ -143,7 +149,7 @@ impl From<&Catalog> for CatalogRecord {
     }
 }
 
-impl From<NamespaceRecord> for Namespace {
+impl From<NamespaceRecord> for Schema {
     fn from(r: NamespaceRecord) -> Self {
         Self {
             id: r.id,
@@ -156,8 +162,8 @@ impl From<NamespaceRecord> for Namespace {
     }
 }
 
-impl From<&Namespace> for NamespaceRecord {
-    fn from(ns: &Namespace) -> Self {
+impl From<&Schema> for NamespaceRecord {
+    fn from(ns: &Schema) -> Self {
         Self {
             id: ns.id.clone(),
             catalog_id: ns.catalog_id.clone(),
@@ -864,7 +870,7 @@ impl CatalogWriter {
         schema: &str,
         description: Option<&str>,
         opts: WriteOptions,
-    ) -> Result<Namespace> {
+    ) -> Result<Schema> {
         // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
@@ -1100,7 +1106,7 @@ impl CatalogWriter {
         name: &str,
         description: Option<&str>,
         opts: WriteOptions,
-    ) -> Result<Namespace> {
+    ) -> Result<Schema> {
         // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
@@ -1323,7 +1329,7 @@ impl CatalogWriter {
         name: &str,
         description: Option<&str>,
         opts: WriteOptions,
-    ) -> Result<Namespace> {
+    ) -> Result<Schema> {
         // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
@@ -3671,6 +3677,46 @@ mod tests {
         assert_eq!(ns.name, "default");
         assert_eq!(ns.description, Some("Default namespace".to_string()));
         assert!(!ns.id.is_empty());
+    }
+
+    #[test]
+    fn schema_roundtrips_through_namespace_storage_record() {
+        let schema = Schema {
+            id: "schema-01".to_string(),
+            catalog_id: Some("catalog-01".to_string()),
+            name: "sales".to_string(),
+            description: Some("sales schema".to_string()),
+            created_at: 1,
+            updated_at: 2,
+        };
+
+        let record = NamespaceRecord::from(&schema);
+        let roundtrip = Schema::from(record);
+
+        assert_eq!(roundtrip.id, "schema-01");
+        assert_eq!(roundtrip.catalog_id.as_deref(), Some("catalog-01"));
+        assert_eq!(roundtrip.name, "sales");
+        assert_eq!(roundtrip.description.as_deref(), Some("sales schema"));
+    }
+
+    #[test]
+    fn schema_roundtrips_without_optional_description() {
+        let schema = Schema {
+            id: "schema-02".to_string(),
+            catalog_id: Some("catalog-01".to_string()),
+            name: "finance".to_string(),
+            description: None,
+            created_at: 3,
+            updated_at: 4,
+        };
+
+        let record = NamespaceRecord::from(&schema);
+        let roundtrip = Schema::from(record);
+
+        assert_eq!(roundtrip.id, "schema-02");
+        assert_eq!(roundtrip.catalog_id.as_deref(), Some("catalog-01"));
+        assert_eq!(roundtrip.name, "finance");
+        assert_eq!(roundtrip.description, None);
     }
 
     #[tokio::test]

@@ -2567,23 +2567,71 @@ pub fn read_idempotency_keys(bytes: &Bytes) -> Result<Vec<IdempotencyKeyRow>> {
         let workspace_id = col_string(&batch, "workspace_id")?;
         let idempotency_key = col_string(&batch, "idempotency_key")?;
         let event_id = col_string(&batch, "event_id")?;
-        let event_type = col_string(&batch, "event_type")?;
+        let event_type = col_string_opt(&batch, "event_type");
         let recorded_at = col_i64(&batch, "recorded_at")?;
         let row_version = col_string(&batch, "row_version")?;
 
         for row in 0..batch.num_rows() {
+            let inferred_event_type = event_type
+                .and_then(|column| {
+                    if column.is_null(row) {
+                        None
+                    } else {
+                        Some(column.value(row).to_string())
+                    }
+                })
+                .unwrap_or_else(|| {
+                    infer_legacy_idempotency_event_type(idempotency_key.value(row)).to_string()
+                });
             out.push(IdempotencyKeyRow {
                 tenant_id: tenant_id.value(row).to_string(),
                 workspace_id: workspace_id.value(row).to_string(),
                 idempotency_key: idempotency_key.value(row).to_string(),
                 event_id: event_id.value(row).to_string(),
-                event_type: event_type.value(row).to_string(),
+                event_type: inferred_event_type,
                 recorded_at: millis_to_datetime(recorded_at.value(row)),
                 row_version: row_version.value(row).to_string(),
             });
         }
     }
     Ok(out)
+}
+
+const LEGACY_IDEMPOTENCY_EVENT_TYPES: &[(&str, &str)] = &[
+    ("run", "RunTriggered"),
+    ("plan", "PlanCreated"),
+    ("cancel_req", "RunCancelRequested"),
+    ("started", "TaskStarted"),
+    ("heartbeat", "TaskHeartbeat"),
+    ("finished", "TaskFinished"),
+    ("dispatch_req", "DispatchRequested"),
+    ("timer_req", "TimerRequested"),
+    ("dispatch_ack", "DispatchEnqueued"),
+    ("timer_ack", "TimerEnqueued"),
+    ("timer_fired", "TimerFired"),
+    ("sched_def", "ScheduleDefinitionUpserted"),
+    ("sched_tick", "ScheduleTicked"),
+    ("sensor_eval", "SensorEvaluated"),
+    ("runreq", "RunRequested"),
+    ("backfill_create", "BackfillCreated"),
+    ("backfill_chunk", "BackfillChunkPlanned"),
+    ("backfill_state", "BackfillStateChanged"),
+];
+
+fn infer_legacy_idempotency_event_type(idempotency_key: &str) -> &'static str {
+    let prefix = idempotency_key.split(':').next().unwrap_or_default();
+    for (candidate, event_type) in LEGACY_IDEMPOTENCY_EVENT_TYPES {
+        if *candidate == prefix {
+            return event_type;
+        }
+    }
+
+    tracing::warn!(
+        legacy_prefix = prefix,
+        idempotency_key,
+        "unknown legacy orchestration idempotency prefix"
+    );
+    "LegacyUnknown"
 }
 
 /// Reads `schedule_definitions.parquet`.
@@ -3107,6 +3155,48 @@ fn str_to_chunk_state(s: &str) -> Result<ChunkState> {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct SharedWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl SharedWriter {
+        fn new(buffer: Arc<Mutex<Vec<u8>>>) -> Self {
+            Self { buffer }
+        }
+    }
+
+    struct BufferWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl io::Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedWriter {
+        type Writer = BufferWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            BufferWriter {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
 
     #[test]
     fn test_runs_roundtrip() {
@@ -3477,6 +3567,123 @@ mod tests {
             "sensor_eval:sensor-01:msg:abc123"
         );
         assert_eq!(parsed[0].event_type, "SensorEvaluated");
+    }
+
+    #[test]
+    fn test_read_idempotency_keys_infers_event_type_when_legacy_column_is_missing() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tenant_id", DataType::Utf8, false),
+            Field::new("workspace_id", DataType::Utf8, false),
+            Field::new("idempotency_key", DataType::Utf8, false),
+            Field::new("event_id", DataType::Utf8, false),
+            Field::new("recorded_at", DataType::Int64, false),
+            Field::new("row_version", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("tenant-01")])),
+                Arc::new(StringArray::from(vec![Some("workspace-01")])),
+                Arc::new(StringArray::from(vec![Some(
+                    "sensor_eval:sensor-01:msg:abc123",
+                )])),
+                Arc::new(StringArray::from(vec![Some("01HQXYZ123")])),
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(StringArray::from(vec![Some("01HQXYZ123")])),
+            ],
+        )
+        .expect("record batch");
+
+        let bytes = write_single_batch(schema, &batch).expect("write");
+        let parsed = read_idempotency_keys(&bytes).expect("read");
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].event_type, "SensorEvaluated");
+    }
+
+    #[test]
+    fn test_read_idempotency_keys_infers_event_type_when_legacy_column_is_null() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tenant_id", DataType::Utf8, false),
+            Field::new("workspace_id", DataType::Utf8, false),
+            Field::new("idempotency_key", DataType::Utf8, false),
+            Field::new("event_id", DataType::Utf8, false),
+            Field::new("event_type", DataType::Utf8, true),
+            Field::new("recorded_at", DataType::Int64, false),
+            Field::new("row_version", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("tenant-01")])),
+                Arc::new(StringArray::from(vec![Some("workspace-01")])),
+                Arc::new(StringArray::from(vec![Some(
+                    "sensor_eval:sensor-01:msg:abc123",
+                )])),
+                Arc::new(StringArray::from(vec![Some("01HQXYZ123")])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(StringArray::from(vec![Some("01HQXYZ123")])),
+            ],
+        )
+        .expect("record batch");
+
+        let bytes = write_single_batch(schema, &batch).expect("write");
+        let parsed = read_idempotency_keys(&bytes).expect("read");
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].event_type, "SensorEvaluated");
+    }
+
+    #[test]
+    fn test_read_idempotency_keys_unknown_legacy_prefix_warns_and_marks_legacy_unknown() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tenant_id", DataType::Utf8, false),
+            Field::new("workspace_id", DataType::Utf8, false),
+            Field::new("idempotency_key", DataType::Utf8, false),
+            Field::new("event_id", DataType::Utf8, false),
+            Field::new("recorded_at", DataType::Int64, false),
+            Field::new("row_version", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("tenant-01")])),
+                Arc::new(StringArray::from(vec![Some("workspace-01")])),
+                Arc::new(StringArray::from(vec![Some("mystery_prefix:abc123")])),
+                Arc::new(StringArray::from(vec![Some("01HQXYZ123")])),
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(StringArray::from(vec![Some("01HQXYZ123")])),
+            ],
+        )
+        .expect("record batch");
+        let bytes = write_single_batch(schema, &batch).expect("write");
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(SharedWriter::new(Arc::clone(&logs)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let parsed = read_idempotency_keys(&bytes).expect("read");
+        let rendered = String::from_utf8(logs.lock().expect("logs lock").clone()).expect("utf8");
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].event_type, "LegacyUnknown");
+        assert!(
+            rendered.contains("unknown legacy orchestration idempotency prefix"),
+            "expected warning log, got {rendered}"
+        );
+        assert!(
+            rendered.contains("mystery_prefix"),
+            "expected unknown prefix in warning log, got {rendered}"
+        );
     }
 
     #[test]

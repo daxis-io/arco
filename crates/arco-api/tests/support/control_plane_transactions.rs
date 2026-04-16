@@ -31,7 +31,7 @@ use arco_proto::arco::controlplane::v1::{
     DomainMutation, OrchestrationBatchSpec, domain_mutation,
 };
 use arco_proto::arco::orchestration::v1::{
-    ManualTrigger, OrchestrationEventEnvelope, RunTriggered, TriggerInfo,
+    ManualTrigger, OrchestrationEventEnvelope, RunRequested, RunTriggered, TriggerInfo,
     orchestration_event_envelope, trigger_info,
 };
 
@@ -385,6 +385,44 @@ pub fn orchestration_request_with_event_id(
                     run_key: Some(format!("manual:{run_id}")),
                     labels: Default::default(),
                     code_version: None,
+                },
+            )),
+        }],
+    }
+}
+
+pub fn orchestration_run_requested_request(
+    idempotency_key: &str,
+    _request_id: &str,
+    run_key: &str,
+    manual_request_id: &str,
+) -> CommitOrchestrationBatchRequest {
+    let _ = idempotency_key;
+    CommitOrchestrationBatchRequest {
+        events: vec![OrchestrationEventEnvelope {
+            event_id: "01JTXORCHRUNREQ0000000000001".to_string(),
+            event_version: 1,
+            timestamp: Some(prost_types::Timestamp {
+                seconds: 1_776_000_000,
+                nanos: 0,
+            }),
+            source: format!("arco-flow/{TENANT}/{WORKSPACE}"),
+            idempotency_key: format!("run_requested:{run_key}"),
+            correlation_id: Some(run_key.to_string()),
+            causation_id: None,
+            event: Some(orchestration_event_envelope::Event::RunRequested(
+                RunRequested {
+                    run_key: run_key.to_string(),
+                    request_fingerprint: format!("sha256:{run_key}"),
+                    asset_selection: vec!["default.raw.events".to_string()],
+                    partition_selection: Vec::new(),
+                    trigger: Some(TriggerInfo {
+                        trigger: Some(trigger_info::Trigger::Manual(ManualTrigger {
+                            user_id: "tester".to_string(),
+                            request_id: Some(manual_request_id.to_string()),
+                        })),
+                    }),
+                    labels: Default::default(),
                 },
             )),
         }],

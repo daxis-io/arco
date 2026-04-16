@@ -26,7 +26,7 @@ use arco_core::control_plane_transactions::{
 };
 use arco_core::lock::{DEFAULT_LOCK_TTL, DistributedLock};
 use arco_core::storage::WritePrecondition;
-use arco_flow::orchestration::events::OrchestrationEvent;
+use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData, SourceRef};
 use arco_flow::orchestration::proto::event_from_proto_envelope;
 use arco_flow::orchestration_compaction_lock_path;
 use arco_proto::arco::catalog::v1::{
@@ -185,6 +185,10 @@ impl<'a> ControlPlaneTransactionService<'a> {
         }
 
         let request_hash = root_request_hash(&mutations, &meta)?;
+        let idempotency_path = ControlPlaneTxPaths::idempotency(
+            ControlPlaneTxDomain::Root,
+            meta.idempotency_key.as_str(),
+        );
         let claim = self
             .claim_idempotency(
                 ControlPlaneTxDomain::Root,
@@ -198,6 +202,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             let record = self
                 .resolve_existing_visible_record::<RootTxReceipt>(
                     ControlPlaneTxDomain::Root,
+                    idempotency_path.as_str(),
                     existing,
                 )
                 .await?;
@@ -329,6 +334,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             self.finalize_visible(
                 ControlPlaneTxDomain::Root,
                 &tx_id,
+                idempotency_path.as_str(),
                 root_lock_path.clone(),
                 fencing_token,
                 repair_pending,
@@ -370,6 +376,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
                     .mark_visible_repair_pending::<RootTxReceipt>(
                         ControlPlaneTxDomain::Root,
                         &tx_id,
+                        idempotency_path.as_str(),
                     )
                     .await
                 {
@@ -436,6 +443,10 @@ impl<'a> ControlPlaneTransactionService<'a> {
         command: CatalogMutation,
     ) -> Result<TxExecutionOutcome<CatalogTxReceipt>, ApiError> {
         let request_hash = command.request_hash()?;
+        let idempotency_path = ControlPlaneTxPaths::idempotency(
+            ControlPlaneTxDomain::Catalog,
+            meta.idempotency_key.as_str(),
+        );
         let claim = self
             .claim_idempotency(
                 ControlPlaneTxDomain::Catalog,
@@ -449,6 +460,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             let record = self
                 .resolve_existing_visible_record::<CatalogTxReceipt>(
                     ControlPlaneTxDomain::Catalog,
+                    idempotency_path.as_str(),
                     existing,
                 )
                 .await?;
@@ -522,6 +534,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         self.finalize_visible(
             ControlPlaneTxDomain::Catalog,
             &tx_id,
+            idempotency_path.as_str(),
             commit.lock_path,
             commit.fencing_token,
             commit.repair_pending,
@@ -543,6 +556,10 @@ impl<'a> ControlPlaneTransactionService<'a> {
     ) -> Result<TxExecutionOutcome<OrchestrationTxReceipt>, ApiError> {
         let events = batch.events(meta)?;
         let request_hash = batch.request_hash_for_events(&events)?;
+        let idempotency_path = ControlPlaneTxPaths::idempotency(
+            ControlPlaneTxDomain::Orchestration,
+            meta.idempotency_key.as_str(),
+        );
         let claim = self
             .claim_idempotency(
                 ControlPlaneTxDomain::Orchestration,
@@ -556,6 +573,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             let record = self
                 .resolve_existing_visible_record::<OrchestrationTxReceipt>(
                     ControlPlaneTxDomain::Orchestration,
+                    idempotency_path.as_str(),
                     existing,
                 )
                 .await?;
@@ -651,16 +669,29 @@ impl<'a> ControlPlaneTransactionService<'a> {
             }
         }
 
-        self.finalize_visible(
-            ControlPlaneTxDomain::Orchestration,
-            &tx_id,
-            commit.lock_path,
-            commit.fencing_token,
-            repair_pending,
-            visible_at,
-            receipt.clone(),
-        )
-        .await?;
+        // The commit receipt is immutable audit state. If finalize fails after this point,
+        // retries repair the visible tx/idempotency records around the stored receipt.
+        if let Err(error) = self
+            .finalize_visible(
+                ControlPlaneTxDomain::Orchestration,
+                &tx_id,
+                idempotency_path.as_str(),
+                commit.lock_path,
+                commit.fencing_token,
+                repair_pending,
+                visible_at,
+                receipt.clone(),
+            )
+            .await
+        {
+            tracing::warn!(
+                error = ?error,
+                tx_id,
+                commit_id = %receipt.commit_id,
+                "failed to finalize orchestration visibility after writing commit receipt"
+            );
+            return Err(error);
+        }
 
         Ok(TxExecutionOutcome {
             receipt,
@@ -825,6 +856,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         &self,
         domain: ControlPlaneTxDomain,
         tx_id: &str,
+        idempotency_path: &str,
         lock_path: String,
         fencing_token: u64,
         repair_pending: bool,
@@ -846,7 +878,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         record.visible_at = Some(visible_at);
         record.result = Some(result.clone());
 
-        self.persist_visible_record_and_idempotency(domain, &record)
+        self.persist_visible_record_and_idempotency(domain, idempotency_path, &record)
             .await
     }
 
@@ -854,6 +886,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         &self,
         domain: ControlPlaneTxDomain,
         tx_id: &str,
+        idempotency_path: &str,
     ) -> Result<(), ApiError>
     where
         TResult: Serialize + DeserializeOwned + Clone,
@@ -873,22 +906,22 @@ impl<'a> ControlPlaneTransactionService<'a> {
         }
 
         record.repair_pending = true;
-        self.persist_visible_record_and_idempotency(domain, &record)
+        self.persist_visible_record_and_idempotency(domain, idempotency_path, &record)
             .await
     }
 
     async fn persist_visible_record_and_idempotency<TResult>(
         &self,
         domain: ControlPlaneTxDomain,
+        idempotency_path: &str,
         record: &ControlPlaneTxRecord<TResult>,
     ) -> Result<(), ApiError>
     where
         TResult: Serialize + DeserializeOwned + Clone,
     {
         let path = ControlPlaneTxPaths::record(domain, record.tx_id.as_str());
-        let idem_path = ControlPlaneTxPaths::idempotency(domain, record.idempotency_key.as_str());
         let mut idem: ControlPlaneIdempotencyRecord = self
-            .load_json_required(&idem_path)
+            .load_json_required(idempotency_path)
             .await?
             .ok_or_else(|| ApiError::internal("idempotency record missing during finalize"))?;
         idem.visible_at = record.visible_at;
@@ -902,7 +935,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             .write_json(&path, record, WritePrecondition::None)
             .await;
         let idem_write = self
-            .write_json(&idem_path, &idem, WritePrecondition::None)
+            .write_json(idempotency_path, &idem, WritePrecondition::None)
             .await;
         match (tx_write, idem_write) {
             (Ok(_), Ok(_)) => Ok(()),
@@ -934,6 +967,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
     async fn resolve_existing_visible_record<TResult>(
         &self,
         domain: ControlPlaneTxDomain,
+        idempotency_path: &str,
         existing: &ControlPlaneIdempotencyRecord,
     ) -> Result<ControlPlaneTxRecord<TResult>, ApiError>
     where
@@ -942,8 +976,10 @@ impl<'a> ControlPlaneTransactionService<'a> {
         if let Some(record) = self.load_record(domain, existing.tx_id.as_str()).await? {
             if record.status == ControlPlaneTxStatus::Visible {
                 if existing.visible_at != record.visible_at || existing.tx_record.is_none() {
+                    // Safe as a repair write: replayers converge on the same visible receipt,
+                    // and any later repair_pending flip is recovered from the canonical tx record.
                     if let Err(error) = self
-                        .persist_visible_record_and_idempotency(domain, &record)
+                        .persist_visible_record_and_idempotency(domain, idempotency_path, &record)
                         .await
                     {
                         tracing::warn!(
@@ -1235,11 +1271,14 @@ impl OrchestrationBatchMutation {
         meta: &ResolvedRequestMetadata,
     ) -> Result<serde_json::Value, ApiError> {
         let events = self.events(meta)?;
-        Self::request_hash_value_for_events(&events)
+        Self::request_hash_value_for_events(&sanitize_runtime_events_for_request_hash(&events))
     }
 
     fn request_hash_for_events(&self, events: &[OrchestrationEvent]) -> Result<String, ApiError> {
-        prefixed_request_hash(&Self::request_hash_value_for_events(events)?).map_err(|error| {
+        prefixed_request_hash(&Self::request_hash_value_for_events(
+            &sanitize_runtime_events_for_request_hash(events),
+        )?)
+        .map_err(|error| {
             ApiError::bad_request(format!("failed to hash orchestration request: {error}"))
         })
     }
@@ -1702,6 +1741,26 @@ fn prefixed_request_hash(
     value: &serde_json::Value,
 ) -> Result<String, arco_catalog::idempotency::CanonicalizationError> {
     canonical_request_hash(value).map(|hash| format!("sha256:{hash}"))
+}
+
+fn sanitize_runtime_events_for_request_hash(
+    events: &[OrchestrationEvent],
+) -> Vec<OrchestrationEvent> {
+    events
+        .iter()
+        .cloned()
+        .map(|mut event| {
+            if let OrchestrationEventData::RunRequested {
+                trigger_source_ref: SourceRef::Manual { request_id, .. },
+                ..
+            } = &mut event.data
+            {
+                request_id.clear();
+            }
+
+            event
+        })
+        .collect()
 }
 
 fn envelope_to_event(

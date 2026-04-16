@@ -39,7 +39,8 @@ use support::{
     catalog_register_table_in_schema_request_with_columns, catalog_register_table_request,
     catalog_rename_table_request, catalog_update_table_request, load_catalog_tx_record,
     load_idempotency_record, load_orchestration_tx_record, load_root_tx_record,
-    orchestration_request, orchestration_request_with_event_id, post_error_json, post_protobuf,
+    orchestration_request, orchestration_request_with_event_id,
+    orchestration_run_requested_request, post_error_json, post_protobuf,
     post_protobuf_without_idempotency, root_request, scoped_storage, test_router,
     test_router_with_backend, test_router_with_config_backend,
 };
@@ -829,6 +830,52 @@ async fn commit_orchestration_batch_replays_semantically_equivalent_manual_trigg
     let replay_receipt = replay_response
         .receipt
         .context("replay typed orchestration receipt missing")?;
+    assert_eq!(first_receipt.tx_id, replay_receipt.tx_id);
+    assert_eq!(first_receipt.commit_id, replay_receipt.commit_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_orchestration_batch_replays_semantically_equivalent_run_requested_manual_trigger_request_id()
+-> Result<()> {
+    let router = test_router();
+    let first = orchestration_run_requested_request(
+        "idem-orch-runreq-01",
+        "req-orch-runreq-01",
+        "manual:runreq-01",
+        "manual-request-runreq-01",
+    );
+    let replay = orchestration_run_requested_request(
+        "idem-orch-runreq-01",
+        "req-orch-runreq-02",
+        "manual:runreq-01",
+        "manual-request-runreq-02",
+    );
+
+    let (_status, first_response): (_, CommitOrchestrationBatchResponse) = post_protobuf(
+        router.clone(),
+        "/api/v1/transactions/commitOrchestrationBatch",
+        &first,
+        "idem-orch-runreq-01",
+        "req-orch-runreq-01",
+    )
+    .await?;
+    let (_status, replay_response): (_, CommitOrchestrationBatchResponse) = post_protobuf(
+        router,
+        "/api/v1/transactions/commitOrchestrationBatch",
+        &replay,
+        "idem-orch-runreq-01",
+        "req-orch-runreq-02",
+    )
+    .await?;
+
+    let first_receipt = first_response
+        .receipt
+        .context("first run_requested orchestration receipt missing")?;
+    let replay_receipt = replay_response
+        .receipt
+        .context("replay run_requested orchestration receipt missing")?;
     assert_eq!(first_receipt.tx_id, replay_receipt.tx_id);
     assert_eq!(first_receipt.commit_id, replay_receipt.commit_id);
 

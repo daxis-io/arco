@@ -8,6 +8,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod codec;
+mod timestamp;
 #[allow(
     unused_qualifications,
     deprecated,
@@ -17,12 +18,16 @@ mod codec;
     clippy::pedantic
 )]
 mod generated {
+    #![allow(unused_qualifications)]
+
     // Include generated code; all types are re-exported at crate root.
     include!(concat!(env!("OUT_DIR"), "/arco.v1.rs"));
+    include!(concat!(env!("OUT_DIR"), "/arco.v1.serde.rs"));
 }
 
 pub use codec::{ProstCodec, ProstDecoder, ProstEncoder};
 pub use generated::*;
+pub use timestamp::Timestamp;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOutputContractError {
@@ -236,6 +241,7 @@ impl CommitRootTransactionRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value as JsonValue;
 
     fn pending_output() -> TaskOutput {
         TaskOutput {
@@ -264,19 +270,16 @@ mod tests {
     fn test_partition_key_serialization() -> Result<(), prost::DecodeError> {
         use prost::Message;
 
-        let mut dimensions = std::collections::BTreeMap::new();
-        dimensions.insert(
-            "date".to_string(),
-            ScalarValue {
-                value: Some(scalar_value::Value::DateValue("2025-01-15".to_string())),
-            },
-        );
-
-        let pk = PartitionKey { dimensions };
+        let fixture = include_str!("../fixtures/partition_key_v2.json");
+        let pk: PartitionKey = serde_json::from_str(fixture).expect("v2 fixture should parse");
         let encoded = pk.encode_to_vec();
         let decoded = PartitionKey::decode(encoded.as_slice())?;
+        let original: JsonValue =
+            serde_json::from_str(fixture).expect("fixture should be valid JSON");
+        let decoded_json =
+            serde_json::to_value(&decoded).expect("decoded partition key should serialize");
 
-        assert_eq!(decoded.dimensions.len(), 1);
+        assert_eq!(decoded_json, original);
         Ok(())
     }
 
@@ -349,8 +352,11 @@ mod tests {
             path: "s3://bucket/output.parquet".into(),
             size_bytes: 128,
             row_count: 0,
-            content_hash: "abc123".into(),
-            format: "parquet".into(),
+            content_digest: Some(FileHash {
+                algorithm: HashAlgorithm::Sha256 as i32,
+                digest: vec![0xAB; 32],
+            }),
+            file_format: FileFormat::Parquet as i32,
         });
         output.row_count = 0;
         output.byte_size = 128;
@@ -388,12 +394,15 @@ mod tests {
             path: "s3://bucket/output.parquet".into(),
             size_bytes: 0,
             row_count: 0,
-            content_hash: "def456".into(),
-            format: "parquet".into(),
+            content_digest: Some(FileHash {
+                algorithm: HashAlgorithm::Sha256 as i32,
+                digest: vec![0xCD; 32],
+            }),
+            file_format: FileFormat::Parquet as i32,
         });
         zero_stats.row_count = 0;
         zero_stats.byte_size = 0;
-        zero_stats.published_at = Some(prost_types::Timestamp {
+        zero_stats.published_at = Some(Timestamp {
             seconds: 1_742_770_800,
             nanos: 0,
         });

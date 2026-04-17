@@ -6,7 +6,8 @@ option java_multiple_files = true;
 option java_package = "com.arco.v1";
 option go_package = "github.com/daxis-io/arco/proto/arco/v1";
 
-// google/protobuf/timestamp.proto is imported where needed
+import "buf/validate/validate.proto";
+import "google/protobuf/timestamp.proto";
 
 // Strongly-typed IDs (string-wrapped for cross-language compat)
 message TenantId {
@@ -22,27 +23,28 @@ message WorkspaceId {
 
 message AssetId {
   // UUID-based asset identifier (generated as UUIDv7 in canonical implementation)
-  string value = 1;
+  string value = 1 [(buf.validate.field).string.pattern =
+                        "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"];
 }
 
 message RunId {
   // ULID-based run identifier
-  string value = 1;
+  string value = 1 [(buf.validate.field).string.pattern = "^[0-9A-HJKMNP-TV-Z]{26}$"];
 }
 
 message TaskId {
   // ULID-based task identifier
-  string value = 1;
+  string value = 1 [(buf.validate.field).string.pattern = "^[0-9A-HJKMNP-TV-Z]{26}$"];
 }
 
 message PartitionId {
   // Derived partition identifier (hash of asset_id + partition_key)
-  string value = 1;
+  string value = 1 [(buf.validate.field).string.pattern = "^part_[0-9a-f]{32}$"];
 }
 
 message MaterializationId {
   // ULID-based materialization identifier
-  string value = 1;
+  string value = 1 [(buf.validate.field).string.pattern = "^[0-9A-HJKMNP-TV-Z]{26}$"];
 }
 
 message SnapshotId {
@@ -50,39 +52,80 @@ message SnapshotId {
   string value = 1;
 }
 
-// Multi-dimensional partition key
+// Single partition dimension in canonical order.
+message PartitionDimension {
+  // Partition dimension name.
+  string key = 1 [(buf.validate.field).string = {
+    pattern: "^[a-z][a-z0-9_]*$"
+    min_len: 1
+    max_len: 128
+  }];
+
+  // Typed dimension value.
+  ScalarValue value = 2 [(buf.validate.field).required = true];
+}
+
+// Multi-dimensional partition key.
 message PartitionKey {
-  // Dimensions sorted alphabetically by key for determinism
-  map<string, ScalarValue> dimensions = 1;
+  // Dimensions sorted alphabetically by key for determinism and hashing stability.
+  repeated PartitionDimension dimensions = 1;
+}
+
+// Calendar date without time or timezone.
+message DateValue {
+  int32 year = 1 [(buf.validate.field).int32.gte = 1];
+  uint32 month = 2 [(buf.validate.field).uint32 = {
+    gte: 1
+    lte: 12
+  }];
+  uint32 day = 3 [(buf.validate.field).uint32 = {
+    gte: 1
+    lte: 31
+  }];
 }
 
 // Scalar value with explicit type for canonical encoding
 message ScalarValue {
   oneof value {
+    option (buf.validate.oneof).required = true;
+
     string string_value = 1;    // Arbitrary string (base64url encoded in canonical form)
     int64 int64_value = 2;      // 64-bit integer
     bool bool_value = 3;        // Boolean
-    string date_value = 4;      // YYYY-MM-DD format
-    string timestamp_value = 5; // ISO 8601 with micros, UTC (e.g., 2025-01-15T10:30:00.000000Z)
-    NullValue null_value = 6;   // Explicit null
+    DateValue date = 4;         // Calendar date
+    google.protobuf.Timestamp timestamp = 5; // Instant in time
+    NullValue null_value = 6 [(buf.validate.field).enum = {
+      defined_only: true
+      not_in: [0]
+    }]; // Explicit null
+    double double_value = 7;    // IEEE 754 double
+    bytes bytes_value = 8;      // Raw bytes
   }
 }
 
-// Represents null value (used in ScalarValue oneof)
+// Explicit null marker for ScalarValue.
 enum NullValue {
-  // Unspecified null value
   NULL_VALUE_UNSPECIFIED = 0;
+  NULL_VALUE_NULL = 1;
 }
 
 // Asset identifier (namespace + name)
 message AssetKey {
   // Namespace, e.g., "raw", "staging", "mart"
   // Pattern: `^[a-z][a-z0-9_]*$`
-  string namespace = 1;
+  string namespace = 1 [(buf.validate.field).string = {
+    pattern: "^[a-z][a-z0-9_]*$"
+    min_len: 1
+    max_len: 128
+  }];
 
   // Asset name within namespace
   // Pattern: `^[a-z][a-z0-9_]*$`
-  string name = 2;
+  string name = 2 [(buf.validate.field).string = {
+    pattern: "^[a-z][a-z0-9_]*$"
+    min_len: 1
+    max_len: 128
+  }];
 }
 
 // Asset format
@@ -93,20 +136,53 @@ enum AssetFormat {
   ASSET_FORMAT_ICEBERG = 3;
 }
 
+// Supported file digest algorithms.
+enum HashAlgorithm {
+  HASH_ALGORITHM_UNSPECIFIED = 0;
+  HASH_ALGORITHM_SHA256 = 1;
+}
+
+// Typed file content digest.
+message FileHash {
+  option (buf.validate.message).cel = {
+    id: "file_hash.sha256_digest_length"
+    message: "SHA-256 digests must be exactly 32 bytes"
+    expression: "this.algorithm != 1 || size(this.digest) == 32"
+  };
+
+  HashAlgorithm algorithm = 1 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+  bytes digest = 2 [(buf.validate.field).bytes.min_len = 1];
+}
+
+// Physical file formats for materialization outputs.
+enum FileFormat {
+  FILE_FORMAT_UNSPECIFIED = 0;
+  FILE_FORMAT_PARQUET = 1;
+  FILE_FORMAT_JSON = 2;
+  FILE_FORMAT_CSV = 3;
+  FILE_FORMAT_AVRO = 4;
+}
+
 // File entry for output tracking (used in materializations and task outputs)
 message FileEntry {
   // Storage path (gs://, s3://, or relative path)
-  string path = 1;
+  string path = 1 [(buf.validate.field).string.min_len = 1];
 
   // File size in bytes
-  int64 size_bytes = 2;
+  uint64 size_bytes = 2;
 
   // Row count (for tabular data)
-  int64 row_count = 3;
+  uint64 row_count = 3;
 
-  // Content hash (SHA-256, hex-encoded) for integrity verification
-  string content_hash = 4;
+  // Content digest for integrity verification.
+  FileHash content_digest = 4 [(buf.validate.field).required = true];
 
-  // File format (e.g., "parquet", "json")
-  string format = 5;
+  // Physical file format.
+  FileFormat file_format = 5 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
 }

@@ -34,8 +34,8 @@ use arco_proto::{
     DropTableOp, GetCatalogTransactionRequest, GetCatalogTransactionResponse,
     GetOrchestrationTransactionRequest, GetOrchestrationTransactionResponse,
     GetRootTransactionRequest, GetRootTransactionResponse, OrchestrationBatchSpec,
-    OrchestrationEventEnvelope, RegisterTableOp, RequestHeader, TenantId, TransactionDomain,
-    TransactionStatus, WorkspaceId, domain_mutation,
+    OrchestrationEventEnvelope, RegisterTableOp, RequestHeader, TenantId, Timestamp,
+    TransactionDomain, TransactionStatus, WorkspaceId, domain_mutation,
 };
 
 const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";
@@ -185,7 +185,7 @@ fn orchestration_request_with_event_id(
             event_id: event_id.to_string(),
             event_type: "RunTriggered".to_string(),
             event_version: 1,
-            timestamp: Some(prost_types::Timestamp {
+            timestamp: Some(Timestamp {
                 seconds: 1_776_000_000,
                 nanos: 0,
             }),

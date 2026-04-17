@@ -39,7 +39,7 @@ use arco_proto::{
     GetOrchestrationTransactionRequest, GetOrchestrationTransactionResponse,
     GetRootTransactionRequest, GetRootTransactionResponse, OrchestrationBatchSpec,
     OrchestrationEventEnvelope, OrchestrationTxStatus, RegisterTableOp, RequestHeader,
-    RootTxParticipant, RootTxStatus, TransactionDomain, TransactionStatus,
+    RootTxParticipant, RootTxStatus, Timestamp, TransactionDomain, TransactionStatus,
 };
 
 use crate::context::RequestContext;
@@ -1758,9 +1758,7 @@ fn envelope_to_event(
     })
 }
 
-fn protobuf_timestamp_to_chrono(
-    timestamp: &prost_types::Timestamp,
-) -> Result<DateTime<Utc>, ApiError> {
+fn protobuf_timestamp_to_chrono(timestamp: &Timestamp) -> Result<DateTime<Utc>, ApiError> {
     DateTime::<Utc>::from_timestamp(
         timestamp.seconds,
         u32::try_from(timestamp.nanos)
@@ -1769,11 +1767,8 @@ fn protobuf_timestamp_to_chrono(
     .ok_or_else(|| ApiError::bad_request("invalid protobuf timestamp"))
 }
 
-fn chrono_to_timestamp(timestamp: DateTime<Utc>) -> prost_types::Timestamp {
-    prost_types::Timestamp {
-        seconds: timestamp.timestamp(),
-        nanos: i32::try_from(timestamp.timestamp_subsec_nanos()).unwrap_or(i32::MAX),
-    }
+fn chrono_to_timestamp(timestamp: DateTime<Utc>) -> Timestamp {
+    Timestamp::from(timestamp)
 }
 
 fn catalog_receipt_to_proto(receipt: &CatalogTxReceipt) -> arco_proto::CatalogTxReceipt {

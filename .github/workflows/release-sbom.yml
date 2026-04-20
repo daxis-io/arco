@@ -181,7 +181,7 @@ jobs:
           toolchain: 1.85
 
       - name: Install cargo-sbom
-        uses: taiki-e/install-action@e9e8e031bcd90cdbe8ac6bb1d376f8596e587fbf # v2
+        uses: taiki-e/install-action@055f5df8c3f65ea01cd41e9dc855becd88953486 # v2
         with:
           tool: cargo-sbom@0.10.0
 
@@ -196,7 +196,7 @@ jobs:
           sha256sum "${SBOM_SPDX_FILE}" "${SBOM_CYCLONEDX_FILE}" > "${SBOM_SHA256_FILE}"
 
       - name: Upload release SBOM artifact pack (retained)
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-sbom-${{ env.RELEASE_TAG }}
           retention-days: ${{ env.SBOM_RETENTION_DAYS }}
@@ -217,7 +217,7 @@ jobs:
             ${{ env.SBOM_SHA256_FILE }}
 
       - name: Attach SBOM files to GitHub release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           files: |
@@ -237,7 +237,7 @@ jobs:
           tar -C "$(dirname "${PACK_DIR}")" -czf "${EVIDENCE_ARCHIVE}" "$(basename "${PACK_DIR}")"
 
       - name: Upload release evidence pack artifact (retained)
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-evidence-${{ env.RELEASE_TAG }}
           retention-days: ${{ env.SBOM_RETENTION_DAYS }}

@@ -2,6 +2,7 @@
 //!
 //! Provides a minimal SQL query endpoint backed by `DataFusion`.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,29 +12,26 @@ use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::Response;
 use axum::routing::post;
 use axum::{Json, Router};
-use bytes::Bytes;
 use serde::Deserialize;
 use tokio::time::timeout;
 use utoipa::ToSchema;
 
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatchReader;
 use arrow_json::ArrayWriter;
 use datafusion::common::DFSchema;
-use datafusion::datasource::MemTable;
 use datafusion::error::DataFusionError;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
-use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use datafusion::sql::sqlparser::ast::{ObjectName, Statement as SqlStatement, visit_relations};
 
 use arco_catalog::{CatalogError, CatalogReader};
 use arco_core::CatalogDomain;
 
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
+use crate::parquet_table::parquet_bytes_to_mem_table;
 use crate::server::AppState;
 use crate::system_tables;
 
@@ -55,6 +53,37 @@ pub struct QueryRequest {
 pub(crate) struct QueryParams {
     /// Optional response format override: "json" or "arrow".
     pub format: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct QueryRegistrationTargets {
+    snapshot_tables: HashMap<String, HashSet<String>>,
+    system_tables: HashMap<String, HashSet<String>>,
+    known_relation_count: usize,
+}
+
+impl QueryRegistrationTargets {
+    fn record_snapshot(&mut self, schema: &str, table: &str) {
+        if self
+            .snapshot_tables
+            .entry(schema.to_string())
+            .or_default()
+            .insert(table.to_string())
+        {
+            self.known_relation_count += 1;
+        }
+    }
+
+    fn record_system(&mut self, schema: &str, table: &str) {
+        if self
+            .system_tables
+            .entry(schema.to_string())
+            .or_default()
+            .insert(table.to_string())
+        {
+            self.known_relation_count += 1;
+        }
+    }
 }
 
 /// Creates query routes.
@@ -97,7 +126,7 @@ pub(crate) async fn query(
             "sql exceeds max length ({MAX_QUERY_LENGTH} bytes)",
         )));
     }
-    validate_query(sql)?;
+    let registration_targets = analyze_query(sql)?;
 
     tracing::info!(
         tenant = %ctx.tenant,
@@ -111,10 +140,21 @@ pub(crate) async fn query(
     let reader = CatalogReader::new(storage.clone());
 
     let session = SessionContext::new();
-    let registered = register_snapshot_tables(&session, &reader, &storage).await?
-        + system_tables::register_catalog_and_lineage_system_tables(&session, &reader, &storage)
-            .await?;
-    if registered == 0 {
+    let registered = register_snapshot_tables(
+        &session,
+        &reader,
+        &storage,
+        &registration_targets.snapshot_tables,
+    )
+    .await?
+        + system_tables::register_system_tables(
+            &session,
+            &reader,
+            &storage,
+            &registration_targets.system_tables,
+        )
+        .await?;
+    if registration_targets.known_relation_count > 0 && registered == 0 {
         return Err(ApiError::not_found(
             "No snapshot tables available for query",
         ));
@@ -153,7 +193,7 @@ pub(crate) async fn query(
     Ok(response)
 }
 
-fn validate_query(sql: &str) -> Result<(), ApiError> {
+fn analyze_query(sql: &str) -> Result<QueryRegistrationTargets, ApiError> {
     let statements = DFParser::parse_sql(sql)
         .map_err(|err| ApiError::bad_request(format!("failed to parse SQL: {err}")))?;
     let mut iter = statements.iter();
@@ -165,17 +205,91 @@ fn validate_query(sql: &str) -> Result<(), ApiError> {
             "only single-statement queries are supported",
         ));
     }
-    match statement {
-        DFStatement::Statement(statement) => match statement.as_ref() {
-            SqlStatement::Query(_) => Ok(()),
-            _ => Err(ApiError::bad_request(
-                "Only SELECT/CTE queries are supported",
-            )),
-        },
-        _ => Err(ApiError::bad_request(
+    let DFStatement::Statement(statement) = statement else {
+        return Err(ApiError::bad_request(
             "Only SELECT/CTE queries are supported",
-        )),
-    }
+        ));
+    };
+    let SqlStatement::Query(query) = statement.as_ref() else {
+        return Err(ApiError::bad_request(
+            "Only SELECT/CTE queries are supported",
+        ));
+    };
+
+    let cte_names: HashSet<String> = query
+        .with
+        .as_ref()
+        .map(|with| {
+            with.cte_tables
+                .iter()
+                .map(|cte| cte.alias.name.value.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut targets = QueryRegistrationTargets::default();
+
+    let _ = visit_relations(query, |relation: &ObjectName| {
+        let parts: Vec<String> = relation
+            .0
+            .iter()
+            .map(|ident| ident.value.to_ascii_lowercase())
+            .collect();
+
+        if parts.len() == 1 && cte_names.contains(&parts[0]) {
+            return std::ops::ControlFlow::<()>::Continue(());
+        }
+
+        match parts.as_slice() {
+            [schema, table] if is_known_snapshot_table(schema, table) => {
+                targets.record_snapshot(schema, table);
+            }
+            [catalog, schema, table]
+                if catalog == "system" && is_known_system_table(schema, table) =>
+            {
+                targets.record_system(schema, table);
+            }
+            _ => {}
+        }
+
+        std::ops::ControlFlow::<()>::Continue(())
+    });
+
+    Ok(targets)
+}
+
+fn is_known_snapshot_table(schema: &str, table: &str) -> bool {
+    matches!(
+        (schema, table),
+        ("catalog", "catalogs" | "namespaces" | "tables" | "columns")
+            | ("lineage", "lineage_edges")
+            | ("search", "token_postings")
+    )
+}
+
+fn is_known_system_table(schema: &str, table: &str) -> bool {
+    matches!(
+        (schema, table),
+        ("catalog", "catalogs" | "namespaces" | "tables" | "columns")
+            | ("lineage", "edges")
+            | (
+                "orchestration",
+                "runs"
+                    | "tasks"
+                    | "dep_satisfaction"
+                    | "timers"
+                    | "dispatch_outbox"
+                    | "sensor_state"
+                    | "sensor_evals"
+                    | "partition_status"
+                    | "schedule_definitions"
+                    | "schedule_state"
+                    | "schedule_ticks"
+                    | "backfills"
+                    | "backfill_chunks"
+                    | "run_key_conflicts"
+            )
+    )
 }
 
 fn wants_json(params: &QueryParams, headers: &HeaderMap) -> Result<bool, ApiError> {
@@ -201,37 +315,47 @@ async fn register_snapshot_tables(
     session: &SessionContext,
     reader: &CatalogReader,
     storage: &arco_core::ScopedStorage,
+    requested_tables: &HashMap<String, HashSet<String>>,
 ) -> Result<usize, ApiError> {
     let mut registered = 0;
-    registered += register_domain_tables(
-        session,
-        reader,
-        storage,
-        CatalogDomain::Catalog,
-        &[
-            ("catalogs.parquet", "catalogs"),
-            ("namespaces.parquet", "namespaces"),
-            ("tables.parquet", "tables"),
-            ("columns.parquet", "columns"),
-        ],
-    )
-    .await?;
-    registered += register_domain_tables(
-        session,
-        reader,
-        storage,
-        CatalogDomain::Lineage,
-        &[("lineage_edges.parquet", "lineage_edges")],
-    )
-    .await?;
-    registered += register_domain_tables(
-        session,
-        reader,
-        storage,
-        CatalogDomain::Search,
-        &[("token_postings.parquet", "token_postings")],
-    )
-    .await?;
+    if let Some(catalog_tables) = requested_tables.get("catalog") {
+        registered += register_domain_tables(
+            session,
+            reader,
+            storage,
+            CatalogDomain::Catalog,
+            &[
+                ("catalogs.parquet", "catalogs"),
+                ("namespaces.parquet", "namespaces"),
+                ("tables.parquet", "tables"),
+                ("columns.parquet", "columns"),
+            ],
+            catalog_tables,
+        )
+        .await?;
+    }
+    if let Some(lineage_tables) = requested_tables.get("lineage") {
+        registered += register_domain_tables(
+            session,
+            reader,
+            storage,
+            CatalogDomain::Lineage,
+            &[("lineage_edges.parquet", "lineage_edges")],
+            lineage_tables,
+        )
+        .await?;
+    }
+    if let Some(search_tables) = requested_tables.get("search") {
+        registered += register_domain_tables(
+            session,
+            reader,
+            storage,
+            CatalogDomain::Search,
+            &[("token_postings.parquet", "token_postings")],
+            search_tables,
+        )
+        .await?;
+    }
     Ok(registered)
 }
 
@@ -241,7 +365,12 @@ async fn register_domain_tables(
     storage: &arco_core::ScopedStorage,
     domain: CatalogDomain,
     mappings: &[(&str, &str)],
+    requested_tables: &HashSet<String>,
 ) -> Result<usize, ApiError> {
+    if requested_tables.is_empty() {
+        return Ok(0);
+    }
+
     let paths = match reader.get_mintable_paths(domain).await {
         Ok(paths) => paths,
         Err(CatalogError::NotFound { .. }) => return Ok(0),
@@ -258,7 +387,9 @@ async fn register_domain_tables(
         let Some(file_name) = path.rsplit('/').next() else {
             continue;
         };
-        let Some((_, table_name)) = mappings.iter().find(|(name, _)| *name == file_name) else {
+        let Some((_, table_name)) = mappings.iter().find(|(name, table_name)| {
+            *name == file_name && requested_tables.contains(*table_name)
+        }) else {
             continue;
         };
 
@@ -283,25 +414,6 @@ async fn ensure_schema(session: &SessionContext, schema: &str) -> Result<(), Api
         .await
         .map_err(|err| map_datafusion_error(&err))?;
     Ok(())
-}
-
-fn parquet_bytes_to_mem_table(bytes: Bytes) -> Result<Arc<MemTable>, ApiError> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
-        .map_err(|e| ApiError::internal(format!("failed to read parquet bytes: {e}")))?;
-    let reader = builder
-        .build()
-        .map_err(|e| ApiError::internal(format!("failed to build parquet reader: {e}")))?;
-    let schema = reader.schema();
-    let mut batches = Vec::new();
-    for batch in reader {
-        let batch = batch
-            .map_err(|e| ApiError::internal(format!("failed to decode parquet batch: {e}")))?;
-        batches.push(batch);
-    }
-
-    let table = MemTable::try_new(schema, vec![batches])
-        .map_err(|e| ApiError::internal(format!("failed to register table: {e}")))?;
-    Ok(Arc::new(table))
 }
 
 fn batches_to_json(batches: &[arrow::record_batch::RecordBatch]) -> Result<Vec<u8>, ApiError> {

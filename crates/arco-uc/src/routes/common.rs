@@ -19,6 +19,20 @@ pub(crate) fn known_but_unsupported(method: &Method, uri: &OriginalUri) -> Unity
     }
 }
 
+fn unity_catalog_error_for_status(http_status: u16, message: String) -> UnityCatalogError {
+    match http_status {
+        400 => UnityCatalogError::BadRequest { message },
+        401 => UnityCatalogError::Unauthorized { message },
+        403 => UnityCatalogError::Forbidden { message },
+        404 => UnityCatalogError::NotFound { message },
+        409 | 412 => UnityCatalogError::Conflict { message },
+        429 => UnityCatalogError::TooManyRequests { message },
+        501 => UnityCatalogError::NotImplemented { message },
+        503 => UnityCatalogError::ServiceUnavailable { message },
+        _ => UnityCatalogError::Internal { message },
+    }
+}
+
 pub(crate) fn map_catalog_error(err: CatalogError) -> UnityCatalogError {
     match err {
         CatalogError::Validation { message } => UnityCatalogError::BadRequest { message },
@@ -31,6 +45,10 @@ pub(crate) fn map_catalog_error(err: CatalogError) -> UnityCatalogError {
         CatalogError::PreconditionFailed { message } | CatalogError::CasFailed { message } => {
             UnityCatalogError::Conflict { message }
         }
+        CatalogError::RequestFailed {
+            http_status,
+            message,
+        } => unity_catalog_error_for_status(http_status, message),
         CatalogError::UnsupportedOperation { message } => UnityCatalogError::NotImplemented {
             message: format!("unsupported operation: {message}"),
         },

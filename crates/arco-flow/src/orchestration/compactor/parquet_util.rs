@@ -383,6 +383,36 @@ pub fn idempotency_keys_parquet_schema() -> Schema {
     (*idempotency_keys_schema()).clone()
 }
 
+/// Returns the `schedule_definitions` schema for golden file comparison.
+#[must_use]
+pub fn schedule_definitions_parquet_schema() -> Schema {
+    (*schedule_definitions_schema()).clone()
+}
+
+/// Returns the `schedule_state` schema for golden file comparison.
+#[must_use]
+pub fn schedule_state_parquet_schema() -> Schema {
+    (*schedule_state_schema()).clone()
+}
+
+/// Returns the `schedule_ticks` schema for golden file comparison.
+#[must_use]
+pub fn schedule_ticks_parquet_schema() -> Schema {
+    (*schedule_ticks_schema()).clone()
+}
+
+/// Returns the `backfills` schema for golden file comparison.
+#[must_use]
+pub fn backfills_parquet_schema() -> Schema {
+    (*backfills_schema()).clone()
+}
+
+/// Returns the `backfill_chunks` schema for golden file comparison.
+#[must_use]
+pub fn backfill_chunks_parquet_schema() -> Schema {
+    (*backfill_chunks_schema()).clone()
+}
+
 // ============================================================================
 // Writer Properties
 // ============================================================================
@@ -1088,7 +1118,7 @@ pub(super) fn write_run_key_index(rows: &[RunKeyIndexRow]) -> Result<Bytes> {
 ///
 /// # Errors
 /// Returns an error if Parquet encoding fails.
-pub(super) fn write_run_key_conflicts(rows: &[RunKeyConflictRow]) -> Result<Bytes> {
+pub fn write_run_key_conflicts(rows: &[RunKeyConflictRow]) -> Result<Bytes> {
     let schema = run_key_conflicts_schema();
 
     let tenant_ids = StringArray::from(

@@ -18,13 +18,11 @@ use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::Response;
 use axum::routing::post;
 use axum::{Json, Router};
-use bytes::Bytes;
 use serde::Deserialize;
 use tokio::time::timeout;
 
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatchReader;
 use arrow_json::ArrayWriter;
 use datafusion::catalog::memory::{MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::catalog_common::{CatalogProvider, SchemaProvider};
@@ -34,7 +32,6 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use datafusion::sql::sqlparser::ast::{ObjectName, visit_relations};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use arco_catalog::{CatalogReader, Table};
 
@@ -42,6 +39,7 @@ use super::query::QueryRequest;
 
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
+use crate::parquet_table::parquet_bytes_to_mem_table;
 use crate::server::AppState;
 
 const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
@@ -410,25 +408,6 @@ fn wants_json(params: &QueryParams, headers: &HeaderMap) -> Result<bool, ApiErro
         return Ok(false);
     };
     Ok(value.contains(JSON_CONTENT_TYPE))
-}
-
-fn parquet_bytes_to_mem_table(bytes: Bytes) -> Result<Arc<MemTable>, ApiError> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
-        .map_err(|e| ApiError::internal(format!("failed to read parquet bytes: {e}")))?;
-    let reader = builder
-        .build()
-        .map_err(|e| ApiError::internal(format!("failed to build parquet reader: {e}")))?;
-    let schema = reader.schema();
-    let mut batches = Vec::new();
-    for batch in reader {
-        let batch = batch
-            .map_err(|e| ApiError::internal(format!("failed to decode parquet batch: {e}")))?;
-        batches.push(batch);
-    }
-
-    let table = MemTable::try_new(schema, vec![batches])
-        .map_err(|e| ApiError::internal(format!("failed to register table: {e}")))?;
-    Ok(Arc::new(table))
 }
 
 fn batches_to_json(batches: &[arrow::record_batch::RecordBatch]) -> Result<Vec<u8>, ApiError> {

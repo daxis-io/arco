@@ -36,6 +36,11 @@ use arco_core::{CatalogDomain, CatalogPaths, DeltaPaths, ScopedStorage, TableFor
 
 use crate::error::{CatalogError, Result};
 use crate::event_writer::EventWriter;
+use crate::idempotency::{
+    CatalogIdempotencyMarker, CatalogOperation, DEFAULT_STALE_TIMEOUT, IdempotencyCheck,
+    IdempotencyStore, IdempotencyStoreImpl, ObjectVersion, canonical_request_hash,
+    check_idempotency,
+};
 use crate::lock::DistributedLock;
 use crate::manifest::SnapshotInfo;
 use crate::parquet_util::{
@@ -531,6 +536,123 @@ impl CatalogWriter {
             })
     }
 
+    fn idempotency_store(&self) -> IdempotencyStoreImpl<ScopedStorage> {
+        IdempotencyStoreImpl::new(Arc::new(self.storage.clone()))
+    }
+
+    fn idempotency_request_hash(value: serde_json::Value) -> Result<String> {
+        canonical_request_hash(&value).map_err(|err| CatalogError::InvariantViolation {
+            message: format!("failed to canonicalize idempotent request: {err}"),
+        })
+    }
+
+    fn idempotency_request_failed(http_status: u16, message: impl Into<String>) -> CatalogError {
+        CatalogError::RequestFailed {
+            http_status,
+            message: message.into(),
+        }
+    }
+
+    fn idempotency_conflict_error() -> CatalogError {
+        Self::idempotency_request_failed(
+            409,
+            "Idempotency-Key already used with different request body",
+        )
+    }
+
+    fn idempotency_in_progress_error() -> CatalogError {
+        Self::idempotency_request_failed(409, "request with Idempotency-Key is still in progress")
+    }
+
+    async fn finalize_idempotency_success(
+        &self,
+        marker: CatalogIdempotencyMarker,
+        version: ObjectVersion,
+        entity_id: &str,
+        entity_name: &str,
+    ) -> Result<()> {
+        let finalized = marker.finalize_committed(entity_id.to_string(), entity_name.to_string());
+        match self
+            .idempotency_store()
+            .finalize(&finalized, &version)
+            .await?
+        {
+            crate::idempotency::FinalizeResult::Success { .. } => Ok(()),
+            crate::idempotency::FinalizeResult::Conflict { current_version } => {
+                Err(CatalogError::InvariantViolation {
+                    message: format!(
+                        "idempotency marker finalize conflict after successful operation: {}",
+                        current_version.as_str()
+                    ),
+                })
+            }
+        }
+    }
+
+    async fn finalize_idempotency_failure(
+        &self,
+        marker: CatalogIdempotencyMarker,
+        version: ObjectVersion,
+        err: &CatalogError,
+    ) -> Result<()> {
+        let Some(http_status) = err.http_status_code() else {
+            return Ok(());
+        };
+
+        let finalized = marker.finalize_failed(http_status, err.to_string());
+        match self
+            .idempotency_store()
+            .finalize(&finalized, &version)
+            .await?
+        {
+            crate::idempotency::FinalizeResult::Success { .. } => Ok(()),
+            crate::idempotency::FinalizeResult::Conflict { current_version } => {
+                Err(CatalogError::InvariantViolation {
+                    message: format!(
+                        "idempotency marker finalize conflict after failed operation: {}",
+                        current_version.as_str()
+                    ),
+                })
+            }
+        }
+    }
+
+    async fn replay_catalog_by_name(&self, name: &str) -> Result<Catalog> {
+        crate::reader::CatalogReader::new(self.storage.clone())
+            .get_catalog(name)
+            .await?
+            .ok_or_else(|| CatalogError::InvariantViolation {
+                message: format!("idempotency replay target missing: catalog {name}"),
+            })
+    }
+
+    async fn replay_schema_by_name(&self, catalog: &str, schema: &str) -> Result<Schema> {
+        crate::reader::CatalogReader::new(self.storage.clone())
+            .list_schemas(catalog)
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.name == schema)
+            .ok_or_else(|| CatalogError::InvariantViolation {
+                message: format!("idempotency replay target missing: schema {catalog}.{schema}"),
+            })
+    }
+
+    async fn replay_table_by_name(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Table> {
+        crate::reader::CatalogReader::new(self.storage.clone())
+            .get_table_in_schema(catalog, schema, table)
+            .await?
+            .ok_or_else(|| CatalogError::InvariantViolation {
+                message: format!(
+                    "idempotency replay target missing: table {catalog}.{schema}.{table}"
+                ),
+            })
+    }
+
     fn single_event_sync_compact_request(
         &self,
         domain: CatalogDomain,
@@ -692,88 +814,136 @@ impl CatalogWriter {
         description: Option<&str>,
         opts: WriteOptions,
     ) -> Result<Catalog> {
-        // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
-        if let Some(expected) = &opts.if_match {
-            let manifest = self.tier1.read_manifest().await?;
-            if manifest.catalog.snapshot_version != expected.as_u64() {
-                return Err(CatalogError::PreconditionFailed {
-                    message: format!(
-                        "version mismatch: expected {}, got {}",
-                        expected.as_u64(),
-                        manifest.catalog.snapshot_version
-                    ),
-                });
+        let request_hash = Self::idempotency_request_hash(serde_json::json!({
+            "name": name,
+            "description": description,
+            "if_match": opts.if_match.map(|version| version.as_u64()),
+        }))?;
+        let idempotency_store = self.idempotency_store();
+        let idempotency = match check_idempotency(
+            &idempotency_store,
+            opts.idempotency_key.as_ref().map(|key| key.as_str()),
+            CatalogOperation::CreateCatalog,
+            &request_hash,
+            DEFAULT_STALE_TIMEOUT,
+        )
+        .await?
+        {
+            IdempotencyCheck::NoKey => None,
+            IdempotencyCheck::Proceed { marker, version } => Some((marker, version)),
+            IdempotencyCheck::Replay { entity_name, .. } => {
+                return self.replay_catalog_by_name(&entity_name).await;
             }
-        }
-
-        let now = Utc::now().timestamp_millis();
-        let catalog = Catalog {
-            id: Uuid::now_v7().to_string(),
-            name: name.to_string(),
-            description: description.map(String::from),
-            created_at: now,
-            updated_at: now,
+            IdempotencyCheck::Conflict => return Err(Self::idempotency_conflict_error()),
+            IdempotencyCheck::PreviousFailed {
+                http_status,
+                message,
+            } => return Err(Self::idempotency_request_failed(http_status, message)),
+            IdempotencyCheck::InProgress { .. } => {
+                return Err(Self::idempotency_in_progress_error());
+            }
         };
 
-        let compactor = self.sync_compactor()?;
-
-        // Acquire lock and append ledger event.
-        let guard = self
-            .tier1
-            .acquire_lock(self.lock_ttl, self.lock_max_retries)
-            .await?;
-
-        let manifest = self.tier1.read_manifest().await?;
-        if let Some(expected) = &opts.if_match {
-            if manifest.catalog.snapshot_version != expected.as_u64() {
-                guard.release().await?;
-                return Err(CatalogError::PreconditionFailed {
-                    message: format!(
-                        "version mismatch: expected {}, got {}",
-                        expected.as_u64(),
-                        manifest.catalog.snapshot_version
-                    ),
-                });
+        let result = async {
+            // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
+            if let Some(expected) = &opts.if_match {
+                let manifest = self.tier1.read_manifest().await?;
+                if manifest.catalog.snapshot_version != expected.as_u64() {
+                    return Err(CatalogError::PreconditionFailed {
+                        message: format!(
+                            "version mismatch: expected {}, got {}",
+                            expected.as_u64(),
+                            manifest.catalog.snapshot_version
+                        ),
+                    });
+                }
             }
-        }
-        let state =
-            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
-        // Check for duplicate
-        if state.catalogs.iter().any(|c| c.name == name) {
-            guard.release().await?;
-            return Err(CatalogError::AlreadyExists {
-                entity: "catalog".into(),
+            let now = Utc::now().timestamp_millis();
+            let catalog = Catalog {
+                id: Uuid::now_v7().to_string(),
                 name: name.to_string(),
-            });
-        }
+                description: description.map(String::from),
+                created_at: now,
+                updated_at: now,
+            };
 
-        let event = CatalogDdlEventV2::CatalogCreated {
-            catalog: CatalogRecord::from(&catalog),
-        };
+            let compactor = self.sync_compactor()?;
 
-        let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
+            // Acquire lock and append ledger event.
+            let guard = self
+                .tier1
+                .acquire_lock(self.lock_ttl, self.lock_max_retries)
+                .await?;
+
+            let manifest = self.tier1.read_manifest().await?;
+            if let Some(expected) = &opts.if_match {
+                if manifest.catalog.snapshot_version != expected.as_u64() {
+                    guard.release().await?;
+                    return Err(CatalogError::PreconditionFailed {
+                        message: format!(
+                            "version mismatch: expected {}, got {}",
+                            expected.as_u64(),
+                            manifest.catalog.snapshot_version
+                        ),
+                    });
+                }
+            }
+            let state =
+                tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path)
+                    .await?;
+
+            // Check for duplicate
+            if state.catalogs.iter().any(|c| c.name == name) {
+                guard.release().await?;
+                return Err(CatalogError::AlreadyExists {
+                    entity: "catalog".into(),
+                    name: name.to_string(),
+                });
+            }
+
+            let event = CatalogDdlEventV2::CatalogCreated {
+                catalog: CatalogRecord::from(&catalog),
+            };
+
+            let event_id = self
+                .tier1
+                .append_ledger_event(
+                    &guard,
+                    CatalogDomain::Catalog,
+                    &event,
+                    opts.actor.as_deref().unwrap_or("api"),
+                )
+                .await?;
+
+            let request = self.single_event_sync_compact_request(
                 CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
-            .await?;
+                &event_id,
+                guard.fencing_token().sequence(),
+                opts.request_id.clone(),
+            );
 
-        let request = self.single_event_sync_compact_request(
-            CatalogDomain::Catalog,
-            &event_id,
-            guard.fencing_token().sequence(),
-            opts.request_id.clone(),
-        );
+            let result = compactor.sync_compact(request).await;
+            guard.release().await?;
+            result?;
 
-        let result = compactor.sync_compact(request).await;
-        guard.release().await?;
-        result?;
+            Ok(catalog)
+        }
+        .await;
 
-        Ok(catalog)
+        match (idempotency, result) {
+            (Some((marker, version)), Ok(catalog)) => {
+                self.finalize_idempotency_success(marker, version, &catalog.id, &catalog.name)
+                    .await?;
+                Ok(catalog)
+            }
+            (Some((marker, version)), Err(err)) => {
+                self.finalize_idempotency_failure(marker, version, &err)
+                    .await?;
+                Err(err)
+            }
+            (None, result) => result,
+        }
     }
 
     /// Creates a new catalog and returns visible commit metadata for transaction APIs.
@@ -1134,102 +1304,152 @@ impl CatalogWriter {
         description: Option<&str>,
         opts: WriteOptions,
     ) -> Result<Schema> {
-        // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
-        if let Some(expected) = &opts.if_match {
+        let request_hash = Self::idempotency_request_hash(serde_json::json!({
+            "catalog": catalog,
+            "schema": schema,
+            "description": description,
+            "if_match": opts.if_match.map(|version| version.as_u64()),
+        }))?;
+        let idempotency_store = self.idempotency_store();
+        let idempotency = match check_idempotency(
+            &idempotency_store,
+            opts.idempotency_key.as_ref().map(|key| key.as_str()),
+            CatalogOperation::CreateSchema,
+            &request_hash,
+            DEFAULT_STALE_TIMEOUT,
+        )
+        .await?
+        {
+            IdempotencyCheck::NoKey => None,
+            IdempotencyCheck::Proceed { marker, version } => Some((marker, version)),
+            IdempotencyCheck::Replay { entity_name, .. } => {
+                return self.replay_schema_by_name(catalog, &entity_name).await;
+            }
+            IdempotencyCheck::Conflict => return Err(Self::idempotency_conflict_error()),
+            IdempotencyCheck::PreviousFailed {
+                http_status,
+                message,
+            } => return Err(Self::idempotency_request_failed(http_status, message)),
+            IdempotencyCheck::InProgress { .. } => {
+                return Err(Self::idempotency_in_progress_error());
+            }
+        };
+
+        let result = async {
+            // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
+            if let Some(expected) = &opts.if_match {
+                let manifest = self.tier1.read_manifest().await?;
+                if manifest.catalog.snapshot_version != expected.as_u64() {
+                    return Err(CatalogError::PreconditionFailed {
+                        message: format!(
+                            "version mismatch: expected {}, got {}",
+                            expected.as_u64(),
+                            manifest.catalog.snapshot_version
+                        ),
+                    });
+                }
+            }
+
+            let compactor = self.sync_compactor()?;
+
+            let guard = self
+                .tier1
+                .acquire_lock(self.lock_ttl, self.lock_max_retries)
+                .await?;
+
             let manifest = self.tier1.read_manifest().await?;
-            if manifest.catalog.snapshot_version != expected.as_u64() {
-                return Err(CatalogError::PreconditionFailed {
-                    message: format!(
-                        "version mismatch: expected {}, got {}",
-                        expected.as_u64(),
-                        manifest.catalog.snapshot_version
-                    ),
-                });
+            if let Some(expected) = &opts.if_match {
+                if manifest.catalog.snapshot_version != expected.as_u64() {
+                    guard.release().await?;
+                    return Err(CatalogError::PreconditionFailed {
+                        message: format!(
+                            "version mismatch: expected {}, got {}",
+                            expected.as_u64(),
+                            manifest.catalog.snapshot_version
+                        ),
+                    });
+                }
             }
-        }
+            let state =
+                tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path)
+                    .await?;
 
-        let compactor = self.sync_compactor()?;
-
-        let guard = self
-            .tier1
-            .acquire_lock(self.lock_ttl, self.lock_max_retries)
-            .await?;
-
-        let manifest = self.tier1.read_manifest().await?;
-        if let Some(expected) = &opts.if_match {
-            if manifest.catalog.snapshot_version != expected.as_u64() {
+            let Some(catalog_record) = state.catalogs.iter().find(|c| c.name == catalog) else {
                 guard.release().await?;
-                return Err(CatalogError::PreconditionFailed {
-                    message: format!(
-                        "version mismatch: expected {}, got {}",
-                        expected.as_u64(),
-                        manifest.catalog.snapshot_version
-                    ),
+                return Err(CatalogError::NotFound {
+                    entity: "catalog".into(),
+                    name: catalog.to_string(),
+                });
+            };
+
+            // Check for duplicate within the catalog (UC semantics).
+            let default_catalog_id = state
+                .catalogs
+                .iter()
+                .find(|c| c.name == "default")
+                .map(|c| c.id.as_str());
+            let catalog_id = catalog_record.id.as_str();
+            if state.namespaces.iter().any(|ns| {
+                ns.name == schema
+                    && ns.catalog_id.as_deref().or(default_catalog_id) == Some(catalog_id)
+            }) {
+                guard.release().await?;
+                return Err(CatalogError::AlreadyExists {
+                    entity: "namespace".into(),
+                    name: schema.to_string(),
                 });
             }
-        }
-        let state =
-            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
-        let Some(catalog_record) = state.catalogs.iter().find(|c| c.name == catalog) else {
-            guard.release().await?;
-            return Err(CatalogError::NotFound {
-                entity: "catalog".into(),
-                name: catalog.to_string(),
-            });
-        };
-
-        // Check for duplicate within the catalog (UC semantics).
-        let default_catalog_id = state
-            .catalogs
-            .iter()
-            .find(|c| c.name == "default")
-            .map(|c| c.id.as_str());
-        let catalog_id = catalog_record.id.as_str();
-        if state.namespaces.iter().any(|ns| {
-            ns.name == schema && ns.catalog_id.as_deref().or(default_catalog_id) == Some(catalog_id)
-        }) {
-            guard.release().await?;
-            return Err(CatalogError::AlreadyExists {
-                entity: "namespace".into(),
+            let now = Utc::now().timestamp_millis();
+            let namespace = Namespace {
+                id: Uuid::now_v7().to_string(),
+                catalog_id: Some(catalog_record.id.clone()),
                 name: schema.to_string(),
-            });
-        }
+                description: description.map(String::from),
+                created_at: now,
+                updated_at: now,
+            };
 
-        let now = Utc::now().timestamp_millis();
-        let namespace = Namespace {
-            id: Uuid::now_v7().to_string(),
-            catalog_id: Some(catalog_record.id.clone()),
-            name: schema.to_string(),
-            description: description.map(String::from),
-            created_at: now,
-            updated_at: now,
-        };
+            let event = CatalogDdlEvent::NamespaceCreated {
+                namespace: NamespaceRecord::from(&namespace),
+            };
 
-        let event = CatalogDdlEvent::NamespaceCreated {
-            namespace: NamespaceRecord::from(&namespace),
-        };
+            let event_id = self
+                .tier1
+                .append_ledger_event(
+                    &guard,
+                    CatalogDomain::Catalog,
+                    &event,
+                    opts.actor.as_deref().unwrap_or("api"),
+                )
+                .await?;
 
-        let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
+            let request = self.single_event_sync_compact_request(
                 CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
-            .await?;
+                &event_id,
+                guard.fencing_token().sequence(),
+                opts.request_id.clone(),
+            );
 
-        let request = self.single_event_sync_compact_request(
-            CatalogDomain::Catalog,
-            &event_id,
-            guard.fencing_token().sequence(),
-            opts.request_id.clone(),
-        );
+            let result = compactor.sync_compact(request).await;
+            guard.release().await?;
+            result.map(|_| namespace)
+        }
+        .await;
 
-        let result = compactor.sync_compact(request).await;
-        guard.release().await?;
-        result.map(|_| namespace)
+        match (idempotency, result) {
+            (Some((marker, version)), Ok(schema)) => {
+                self.finalize_idempotency_success(marker, version, &schema.id, &schema.name)
+                    .await?;
+                Ok(schema)
+            }
+            (Some((marker, version)), Err(err)) => {
+                self.finalize_idempotency_failure(marker, version, &err)
+                    .await?;
+                Err(err)
+            }
+            (None, result) => result,
+        }
     }
 
     /// Creates a schema and returns visible commit metadata for transaction APIs.
@@ -2403,161 +2623,224 @@ impl CatalogWriter {
         req: RegisterTableInSchemaRequest,
         opts: WriteOptions,
     ) -> Result<Table> {
-        // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
-        if let Some(expected) = &opts.if_match {
-            let manifest = self.tier1.read_manifest().await?;
-            if manifest.catalog.snapshot_version != expected.as_u64() {
-                return Err(CatalogError::PreconditionFailed {
-                    message: format!(
-                        "version mismatch: expected {}, got {}",
-                        expected.as_u64(),
-                        manifest.catalog.snapshot_version
-                    ),
-                });
+        let request_hash = Self::idempotency_request_hash(serde_json::json!({
+            "catalog": catalog,
+            "schema": schema,
+            "name": req.name.clone(),
+            "description": req.description.clone(),
+            "location": req.location.clone(),
+            "format": req.format.clone(),
+            "columns": req.columns.iter().map(|column| serde_json::json!({
+                "name": column.name.clone(),
+                "data_type": column.data_type.clone(),
+                "is_nullable": column.is_nullable,
+                "ordinal": column.ordinal,
+                "description": column.description.clone(),
+            })).collect::<Vec<_>>(),
+            "if_match": opts.if_match.map(|version| version.as_u64()),
+        }))?;
+        let idempotency_store = self.idempotency_store();
+        let idempotency = match check_idempotency(
+            &idempotency_store,
+            opts.idempotency_key.as_ref().map(|key| key.as_str()),
+            CatalogOperation::RegisterTableInSchema,
+            &request_hash,
+            DEFAULT_STALE_TIMEOUT,
+        )
+        .await?
+        {
+            IdempotencyCheck::NoKey => None,
+            IdempotencyCheck::Proceed { marker, version } => Some((marker, version)),
+            IdempotencyCheck::Replay { entity_name, .. } => {
+                return self
+                    .replay_table_by_name(catalog, schema, &entity_name)
+                    .await;
             }
-        }
-
-        let compactor = self.sync_compactor()?;
-
-        let guard = self
-            .tier1
-            .acquire_lock(self.lock_ttl, self.lock_max_retries)
-            .await?;
-
-        let manifest = self.tier1.read_manifest().await?;
-        if let Some(expected) = &opts.if_match {
-            if manifest.catalog.snapshot_version != expected.as_u64() {
-                guard.release().await?;
-                return Err(CatalogError::PreconditionFailed {
-                    message: format!(
-                        "version mismatch: expected {}, got {}",
-                        expected.as_u64(),
-                        manifest.catalog.snapshot_version
-                    ),
-                });
+            IdempotencyCheck::Conflict => return Err(Self::idempotency_conflict_error()),
+            IdempotencyCheck::PreviousFailed {
+                http_status,
+                message,
+            } => return Err(Self::idempotency_request_failed(http_status, message)),
+            IdempotencyCheck::InProgress { .. } => {
+                return Err(Self::idempotency_in_progress_error());
             }
-        }
-        let state =
-            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+        };
 
-        let target_catalog = if catalog == "default" {
-            match self
-                .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
-                .await
-            {
-                Ok(catalog) => catalog,
-                Err(err) => {
-                    guard.release().await?;
-                    return Err(err);
+        let result = async {
+            // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
+            if let Some(expected) = &opts.if_match {
+                let manifest = self.tier1.read_manifest().await?;
+                if manifest.catalog.snapshot_version != expected.as_u64() {
+                    return Err(CatalogError::PreconditionFailed {
+                        message: format!(
+                            "version mismatch: expected {}, got {}",
+                            expected.as_u64(),
+                            manifest.catalog.snapshot_version
+                        ),
+                    });
                 }
             }
-        } else {
-            let Some(catalog_record) = state.catalogs.iter().find(|c| c.name == catalog) else {
-                guard.release().await?;
-                return Err(CatalogError::NotFound {
-                    entity: "catalog".into(),
-                    name: catalog.to_string(),
-                });
+
+            let compactor = self.sync_compactor()?;
+
+            let guard = self
+                .tier1
+                .acquire_lock(self.lock_ttl, self.lock_max_retries)
+                .await?;
+
+            let manifest = self.tier1.read_manifest().await?;
+            if let Some(expected) = &opts.if_match {
+                if manifest.catalog.snapshot_version != expected.as_u64() {
+                    guard.release().await?;
+                    return Err(CatalogError::PreconditionFailed {
+                        message: format!(
+                            "version mismatch: expected {}, got {}",
+                            expected.as_u64(),
+                            manifest.catalog.snapshot_version
+                        ),
+                    });
+                }
+            }
+            let state =
+                tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path)
+                    .await?;
+
+            let target_catalog = if catalog == "default" {
+                match self
+                    .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+                    .await
+                {
+                    Ok(catalog) => catalog,
+                    Err(err) => {
+                        guard.release().await?;
+                        return Err(err);
+                    }
+                }
+            } else {
+                let Some(catalog_record) = state.catalogs.iter().find(|c| c.name == catalog) else {
+                    guard.release().await?;
+                    return Err(CatalogError::NotFound {
+                        entity: "catalog".into(),
+                        name: catalog.to_string(),
+                    });
+                };
+
+                catalog_record.clone()
             };
 
-            catalog_record.clone()
-        };
+            let target_catalog_id = target_catalog.id.as_str();
+            let default_catalog_id = state
+                .catalogs
+                .iter()
+                .find(|c| c.name == "default")
+                .map(|c| c.id.as_str());
 
-        let target_catalog_id = target_catalog.id.as_str();
-        let default_catalog_id = state
-            .catalogs
-            .iter()
-            .find(|c| c.name == "default")
-            .map(|c| c.id.as_str());
+            // Find schema within the requested catalog, treating legacy `NULL` catalog_id as `default`.
+            let ns = state
+                .namespaces
+                .iter()
+                .find(|ns| {
+                    ns.name == schema
+                        && ns.catalog_id.as_deref().or(default_catalog_id)
+                            == Some(target_catalog_id)
+                })
+                .ok_or_else(|| CatalogError::NotFound {
+                    entity: "schema".into(),
+                    name: format!("{catalog}.{schema}"),
+                })?;
+            let namespace_id = ns.id.clone();
 
-        // Find schema within the requested catalog, treating legacy `NULL` catalog_id as `default`.
-        let ns = state
-            .namespaces
-            .iter()
-            .find(|ns| {
-                ns.name == schema
-                    && ns.catalog_id.as_deref().or(default_catalog_id) == Some(target_catalog_id)
-            })
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "schema".into(),
-                name: format!("{catalog}.{schema}"),
-            })?;
-        let namespace_id = ns.id.clone();
+            // Check for duplicate table
+            if state
+                .tables
+                .iter()
+                .any(|t| t.namespace_id == namespace_id && t.name == req.name)
+            {
+                guard.release().await?;
+                return Err(CatalogError::AlreadyExists {
+                    entity: "table".into(),
+                    name: format!("{catalog}.{schema}.{}", req.name),
+                });
+            }
 
-        // Check for duplicate table
-        if state
-            .tables
-            .iter()
-            .any(|t| t.namespace_id == namespace_id && t.name == req.name)
-        {
-            guard.release().await?;
-            return Err(CatalogError::AlreadyExists {
-                entity: "table".into(),
-                name: format!("{catalog}.{schema}.{}", req.name),
-            });
-        }
+            let now = Utc::now().timestamp_millis();
+            let table_id = Uuid::now_v7().to_string();
+            let table_format = normalize_new_table_format(req.format.as_deref())?;
+            let table_format_kind =
+                TableFormat::parse(&table_format).map_err(CatalogError::from)?;
+            let table_location = normalize_table_location_for_write(
+                table_format_kind,
+                req.location.clone(),
+                self.storage.tenant_id(),
+                self.storage.workspace_id(),
+            )?;
 
-        let now = Utc::now().timestamp_millis();
-        let table_id = Uuid::now_v7().to_string();
-        let table_format = normalize_new_table_format(req.format.as_deref())?;
-        let table_format_kind = TableFormat::parse(&table_format).map_err(CatalogError::from)?;
-        let table_location = normalize_table_location_for_write(
-            table_format_kind,
-            req.location.clone(),
-            self.storage.tenant_id(),
-            self.storage.workspace_id(),
-        )?;
+            let table = Table {
+                id: table_id.clone(),
+                namespace_id: namespace_id.clone(),
+                name: req.name.clone(),
+                description: req.description.clone(),
+                location: table_location,
+                format: Some(table_format),
+                created_at: now,
+                updated_at: now,
+            };
 
-        let table = Table {
-            id: table_id.clone(),
-            namespace_id: namespace_id.clone(),
-            name: req.name.clone(),
-            description: req.description.clone(),
-            location: table_location,
-            format: Some(table_format),
-            created_at: now,
-            updated_at: now,
-        };
+            let columns: Vec<ColumnRecord> = req
+                .columns
+                .iter()
+                .map(|col_def| ColumnRecord {
+                    id: Uuid::now_v7().to_string(),
+                    table_id: table_id.clone(),
+                    name: col_def.name.clone(),
+                    data_type: col_def.data_type.clone(),
+                    is_nullable: col_def.is_nullable,
+                    ordinal: col_def.ordinal,
+                    description: col_def.description.clone(),
+                })
+                .collect();
 
-        let columns: Vec<ColumnRecord> = req
-            .columns
-            .iter()
-            .map(|col_def| ColumnRecord {
-                id: Uuid::now_v7().to_string(),
-                table_id: table_id.clone(),
-                name: col_def.name.clone(),
-                data_type: col_def.data_type.clone(),
-                is_nullable: col_def.is_nullable,
-                ordinal: col_def.ordinal,
-                description: col_def.description.clone(),
-            })
-            .collect();
+            let event = CatalogDdlEvent::TableRegistered {
+                table: TableRecord::from(&table),
+                columns,
+            };
 
-        let event = CatalogDdlEvent::TableRegistered {
-            table: TableRecord::from(&table),
-            columns,
-        };
+            let event_id = self
+                .tier1
+                .append_ledger_event(
+                    &guard,
+                    CatalogDomain::Catalog,
+                    &event,
+                    opts.actor.as_deref().unwrap_or("api"),
+                )
+                .await?;
 
-        let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
+            let request = self.single_event_sync_compact_request(
                 CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
-            .await?;
+                &event_id,
+                guard.fencing_token().sequence(),
+                opts.request_id.clone(),
+            );
 
-        let request = self.single_event_sync_compact_request(
-            CatalogDomain::Catalog,
-            &event_id,
-            guard.fencing_token().sequence(),
-            opts.request_id.clone(),
-        );
+            let result = compactor.sync_compact(request).await;
+            guard.release().await?;
+            result.map(|_| table)
+        }
+        .await;
 
-        let result = compactor.sync_compact(request).await;
-        guard.release().await?;
-        result.map(|_| table)
+        match (idempotency, result) {
+            (Some((marker, version)), Ok(table)) => {
+                self.finalize_idempotency_success(marker, version, &table.id, &table.name)
+                    .await?;
+                Ok(table)
+            }
+            (Some((marker, version)), Err(err)) => {
+                self.finalize_idempotency_failure(marker, version, &err)
+                    .await?;
+                Err(err)
+            }
+            (None, result) => result,
+        }
     }
 
     /// Registers a table in a catalog/schema and returns visible commit metadata.

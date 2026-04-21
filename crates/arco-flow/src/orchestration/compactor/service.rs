@@ -259,19 +259,6 @@ impl MicroCompactor {
         Ok((manifest, state))
     }
 
-    /// Returns the current visible base snapshot artifact paths.
-    ///
-    /// This is a manifest-only read path for consumers that need the published
-    /// base snapshot table artifacts without replaying L0 deltas or reconstructing rows.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the current manifest cannot be read.
-    pub async fn current_base_table_paths(&self) -> Result<TablePaths> {
-        let manifest = self.load_current_manifest_only().await?;
-        Ok(manifest.base_snapshot.tables.clone())
-    }
-
     /// Loads orchestration state pinned to one visible root transaction token.
     ///
     /// This opt-in read path resolves `root:{tx_id}` through the visible root
@@ -908,11 +895,6 @@ impl MicroCompactor {
         let manifest_bytes = self.storage.get_raw(&orchestration.manifest_path).await?;
         serde_json::from_slice(&manifest_bytes)
             .map_err(|e| Error::serialization(format!("failed to parse pinned manifest: {e}")))
-    }
-
-    async fn load_current_manifest_only(&self) -> Result<OrchestrationManifest> {
-        let (manifest, _, _, _) = self.read_manifest_with_version().await?;
-        Ok(manifest)
     }
 
     #[cfg(test)]

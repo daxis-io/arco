@@ -27,6 +27,16 @@ pub fn test_router() -> axum::Router {
     ServerBuilder::new().debug(true).build().test_router()
 }
 
+pub fn test_router_with_backend() -> (axum::Router, Arc<MemoryBackend>) {
+    let backend = Arc::new(MemoryBackend::new());
+    let router = ServerBuilder::new()
+        .debug(true)
+        .storage_backend(backend.clone())
+        .build()
+        .test_router();
+    (router, backend)
+}
+
 pub async fn seed_catalog(router: axum::Router) -> Result<axum::Router> {
     let (status, _): (_, serde_json::Value) = helpers::post_json(
         router.clone(),
@@ -75,6 +85,16 @@ pub async fn seed_catalog(router: axum::Router) -> Result<axum::Router> {
 }
 
 pub async fn seed_orchestration_router() -> Result<axum::Router> {
+    seed_orchestration_router_with_base_snapshot(true).await
+}
+
+pub async fn seed_orchestration_router_with_l0_only() -> Result<axum::Router> {
+    seed_orchestration_router_with_base_snapshot(false).await
+}
+
+async fn seed_orchestration_router_with_base_snapshot(
+    force_base_snapshot: bool,
+) -> Result<axum::Router> {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = ServerBuilder::new()
         .debug(true)
@@ -83,17 +103,22 @@ pub async fn seed_orchestration_router() -> Result<axum::Router> {
         .test_router();
 
     let storage = ScopedStorage::new(backend, "test-tenant", "test-workspace")?;
-    seed_orchestration_state(&storage).await?;
+    seed_orchestration_storage(&storage, force_base_snapshot).await?;
 
     Ok(router)
 }
 
-async fn seed_orchestration_state(storage: &ScopedStorage) -> Result<()> {
+pub async fn seed_orchestration_storage(
+    storage: &ScopedStorage,
+    force_base_snapshot: bool,
+) -> Result<()> {
     let manifest_id = "00000000000000000000";
     let manifest_path = format!("state/orchestration/manifests/{manifest_id}.json");
 
     let mut manifest = OrchestrationManifest::new(Ulid::new().to_string());
-    manifest.l0_limits.max_count = 1;
+    if force_base_snapshot {
+        manifest.l0_limits.max_count = 1;
+    }
 
     storage
         .put_raw(

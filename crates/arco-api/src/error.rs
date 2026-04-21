@@ -277,6 +277,10 @@ impl From<CatalogError> for ApiError {
             }
             CatalogError::PreconditionFailed { message } => Self::precondition_failed(message),
             CatalogError::CasFailed { message } => Self::conflict(message),
+            CatalogError::RequestFailed {
+                http_status,
+                message,
+            } => Self::from_status_and_message(http_status, message),
             CatalogError::Storage { message }
             | CatalogError::Serialization { message }
             | CatalogError::Parquet { message }

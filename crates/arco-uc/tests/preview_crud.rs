@@ -11,6 +11,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use serde_json::{Value, json};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 fn test_router() -> Router {
     let backend = Arc::new(MemoryBackend::new());
@@ -76,6 +77,53 @@ async fn uc_request(
         .uri(uri)
         .header("X-Tenant-Id", tenant)
         .header("X-Workspace-Id", workspace);
+
+    let req = if let Some(payload) = body {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+        let bytes =
+            serde_json::to_vec(&payload).map_err(|err| format!("serialize request body: {err}"))?;
+        builder
+            .body(Body::from(bytes))
+            .map_err(|err| format!("build request: {err}"))?
+    } else {
+        builder
+            .body(Body::empty())
+            .map_err(|err| format!("build request: {err}"))?
+    };
+
+    let response = router
+        .clone()
+        .oneshot(req)
+        .await
+        .map_err(|err| format!("route request: {err}"))?;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .map_err(|err| format!("read response body: {err}"))?;
+
+    let parsed = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).map_err(|err| format!("parse response body: {err}"))?
+    };
+    Ok((status, parsed))
+}
+
+async fn uc_request_with_idempotency(
+    router: &Router,
+    method: Method,
+    uri: &str,
+    tenant: &str,
+    workspace: &str,
+    idempotency_key: &str,
+    body: Option<Value>,
+) -> Result<(StatusCode, Value), String> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("X-Tenant-Id", tenant)
+        .header("X-Workspace-Id", workspace)
+        .header("Idempotency-Key", idempotency_key);
 
     let req = if let Some(payload) = body {
         builder = builder.header(header::CONTENT_TYPE, "application/json");
@@ -478,6 +526,231 @@ async fn uc_table_create_is_visible_through_authoritative_reader_without_preview
             .is_none(),
         "preview table object should not be created for authoritative UC CRUD"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_catalog_replays_with_same_idempotency_key() -> Result<(), String> {
+    let (router, backend) = test_harness();
+    let idempotency_key = Uuid::now_v7().to_string();
+    let payload = json!({
+        "name": "main",
+        "comment": "primary catalog"
+    });
+
+    let (first_status, first_body) = uc_request_with_idempotency(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        &idempotency_key,
+        Some(payload.clone()),
+    )
+    .await?;
+    assert_eq!(first_status, StatusCode::OK);
+
+    let (second_status, second_body) = uc_request_with_idempotency(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        &idempotency_key,
+        Some(payload),
+    )
+    .await?;
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(second_body, first_body);
+
+    let reader = CatalogReader::new(scoped_storage(backend, "tenant_a", "workspace_a")?);
+    let catalogs = reader
+        .list_catalogs()
+        .await
+        .map_err(|err| format!("list catalogs after idempotent replay: {err}"))?;
+    assert_eq!(catalogs.len(), 1);
+    assert_eq!(catalogs[0].name, "main");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_catalog_conflicts_when_idempotency_key_is_reused_for_different_payload()
+-> Result<(), String> {
+    let router = test_router();
+    let idempotency_key = Uuid::now_v7().to_string();
+
+    let (first_status, _) = uc_request_with_idempotency(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        &idempotency_key,
+        Some(json!({
+            "name": "main",
+            "comment": "primary catalog"
+        })),
+    )
+    .await?;
+    assert_eq!(first_status, StatusCode::OK);
+
+    let (second_status, second_body) = uc_request_with_idempotency(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        &idempotency_key,
+        Some(json!({
+            "name": "secondary",
+            "comment": "different catalog"
+        })),
+    )
+    .await?;
+    assert_eq!(second_status, StatusCode::CONFLICT);
+    assert_eq!(
+        second_body
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str),
+        Some("Idempotency-Key already used with different request body")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_schema_replays_with_same_idempotency_key() -> Result<(), String> {
+    let (router, backend) = test_harness();
+
+    let (catalog_status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(catalog_status, StatusCode::OK);
+
+    let idempotency_key = Uuid::now_v7().to_string();
+    let payload = json!({
+        "name": "analytics",
+        "catalog_name": "main",
+        "comment": "reporting schema"
+    });
+
+    let (first_status, first_body) = uc_request_with_idempotency(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        &idempotency_key,
+        Some(payload.clone()),
+    )
+    .await?;
+    assert_eq!(first_status, StatusCode::OK);
+
+    let (second_status, second_body) = uc_request_with_idempotency(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        &idempotency_key,
+        Some(payload),
+    )
+    .await?;
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(second_body, first_body);
+
+    let reader = CatalogReader::new(scoped_storage(backend, "tenant_a", "workspace_a")?);
+    let schemas = reader
+        .list_schemas("main")
+        .await
+        .map_err(|err| format!("list schemas after idempotent replay: {err}"))?;
+    assert_eq!(schemas.len(), 1);
+    assert_eq!(schemas[0].name, "analytics");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_table_replays_with_same_idempotency_key() -> Result<(), String> {
+    let (router, backend) = test_harness();
+
+    let (catalog_status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(catalog_status, StatusCode::OK);
+
+    let (schema_status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "analytics",
+            "catalog_name": "main"
+        })),
+    )
+    .await?;
+    assert_eq!(schema_status, StatusCode::OK);
+
+    let idempotency_key = Uuid::now_v7().to_string();
+    let payload = json!({
+        "name": "events",
+        "catalog_name": "main",
+        "schema_name": "analytics",
+        "table_type": "EXTERNAL",
+        "data_source_format": "DELTA",
+        "columns": [],
+        "storage_location": "s3://bucket/main/analytics/events",
+        "comment": "tenant events"
+    });
+
+    let (first_status, first_body) = uc_request_with_idempotency(
+        &router,
+        Method::POST,
+        "/tables",
+        "tenant_a",
+        "workspace_a",
+        &idempotency_key,
+        Some(payload.clone()),
+    )
+    .await?;
+    assert_eq!(first_status, StatusCode::OK);
+
+    let (second_status, second_body) = uc_request_with_idempotency(
+        &router,
+        Method::POST,
+        "/tables",
+        "tenant_a",
+        "workspace_a",
+        &idempotency_key,
+        Some(payload),
+    )
+    .await?;
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(second_body, first_body);
+
+    let reader = CatalogReader::new(scoped_storage(backend, "tenant_a", "workspace_a")?);
+    let table = reader
+        .get_table_in_schema("main", "analytics", "events")
+        .await
+        .map_err(|err| format!("get table after idempotent replay: {err}"))?;
+    assert!(table.is_some());
 
     Ok(())
 }

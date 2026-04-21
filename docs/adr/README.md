@@ -48,3 +48,4 @@ Each ADR follows this structure:
 | [032](adr-032-immutable-manifest-pointers.md) | Immutable Manifest Snapshots + Pointer CAS | Accepted |
 | [033](adr-033-internal-durability-modes.md) | Internal Durability Modes for Orchestration Compaction | Proposed |
 | [034](adr-034-fenced-head-published-control-plane-transactions.md) | Fenced Head-Published Control-Plane Transactions | Proposed |
+| [035](adr-035-system-catalog-tables.md) | System Catalog Tables | Proposed |

@@ -19,6 +19,11 @@ Arco uses split services with hard boundaries:
 - Browser analytics use DuckDB-WASM via signed URLs.
 - Task execution happens in external workers via canonical dispatch envelopes.
 
+System tables follow the same model: pointer-first published state remains the
+source for reads, `/api/v1/query` is the first SQL surface for `system.*`, and
+those tables are operational projections rather than the mechanism that commits
+catalog or orchestration state.
+
 Current cycle non-goals: no in-process ETL engine and no Spark/dbt/Flink adapter implementation.
 
 ## Who is Arco for?

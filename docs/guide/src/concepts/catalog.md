@@ -29,6 +29,10 @@ Broader governance scope remains narrower than the highest-level architectural f
 - Browser-oriented read paths are enabled through scoped signed URL workflows.
 - Catalog reads are designed to remain deterministic and auditable.
 
+Catalog reads stay pointer-first: `/api/v1/query` is the initial SQL surface
+for `system.*` tables, and those tables are queryable projections over
+manifest-selected Parquet artifacts rather than the commit point for control-plane truth.
+
 ## Security and Isolation
 
 - Tenant/workspace scoped paths are mandatory.

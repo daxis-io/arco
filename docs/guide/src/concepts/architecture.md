@@ -24,6 +24,11 @@ Arco is a file-native metadata platform with two tightly integrated domains:
 - Operational facts are append-first, then compacted into bounded-staleness views.
 - Read paths are designed for stable contracts and predictable eventual convergence.
 
+That same boundary applies to tenant-visible system tables: catalog reads remain
+pointer-first, `/api/v1/query` is the initial SQL surface, and `system.*`
+relations are read-only projections over published artifacts rather than a new
+commit point.
+
 Current scope note:
 
 - Arco has strong repo-side proof for immutable snapshot publication, fenced head movement, pointer-first reads, and compactor-owned materialization.

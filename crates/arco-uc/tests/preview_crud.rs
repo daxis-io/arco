@@ -1,8 +1,10 @@
-//! Integration tests for Unity Catalog preview CRUD interoperability endpoints.
+//! Integration tests for Unity Catalog catalog/schema/table CRUD endpoints.
 
 use std::sync::Arc;
 
-use arco_core::storage::MemoryBackend;
+use arco_catalog::CatalogReader;
+use arco_core::ScopedStorage;
+use arco_core::storage::{MemoryBackend, WritePrecondition, WriteResult};
 use arco_uc::{UnityCatalogState, unity_catalog_router};
 use axum::Router;
 use axum::body::Body;
@@ -14,6 +16,51 @@ fn test_router() -> Router {
     let backend = Arc::new(MemoryBackend::new());
     let state = UnityCatalogState::new(backend);
     unity_catalog_router(state)
+}
+
+fn test_harness() -> (Router, Arc<MemoryBackend>) {
+    let backend = Arc::new(MemoryBackend::new());
+    let state = UnityCatalogState::new(backend.clone());
+    (unity_catalog_router(state), backend)
+}
+
+fn scoped_storage(
+    backend: Arc<MemoryBackend>,
+    tenant: &str,
+    workspace: &str,
+) -> Result<ScopedStorage, String> {
+    ScopedStorage::new(backend, tenant, workspace).map_err(|err| format!("scoped storage: {err}"))
+}
+
+fn preview_catalog_path(name: &str) -> String {
+    format!("unity-catalog-preview/catalogs/{name}.json")
+}
+
+fn preview_schema_path(catalog_name: &str, schema_name: &str) -> String {
+    format!("unity-catalog-preview/schemas/{catalog_name}/{schema_name}.json")
+}
+
+fn preview_table_path(catalog_name: &str, schema_name: &str, table_name: &str) -> String {
+    format!("unity-catalog-preview/tables/{catalog_name}/{schema_name}/{table_name}.json")
+}
+
+async fn write_preview_json(
+    storage: &ScopedStorage,
+    path: &str,
+    payload: Value,
+) -> Result<(), String> {
+    let bytes =
+        serde_json::to_vec(&payload).map_err(|err| format!("serialize preview json: {err}"))?;
+    match storage
+        .put_raw(path, bytes.into(), WritePrecondition::None)
+        .await
+        .map_err(|err| format!("write preview json: {err}"))?
+    {
+        WriteResult::Success { .. } => Ok(()),
+        WriteResult::PreconditionFailed { current_version } => Err(format!(
+            "unexpected preview write precondition failure at {path}: {current_version}"
+        )),
+    }
 }
 
 async fn uc_request(
@@ -143,6 +190,47 @@ async fn create_and_list_catalogs() -> Result<(), String> {
 }
 
 #[tokio::test]
+async fn uc_catalog_create_is_visible_through_authoritative_reader_without_preview_object()
+-> Result<(), String> {
+    let (router, backend) = test_harness();
+
+    let (create_status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "main",
+            "comment": "primary catalog"
+        })),
+    )
+    .await?;
+    assert_eq!(create_status, StatusCode::OK);
+
+    let storage = scoped_storage(backend, "tenant_a", "workspace_a")?;
+    let reader = CatalogReader::new(storage.clone());
+    let catalog = reader
+        .get_catalog("main")
+        .await
+        .map_err(|err| format!("read catalog from authoritative path: {err}"))?;
+    assert!(
+        catalog.is_some(),
+        "catalog should exist in authoritative catalog state"
+    );
+    assert!(
+        storage
+            .head_raw(&preview_catalog_path("main"))
+            .await
+            .map_err(|err| format!("head preview catalog object: {err}"))?
+            .is_none(),
+        "preview catalog object should not be created for authoritative UC CRUD"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_and_list_schemas_scoped_to_catalog() -> Result<(), String> {
     let router = test_router();
 
@@ -194,6 +282,58 @@ async fn create_and_list_schemas_scoped_to_catalog() -> Result<(), String> {
         schemas[0].get("full_name").and_then(Value::as_str),
         Some("main.analytics")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn uc_schema_create_is_visible_through_authoritative_reader_without_preview_object()
+-> Result<(), String> {
+    let (router, backend) = test_harness();
+
+    let (catalog_status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(catalog_status, StatusCode::OK);
+
+    let (create_status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "analytics",
+            "catalog_name": "main"
+        })),
+    )
+    .await?;
+    assert_eq!(create_status, StatusCode::OK);
+
+    let storage = scoped_storage(backend, "tenant_a", "workspace_a")?;
+    let reader = CatalogReader::new(storage.clone());
+    let schemas = reader
+        .list_schemas("main")
+        .await
+        .map_err(|err| format!("read schemas from authoritative path: {err}"))?;
+    assert!(
+        schemas.iter().any(|schema| schema.name == "analytics"),
+        "schema should exist in authoritative catalog state"
+    );
+    assert!(
+        storage
+            .head_raw(&preview_schema_path("main", "analytics"))
+            .await
+            .map_err(|err| format!("head preview schema object: {err}"))?
+            .is_none(),
+        "preview schema object should not be created for authoritative UC CRUD"
+    );
+
     Ok(())
 }
 
@@ -268,6 +408,165 @@ async fn create_and_list_tables_scoped_to_catalog_and_schema() -> Result<(), Str
         tables[0].get("full_name").and_then(Value::as_str),
         Some("main.analytics.events")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn uc_table_create_is_visible_through_authoritative_reader_without_preview_object()
+-> Result<(), String> {
+    let (router, backend) = test_harness();
+
+    let (catalog_status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(catalog_status, StatusCode::OK);
+
+    let (schema_status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "analytics",
+            "catalog_name": "main"
+        })),
+    )
+    .await?;
+    assert_eq!(schema_status, StatusCode::OK);
+
+    let (create_status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/tables",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "events",
+            "catalog_name": "main",
+            "schema_name": "analytics",
+            "table_type": "EXTERNAL",
+            "data_source_format": "DELTA",
+            "columns": [],
+            "storage_location": "s3://bucket/main/analytics/events"
+        })),
+    )
+    .await?;
+    assert_eq!(create_status, StatusCode::OK);
+
+    let storage = scoped_storage(backend, "tenant_a", "workspace_a")?;
+    let reader = CatalogReader::new(storage.clone());
+    let table = reader
+        .get_table_in_schema("main", "analytics", "events")
+        .await
+        .map_err(|err| format!("read table from authoritative path: {err}"))?;
+    assert!(
+        table.is_some(),
+        "table should exist in authoritative catalog state"
+    );
+    assert!(
+        storage
+            .head_raw(&preview_table_path("main", "analytics", "events"))
+            .await
+            .map_err(|err| format!("head preview table object: {err}"))?
+            .is_none(),
+        "preview table object should not be created for authoritative UC CRUD"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn preview_only_catalog_schema_and_table_objects_are_ignored() -> Result<(), String> {
+    let (router, backend) = test_harness();
+    let storage = scoped_storage(backend, "tenant_a", "workspace_a")?;
+
+    write_preview_json(
+        &storage,
+        &preview_catalog_path("main"),
+        json!({"name": "main", "comment": "preview only"}),
+    )
+    .await?;
+    write_preview_json(
+        &storage,
+        &preview_schema_path("main", "analytics"),
+        json!({
+            "name": "analytics",
+            "catalog_name": "main",
+            "full_name": "main.analytics"
+        }),
+    )
+    .await?;
+    write_preview_json(
+        &storage,
+        &preview_table_path("main", "analytics", "events"),
+        json!({
+            "name": "events",
+            "catalog_name": "main",
+            "schema_name": "analytics",
+            "full_name": "main.analytics.events"
+        }),
+    )
+    .await?;
+
+    let (catalogs_status, catalogs_body) = uc_request(
+        &router,
+        Method::GET,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(catalogs_status, StatusCode::OK);
+    assert_eq!(
+        catalogs_body
+            .get("catalogs")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0),
+        "preview-only catalog object must not appear in authoritative list results"
+    );
+
+    let (catalog_status, _) = uc_request(
+        &router,
+        Method::GET,
+        "/catalogs/main",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(catalog_status, StatusCode::NOT_FOUND);
+
+    let (schema_status, _) = uc_request(
+        &router,
+        Method::GET,
+        "/schemas/main.analytics",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(schema_status, StatusCode::NOT_FOUND);
+
+    let (table_status, _) = uc_request(
+        &router,
+        Method::GET,
+        "/tables/main.analytics.events",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(table_status, StatusCode::NOT_FOUND);
+
     Ok(())
 }
 
@@ -427,6 +726,178 @@ async fn schema_get_delete_and_not_found() -> Result<(), String> {
         body.pointer("/error/error_code").and_then(Value::as_str),
         Some("NOT_FOUND")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_patch_updates_authoritative_comment() -> Result<(), String> {
+    let (router, backend) = test_harness();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main", "comment": "before"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = uc_request(
+        &router,
+        Method::PATCH,
+        "/catalogs/main",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"comment": "after"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.get("comment").and_then(Value::as_str), Some("after"));
+
+    let storage = scoped_storage(backend, "tenant_a", "workspace_a")?;
+    let reader = CatalogReader::new(storage);
+    let catalog = reader
+        .get_catalog("main")
+        .await
+        .map_err(|err| format!("read updated catalog: {err}"))?
+        .ok_or_else(|| "catalog should exist after patch".to_string())?;
+    assert_eq!(catalog.description.as_deref(), Some("after"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn schema_patch_updates_authoritative_comment() -> Result<(), String> {
+    let (router, backend) = test_harness();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "analytics",
+            "catalog_name": "main",
+            "comment": "before"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = uc_request(
+        &router,
+        Method::PATCH,
+        "/schemas/main.analytics",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"comment": "after"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.get("comment").and_then(Value::as_str), Some("after"));
+
+    let storage = scoped_storage(backend, "tenant_a", "workspace_a")?;
+    let reader = CatalogReader::new(storage);
+    let schema = reader
+        .list_schemas("main")
+        .await
+        .map_err(|err| format!("read updated schemas: {err}"))?
+        .into_iter()
+        .find(|candidate| candidate.name == "analytics")
+        .ok_or_else(|| "schema should exist after patch".to_string())?;
+    assert_eq!(schema.description.as_deref(), Some("after"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn force_delete_catalog_cascades_authoritative_state() -> Result<(), String> {
+    let (router, backend) = test_harness();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "analytics",
+            "catalog_name": "main"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/tables",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "events",
+            "catalog_name": "main",
+            "schema_name": "analytics",
+            "table_type": "EXTERNAL",
+            "data_source_format": "DELTA",
+            "columns": [],
+            "storage_location": "s3://bucket/main/analytics/events"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = uc_request(
+        &router,
+        Method::DELETE,
+        "/catalogs/main?force=true",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "unexpected force-delete body: {body:?}"
+    );
+
+    let storage = scoped_storage(backend, "tenant_a", "workspace_a")?;
+    let reader = CatalogReader::new(storage);
+    assert!(
+        reader
+            .get_catalog("main")
+            .await
+            .map_err(|err| format!("read catalog after force delete: {err}"))?
+            .is_none(),
+        "catalog should be removed by force delete"
+    );
+
     Ok(())
 }
 

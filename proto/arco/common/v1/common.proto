@@ -33,20 +33,3 @@ enum NullValue {
   NULL_VALUE_UNSPECIFIED = 0;
   NULL_VALUE_NULL = 1;
 }
-
-// Supported table formats across public Arco contracts.
-enum TableFormat {
-  TABLE_FORMAT_UNSPECIFIED = 0;
-  TABLE_FORMAT_DELTA = 1;
-  TABLE_FORMAT_ICEBERG = 2;
-  TABLE_FORMAT_PARQUET = 3;
-}
-
-// Canonical published file metadata reused across catalog/orchestration contracts.
-message FileEntry {
-  string path = 1;
-  uint64 size_bytes = 2;
-  optional uint64 row_count = 3;
-  optional string content_hash = 4;
-  optional string format = 5;
-}

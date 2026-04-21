@@ -41,6 +41,10 @@ message DependencyEdge {
   string target_task_key = 2;
 }
 
+// Runtime-accurate orchestration run states.
+//
+// Public HTTP/UI adapters may collapse these into smaller presentation enums,
+// but this protobuf surface intentionally preserves the richer execution truth.
 enum RunState {
   RUN_STATE_UNSPECIFIED = 0;
   RUN_STATE_PENDING = 1;
@@ -52,6 +56,7 @@ enum RunState {
   RUN_STATE_TIMED_OUT = 7;
 }
 
+// Runtime-accurate task states for cross-process and replay-safe orchestration contracts.
 enum TaskState {
   TASK_STATE_UNSPECIFIED = 0;
   TASK_STATE_PLANNED = 1;
@@ -123,6 +128,7 @@ message TaskMetrics {
 }
 
 // Worker-reported callback output before publication visibility is known.
+// This is distinct from the published/read-model `TaskOutput`.
 message TaskCallbackOutput {
   optional string materialization_id = 1;
   optional uint64 row_count = 2;
@@ -133,10 +139,20 @@ message TaskCallbackOutput {
   optional string delta_partition = 7;
 }
 
+// Published file metadata owned by the orchestration output contract.
+message FileEntry {
+  string path = 1;
+  uint64 size_bytes = 2;
+  optional uint64 row_count = 3;
+  optional string content_hash = 4;
+  optional string format = 5;
+}
+
 // Published/read-model output with visibility semantics.
+// This is the externally visible outcome, not the worker callback payload.
 message TaskOutput {
   optional string materialization_id = 1;
-  repeated arco.common.v1.FileEntry files = 2;
+  repeated FileEntry files = 2;
   optional uint64 row_count = 3;
   optional uint64 byte_size = 4;
   OutputVisibilityState visibility_state = 5;
@@ -348,7 +364,8 @@ message TaskFinished {
   TaskError error = 8;
   TaskMetrics metrics = 9;
   optional string cancelled_during_phase = 10;
-  optional string partial_progress_json = 11;
+  reserved 11;
+  reserved "partial_progress_json";
   optional string asset_key = 12;
   arco.common.v1.PartitionKey partition_key = 13;
   optional string code_version = 14;
@@ -469,6 +486,12 @@ message BackfillStateChanged {
   optional string changed_by = 5;
 }
 
+// Authoritative typed orchestration event envelope for cross-process commits.
+//
+// This file intentionally exposes the append-only event contract consumed by
+// `CommitOrchestrationBatch` and root transactions. Storage-only event shapes
+// should live outside the public proto tree instead of being tunneled here as
+// ad hoc JSON payloads.
 message OrchestrationEventEnvelope {
   string event_id = 1;
   uint32 event_version = 2;

@@ -31,9 +31,8 @@ use arco_flow::orchestration::proto::event_from_proto_envelope;
 use arco_flow::orchestration_compaction_lock_path;
 use arco_proto::arco::catalog::v1::{
     CatalogDdlOperation, CreateCatalogOp, CreateSchemaOp, DropTableOp, RegisterTableOp,
-    RenameTableOp, UpdateTableOp, catalog_ddl_operation,
+    RenameTableOp, TableFormat as ProtoTableFormat, UpdateTableOp, catalog_ddl_operation,
 };
-use arco_proto::arco::common::v1::TableFormat as ProtoTableFormat;
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CatalogTxReceipt as ProtoCatalogTxReceipt,
     CatalogTxStatus, CommitOrchestrationBatchRequest, CommitOrchestrationBatchResponse,
@@ -1202,41 +1201,41 @@ struct TxExecutionOutcome<T> {
 #[derive(Debug, Clone)]
 enum CatalogMutation {
     CreateCatalog {
-        name: String,
+        catalog: String,
         description: Option<String>,
     },
     CreateSchema {
-        catalog_name: String,
-        schema_name: String,
+        catalog: String,
+        schema: String,
         description: Option<String>,
     },
     RegisterTable {
-        catalog_name: String,
-        schema_name: String,
-        table_name: String,
+        catalog: String,
+        schema: String,
+        table: String,
         description: Option<String>,
         location: Option<String>,
         format: Option<String>,
         columns: Vec<ColumnDefinition>,
     },
     UpdateTable {
-        catalog_name: String,
-        schema_name: String,
-        table_name: String,
+        catalog: String,
+        schema: String,
+        table: String,
         description: Option<Option<String>>,
         location: Option<Option<String>>,
         format: Option<Option<String>>,
     },
     DropTable {
-        catalog_name: String,
-        schema_name: String,
-        table_name: String,
+        catalog: String,
+        schema: String,
+        table: String,
     },
     RenameTable {
-        catalog_name: String,
-        schema_name: String,
-        old_table_name: String,
-        new_table_name: String,
+        catalog: String,
+        schema: String,
+        table: String,
+        new_table: String,
     },
 }
 
@@ -1349,33 +1348,33 @@ impl CatalogMutation {
     fn from_proto(operation: &CatalogDdlOperation) -> Result<Self, ApiError> {
         match operation.op.as_ref() {
             Some(catalog_ddl_operation::Op::CreateCatalog(CreateCatalogOp {
-                name,
+                catalog,
                 description,
             })) => Ok(Self::CreateCatalog {
-                name: name.clone(),
+                catalog: catalog.clone(),
                 description: description.clone(),
             }),
             Some(catalog_ddl_operation::Op::CreateSchema(CreateSchemaOp {
-                catalog_name,
-                schema_name,
+                catalog,
+                schema,
                 description,
             })) => Ok(Self::CreateSchema {
-                catalog_name: catalog_name.clone(),
-                schema_name: schema_name.clone(),
+                catalog: catalog.clone(),
+                schema: schema.clone(),
                 description: description.clone(),
             }),
             Some(catalog_ddl_operation::Op::RegisterTable(RegisterTableOp {
-                catalog_name,
-                schema_name,
-                table_name,
+                catalog,
+                schema,
+                table,
                 description,
                 location,
                 format,
                 columns,
             })) => Ok(Self::RegisterTable {
-                catalog_name: catalog_name.clone(),
-                schema_name: schema_name.clone(),
-                table_name: table_name.clone(),
+                catalog: catalog.clone(),
+                schema: schema.clone(),
+                table: table.clone(),
                 description: description.clone(),
                 location: location.clone(),
                 format: parse_table_format(*format)?,
@@ -1391,16 +1390,16 @@ impl CatalogMutation {
                     .collect(),
             }),
             Some(catalog_ddl_operation::Op::UpdateTable(UpdateTableOp {
-                catalog_name,
-                schema_name,
-                table_name,
+                catalog,
+                schema,
+                table,
                 description,
                 location,
                 format,
             })) => Ok(Self::UpdateTable {
-                catalog_name: catalog_name.clone(),
-                schema_name: schema_name.clone(),
-                table_name: table_name.clone(),
+                catalog: catalog.clone(),
+                schema: schema.clone(),
+                table: table.clone(),
                 description: description.clone().map(Some),
                 location: location.clone().map(Some),
                 format: format
@@ -1409,24 +1408,24 @@ impl CatalogMutation {
                     .transpose()?,
             }),
             Some(catalog_ddl_operation::Op::DropTable(DropTableOp {
-                catalog_name,
-                schema_name,
-                table_name,
+                catalog,
+                schema,
+                table,
             })) => Ok(Self::DropTable {
-                catalog_name: catalog_name.clone(),
-                schema_name: schema_name.clone(),
-                table_name: table_name.clone(),
+                catalog: catalog.clone(),
+                schema: schema.clone(),
+                table: table.clone(),
             }),
             Some(catalog_ddl_operation::Op::RenameTable(RenameTableOp {
-                catalog_name,
-                schema_name,
-                old_table_name,
-                new_table_name,
+                catalog,
+                schema,
+                table,
+                new_table,
             })) => Ok(Self::RenameTable {
-                catalog_name: catalog_name.clone(),
-                schema_name: schema_name.clone(),
-                old_table_name: old_table_name.clone(),
-                new_table_name: new_table_name.clone(),
+                catalog: catalog.clone(),
+                schema: schema.clone(),
+                table: table.clone(),
+                new_table: new_table.clone(),
             }),
             None => Err(ApiError::bad_request("catalog DDL operation is required")),
         }
@@ -1440,34 +1439,37 @@ impl CatalogMutation {
 
     fn request_hash_value(&self) -> Result<serde_json::Value, ApiError> {
         Ok(match self {
-            Self::CreateCatalog { name, description } => serde_json::json!({
+            Self::CreateCatalog {
+                catalog,
+                description,
+            } => serde_json::json!({
                 "type": "create_catalog",
-                "name": name,
+                "catalog": catalog,
                 "description": description,
             }),
             Self::CreateSchema {
-                catalog_name,
-                schema_name,
+                catalog,
+                schema,
                 description,
             } => serde_json::json!({
                 "type": "create_schema",
-                "catalog_name": catalog_name,
-                "schema_name": schema_name,
+                "catalog": catalog,
+                "schema": schema,
                 "description": description,
             }),
             Self::RegisterTable {
-                catalog_name,
-                schema_name,
-                table_name,
+                catalog,
+                schema,
+                table,
                 description,
                 location,
                 format,
                 columns,
             } => serde_json::json!({
                 "type": "register_table",
-                "catalog_name": catalog_name,
-                "schema_name": schema_name,
-                "table_name": table_name,
+                "catalog": catalog,
+                "schema": schema,
+                "table": table,
                 "description": description,
                 "location": location,
                 "format": format,
@@ -1480,9 +1482,9 @@ impl CatalogMutation {
                 })).collect::<Vec<_>>(),
             }),
             Self::UpdateTable {
-                catalog_name,
-                schema_name,
-                table_name,
+                catalog,
+                schema,
+                table,
                 description,
                 location,
                 format,
@@ -1493,16 +1495,16 @@ impl CatalogMutation {
                     serde_json::Value::String("update_table".to_string()),
                 );
                 value.insert(
-                    "catalog_name".to_string(),
-                    serde_json::Value::String(catalog_name.clone()),
+                    "catalog".to_string(),
+                    serde_json::Value::String(catalog.clone()),
                 );
                 value.insert(
-                    "schema_name".to_string(),
-                    serde_json::Value::String(schema_name.clone()),
+                    "schema".to_string(),
+                    serde_json::Value::String(schema.clone()),
                 );
                 value.insert(
-                    "table_name".to_string(),
-                    serde_json::Value::String(table_name.clone()),
+                    "table".to_string(),
+                    serde_json::Value::String(table.clone()),
                 );
                 if let Some(description) = description {
                     value.insert(
@@ -1537,26 +1539,26 @@ impl CatalogMutation {
                 serde_json::Value::Object(value)
             }
             Self::DropTable {
-                catalog_name,
-                schema_name,
-                table_name,
+                catalog,
+                schema,
+                table,
             } => serde_json::json!({
                 "type": "drop_table",
-                "catalog_name": catalog_name,
-                "schema_name": schema_name,
-                "table_name": table_name,
+                "catalog": catalog,
+                "schema": schema,
+                "table": table,
             }),
             Self::RenameTable {
-                catalog_name,
-                schema_name,
-                old_table_name,
-                new_table_name,
+                catalog,
+                schema,
+                table,
+                new_table,
             } => serde_json::json!({
                 "type": "rename_table",
-                "catalog_name": catalog_name,
-                "schema_name": schema_name,
-                "old_table_name": old_table_name,
-                "new_table_name": new_table_name,
+                "catalog": catalog,
+                "schema": schema,
+                "table": table,
+                "new_table": new_table,
             }),
         })
     }
@@ -1567,29 +1569,27 @@ impl CatalogMutation {
         options: WriteOptions,
     ) -> arco_catalog::Result<CatalogTransactionCommit> {
         match self {
-            Self::CreateCatalog { name, description } => {
-                writer
-                    .create_catalog_transaction(name, description.as_deref(), options)
-                    .await
-            }
-            Self::CreateSchema {
-                catalog_name,
-                schema_name,
+            Self::CreateCatalog {
+                catalog,
                 description,
             } => {
                 writer
-                    .create_schema_transaction(
-                        catalog_name,
-                        schema_name,
-                        description.as_deref(),
-                        options,
-                    )
+                    .create_catalog_transaction(catalog, description.as_deref(), options)
+                    .await
+            }
+            Self::CreateSchema {
+                catalog,
+                schema,
+                description,
+            } => {
+                writer
+                    .create_schema_transaction(catalog, schema, description.as_deref(), options)
                     .await
             }
             Self::RegisterTable {
-                catalog_name,
-                schema_name,
-                table_name,
+                catalog,
+                schema,
+                table,
                 description,
                 location,
                 format,
@@ -1597,10 +1597,10 @@ impl CatalogMutation {
             } => {
                 writer
                     .register_table_in_schema_transaction(
-                        catalog_name,
-                        schema_name,
+                        catalog,
+                        schema,
                         RegisterTableInSchemaRequest {
-                            name: table_name.clone(),
+                            name: table.clone(),
                             description: description.clone(),
                             location: location.clone(),
                             format: format.clone(),
@@ -1611,18 +1611,18 @@ impl CatalogMutation {
                     .await
             }
             Self::UpdateTable {
-                catalog_name,
-                schema_name,
-                table_name,
+                catalog,
+                schema,
+                table,
                 description,
                 location,
                 format,
             } => {
                 writer
                     .update_table_in_schema_transaction(
-                        catalog_name,
-                        schema_name,
-                        table_name,
+                        catalog,
+                        schema,
+                        table,
                         TablePatch {
                             description: description.clone(),
                             location: location.clone(),
@@ -1633,33 +1633,22 @@ impl CatalogMutation {
                     .await
             }
             Self::DropTable {
-                catalog_name,
-                schema_name,
-                table_name,
+                catalog,
+                schema,
+                table,
             } => {
                 writer
-                    .drop_table_in_schema_transaction(
-                        catalog_name,
-                        schema_name,
-                        table_name,
-                        options,
-                    )
+                    .drop_table_in_schema_transaction(catalog, schema, table, options)
                     .await
             }
             Self::RenameTable {
-                catalog_name,
-                schema_name,
-                old_table_name,
-                new_table_name,
+                catalog,
+                schema,
+                table,
+                new_table,
             } => {
                 writer
-                    .rename_table_in_schema_transaction(
-                        catalog_name,
-                        schema_name,
-                        old_table_name,
-                        new_table_name,
-                        options,
-                    )
+                    .rename_table_in_schema_transaction(catalog, schema, table, new_table, options)
                     .await
             }
         }

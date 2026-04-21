@@ -28,7 +28,7 @@ Observed results:
 - `arco-api` root replay protocol: passed
 - `arco-api` visible contracts: passed
 - `arco-compactor` operational smoke and handler boundary tests: passed
-- Fresh `CARGO_TARGET_DIR=target-codex-review cargo check -p arco-api --lib`: passed
+- Fresh `CARGO_TARGET_DIR=target-review cargo check -p arco-api --lib`: passed
 
 ## Invariant Matrix
 

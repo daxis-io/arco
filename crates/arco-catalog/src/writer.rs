@@ -42,7 +42,7 @@ use crate::parquet_util::{
     CatalogRecord, ColumnRecord, LineageEdgeRecord, NamespaceRecord, TableRecord,
 };
 use crate::sync_compactor::SyncCompactor;
-use crate::tier1_events::{CatalogDdlEvent, CatalogDdlEventV2, LineageDdlEvent};
+use crate::tier1_events::{CatalogDdlEvent, CatalogDdlEventV2, CatalogDdlEventV3, LineageDdlEvent};
 use crate::tier1_state;
 use crate::tier1_writer::Tier1Writer;
 use crate::write_options::WriteOptions;
@@ -547,6 +547,25 @@ impl CatalogWriter {
         }
     }
 
+    fn multi_event_sync_compact_request(
+        &self,
+        domain: CatalogDomain,
+        event_ids: &[String],
+        fencing_token: u64,
+        request_id: Option<String>,
+    ) -> SyncCompactRequest {
+        SyncCompactRequest {
+            domain: domain.as_str().to_string(),
+            event_paths: event_ids
+                .iter()
+                .map(|event_id| CatalogPaths::ledger_event(domain, event_id))
+                .collect(),
+            fencing_token,
+            lock_path: Some(self.storage.lock(domain)),
+            request_id,
+        }
+    }
+
     async fn finish_catalog_transaction(
         &self,
         guard: crate::lock::LockGuard<dyn StorageBackend>,
@@ -846,6 +865,250 @@ impl CatalogWriter {
             compactor.sync_compact(request).await,
         )
         .await
+    }
+
+    /// Updates catalog metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog doesn't exist or storage operations fail.
+    pub async fn update_catalog(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        opts: WriteOptions,
+    ) -> Result<Catalog> {
+        if let Some(expected) = &opts.if_match {
+            let manifest = self.tier1.read_manifest().await?;
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+
+        let compactor = self.sync_compactor()?;
+        let guard = self
+            .tier1
+            .acquire_lock(self.lock_ttl, self.lock_max_retries)
+            .await?;
+
+        let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+
+        let existing = state
+            .catalogs
+            .iter()
+            .find(|catalog| catalog.name == name)
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "catalog".into(),
+                name: name.to_string(),
+            })?;
+
+        let now = Utc::now().timestamp_millis();
+        let catalog = Catalog {
+            id: existing.id.clone(),
+            name: existing.name.clone(),
+            description: description.map(String::from),
+            created_at: existing.created_at,
+            updated_at: now,
+        };
+
+        let event = CatalogDdlEventV3::CatalogUpdated {
+            catalog: CatalogRecord::from(&catalog),
+        };
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
+            .await?;
+
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
+
+        let result = compactor.sync_compact(request).await;
+        guard.release().await?;
+        result.map(|_| catalog)
+    }
+
+    /// Deletes a catalog, optionally cascading through schemas and tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog doesn't exist or storage operations fail.
+    pub async fn delete_catalog(&self, name: &str, force: bool, opts: WriteOptions) -> Result<()> {
+        if let Some(expected) = &opts.if_match {
+            let manifest = self.tier1.read_manifest().await?;
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+
+        let compactor = self.sync_compactor()?;
+        let guard = self
+            .tier1
+            .acquire_lock(self.lock_ttl, self.lock_max_retries)
+            .await?;
+
+        let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+
+        let target_catalog = state
+            .catalogs
+            .iter()
+            .find(|catalog| catalog.name == name)
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "catalog".into(),
+                name: name.to_string(),
+            })?
+            .clone();
+
+        let default_catalog_id = state
+            .catalogs
+            .iter()
+            .find(|catalog| catalog.name == "default")
+            .map(|catalog| catalog.id.as_str());
+        let target_catalog_id = target_catalog.id.as_str();
+
+        let mut namespaces: Vec<_> = state
+            .namespaces
+            .iter()
+            .filter(|namespace| {
+                namespace.catalog_id.as_deref().or(default_catalog_id) == Some(target_catalog_id)
+            })
+            .cloned()
+            .collect();
+        namespaces.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+
+        let namespace_ids = namespaces
+            .iter()
+            .map(|namespace| namespace.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut tables: Vec<_> = state
+            .tables
+            .iter()
+            .filter(|table| namespace_ids.contains(&table.namespace_id))
+            .cloned()
+            .collect();
+        tables.sort_by(|left, right| {
+            left.namespace_id
+                .cmp(&right.namespace_id)
+                .then(left.name.cmp(&right.name))
+                .then(left.id.cmp(&right.id))
+        });
+
+        if (!tables.is_empty() || !namespaces.is_empty()) && !force {
+            guard.release().await?;
+            return Err(CatalogError::Validation {
+                message: format!("catalog '{name}' contains schemas, cannot delete"),
+            });
+        }
+
+        let mut event_ids = Vec::with_capacity(tables.len() + namespaces.len() + 1);
+        for table in tables {
+            let event = CatalogDdlEvent::TableDropped {
+                table_id: table.id,
+                namespace_id: table.namespace_id,
+                table_name: table.name,
+            };
+            let event_id = self
+                .tier1
+                .append_ledger_event(
+                    &guard,
+                    CatalogDomain::Catalog,
+                    &event,
+                    opts.actor.as_deref().unwrap_or("api"),
+                )
+                .await?;
+            event_ids.push(event_id.to_string());
+        }
+
+        for namespace in namespaces {
+            let event = CatalogDdlEvent::NamespaceDeleted {
+                namespace_id: namespace.id,
+                namespace_name: namespace.name,
+            };
+            let event_id = self
+                .tier1
+                .append_ledger_event(
+                    &guard,
+                    CatalogDomain::Catalog,
+                    &event,
+                    opts.actor.as_deref().unwrap_or("api"),
+                )
+                .await?;
+            event_ids.push(event_id.to_string());
+        }
+
+        let event = CatalogDdlEventV3::CatalogDeleted {
+            catalog_id: target_catalog.id,
+            catalog_name: target_catalog.name,
+        };
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
+            .await?;
+        event_ids.push(event_id.to_string());
+
+        let request = self.multi_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_ids,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
+
+        let result = compactor.sync_compact(request).await;
+        guard.release().await?;
+        result.map(|_| ())
     }
 
     // ========================================================================
@@ -1317,6 +1580,275 @@ impl CatalogWriter {
             commit.repair_pending |= default_catalog_repair_pending;
             commit
         })
+    }
+
+    /// Updates a schema's description within a catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog or schema doesn't exist.
+    pub async fn update_schema_in_catalog(
+        &self,
+        catalog: &str,
+        schema: &str,
+        description: Option<&str>,
+        opts: WriteOptions,
+    ) -> Result<Schema> {
+        if catalog == "default" {
+            return self.update_namespace(schema, description, opts).await;
+        }
+
+        if let Some(expected) = &opts.if_match {
+            let manifest = self.tier1.read_manifest().await?;
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+
+        let compactor = self.sync_compactor()?;
+        let guard = self
+            .tier1
+            .acquire_lock(self.lock_ttl, self.lock_max_retries)
+            .await?;
+
+        let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+
+        let Some(catalog_record) = state.catalogs.iter().find(|record| record.name == catalog)
+        else {
+            guard.release().await?;
+            return Err(CatalogError::NotFound {
+                entity: "catalog".into(),
+                name: catalog.to_string(),
+            });
+        };
+
+        let default_catalog_id = state
+            .catalogs
+            .iter()
+            .find(|record| record.name == "default")
+            .map(|record| record.id.as_str());
+        let catalog_id = catalog_record.id.as_str();
+        let existing = state
+            .namespaces
+            .iter()
+            .find(|candidate| {
+                candidate.name == schema
+                    && candidate.catalog_id.as_deref().or(default_catalog_id) == Some(catalog_id)
+            })
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "schema".into(),
+                name: format!("{catalog}.{schema}"),
+            })?;
+
+        let now = Utc::now().timestamp_millis();
+        let namespace = Namespace {
+            id: existing.id.clone(),
+            catalog_id: Some(catalog_record.id.clone()),
+            name: existing.name.clone(),
+            description: description.map(String::from),
+            created_at: existing.created_at,
+            updated_at: now,
+        };
+
+        let event = CatalogDdlEvent::NamespaceUpdated {
+            namespace: NamespaceRecord::from(&namespace),
+        };
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
+            .await?;
+
+        let request = self.single_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_id,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
+
+        let result = compactor.sync_compact(request).await;
+        guard.release().await?;
+        result.map(|_| namespace)
+    }
+
+    /// Deletes a schema within a catalog, optionally cascading through tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog or schema doesn't exist.
+    pub async fn delete_schema_in_catalog(
+        &self,
+        catalog: &str,
+        schema: &str,
+        force: bool,
+        opts: WriteOptions,
+    ) -> Result<()> {
+        if let Some(expected) = &opts.if_match {
+            let manifest = self.tier1.read_manifest().await?;
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+
+        let compactor = self.sync_compactor()?;
+        let guard = self
+            .tier1
+            .acquire_lock(self.lock_ttl, self.lock_max_retries)
+            .await?;
+
+        let manifest = self.tier1.read_manifest().await?;
+        if let Some(expected) = &opts.if_match {
+            if manifest.catalog.snapshot_version != expected.as_u64() {
+                guard.release().await?;
+                return Err(CatalogError::PreconditionFailed {
+                    message: format!(
+                        "version mismatch: expected {}, got {}",
+                        expected.as_u64(),
+                        manifest.catalog.snapshot_version
+                    ),
+                });
+            }
+        }
+        let state =
+            tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
+
+        let (catalog_id, default_catalog_id) = if catalog == "default" {
+            let default_catalog = match self
+                .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+                .await
+            {
+                Ok(catalog_record) => catalog_record,
+                Err(err) => {
+                    guard.release().await?;
+                    return Err(err);
+                }
+            };
+            let default_catalog_id = default_catalog.id.clone();
+            (default_catalog.id, Some(default_catalog_id))
+        } else {
+            let Some(catalog_record) = state.catalogs.iter().find(|record| record.name == catalog)
+            else {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "catalog".into(),
+                    name: catalog.to_string(),
+                });
+            };
+
+            (
+                catalog_record.id.clone(),
+                state
+                    .catalogs
+                    .iter()
+                    .find(|record| record.name == "default")
+                    .map(|record| record.id.clone()),
+            )
+        };
+
+        let default_catalog_id_ref = default_catalog_id.as_deref();
+        let namespace = state
+            .namespaces
+            .iter()
+            .find(|candidate| {
+                candidate.name == schema
+                    && candidate.catalog_id.as_deref().or(default_catalog_id_ref)
+                        == Some(catalog_id.as_str())
+            })
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "schema".into(),
+                name: format!("{catalog}.{schema}"),
+            })?
+            .clone();
+
+        let mut tables: Vec<_> = state
+            .tables
+            .iter()
+            .filter(|table| table.namespace_id == namespace.id)
+            .cloned()
+            .collect();
+        tables.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+
+        if !tables.is_empty() && !force {
+            guard.release().await?;
+            return Err(CatalogError::Validation {
+                message: format!("schema '{catalog}.{schema}' contains tables, cannot delete"),
+            });
+        }
+
+        let mut event_ids = Vec::with_capacity(tables.len() + 1);
+        for table in tables {
+            let event = CatalogDdlEvent::TableDropped {
+                table_id: table.id,
+                namespace_id: table.namespace_id,
+                table_name: table.name,
+            };
+            let event_id = self
+                .tier1
+                .append_ledger_event(
+                    &guard,
+                    CatalogDomain::Catalog,
+                    &event,
+                    opts.actor.as_deref().unwrap_or("api"),
+                )
+                .await?;
+            event_ids.push(event_id.to_string());
+        }
+
+        let event = CatalogDdlEvent::NamespaceDeleted {
+            namespace_id: namespace.id,
+            namespace_name: namespace.name,
+        };
+        let event_id = self
+            .tier1
+            .append_ledger_event(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                opts.actor.as_deref().unwrap_or("api"),
+            )
+            .await?;
+        event_ids.push(event_id.to_string());
+
+        let request = self.multi_event_sync_compact_request(
+            CatalogDomain::Catalog,
+            &event_ids,
+            guard.fencing_token().sequence(),
+            opts.request_id.clone(),
+        );
+
+        let result = compactor.sync_compact(request).await;
+        guard.release().await?;
+        result.map(|_| ())
     }
 
     /// Updates a namespace's description.

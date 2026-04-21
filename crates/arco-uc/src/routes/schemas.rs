@@ -1,19 +1,21 @@
 //! Schema routes for the Unity Catalog facade.
+//!
+//! These handlers expose UC-shaped schema operations over Arco's authoritative
+//! catalog ledger and manifest-published snapshot path.
 
+use arco_catalog::{CatalogError, CatalogReader};
 use axum::Json;
 use axum::Router;
-use axum::extract::{Extension, OriginalUri, Path, Query, State};
-use axum::http::{Method, StatusCode};
+use axum::extract::{Extension, Path, Query, State};
+use axum::http::StatusCode;
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-use arco_core::storage::WriteResult;
-
 use crate::context::UnityCatalogRequestContext;
 use crate::error::{UnityCatalogError, UnityCatalogErrorResponse, UnityCatalogResult};
-use crate::routes::preview::{self, catalog_path, schema_path, schema_prefix};
+use crate::routes::{common, preview};
 use crate::state::UnityCatalogState;
 
 /// Schema route group.
@@ -66,6 +68,25 @@ pub(crate) struct CreateSchemaRequestBody {
     storage_root: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct UpdateSchemaPayload {
+    #[serde(default)]
+    comment: Option<Option<String>>,
+    properties: Option<BTreeMap<String, String>>,
+    new_name: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+#[schema(title = "UpdateSchemaRequestBody")]
+pub(crate) struct UpdateSchemaRequestBody {
+    comment: Option<String>,
+    properties: Option<BTreeMap<String, String>>,
+    new_name: Option<String>,
+}
+
 /// Response payload for a schema object.
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub(crate) struct SchemaInfo {
@@ -83,6 +104,60 @@ pub(crate) struct ListSchemasResponse {
     schemas: Vec<SchemaInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     next_page_token: Option<String>,
+}
+
+fn schema_info(catalog_name: &str, schema: arco_catalog::writer::Schema) -> SchemaInfo {
+    SchemaInfo {
+        name: schema.name.clone(),
+        catalog_name: catalog_name.to_string(),
+        full_name: format!("{catalog_name}.{}", schema.name),
+        comment: schema.description,
+        properties: None,
+        storage_root: None,
+    }
+}
+
+fn paginate_schemas(
+    schemas: Vec<SchemaInfo>,
+    pagination: &preview::Pagination,
+) -> (Vec<SchemaInfo>, Option<String>) {
+    let start = pagination.start();
+    if start >= schemas.len() {
+        return (Vec::new(), None);
+    }
+
+    let end = start.saturating_add(pagination.limit()).min(schemas.len());
+    let next_page_token = (end < schemas.len()).then(|| end.to_string());
+    (schemas[start..end].to_vec(), next_page_token)
+}
+
+fn unsupported_schema_fields(
+    properties: &Option<BTreeMap<String, String>>,
+    storage_root: &Option<String>,
+) -> UnityCatalogResult<()> {
+    if properties.is_some() {
+        return Err(UnityCatalogError::NotImplemented {
+            message: "operation not supported: schema properties are not authoritative in Arco yet"
+                .to_string(),
+        });
+    }
+    if storage_root.is_some() {
+        return Err(UnityCatalogError::NotImplemented {
+            message:
+                "operation not supported: schema storage_root is not authoritative in Arco yet"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn map_delete_schema_error(err: CatalogError) -> UnityCatalogError {
+    match err {
+        CatalogError::Validation { message } if message.contains("cannot delete") => {
+            UnityCatalogError::Conflict { message }
+        }
+        other => common::map_catalog_error(other),
+    }
 }
 
 /// Lists schemas.
@@ -125,7 +200,7 @@ pub(crate) async fn get_schemas(
         catalog_name = %catalog_name,
         page_token = ?query.page_token,
         max_results = ?query.max_results,
-        "unity catalog preview list schemas"
+        "unity catalog list schemas from authoritative catalog state"
     );
     let pagination = preview::parse_pagination(
         query.page_token.as_deref(),
@@ -134,26 +209,17 @@ pub(crate) async fn get_schemas(
         1000,
     )?;
 
-    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
-    let catalog_exists = preview::object_exists(
-        &scoped_storage,
-        &catalog_path(&catalog_name),
-        "check catalog",
-    )
-    .await?;
-    if !catalog_exists {
-        return Err(UnityCatalogError::NotFound {
-            message: format!("catalog not found: {catalog_name}"),
-        });
-    }
-
-    let (schemas, next_page_token) = preview::read_json_page::<SchemaInfo>(
-        &scoped_storage,
-        &schema_prefix(&catalog_name),
-        "list schemas",
-        &pagination,
-    )
-    .await?;
+    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
+    let reader = CatalogReader::new(writer.storage().clone());
+    let mut schemas = reader
+        .list_schemas(&catalog_name)
+        .await
+        .map_err(common::map_catalog_error)?
+        .into_iter()
+        .map(|schema| schema_info(&catalog_name, schema))
+        .collect::<Vec<_>>();
+    schemas.sort_by(|left, right| left.name.cmp(&right.name));
+    let (schemas, next_page_token) = paginate_schemas(schemas, &pagination);
     tracing::debug!(
         tenant = %ctx.tenant,
         workspace = %ctx.workspace,
@@ -161,7 +227,7 @@ pub(crate) async fn get_schemas(
         catalog_name = %catalog_name,
         schemas = schemas.len(),
         next_page_token = ?next_page_token,
-        "unity catalog preview listed schemas"
+        "unity catalog listed schemas from authoritative catalog state"
     );
 
     Ok(Json(ListSchemasResponse {
@@ -201,61 +267,36 @@ pub(crate) async fn post_schemas(
 
     let name = preview::require_identifier(payload.name, "name")?;
     let catalog_name = preview::require_identifier(payload.catalog_name, "catalog_name")?;
+    unsupported_schema_fields(&payload.properties, &payload.storage_root)?;
     tracing::debug!(
         tenant = %ctx.tenant,
         workspace = %ctx.workspace,
         request_id = %ctx.request_id,
         catalog_name = %catalog_name,
         schema_name = %name,
-        "unity catalog preview create schema"
+        "unity catalog create schema on authoritative catalog state"
     );
-    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
 
-    let catalog_exists = preview::object_exists(
-        &scoped_storage,
-        &catalog_path(&catalog_name),
-        "check catalog",
-    )
-    .await?;
-    if !catalog_exists {
-        return Err(UnityCatalogError::NotFound {
-            message: format!("catalog not found: {catalog_name}"),
-        });
-    }
+    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
+    let schema = writer
+        .create_schema(
+            &catalog_name,
+            &name,
+            payload.comment.as_deref(),
+            common::writer_options(&ctx),
+        )
+        .await
+        .map_err(common::map_catalog_error)?;
 
-    let schema = SchemaInfo {
-        name: name.clone(),
-        catalog_name: catalog_name.clone(),
-        full_name: format!("{catalog_name}.{name}"),
-        comment: payload.comment,
-        properties: payload.properties,
-        storage_root: payload.storage_root,
-    };
-
-    let write_result = preview::write_json_if_absent(
-        &scoped_storage,
-        &schema_path(&catalog_name, &name),
-        &schema,
-        "create schema",
-    )
-    .await?;
-
-    match write_result {
-        WriteResult::Success { .. } => {
-            tracing::debug!(
-                tenant = %ctx.tenant,
-                workspace = %ctx.workspace,
-                request_id = %ctx.request_id,
-                catalog_name = %catalog_name,
-                schema_name = %name,
-                "unity catalog preview schema created"
-            );
-            Ok(Json(schema))
-        }
-        WriteResult::PreconditionFailed { .. } => Err(UnityCatalogError::Conflict {
-            message: format!("schema already exists: {catalog_name}.{name}"),
-        }),
-    }
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalog_name = %catalog_name,
+        schema_name = %name,
+        "unity catalog created schema on authoritative catalog state"
+    );
+    Ok(Json(schema_info(&catalog_name, schema)))
 }
 
 /// Gets a schema by full name (`catalog.schema`).
@@ -287,24 +328,24 @@ pub(crate) async fn get_schema(
         request_id = %ctx.request_id,
         catalog_name = %catalog_name,
         schema_name = %schema_name,
-        "unity catalog preview get schema"
+        "unity catalog get schema from authoritative catalog state"
     );
 
-    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
-    let path = schema_path(&catalog_name, &schema_name);
-    let exists = preview::object_exists(&scoped_storage, &path, "check schema").await?;
-    if !exists {
-        return Err(UnityCatalogError::NotFound {
+    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
+    let reader = CatalogReader::new(writer.storage().clone());
+    let schema = reader
+        .list_schemas(&catalog_name)
+        .await
+        .map_err(common::map_catalog_error)?
+        .into_iter()
+        .find(|candidate| candidate.name == schema_name)
+        .ok_or_else(|| UnityCatalogError::NotFound {
             message: format!("schema not found: {catalog_name}.{schema_name}"),
-        });
-    }
-
-    let schema =
-        preview::read_json_object::<SchemaInfo>(&scoped_storage, &path, "get schema").await?;
-    Ok(Json(schema))
+        })?;
+    Ok(Json(schema_info(&catalog_name, schema)))
 }
 
-/// `PATCH /schemas/{full_name}` (known UC operation; currently unsupported).
+/// Updates a schema.
 #[utoipa::path(
     patch,
     path = "/schemas/{full_name}",
@@ -312,12 +353,73 @@ pub(crate) async fn get_schema(
     params(
         ("full_name" = String, Path, description = "Schema full name"),
     ),
+    request_body = UpdateSchemaRequestBody,
     responses(
+        (status = 200, description = "The schema was successfully updated.", body = SchemaInfo),
+        (status = 400, description = "Bad request.", body = UnityCatalogErrorResponse),
+        (status = 401, description = "Unauthorized.", body = UnityCatalogErrorResponse),
+        (status = 403, description = "Forbidden.", body = UnityCatalogErrorResponse),
+        (status = 404, description = "Not found.", body = UnityCatalogErrorResponse),
+        (status = 409, description = "Conflict.", body = UnityCatalogErrorResponse),
         (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
+        (status = 500, description = "Internal server error.", body = UnityCatalogErrorResponse),
     )
 )]
-pub(crate) async fn update_schema(method: Method, uri: OriginalUri) -> UnityCatalogError {
-    super::common::known_but_unsupported(&method, &uri)
+pub(crate) async fn update_schema(
+    State(state): State<UnityCatalogState>,
+    Extension(ctx): Extension<UnityCatalogRequestContext>,
+    Path(full_name): Path<String>,
+    payload: Json<UpdateSchemaPayload>,
+) -> UnityCatalogResult<Json<SchemaInfo>> {
+    let (catalog_name, schema_name) = parse_schema_full_name(&full_name)?;
+    let Json(payload) = payload;
+    let _ = payload.extra;
+
+    if payload.new_name.is_some() {
+        return Err(UnityCatalogError::NotImplemented {
+            message: "operation not supported: schema rename is not authoritative in Arco yet"
+                .to_string(),
+        });
+    }
+    if payload.properties.is_some() {
+        return Err(UnityCatalogError::NotImplemented {
+            message: "operation not supported: schema properties are not authoritative in Arco yet"
+                .to_string(),
+        });
+    }
+
+    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
+    let reader = CatalogReader::new(writer.storage().clone());
+    let current = reader
+        .list_schemas(&catalog_name)
+        .await
+        .map_err(common::map_catalog_error)?
+        .into_iter()
+        .find(|candidate| candidate.name == schema_name)
+        .ok_or_else(|| UnityCatalogError::NotFound {
+            message: format!("schema not found: {catalog_name}.{schema_name}"),
+        })?;
+    let next_description = payload.comment.unwrap_or(current.description);
+
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalog_name = %catalog_name,
+        schema_name = %schema_name,
+        "unity catalog update schema on authoritative catalog state"
+    );
+
+    let schema = writer
+        .update_schema_in_catalog(
+            &catalog_name,
+            &schema_name,
+            next_description.as_deref(),
+            common::writer_options(&ctx),
+        )
+        .await
+        .map_err(common::map_catalog_error)?;
+    Ok(Json(schema_info(&catalog_name, schema)))
 }
 
 /// Deletes a schema.
@@ -356,37 +458,32 @@ pub(crate) async fn delete_schema(
         catalog_name = %catalog_name,
         schema_name = %schema_name,
         force,
-        "unity catalog preview delete schema"
+        "unity catalog delete schema from authoritative catalog state"
     );
 
-    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
-    let path = schema_path(&catalog_name, &schema_name);
-    let exists = preview::object_exists(&scoped_storage, &path, "check schema").await?;
-    if !exists {
-        return Err(UnityCatalogError::NotFound {
-            message: format!("schema not found: {catalog_name}.{schema_name}"),
-        });
-    }
-
-    let tables = preview::list_paths(
-        &scoped_storage,
-        &preview::table_prefix(&catalog_name, &schema_name),
-        "list schema tables",
-    )
-    .await?;
-    if !tables.is_empty() && !force {
-        return Err(UnityCatalogError::Conflict {
-            message: format!("schema is not empty: {catalog_name}.{schema_name}"),
-        });
-    }
-
-    if force {
-        for table_path in tables {
-            preview::delete_path(&scoped_storage, &table_path, "delete schema table").await?;
+    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
+    if !force {
+        let reader = CatalogReader::new(writer.storage().clone());
+        let tables = reader
+            .list_tables_in_schema(&catalog_name, &schema_name)
+            .await
+            .map_err(common::map_catalog_error)?;
+        if !tables.is_empty() {
+            return Err(UnityCatalogError::Conflict {
+                message: format!("schema is not empty: {catalog_name}.{schema_name}"),
+            });
         }
     }
 
-    preview::delete_path(&scoped_storage, &path, "delete schema").await?;
+    writer
+        .delete_schema_in_catalog(
+            &catalog_name,
+            &schema_name,
+            force,
+            common::writer_options(&ctx),
+        )
+        .await
+        .map_err(map_delete_schema_error)?;
     Ok((StatusCode::OK, Json(json!({}))))
 }
 

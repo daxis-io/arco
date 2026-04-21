@@ -21,9 +21,8 @@ use arco_core::storage::{MemoryBackend, StorageBackend};
 use arco_core::{ControlPlaneTxDomain, ScopedStorage};
 use arco_proto::arco::catalog::v1::{
     CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp, RegisterTableOp,
-    RenameTableOp, catalog_ddl_operation,
+    RenameTableOp, TableFormat, catalog_ddl_operation,
 };
-use arco_proto::arco::common::v1::TableFormat;
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, CommitOrchestrationBatchRequest, CommitRootTransactionRequest,
     DomainMutation, GetCatalogTransactionRequest, GetOrchestrationTransactionRequest,
@@ -57,7 +56,7 @@ fn catalog_create_catalog_request(
     ApplyCatalogDdlRequest {
         ddl: Some(CatalogDdlOperation {
             op: Some(catalog_ddl_operation::Op::CreateCatalog(CreateCatalogOp {
-                name: name.to_string(),
+                catalog: name.to_string(),
                 description: Some("grpc transaction catalog".to_string()),
             })),
         }),
@@ -75,8 +74,8 @@ fn catalog_create_schema_request(
     ApplyCatalogDdlRequest {
         ddl: Some(CatalogDdlOperation {
             op: Some(catalog_ddl_operation::Op::CreateSchema(CreateSchemaOp {
-                catalog_name: catalog_name.to_string(),
-                schema_name: schema_name.to_string(),
+                catalog: catalog_name.to_string(),
+                schema: schema_name.to_string(),
                 description: Some("grpc transaction test".to_string()),
             })),
         }),
@@ -95,9 +94,9 @@ fn catalog_register_table_request(
     ApplyCatalogDdlRequest {
         ddl: Some(CatalogDdlOperation {
             op: Some(catalog_ddl_operation::Op::RegisterTable(RegisterTableOp {
-                catalog_name: catalog_name.to_string(),
-                schema_name: schema_name.to_string(),
-                table_name: table_name.to_string(),
+                catalog: catalog_name.to_string(),
+                schema: schema_name.to_string(),
+                table: table_name.to_string(),
                 description: Some("grpc transaction table".to_string()),
                 location: None,
                 format: TableFormat::Unspecified as i32,
@@ -126,10 +125,10 @@ fn catalog_rename_table_request(
     ApplyCatalogDdlRequest {
         ddl: Some(CatalogDdlOperation {
             op: Some(catalog_ddl_operation::Op::RenameTable(RenameTableOp {
-                catalog_name: catalog_name.to_string(),
-                schema_name: schema_name.to_string(),
-                old_table_name: old_table_name.to_string(),
-                new_table_name: new_table_name.to_string(),
+                catalog: catalog_name.to_string(),
+                schema: schema_name.to_string(),
+                table: old_table_name.to_string(),
+                new_table: new_table_name.to_string(),
             })),
         }),
     }
@@ -210,7 +209,6 @@ fn orchestration_failure_request(
                     }),
                     metrics: None,
                     cancelled_during_phase: None,
-                    partial_progress_json: None,
                     asset_key: Some("default.raw.events".to_string()),
                     partition_key: None,
                     code_version: Some("git:test".to_string()),
@@ -231,8 +229,8 @@ fn root_request(
             DomainMutation {
                 kind: Some(domain_mutation::Kind::Catalog(CatalogDdlOperation {
                     op: Some(catalog_ddl_operation::Op::CreateSchema(CreateSchemaOp {
-                        catalog_name: "default".to_string(),
-                        schema_name: schema_name.to_string(),
+                        catalog: "default".to_string(),
+                        schema: schema_name.to_string(),
                         description: Some("grpc root transaction schema".to_string()),
                     })),
                 })),

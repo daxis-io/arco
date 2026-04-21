@@ -5,11 +5,10 @@
 use prost::Message;
 
 use arco_proto::arco::catalog::v1::{
-    Catalog, CatalogDdlOperation, Column, ColumnDefinition, CreateCatalogOp, CreateSchemaOp,
-    DropTableOp, LineageEdge, RegisterTableOp, RenameTableOp, Schema, Table, UpdateTableOp,
+    Catalog, CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp, DropTableOp,
+    RegisterTableOp, RenameTableOp, Schema, Table, TableFormat, UpdateTableOp,
     catalog_ddl_operation,
 };
-use arco_proto::arco::common::v1::TableFormat;
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CatalogTxReceipt, CatalogTxStatus,
     CommitOrchestrationBatchRequest, CommitOrchestrationBatchResponse,
@@ -21,10 +20,10 @@ use arco_proto::arco::controlplane::v1::{
     TransactionStatus, domain_mutation,
 };
 use arco_proto::arco::orchestration::v1::{
-    BackfillTrigger, ManualTrigger, MaterializationTrigger, OrchestrationEventEnvelope,
-    RunRequested, RunTriggered, ScheduleTrigger, SensorTrigger, TaskCallbackOutput, TaskError,
-    TaskErrorCategory, TaskFinished, TaskOutcome, TriggerInfo, WebhookTrigger,
-    orchestration_event_envelope, trigger_info,
+    BackfillTrigger, FileEntry, ManualTrigger, MaterializationTrigger, OrchestrationEventEnvelope,
+    OutputVisibilityState, RunRequested, RunTriggered, ScheduleTrigger, SensorTrigger,
+    TaskCallbackOutput, TaskError, TaskErrorCategory, TaskFinished, TaskOutcome, TaskOutput,
+    TriggerInfo, WebhookTrigger, orchestration_event_envelope, trigger_info,
 };
 use arco_proto::{ControlPlaneTransactionContractError, OrchestrationEventContractError};
 
@@ -33,8 +32,8 @@ fn control_plane_transaction_messages_compile_and_roundtrip_basic_fields() {
     let request = ApplyCatalogDdlRequest {
         ddl: Some(CatalogDdlOperation {
             op: Some(catalog_ddl_operation::Op::CreateSchema(CreateSchemaOp {
-                catalog_name: "default".to_string(),
-                schema_name: "raw".to_string(),
+                catalog: "default".to_string(),
+                schema: "raw".to_string(),
                 description: Some("raw landing schema".to_string()),
             })),
         }),
@@ -49,9 +48,9 @@ fn control_plane_transaction_messages_compile_and_roundtrip_basic_fields() {
             DomainMutation {
                 kind: Some(domain_mutation::Kind::Catalog(CatalogDdlOperation {
                     op: Some(catalog_ddl_operation::Op::DropTable(DropTableOp {
-                        catalog_name: "default".to_string(),
-                        schema_name: "raw".to_string(),
-                        table_name: "events".to_string(),
+                        catalog: "default".to_string(),
+                        schema: "raw".to_string(),
+                        table: "events".to_string(),
                     })),
                 })),
             },
@@ -178,77 +177,76 @@ fn control_plane_transaction_messages_compile_and_roundtrip_basic_fields() {
 }
 
 #[test]
-fn catalog_surface_uses_canonical_catalog_schema_table_nouns_and_plain_string_ids() {
+fn catalog_surface_uses_catalog_schema_table_json_field_names() {
     let catalog = Catalog {
-        id: "cat_01".to_string(),
-        name: "default".to_string(),
+        catalog: "default".to_string(),
+        display_name: Some("Default".to_string()),
         description: Some("default catalog".to_string()),
         created_at: None,
         updated_at: None,
     };
     let schema = Schema {
-        id: "sch_01".to_string(),
-        catalog_id: "cat_01".to_string(),
-        name: "raw".to_string(),
+        catalog: "default".to_string(),
+        schema: "raw".to_string(),
         description: Some("raw landing schema".to_string()),
         created_at: None,
         updated_at: None,
     };
     let table = Table {
-        id: "tbl_01".to_string(),
-        schema_id: "sch_01".to_string(),
-        name: "events".to_string(),
+        catalog: "default".to_string(),
+        schema: "raw".to_string(),
+        table: "events".to_string(),
         description: Some("raw events".to_string()),
         location: Some("s3://bucket/raw/events".to_string()),
         format: TableFormat::Delta as i32,
         created_at: None,
         updated_at: None,
     };
-    let column = Column {
-        id: "col_01".to_string(),
-        table_id: "tbl_01".to_string(),
-        name: "event_id".to_string(),
-        data_type: "string".to_string(),
-        is_nullable: false,
-        ordinal: 0,
-        description: None,
-    };
-    let edge = LineageEdge {
-        id: "edge_01".to_string(),
-        source_table_id: "tbl_upstream".to_string(),
-        target_table_id: "tbl_01".to_string(),
-        edge_type: "depends_on".to_string(),
-        run_id: Some("run_01".to_string()),
-        created_at: None,
-    };
+    let catalog_json = serde_json::to_value(&catalog).expect("catalog should serialize");
+    let schema_json = serde_json::to_value(&schema).expect("schema should serialize");
+    let table_json = serde_json::to_value(&table).expect("table should serialize");
 
-    assert_eq!(catalog.id, "cat_01");
-    assert_eq!(schema.catalog_id, "cat_01");
-    assert_eq!(table.schema_id, "sch_01");
-    assert_eq!(column.table_id, "tbl_01");
-    assert_eq!(edge.target_table_id, "tbl_01");
+    assert!(catalog_json.get("catalog").is_some());
+    assert!(catalog_json.get("id").is_none());
+    assert!(catalog_json.get("displayName").is_some());
+    assert!(schema_json.get("catalog").is_some());
+    assert!(schema_json.get("schema").is_some());
+    assert!(schema_json.get("catalogId").is_none());
+    assert!(schema_json.get("id").is_none());
+    assert!(table_json.get("catalog").is_some());
+    assert!(table_json.get("schema").is_some());
+    assert!(table_json.get("table").is_some());
+    assert!(table_json.get("schemaId").is_none());
+    assert!(table_json.get("id").is_none());
+}
+
+#[test]
+fn catalog_table_format_enum_lives_with_catalog_contracts() {
+    assert_eq!(TableFormat::Delta.as_str_name(), "TABLE_FORMAT_DELTA");
+    assert_eq!(TableFormat::Iceberg.as_str_name(), "TABLE_FORMAT_ICEBERG");
+    assert_eq!(TableFormat::Parquet.as_str_name(), "TABLE_FORMAT_PARQUET");
 }
 
 #[test]
 fn catalog_ddl_surface_covers_authoritative_operations() {
     let create_catalog = CatalogDdlOperation {
         op: Some(catalog_ddl_operation::Op::CreateCatalog(CreateCatalogOp {
-            name: "default".to_string(),
+            catalog: "default".to_string(),
             description: None,
         })),
     };
     let create_schema = CatalogDdlOperation {
         op: Some(catalog_ddl_operation::Op::CreateSchema(CreateSchemaOp {
-            catalog_name: "default".to_string(),
-            schema_name: "raw".to_string(),
+            catalog: "default".to_string(),
+            schema: "raw".to_string(),
             description: None,
         })),
     };
     let register_table = CatalogDdlOperation {
         op: Some(catalog_ddl_operation::Op::RegisterTable(RegisterTableOp {
-            catalog_name: "default".to_string(),
-            schema_name: "raw".to_string(),
-            table_name: "events".to_string(),
+            catalog: "default".to_string(),
+            schema: "raw".to_string(),
+            table: "events".to_string(),
             description: Some("raw events".to_string()),
             location: Some("s3://bucket/raw/events".to_string()),
             format: TableFormat::Delta as i32,
@@ -263,9 +261,9 @@ fn catalog_ddl_surface_covers_authoritative_operations() {
     };
     let update_table = CatalogDdlOperation {
         op: Some(catalog_ddl_operation::Op::UpdateTable(UpdateTableOp {
-            catalog_name: "default".to_string(),
-            schema_name: "raw".to_string(),
-            table_name: "events".to_string(),
+            catalog: "default".to_string(),
+            schema: "raw".to_string(),
+            table: "events".to_string(),
             description: Some("curated raw events".to_string()),
             location: Some("s3://bucket/curated/events".to_string()),
             format: Some(TableFormat::Iceberg as i32),
@@ -273,17 +271,17 @@ fn catalog_ddl_surface_covers_authoritative_operations() {
     };
     let drop_table = CatalogDdlOperation {
         op: Some(catalog_ddl_operation::Op::DropTable(DropTableOp {
-            catalog_name: "default".to_string(),
-            schema_name: "raw".to_string(),
-            table_name: "events".to_string(),
+            catalog: "default".to_string(),
+            schema: "raw".to_string(),
+            table: "events".to_string(),
         })),
     };
     let rename_table = CatalogDdlOperation {
         op: Some(catalog_ddl_operation::Op::RenameTable(RenameTableOp {
-            catalog_name: "default".to_string(),
-            schema_name: "raw".to_string(),
-            old_table_name: "events".to_string(),
-            new_table_name: "events_v2".to_string(),
+            catalog: "default".to_string(),
+            schema: "raw".to_string(),
+            table: "events".to_string(),
+            new_table: "events_v2".to_string(),
         })),
     };
 
@@ -293,6 +291,88 @@ fn catalog_ddl_surface_covers_authoritative_operations() {
     assert!(update_table.op.is_some());
     assert!(drop_table.op.is_some());
     assert!(rename_table.op.is_some());
+}
+
+#[test]
+fn catalog_mutation_surface_uses_canonical_public_json_nouns() {
+    let create_catalog = CreateCatalogOp::decode(encode_string_field(1, "default").as_slice())
+        .expect("create_catalog should decode");
+    let create_schema = CreateSchemaOp::decode(
+        encode_message(&[(1, "default"), (2, "raw"), (3, "raw landing schema")]).as_slice(),
+    )
+    .expect("create_schema should decode");
+    let register_table = RegisterTableOp::decode(
+        encode_message(&[(1, "default"), (2, "raw"), (3, "events"), (4, "raw events")]).as_slice(),
+    )
+    .expect("register_table should decode");
+    let update_table = UpdateTableOp::decode(
+        encode_message(&[
+            (1, "default"),
+            (2, "raw"),
+            (3, "events"),
+            (4, "curated events"),
+        ])
+        .as_slice(),
+    )
+    .expect("update_table should decode");
+    let drop_table = DropTableOp::decode(
+        encode_message(&[(1, "default"), (2, "raw"), (3, "events")]).as_slice(),
+    )
+    .expect("drop_table should decode");
+    let rename_table = RenameTableOp::decode(
+        encode_message(&[(1, "default"), (2, "raw"), (3, "events"), (4, "events_v2")]).as_slice(),
+    )
+    .expect("rename_table should decode");
+
+    let create_catalog_json =
+        serde_json::to_value(&create_catalog).expect("create_catalog should serialize");
+    let create_schema_json =
+        serde_json::to_value(&create_schema).expect("create_schema should serialize");
+    let register_table_json =
+        serde_json::to_value(&register_table).expect("register_table should serialize");
+    let update_table_json =
+        serde_json::to_value(&update_table).expect("update_table should serialize");
+    let drop_table_json = serde_json::to_value(&drop_table).expect("drop_table should serialize");
+    let rename_table_json =
+        serde_json::to_value(&rename_table).expect("rename_table should serialize");
+
+    assert!(create_catalog_json.get("catalog").is_some());
+    assert!(create_catalog_json.get("name").is_none());
+
+    assert!(create_schema_json.get("catalog").is_some());
+    assert!(create_schema_json.get("schema").is_some());
+    assert!(create_schema_json.get("catalogName").is_none());
+    assert!(create_schema_json.get("schemaName").is_none());
+
+    assert!(register_table_json.get("catalog").is_some());
+    assert!(register_table_json.get("schema").is_some());
+    assert!(register_table_json.get("table").is_some());
+    assert!(register_table_json.get("catalogName").is_none());
+    assert!(register_table_json.get("schemaName").is_none());
+    assert!(register_table_json.get("tableName").is_none());
+
+    assert!(update_table_json.get("catalog").is_some());
+    assert!(update_table_json.get("schema").is_some());
+    assert!(update_table_json.get("table").is_some());
+    assert!(update_table_json.get("catalogName").is_none());
+    assert!(update_table_json.get("schemaName").is_none());
+    assert!(update_table_json.get("tableName").is_none());
+
+    assert!(drop_table_json.get("catalog").is_some());
+    assert!(drop_table_json.get("schema").is_some());
+    assert!(drop_table_json.get("table").is_some());
+    assert!(drop_table_json.get("catalogName").is_none());
+    assert!(drop_table_json.get("schemaName").is_none());
+    assert!(drop_table_json.get("tableName").is_none());
+
+    assert!(rename_table_json.get("catalog").is_some());
+    assert!(rename_table_json.get("schema").is_some());
+    assert!(rename_table_json.get("table").is_some());
+    assert!(rename_table_json.get("newTable").is_some());
+    assert!(rename_table_json.get("catalogName").is_none());
+    assert!(rename_table_json.get("schemaName").is_none());
+    assert!(rename_table_json.get("oldTableName").is_none());
+    assert!(rename_table_json.get("newTableName").is_none());
 }
 
 #[test]
@@ -699,6 +779,45 @@ fn typed_orchestration_envelope_roundtrips_with_variant_payloads() {
 }
 
 #[test]
+fn task_output_files_are_owned_by_orchestration_contract() {
+    let output = TaskOutput {
+        materialization_id: Some("mat_01".to_string()),
+        files: vec![FileEntry {
+            path: "s3://bucket/output/part-000.parquet".to_string(),
+            size_bytes: 128,
+            row_count: Some(5),
+            content_hash: Some("sha256:abc123".to_string()),
+            format: Some("parquet".to_string()),
+        }],
+        row_count: Some(5),
+        byte_size: Some(128),
+        visibility_state: OutputVisibilityState::Visible as i32,
+        published_at: Some(prost_types::Timestamp {
+            seconds: 1_776_000_003,
+            nanos: 0,
+        }),
+        publish_error: None,
+    };
+
+    output
+        .validate_contract()
+        .expect("visible published output should validate");
+
+    let encoded = output.encode_to_vec();
+    let decoded = TaskOutput::decode(encoded.as_slice()).expect("decode published output");
+
+    assert_eq!(decoded.files.len(), 1);
+    assert_eq!(decoded.files[0].path, "s3://bucket/output/part-000.parquet");
+    assert_eq!(decoded.files[0].size_bytes, 128);
+    assert_eq!(decoded.files[0].row_count, Some(5));
+    assert_eq!(
+        decoded.files[0].content_hash.as_deref(),
+        Some("sha256:abc123")
+    );
+    assert_eq!(decoded.files[0].format.as_deref(), Some("parquet"));
+}
+
+#[test]
 fn root_super_manifest_path_preserves_legacy_wire_tags() {
     let path = "transactions/root/01JQROOTTX.manifest.json";
 
@@ -829,7 +948,6 @@ fn sample_task_finished_event() -> OrchestrationEventEnvelope {
                 }),
                 metrics: None,
                 cancelled_during_phase: None,
-                partial_progress_json: None,
                 asset_key: Some("default.raw.events".to_string()),
                 partition_key: Some(arco_proto::arco::common::v1::PartitionKey {
                     dimensions: vec![arco_proto::arco::common::v1::PartitionDimension {
@@ -855,6 +973,14 @@ fn encode_string_field(field_number: u32, value: &str) -> Vec<u8> {
         u64::try_from(value.len()).expect("string length fits in u64"),
     ));
     bytes.extend_from_slice(value.as_bytes());
+    bytes
+}
+
+fn encode_message(fields: &[(u32, &str)]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for (field_number, value) in fields {
+        bytes.extend(encode_string_field(*field_number, value));
+    }
     bytes
 }
 

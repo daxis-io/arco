@@ -93,6 +93,32 @@ impl CatalogEventPayload for CatalogDdlEventV2 {
     const EVENT_VERSION: u32 = 2;
 }
 
+/// Catalog domain DDL events (schema v3).
+///
+/// Version 3 adds catalog update/delete mutations without changing the
+/// previously deployed v2 create-catalog envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CatalogDdlEventV3 {
+    /// Update catalog metadata.
+    CatalogUpdated {
+        /// The updated catalog record.
+        catalog: CatalogRecord,
+    },
+    /// Delete a catalog by ID.
+    CatalogDeleted {
+        /// ID of the catalog to delete.
+        catalog_id: String,
+        /// Name of the catalog (for verification).
+        catalog_name: String,
+    },
+}
+
+impl CatalogEventPayload for CatalogDdlEventV3 {
+    const EVENT_TYPE: &'static str = "catalog.ddl";
+    const EVENT_VERSION: u32 = 3;
+}
+
 /// Lineage domain DDL events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::{Duration, Utc};
+use chrono::{Duration, TimeZone, Utc};
 
 use arco_core::ScopedStorage;
 use arco_core::storage::{
@@ -175,6 +175,22 @@ async fn write_event(storage: &ScopedStorage, event: &OrchestrationEvent) -> Res
     Ok(path)
 }
 
+async fn write_raw_event_json(
+    storage: &ScopedStorage,
+    event_id: &str,
+    raw_json: &str,
+) -> Result<String> {
+    let path = format!("ledger/orchestration/2026-02-21/{event_id}.json");
+    storage
+        .put_raw(
+            &path,
+            Bytes::from(raw_json.as_bytes().to_vec()),
+            WritePrecondition::None,
+        )
+        .await?;
+    Ok(path)
+}
+
 #[tokio::test]
 async fn rebuild_from_ledger_manifest_reproduces_equivalent_projection_state() -> Result<()> {
     let baseline_backend = Arc::new(MemoryBackend::new());
@@ -233,6 +249,104 @@ async fn rebuild_from_ledger_manifest_reproduces_equivalent_projection_state() -
     assert_eq!(
         baseline_manifest.watermarks.last_visible_event_id,
         rebuild_manifest.watermarks.last_visible_event_id
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rebuild_accepts_legacy_task_finished_json_with_internal_partial_progress_blob()
+-> Result<()> {
+    let baseline_backend = Arc::new(MemoryBackend::new());
+    let baseline_storage = ScopedStorage::new(baseline_backend, TENANT, WORKSPACE)?;
+    let baseline_compactor = MicroCompactor::new(baseline_storage.clone());
+
+    let rebuild_backend = Arc::new(MemoryBackend::new());
+    let rebuild_storage = ScopedStorage::new(rebuild_backend, TENANT, WORKSPACE)?;
+    let rebuild_compactor = MicroCompactor::new(rebuild_storage.clone());
+
+    let run_id = "run-dr-legacy-json";
+    let plan_id = "plan-dr-legacy-json";
+
+    let run_triggered = run_triggered("01J1DRREBUILD00000000000021", run_id, plan_id);
+    let plan_created = plan_created("01J1DRREBUILD00000000000022", run_id, plan_id);
+    let mut task_finished = OrchestrationEvent::new_with_timestamp_and_idempotency_key(
+        TENANT,
+        WORKSPACE,
+        OrchestrationEventData::TaskFinished {
+            run_id: run_id.to_string(),
+            task_key: "extract".to_string(),
+            attempt: 1,
+            attempt_id: "01J1DRLEGACYATTEMPT000000".to_string(),
+            worker_id: "worker-dr".to_string(),
+            outcome: TaskOutcome::Succeeded,
+            materialization_id: None,
+            error_message: None,
+            output: None,
+            error: None,
+            metrics: None,
+            cancelled_during_phase: Some("upload".to_string()),
+            partial_progress_json: Some("{\"percent\":50}".to_string()),
+            asset_key: None,
+            partition_key: None,
+            code_version: Some("git:legacy".to_string()),
+        },
+        "finished:run-dr-legacy-json:extract:1",
+        Utc.with_ymd_and_hms(2026, 4, 9, 12, 0, 0).unwrap(),
+    );
+    task_finished.event_id = "01J1DRREBUILD00000000000023".to_string();
+
+    let baseline_paths = vec![
+        write_event(&baseline_storage, &run_triggered).await?,
+        write_event(&baseline_storage, &plan_created).await?,
+        write_event(&baseline_storage, &task_finished).await?,
+    ];
+    baseline_compactor.compact_events(baseline_paths).await?;
+
+    let mut legacy_json =
+        serde_json::to_value(&task_finished).expect("legacy event should serialize to JSON");
+    legacy_json
+        .as_object_mut()
+        .expect("legacy envelope should be an object")
+        .remove("correlation_id");
+    legacy_json
+        .get_mut("data")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("legacy data should be an object")
+        .remove("code_version");
+
+    let rebuild_paths = vec![
+        write_event(&rebuild_storage, &run_triggered).await?,
+        write_event(&rebuild_storage, &plan_created).await?,
+        write_raw_event_json(
+            &rebuild_storage,
+            &task_finished.event_id,
+            &serde_json::to_string_pretty(&legacy_json).expect("legacy JSON should render"),
+        )
+        .await?,
+    ];
+
+    rebuild_compactor
+        .rebuild_from_ledger_manifest(LedgerRebuildManifest {
+            event_paths: rebuild_paths,
+        })
+        .await?;
+
+    let (baseline_manifest, baseline_state) = baseline_compactor.load_state().await?;
+    let (rebuild_manifest, rebuild_state) = rebuild_compactor.load_state().await?;
+
+    assert_eq!(
+        baseline_state.tasks, rebuild_state.tasks,
+        "legacy stored task-finished JSON should replay equivalently"
+    );
+    assert_eq!(
+        baseline_state.runs, rebuild_state.runs,
+        "legacy stored task-finished JSON should preserve run state"
+    );
+    assert_eq!(
+        baseline_manifest.watermarks.last_visible_event_id,
+        rebuild_manifest.watermarks.last_visible_event_id,
+        "legacy stored task-finished JSON should still advance replay watermarks"
     );
 
     Ok(())

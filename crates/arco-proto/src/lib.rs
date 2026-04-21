@@ -5,6 +5,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod codec;
+mod serde_helpers;
 
 pub use codec::{ProstCodec, ProstDecoder, ProstEncoder};
 
@@ -490,6 +491,11 @@ fn validate_run_triggered_trigger(
 mod tests {
     use super::*;
 
+    const GENERATED_CATALOG_RS: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/arco.catalog.v1.rs"));
+    const GENERATED_ORCHESTRATION_RS: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/arco.orchestration.v1.rs"));
+
     fn pending_output() -> TaskOutput {
         TaskOutput {
             materialization_id: Some("mat_01HQXYZ".into()),
@@ -516,6 +522,26 @@ mod tests {
         assert_eq!(
             request.validate_contract(),
             Err(ControlPlaneTransactionContractError::MissingCatalogDdlOp)
+        );
+    }
+
+    #[test]
+    fn catalog_proto_does_not_generate_dead_id_based_helper_messages() {
+        assert!(
+            !GENERATED_CATALOG_RS.contains("pub struct Column "),
+            "catalog proto should not generate a dead public Column helper message"
+        );
+        assert!(
+            !GENERATED_CATALOG_RS.contains("pub struct LineageEdge "),
+            "catalog proto should not generate a dead public LineageEdge helper message"
+        );
+    }
+
+    #[test]
+    fn orchestration_proto_does_not_generate_partial_progress_json_escape_hatch() {
+        assert!(
+            !GENERATED_ORCHESTRATION_RS.contains("partial_progress_json"),
+            "orchestration proto should not generate a public partial_progress_json field"
         );
     }
 }

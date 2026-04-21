@@ -8,4 +8,4 @@ lint:
     - PACKAGE_VERSION_SUFFIX
 breaking:
   use:
-    - FILE
+    - WIRE_JSON

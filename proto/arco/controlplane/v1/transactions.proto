@@ -85,6 +85,8 @@ message CommitOrchestrationBatchRequest {
   reserved 1, 3, 4;
   reserved "header", "require_visible", "allow_inline_merge";
 
+  // Public typed orchestration event contract. Keep storage-internal-only
+  // envelopes out of this surface instead of relying on undocumented payloads.
   repeated arco.orchestration.v1.OrchestrationEventEnvelope events = 2;
 }
 

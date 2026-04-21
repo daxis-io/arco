@@ -8,50 +8,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/arco/controlplane/v1/transactions.proto",
     ];
 
-    tonic_prost_build::configure()
+    let mut config = tonic_prost_build::configure()
         .codec_path("crate::ProstCodec")
-        .btree_map(".")
-        .type_attribute(
-            ".arco.common.v1.PartitionDimension",
-            "#[derive(serde::Serialize, serde::Deserialize)]",
-        )
-        .type_attribute(
-            ".arco.common.v1.PartitionDimension",
-            "#[serde(rename_all = \"camelCase\")]",
-        )
-        .type_attribute(
-            ".arco.common.v1.PartitionKey",
-            "#[derive(serde::Serialize, serde::Deserialize)]",
-        )
-        .type_attribute(
-            ".arco.common.v1.PartitionKey",
-            "#[serde(rename_all = \"camelCase\")]",
-        )
-        .type_attribute(
-            ".arco.common.v1.ScalarValue",
-            "#[derive(serde::Serialize, serde::Deserialize)]",
-        )
-        .type_attribute(
-            ".arco.common.v1.ScalarValue",
-            "#[serde(rename_all = \"camelCase\")]",
-        )
-        .type_attribute(
-            ".arco.common.v1.NullValue",
-            "#[derive(serde::Serialize, serde::Deserialize)]",
-        )
-        .type_attribute(
-            ".arco.common.v1.TableFormat",
-            "#[derive(serde::Serialize, serde::Deserialize)]",
-        )
-        .type_attribute(
-            ".arco.common.v1.FileEntry",
-            "#[derive(serde::Serialize, serde::Deserialize)]",
-        )
-        .type_attribute(
-            ".arco.common.v1.FileEntry",
-            "#[serde(rename_all = \"camelCase\")]",
-        )
-        .compile_protos(&proto_files, &["../../proto"])?;
+        .btree_map(".");
+
+    for ty in [
+        ".arco.common.v1.PartitionDimension",
+        ".arco.common.v1.PartitionKey",
+        ".arco.common.v1.ScalarValue",
+        ".arco.common.v1.NullValue",
+    ] {
+        config = config.type_attribute(ty, "#[derive(serde::Serialize, serde::Deserialize)]");
+    }
+
+    for ty in [
+        ".arco.catalog.v1.Catalog",
+        ".arco.catalog.v1.Schema",
+        ".arco.catalog.v1.Table",
+        ".arco.catalog.v1.TableFormat",
+        ".arco.catalog.v1.ColumnDefinition",
+        ".arco.catalog.v1.CreateCatalogOp",
+        ".arco.catalog.v1.CreateSchemaOp",
+        ".arco.catalog.v1.RegisterTableOp",
+        ".arco.catalog.v1.UpdateTableOp",
+        ".arco.catalog.v1.DropTableOp",
+        ".arco.catalog.v1.RenameTableOp",
+        ".arco.catalog.v1.CatalogDdlOperation",
+    ] {
+        config = config.type_attribute(ty, "#[derive(serde::Serialize)]");
+    }
+
+    for ty in [
+        ".arco.common.v1.PartitionDimension",
+        ".arco.common.v1.PartitionKey",
+        ".arco.common.v1.ScalarValue",
+        ".arco.catalog.v1.Catalog",
+        ".arco.catalog.v1.Schema",
+        ".arco.catalog.v1.Table",
+        ".arco.catalog.v1.ColumnDefinition",
+        ".arco.catalog.v1.CreateCatalogOp",
+        ".arco.catalog.v1.CreateSchemaOp",
+        ".arco.catalog.v1.RegisterTableOp",
+        ".arco.catalog.v1.UpdateTableOp",
+        ".arco.catalog.v1.DropTableOp",
+        ".arco.catalog.v1.RenameTableOp",
+        ".arco.catalog.v1.CatalogDdlOperation",
+    ] {
+        config = config.type_attribute(ty, "#[serde(rename_all = \"camelCase\")]");
+    }
+
+    for field in [
+        ".arco.catalog.v1.Catalog.created_at",
+        ".arco.catalog.v1.Catalog.updated_at",
+        ".arco.catalog.v1.Schema.created_at",
+        ".arco.catalog.v1.Schema.updated_at",
+        ".arco.catalog.v1.Table.created_at",
+        ".arco.catalog.v1.Table.updated_at",
+    ] {
+        config = config.field_attribute(
+            field,
+            "#[serde(skip_serializing_if = \"Option::is_none\", serialize_with = \"crate::serde_helpers::serialize_optional_timestamp\")]",
+        );
+    }
+
+    config.compile_protos(&proto_files, &["../../proto"])?;
 
     for file in &proto_files {
         println!("cargo:rerun-if-changed={file}");

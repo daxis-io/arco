@@ -23,9 +23,8 @@ use arco_core::storage::{
 };
 use arco_proto::arco::catalog::v1::{
     CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp, DropTableOp,
-    RegisterTableOp, RenameTableOp, UpdateTableOp, catalog_ddl_operation,
+    RegisterTableOp, RenameTableOp, TableFormat, UpdateTableOp, catalog_ddl_operation,
 };
-use arco_proto::arco::common::v1::TableFormat;
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, CommitOrchestrationBatchRequest, CommitRootTransactionRequest,
     DomainMutation, OrchestrationBatchSpec, domain_mutation,
@@ -186,7 +185,7 @@ pub fn catalog_create_catalog_request(
     ApplyCatalogDdlRequest {
         ddl: Some(CatalogDdlOperation {
             op: Some(catalog_ddl_operation::Op::CreateCatalog(CreateCatalogOp {
-                name: name.to_string(),
+                catalog: name.to_string(),
                 description: Some("control-plane transaction catalog".to_string()),
             })),
         }),
@@ -204,8 +203,8 @@ pub fn catalog_create_schema_request(
     ApplyCatalogDdlRequest {
         ddl: Some(CatalogDdlOperation {
             op: Some(catalog_ddl_operation::Op::CreateSchema(CreateSchemaOp {
-                catalog_name: catalog_name.to_string(),
-                schema_name: schema_name.to_string(),
+                catalog: catalog_name.to_string(),
+                schema: schema_name.to_string(),
                 description: Some("control-plane transaction test".to_string()),
             })),
         }),
@@ -263,9 +262,9 @@ pub fn catalog_register_table_in_schema_request_with_columns(
     ApplyCatalogDdlRequest {
         ddl: Some(CatalogDdlOperation {
             op: Some(catalog_ddl_operation::Op::RegisterTable(RegisterTableOp {
-                catalog_name: catalog_name.to_string(),
-                schema_name: schema_name.to_string(),
-                table_name: table_name.to_string(),
+                catalog: catalog_name.to_string(),
+                schema: schema_name.to_string(),
+                table: table_name.to_string(),
                 description: Some("control-plane transaction table".to_string()),
                 location: None,
                 format: TableFormat::Unspecified as i32,
@@ -287,9 +286,9 @@ pub fn catalog_update_table_request(
     ApplyCatalogDdlRequest {
         ddl: Some(CatalogDdlOperation {
             op: Some(catalog_ddl_operation::Op::UpdateTable(UpdateTableOp {
-                catalog_name: "default".to_string(),
-                schema_name: schema_name.to_string(),
-                table_name: table_name.to_string(),
+                catalog: "default".to_string(),
+                schema: schema_name.to_string(),
+                table: table_name.to_string(),
                 description: description.map(str::to_string),
                 location: None,
                 format: None,
@@ -309,9 +308,9 @@ pub fn catalog_drop_table_request(
     ApplyCatalogDdlRequest {
         ddl: Some(CatalogDdlOperation {
             op: Some(catalog_ddl_operation::Op::DropTable(DropTableOp {
-                catalog_name: "default".to_string(),
-                schema_name: schema_name.to_string(),
-                table_name: table_name.to_string(),
+                catalog: "default".to_string(),
+                schema: schema_name.to_string(),
+                table: table_name.to_string(),
             })),
         }),
     }
@@ -330,10 +329,10 @@ pub fn catalog_rename_table_request(
     ApplyCatalogDdlRequest {
         ddl: Some(CatalogDdlOperation {
             op: Some(catalog_ddl_operation::Op::RenameTable(RenameTableOp {
-                catalog_name: catalog_name.to_string(),
-                schema_name: schema_name.to_string(),
-                old_table_name: old_table_name.to_string(),
-                new_table_name: new_table_name.to_string(),
+                catalog: catalog_name.to_string(),
+                schema: schema_name.to_string(),
+                table: old_table_name.to_string(),
+                new_table: new_table_name.to_string(),
             })),
         }),
     }
@@ -441,8 +440,8 @@ pub fn root_request(
             DomainMutation {
                 kind: Some(domain_mutation::Kind::Catalog(CatalogDdlOperation {
                     op: Some(catalog_ddl_operation::Op::CreateSchema(CreateSchemaOp {
-                        catalog_name: "default".to_string(),
-                        schema_name: schema_name.to_string(),
+                        catalog: "default".to_string(),
+                        schema: schema_name.to_string(),
                         description: Some("root transaction schema".to_string()),
                     })),
                 })),

@@ -14,7 +14,7 @@ Arco is a file-native metadata platform with two tightly integrated domains:
 
 ## Domain Model
 
-- Tier 1 metadata (low-frequency, strongly consistent): schema and control-plane state.
+- Tier 1 metadata (low-frequency, strongly consistent): schema and implemented control-plane state such as catalog DDL, lineage/search publication, and orchestration transactions.
 - Tier 2 metadata (high-frequency, append-first): execution and operational events.
 - Compaction materializes query-efficient snapshots from append-first logs.
 
@@ -23,6 +23,11 @@ Arco is a file-native metadata platform with two tightly integrated domains:
 - Writes for control-plane metadata prioritize correctness and idempotency.
 - Operational facts are append-first, then compacted into bounded-staleness views.
 - Read paths are designed for stable contracts and predictable eventual convergence.
+
+Current scope note:
+
+- Arco has strong repo-side proof for immutable snapshot publication, fenced head movement, pointer-first reads, and compactor-owned materialization.
+- Broader governance domains such as grants, permissions, and credentials are not yet uniformly implemented on that same authoritative path.
 
 ## Canonical Decision Sources
 

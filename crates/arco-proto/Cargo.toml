@@ -16,6 +16,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+chrono = { workspace = true }
 http = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }

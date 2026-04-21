@@ -1,6 +1,6 @@
 # Compactor Publish Race Retry Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **Execution note:** Implement this plan task-by-task.
 
 **Goal:** Harden orchestration compaction against concurrent manifest publish races without relying on fragile storage error strings.
 

@@ -48,7 +48,8 @@ fn base_task_row(state: FoldTaskState) -> TaskRow {
 }
 
 #[test]
-fn task_finished_proto_round_trip_preserves_typed_callback_payloads() {
+fn task_finished_proto_round_trip_preserves_typed_callback_payloads_without_public_json_escape_hatch()
+ {
     let event = OrchestrationEvent::new(
         "tenant-01",
         "workspace-01",
@@ -110,10 +111,6 @@ fn task_finished_proto_round_trip_preserves_typed_callback_payloads() {
         Some("default.raw.events")
     );
     assert_eq!(callback_output.delta_version, Some(7));
-    assert_eq!(
-        task_finished.partial_progress_json.as_deref(),
-        Some("{\"percent\":50}")
-    );
 
     let roundtrip = event_from_proto_envelope("tenant-01", "workspace-01", &envelope)
         .expect("proto event should map back to runtime");
@@ -148,7 +145,10 @@ fn task_finished_proto_round_trip_preserves_typed_callback_payloads() {
         metrics.as_ref().and_then(|value| value.cpu_time_ms),
         Some(42)
     );
-    assert_eq!(partial_progress_json.as_deref(), Some("{\"percent\":50}"));
+    assert!(
+        partial_progress_json.is_none(),
+        "public proto round-trip should not preserve internal partial progress blobs"
+    );
 }
 
 #[test]

@@ -2,7 +2,6 @@ syntax = "proto3";
 
 package arco.catalog.v1;
 
-import "arco/common/v1/common.proto";
 import "google/protobuf/timestamp.proto";
 
 option go_package = "github.com/daxis-io/arco/proto/arco/catalog/v1";
@@ -10,41 +9,39 @@ option java_multiple_files = true;
 option java_package = "com.arco.catalog.v1";
 
 message Catalog {
-  string id = 1;
-  string name = 2;
+  // Canonical public noun for the top namespace level.
+  string catalog = 1;
+  optional string display_name = 2;
   optional string description = 3;
   google.protobuf.Timestamp created_at = 4;
   google.protobuf.Timestamp updated_at = 5;
 }
 
 message Schema {
-  string id = 1;
-  string catalog_id = 2;
-  string name = 3;
-  optional string description = 4;
-  google.protobuf.Timestamp created_at = 5;
-  google.protobuf.Timestamp updated_at = 6;
+  string catalog = 1;
+  string schema = 2;
+  optional string description = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+// Supported table formats across catalog contracts.
+enum TableFormat {
+  TABLE_FORMAT_UNSPECIFIED = 0;
+  TABLE_FORMAT_DELTA = 1;
+  TABLE_FORMAT_ICEBERG = 2;
+  TABLE_FORMAT_PARQUET = 3;
 }
 
 message Table {
-  string id = 1;
-  string schema_id = 2;
-  string name = 3;
+  string catalog = 1;
+  string schema = 2;
+  string table = 3;
   optional string description = 4;
   optional string location = 5;
-  arco.common.v1.TableFormat format = 6;
+  TableFormat format = 6;
   google.protobuf.Timestamp created_at = 7;
   google.protobuf.Timestamp updated_at = 8;
-}
-
-message Column {
-  string id = 1;
-  string table_id = 2;
-  string name = 3;
-  string data_type = 4;
-  bool is_nullable = 5;
-  int32 ordinal = 6;
-  optional string description = 7;
 }
 
 message ColumnDefinition {
@@ -55,56 +52,47 @@ message ColumnDefinition {
   optional string description = 5;
 }
 
-message LineageEdge {
-  string id = 1;
-  string source_table_id = 2;
-  string target_table_id = 3;
-  string edge_type = 4;
-  optional string run_id = 5;
-  google.protobuf.Timestamp created_at = 6;
-}
-
 message CreateCatalogOp {
-  string name = 1;
+  string catalog = 1;
   optional string description = 2;
 }
 
 message CreateSchemaOp {
-  string catalog_name = 1;
-  string schema_name = 2;
+  string catalog = 1;
+  string schema = 2;
   optional string description = 3;
 }
 
 message RegisterTableOp {
-  string catalog_name = 1;
-  string schema_name = 2;
-  string table_name = 3;
+  string catalog = 1;
+  string schema = 2;
+  string table = 3;
   optional string description = 4;
   optional string location = 5;
-  arco.common.v1.TableFormat format = 6;
+  TableFormat format = 6;
   repeated ColumnDefinition columns = 7;
 }
 
 message UpdateTableOp {
-  string catalog_name = 1;
-  string schema_name = 2;
-  string table_name = 3;
+  string catalog = 1;
+  string schema = 2;
+  string table = 3;
   optional string description = 4;
   optional string location = 5;
-  optional arco.common.v1.TableFormat format = 6;
+  optional TableFormat format = 6;
 }
 
 message DropTableOp {
-  string catalog_name = 1;
-  string schema_name = 2;
-  string table_name = 3;
+  string catalog = 1;
+  string schema = 2;
+  string table = 3;
 }
 
 message RenameTableOp {
-  string catalog_name = 1;
-  string schema_name = 2;
-  string old_table_name = 3;
-  string new_table_name = 4;
+  string catalog = 1;
+  string schema = 2;
+  string table = 3;
+  string new_table = 4;
 }
 
 message CatalogDdlOperation {

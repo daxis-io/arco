@@ -31,6 +31,8 @@ mod versions {
     pub const BUF_VERSION: &str = "1.47.2";
 }
 
+const PROTO_POST_HARD_CUT_BASELINE: &str = "proto-baselines/post-hard-cut-v1.binpb";
+
 #[derive(Parser)]
 #[command(name = "xtask", about = "Arco workspace automation")]
 struct Cli {
@@ -52,6 +54,8 @@ enum Commands {
     AdrCheck,
     /// Enforce repository hygiene invariants
     RepoHygieneCheck,
+    /// Check the frozen post-hard-cut protobuf contract baseline
+    ProtoBreakingCheck,
     /// Verify catalog integrity (schemas, golden files, workspace checks)
     VerifyIntegrity {
         /// Show detailed output
@@ -90,6 +94,7 @@ fn main() -> Result<()> {
         Commands::Doctor => run_doctor(),
         Commands::AdrCheck => run_adr_check(),
         Commands::RepoHygieneCheck => run_repo_hygiene_check(),
+        Commands::ProtoBreakingCheck => run_proto_breaking_check(),
         Commands::ParityMatrixCheck => run_parity_matrix_check(),
         Commands::UcOpenapiInventory => run_uc_openapi_inventory(),
         Commands::EngineBoundaryCheck => run_engine_boundary_check(),
@@ -296,6 +301,8 @@ fn run_ci() -> Result<()> {
     run_engine_boundary_check()?;
     run_parity_matrix_check()?;
     run_repo_hygiene_check()?;
+    run_cmd("buf", &["lint", "proto/"])?;
+    run_proto_breaking_check()?;
 
     run_cmd("cargo", &["check", "--workspace", "--all-features"])?;
     run_cmd("cargo", &["fmt", "--all", "--check"])?;
@@ -340,6 +347,29 @@ fn run_ci() -> Result<()> {
     Ok(())
 }
 
+fn run_proto_breaking_check() -> Result<()> {
+    println!("Checking frozen post-cut protobuf contract baseline...\n");
+
+    if !Path::new(PROTO_POST_HARD_CUT_BASELINE).exists() {
+        anyhow::bail!(
+            "missing frozen proto baseline image at {PROTO_POST_HARD_CUT_BASELINE}; regenerate it from the intended post-cut surface before running this check"
+        );
+    }
+
+    run_cmd(
+        "buf",
+        &[
+            "breaking",
+            "proto",
+            "--against",
+            PROTO_POST_HARD_CUT_BASELINE,
+        ],
+    )?;
+
+    println!("\nFrozen post-cut protobuf contract baseline check passed!");
+    Ok(())
+}
+
 fn run_repo_hygiene_check() -> Result<()> {
     println!("Running repository hygiene checks...\n");
 
@@ -370,6 +400,10 @@ fn run_repo_hygiene_check() -> Result<()> {
             if lower.contains(marker) {
                 errors.push(format!("{path}: forbidden path reference '{marker}'"));
             }
+        }
+
+        for hit in scan_proto_denylist(&path, &text) {
+            errors.push(format!("{path}: legacy proto symbol '{hit}'"));
         }
     }
 
@@ -548,6 +582,49 @@ fn contains_standalone_ai(text: &str) -> bool {
 
 fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// References from the legacy `arco.v1` proto surface that must not reappear
+/// after the breaking-release cut. Two scopes: `cross_scope` matches everywhere
+/// in `proto/` and `crates/`; `proto_only` matches only inside `.proto` files
+/// (these are common Rust identifier shapes that would false-positive on
+/// disambiguating type aliases otherwise).
+fn proto_denylist_cross_scope() -> [&'static str; 3] {
+    ["arco.v1", "flow.proto", "payload_json"]
+}
+
+fn proto_denylist_proto_only() -> [&'static str; 2] {
+    ["FlowRun", "FlowTask"]
+}
+
+fn scan_proto_denylist(path: &str, text: &str) -> Vec<String> {
+    if !is_proto_denylist_path(path) {
+        return Vec::new();
+    }
+
+    let mut hits = Vec::new();
+    for term in proto_denylist_cross_scope() {
+        if text.contains(term) {
+            hits.push(term.to_string());
+        }
+    }
+
+    if path.ends_with(".proto") {
+        for term in proto_denylist_proto_only() {
+            if text.contains(term) {
+                hits.push(term.to_string());
+            }
+        }
+    }
+
+    hits
+}
+
+fn is_proto_denylist_path(path: &str) -> bool {
+    if path == "tools/xtask/src/main.rs" {
+        return false;
+    }
+    path.ends_with(".proto") || path.starts_with("crates/")
 }
 
 fn run_lint() -> Result<()> {
@@ -2144,7 +2221,7 @@ fn validate_deny_toml() -> Result<()> {
 }
 
 fn validate_buf_yaml() -> Result<()> {
-    let content = std::fs::read_to_string("proto/buf.yaml").context("proto/buf.yaml not found")?;
+    let content = std::fs::read_to_string("buf.yaml").context("buf.yaml not found")?;
 
     let doc: serde_yaml::Value = serde_yaml::from_str(&content).context("invalid YAML syntax")?;
     let version = doc

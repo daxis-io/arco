@@ -16,6 +16,8 @@ source of truth quickly.
   - `docs/guide/src/concepts/architecture.md`
   - `docs/guide/src/concepts/catalog.md`
   - `docs/guide/src/concepts/orchestration.md`
+- Control-plane scope scorecard:
+  - `docs/guide/src/reference/control-plane-scope.md`
 
 ## Operations and Readiness
 
@@ -40,3 +42,6 @@ source of truth quickly.
 
 Transient evidence should not be tracked as long-lived repository content.
 See `docs/guide/src/reference/evidence-policy.md` for policy details.
+
+For repo-grounded "what is actually implemented" checks, use the control-plane
+scope scorecard before summarizing architecture status.

@@ -52,16 +52,57 @@ message Example {
 - Fields: `snake_case`
 - Enums: `SCREAMING_SNAKE_CASE` with type prefix
 - Services: `PascalCase` with `Service` suffix
-- RPCs: `PascalCase` verb-noun (e.g., `GetAsset`, `CreateRun`)
+- RPCs: `PascalCase` verb-noun (e.g., `GetTable`, `CommitOrchestrationBatch`)
 
 ## Change Review Checklist
 
 Before merging proto changes:
 
 - [ ] `buf lint` passes
-- [ ] `buf breaking` passes against main branch
+- [ ] `cargo xtask proto-breaking-check` passes against `proto-baselines/post-hard-cut-v1.binpb`
 - [ ] New fields have clear documentation
 - [ ] Field numbers follow allocation guidelines
 - [ ] Enum values include `_UNSPECIFIED = 0` default
 - [ ] No field number reuse
 - [ ] Deprecated fields marked with option
+
+## JSON Contract Policy
+
+The public proto surface must preserve both **binary protobuf/gRPC** compatibility and
+**ProtoJSON** compatibility. The active Buf breaking policy is `WIRE_JSON` — see
+[buf.yaml](../buf.yaml).
+
+The frozen post-cut baseline image lives at
+`proto-baselines/post-hard-cut-v1.binpb`. Run `cargo xtask proto-breaking-check` to verify that
+current proto changes remain compatible with that baseline.
+Regenerate the baseline with
+`buf build proto --exclude-source-info -o proto-baselines/post-hard-cut-v1.binpb`.
+
+A small allowlist of cross-domain value objects in `arco.common.v1` is still annotated with
+`serde::{Serialize, Deserialize}` derives in
+[crates/arco-proto/build.rs](../crates/arco-proto/build.rs) because those shapes are persisted in
+JSON storage objects (control-plane transaction records, golden fixtures) and crossed across
+crate boundaries. The current allowlist is:
+
+- `arco.common.v1.PartitionKey`, `PartitionDimension`
+- `arco.common.v1.ScalarValue`, `NullValue`
+
+`TableFormat` no longer belongs in `arco.common.v1`; it lives with the catalog domain in
+`arco.catalog.v1` because it is not a cross-domain value object.
+
+`FileEntry` no longer belongs in `arco.common.v1`; published output files are owned by the
+orchestration contract as `arco.orchestration.v1.FileEntry` because they sit on the public
+`TaskOutput` boundary rather than acting as a shared cross-domain value object.
+
+Rules for proto authors:
+
+- Treat ProtoJSON field names and enum spellings as public contract once a message is exposed from
+  `proto/arco/*/v1`.
+- Keep `arco.common.v1` limited to true cross-domain value objects. Domain-specific nouns such as
+  catalog-only enums belong in their owning package.
+- Do not expand generated `serde` derives casually. Storage-bound JSON shapes should still prefer
+  hand-written `serde` types in the consuming crate unless the shared proto shape is intentionally
+  reused across crate boundaries or fixtures.
+- If the JSON-eligible value-type set in `arco.common.v1` changes, update both this section and
+  [build.rs](../crates/arco-proto/build.rs) so the policy and code stay in sync.
+- Storage-internal or binary-only payloads stay in their consuming crate, not in the public proto module.

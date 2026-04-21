@@ -1,6 +1,14 @@
 # Catalog
 
-The catalog domain tracks data assets, schemas, lineage, and governance metadata.
+The catalog domain tracks data assets, schemas, lineage, and search-oriented metadata today.
+
+Arco already proves authoritative control-plane behavior for:
+
+- catalogs, schemas, tables, and columns
+- lineage projections
+- search projections derived from current catalog state
+
+Broader governance scope remains narrower than the highest-level architectural framing sometimes implies. Grants, permissions, credentials, and policy-style metadata are not yet fully implemented as authoritative catalog-ledger objects in the current repo. Use `docs/guide/src/reference/control-plane-scope.md` when describing implementation status.
 
 ## What the Catalog Stores
 

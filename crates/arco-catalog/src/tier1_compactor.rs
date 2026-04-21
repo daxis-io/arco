@@ -24,7 +24,7 @@ use crate::manifest::{
 };
 use crate::parquet_util::SearchPostingRecord;
 use crate::sync_compact_permit_issuer;
-use crate::tier1_events::{CatalogDdlEvent, CatalogDdlEventV2, LineageDdlEvent};
+use crate::tier1_events::{CatalogDdlEvent, CatalogDdlEventV2, CatalogDdlEventV3, LineageDdlEvent};
 use crate::tier1_snapshot;
 use crate::tier1_state;
 
@@ -198,15 +198,16 @@ impl Tier1Compactor {
             CatalogDomain::Catalog | CatalogDomain::Lineage | CatalogDomain::Search => {}
         }
 
-        let mut event_paths = validate_event_paths(domain, event_paths)?;
+        // Preserve the caller-supplied order for explicit event batches. This is
+        // required for multi-event mutations like force deletes that must apply
+        // table drops before namespace/catalog deletes.
+        let event_paths = validate_event_paths(domain, event_paths)?;
 
         if event_paths.is_empty() && domain != CatalogDomain::Search {
             return Err(Tier1CompactionError::ProcessingError {
                 message: "no event paths provided".to_string(),
             });
         }
-
-        event_paths.sort();
 
         let lock_path = self.storage.lock(domain);
         let lock = DistributedLock::new(self.storage.backend().clone(), &lock_path);
@@ -862,6 +863,7 @@ fn validate_event_paths(
 enum ParsedCatalogDdlEvent {
     V1(CatalogDdlEvent),
     V2(CatalogDdlEventV2),
+    V3(CatalogDdlEventV3),
 }
 
 async fn read_catalog_event(
@@ -904,6 +906,11 @@ async fn read_catalog_event(
             let payload: CatalogDdlEventV2 =
                 serde_json::from_value(envelope.payload).map_err(map_processing_error)?;
             Ok(ParsedCatalogDdlEvent::V2(payload))
+        }
+        CatalogDdlEventV3::EVENT_VERSION => {
+            let payload: CatalogDdlEventV3 =
+                serde_json::from_value(envelope.payload).map_err(map_processing_error)?;
+            Ok(ParsedCatalogDdlEvent::V3(payload))
         }
         other => Err(Tier1CompactionError::ProcessingError {
             message: format!(
@@ -957,6 +964,7 @@ fn apply_catalog_event(
     match event {
         ParsedCatalogDdlEvent::V1(event) => apply_catalog_event_v1(state, event),
         ParsedCatalogDdlEvent::V2(event) => apply_catalog_event_v2(state, event),
+        ParsedCatalogDdlEvent::V3(event) => apply_catalog_event_v3(state, event),
     }
 }
 
@@ -1205,6 +1213,76 @@ fn apply_catalog_event_v2(
                 });
             }
             state.catalogs.push(catalog);
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_catalog_event_v3(
+    state: &mut crate::state::CatalogState,
+    event: CatalogDdlEventV3,
+) -> Result<(), Tier1CompactionError> {
+    match event {
+        CatalogDdlEventV3::CatalogUpdated { catalog } => {
+            let Some(existing) = state
+                .catalogs
+                .iter_mut()
+                .find(|candidate| candidate.id == catalog.id)
+            else {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog '{}' not found", catalog.id),
+                });
+            };
+
+            if existing.name != catalog.name {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog identity mismatch for {}", catalog.id),
+                });
+            }
+
+            if existing == &catalog {
+                return Ok(());
+            }
+
+            *existing = catalog;
+        }
+        CatalogDdlEventV3::CatalogDeleted {
+            catalog_id,
+            catalog_name,
+        } => {
+            let index = state
+                .catalogs
+                .iter()
+                .position(|catalog| catalog.id == catalog_id);
+
+            let Some(index) = index else {
+                return Ok(());
+            };
+
+            let Some(existing) = state.catalogs.get(index) else {
+                return Ok(());
+            };
+            if existing.name != catalog_name {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog name mismatch for {catalog_id}"),
+                });
+            }
+
+            let default_catalog_id = state
+                .catalogs
+                .iter()
+                .find(|catalog| catalog.name == "default")
+                .map(|catalog| catalog.id.as_str());
+            if state.namespaces.iter().any(|namespace| {
+                namespace.catalog_id.as_deref().or(default_catalog_id) == Some(catalog_id.as_str())
+            }) {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog '{catalog_name}' contains schemas"),
+                });
+            }
+
+            state.catalogs.remove(index);
         }
     }
 

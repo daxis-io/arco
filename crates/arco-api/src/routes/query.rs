@@ -35,6 +35,7 @@ use arco_core::CatalogDomain;
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
 use crate::server::AppState;
+use crate::system_tables;
 
 const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 const JSON_CONTENT_TYPE: &str = "application/json";
@@ -110,7 +111,9 @@ pub(crate) async fn query(
     let reader = CatalogReader::new(storage.clone());
 
     let session = SessionContext::new();
-    let registered = register_snapshot_tables(&session, &reader, &storage).await?;
+    let registered = register_snapshot_tables(&session, &reader, &storage).await?
+        + system_tables::register_catalog_and_lineage_system_tables(&session, &reader, &storage)
+            .await?;
     if registered == 0 {
         return Err(ApiError::not_found(
             "No snapshot tables available for query",

@@ -67,6 +67,7 @@ pub mod rate_limit;
 pub(crate) mod redaction;
 pub mod routes;
 pub mod server;
+pub(crate) mod system_tables;
 
 /// Prelude module for convenient imports.
 pub mod prelude {

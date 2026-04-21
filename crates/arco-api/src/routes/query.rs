@@ -29,7 +29,7 @@ use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use arco_catalog::CatalogReader;
+use arco_catalog::{CatalogError, CatalogReader};
 use arco_core::CatalogDomain;
 
 use crate::context::RequestContext;
@@ -242,10 +242,11 @@ async fn register_domain_tables(
     domain: CatalogDomain,
     mappings: &[(&str, &str)],
 ) -> Result<usize, ApiError> {
-    let paths = reader
-        .get_mintable_paths(domain)
-        .await
-        .map_err(ApiError::from)?;
+    let paths = match reader.get_mintable_paths(domain).await {
+        Ok(paths) => paths,
+        Err(CatalogError::NotFound { .. }) => return Ok(0),
+        Err(err) => return Err(ApiError::from(err)),
+    };
     if paths.is_empty() {
         return Ok(0);
     }

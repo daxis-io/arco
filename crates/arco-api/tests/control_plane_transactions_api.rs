@@ -21,8 +21,7 @@ use arco_core::storage::{
 };
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_proto::arco::catalog::v1::{
-    CatalogDdlOperation, ColumnDefinition, MetastoreMutation, StorageCredential,
-    metastore_mutation,
+    CatalogDdlOperation, ColumnDefinition, MetastoreMutation, StorageCredential, metastore_mutation,
 };
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CommitOrchestrationBatchRequest,
@@ -1511,8 +1510,8 @@ async fn commit_root_transaction_hashes_metastore_mutation_payloads() -> Result<
 }
 
 #[tokio::test]
-async fn commit_root_transaction_captures_mixed_metastore_hash_before_not_implemented()
--> Result<()> {
+async fn commit_root_transaction_captures_mixed_metastore_hash_before_not_implemented() -> Result<()>
+{
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let router = test_router_with_backend(backend.clone());
     let mut request = root_request(
@@ -1521,8 +1520,7 @@ async fn commit_root_transaction_captures_mixed_metastore_hash_before_not_implem
         "mixed-metastore-root",
         "run-root-metastore-mixed-01",
     );
-    let mut metastore_request =
-        metastore_storage_credential_root_request("lakehouse-prod-mixed");
+    let mut metastore_request = metastore_storage_credential_root_request("lakehouse-prod-mixed");
     request.mutations.push(
         metastore_request
             .mutations

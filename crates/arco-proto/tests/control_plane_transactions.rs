@@ -7,9 +7,8 @@ use prost::Message;
 use arco_proto::arco::catalog::v1::{
     Catalog, CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp, DropTableOp,
     ExternalLocation, Function, GovernanceAttachment, Grant, MetastoreMutation, ModelVersion,
-    RegisteredModel, RegisterTableOp, RenameTableOp, Schema, StorageCredential, Table,
-    TableFormat, UpdateTableOp, Volume, WorkspaceBinding, catalog_ddl_operation,
-    metastore_mutation,
+    RegisterTableOp, RegisteredModel, RenameTableOp, Schema, StorageCredential, Table, TableFormat,
+    UpdateTableOp, Volume, WorkspaceBinding, catalog_ddl_operation, metastore_mutation,
 };
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CatalogTxReceipt, CatalogTxStatus,
@@ -382,7 +381,10 @@ fn metastore_contract_exposes_stable_id_objects() {
     assert_eq!(grant.grant_id, "grant_01");
     assert_eq!(grant.object_id, "table_01");
     assert_eq!(storage_credential.credential_id, "cred_01");
-    assert_eq!(external_location.credential_id, storage_credential.credential_id);
+    assert_eq!(
+        external_location.credential_id,
+        storage_credential.credential_id
+    );
     assert_eq!(binding.object_id, external_location.location_id);
     assert_eq!(attachment.attachment_type, "CLASSIFICATION");
     assert_eq!(volume.volume_id, "volume_01");

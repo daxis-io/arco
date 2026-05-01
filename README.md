@@ -96,6 +96,8 @@ cargo clippy --workspace --all-features -- -D warnings
 
 - `proto/` is the authoritative protobuf source tree.
 - The generated `arco-proto` types are part of the supported cross-process contract.
+- `arco.*.v1` remains in the pre-freeze hard cut window until
+  `proto-baselines/post-hard-cut-v1.binpb` is regenerated for the expanded API.
 - Protobuf JSON field compatibility is enforced as part of the post-cut schema baseline, not treated as accidental serialization behavior.
 - Run `cargo xtask proto-breaking-check` to verify compatibility against the frozen post-cut baseline at `proto-baselines/post-hard-cut-v1.binpb`.
 - Regenerate that frozen baseline image with `buf build proto --exclude-source-info -o proto-baselines/post-hard-cut-v1.binpb`.

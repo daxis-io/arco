@@ -66,3 +66,13 @@ fn partition_dimensions_use_explicit_messages_instead_of_maps() {
     assert_eq!(pk.dimensions[0].name, "date");
     assert_eq!(pk.dimensions[1].name, "region");
 }
+
+#[test]
+fn docs_name_the_pre_freeze_proto_hard_cut_policy() {
+    let readme = include_str!("../../../README.md");
+    let style = include_str!("../../../proto/STYLE.md");
+
+    assert!(readme.contains("pre-freeze hard cut"));
+    assert!(style.contains("pre-freeze hard cut"));
+    assert!(style.contains("After the post-hard-cut baseline is regenerated"));
+}

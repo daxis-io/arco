@@ -78,6 +78,14 @@ current proto changes remain compatible with that baseline.
 Regenerate the baseline with
 `buf build proto --exclude-source-info -o proto-baselines/post-hard-cut-v1.binpb`.
 
+## Pre-Freeze Hard-Cut Policy
+
+The current `arco.*.v1` packages are allowed to receive intentional breaking
+changes only as part of the documented pre-freeze hard cut that expands the
+public API surface. After the post-hard-cut baseline is regenerated, `v1`
+changes must be additive and must preserve binary and ProtoJSON compatibility.
+Future broad reshapes require new `v2` packages.
+
 A small allowlist of cross-domain value objects in `arco.common.v1` is still annotated with
 `serde::{Serialize, Deserialize}` derives in
 [crates/arco-proto/build.rs](../crates/arco-proto/build.rs) because those shapes are persisted in

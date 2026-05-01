@@ -1,6 +1,12 @@
 //! Contract tests for the authoritative control-plane protobuf surface.
 
-#![allow(clippy::expect_used)]
+#![allow(
+    clippy::cognitive_complexity,
+    clippy::default_trait_access,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::too_many_lines
+)]
 
 use prost::Message;
 

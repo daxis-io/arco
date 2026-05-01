@@ -1,6 +1,6 @@
 //! Golden fixture tests for the authoritative shared protobuf surface.
 
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::indexing_slicing)]
 
 use arco_proto::arco::catalog::v1::MetastoreMutation;
 use arco_proto::arco::common::v1::{PartitionDimension, PartitionKey, ScalarValue, scalar_value};

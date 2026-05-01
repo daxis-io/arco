@@ -23,14 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config = config.type_attribute(ty, "#[derive(serde::Serialize, serde::Deserialize)]");
     }
 
-    config = config.message_attribute(
-        ".arco.catalog.v1.MetastoreMutation",
-        "#[derive(serde::Serialize, serde::Deserialize)] #[serde(transparent)]",
-    );
-    config = config.enum_attribute(
-        ".arco.catalog.v1.MetastoreMutation.op",
-        "#[derive(serde::Serialize, serde::Deserialize)] #[serde(rename_all = \"camelCase\")]",
-    );
+    config = configure_metastore_serde(config);
 
     for ty in [
         ".arco.catalog.v1.Catalog",
@@ -83,6 +76,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    config = configure_metastore_serde_fields(config);
+
+    config.compile_protos(&proto_files, &["../../proto"])?;
+
+    for file in &proto_files {
+        println!("cargo:rerun-if-changed={file}");
+    }
+    println!("cargo:rerun-if-changed=../../proto");
+
+    Ok(())
+}
+
+fn configure_metastore_serde(config: tonic_prost_build::Builder) -> tonic_prost_build::Builder {
+    config
+        .message_attribute(
+            ".arco.catalog.v1.MetastoreMutation",
+            "#[derive(serde::Serialize, serde::Deserialize)] #[serde(transparent)]",
+        )
+        .enum_attribute(
+            ".arco.catalog.v1.MetastoreMutation.op",
+            "#[derive(serde::Serialize, serde::Deserialize)] #[serde(rename_all = \"camelCase\")]",
+        )
+}
+
+fn configure_metastore_serde_fields(
+    mut config: tonic_prost_build::Builder,
+) -> tonic_prost_build::Builder {
     for field in [
         ".arco.catalog.v1.StorageCredential.created_at",
         ".arco.catalog.v1.StorageCredential.updated_at",
@@ -106,12 +126,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config = config.field_attribute(variant, "#[serde(skip)]");
     }
 
-    config.compile_protos(&proto_files, &["../../proto"])?;
-
-    for file in &proto_files {
-        println!("cargo:rerun-if-changed={file}");
-    }
-    println!("cargo:rerun-if-changed=../../proto");
-
-    Ok(())
+    config
 }

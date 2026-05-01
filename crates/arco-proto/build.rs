@@ -4,6 +4,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_files = [
         "../../proto/arco/common/v1/common.proto",
         "../../proto/arco/catalog/v1/catalog.proto",
+        "../../proto/arco/catalog/v1/metastore.proto",
         "../../proto/arco/orchestration/v1/orchestration.proto",
         "../../proto/arco/controlplane/v1/transactions.proto",
     ];

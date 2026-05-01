@@ -1,0 +1,117 @@
+syntax = "proto3";
+
+package arco.catalog.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/daxis-io/arco/proto/arco/catalog/v1";
+option java_multiple_files = true;
+option java_package = "com.arco.catalog.v1";
+
+message Grant {
+  string grant_id = 1;
+  string object_id = 2;
+  string object_type = 3;
+  string principal = 4;
+  string privilege = 5;
+  string granted_by = 6;
+  google.protobuf.Timestamp created_at = 7;
+}
+
+message StorageCredential {
+  string credential_id = 1;
+  string name = 2;
+  string cloud = 3;
+  string owner = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message ExternalLocation {
+  string location_id = 1;
+  string name = 2;
+  string url = 3;
+  string credential_id = 4;
+  string owner = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message WorkspaceBinding {
+  string binding_id = 1;
+  string workspace_id = 2;
+  string object_id = 3;
+  string object_type = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message GovernanceAttachment {
+  string attachment_id = 1;
+  string object_id = 2;
+  string object_type = 3;
+  string attachment_type = 4;
+  string value = 5;
+  string created_by = 6;
+  google.protobuf.Timestamp created_at = 7;
+}
+
+message Volume {
+  string volume_id = 1;
+  string catalog = 2;
+  string schema = 3;
+  string volume = 4;
+  string storage_location = 5;
+  string owner = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+message Function {
+  string function_id = 1;
+  string catalog = 2;
+  string schema = 3;
+  string function = 4;
+  string owner = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message RegisteredModel {
+  string model_id = 1;
+  string catalog = 2;
+  string schema = 3;
+  string model = 4;
+  string owner = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message ModelVersion {
+  string model_version_id = 1;
+  string model_id = 2;
+  string version = 3;
+  string storage_location = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message GrantMutation {
+  oneof op {
+    Grant grant = 1;
+    Grant revoke = 2;
+  }
+}
+
+message MetastoreMutation {
+  oneof op {
+    GrantMutation grant = 1;
+    StorageCredential storage_credential = 2;
+    ExternalLocation external_location = 3;
+    WorkspaceBinding workspace_binding = 4;
+    GovernanceAttachment governance_attachment = 5;
+    Volume volume = 6;
+    Function function = 7;
+    RegisteredModel registered_model = 8;
+    ModelVersion model_version = 9;
+  }
+}

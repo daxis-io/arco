@@ -6,8 +6,9 @@ use prost::Message;
 
 use arco_proto::arco::catalog::v1::{
     Catalog, CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp, DropTableOp,
-    RegisterTableOp, RenameTableOp, Schema, Table, TableFormat, UpdateTableOp,
-    catalog_ddl_operation,
+    ExternalLocation, Function, GovernanceAttachment, Grant, MetastoreMutation, ModelVersion,
+    RegisteredModel, RegisterTableOp, RenameTableOp, Schema, StorageCredential, Table,
+    TableFormat, UpdateTableOp, Volume, WorkspaceBinding, catalog_ddl_operation,
 };
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CatalogTxReceipt, CatalogTxStatus,
@@ -291,6 +292,102 @@ fn catalog_ddl_surface_covers_authoritative_operations() {
     assert!(update_table.op.is_some());
     assert!(drop_table.op.is_some());
     assert!(rename_table.op.is_some());
+}
+
+#[test]
+fn metastore_contract_exposes_stable_id_objects() {
+    let grant = Grant {
+        grant_id: "grant_01".to_string(),
+        object_id: "table_01".to_string(),
+        object_type: "TABLE".to_string(),
+        principal: "user:alice@example.com".to_string(),
+        privilege: "SELECT".to_string(),
+        granted_by: "user:admin@example.com".to_string(),
+        created_at: None,
+    };
+
+    let storage_credential = StorageCredential {
+        credential_id: "cred_01".to_string(),
+        name: "lakehouse-prod".to_string(),
+        cloud: "aws".to_string(),
+        owner: "group:data-platform".to_string(),
+        created_at: None,
+        updated_at: None,
+    };
+
+    let external_location = ExternalLocation {
+        location_id: "loc_01".to_string(),
+        name: "raw-prod".to_string(),
+        url: "s3://bucket/raw".to_string(),
+        credential_id: storage_credential.credential_id.clone(),
+        owner: "group:data-platform".to_string(),
+        created_at: None,
+        updated_at: None,
+    };
+    let binding = WorkspaceBinding {
+        binding_id: "binding_01".to_string(),
+        workspace_id: "workspace_01".to_string(),
+        object_id: external_location.location_id.clone(),
+        object_type: "EXTERNAL_LOCATION".to_string(),
+        created_at: None,
+    };
+    let attachment = GovernanceAttachment {
+        attachment_id: "attach_01".to_string(),
+        object_id: "table_01".to_string(),
+        object_type: "TABLE".to_string(),
+        attachment_type: "CLASSIFICATION".to_string(),
+        value: "restricted".to_string(),
+        created_by: "user:admin@example.com".to_string(),
+        created_at: None,
+    };
+    let volume = Volume {
+        volume_id: "volume_01".to_string(),
+        catalog: "default".to_string(),
+        schema: "raw".to_string(),
+        volume: "landing".to_string(),
+        storage_location: "s3://bucket/volumes/landing".to_string(),
+        owner: "group:data-platform".to_string(),
+        created_at: None,
+        updated_at: None,
+    };
+    let function = Function {
+        function_id: "function_01".to_string(),
+        catalog: "default".to_string(),
+        schema: "raw".to_string(),
+        function: "normalize_email".to_string(),
+        owner: "group:data-platform".to_string(),
+        created_at: None,
+        updated_at: None,
+    };
+    let model = RegisteredModel {
+        model_id: "model_01".to_string(),
+        catalog: "default".to_string(),
+        schema: "ml".to_string(),
+        model: "churn".to_string(),
+        owner: "group:ml-platform".to_string(),
+        created_at: None,
+        updated_at: None,
+    };
+    let model_version = ModelVersion {
+        model_version_id: "model_version_01".to_string(),
+        model_id: model.model_id.clone(),
+        version: "1".to_string(),
+        storage_location: "s3://bucket/models/churn/1".to_string(),
+        created_at: None,
+        updated_at: None,
+    };
+    let empty_mutation = MetastoreMutation { op: None };
+
+    assert_eq!(grant.grant_id, "grant_01");
+    assert_eq!(grant.object_id, "table_01");
+    assert_eq!(storage_credential.credential_id, "cred_01");
+    assert_eq!(external_location.credential_id, storage_credential.credential_id);
+    assert_eq!(binding.object_id, external_location.location_id);
+    assert_eq!(attachment.attachment_type, "CLASSIFICATION");
+    assert_eq!(volume.volume_id, "volume_01");
+    assert_eq!(function.function, "normalize_email");
+    assert_eq!(model_version.model_id, model.model_id);
+    assert!(empty_mutation.op.is_none());
 }
 
 #[test]

@@ -9,6 +9,7 @@ use arco_proto::arco::catalog::v1::{
     ExternalLocation, Function, GovernanceAttachment, Grant, MetastoreMutation, ModelVersion,
     RegisteredModel, RegisterTableOp, RenameTableOp, Schema, StorageCredential, Table,
     TableFormat, UpdateTableOp, Volume, WorkspaceBinding, catalog_ddl_operation,
+    metastore_mutation,
 };
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CatalogTxReceipt, CatalogTxStatus,
@@ -817,6 +818,44 @@ fn commit_root_transaction_rejects_missing_catalog_operation() {
     assert_eq!(
         request.validate_contract(),
         Err(ControlPlaneTransactionContractError::MissingRootCatalogDdlOp(0,))
+    );
+}
+
+#[test]
+fn metastore_root_transaction_accepts_mutations() {
+    let request = CommitRootTransactionRequest {
+        mutations: vec![DomainMutation {
+            kind: Some(domain_mutation::Kind::Metastore(MetastoreMutation {
+                op: Some(metastore_mutation::Op::StorageCredential(
+                    StorageCredential {
+                        credential_id: "cred_01".to_string(),
+                        name: "lakehouse-prod".to_string(),
+                        cloud: "aws".to_string(),
+                        owner: "group:data-platform".to_string(),
+                        created_at: None,
+                        updated_at: None,
+                    },
+                )),
+            })),
+        }],
+    };
+
+    assert_eq!(request.validate_contract(), Ok(()));
+}
+
+#[test]
+fn metastore_root_transaction_rejects_empty_mutation() {
+    let request = CommitRootTransactionRequest {
+        mutations: vec![DomainMutation {
+            kind: Some(domain_mutation::Kind::Metastore(MetastoreMutation {
+                op: None,
+            })),
+        }],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(ControlPlaneTransactionContractError::MissingRootMetastoreMutationOp(0))
     );
 }
 

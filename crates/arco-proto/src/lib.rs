@@ -131,6 +131,7 @@ pub enum ControlPlaneTransactionContractError {
     InvalidOrchestrationEvent(usize, OrchestrationEventContractError),
     EmptyRootMutations,
     MissingRootCatalogDdlOp(usize),
+    MissingRootMetastoreMutationOp(usize),
     EmptyRootOrchestrationEvents(usize),
     InvalidRootOrchestrationEvent(usize, usize, OrchestrationEventContractError),
     MissingRootMutationKind(usize),
@@ -157,6 +158,12 @@ impl std::fmt::Display for ControlPlaneTransactionContractError {
                 write!(
                     f,
                     "root catalog mutation at index {index} must set catalog DDL operation"
+                )
+            }
+            Self::MissingRootMetastoreMutationOp(index) => {
+                write!(
+                    f,
+                    "root metastore mutation at index {index} must set metastore mutation operation"
                 )
             }
             Self::EmptyRootOrchestrationEvents(index) => {
@@ -358,6 +365,15 @@ impl CommitRootTransactionRequest {
                                 index,
                                 event_index,
                                 error,
+                            ),
+                        );
+                    }
+                }
+                Some(domain_mutation::Kind::Metastore(mutation)) => {
+                    if mutation.op.is_none() {
+                        return Err(
+                            ControlPlaneTransactionContractError::MissingRootMetastoreMutationOp(
+                                index,
                             ),
                         );
                     }

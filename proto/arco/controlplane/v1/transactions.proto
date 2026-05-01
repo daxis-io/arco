@@ -3,6 +3,7 @@ syntax = "proto3";
 package arco.controlplane.v1;
 
 import "arco/catalog/v1/catalog.proto";
+import "arco/catalog/v1/metastore.proto";
 import "arco/orchestration/v1/orchestration.proto";
 import "google/protobuf/timestamp.proto";
 
@@ -140,6 +141,7 @@ message DomainMutation {
   oneof kind {
     arco.catalog.v1.CatalogDdlOperation catalog = 1;
     OrchestrationBatchSpec orchestration = 2;
+    arco.catalog.v1.MetastoreMutation metastore = 3;
   }
 }
 

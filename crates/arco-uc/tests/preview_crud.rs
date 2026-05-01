@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use arco_catalog::CatalogReader;
-use arco_core::ScopedStorage;
 use arco_core::storage::{MemoryBackend, WritePrecondition, WriteResult};
+use arco_core::{CatalogPaths, ScopedStorage};
 use arco_uc::{UnityCatalogState, unity_catalog_router};
 use axum::Router;
 use axum::body::Body;
@@ -234,6 +234,41 @@ async fn create_and_list_catalogs() -> Result<(), String> {
         catalogs[0].get("name").and_then(Value::as_str),
         Some("main")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_catalogs_does_not_initialize_authoritative_storage_on_read() -> Result<(), String> {
+    let (router, backend) = test_harness();
+
+    let (list_status, listed) = uc_request(
+        &router,
+        Method::GET,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(list_status, StatusCode::OK);
+    assert_eq!(
+        listed
+            .get("catalogs")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let storage = scoped_storage(backend, "tenant_a", "workspace_a")?;
+    assert!(
+        storage
+            .head_raw(CatalogPaths::ROOT_MANIFEST)
+            .await
+            .map_err(|err| format!("head authoritative root manifest after read: {err}"))?
+            .is_none(),
+        "read-only catalog listing must not initialize authoritative catalog scaffolding"
+    );
+
     Ok(())
 }
 
@@ -1042,6 +1077,159 @@ async fn catalog_patch_updates_authoritative_comment() -> Result<(), String> {
 }
 
 #[tokio::test]
+async fn catalog_patch_round_trips_authoritative_uc_metadata() -> Result<(), String> {
+    let (router, backend) = test_harness();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "main",
+            "comment": "before",
+            "properties": {
+                "classification": "internal"
+            },
+            "storage_root": "s3://bucket/catalogs/main"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = uc_request(
+        &router,
+        Method::PATCH,
+        "/catalogs/main",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "comment": "after",
+            "new_name": "main_curated",
+            "properties": {
+                "classification": "restricted",
+                "owner": "governance"
+            },
+            "storage_root": "s3://bucket/catalogs/main_curated"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.get("name").and_then(Value::as_str),
+        Some("main_curated")
+    );
+    assert_eq!(body.get("comment").and_then(Value::as_str), Some("after"));
+    assert_eq!(
+        body.pointer("/properties/classification")
+            .and_then(Value::as_str),
+        Some("restricted")
+    );
+    assert_eq!(
+        body.pointer("/properties/owner").and_then(Value::as_str),
+        Some("governance")
+    );
+    assert_eq!(
+        body.get("storage_root").and_then(Value::as_str),
+        Some("s3://bucket/catalogs/main_curated")
+    );
+
+    let storage = scoped_storage(backend, "tenant_a", "workspace_a")?;
+    let reader = CatalogReader::new(storage);
+    let after = reader
+        .get_catalog("main_curated")
+        .await
+        .map_err(|err| format!("read catalog after authoritative patch: {err}"))?
+        .ok_or_else(|| "catalog should exist after authoritative patch".to_string())?;
+    assert_eq!(after.description.as_deref(), Some("after"));
+    assert_eq!(
+        after
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("classification"))
+            .map(String::as_str),
+        Some("restricted")
+    );
+    assert_eq!(
+        after
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("owner"))
+            .map(String::as_str),
+        Some("governance")
+    );
+    assert_eq!(
+        after.storage_root.as_deref(),
+        Some("s3://bucket/catalogs/main_curated")
+    );
+    assert!(
+        reader
+            .get_catalog("main")
+            .await
+            .map_err(|err| format!("read pre-rename catalog after authoritative patch: {err}"))?
+            .is_none(),
+        "old catalog name must disappear after authoritative rename"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_patch_clears_authoritative_uc_metadata_with_nulls() -> Result<(), String> {
+    let (router, backend) = test_harness();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "main",
+            "comment": "before",
+            "properties": {
+                "classification": "internal"
+            },
+            "storage_root": "s3://bucket/catalogs/main"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = uc_request(
+        &router,
+        Method::PATCH,
+        "/catalogs/main",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "comment": null,
+            "properties": null,
+            "storage_root": null
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.get("comment").is_some_and(Value::is_null));
+    assert!(body.get("properties").is_some_and(Value::is_null));
+    assert!(body.get("storage_root").is_some_and(Value::is_null));
+
+    let storage = scoped_storage(backend, "tenant_a", "workspace_a")?;
+    let reader = CatalogReader::new(storage);
+    let catalog = reader
+        .get_catalog("main")
+        .await
+        .map_err(|err| format!("read catalog after clearing metadata: {err}"))?
+        .ok_or_else(|| "catalog should exist after clear patch".to_string())?;
+    assert_eq!(catalog.description, None);
+    assert_eq!(catalog.properties, None);
+    assert_eq!(catalog.storage_root, None);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn schema_patch_updates_authoritative_comment() -> Result<(), String> {
     let (router, backend) = test_harness();
 
@@ -1093,6 +1281,350 @@ async fn schema_patch_updates_authoritative_comment() -> Result<(), String> {
         .find(|candidate| candidate.name == "analytics")
         .ok_or_else(|| "schema should exist after patch".to_string())?;
     assert_eq!(schema.description.as_deref(), Some("after"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn schema_patch_round_trips_authoritative_uc_metadata() -> Result<(), String> {
+    let (router, backend) = test_harness();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "analytics",
+            "catalog_name": "main",
+            "comment": "before",
+            "properties": {
+                "domain": "finance"
+            },
+            "storage_root": "s3://bucket/schemas/analytics"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = uc_request(
+        &router,
+        Method::PATCH,
+        "/schemas/main.analytics",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "comment": "after",
+            "new_name": "gold",
+            "properties": {
+                "domain": "governance",
+                "retention": "90d"
+            },
+            "storage_root": "s3://bucket/schemas/gold"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.get("full_name").and_then(Value::as_str),
+        Some("main.gold")
+    );
+    assert_eq!(body.get("comment").and_then(Value::as_str), Some("after"));
+    assert_eq!(
+        body.pointer("/properties/domain").and_then(Value::as_str),
+        Some("governance")
+    );
+    assert_eq!(
+        body.pointer("/properties/retention")
+            .and_then(Value::as_str),
+        Some("90d")
+    );
+    assert_eq!(
+        body.get("storage_root").and_then(Value::as_str),
+        Some("s3://bucket/schemas/gold")
+    );
+
+    let storage = scoped_storage(backend, "tenant_a", "workspace_a")?;
+    let reader = CatalogReader::new(storage);
+    let after = reader
+        .list_schemas("main")
+        .await
+        .map_err(|err| format!("read schema after authoritative patch: {err}"))?
+        .into_iter()
+        .find(|candidate| candidate.name == "gold")
+        .ok_or_else(|| "schema should exist after authoritative patch".to_string())?;
+    assert_eq!(after.description.as_deref(), Some("after"));
+    assert_eq!(
+        after
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("domain"))
+            .map(String::as_str),
+        Some("governance")
+    );
+    assert_eq!(
+        after
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("retention"))
+            .map(String::as_str),
+        Some("90d")
+    );
+    assert_eq!(
+        after.storage_root.as_deref(),
+        Some("s3://bucket/schemas/gold")
+    );
+    assert!(
+        reader
+            .list_schemas("main")
+            .await
+            .map_err(|err| format!("read schemas after authoritative rename: {err}"))?
+            .into_iter()
+            .all(|candidate| candidate.name != "analytics"),
+        "old schema name must disappear after authoritative rename"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn schema_patch_clears_authoritative_uc_metadata_with_nulls() -> Result<(), String> {
+    let (router, backend) = test_harness();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "analytics",
+            "catalog_name": "main",
+            "comment": "before",
+            "properties": {
+                "domain": "finance"
+            },
+            "storage_root": "s3://bucket/schemas/analytics"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = uc_request(
+        &router,
+        Method::PATCH,
+        "/schemas/main.analytics",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "comment": null,
+            "properties": null,
+            "storage_root": null
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.get("comment").is_some_and(Value::is_null));
+    assert!(body.get("properties").is_some_and(Value::is_null));
+    assert!(body.get("storage_root").is_some_and(Value::is_null));
+
+    let storage = scoped_storage(backend, "tenant_a", "workspace_a")?;
+    let reader = CatalogReader::new(storage);
+    let schema = reader
+        .list_schemas("main")
+        .await
+        .map_err(|err| format!("read schema after clearing metadata: {err}"))?
+        .into_iter()
+        .find(|candidate| candidate.name == "analytics")
+        .ok_or_else(|| "schema should exist after clear patch".to_string())?;
+    assert_eq!(schema.description, None);
+    assert_eq!(schema.properties, None);
+    assert_eq!(schema.storage_root, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_create_round_trips_authoritative_uc_metadata() -> Result<(), String> {
+    let (router, backend) = test_harness();
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/catalogs",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({"name": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = uc_request(
+        &router,
+        Method::POST,
+        "/schemas",
+        "tenant_a",
+        "workspace_a",
+        Some(json!({
+            "name": "analytics",
+            "catalog_name": "main"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let payload = json!({
+        "name": "events",
+        "catalog_name": "main",
+        "schema_name": "analytics",
+        "table_type": "EXTERNAL",
+        "data_source_format": "DELTA",
+        "columns": [
+            {
+                "name": "event_id",
+                "type_text": "STRING",
+                "nullable": false
+            }
+        ],
+        "storage_location": "s3://bucket/main/analytics/events",
+        "comment": "tenant events",
+        "properties": {
+            "quality": "bronze",
+            "retention": "30d"
+        }
+    });
+
+    let (status, created) = uc_request(
+        &router,
+        Method::POST,
+        "/tables",
+        "tenant_a",
+        "workspace_a",
+        Some(payload),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        created.get("table_type").and_then(Value::as_str),
+        Some("EXTERNAL")
+    );
+    assert_eq!(
+        created
+            .pointer("/properties/quality")
+            .and_then(Value::as_str),
+        Some("bronze")
+    );
+    assert_eq!(
+        created
+            .pointer("/properties/retention")
+            .and_then(Value::as_str),
+        Some("30d")
+    );
+
+    let (status, fetched) = uc_request(
+        &router,
+        Method::GET,
+        "/tables/main.analytics.events",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        fetched.get("table_type").and_then(Value::as_str),
+        Some("EXTERNAL")
+    );
+    assert_eq!(
+        fetched
+            .pointer("/properties/quality")
+            .and_then(Value::as_str),
+        Some("bronze")
+    );
+    assert_eq!(
+        fetched
+            .pointer("/properties/retention")
+            .and_then(Value::as_str),
+        Some("30d")
+    );
+
+    let (status, listed) = uc_request(
+        &router,
+        Method::GET,
+        "/tables?catalog_name=main&schema_name=analytics",
+        "tenant_a",
+        "workspace_a",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let table = listed
+        .get("tables")
+        .and_then(Value::as_array)
+        .and_then(|tables| tables.first())
+        .ok_or_else(|| "table should be present in list response".to_string())?;
+    assert_eq!(
+        table.get("table_type").and_then(Value::as_str),
+        Some("EXTERNAL")
+    );
+    assert_eq!(
+        table.pointer("/properties/quality").and_then(Value::as_str),
+        Some("bronze")
+    );
+    assert_eq!(
+        table
+            .pointer("/properties/retention")
+            .and_then(Value::as_str),
+        Some("30d")
+    );
+
+    let storage = scoped_storage(backend, "tenant_a", "workspace_a")?;
+    let reader = CatalogReader::new(storage);
+    let table = reader
+        .get_table_in_schema("main", "analytics", "events")
+        .await
+        .map_err(|err| format!("read table with authoritative UC metadata: {err}"))?
+        .ok_or_else(|| "table should exist in authoritative catalog state".to_string())?;
+    assert_eq!(table.table_type.as_deref(), Some("EXTERNAL"));
+    assert_eq!(
+        table
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("quality"))
+            .map(String::as_str),
+        Some("bronze")
+    );
+    assert_eq!(
+        table
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("retention"))
+            .map(String::as_str),
+        Some("30d")
+    );
 
     Ok(())
 }

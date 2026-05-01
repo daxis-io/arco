@@ -3,6 +3,7 @@
 //! These handlers expose UC-shaped schema operations over Arco's authoritative
 //! catalog ledger and manifest-published snapshot path.
 
+use arco_catalog::writer::SchemaPatch;
 use arco_catalog::{CatalogError, CatalogReader};
 use axum::Json;
 use axum::Router;
@@ -71,10 +72,13 @@ pub(crate) struct CreateSchemaRequestBody {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct UpdateSchemaPayload {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "common::deserialize_nullable_patch_field")]
     comment: Option<Option<String>>,
-    properties: Option<BTreeMap<String, String>>,
+    #[serde(default, deserialize_with = "common::deserialize_nullable_patch_field")]
+    properties: Option<Option<BTreeMap<String, String>>>,
     new_name: Option<String>,
+    #[serde(default, deserialize_with = "common::deserialize_nullable_patch_field")]
+    storage_root: Option<Option<String>>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -85,6 +89,7 @@ pub(crate) struct UpdateSchemaRequestBody {
     comment: Option<String>,
     properties: Option<BTreeMap<String, String>>,
     new_name: Option<String>,
+    storage_root: Option<String>,
 }
 
 /// Response payload for a schema object.
@@ -112,8 +117,8 @@ fn schema_info(catalog_name: &str, schema: arco_catalog::writer::Schema) -> Sche
         catalog_name: catalog_name.to_string(),
         full_name: format!("{catalog_name}.{}", schema.name),
         comment: schema.description,
-        properties: None,
-        storage_root: None,
+        properties: schema.properties,
+        storage_root: schema.storage_root,
     }
 }
 
@@ -131,24 +136,35 @@ fn paginate_schemas(
     (schemas[start..end].to_vec(), next_page_token)
 }
 
-fn unsupported_schema_fields(
-    properties: &Option<BTreeMap<String, String>>,
-    storage_root: &Option<String>,
-) -> UnityCatalogResult<()> {
-    if properties.is_some() {
-        return Err(UnityCatalogError::NotImplemented {
-            message: "operation not supported: schema properties are not authoritative in Arco yet"
-                .to_string(),
-        });
+fn validate_storage_root(value: Option<String>) -> UnityCatalogResult<Option<String>> {
+    value
+        .map(|storage_root| preview::require_non_empty_string(Some(storage_root), "storage_root"))
+        .transpose()
+}
+
+fn validate_storage_root_patch(
+    value: Option<Option<String>>,
+) -> UnityCatalogResult<Option<Option<String>>> {
+    value
+        .map(|storage_root| {
+            storage_root
+                .map(|storage_root| {
+                    preview::require_non_empty_string(Some(storage_root), "storage_root")
+                })
+                .transpose()
+        })
+        .transpose()
+}
+
+fn reject_unknown_schema_patch_fields(extra: &BTreeMap<String, Value>) -> UnityCatalogResult<()> {
+    if extra.is_empty() {
+        return Ok(());
     }
-    if storage_root.is_some() {
-        return Err(UnityCatalogError::NotImplemented {
-            message:
-                "operation not supported: schema storage_root is not authoritative in Arco yet"
-                    .to_string(),
-        });
-    }
-    Ok(())
+
+    let fields = extra.keys().cloned().collect::<Vec<_>>().join(", ");
+    Err(UnityCatalogError::BadRequest {
+        message: format!("unexpected fields in schema patch: {fields}"),
+    })
 }
 
 fn map_delete_schema_error(err: CatalogError) -> UnityCatalogError {
@@ -209,8 +225,11 @@ pub(crate) async fn get_schemas(
         1000,
     )?;
 
-    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
-    let reader = CatalogReader::new(writer.storage().clone());
+    let reader = common::authoritative_catalog_reader(&state, &ctx)
+        .await?
+        .ok_or_else(|| UnityCatalogError::NotFound {
+            message: format!("catalog not found: {catalog_name}"),
+        })?;
     let mut schemas = reader
         .list_schemas(&catalog_name)
         .await
@@ -267,7 +286,7 @@ pub(crate) async fn post_schemas(
 
     let name = preview::require_identifier(payload.name, "name")?;
     let catalog_name = preview::require_identifier(payload.catalog_name, "catalog_name")?;
-    unsupported_schema_fields(&payload.properties, &payload.storage_root)?;
+    let storage_root = validate_storage_root(payload.storage_root)?;
     tracing::debug!(
         tenant = %ctx.tenant,
         workspace = %ctx.workspace,
@@ -279,10 +298,12 @@ pub(crate) async fn post_schemas(
 
     let writer = common::initialized_catalog_writer(&state, &ctx).await?;
     let schema = writer
-        .create_schema(
+        .create_schema_with_metadata(
             &catalog_name,
             &name,
             payload.comment.as_deref(),
+            payload.properties,
+            storage_root.as_deref(),
             common::writer_options(&ctx),
         )
         .await
@@ -331,8 +352,11 @@ pub(crate) async fn get_schema(
         "unity catalog get schema from authoritative catalog state"
     );
 
-    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
-    let reader = CatalogReader::new(writer.storage().clone());
+    let reader = common::authoritative_catalog_reader(&state, &ctx)
+        .await?
+        .ok_or_else(|| UnityCatalogError::NotFound {
+            message: format!("schema not found: {catalog_name}.{schema_name}"),
+        })?;
     let schema = reader
         .list_schemas(&catalog_name)
         .await
@@ -361,7 +385,6 @@ pub(crate) async fn get_schema(
         (status = 403, description = "Forbidden.", body = UnityCatalogErrorResponse),
         (status = 404, description = "Not found.", body = UnityCatalogErrorResponse),
         (status = 409, description = "Conflict.", body = UnityCatalogErrorResponse),
-        (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
         (status = 500, description = "Internal server error.", body = UnityCatalogErrorResponse),
     )
 )]
@@ -373,33 +396,12 @@ pub(crate) async fn update_schema(
 ) -> UnityCatalogResult<Json<SchemaInfo>> {
     let (catalog_name, schema_name) = parse_schema_full_name(&full_name)?;
     let Json(payload) = payload;
-    let _ = payload.extra;
-
-    if payload.new_name.is_some() {
-        return Err(UnityCatalogError::NotImplemented {
-            message: "operation not supported: schema rename is not authoritative in Arco yet"
-                .to_string(),
-        });
-    }
-    if payload.properties.is_some() {
-        return Err(UnityCatalogError::NotImplemented {
-            message: "operation not supported: schema properties are not authoritative in Arco yet"
-                .to_string(),
-        });
-    }
-
-    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
-    let reader = CatalogReader::new(writer.storage().clone());
-    let current = reader
-        .list_schemas(&catalog_name)
-        .await
-        .map_err(common::map_catalog_error)?
-        .into_iter()
-        .find(|candidate| candidate.name == schema_name)
-        .ok_or_else(|| UnityCatalogError::NotFound {
-            message: format!("schema not found: {catalog_name}.{schema_name}"),
-        })?;
-    let next_description = payload.comment.unwrap_or(current.description);
+    reject_unknown_schema_patch_fields(&payload.extra)?;
+    let new_name = payload
+        .new_name
+        .map(|new_name| preview::require_identifier(Some(new_name), "new_name"))
+        .transpose()?;
+    let storage_root = validate_storage_root_patch(payload.storage_root)?;
 
     tracing::debug!(
         tenant = %ctx.tenant,
@@ -410,11 +412,17 @@ pub(crate) async fn update_schema(
         "unity catalog update schema on authoritative catalog state"
     );
 
+    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
     let schema = writer
-        .update_schema_in_catalog(
+        .patch_schema_in_catalog(
             &catalog_name,
             &schema_name,
-            next_description.as_deref(),
+            SchemaPatch {
+                description: payload.comment,
+                new_name,
+                properties: payload.properties,
+                storage_root,
+            },
             common::writer_options(&ctx),
         )
         .await

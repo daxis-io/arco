@@ -130,12 +130,12 @@ fn table_info_base(
         catalog_name: catalog_name.to_string(),
         schema_name: schema_name.to_string(),
         full_name: format!("{catalog_name}.{schema_name}.{}", table.name),
-        table_type: None,
+        table_type: table.table_type,
         data_source_format: table.format.map(|format| format.to_ascii_uppercase()),
         columns: None,
         storage_location: table.location,
         comment: table.description,
-        properties: None,
+        properties: table.properties,
     }
 }
 
@@ -183,18 +183,6 @@ fn paginate_tables(
     let end = start.saturating_add(pagination.limit()).min(tables.len());
     let next_page_token = (end < tables.len()).then(|| end.to_string());
     (tables[start..end].to_vec(), next_page_token)
-}
-
-fn unsupported_table_properties(
-    properties: &Option<BTreeMap<String, String>>,
-) -> UnityCatalogResult<()> {
-    if properties.is_some() {
-        return Err(UnityCatalogError::NotImplemented {
-            message: "operation not supported: table properties are not authoritative in Arco yet"
-                .to_string(),
-        });
-    }
-    Ok(())
 }
 
 fn column_definitions(columns: &[Value]) -> UnityCatalogResult<Vec<ColumnDefinition>> {
@@ -287,8 +275,11 @@ pub(crate) async fn get_tables(
         50,
     )?;
 
-    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
-    let reader = CatalogReader::new(writer.storage().clone());
+    let reader = common::authoritative_catalog_reader(&state, &ctx)
+        .await?
+        .ok_or_else(|| UnityCatalogError::NotFound {
+            message: format!("catalog not found: {catalog_name}"),
+        })?;
     let mut tables = reader
         .list_tables_in_schema(&catalog_name, &schema_name)
         .await
@@ -358,7 +349,6 @@ pub(crate) async fn post_tables(
         VALID_DATA_SOURCE_FORMATS,
     )?;
     let columns = validate_columns(preview::require_present(payload.columns, "columns")?)?;
-    unsupported_table_properties(&payload.properties)?;
     let storage_location =
         preview::require_non_empty_string(payload.storage_location, "storage_location")?;
     tracing::debug!(
@@ -384,6 +374,8 @@ pub(crate) async fn post_tables(
                 description: payload.comment.clone(),
                 location: Some(storage_location.clone()),
                 format: Some(data_source_format.to_ascii_lowercase()),
+                table_type: Some(table_type.clone()),
+                properties: payload.properties.clone(),
                 columns: authoritative_columns,
             },
             common::writer_options(&ctx),
@@ -402,7 +394,6 @@ pub(crate) async fn post_tables(
     );
 
     let mut response = table_info_base(&catalog_name, &schema_name, table);
-    response.table_type = Some(table_type);
     response.columns = Some(columns);
     Ok(Json(response))
 }
@@ -445,8 +436,11 @@ pub(crate) async fn get_table(
         "unity catalog get table from authoritative catalog state"
     );
 
-    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
-    let reader = CatalogReader::new(writer.storage().clone());
+    let reader = common::authoritative_catalog_reader(&state, &ctx)
+        .await?
+        .ok_or_else(|| UnityCatalogError::NotFound {
+            message: format!("table not found: {catalog_name}.{schema_name}.{table_name}"),
+        })?;
     let table = reader
         .get_table_in_schema(&catalog_name, &schema_name, &table_name)
         .await

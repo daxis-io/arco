@@ -3,6 +3,7 @@
 //! These handlers expose UC-shaped catalog operations over Arco's authoritative
 //! catalog ledger and manifest-published snapshot path.
 
+use arco_catalog::writer::CatalogPatch;
 use arco_catalog::{CatalogError, CatalogReader};
 use axum::Json;
 use axum::Router;
@@ -70,10 +71,13 @@ pub(crate) struct CreateCatalogRequestBody {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct UpdateCatalogPayload {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "common::deserialize_nullable_patch_field")]
     comment: Option<Option<String>>,
-    properties: Option<BTreeMap<String, String>>,
+    #[serde(default, deserialize_with = "common::deserialize_nullable_patch_field")]
+    properties: Option<Option<BTreeMap<String, String>>>,
     new_name: Option<String>,
+    #[serde(default, deserialize_with = "common::deserialize_nullable_patch_field")]
+    storage_root: Option<Option<String>>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -84,6 +88,7 @@ pub(crate) struct UpdateCatalogRequestBody {
     comment: Option<String>,
     properties: Option<BTreeMap<String, String>>,
     new_name: Option<String>,
+    storage_root: Option<String>,
 }
 
 /// Response payload for a catalog object.
@@ -107,8 +112,8 @@ fn catalog_info(catalog: arco_catalog::writer::Catalog) -> CatalogInfo {
     CatalogInfo {
         name: catalog.name,
         comment: catalog.description,
-        properties: None,
-        storage_root: None,
+        properties: catalog.properties,
+        storage_root: catalog.storage_root,
     }
 }
 
@@ -126,25 +131,35 @@ fn paginate_catalogs(
     (catalogs[start..end].to_vec(), next_page_token)
 }
 
-fn unsupported_catalog_fields(
-    properties: &Option<BTreeMap<String, String>>,
-    storage_root: &Option<String>,
-) -> UnityCatalogResult<()> {
-    if properties.is_some() {
-        return Err(UnityCatalogError::NotImplemented {
-            message:
-                "operation not supported: catalog properties are not authoritative in Arco yet"
-                    .to_string(),
-        });
+fn validate_storage_root(value: Option<String>) -> UnityCatalogResult<Option<String>> {
+    value
+        .map(|storage_root| preview::require_non_empty_string(Some(storage_root), "storage_root"))
+        .transpose()
+}
+
+fn validate_storage_root_patch(
+    value: Option<Option<String>>,
+) -> UnityCatalogResult<Option<Option<String>>> {
+    value
+        .map(|storage_root| {
+            storage_root
+                .map(|storage_root| {
+                    preview::require_non_empty_string(Some(storage_root), "storage_root")
+                })
+                .transpose()
+        })
+        .transpose()
+}
+
+fn reject_unknown_catalog_patch_fields(extra: &BTreeMap<String, Value>) -> UnityCatalogResult<()> {
+    if extra.is_empty() {
+        return Ok(());
     }
-    if storage_root.is_some() {
-        return Err(UnityCatalogError::NotImplemented {
-            message:
-                "operation not supported: catalog storage_root is not authoritative in Arco yet"
-                    .to_string(),
-        });
-    }
-    Ok(())
+
+    let fields = extra.keys().cloned().collect::<Vec<_>>().join(", ");
+    Err(UnityCatalogError::BadRequest {
+        message: format!("unexpected fields in catalog patch: {fields}"),
+    })
 }
 
 fn map_delete_catalog_error(err: CatalogError) -> UnityCatalogError {
@@ -200,15 +215,16 @@ pub(crate) async fn get_catalogs(
         1000,
     )?;
 
-    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
-    let reader = CatalogReader::new(writer.storage().clone());
-    let mut catalogs = reader
-        .list_catalogs()
-        .await
-        .map_err(common::map_catalog_error)?
-        .into_iter()
-        .map(catalog_info)
-        .collect::<Vec<_>>();
+    let mut catalogs = match common::authoritative_catalog_reader(&state, &ctx).await? {
+        Some(reader) => reader
+            .list_catalogs()
+            .await
+            .map_err(common::map_catalog_error)?
+            .into_iter()
+            .map(catalog_info)
+            .collect::<Vec<_>>(),
+        None => Vec::new(),
+    };
     catalogs.sort_by(|left, right| left.name.cmp(&right.name));
     let (catalogs, next_page_token) = paginate_catalogs(catalogs, &pagination);
     tracing::debug!(
@@ -255,7 +271,7 @@ pub(crate) async fn post_catalogs(
     let _ = payload.extra;
 
     let name = preview::require_identifier(payload.name, "name")?;
-    unsupported_catalog_fields(&payload.properties, &payload.storage_root)?;
+    let storage_root = validate_storage_root(payload.storage_root)?;
     tracing::debug!(
         tenant = %ctx.tenant,
         workspace = %ctx.workspace,
@@ -266,9 +282,11 @@ pub(crate) async fn post_catalogs(
 
     let writer = common::initialized_catalog_writer(&state, &ctx).await?;
     let catalog = writer
-        .create_catalog(
+        .create_catalog_with_metadata(
             &name,
             payload.comment.as_deref(),
+            payload.properties,
+            storage_root.as_deref(),
             common::writer_options(&ctx),
         )
         .await
@@ -315,8 +333,11 @@ pub(crate) async fn get_catalog(
         "unity catalog get catalog from authoritative catalog state"
     );
 
-    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
-    let reader = CatalogReader::new(writer.storage().clone());
+    let reader = common::authoritative_catalog_reader(&state, &ctx)
+        .await?
+        .ok_or_else(|| UnityCatalogError::NotFound {
+            message: format!("catalog not found: {name}"),
+        })?;
     let catalog = reader
         .get_catalog(&name)
         .await
@@ -343,7 +364,6 @@ pub(crate) async fn get_catalog(
         (status = 403, description = "Forbidden.", body = UnityCatalogErrorResponse),
         (status = 404, description = "Not found.", body = UnityCatalogErrorResponse),
         (status = 409, description = "Conflict.", body = UnityCatalogErrorResponse),
-        (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
         (status = 500, description = "Internal server error.", body = UnityCatalogErrorResponse),
     )
 )]
@@ -355,32 +375,12 @@ pub(crate) async fn update_catalog(
 ) -> UnityCatalogResult<Json<CatalogInfo>> {
     let name = preview::require_identifier(Some(name), "name")?;
     let Json(payload) = payload;
-    let _ = payload.extra;
-
-    if payload.new_name.is_some() {
-        return Err(UnityCatalogError::NotImplemented {
-            message: "operation not supported: catalog rename is not authoritative in Arco yet"
-                .to_string(),
-        });
-    }
-    if payload.properties.is_some() {
-        return Err(UnityCatalogError::NotImplemented {
-            message:
-                "operation not supported: catalog properties are not authoritative in Arco yet"
-                    .to_string(),
-        });
-    }
-
-    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
-    let reader = CatalogReader::new(writer.storage().clone());
-    let current = reader
-        .get_catalog(&name)
-        .await
-        .map_err(common::map_catalog_error)?
-        .ok_or_else(|| UnityCatalogError::NotFound {
-            message: format!("catalog not found: {name}"),
-        })?;
-    let next_description = payload.comment.unwrap_or(current.description);
+    reject_unknown_catalog_patch_fields(&payload.extra)?;
+    let new_name = payload
+        .new_name
+        .map(|new_name| preview::require_identifier(Some(new_name), "new_name"))
+        .transpose()?;
+    let storage_root = validate_storage_root_patch(payload.storage_root)?;
 
     tracing::debug!(
         tenant = %ctx.tenant,
@@ -390,10 +390,16 @@ pub(crate) async fn update_catalog(
         "unity catalog update catalog on authoritative catalog state"
     );
 
+    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
     let catalog = writer
-        .update_catalog(
+        .patch_catalog(
             &name,
-            next_description.as_deref(),
+            CatalogPatch {
+                description: payload.comment,
+                new_name,
+                properties: payload.properties,
+                storage_root,
+            },
             common::writer_options(&ctx),
         )
         .await

@@ -59,6 +59,8 @@ async fn seeded_router() -> SeededRouter {
                 description: Some("Orders table".to_string()),
                 location: Some("gs://arco-test/tenant1/workspace1/orders".to_string()),
                 format: Some("delta".to_string()),
+                table_type: None,
+                properties: None,
                 columns: vec![
                     ColumnDefinition {
                         name: "order_id".to_string(),
@@ -242,6 +244,54 @@ async fn test_permissions_principal_filter_returns_empty_assignments() {
             .map(Vec::len),
         Some(0)
     );
+}
+
+#[tokio::test]
+async fn test_patch_permissions_remains_scaffolded() {
+    let seeded = seeded_router().await;
+    let app = seeded.app;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/permissions/table/analytics.sales.orders")
+                .header("content-type", "application/json")
+                .header("X-Tenant-Id", "tenant1")
+                .header("X-Workspace-Id", "workspace1")
+                .body(Body::from(r#"{"changes":[]}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn test_post_temporary_table_credentials_remains_scaffolded() {
+    let seeded = seeded_router().await;
+    let app = seeded.app;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/temporary-table-credentials")
+                .header("content-type", "application/json")
+                .header("X-Tenant-Id", "tenant1")
+                .header("X-Workspace-Id", "workspace1")
+                .body(Body::from(
+                    json!({
+                        "table_id": seeded.table_id,
+                        "operation": "READ"
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 }
 
 #[tokio::test]

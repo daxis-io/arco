@@ -410,16 +410,16 @@ impl OrchestrationEventEnvelope {
         if self.idempotency_key.is_empty() {
             return Err(OrchestrationEventContractError::EmptyIdempotencyKey);
         }
-        if self.event.is_none() {
+        let Some(event) = self.event.as_ref() else {
             return Err(OrchestrationEventContractError::MissingEventKind);
-        }
+        };
 
-        match self.event.as_ref().expect("checked above") {
+        match event {
             orchestration_event_envelope::Event::RunRequested(event) => {
-                validate_run_requested_trigger(event)?
+                validate_run_requested_trigger(event)?;
             }
             orchestration_event_envelope::Event::RunTriggered(event) => {
-                validate_run_triggered_trigger(event)?
+                validate_run_triggered_trigger(event)?;
             }
             _ => {}
         }
@@ -430,14 +430,11 @@ impl OrchestrationEventEnvelope {
 
 fn required_trigger<'a>(
     event_name: &'static str,
-    trigger: &'a Option<TriggerInfo>,
+    trigger: Option<&'a TriggerInfo>,
 ) -> Result<&'a trigger_info::Trigger, OrchestrationEventContractError> {
-    let trigger_info =
-        trigger
-            .as_ref()
-            .ok_or(OrchestrationEventContractError::MissingTriggerInfo(
-                event_name,
-            ))?;
+    let trigger_info = trigger.ok_or(OrchestrationEventContractError::MissingTriggerInfo(
+        event_name,
+    ))?;
     trigger_info
         .trigger
         .as_ref()
@@ -449,7 +446,7 @@ fn required_trigger<'a>(
 fn validate_run_requested_trigger(
     event: &RunRequested,
 ) -> Result<(), OrchestrationEventContractError> {
-    match required_trigger("run_requested", &event.trigger)? {
+    match required_trigger("run_requested", event.trigger.as_ref())? {
         trigger_info::Trigger::Manual(manual) => {
             if manual.request_id.is_none() {
                 return Err(OrchestrationEventContractError::MissingTriggerField(
@@ -501,7 +498,7 @@ fn validate_run_requested_trigger(
 fn validate_run_triggered_trigger(
     event: &RunTriggered,
 ) -> Result<(), OrchestrationEventContractError> {
-    match required_trigger("run_triggered", &event.trigger)? {
+    match required_trigger("run_triggered", event.trigger.as_ref())? {
         trigger_info::Trigger::Backfill(_) => Err(
             OrchestrationEventContractError::UnsupportedTriggerKind("run_triggered", "backfill"),
         ),

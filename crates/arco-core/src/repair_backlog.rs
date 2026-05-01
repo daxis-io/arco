@@ -14,7 +14,7 @@ pub struct RepairBacklogSnapshot {
 }
 
 /// Tracks repair backlog state across repeated reconciliation checks.
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RepairBacklogEntry {
     count: u64,
     fingerprint: Option<String>,
@@ -72,7 +72,9 @@ impl RepairBacklogEntry {
 }
 
 fn elapsed_seconds(now: DateTime<Utc>, first_detected_at: DateTime<Utc>) -> f64 {
-    (now - first_detected_at).num_seconds().max(0) as f64
+    (now - first_detected_at)
+        .to_std()
+        .map_or(0.0, |duration| duration.as_secs_f64())
 }
 
 #[cfg(test)]

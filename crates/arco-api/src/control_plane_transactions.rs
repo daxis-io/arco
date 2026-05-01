@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use prost::Message;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -30,8 +31,9 @@ use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventDat
 use arco_flow::orchestration::proto::event_from_proto_envelope;
 use arco_flow::orchestration_compaction_lock_path;
 use arco_proto::arco::catalog::v1::{
-    CatalogDdlOperation, CreateCatalogOp, CreateSchemaOp, DropTableOp, RegisterTableOp,
-    RenameTableOp, TableFormat as ProtoTableFormat, UpdateTableOp, catalog_ddl_operation,
+    CatalogDdlOperation, CreateCatalogOp, CreateSchemaOp, DropTableOp, MetastoreMutation,
+    RegisterTableOp, RenameTableOp, TableFormat as ProtoTableFormat, UpdateTableOp,
+    catalog_ddl_operation,
 };
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CatalogTxReceipt as ProtoCatalogTxReceipt,
@@ -255,6 +257,12 @@ impl<'a> ControlPlaneTransactionService<'a> {
         let fencing_token = guard.fencing_token().sequence();
 
         let result = async {
+            if mutations.iter().any(RootMutation::is_metastore) {
+                return Err(ApiError::not_implemented(
+                    "metastore root mutations are not implemented yet",
+                ));
+            }
+
             let mut repair_pending = false;
             let mut domain_commits = Vec::with_capacity(mutations.len());
             let mut manifest_domains = BTreeMap::new();
@@ -293,6 +301,11 @@ impl<'a> ControlPlaneTransactionService<'a> {
                             },
                         );
                         domain_commits.push(commit);
+                    }
+                    RootMutation::Metastore(_) => {
+                        return Err(ApiError::not_implemented(
+                            "metastore root mutations are not implemented yet",
+                        ));
                     }
                 }
             }
@@ -1305,6 +1318,7 @@ impl OrchestrationBatchMutation {
 enum RootMutation {
     Catalog(CatalogMutation),
     Orchestration(OrchestrationBatchMutation),
+    Metastore(MetastoreMutation),
 }
 
 impl RootMutation {
@@ -1316,6 +1330,14 @@ impl RootMutation {
             Some(domain_mutation::Kind::Orchestration(spec)) => Ok(Self::Orchestration(
                 OrchestrationBatchMutation::from_spec(spec)?,
             )),
+            Some(domain_mutation::Kind::Metastore(mutation)) => {
+                if mutation.op.is_none() {
+                    return Err(ApiError::bad_request(
+                        "metastore mutation operation is required",
+                    ));
+                }
+                Ok(Self::Metastore(mutation.clone()))
+            }
             None => Err(ApiError::bad_request("root mutation kind is required")),
         }
     }
@@ -1324,7 +1346,12 @@ impl RootMutation {
         match self {
             Self::Catalog(_) => ControlPlaneTxDomain::Catalog,
             Self::Orchestration(_) => ControlPlaneTxDomain::Orchestration,
+            Self::Metastore(_) => ControlPlaneTxDomain::Catalog,
         }
+    }
+
+    const fn is_metastore(&self) -> bool {
+        matches!(self, Self::Metastore(_))
     }
 
     fn request_hash_value(
@@ -1339,6 +1366,12 @@ impl RootMutation {
             Self::Orchestration(batch) => Ok(serde_json::json!({
                 "domain": "orchestration",
                 "request": batch.request_hash_value(meta)?,
+            })),
+            Self::Metastore(mutation) => Ok(serde_json::json!({
+                "domain": "metastore",
+                "request": {
+                    "protoHex": hex::encode(mutation.encode_to_vec()),
+                },
             })),
         }
     }

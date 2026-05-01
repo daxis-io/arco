@@ -20,13 +20,17 @@ use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
 };
 use arco_flow::orchestration::compactor::MicroCompactor;
-use arco_proto::arco::catalog::v1::{CatalogDdlOperation, ColumnDefinition};
+use arco_proto::arco::catalog::v1::{
+    CatalogDdlOperation, ColumnDefinition, MetastoreMutation, StorageCredential,
+    metastore_mutation,
+};
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CommitOrchestrationBatchRequest,
-    CommitOrchestrationBatchResponse, CommitRootTransactionResponse, GetCatalogTransactionRequest,
-    GetCatalogTransactionResponse, GetOrchestrationTransactionRequest,
-    GetOrchestrationTransactionResponse, GetRootTransactionRequest, GetRootTransactionResponse,
-    TransactionDomain, TransactionStatus, domain_mutation,
+    CommitOrchestrationBatchResponse, CommitRootTransactionRequest, CommitRootTransactionResponse,
+    DomainMutation, GetCatalogTransactionRequest, GetCatalogTransactionResponse,
+    GetOrchestrationTransactionRequest, GetOrchestrationTransactionResponse,
+    GetRootTransactionRequest, GetRootTransactionResponse, TransactionDomain, TransactionStatus,
+    domain_mutation,
 };
 use arco_proto::arco::orchestration::v1::{orchestration_event_envelope, trigger_info};
 #[path = "support/control_plane_transactions.rs"]
@@ -106,6 +110,25 @@ async fn load_catalog_ledger_event_source(
     let envelope: CatalogEvent<serde_json::Value> =
         serde_json::from_slice(bytes.as_ref()).context("decode catalog ledger event")?;
     Ok(envelope.source)
+}
+
+fn metastore_storage_credential_root_request(name: &str) -> CommitRootTransactionRequest {
+    CommitRootTransactionRequest {
+        mutations: vec![DomainMutation {
+            kind: Some(domain_mutation::Kind::Metastore(MetastoreMutation {
+                op: Some(metastore_mutation::Op::StorageCredential(
+                    StorageCredential {
+                        credential_id: "cred_01".to_string(),
+                        name: name.to_string(),
+                        cloud: "aws".to_string(),
+                        owner: "group:data-platform".to_string(),
+                        created_at: None,
+                        updated_at: None,
+                    },
+                )),
+            })),
+        }],
+    }
 }
 
 #[derive(Debug)]
@@ -1434,6 +1457,55 @@ async fn commit_root_transaction_rejects_empty_orchestration_participant() -> Re
     .await?;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error["code"], "BAD_REQUEST");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_root_transaction_hashes_metastore_mutation_payloads() -> Result<()> {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let router = test_router_with_backend(backend.clone());
+    let first = metastore_storage_credential_root_request("lakehouse-prod-a");
+    let second = metastore_storage_credential_root_request("lakehouse-prod-b");
+
+    let (first_status, first_error) = post_error_json(
+        router.clone(),
+        "/api/v1/transactions/commitRootTransaction",
+        &first,
+        "idem-root-metastore-hash-01",
+        "req-root-metastore-hash-01",
+    )
+    .await?;
+    assert_eq!(first_status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(first_error["code"], "NOT_IMPLEMENTED");
+
+    let (second_status, second_error) = post_error_json(
+        router,
+        "/api/v1/transactions/commitRootTransaction",
+        &second,
+        "idem-root-metastore-hash-02",
+        "req-root-metastore-hash-02",
+    )
+    .await?;
+    assert_eq!(second_status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(second_error["code"], "NOT_IMPLEMENTED");
+
+    let first_record = load_idempotency_record(
+        backend.clone(),
+        ControlPlaneTxDomain::Root,
+        "idem-root-metastore-hash-01",
+    )
+    .await?;
+    let second_record = load_idempotency_record(
+        backend,
+        ControlPlaneTxDomain::Root,
+        "idem-root-metastore-hash-02",
+    )
+    .await?;
+
+    assert!(first_record.request_hash.starts_with("sha256:"));
+    assert!(second_record.request_hash.starts_with("sha256:"));
+    assert_ne!(first_record.request_hash, second_record.request_hash);
 
     Ok(())
 }

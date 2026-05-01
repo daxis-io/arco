@@ -177,10 +177,14 @@ impl<'a> ControlPlaneTransactionService<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let mut seen_domains = BTreeSet::new();
         for mutation in &mutations {
-            if !seen_domains.insert(mutation.domain()) {
+            if matches!(mutation, RootMutation::Metastore(_)) {
+                continue;
+            }
+            let domain = mutation.domain();
+            if !seen_domains.insert(domain) {
                 return Err(ApiError::bad_request(format!(
                     "duplicate root mutation for domain '{}'",
-                    mutation.domain()
+                    domain
                 )));
             }
         }

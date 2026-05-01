@@ -1511,6 +1511,51 @@ async fn commit_root_transaction_hashes_metastore_mutation_payloads() -> Result<
 }
 
 #[tokio::test]
+async fn commit_root_transaction_captures_mixed_metastore_hash_before_not_implemented()
+-> Result<()> {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let router = test_router_with_backend(backend.clone());
+    let mut request = root_request(
+        "idem-root-metastore-mixed-01",
+        "req-root-metastore-mixed-01",
+        "mixed-metastore-root",
+        "run-root-metastore-mixed-01",
+    );
+    let mut metastore_request =
+        metastore_storage_credential_root_request("lakehouse-prod-mixed");
+    request.mutations.push(
+        metastore_request
+            .mutations
+            .pop()
+            .context("metastore mutation missing")?,
+    );
+
+    let (status, error) = post_error_json(
+        router,
+        "/api/v1/transactions/commitRootTransaction",
+        &request,
+        "idem-root-metastore-mixed-01",
+        "req-root-metastore-mixed-01",
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(error["code"], "NOT_IMPLEMENTED");
+
+    let idempotency_record = load_idempotency_record(
+        backend.clone(),
+        ControlPlaneTxDomain::Root,
+        "idem-root-metastore-mixed-01",
+    )
+    .await?;
+    let root_record = load_root_tx_record(backend, &idempotency_record.tx_id).await?;
+
+    assert!(idempotency_record.request_hash.starts_with("sha256:"));
+    assert_eq!(root_record.status, ControlPlaneTxStatus::Aborted);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn apply_catalog_ddl_retries_same_key_after_missing_tx_record_is_stale() -> Result<()> {
     let fail_prefix = format!("tenant={TENANT}/workspace={WORKSPACE}/transactions/catalog/");
     let backend: Arc<dyn StorageBackend> = Arc::new(FailPrefixBackend::new(fail_prefix, 1));

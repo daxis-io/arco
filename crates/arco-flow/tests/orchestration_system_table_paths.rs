@@ -1,4 +1,4 @@
-//! Tests for visible orchestration state used by system tables.
+//! Tests for pointer-selected orchestration base snapshot paths used by system tables.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,30 +20,35 @@ use arco_flow::orchestration::events::{
 use arco_flow::orchestration_manifest_pointer_path;
 
 #[tokio::test]
-async fn load_state_reads_visible_l0_state_without_base_snapshot() -> Result<()> {
+async fn current_base_table_paths_returns_pointer_selected_tables() -> Result<()> {
     let compactor = seeded_compactor().await?;
-    let (_, state) = compactor.load_state().await?;
-    assert!(state.runs.contains_key("run_01"));
-    assert!(
-        state
-            .tasks
-            .contains_key(&("run_01".to_string(), "extract".to_string()))
-    );
+    let paths = compactor.current_base_table_paths().await?;
+    assert!(paths.runs.is_some());
+    assert!(paths.tasks.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn current_base_table_paths_includes_empty_schedule_ticks_artifact() -> Result<()> {
+    let compactor = seeded_compactor().await?;
+    let paths = compactor.current_base_table_paths().await?;
+    assert!(paths.schedule_ticks.is_some());
     Ok(())
 }
 
 async fn seeded_compactor() -> Result<MicroCompactor> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
-    seed_visible_l0_state(&storage).await?;
+    seed_base_snapshot_state(&storage).await?;
     Ok(MicroCompactor::new(storage))
 }
 
-async fn seed_visible_l0_state(storage: &ScopedStorage) -> Result<()> {
+async fn seed_base_snapshot_state(storage: &ScopedStorage) -> Result<()> {
     let manifest_id = "00000000000000000000";
     let manifest_path = format!("state/orchestration/manifests/{manifest_id}.json");
 
-    let manifest = OrchestrationManifest::new(Ulid::new().to_string());
+    let mut manifest = OrchestrationManifest::new(Ulid::new().to_string());
+    manifest.l0_limits.max_count = 1;
 
     let manifest_bytes = serde_json::to_vec(&manifest)
         .map(Bytes::from)

@@ -270,8 +270,10 @@ fn is_known_snapshot_table(schema: &str, table: &str) -> bool {
 fn is_known_system_table(schema: &str, table: &str) -> bool {
     matches!(
         (schema, table),
-        ("catalog", "catalogs" | "namespaces" | "tables" | "columns")
-            | ("lineage", "edges")
+        (
+            "catalog",
+            "catalogs" | "namespaces" | "tables" | "columns" | "commits"
+        ) | ("lineage", "edges")
             | (
                 "orchestration",
                 "runs"
@@ -460,10 +462,26 @@ fn ensure_response_size(len: usize) -> Result<(), ApiError> {
 }
 
 fn map_datafusion_error(err: &DataFusionError) -> ApiError {
+    if is_client_query_error(err) {
+        ApiError::bad_request(err.to_string())
+    } else {
+        ApiError::internal(format!("query failed: {err}"))
+    }
+}
+
+fn is_client_query_error(err: &DataFusionError) -> bool {
     match err {
         DataFusionError::SQL(_, _)
         | DataFusionError::Plan(_)
-        | DataFusionError::SchemaError(_, _) => ApiError::bad_request(err.to_string()),
-        _ => ApiError::internal(format!("query failed: {err}")),
+        | DataFusionError::SchemaError(_, _)
+        | DataFusionError::Execution(_)
+        | DataFusionError::Configuration(_)
+        | DataFusionError::NotImplemented(_) => true,
+        DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
+            is_client_query_error(inner)
+        }
+        DataFusionError::Shared(inner) => is_client_query_error(inner),
+        DataFusionError::Collection(errors) => errors.iter().all(is_client_query_error),
+        _ => false,
     }
 }

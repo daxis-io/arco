@@ -259,6 +259,19 @@ impl MicroCompactor {
         Ok((manifest, state))
     }
 
+    /// Returns the current visible base snapshot artifact paths.
+    ///
+    /// This is a manifest-only read path for consumers that need the published
+    /// base snapshot table artifacts without replaying L0 deltas or reconstructing rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the current manifest cannot be read.
+    pub async fn current_base_table_paths(&self) -> Result<TablePaths> {
+        let manifest = self.load_current_manifest_only().await?;
+        Ok(manifest.base_snapshot.tables.clone())
+    }
+
     /// Loads orchestration state pinned to one visible root transaction token.
     ///
     /// This opt-in read path resolves `root:{tx_id}` through the visible root
@@ -897,6 +910,11 @@ impl MicroCompactor {
             .map_err(|e| Error::serialization(format!("failed to parse pinned manifest: {e}")))
     }
 
+    async fn load_current_manifest_only(&self) -> Result<OrchestrationManifest> {
+        let (manifest, _, _, _) = self.read_manifest_with_version().await?;
+        Ok(manifest)
+    }
+
     #[cfg(test)]
     async fn get_or_create_manifest(&self) -> Result<OrchestrationManifest> {
         let (manifest, _, _, _) = self.read_manifest_with_version().await?;
@@ -1102,7 +1120,7 @@ impl MicroCompactor {
 
     /// Writes fold state to L0 delta Parquet files.
     async fn write_delta_parquet(&self, delta_id: &str, state: &FoldState) -> Result<TablePaths> {
-        self.write_state_parquet(&orchestration_l0_dir(delta_id), state)
+        self.write_state_parquet(&orchestration_l0_dir(delta_id), state, false)
             .await
     }
 
@@ -1112,16 +1130,21 @@ impl MicroCompactor {
         snapshot_id: &str,
         state: &FoldState,
     ) -> Result<TablePaths> {
-        self.write_state_parquet(&orchestration_base_snapshot_dir(snapshot_id), state)
+        self.write_state_parquet(&orchestration_base_snapshot_dir(snapshot_id), state, true)
             .await
     }
 
-    async fn write_state_parquet(&self, base_path: &str, state: &FoldState) -> Result<TablePaths> {
+    async fn write_state_parquet(
+        &self,
+        base_path: &str,
+        state: &FoldState,
+        include_empty_tables: bool,
+    ) -> Result<TablePaths> {
         let mut paths = TablePaths::default();
 
         macro_rules! write_table {
             ($file:literal, $rows:expr, $encode:expr, $out:expr) => {
-                self.write_map_table_if_nonempty(base_path, $file, $rows, $encode, $out)
+                self.write_map_table(base_path, $file, $rows, $encode, $out, include_empty_tables)
                     .await?;
             };
         }
@@ -1216,19 +1239,20 @@ impl MicroCompactor {
         Ok(paths)
     }
 
-    async fn write_map_table_if_nonempty<K, R>(
+    async fn write_map_table<K, R>(
         &self,
         base_path: &str,
         file: &str,
         rows: &std::collections::HashMap<K, R>,
         encode: fn(&[R]) -> Result<Bytes>,
         out: &mut Option<TableArtifact>,
+        include_empty_tables: bool,
     ) -> Result<()>
     where
         K: std::hash::Hash + Eq + Sync,
         R: Clone + Sync,
     {
-        if rows.is_empty() {
+        if rows.is_empty() && !include_empty_tables {
             return Ok(());
         }
 

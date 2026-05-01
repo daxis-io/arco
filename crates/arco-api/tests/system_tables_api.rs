@@ -53,6 +53,40 @@ async fn query_can_select_from_system_lineage_edges() -> Result<()> {
 }
 
 #[tokio::test]
+async fn query_can_select_from_system_catalog_commits() -> Result<()> {
+    let router = seed_catalog(test_router()).await?;
+
+    let request = helpers::make_request(
+        Method::POST,
+        "/api/v1/query?format=json",
+        Some(serde_json::json!({
+            "sql": "SELECT commit_ulid, snapshot_version FROM system.catalog.commits ORDER BY published_at DESC"
+        })),
+    )?;
+
+    let response = router.oneshot(request).await.map_err(|err| match err {})?;
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_does_not_expose_manifest_paths_in_system_catalog_commits() -> Result<()> {
+    let router = seed_catalog(test_router()).await?;
+
+    let request = helpers::make_request(
+        Method::POST,
+        "/api/v1/query?format=json",
+        Some(serde_json::json!({
+            "sql": "SELECT manifest_path FROM system.catalog.commits"
+        })),
+    )?;
+
+    let response = router.oneshot(request).await.map_err(|err| match err {})?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
 async fn query_can_select_from_system_orchestration_runs() -> Result<()> {
     let router = seed_orchestration_router().await?;
 
@@ -87,24 +121,19 @@ async fn query_can_select_from_system_orchestration_partition_status() -> Result
 }
 
 #[tokio::test]
-async fn query_can_select_from_system_orchestration_runs_when_state_is_only_in_l0() -> Result<()> {
+async fn query_does_not_expose_system_orchestration_runs_when_state_is_only_in_l0() -> Result<()> {
     let router = seed_orchestration_router_with_l0_only().await?;
 
-    let (status, rows): (_, Vec<serde_json::Value>) = helpers::post_json(
-        router,
+    let request = helpers::make_request(
+        Method::POST,
         "/api/v1/query?format=json",
-        serde_json::json!({
+        Some(serde_json::json!({
             "sql": "SELECT run_id FROM system.orchestration.runs ORDER BY run_id"
-        }),
-    )
-    .await?;
+        })),
+    )?;
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(rows.len(), 1);
-    assert_eq!(
-        rows[0].get("run_id"),
-        Some(&serde_json::Value::String("run_01".to_string()))
-    );
+    let response = router.oneshot(request).await.map_err(|err| match err {})?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     Ok(())
 }
 

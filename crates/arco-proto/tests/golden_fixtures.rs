@@ -2,6 +2,7 @@
 
 #![allow(clippy::expect_used)]
 
+use arco_proto::arco::catalog::v1::MetastoreMutation;
 use arco_proto::arco::common::v1::{PartitionDimension, PartitionKey, ScalarValue, scalar_value};
 
 #[test]
@@ -75,4 +76,16 @@ fn docs_name_the_pre_freeze_proto_hard_cut_policy() {
     assert!(readme.contains("pre-freeze hard cut"));
     assert!(style.contains("pre-freeze hard cut"));
     assert!(style.contains("After the post-hard-cut baseline is regenerated"));
+}
+
+#[test]
+fn metastore_mutation_protojson_field_names_are_contract() {
+    let fixture = include_str!("../fixtures/metastore_mutation_v1.json");
+    let parsed: MetastoreMutation =
+        serde_json::from_str(fixture).expect("metastore mutation fixture should parse");
+
+    let json = serde_json::to_value(&parsed).expect("metastore mutation should serialize");
+    assert!(json.get("storageCredential").is_some());
+    assert!(json.to_string().contains("credentialId"));
+    assert!(json.to_string().contains("lakehouse-prod"));
 }

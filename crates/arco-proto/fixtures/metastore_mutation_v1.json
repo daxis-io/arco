@@ -1,0 +1,8 @@
+{
+  "storageCredential": {
+    "credentialId": "cred_01",
+    "name": "lakehouse-prod",
+    "cloud": "aws",
+    "owner": "group:data-platform"
+  }
+}

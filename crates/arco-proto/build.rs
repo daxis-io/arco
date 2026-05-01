@@ -18,9 +18,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ".arco.common.v1.PartitionKey",
         ".arco.common.v1.ScalarValue",
         ".arco.common.v1.NullValue",
+        ".arco.catalog.v1.StorageCredential",
     ] {
         config = config.type_attribute(ty, "#[derive(serde::Serialize, serde::Deserialize)]");
     }
+
+    config = config.message_attribute(
+        ".arco.catalog.v1.MetastoreMutation",
+        "#[derive(serde::Serialize, serde::Deserialize)] #[serde(transparent)]",
+    );
+    config = config.enum_attribute(
+        ".arco.catalog.v1.MetastoreMutation.op",
+        "#[derive(serde::Serialize, serde::Deserialize)] #[serde(rename_all = \"camelCase\")]",
+    );
 
     for ty in [
         ".arco.catalog.v1.Catalog",
@@ -43,6 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ".arco.common.v1.PartitionDimension",
         ".arco.common.v1.PartitionKey",
         ".arco.common.v1.ScalarValue",
+        ".arco.catalog.v1.StorageCredential",
         ".arco.catalog.v1.Catalog",
         ".arco.catalog.v1.Schema",
         ".arco.catalog.v1.Table",
@@ -70,6 +81,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             field,
             "#[serde(skip_serializing_if = \"Option::is_none\", serialize_with = \"crate::serde_helpers::serialize_optional_timestamp\")]",
         );
+    }
+
+    for field in [
+        ".arco.catalog.v1.StorageCredential.created_at",
+        ".arco.catalog.v1.StorageCredential.updated_at",
+    ] {
+        config = config.field_attribute(
+            field,
+            "#[serde(default, skip_deserializing, skip_serializing_if = \"Option::is_none\", serialize_with = \"crate::serde_helpers::serialize_optional_timestamp\")]",
+        );
+    }
+
+    for variant in [
+        ".arco.catalog.v1.MetastoreMutation.op.grant",
+        ".arco.catalog.v1.MetastoreMutation.op.external_location",
+        ".arco.catalog.v1.MetastoreMutation.op.workspace_binding",
+        ".arco.catalog.v1.MetastoreMutation.op.governance_attachment",
+        ".arco.catalog.v1.MetastoreMutation.op.volume",
+        ".arco.catalog.v1.MetastoreMutation.op.function",
+        ".arco.catalog.v1.MetastoreMutation.op.registered_model",
+        ".arco.catalog.v1.MetastoreMutation.op.model_version",
+    ] {
+        config = config.field_attribute(variant, "#[serde(skip)]");
     }
 
     config.compile_protos(&proto_files, &["../../proto"])?;

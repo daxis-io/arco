@@ -261,7 +261,9 @@ impl CatalogReader {
         let by_id = Arc::new(
             records
                 .into_iter()
-                .map(Table::from)
+                .map(Table::try_from)
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
                 .map(|table| (table.id.clone(), table))
                 .collect::<HashMap<_, _>>(),
         );
@@ -407,7 +409,7 @@ impl CatalogReader {
             Err(e) => return Err(e.into()),
         };
 
-        Ok(records.into_iter().map(Catalog::from).collect())
+        records.into_iter().map(Catalog::try_from).collect()
     }
 
     async fn list_namespaces_from_catalog_manifest(
@@ -427,7 +429,7 @@ impl CatalogReader {
         let bytes = self.storage.get_raw(&ns_path).await?;
         let records = parquet_util::read_namespaces(&bytes)?;
 
-        Ok(records.into_iter().map(Schema::from).collect())
+        records.into_iter().map(Schema::try_from).collect()
     }
 
     async fn list_schemas_from_catalog_manifest(
@@ -493,11 +495,11 @@ impl CatalogReader {
         let bytes = self.storage.get_raw(&tables_path).await?;
         let records = parquet_util::read_tables(&bytes)?;
 
-        Ok(records
+        records
             .into_iter()
             .filter(|table| table.namespace_id == namespace_id)
-            .map(Table::from)
-            .collect())
+            .map(Table::try_from)
+            .collect()
     }
 
     async fn list_tables_from_catalog_manifest(

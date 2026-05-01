@@ -5,6 +5,7 @@
 //! - `namespaces.parquet`
 //! - `tables.parquet`
 //! - `columns.parquet`
+//! - `commits.parquet`
 //! - `lineage_edges.parquet`
 //!
 //! The schemas here are the contract for browser reads (DuckDB-WASM) and API
@@ -40,6 +41,10 @@ pub struct NamespaceRecord {
     pub created_at: i64,
     /// Update timestamp (ms since epoch).
     pub updated_at: i64,
+    /// Optional JSON-encoded UC properties map.
+    pub properties_json: Option<String>,
+    /// Optional UC storage root.
+    pub storage_root: Option<String>,
 }
 
 /// Record stored in `catalogs.parquet`.
@@ -55,6 +60,10 @@ pub struct CatalogRecord {
     pub created_at: i64,
     /// Update timestamp (ms since epoch).
     pub updated_at: i64,
+    /// Optional JSON-encoded UC properties map.
+    pub properties_json: Option<String>,
+    /// Optional UC storage root.
+    pub storage_root: Option<String>,
 }
 
 /// Record stored in `tables.parquet`.
@@ -76,6 +85,10 @@ pub struct TableRecord {
     pub created_at: i64,
     /// Update timestamp (ms since epoch).
     pub updated_at: i64,
+    /// Optional UC table type (e.g. `EXTERNAL`).
+    pub table_type: Option<String>,
+    /// Optional JSON-encoded UC properties map.
+    pub properties_json: Option<String>,
 }
 
 /// Record stored in `columns.parquet`.
@@ -131,6 +144,29 @@ pub struct SearchPostingRecord {
     pub score: f32,
 }
 
+/// Record stored in `commits.parquet`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogCommitRecord {
+    /// Visible commit ULID.
+    pub commit_ulid: String,
+    /// Pointer-selected snapshot version.
+    pub snapshot_version: i64,
+    /// Publication timestamp in milliseconds since epoch.
+    pub published_at: i64,
+    /// Fencing token held while publishing.
+    pub fencing_token: i64,
+    /// Watermark event identifier when present.
+    pub watermark_event_id: Option<String>,
+    /// Catalog DDL operation kind when derivable from the input event.
+    pub operation: Option<String>,
+    /// Logical object type affected by the commit.
+    pub object_type: Option<String>,
+    /// Object identifier affected by the commit.
+    pub object_id: Option<String>,
+    /// Object name affected by the commit.
+    pub object_name: Option<String>,
+}
+
 fn namespaces_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -139,6 +175,8 @@ fn namespaces_schema() -> Arc<Schema> {
         Field::new("description", DataType::Utf8, true),
         Field::new("created_at", DataType::Int64, false),
         Field::new("updated_at", DataType::Int64, false),
+        Field::new("properties_json", DataType::Utf8, true),
+        Field::new("storage_root", DataType::Utf8, true),
     ]))
 }
 
@@ -149,6 +187,8 @@ fn catalogs_schema() -> Arc<Schema> {
         Field::new("description", DataType::Utf8, true),
         Field::new("created_at", DataType::Int64, false),
         Field::new("updated_at", DataType::Int64, false),
+        Field::new("properties_json", DataType::Utf8, true),
+        Field::new("storage_root", DataType::Utf8, true),
     ]))
 }
 
@@ -162,6 +202,8 @@ fn tables_schema() -> Arc<Schema> {
         Field::new("format", DataType::Utf8, true),
         Field::new("created_at", DataType::Int64, false),
         Field::new("updated_at", DataType::Int64, false),
+        Field::new("table_type", DataType::Utf8, true),
+        Field::new("properties_json", DataType::Utf8, true),
     ]))
 }
 
@@ -196,6 +238,20 @@ fn search_postings_schema() -> Arc<Schema> {
         Field::new("doc_id", DataType::Utf8, false),
         Field::new("field", DataType::Utf8, false),
         Field::new("score", DataType::Float32, false),
+    ]))
+}
+
+fn commits_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("commit_ulid", DataType::Utf8, false),
+        Field::new("snapshot_version", DataType::Int64, false),
+        Field::new("published_at", DataType::Int64, false),
+        Field::new("fencing_token", DataType::Int64, false),
+        Field::new("watermark_event_id", DataType::Utf8, true),
+        Field::new("operation", DataType::Utf8, true),
+        Field::new("object_type", DataType::Utf8, true),
+        Field::new("object_id", DataType::Utf8, true),
+        Field::new("object_name", DataType::Utf8, true),
     ]))
 }
 
@@ -237,6 +293,12 @@ pub fn lineage_edge_schema() -> Schema {
 #[must_use]
 pub fn search_posting_schema() -> Schema {
     (*search_postings_schema()).clone()
+}
+
+/// Returns the catalog commit schema for golden file comparison.
+#[must_use]
+pub fn commit_schema() -> Schema {
+    (*commits_schema()).clone()
 }
 
 fn writer_properties() -> WriterProperties {
@@ -294,6 +356,16 @@ pub fn write_namespaces(rows: &[NamespaceRecord]) -> Result<Bytes> {
     );
     let created_at = Int64Array::from(rows.iter().map(|r| r.created_at).collect::<Vec<_>>());
     let updated_at = Int64Array::from(rows.iter().map(|r| r.updated_at).collect::<Vec<_>>());
+    let properties_json = StringArray::from(
+        rows.iter()
+            .map(|r| r.properties_json.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let storage_roots = StringArray::from(
+        rows.iter()
+            .map(|r| r.storage_root.as_deref())
+            .collect::<Vec<_>>(),
+    );
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -304,6 +376,8 @@ pub fn write_namespaces(rows: &[NamespaceRecord]) -> Result<Bytes> {
             Arc::new(descriptions),
             Arc::new(created_at),
             Arc::new(updated_at),
+            Arc::new(properties_json),
+            Arc::new(storage_roots),
         ],
     )
     .map_err(|e| CatalogError::Parquet {
@@ -335,6 +409,16 @@ pub fn write_catalogs(rows: &[CatalogRecord]) -> Result<Bytes> {
     );
     let created_at = Int64Array::from(rows.iter().map(|r| r.created_at).collect::<Vec<_>>());
     let updated_at = Int64Array::from(rows.iter().map(|r| r.updated_at).collect::<Vec<_>>());
+    let properties_json = StringArray::from(
+        rows.iter()
+            .map(|r| r.properties_json.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let storage_roots = StringArray::from(
+        rows.iter()
+            .map(|r| r.storage_root.as_deref())
+            .collect::<Vec<_>>(),
+    );
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -344,6 +428,8 @@ pub fn write_catalogs(rows: &[CatalogRecord]) -> Result<Bytes> {
             Arc::new(descriptions),
             Arc::new(created_at),
             Arc::new(updated_at),
+            Arc::new(properties_json),
+            Arc::new(storage_roots),
         ],
     )
     .map_err(|e| CatalogError::Parquet {
@@ -386,6 +472,16 @@ pub fn write_tables(rows: &[TableRecord]) -> Result<Bytes> {
     let formats = StringArray::from(rows.iter().map(|r| r.format.as_deref()).collect::<Vec<_>>());
     let created_at = Int64Array::from(rows.iter().map(|r| r.created_at).collect::<Vec<_>>());
     let updated_at = Int64Array::from(rows.iter().map(|r| r.updated_at).collect::<Vec<_>>());
+    let table_types = StringArray::from(
+        rows.iter()
+            .map(|r| r.table_type.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let properties_json = StringArray::from(
+        rows.iter()
+            .map(|r| r.properties_json.as_deref())
+            .collect::<Vec<_>>(),
+    );
 
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -398,6 +494,8 @@ pub fn write_tables(rows: &[TableRecord]) -> Result<Bytes> {
             Arc::new(formats),
             Arc::new(created_at),
             Arc::new(updated_at),
+            Arc::new(table_types),
+            Arc::new(properties_json),
         ],
     )
     .map_err(|e| CatalogError::Parquet {
@@ -557,6 +655,71 @@ pub fn write_search_postings(rows: &[SearchPostingRecord]) -> Result<Bytes> {
     write_single_batch(schema, &batch)
 }
 
+/// Writes `commits.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if the record batch cannot be built or the Parquet write
+/// fails.
+pub fn write_commits(rows: &[CatalogCommitRecord]) -> Result<Bytes> {
+    let schema = commits_schema();
+
+    let commit_ulids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.commit_ulid.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let snapshot_versions =
+        Int64Array::from(rows.iter().map(|r| r.snapshot_version).collect::<Vec<_>>());
+    let published_at = Int64Array::from(rows.iter().map(|r| r.published_at).collect::<Vec<_>>());
+    let fencing_tokens = Int64Array::from(rows.iter().map(|r| r.fencing_token).collect::<Vec<_>>());
+    let watermark_event_ids = StringArray::from(
+        rows.iter()
+            .map(|r| r.watermark_event_id.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let operations = StringArray::from(
+        rows.iter()
+            .map(|r| r.operation.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let object_types = StringArray::from(
+        rows.iter()
+            .map(|r| r.object_type.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let object_ids = StringArray::from(
+        rows.iter()
+            .map(|r| r.object_id.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let object_names = StringArray::from(
+        rows.iter()
+            .map(|r| r.object_name.as_deref())
+            .collect::<Vec<_>>(),
+    );
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(commit_ulids),
+            Arc::new(snapshot_versions),
+            Arc::new(published_at),
+            Arc::new(fencing_tokens),
+            Arc::new(watermark_event_ids),
+            Arc::new(operations),
+            Arc::new(object_types),
+            Arc::new(object_ids),
+            Arc::new(object_names),
+        ],
+    )
+    .map_err(|e| CatalogError::Parquet {
+        message: format!("record batch build failed: {e}"),
+    })?;
+
+    write_single_batch(schema, &batch)
+}
+
 fn read_batches(bytes: &Bytes) -> Result<Vec<RecordBatch>> {
     let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
         .map_err(|e| CatalogError::Parquet {
@@ -692,6 +855,8 @@ pub fn read_namespaces(bytes: &Bytes) -> Result<Vec<NamespaceRecord>> {
         let description = col_string_optional(&batch, "description")?;
         let created_at = col_i64(&batch, "created_at")?;
         let updated_at = col_i64(&batch, "updated_at")?;
+        let properties_json = col_string_optional(&batch, "properties_json")?;
+        let storage_root = col_string_optional(&batch, "storage_root")?;
 
         for row in 0..batch.num_rows() {
             out.push(NamespaceRecord {
@@ -713,6 +878,20 @@ pub fn read_namespaces(bytes: &Bytes) -> Result<Vec<NamespaceRecord>> {
                 }),
                 created_at: created_at.value(row),
                 updated_at: updated_at.value(row),
+                properties_json: properties_json.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                storage_root: storage_root.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
             });
         }
     }
@@ -733,6 +912,8 @@ pub fn read_catalogs(bytes: &Bytes) -> Result<Vec<CatalogRecord>> {
         let description = col_string_optional(&batch, "description")?;
         let created_at = col_i64(&batch, "created_at")?;
         let updated_at = col_i64(&batch, "updated_at")?;
+        let properties_json = col_string_optional(&batch, "properties_json")?;
+        let storage_root = col_string_optional(&batch, "storage_root")?;
 
         for row in 0..batch.num_rows() {
             out.push(CatalogRecord {
@@ -747,6 +928,20 @@ pub fn read_catalogs(bytes: &Bytes) -> Result<Vec<CatalogRecord>> {
                 }),
                 created_at: created_at.value(row),
                 updated_at: updated_at.value(row),
+                properties_json: properties_json.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                storage_root: storage_root.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
             });
         }
     }
@@ -770,6 +965,8 @@ pub fn read_tables(bytes: &Bytes) -> Result<Vec<TableRecord>> {
         let format = col_string_optional(&batch, "format")?;
         let created_at = col_i64(&batch, "created_at")?;
         let updated_at = col_i64(&batch, "updated_at")?;
+        let table_type = col_string_optional(&batch, "table_type")?;
+        let properties_json = col_string_optional(&batch, "properties_json")?;
 
         for row in 0..batch.num_rows() {
             out.push(TableRecord {
@@ -799,6 +996,20 @@ pub fn read_tables(bytes: &Bytes) -> Result<Vec<TableRecord>> {
                 }),
                 created_at: created_at.value(row),
                 updated_at: updated_at.value(row),
+                table_type: table_type.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                properties_json: properties_json.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
             });
         }
     }
@@ -907,6 +1118,72 @@ pub fn read_search_postings(bytes: &Bytes) -> Result<Vec<SearchPostingRecord>> {
     Ok(out)
 }
 
+/// Reads `commits.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if the Parquet payload is invalid or required columns are
+/// missing.
+pub fn read_commits(bytes: &Bytes) -> Result<Vec<CatalogCommitRecord>> {
+    let mut out = Vec::new();
+    for batch in read_batches(bytes)? {
+        let commit_ulid = col_string(&batch, "commit_ulid")?;
+        let snapshot_version = col_i64(&batch, "snapshot_version")?;
+        let published_at = col_i64(&batch, "published_at")?;
+        let fencing_token = col_i64(&batch, "fencing_token")?;
+        let watermark_event_id = col_string_optional(&batch, "watermark_event_id")?;
+        let operation = col_string_optional(&batch, "operation")?;
+        let object_type = col_string_optional(&batch, "object_type")?;
+        let object_id = col_string_optional(&batch, "object_id")?;
+        let object_name = col_string_optional(&batch, "object_name")?;
+
+        for row in 0..batch.num_rows() {
+            out.push(CatalogCommitRecord {
+                commit_ulid: commit_ulid.value(row).to_string(),
+                snapshot_version: snapshot_version.value(row),
+                published_at: published_at.value(row),
+                fencing_token: fencing_token.value(row),
+                watermark_event_id: watermark_event_id.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                operation: operation.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                object_type: object_type.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                object_id: object_id.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                object_name: object_name.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+            });
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -947,6 +1224,45 @@ mod tests {
         assert_eq!(rows[0].catalog_id, None);
         assert_eq!(rows[0].name, "default");
         assert_eq!(rows[0].description, None);
+        assert_eq!(rows[0].properties_json, None);
+        assert_eq!(rows[0].storage_root, None);
+    }
+
+    #[test]
+    fn read_catalogs_tolerates_missing_optional_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
+            // NOTE: "description" intentionally omitted.
+            Field::new("created_at", DataType::Int64, false),
+            Field::new("updated_at", DataType::Int64, false),
+        ]));
+
+        let ids = StringArray::from(vec![Some("cat_1")]);
+        let names = StringArray::from(vec![Some("main")]);
+        let created_at = Int64Array::from(vec![123_i64]);
+        let updated_at = Int64Array::from(vec![123_i64]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(ids),
+                Arc::new(names),
+                Arc::new(created_at),
+                Arc::new(updated_at),
+            ],
+        )
+        .expect("record batch build");
+
+        let bytes = write_single_batch(schema, &batch).expect("write parquet");
+        let rows = read_catalogs(&bytes).expect("read catalogs");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "cat_1");
+        assert_eq!(rows[0].name, "main");
+        assert_eq!(rows[0].description, None);
+        assert_eq!(rows[0].properties_json, None);
+        assert_eq!(rows[0].storage_root, None);
     }
 
     #[test]
@@ -989,6 +1305,8 @@ mod tests {
         assert_eq!(rows[0].description, None);
         assert_eq!(rows[0].location, None);
         assert_eq!(rows[0].format, None);
+        assert_eq!(rows[0].table_type, None);
+        assert_eq!(rows[0].properties_json, None);
     }
 
     #[test]

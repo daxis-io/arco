@@ -12,9 +12,10 @@ use std::time::Duration;
 
 use arco_catalog::manifest::{CatalogDomainManifest, DomainManifestPointer};
 use arco_catalog::parquet_util::{
-    NamespaceRecord, TableRecord, write_catalogs, write_columns, write_namespaces, write_tables,
+    NamespaceRecord, TableRecord, read_commits, write_catalogs, write_columns, write_namespaces,
+    write_tables,
 };
-use arco_catalog::writer::CatalogTransactionCommit;
+use arco_catalog::writer::{CatalogTransactionCommit, SchemaPatch};
 use arco_catalog::{
     CatalogReader, CatalogWriter, ColumnDefinition, RegisterTableInSchemaRequest,
     RegisterTableRequest, TablePatch, Tier1Compactor, Tier1Writer, WriteOptions,
@@ -77,6 +78,34 @@ async fn assert_visible_commit(storage: &ScopedStorage, commit: &CatalogTransact
         commit.fencing_token > 0,
         "transaction helper must report the held fencing token"
     );
+
+    let commits_path = CatalogPaths::snapshot_file(
+        CatalogDomain::Catalog,
+        manifest.snapshot_version,
+        "commits.parquet",
+    );
+    let commit_bytes = storage
+        .get_raw(&commits_path)
+        .await
+        .expect("catalog commits snapshot bytes");
+    let commit_rows = read_commits(&commit_bytes).expect("parse catalog commits snapshot");
+    let latest = commit_rows
+        .last()
+        .expect("visible catalog snapshot must include at least one commit row");
+    assert_eq!(latest.commit_ulid, commit.commit_id);
+    assert_eq!(
+        latest.snapshot_version,
+        i64::try_from(manifest.snapshot_version).expect("snapshot version fits in i64")
+    );
+    assert_eq!(
+        latest.watermark_event_id,
+        manifest.watermark_event_id.clone()
+    );
+    assert_eq!(
+        latest.fencing_token,
+        i64::try_from(commit.fencing_token).expect("fencing token fits in i64")
+    );
+    assert_eq!(latest.published_at, manifest.updated_at.timestamp_millis());
 }
 
 async fn current_catalog_pointer(
@@ -213,6 +242,8 @@ async fn seed_legacy_default_namespace_snapshot(
                 catalog_id: None,
                 name: namespace.to_string(),
                 description: Some("legacy default namespace".to_string()),
+                properties_json: None,
+                storage_root: None,
                 created_at: now,
                 updated_at: now,
             }])
@@ -235,6 +266,8 @@ async fn seed_legacy_default_namespace_snapshot(
                 description: Some("legacy table".to_string()),
                 location: None,
                 format: Some("iceberg".to_string()),
+                table_type: None,
+                properties_json: None,
                 created_at: now,
                 updated_at: now,
             }])
@@ -462,6 +495,8 @@ async fn tier1_sync_compaction_rejects_stale_fencing_and_leaves_visible_head_unc
         catalog_id: None,
         name: "stale-fence".to_string(),
         description: None,
+        properties_json: None,
+        storage_root: None,
         created_at: 1_710_000_000_000,
         updated_at: 1_710_000_000_000,
     };
@@ -567,6 +602,76 @@ async fn default_catalog_rename_transaction_bridges_legacy_null_catalog_namespac
 }
 
 #[tokio::test]
+async fn default_catalog_schema_patch_bridges_legacy_null_catalog_namespaces() {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = scoped_storage(backend);
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+    seed_legacy_default_namespace_snapshot(&storage, "legacy", "old_name").await;
+
+    writer
+        .patch_schema_in_catalog(
+            "default",
+            "legacy",
+            SchemaPatch {
+                description: Some(Some("patched legacy default schema".to_string())),
+                new_name: Some("gold".to_string()),
+                properties: Some(Some(BTreeMap::from([(
+                    "classification".to_string(),
+                    "restricted".to_string(),
+                )]))),
+                storage_root: Some(Some("s3://bucket/schemas/gold".to_string())),
+            },
+            WriteOptions::default(),
+        )
+        .await
+        .expect("default catalog schema patch should bridge legacy null catalog_id namespaces");
+
+    let reader = CatalogReader::new(storage);
+    let default_catalog = reader
+        .get_catalog("default")
+        .await
+        .expect("get default catalog")
+        .expect("default catalog exists");
+    let patched = reader
+        .list_schemas("default")
+        .await
+        .expect("list default schemas")
+        .into_iter()
+        .find(|schema| schema.name == "gold")
+        .expect("patched schema exists");
+    assert_eq!(
+        patched.catalog_id.as_deref(),
+        Some(default_catalog.id.as_str())
+    );
+    assert_eq!(
+        patched.description.as_deref(),
+        Some("patched legacy default schema")
+    );
+    assert_eq!(
+        patched
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("classification"))
+            .map(String::as_str),
+        Some("restricted")
+    );
+    assert_eq!(
+        patched.storage_root.as_deref(),
+        Some("s3://bucket/schemas/gold")
+    );
+    assert!(
+        reader
+            .list_schemas("default")
+            .await
+            .expect("list schemas after patch")
+            .into_iter()
+            .all(|schema| schema.name != "legacy"),
+        "old schema name must disappear after authoritative patch"
+    );
+}
+
+#[tokio::test]
 async fn default_catalog_transaction_helpers_publish_visible_round_trip_state() {
     let backend = Arc::new(MemoryBackend::new());
     let storage = scoped_storage(backend);
@@ -609,6 +714,8 @@ async fn default_catalog_transaction_helpers_publish_visible_round_trip_state() 
                 description: Some("event log".to_string()),
                 location: None,
                 format: Some("iceberg".to_string()),
+                table_type: None,
+                properties: None,
                 columns: vec![test_column("event_id")],
             },
             WriteOptions::default(),
@@ -730,6 +837,8 @@ async fn named_catalog_transaction_helpers_round_trip_and_preserve_catalog_scope
                 description: Some("default events".to_string()),
                 location: None,
                 format: Some("iceberg".to_string()),
+                table_type: None,
+                properties: None,
                 columns: vec![test_column("event_id")],
             },
             WriteOptions::default(),
@@ -764,6 +873,8 @@ async fn named_catalog_transaction_helpers_round_trip_and_preserve_catalog_scope
                 description: Some("warehouse events".to_string()),
                 location: None,
                 format: Some("iceberg".to_string()),
+                table_type: None,
+                properties: None,
                 columns: vec![test_column("warehouse_event_id")],
             },
             WriteOptions::default(),

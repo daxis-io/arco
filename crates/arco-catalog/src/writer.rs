@@ -23,6 +23,7 @@
 #![allow(clippy::option_if_let_else)]
 #![allow(clippy::uninlined_format_args)]
 
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,7 +48,9 @@ use crate::parquet_util::{
     CatalogRecord, ColumnRecord, LineageEdgeRecord, NamespaceRecord, TableRecord,
 };
 use crate::sync_compactor::SyncCompactor;
-use crate::tier1_events::{CatalogDdlEvent, CatalogDdlEventV2, CatalogDdlEventV3, LineageDdlEvent};
+use crate::tier1_events::{
+    CatalogDdlEvent, CatalogDdlEventV2, CatalogDdlEventV3, CatalogDdlEventV4, LineageDdlEvent,
+};
 use crate::tier1_state;
 use crate::tier1_writer::Tier1Writer;
 use crate::write_options::WriteOptions;
@@ -88,6 +91,31 @@ fn normalize_table_location_for_write(
         .map_err(CatalogError::from)?;
     Ok(Some(trimmed))
 }
+
+fn encode_uc_properties(properties: &Option<BTreeMap<String, String>>) -> Result<Option<String>> {
+    properties
+        .as_ref()
+        .map(|properties| {
+            serde_json::to_string(properties).map_err(|err| CatalogError::Serialization {
+                message: format!("failed to serialize UC properties: {err}"),
+            })
+        })
+        .transpose()
+}
+
+fn decode_uc_properties(
+    properties_json: Option<String>,
+) -> Result<Option<BTreeMap<String, String>>> {
+    properties_json
+        .map(|properties_json| {
+            serde_json::from_str::<BTreeMap<String, String>>(&properties_json).map_err(|err| {
+                CatalogError::Serialization {
+                    message: format!("failed to parse UC properties JSON: {err}"),
+                }
+            })
+        })
+        .transpose()
+}
 // ============================================================================
 // Domain Types (returned from write operations)
 // ============================================================================
@@ -103,6 +131,10 @@ pub struct Schema {
     pub name: String,
     /// Optional description.
     pub description: Option<String>,
+    /// Optional UC properties.
+    pub properties: Option<BTreeMap<String, String>>,
+    /// Optional UC storage root.
+    pub storage_root: Option<String>,
     /// Creation timestamp (milliseconds since epoch).
     pub created_at: i64,
     /// Last update timestamp (milliseconds since epoch).
@@ -124,59 +156,79 @@ pub struct Catalog {
     pub name: String,
     /// Optional description.
     pub description: Option<String>,
+    /// Optional UC properties.
+    pub properties: Option<BTreeMap<String, String>>,
+    /// Optional UC storage root.
+    pub storage_root: Option<String>,
     /// Creation timestamp (milliseconds since epoch).
     pub created_at: i64,
     /// Last update timestamp (milliseconds since epoch).
     pub updated_at: i64,
 }
 
-impl From<CatalogRecord> for Catalog {
-    fn from(r: CatalogRecord) -> Self {
-        Self {
+impl TryFrom<CatalogRecord> for Catalog {
+    type Error = CatalogError;
+
+    fn try_from(r: CatalogRecord) -> Result<Self> {
+        Ok(Self {
             id: r.id,
             name: r.name,
             description: r.description,
+            properties: decode_uc_properties(r.properties_json)?,
+            storage_root: r.storage_root,
             created_at: r.created_at,
             updated_at: r.updated_at,
-        }
+        })
     }
 }
 
-impl From<&Catalog> for CatalogRecord {
-    fn from(catalog: &Catalog) -> Self {
-        Self {
+impl TryFrom<&Catalog> for CatalogRecord {
+    type Error = CatalogError;
+
+    fn try_from(catalog: &Catalog) -> Result<Self> {
+        Ok(Self {
             id: catalog.id.clone(),
             name: catalog.name.clone(),
             description: catalog.description.clone(),
             created_at: catalog.created_at,
             updated_at: catalog.updated_at,
-        }
+            properties_json: encode_uc_properties(&catalog.properties)?,
+            storage_root: catalog.storage_root.clone(),
+        })
     }
 }
 
-impl From<NamespaceRecord> for Schema {
-    fn from(r: NamespaceRecord) -> Self {
-        Self {
+impl TryFrom<NamespaceRecord> for Schema {
+    type Error = CatalogError;
+
+    fn try_from(r: NamespaceRecord) -> Result<Self> {
+        Ok(Self {
             id: r.id,
             catalog_id: r.catalog_id,
             name: r.name,
             description: r.description,
+            properties: decode_uc_properties(r.properties_json)?,
+            storage_root: r.storage_root,
             created_at: r.created_at,
             updated_at: r.updated_at,
-        }
+        })
     }
 }
 
-impl From<&Schema> for NamespaceRecord {
-    fn from(ns: &Schema) -> Self {
-        Self {
+impl TryFrom<&Schema> for NamespaceRecord {
+    type Error = CatalogError;
+
+    fn try_from(ns: &Schema) -> Result<Self> {
+        Ok(Self {
             id: ns.id.clone(),
             catalog_id: ns.catalog_id.clone(),
             name: ns.name.clone(),
             description: ns.description.clone(),
             created_at: ns.created_at,
             updated_at: ns.updated_at,
-        }
+            properties_json: encode_uc_properties(&ns.properties)?,
+            storage_root: ns.storage_root.clone(),
+        })
     }
 }
 
@@ -195,30 +247,40 @@ pub struct Table {
     pub location: Option<String>,
     /// File format (e.g., "parquet", "iceberg").
     pub format: Option<String>,
+    /// Optional UC table type (for example `EXTERNAL`).
+    pub table_type: Option<String>,
+    /// Optional UC properties.
+    pub properties: Option<BTreeMap<String, String>>,
     /// Creation timestamp (milliseconds since epoch).
     pub created_at: i64,
     /// Last update timestamp (milliseconds since epoch).
     pub updated_at: i64,
 }
 
-impl From<TableRecord> for Table {
-    fn from(r: TableRecord) -> Self {
-        Self {
+impl TryFrom<TableRecord> for Table {
+    type Error = CatalogError;
+
+    fn try_from(r: TableRecord) -> Result<Self> {
+        Ok(Self {
             id: r.id,
             namespace_id: r.namespace_id,
             name: r.name,
             description: r.description,
             location: r.location,
             format: r.format,
+            table_type: r.table_type,
+            properties: decode_uc_properties(r.properties_json)?,
             created_at: r.created_at,
             updated_at: r.updated_at,
-        }
+        })
     }
 }
 
-impl From<&Table> for TableRecord {
-    fn from(t: &Table) -> Self {
-        Self {
+impl TryFrom<&Table> for TableRecord {
+    type Error = CatalogError;
+
+    fn try_from(t: &Table) -> Result<Self> {
+        Ok(Self {
             id: t.id.clone(),
             namespace_id: t.namespace_id.clone(),
             name: t.name.clone(),
@@ -227,7 +289,9 @@ impl From<&Table> for TableRecord {
             format: t.format.clone(),
             created_at: t.created_at,
             updated_at: t.updated_at,
-        }
+            table_type: t.table_type.clone(),
+            properties_json: encode_uc_properties(&t.properties)?,
+        })
     }
 }
 
@@ -349,6 +413,10 @@ pub struct RegisterTableInSchemaRequest {
     pub location: Option<String>,
     /// File format (e.g., "parquet", "iceberg", "delta").
     pub format: Option<String>,
+    /// Optional UC table type (for example `EXTERNAL`).
+    pub table_type: Option<String>,
+    /// Optional UC properties.
+    pub properties: Option<BTreeMap<String, String>>,
     /// Column definitions.
     pub columns: Vec<ColumnDefinition>,
 }
@@ -377,6 +445,32 @@ pub struct TablePatch {
     pub location: Option<Option<String>>,
     /// New format (None = no change).
     pub format: Option<Option<String>>,
+}
+
+/// Patch for updating catalog UC-facing metadata.
+#[derive(Debug, Clone, Default)]
+pub struct CatalogPatch {
+    /// New description (None = no change).
+    pub description: Option<Option<String>>,
+    /// New catalog name.
+    pub new_name: Option<String>,
+    /// New UC properties (None = no change, Some(None) = clear).
+    pub properties: Option<Option<BTreeMap<String, String>>>,
+    /// New UC storage root (None = no change, Some(None) = clear).
+    pub storage_root: Option<Option<String>>,
+}
+
+/// Patch for updating schema UC-facing metadata.
+#[derive(Debug, Clone, Default)]
+pub struct SchemaPatch {
+    /// New description (None = no change).
+    pub description: Option<Option<String>>,
+    /// New schema name.
+    pub new_name: Option<String>,
+    /// New UC properties (None = no change, Some(None) = clear).
+    pub properties: Option<Option<BTreeMap<String, String>>>,
+    /// New UC storage root (None = no change, Some(None) = clear).
+    pub storage_root: Option<Option<String>>,
 }
 
 /// Event source identifier for Tier-2 event writing.
@@ -742,12 +836,14 @@ impl CatalogWriter {
             id: Uuid::now_v7().to_string(),
             name: "default".to_string(),
             description: None,
+            properties: None,
+            storage_root: None,
             created_at: now,
             updated_at: now,
         };
 
         let event = CatalogDdlEventV2::CatalogCreated {
-            catalog: CatalogRecord::from(&default),
+            catalog: CatalogRecord::try_from(&default)?,
         };
 
         let event_id = self
@@ -770,7 +866,7 @@ impl CatalogWriter {
         let response = compactor.sync_compact(request).await?;
 
         Ok(DefaultCatalogOutcome {
-            catalog: CatalogRecord::from(&default),
+            catalog: CatalogRecord::try_from(&default)?,
             repair_pending: response.repair_pending,
         })
     }
@@ -814,9 +910,28 @@ impl CatalogWriter {
         description: Option<&str>,
         opts: WriteOptions,
     ) -> Result<Catalog> {
+        self.create_catalog_with_metadata(name, description, None, None, opts)
+            .await
+    }
+
+    /// Creates a new catalog with authoritative UC metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog already exists or storage operations fail.
+    pub async fn create_catalog_with_metadata(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        properties: Option<BTreeMap<String, String>>,
+        storage_root: Option<&str>,
+        opts: WriteOptions,
+    ) -> Result<Catalog> {
         let request_hash = Self::idempotency_request_hash(serde_json::json!({
             "name": name,
             "description": description,
+            "properties": properties,
+            "storage_root": storage_root,
             "if_match": opts.if_match.map(|version| version.as_u64()),
         }))?;
         let idempotency_store = self.idempotency_store();
@@ -864,6 +979,8 @@ impl CatalogWriter {
                 id: Uuid::now_v7().to_string(),
                 name: name.to_string(),
                 description: description.map(String::from),
+                properties,
+                storage_root: storage_root.map(String::from),
                 created_at: now,
                 updated_at: now,
             };
@@ -903,7 +1020,7 @@ impl CatalogWriter {
             }
 
             let event = CatalogDdlEventV2::CatalogCreated {
-                catalog: CatalogRecord::from(&catalog),
+                catalog: CatalogRecord::try_from(&catalog)?,
             };
 
             let event_id = self
@@ -975,6 +1092,8 @@ impl CatalogWriter {
             id: Uuid::now_v7().to_string(),
             name: name.to_string(),
             description: description.map(String::from),
+            properties: None,
+            storage_root: None,
             created_at: now,
             updated_at: now,
         };
@@ -1010,7 +1129,7 @@ impl CatalogWriter {
         }
 
         let event = CatalogDdlEventV2::CatalogCreated {
-            catalog: CatalogRecord::from(&catalog),
+            catalog: CatalogRecord::try_from(&catalog)?,
         };
         let event_id = self
             .tier1
@@ -1046,6 +1165,28 @@ impl CatalogWriter {
         &self,
         name: &str,
         description: Option<&str>,
+        opts: WriteOptions,
+    ) -> Result<Catalog> {
+        self.patch_catalog(
+            name,
+            CatalogPatch {
+                description: Some(description.map(str::to_string)),
+                ..CatalogPatch::default()
+            },
+            opts,
+        )
+        .await
+    }
+
+    /// Applies an authoritative UC metadata patch to a catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog doesn't exist, a rename conflicts, or storage operations fail.
+    pub async fn patch_catalog(
+        &self,
+        name: &str,
+        patch: CatalogPatch,
         opts: WriteOptions,
     ) -> Result<Catalog> {
         if let Some(expected) = &opts.if_match {
@@ -1092,27 +1233,91 @@ impl CatalogWriter {
                 name: name.to_string(),
             })?;
 
+        if name == "default" && patch.new_name.is_some() {
+            guard.release().await?;
+            return Err(CatalogError::Validation {
+                message: "default catalog cannot be renamed".to_string(),
+            });
+        }
+
+        if patch.new_name.as_deref() == Some("default") && name != "default" {
+            guard.release().await?;
+            return Err(CatalogError::Validation {
+                message: "catalogs cannot be renamed to reserved name 'default'".to_string(),
+            });
+        }
+
+        let existing_catalog = Catalog::try_from(existing.clone())?;
+        let next_name = patch
+            .new_name
+            .clone()
+            .unwrap_or_else(|| existing_catalog.name.clone());
+
+        if next_name != existing_catalog.name
+            && state
+                .catalogs
+                .iter()
+                .any(|catalog| catalog.name == next_name)
+        {
+            guard.release().await?;
+            return Err(CatalogError::AlreadyExists {
+                entity: "catalog".into(),
+                name: next_name,
+            });
+        }
+
         let now = Utc::now().timestamp_millis();
         let catalog = Catalog {
-            id: existing.id.clone(),
-            name: existing.name.clone(),
-            description: description.map(String::from),
-            created_at: existing.created_at,
+            id: existing_catalog.id.clone(),
+            name: next_name,
+            description: patch
+                .description
+                .unwrap_or(existing_catalog.description.clone()),
+            properties: patch
+                .properties
+                .unwrap_or(existing_catalog.properties.clone()),
+            storage_root: patch
+                .storage_root
+                .unwrap_or(existing_catalog.storage_root.clone()),
+            created_at: existing_catalog.created_at,
             updated_at: now,
         };
 
-        let event = CatalogDdlEventV3::CatalogUpdated {
-            catalog: CatalogRecord::from(&catalog),
+        if catalog.name == existing_catalog.name
+            && catalog.description == existing_catalog.description
+            && catalog.properties == existing_catalog.properties
+            && catalog.storage_root == existing_catalog.storage_root
+        {
+            guard.release().await?;
+            return Ok(existing_catalog);
+        }
+
+        let event_id = if catalog.name == existing_catalog.name {
+            let event = CatalogDdlEventV3::CatalogUpdated {
+                catalog: CatalogRecord::try_from(&catalog)?,
+            };
+            self.tier1
+                .append_ledger_event(
+                    &guard,
+                    CatalogDomain::Catalog,
+                    &event,
+                    opts.actor.as_deref().unwrap_or("api"),
+                )
+                .await?
+        } else {
+            let event = CatalogDdlEventV4::CatalogRenamed {
+                catalog: CatalogRecord::try_from(&catalog)?,
+                old_name: existing_catalog.name,
+            };
+            self.tier1
+                .append_ledger_event(
+                    &guard,
+                    CatalogDomain::Catalog,
+                    &event,
+                    opts.actor.as_deref().unwrap_or("api"),
+                )
+                .await?
         };
-        let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
-                CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
-            .await?;
 
         let request = self.single_event_sync_compact_request(
             CatalogDomain::Catalog,
@@ -1304,10 +1509,30 @@ impl CatalogWriter {
         description: Option<&str>,
         opts: WriteOptions,
     ) -> Result<Schema> {
+        self.create_schema_with_metadata(catalog, schema, description, None, None, opts)
+            .await
+    }
+
+    /// Creates a new schema within a catalog with authoritative UC metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog or schema is invalid or storage operations fail.
+    pub async fn create_schema_with_metadata(
+        &self,
+        catalog: &str,
+        schema: &str,
+        description: Option<&str>,
+        properties: Option<BTreeMap<String, String>>,
+        storage_root: Option<&str>,
+        opts: WriteOptions,
+    ) -> Result<Schema> {
         let request_hash = Self::idempotency_request_hash(serde_json::json!({
             "catalog": catalog,
             "schema": schema,
             "description": description,
+            "properties": properties,
+            "storage_root": storage_root,
             "if_match": opts.if_match.map(|version| version.as_u64()),
         }))?;
         let idempotency_store = self.idempotency_store();
@@ -1406,12 +1631,14 @@ impl CatalogWriter {
                 catalog_id: Some(catalog_record.id.clone()),
                 name: schema.to_string(),
                 description: description.map(String::from),
+                properties,
+                storage_root: storage_root.map(String::from),
                 created_at: now,
                 updated_at: now,
             };
 
             let event = CatalogDdlEvent::NamespaceCreated {
-                namespace: NamespaceRecord::from(&namespace),
+                namespace: NamespaceRecord::try_from(&namespace)?,
             };
 
             let event_id = self
@@ -1539,11 +1766,13 @@ impl CatalogWriter {
             catalog_id: Some(catalog_record.id.clone()),
             name: schema.to_string(),
             description: description.map(String::from),
+            properties: None,
+            storage_root: None,
             created_at: now,
             updated_at: now,
         };
         let event = CatalogDdlEvent::NamespaceCreated {
-            namespace: NamespaceRecord::from(&namespace),
+            namespace: NamespaceRecord::try_from(&namespace)?,
         };
         let event_id = self
             .tier1
@@ -1659,12 +1888,14 @@ impl CatalogWriter {
             catalog_id: Some(default_catalog.id),
             name: name.to_string(),
             description: description.map(String::from),
+            properties: None,
+            storage_root: None,
             created_at: now,
             updated_at: now,
         };
 
         let event = CatalogDdlEvent::NamespaceCreated {
-            namespace: NamespaceRecord::from(&namespace),
+            namespace: NamespaceRecord::try_from(&namespace)?,
         };
 
         let event_id = self
@@ -1766,11 +1997,13 @@ impl CatalogWriter {
             catalog_id: Some(default_catalog.id),
             name: name.to_string(),
             description: description.map(String::from),
+            properties: None,
+            storage_root: None,
             created_at: now,
             updated_at: now,
         };
         let event = CatalogDdlEvent::NamespaceCreated {
-            namespace: NamespaceRecord::from(&namespace),
+            namespace: NamespaceRecord::try_from(&namespace)?,
         };
 
         let event_id = self
@@ -1814,10 +2047,30 @@ impl CatalogWriter {
         description: Option<&str>,
         opts: WriteOptions,
     ) -> Result<Schema> {
-        if catalog == "default" {
-            return self.update_namespace(schema, description, opts).await;
-        }
+        self.patch_schema_in_catalog(
+            catalog,
+            schema,
+            SchemaPatch {
+                description: Some(description.map(str::to_string)),
+                ..SchemaPatch::default()
+            },
+            opts,
+        )
+        .await
+    }
 
+    /// Applies an authoritative UC metadata patch to a schema within a catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the schema doesn't exist, a rename conflicts, or storage operations fail.
+    pub async fn patch_schema_in_catalog(
+        &self,
+        catalog: &str,
+        schema: &str,
+        patch: SchemaPatch,
+        opts: WriteOptions,
+    ) -> Result<Schema> {
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -1853,55 +2106,126 @@ impl CatalogWriter {
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
-        let Some(catalog_record) = state.catalogs.iter().find(|record| record.name == catalog)
-        else {
-            guard.release().await?;
-            return Err(CatalogError::NotFound {
-                entity: "catalog".into(),
-                name: catalog.to_string(),
-            });
+        let target_catalog = if catalog == "default" {
+            match self
+                .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+                .await
+            {
+                Ok(catalog) => catalog,
+                Err(err) => {
+                    guard.release().await?;
+                    return Err(err);
+                }
+            }
+        } else {
+            let Some(catalog_record) = state.catalogs.iter().find(|record| record.name == catalog)
+            else {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "catalog".into(),
+                    name: catalog.to_string(),
+                });
+            };
+            catalog_record.clone()
         };
 
-        let default_catalog_id = state
-            .catalogs
-            .iter()
-            .find(|record| record.name == "default")
-            .map(|record| record.id.as_str());
-        let catalog_id = catalog_record.id.as_str();
+        let default_catalog_id = if catalog == "default" {
+            Some(target_catalog.id.clone())
+        } else {
+            state
+                .catalogs
+                .iter()
+                .find(|record| record.name == "default")
+                .map(|record| record.id.clone())
+        };
+        let target_catalog_id = target_catalog.id.as_str();
+        let default_catalog_id_ref = default_catalog_id.as_deref();
         let existing = state
             .namespaces
             .iter()
             .find(|candidate| {
                 candidate.name == schema
-                    && candidate.catalog_id.as_deref().or(default_catalog_id) == Some(catalog_id)
+                    && candidate.catalog_id.as_deref().or(default_catalog_id_ref)
+                        == Some(target_catalog_id)
             })
             .ok_or_else(|| CatalogError::NotFound {
                 entity: "schema".into(),
                 name: format!("{catalog}.{schema}"),
             })?;
 
+        let existing_schema = Schema::try_from(existing.clone())?;
+        let next_name = patch
+            .new_name
+            .clone()
+            .unwrap_or_else(|| existing_schema.name.clone());
+
+        if next_name != existing_schema.name
+            && state.namespaces.iter().any(|candidate| {
+                candidate.name == next_name
+                    && candidate.catalog_id.as_deref().or(default_catalog_id_ref)
+                        == Some(target_catalog_id)
+            })
+        {
+            guard.release().await?;
+            return Err(CatalogError::AlreadyExists {
+                entity: "schema".into(),
+                name: format!("{catalog}.{next_name}"),
+            });
+        }
+
         let now = Utc::now().timestamp_millis();
         let namespace = Namespace {
-            id: existing.id.clone(),
-            catalog_id: Some(catalog_record.id.clone()),
-            name: existing.name.clone(),
-            description: description.map(String::from),
-            created_at: existing.created_at,
+            id: existing_schema.id.clone(),
+            catalog_id: Some(target_catalog.id.clone()),
+            name: next_name,
+            description: patch
+                .description
+                .unwrap_or(existing_schema.description.clone()),
+            properties: patch
+                .properties
+                .unwrap_or(existing_schema.properties.clone()),
+            storage_root: patch
+                .storage_root
+                .unwrap_or(existing_schema.storage_root.clone()),
+            created_at: existing_schema.created_at,
             updated_at: now,
         };
 
-        let event = CatalogDdlEvent::NamespaceUpdated {
-            namespace: NamespaceRecord::from(&namespace),
+        if namespace.name == existing_schema.name
+            && namespace.description == existing_schema.description
+            && namespace.properties == existing_schema.properties
+            && namespace.storage_root == existing_schema.storage_root
+        {
+            guard.release().await?;
+            return Ok(existing_schema);
+        }
+
+        let event_id = if namespace.name == existing_schema.name {
+            let event = CatalogDdlEvent::NamespaceUpdated {
+                namespace: NamespaceRecord::try_from(&namespace)?,
+            };
+            self.tier1
+                .append_ledger_event(
+                    &guard,
+                    CatalogDomain::Catalog,
+                    &event,
+                    opts.actor.as_deref().unwrap_or("api"),
+                )
+                .await?
+        } else {
+            let event = CatalogDdlEventV4::NamespaceRenamed {
+                namespace: NamespaceRecord::try_from(&namespace)?,
+                old_name: existing_schema.name,
+            };
+            self.tier1
+                .append_ledger_event(
+                    &guard,
+                    CatalogDomain::Catalog,
+                    &event,
+                    opts.actor.as_deref().unwrap_or("api"),
+                )
+                .await?
         };
-        let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
-                CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
-            .await?;
 
         let request = self.single_event_sync_compact_request(
             CatalogDomain::Catalog,
@@ -2152,10 +2476,12 @@ impl CatalogWriter {
             description: description.map(String::from),
             created_at: existing.created_at,
             updated_at: now,
+            properties: decode_uc_properties(existing.properties_json.clone())?,
+            storage_root: existing.storage_root.clone(),
         };
 
         let event = CatalogDdlEvent::NamespaceUpdated {
-            namespace: NamespaceRecord::from(&namespace),
+            namespace: NamespaceRecord::try_from(&namespace)?,
         };
 
         let event_id = self
@@ -2407,6 +2733,8 @@ impl CatalogWriter {
             description: req.description.clone(),
             location: table_location,
             format: Some(table_format),
+            table_type: None,
+            properties: None,
             created_at: now,
             updated_at: now,
         };
@@ -2426,7 +2754,7 @@ impl CatalogWriter {
             .collect();
 
         let event = CatalogDdlEvent::TableRegistered {
-            table: TableRecord::from(&table),
+            table: TableRecord::try_from(&table)?,
             columns,
         };
 
@@ -2555,6 +2883,8 @@ impl CatalogWriter {
             description: req.description.clone(),
             location: table_location,
             format: Some(table_format),
+            table_type: None,
+            properties: None,
             created_at: now,
             updated_at: now,
         };
@@ -2574,7 +2904,7 @@ impl CatalogWriter {
             .collect();
 
         let event = CatalogDdlEvent::TableRegistered {
-            table: TableRecord::from(&table),
+            table: TableRecord::try_from(&table)?,
             columns,
         };
         let event_id = self
@@ -2630,6 +2960,8 @@ impl CatalogWriter {
             "description": req.description.clone(),
             "location": req.location.clone(),
             "format": req.format.clone(),
+            "table_type": req.table_type.clone(),
+            "properties": req.properties.clone(),
             "columns": req.columns.iter().map(|column| serde_json::json!({
                 "name": column.name.clone(),
                 "data_type": column.data_type.clone(),
@@ -2782,6 +3114,8 @@ impl CatalogWriter {
                 description: req.description.clone(),
                 location: table_location,
                 format: Some(table_format),
+                table_type: req.table_type.clone(),
+                properties: req.properties.clone(),
                 created_at: now,
                 updated_at: now,
             };
@@ -2801,7 +3135,7 @@ impl CatalogWriter {
                 .collect();
 
             let event = CatalogDdlEvent::TableRegistered {
-                table: TableRecord::from(&table),
+                table: TableRecord::try_from(&table)?,
                 columns,
             };
 
@@ -2967,6 +3301,8 @@ impl CatalogWriter {
             description: req.description.clone(),
             location: table_location,
             format: Some(table_format),
+            table_type: req.table_type.clone(),
+            properties: req.properties.clone(),
             created_at: now,
             updated_at: now,
         };
@@ -2985,7 +3321,7 @@ impl CatalogWriter {
             .collect();
 
         let event = CatalogDdlEvent::TableRegistered {
-            table: TableRecord::from(&table),
+            table: TableRecord::try_from(&table)?,
             columns,
         };
         let event_id = self
@@ -3132,7 +3468,7 @@ impl CatalogWriter {
         }
 
         let table_record = table_rec.clone();
-        let updated_table = Table::from(table_record.clone());
+        let updated_table = Table::try_from(table_record.clone())?;
 
         let event = CatalogDdlEvent::TableUpdated {
             table: table_record,
@@ -3901,7 +4237,7 @@ impl CatalogWriter {
                     name: format!("{}.{}", source_namespace, source_name),
                 })?;
 
-            let out = Table::from(table.clone());
+            let out = Table::try_from(table.clone())?;
             guard.release().await?;
             return Ok(out);
         }
@@ -4028,16 +4364,21 @@ impl CatalogWriter {
         let result = compactor.sync_compact(request).await;
         guard.release().await?;
 
-        // Construct the renamed table for return
-        result.map(|_| Table {
-            id: table_id,
-            namespace_id,
-            name: dest_name.to_string(),
-            description: table.description.clone(),
-            location: table.location.clone(),
-            format: table.format.clone(),
-            created_at: table.created_at,
-            updated_at: now,
+        // Construct the renamed table for return.
+        result.and_then(|_| {
+            let existing_table = Table::try_from(table.clone())?;
+            Ok(Table {
+                id: table_id,
+                namespace_id,
+                name: dest_name.to_string(),
+                description: existing_table.description,
+                location: existing_table.location,
+                format: existing_table.format,
+                table_type: existing_table.table_type,
+                properties: existing_table.properties,
+                created_at: existing_table.created_at,
+                updated_at: now,
+            })
         })
     }
 
@@ -4335,8 +4676,10 @@ impl CatalogWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reader::CatalogReader;
     use crate::tier1_compactor::Tier1Compactor;
     use arco_core::storage::MemoryBackend;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use ulid::Ulid;
 
@@ -4368,6 +4711,79 @@ mod tests {
 
         assert_eq!(state.catalogs.len(), 1);
         assert_eq!(state.catalogs[0].name, "default");
+    }
+
+    #[tokio::test]
+    async fn test_patch_catalog_persists_authoritative_uc_metadata_and_rename() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_catalog_with_metadata(
+                "analytics",
+                Some("before"),
+                Some(BTreeMap::from([(
+                    "classification".to_string(),
+                    "internal".to_string(),
+                )])),
+                Some("s3://bucket/catalogs/analytics"),
+                WriteOptions::default(),
+            )
+            .await
+            .expect("create catalog with UC metadata");
+
+        writer
+            .patch_catalog(
+                "analytics",
+                CatalogPatch {
+                    description: Some(Some("after".to_string())),
+                    new_name: Some("analytics_curated".to_string()),
+                    properties: Some(Some(BTreeMap::from([
+                        ("classification".to_string(), "restricted".to_string()),
+                        ("owner".to_string(), "governance".to_string()),
+                    ]))),
+                    storage_root: Some(Some("s3://bucket/catalogs/analytics_curated".to_string())),
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("patch catalog with UC metadata");
+
+        let reader = CatalogReader::new(writer.storage.clone());
+        let catalog = reader
+            .get_catalog("analytics_curated")
+            .await
+            .expect("get renamed catalog")
+            .expect("renamed catalog should exist");
+        assert_eq!(catalog.description.as_deref(), Some("after"));
+        assert_eq!(
+            catalog
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("classification"))
+                .map(String::as_str),
+            Some("restricted")
+        );
+        assert_eq!(
+            catalog
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("owner"))
+                .map(String::as_str),
+            Some("governance")
+        );
+        assert_eq!(
+            catalog.storage_root.as_deref(),
+            Some("s3://bucket/catalogs/analytics_curated")
+        );
+        assert!(
+            reader
+                .get_catalog("analytics")
+                .await
+                .expect("get old catalog name")
+                .is_none(),
+            "old catalog name must disappear after authoritative rename"
+        );
     }
 
     #[tokio::test]
@@ -4501,17 +4917,34 @@ mod tests {
             catalog_id: Some("catalog-01".to_string()),
             name: "sales".to_string(),
             description: Some("sales schema".to_string()),
+            properties: Some(BTreeMap::from([(
+                "domain".to_string(),
+                "finance".to_string(),
+            )])),
+            storage_root: Some("s3://bucket/schemas/sales".to_string()),
             created_at: 1,
             updated_at: 2,
         };
 
-        let record = NamespaceRecord::from(&schema);
-        let roundtrip = Schema::from(record);
+        let record = NamespaceRecord::try_from(&schema).expect("encode schema record");
+        let roundtrip = Schema::try_from(record).expect("decode schema record");
 
         assert_eq!(roundtrip.id, "schema-01");
         assert_eq!(roundtrip.catalog_id.as_deref(), Some("catalog-01"));
         assert_eq!(roundtrip.name, "sales");
         assert_eq!(roundtrip.description.as_deref(), Some("sales schema"));
+        assert_eq!(
+            roundtrip
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("domain"))
+                .map(String::as_str),
+            Some("finance")
+        );
+        assert_eq!(
+            roundtrip.storage_root.as_deref(),
+            Some("s3://bucket/schemas/sales")
+        );
     }
 
     #[test]
@@ -4521,17 +4954,92 @@ mod tests {
             catalog_id: Some("catalog-01".to_string()),
             name: "finance".to_string(),
             description: None,
+            properties: None,
+            storage_root: None,
             created_at: 3,
             updated_at: 4,
         };
 
-        let record = NamespaceRecord::from(&schema);
-        let roundtrip = Schema::from(record);
+        let record = NamespaceRecord::try_from(&schema).expect("encode schema record");
+        let roundtrip = Schema::try_from(record).expect("decode schema record");
 
         assert_eq!(roundtrip.id, "schema-02");
         assert_eq!(roundtrip.catalog_id.as_deref(), Some("catalog-01"));
         assert_eq!(roundtrip.name, "finance");
         assert_eq!(roundtrip.description, None);
+    }
+
+    #[tokio::test]
+    async fn test_patch_schema_in_catalog_persists_authoritative_uc_metadata_and_rename() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_catalog("analytics", None, WriteOptions::default())
+            .await
+            .expect("create analytics catalog");
+        writer
+            .create_schema_with_metadata(
+                "analytics",
+                "staging",
+                Some("before"),
+                Some(BTreeMap::from([(
+                    "domain".to_string(),
+                    "finance".to_string(),
+                )])),
+                Some("s3://bucket/schemas/staging"),
+                WriteOptions::default(),
+            )
+            .await
+            .expect("create schema with UC metadata");
+
+        writer
+            .patch_schema_in_catalog(
+                "analytics",
+                "staging",
+                SchemaPatch {
+                    description: Some(Some("after".to_string())),
+                    new_name: Some("gold".to_string()),
+                    properties: Some(Some(BTreeMap::from([
+                        ("domain".to_string(), "governance".to_string()),
+                        ("retention".to_string(), "90d".to_string()),
+                    ]))),
+                    storage_root: Some(Some("s3://bucket/schemas/gold".to_string())),
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("patch schema with UC metadata");
+
+        let reader = CatalogReader::new(writer.storage.clone());
+        let schema = reader
+            .list_schemas("analytics")
+            .await
+            .expect("list schemas in analytics")
+            .into_iter()
+            .find(|candidate| candidate.name == "gold")
+            .expect("renamed schema should exist");
+        assert_eq!(schema.description.as_deref(), Some("after"));
+        assert_eq!(
+            schema
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("domain"))
+                .map(String::as_str),
+            Some("governance")
+        );
+        assert_eq!(
+            schema
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("retention"))
+                .map(String::as_str),
+            Some("90d")
+        );
+        assert_eq!(
+            schema.storage_root.as_deref(),
+            Some("s3://bucket/schemas/gold")
+        );
     }
 
     #[tokio::test]
@@ -4842,6 +5350,8 @@ mod tests {
                     description: None,
                     location: Some("gs://bucket/warehouse/sales/orders".to_string()),
                     format: Some("delta".to_string()),
+                    table_type: None,
+                    properties: None,
                     columns: vec![],
                 },
                 WriteOptions::default(),
@@ -4876,6 +5386,8 @@ mod tests {
                     description: None,
                     location: Some("warehouse/sales/orders".to_string()),
                     format: None,
+                    table_type: None,
+                    properties: None,
                     columns: vec![],
                 },
                 WriteOptions::default(),
@@ -4893,6 +5405,8 @@ mod tests {
                     description: None,
                     location: Some("warehouse/sales/orders_iceberg".to_string()),
                     format: Some("Iceberg".to_string()),
+                    table_type: None,
+                    properties: None,
                     columns: vec![],
                 },
                 WriteOptions::default(),
@@ -4910,6 +5424,8 @@ mod tests {
                     description: None,
                     location: Some("warehouse/sales/orders_invalid".to_string()),
                     format: Some("orc".to_string()),
+                    table_type: None,
+                    properties: None,
                     columns: vec![],
                 },
                 WriteOptions::default(),
@@ -4942,6 +5458,8 @@ mod tests {
                     description: None,
                     location: Some("   ".to_string()),
                     format: Some("delta".to_string()),
+                    table_type: None,
+                    properties: None,
                     columns: vec![],
                 },
                 WriteOptions::default(),
@@ -4959,6 +5477,8 @@ mod tests {
                     description: None,
                     location: Some("../escape".to_string()),
                     format: Some("delta".to_string()),
+                    table_type: None,
+                    properties: None,
                     columns: vec![],
                 },
                 WriteOptions::default(),
@@ -4969,6 +5489,66 @@ mod tests {
             traversal_location,
             CatalogError::Validation { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_register_table_in_schema_persists_authoritative_uc_table_metadata() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_catalog("analytics", None, WriteOptions::default())
+            .await
+            .expect("create analytics catalog");
+        writer
+            .create_schema("analytics", "sales", None, WriteOptions::default())
+            .await
+            .expect("create schema");
+
+        writer
+            .register_table_in_schema(
+                "analytics",
+                "sales",
+                RegisterTableInSchemaRequest {
+                    name: "orders".to_string(),
+                    description: Some("orders table".to_string()),
+                    location: Some("s3://bucket/analytics/sales/orders".to_string()),
+                    format: Some("delta".to_string()),
+                    table_type: Some("EXTERNAL".to_string()),
+                    properties: Some(BTreeMap::from([
+                        ("quality".to_string(), "silver".to_string()),
+                        ("retention".to_string(), "30d".to_string()),
+                    ])),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table with UC metadata");
+
+        let reader = CatalogReader::new(writer.storage.clone());
+        let table = reader
+            .get_table_in_schema("analytics", "sales", "orders")
+            .await
+            .expect("get registered table")
+            .expect("registered table should exist");
+        assert_eq!(table.table_type.as_deref(), Some("EXTERNAL"));
+        assert_eq!(
+            table
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("quality"))
+                .map(String::as_str),
+            Some("silver")
+        );
+        assert_eq!(
+            table
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("retention"))
+                .map(String::as_str),
+            Some("30d")
+        );
     }
 
     #[tokio::test]
@@ -5055,7 +5635,7 @@ mod tests {
             ScopedStorage::new(backend.clone(), "acme", "production").expect("valid storage");
         let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
         let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
-        let reader = crate::reader::CatalogReader::new(storage);
+        let reader = CatalogReader::new(storage);
 
         writer.initialize().await.expect("initialize");
 

@@ -40,6 +40,8 @@ fn prelude_asset_exports_and_namespace_alias_remain_public() {
         catalog_id: Some("catalog-01".to_string()),
         name: "sales".to_string(),
         description: Some("sales schema".to_string()),
+        properties: None,
+        storage_root: None,
         created_at: 1,
         updated_at: 2,
     };

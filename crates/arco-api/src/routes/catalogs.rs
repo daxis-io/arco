@@ -809,6 +809,8 @@ pub(crate) async fn register_table_in_schema(
                 description: req.description,
                 location: req.location,
                 format: Some(requested_format.clone()),
+                table_type: None,
+                properties: None,
                 columns,
             },
             options,

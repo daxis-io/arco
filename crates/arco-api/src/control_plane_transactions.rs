@@ -1641,6 +1641,8 @@ impl CatalogMutation {
                             description: description.clone(),
                             location: location.clone(),
                             format: format.clone(),
+                            table_type: None,
+                            properties: None,
                             columns: columns.clone(),
                         },
                         options,

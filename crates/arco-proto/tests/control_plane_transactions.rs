@@ -12,9 +12,10 @@ use prost::Message;
 
 use arco_proto::arco::catalog::v1::{
     Catalog, CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp, DropTableOp,
-    ExternalLocation, Function, GovernanceAttachment, Grant, MetastoreMutation, ModelVersion,
-    RegisterTableOp, RegisteredModel, RenameTableOp, Schema, StorageCredential, Table, TableFormat,
-    UpdateTableOp, Volume, WorkspaceBinding, catalog_ddl_operation, metastore_mutation,
+    ExternalLocation, Function, GovernanceAttachment, Grant, GrantMutation, MetastoreMutation,
+    ModelVersion, RegisterTableOp, RegisteredModel, RenameTableOp, Schema, StorageCredential,
+    Table, TableFormat, UpdateTableOp, Volume, WorkspaceBinding, catalog_ddl_operation,
+    metastore_mutation,
 };
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CatalogTxReceipt, CatalogTxStatus,
@@ -857,6 +858,22 @@ fn metastore_root_transaction_rejects_empty_mutation() {
         mutations: vec![DomainMutation {
             kind: Some(domain_mutation::Kind::Metastore(MetastoreMutation {
                 op: None,
+            })),
+        }],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(ControlPlaneTransactionContractError::MissingRootMetastoreMutationOp(0))
+    );
+}
+
+#[test]
+fn metastore_root_transaction_rejects_empty_nested_grant_mutation() {
+    let request = CommitRootTransactionRequest {
+        mutations: vec![DomainMutation {
+            kind: Some(domain_mutation::Kind::Metastore(MetastoreMutation {
+                op: Some(metastore_mutation::Op::Grant(GrantMutation { op: None })),
             })),
         }],
     };

@@ -18,7 +18,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ".arco.common.v1.PartitionKey",
         ".arco.common.v1.ScalarValue",
         ".arco.common.v1.NullValue",
+        ".arco.catalog.v1.Grant",
         ".arco.catalog.v1.StorageCredential",
+        ".arco.catalog.v1.ExternalLocation",
+        ".arco.catalog.v1.WorkspaceBinding",
+        ".arco.catalog.v1.GovernanceAttachment",
+        ".arco.catalog.v1.Volume",
+        ".arco.catalog.v1.Function",
+        ".arco.catalog.v1.RegisteredModel",
+        ".arco.catalog.v1.ModelVersion",
     ] {
         config = config.type_attribute(ty, "#[derive(serde::Serialize, serde::Deserialize)]");
     }
@@ -46,7 +54,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ".arco.common.v1.PartitionDimension",
         ".arco.common.v1.PartitionKey",
         ".arco.common.v1.ScalarValue",
+        ".arco.catalog.v1.Grant",
         ".arco.catalog.v1.StorageCredential",
+        ".arco.catalog.v1.ExternalLocation",
+        ".arco.catalog.v1.WorkspaceBinding",
+        ".arco.catalog.v1.GovernanceAttachment",
+        ".arco.catalog.v1.Volume",
+        ".arco.catalog.v1.Function",
+        ".arco.catalog.v1.RegisteredModel",
+        ".arco.catalog.v1.ModelVersion",
         ".arco.catalog.v1.Catalog",
         ".arco.catalog.v1.Schema",
         ".arco.catalog.v1.Table",
@@ -91,6 +107,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn configure_metastore_serde(config: tonic_prost_build::Builder) -> tonic_prost_build::Builder {
     config
         .message_attribute(
+            ".arco.catalog.v1.GrantMutation",
+            "#[derive(serde::Serialize, serde::Deserialize)] #[serde(transparent)]",
+        )
+        .enum_attribute(
+            ".arco.catalog.v1.GrantMutation.op",
+            "#[derive(serde::Serialize, serde::Deserialize)] #[serde(rename_all = \"camelCase\")]",
+        )
+        .message_attribute(
             ".arco.catalog.v1.MetastoreMutation",
             "#[derive(serde::Serialize, serde::Deserialize)] #[serde(transparent)]",
         )
@@ -104,26 +128,26 @@ fn configure_metastore_serde_fields(
     mut config: tonic_prost_build::Builder,
 ) -> tonic_prost_build::Builder {
     for field in [
+        ".arco.catalog.v1.Grant.created_at",
         ".arco.catalog.v1.StorageCredential.created_at",
         ".arco.catalog.v1.StorageCredential.updated_at",
+        ".arco.catalog.v1.ExternalLocation.created_at",
+        ".arco.catalog.v1.ExternalLocation.updated_at",
+        ".arco.catalog.v1.WorkspaceBinding.created_at",
+        ".arco.catalog.v1.GovernanceAttachment.created_at",
+        ".arco.catalog.v1.Volume.created_at",
+        ".arco.catalog.v1.Volume.updated_at",
+        ".arco.catalog.v1.Function.created_at",
+        ".arco.catalog.v1.Function.updated_at",
+        ".arco.catalog.v1.RegisteredModel.created_at",
+        ".arco.catalog.v1.RegisteredModel.updated_at",
+        ".arco.catalog.v1.ModelVersion.created_at",
+        ".arco.catalog.v1.ModelVersion.updated_at",
     ] {
         config = config.field_attribute(
             field,
             "#[serde(default, skip_deserializing, skip_serializing_if = \"Option::is_none\", serialize_with = \"crate::serde_helpers::serialize_optional_timestamp\")]",
         );
-    }
-
-    for variant in [
-        ".arco.catalog.v1.MetastoreMutation.op.grant",
-        ".arco.catalog.v1.MetastoreMutation.op.external_location",
-        ".arco.catalog.v1.MetastoreMutation.op.workspace_binding",
-        ".arco.catalog.v1.MetastoreMutation.op.governance_attachment",
-        ".arco.catalog.v1.MetastoreMutation.op.volume",
-        ".arco.catalog.v1.MetastoreMutation.op.function",
-        ".arco.catalog.v1.MetastoreMutation.op.registered_model",
-        ".arco.catalog.v1.MetastoreMutation.op.model_version",
-    ] {
-        config = config.field_attribute(variant, "#[serde(skip)]");
     }
 
     config

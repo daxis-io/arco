@@ -2,6 +2,8 @@
 
 #![allow(clippy::expect_used, clippy::indexing_slicing)]
 
+use std::collections::BTreeMap;
+
 use arco_proto::arco::catalog::v1::MetastoreMutation;
 use arco_proto::arco::common::v1::{PartitionDimension, PartitionKey, ScalarValue, scalar_value};
 
@@ -81,11 +83,31 @@ fn docs_name_the_pre_freeze_proto_hard_cut_policy() {
 #[test]
 fn metastore_mutation_protojson_field_names_are_contract() {
     let fixture = include_str!("../fixtures/metastore_mutation_v1.json");
-    let parsed: MetastoreMutation =
+    let parsed: BTreeMap<String, MetastoreMutation> =
         serde_json::from_str(fixture).expect("metastore mutation fixture should parse");
 
     let json = serde_json::to_value(&parsed).expect("metastore mutation should serialize");
-    assert!(json.get("storageCredential").is_some());
+    for variant in [
+        "grant",
+        "revoke",
+        "storageCredential",
+        "externalLocation",
+        "workspaceBinding",
+        "governanceAttachment",
+        "volume",
+        "function",
+        "registeredModel",
+        "modelVersion",
+    ] {
+        assert!(json.get(variant).is_some(), "{variant} missing");
+    }
+    assert!(json["grant"].to_string().contains("grantId"));
+    assert!(json["revoke"].to_string().contains("grantId"));
     assert!(json.to_string().contains("credentialId"));
+    assert!(json.to_string().contains("externalLocation"));
+    assert!(json.to_string().contains("workspaceBinding"));
+    assert!(json.to_string().contains("governanceAttachment"));
+    assert!(json.to_string().contains("registeredModel"));
+    assert!(json.to_string().contains("modelVersion"));
     assert!(json.to_string().contains("lakehouse-prod"));
 }

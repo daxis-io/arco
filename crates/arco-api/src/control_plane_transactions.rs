@@ -1335,7 +1335,7 @@ impl RootMutation {
                 OrchestrationBatchMutation::from_spec(spec)?,
             )),
             Some(domain_mutation::Kind::Metastore(mutation)) => {
-                if mutation.op.is_none() {
+                if !mutation.has_contract_operation() {
                     return Err(ApiError::bad_request(
                         "metastore mutation operation is required",
                     ));

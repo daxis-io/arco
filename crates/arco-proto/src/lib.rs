@@ -370,7 +370,7 @@ impl CommitRootTransactionRequest {
                     }
                 }
                 Some(domain_mutation::Kind::Metastore(mutation)) => {
-                    if mutation.op.is_none() {
+                    if !mutation.has_contract_operation() {
                         return Err(
                             ControlPlaneTransactionContractError::MissingRootMetastoreMutationOp(
                                 index,
@@ -383,6 +383,16 @@ impl CommitRootTransactionRequest {
         }
 
         Ok(())
+    }
+}
+
+impl MetastoreMutation {
+    pub fn has_contract_operation(&self) -> bool {
+        match self.op.as_ref() {
+            Some(metastore_mutation::Op::Grant(grant)) => grant.op.is_some(),
+            Some(_) => true,
+            None => false,
+        }
     }
 }
 

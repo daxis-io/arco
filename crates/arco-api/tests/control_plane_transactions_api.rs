@@ -21,7 +21,8 @@ use arco_core::storage::{
 };
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_proto::arco::catalog::v1::{
-    CatalogDdlOperation, ColumnDefinition, MetastoreMutation, StorageCredential, metastore_mutation,
+    CatalogDdlOperation, ColumnDefinition, GrantMutation, MetastoreMutation, StorageCredential,
+    metastore_mutation,
 };
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CommitOrchestrationBatchRequest,
@@ -125,6 +126,16 @@ fn metastore_storage_credential_root_request(name: &str) -> CommitRootTransactio
                         updated_at: None,
                     },
                 )),
+            })),
+        }],
+    }
+}
+
+fn empty_metastore_grant_root_request() -> CommitRootTransactionRequest {
+    CommitRootTransactionRequest {
+        mutations: vec![DomainMutation {
+            kind: Some(domain_mutation::Kind::Metastore(MetastoreMutation {
+                op: Some(metastore_mutation::Op::Grant(GrantMutation { op: None })),
             })),
         }],
     }
@@ -1505,6 +1516,98 @@ async fn commit_root_transaction_hashes_metastore_mutation_payloads() -> Result<
     assert!(first_record.request_hash.starts_with("sha256:"));
     assert!(second_record.request_hash.starts_with("sha256:"));
     assert_ne!(first_record.request_hash, second_record.request_hash);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_root_transaction_rejects_empty_nested_metastore_grant_before_idempotency()
+-> Result<()> {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let router = test_router_with_backend(backend.clone());
+    let request = empty_metastore_grant_root_request();
+
+    let (status, error) = post_error_json(
+        router,
+        "/api/v1/transactions/commitRootTransaction",
+        &request,
+        "idem-root-empty-metastore-grant-01",
+        "req-root-empty-metastore-grant-01",
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["code"], "BAD_REQUEST");
+    assert!(
+        load_idempotency_record(
+            backend,
+            ControlPlaneTxDomain::Root,
+            "idem-root-empty-metastore-grant-01",
+        )
+        .await
+        .is_err(),
+        "invalid metastore requests must fail before idempotency capture"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_root_transaction_retries_same_metastore_key_and_rejects_body_conflicts()
+-> Result<()> {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let router = test_router_with_backend(backend.clone());
+    let first = metastore_storage_credential_root_request("lakehouse-prod-a");
+    let replay = metastore_storage_credential_root_request("lakehouse-prod-a");
+    let conflicting = metastore_storage_credential_root_request("lakehouse-prod-b");
+
+    let (first_status, first_error) = post_error_json(
+        router.clone(),
+        "/api/v1/transactions/commitRootTransaction",
+        &first,
+        "idem-root-metastore-retry-01",
+        "req-root-metastore-retry-01",
+    )
+    .await?;
+    assert_eq!(first_status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(first_error["code"], "NOT_IMPLEMENTED");
+    let first_idem = load_idempotency_record(
+        backend.clone(),
+        ControlPlaneTxDomain::Root,
+        "idem-root-metastore-retry-01",
+    )
+    .await?;
+    let first_record = load_root_tx_record(backend.clone(), &first_idem.tx_id).await?;
+    assert_eq!(first_record.status, ControlPlaneTxStatus::Aborted);
+
+    let (replay_status, replay_error) = post_error_json(
+        router.clone(),
+        "/api/v1/transactions/commitRootTransaction",
+        &replay,
+        "idem-root-metastore-retry-01",
+        "req-root-metastore-retry-02",
+    )
+    .await?;
+    assert_eq!(replay_status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(replay_error["code"], "NOT_IMPLEMENTED");
+    let replay_idem = load_idempotency_record(
+        backend,
+        ControlPlaneTxDomain::Root,
+        "idem-root-metastore-retry-01",
+    )
+    .await?;
+    assert_ne!(first_idem.tx_id, replay_idem.tx_id);
+
+    let (conflict_status, conflict_error) = post_error_json(
+        router,
+        "/api/v1/transactions/commitRootTransaction",
+        &conflicting,
+        "idem-root-metastore-retry-01",
+        "req-root-metastore-retry-03",
+    )
+    .await?;
+    assert_eq!(conflict_status, StatusCode::CONFLICT);
+    assert_eq!(conflict_error["code"], "CONFLICT");
 
     Ok(())
 }

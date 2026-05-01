@@ -18,6 +18,8 @@ source of truth quickly.
   - `docs/guide/src/concepts/orchestration.md`
 - Control-plane scope scorecard:
   - `docs/guide/src/reference/control-plane-scope.md`
+- Production target architecture:
+  - `docs/guide/src/reference/object-native-catalog-architecture.md`
 
 ## Operations and Readiness
 

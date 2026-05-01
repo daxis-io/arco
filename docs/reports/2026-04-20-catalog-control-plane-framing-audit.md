@@ -2,7 +2,7 @@
 
 Date: April 20, 2026
 
-Update: April 21, 2026
+Update: April 22, 2026
 
 UC catalog/schema/table CRUD was routed to the authoritative catalog path after
 this audit. Treat the UC preview CRUD findings below as historical for that
@@ -62,9 +62,8 @@ The repo does **not** yet prove:
 - permissions/authz as ledger-backed current policy state
 - policy attach/detach / masking / classification as immutable control-plane commits
 - credential bindings / storage credentials / external locations as authoritative catalog-ledger state
-- UC facade CRUD uniformly using the same authoritative ledger path
 
-The strongest drift from the framing is that some Unity Catalog-facing surfaces still run through preview JSON objects or parity scaffolding rather than the authoritative immutable-manifest control plane.
+The strongest remaining drift from the framing is that Unity Catalog-facing surfaces outside catalog/schema/table CRUD still run through parity scaffolding or domain-specific preview behavior rather than the authoritative immutable-manifest control plane.
 
 ## Claim Matrix
 
@@ -81,7 +80,7 @@ The strongest drift from the framing is that some Unity Catalog-facing surfaces 
 | The governance surface includes grants/RBAC in the same authoritative immutable commit model | Intent | `docs/adr/adr-030-delta-uc-metastore.md` only | No authoritative proto/catalog-writer/API/test path found for grants |
 | Permissions/authz are served from current authoritative state with mutation support | Intent | `crates/arco-uc/src/routes/permissions.rs`, `crates/arco-uc/tests/discovery_endpoints.rs` | `GET` returns empty assignments; `PATCH` is explicitly unsupported |
 | Credentials/storage bindings are authoritative catalog-ledger state | Intent | `crates/arco-uc/src/routes/credentials.rs`, `crates/arco-uc/tests/discovery_endpoints.rs` | Mostly stubbed or placeholder; not on the catalog transaction path |
-| UC-facing CRUD operations ride the same authoritative immutable-manifest control plane | Partial | `crates/arco-api/src/routes/catalogs.rs`, `crates/arco-api/src/routes/tables.rs`, `crates/arco-uc/src/routes/catalogs.rs`, `crates/arco-uc/src/routes/schemas.rs`, `crates/arco-uc/src/routes/tables.rs`, `crates/arco-uc/src/routes/preview.rs` | Native Arco catalog APIs do; UC preview CRUD does not |
+| UC catalog/schema/table CRUD operations ride the same authoritative immutable-manifest control plane | Proven | `crates/arco-uc/src/routes/catalogs.rs`, `crates/arco-uc/src/routes/schemas.rs`, `crates/arco-uc/src/routes/tables.rs`, `crates/arco-uc/tests/preview_crud.rs`, `crates/arco-catalog/src/writer.rs` | UC CRUD now persists through the catalog ledger and manifest-published snapshots; remaining UC scaffolding is outside catalog/schema/table CRUD |
 | Delta coordinated commit control plane exists as immutable/idempotent control-plane state | Proven | `crates/arco-delta/src/coordinator.rs`, `crates/arco-uc/src/routes/delta_commits.rs`, `crates/arco-uc/tests/delta_commit_coordinator_semantics.rs` | This is a strong proof for a table-scoped control-plane subsystem |
 | Retention, GC, and orphan cleanup exist as part of the architecture | Proven | `crates/arco-catalog/src/gc/`, `crates/arco-catalog/src/reconciler.rs`, `crates/arco-flow/src/orchestration/compactor/reconciler.rs`, `docs/runbooks/gc-failure.md` | This part is operationally real, not just conceptual |
 

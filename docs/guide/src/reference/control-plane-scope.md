@@ -24,11 +24,11 @@ Implementation claims on this page should satisfy the evidence policy in `docs/g
 | Orchestration transactions | `Implemented` | Orchestration events -> compaction -> immutable manifest snapshot -> pointer CAS | See `proto/arco/controlplane/v1/transactions.proto` |
 | Root transactions for pinned `catalog` + `orchestration` reads | `Implemented` | Root tx record + immutable super-manifest | Cross-domain pinning exists, but it is scoped |
 | Delta commit coordination | `Implemented` | Coordinator state + CAS/idempotency flow | Table-scoped control-plane subsystem |
-| UC native parity for catalogs/schemas/tables | `Implemented` | UC catalog/schema/table routes use `CatalogWriter`/`CatalogReader` over the authoritative catalog ledger and manifest-published snapshots | Remaining preview/scaffolded UC surfaces are outside catalog/schema/table CRUD |
+| UC native parity for catalogs/schemas/tables | `Implemented` | UC catalog/schema/table routes use `CatalogWriter`/`CatalogReader` over the authoritative catalog ledger and manifest-published snapshots | Catalog/schema PATCH now authoritatively persists `comment`, `new_name`, `properties`, and `storage_root`; table create/get/list round-trips authoritative `table_type` and `properties`. Remaining preview/scaffolded UC surfaces are outside catalog/schema/table CRUD |
 | Broader "catalog as control-plane ledger" framing | `Partial` | Real today for catalog DDL, lineage/search publication, orchestration transactions, and delta coordination | Broader governance domains are not yet on the same authoritative path |
 | Grants / RBAC | `Planned` | None in authoritative protobuf/API/catalog writer path | ADR intent exists, but no implemented authoritative path |
-| Permissions/authz state | `Planned` | None | Current UC permissions route is parity scaffolding |
-| Credentials / storage bindings / external locations | `Planned` | None | Current UC credential routes are stubbed or placeholder behavior |
+| Permissions/authz state | `Planned` | None | Current UC permissions route is parity scaffolding and not backed by an authoritative grants store |
+| Credentials / storage bindings / external locations | `Planned` | None | Current UC credential routes are stubbed or placeholder behavior, not catalog-ledger state |
 | Policies, masking, classifications, governance rules | `Planned` | None | Not yet modeled in the authoritative control-plane transaction surface |
 | Ownership / tags as authoritative control-plane state | `Planned` | Data types exist, but not authoritative transaction-managed state | Do not describe these as implemented governance control-plane objects |
 

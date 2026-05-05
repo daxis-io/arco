@@ -19,14 +19,14 @@ classifiers = [
 ]
 dependencies = [
     "httpx>=0.25",
-    "pydantic>=2.0",
+    "pydantic>=2.13.3",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=0.21",
-    "ruff>=0.1",
+    "ruff>=0.15.12",
     "mypy>=1.20.2",
 ]
 

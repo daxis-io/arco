@@ -12,6 +12,54 @@ Validates release-tag discipline for Gate 1:
 USAGE
 }
 
+HAS_RG=0
+if command -v rg >/dev/null 2>&1; then
+  HAS_RG=1
+fi
+
+file_has_regex() {
+  local pattern="$1"
+  local file="$2"
+
+  if [[ "${HAS_RG}" -eq 1 ]]; then
+    rg -q -- "${pattern}" "${file}"
+  else
+    grep -Eq -- "${pattern}" "${file}"
+  fi
+}
+
+file_has_fixed() {
+  local needle="$1"
+  local file="$2"
+
+  if [[ "${HAS_RG}" -eq 1 ]]; then
+    rg -Fq -- "${needle}" "${file}"
+  else
+    grep -Fq -- "${needle}" "${file}"
+  fi
+}
+
+file_has_regex_i() {
+  local pattern="$1"
+  local file="$2"
+
+  if [[ "${HAS_RG}" -eq 1 ]]; then
+    rg -qi -- "${pattern}" "${file}"
+  else
+    grep -Eqi -- "${pattern}" "${file}"
+  fi
+}
+
+stdin_has_regex() {
+  local pattern="$1"
+
+  if [[ "${HAS_RG}" -eq 1 ]]; then
+    rg -q -- "${pattern}"
+  else
+    grep -Eq -- "${pattern}"
+  fi
+}
+
 TAG="${GITHUB_REF_NAME:-}"
 CHANGELOG_PATH="CHANGELOG.md"
 RELEASE_NOTES_PATH=""
@@ -68,7 +116,7 @@ if [[ ! -f "${RELEASE_NOTES_PATH}" ]]; then
 fi
 
 CHANGELOG_HEADER="## [${VERSION}] - "
-if ! rg -n "^## \\[${VERSION}\\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" "${CHANGELOG_PATH}" >/dev/null; then
+if ! file_has_regex "^## \\[${VERSION}\\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" "${CHANGELOG_PATH}"; then
   echo "missing changelog section for ${VERSION} with date (YYYY-MM-DD)" >&2
   exit 1
 fi
@@ -81,34 +129,34 @@ CHANGELOG_SECTION="$(
   ' "${CHANGELOG_PATH}"
 )"
 
-if ! printf '%s\n' "${CHANGELOG_SECTION}" | rg -q "^- "; then
+if ! printf '%s\n' "${CHANGELOG_SECTION}" | stdin_has_regex "^- "; then
   echo "changelog section for ${VERSION} must include at least one bullet item" >&2
   exit 1
 fi
 
-if ! rg -q "^# Release Notes for ${TAG}$" "${RELEASE_NOTES_PATH}"; then
+if ! file_has_regex "^# Release Notes for ${TAG}$" "${RELEASE_NOTES_PATH}"; then
   echo "release notes title must be '# Release Notes for ${TAG}'" >&2
   exit 1
 fi
 
 for section in "## Highlights" "## Changelog Reference" "## Verification"; do
-  if ! rg -q "^${section}$" "${RELEASE_NOTES_PATH}"; then
+  if ! file_has_regex "^${section}$" "${RELEASE_NOTES_PATH}"; then
     echo "release notes missing required section '${section}'" >&2
     exit 1
   fi
 done
 
-if ! rg -q "CHANGELOG\\.md" "${RELEASE_NOTES_PATH}" || ! rg -q "${VERSION}" "${RELEASE_NOTES_PATH}"; then
+if ! file_has_regex "CHANGELOG\\.md" "${RELEASE_NOTES_PATH}" || ! file_has_fixed "${VERSION}" "${RELEASE_NOTES_PATH}"; then
   echo "release notes must reference CHANGELOG.md and version ${VERSION}" >&2
   exit 1
 fi
 
-if ! rg -q "^- " "${RELEASE_NOTES_PATH}"; then
+if ! file_has_regex "^- " "${RELEASE_NOTES_PATH}"; then
   echo "release notes must include at least one bullet item" >&2
   exit 1
 fi
 
-if rg -n -i "\\b(TODO|TBD|PLACEHOLDER|XXX)\\b" "${RELEASE_NOTES_PATH}" >/dev/null; then
+if file_has_regex_i '(^|[^[:alnum:]_])(TODO|TBD|PLACEHOLDER|XXX)([^[:alnum:]_]|$)' "${RELEASE_NOTES_PATH}"; then
   echo "release notes contain placeholder text" >&2
   exit 1
 fi

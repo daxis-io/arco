@@ -5,6 +5,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
 WORKFLOW_PATH=".github/workflows/release-sbom.yml"
+CI_WORKFLOW_PATH=".github/workflows/ci.yml"
 COLLECTOR_PATH="tools/collect_release_evidence.sh"
 
 errors=0
@@ -44,11 +45,17 @@ check_regex() {
 
 check_literal "${WORKFLOW_PATH}" "RELEASE_TAG: \${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}" "Workflow resolves RELEASE_TAG from dispatch input or pushed tag ref"
 check_literal "${WORKFLOW_PATH}" "ref: \${{ env.RELEASE_TAG }}" "Workflow checks out exact release tag ref"
+check_literal "${WORKFLOW_PATH}" "sudo apt-get install -y ripgrep" "Workflow installs ripgrep so tagged snapshot scripts remain runnable"
 check_literal "${WORKFLOW_PATH}" "name: Wait for release-tag CI success" "Workflow waits for successful tag CI before publishing SBOM"
 check_literal "${WORKFLOW_PATH}" "actions/workflows/ci.yml/runs?event=push&per_page=100" "Workflow queries CI workflow runs by commit SHA"
 check_literal "${WORKFLOW_PATH}" "actions/runs/\${run_id}/jobs?per_page=100" "Workflow checks CI jobs for Release Tag Discipline result"
+check_literal "${WORKFLOW_PATH}" "run_conclusion" "Workflow inspects overall CI workflow conclusion for backward compatibility"
+check_literal "${WORKFLOW_PATH}" "falling back to successful CI run conclusion" "Workflow documents fallback when older CI runs lack Release Tag Discipline job"
 check_literal "${WORKFLOW_PATH}" "gpg.ssh.allowedSignersFile=\".github/release-signers.allowed\"" "Workflow verifies signed tags against repository allowed-signers file"
 check_literal "${WORKFLOW_PATH}" "verify-tag \"\${RELEASE_TAG}\" > \"arco-\${RELEASE_TAG}.tag-verify.txt\"" "Workflow captures deterministic tag verification transcript"
+check_literal "${CI_WORKFLOW_PATH}" "tags: ['v*']" "CI triggers on release-like tag pushes"
+check_literal "${CI_WORKFLOW_PATH}" "name: Release Tag Discipline" "CI defines Release Tag Discipline job"
+check_literal "${CI_WORKFLOW_PATH}" "startsWith(github.ref, 'refs/tags/v')" "Release Tag Discipline only runs for release-like tag pushes"
 check_regex "${WORKFLOW_PATH}" "uses: actions/attest-build-provenance@[0-9a-f]{40}" "Attestation action pinned by full commit SHA"
 check_literal "${COLLECTOR_PATH}" 'if [[ -d "${PACK_DIR}" ]]; then' "Collector handles pre-existing deterministic pack directory explicitly"
 check_literal "${COLLECTOR_PATH}" "sha256sum -c manifest.sha256" "Collector verifies existing manifest in allow-existing mode"

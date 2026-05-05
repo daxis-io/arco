@@ -117,6 +117,70 @@ fn test_vendored_uc_spec_is_parseable() -> Result<(), String> {
 }
 
 #[test]
+fn test_generated_openapi_describes_authoritative_boundary() -> Result<(), String> {
+    let ours =
+        serde_json::to_value(openapi()).map_err(|err| format!("serialize openapi: {err}"))?;
+    let description = ours
+        .get("info")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|info| info.get("description"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "generated spec is missing info.description".to_string())?;
+
+    assert!(
+        description.contains("authoritative catalog ledger"),
+        "openapi description must state that catalog/schema/table CRUD is authoritative: {description}"
+    );
+    assert!(
+        description.contains("scaffold"),
+        "openapi description must state that some non-CRUD parity endpoints remain scaffolded: {description}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_generated_openapi_tags_distinguish_authoritative_and_scaffolded_surfaces()
+-> Result<(), String> {
+    let ours =
+        serde_json::to_value(openapi()).map_err(|err| format!("serialize openapi: {err}"))?;
+    let tags = ours
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "generated spec is missing tags".to_string())?;
+
+    let tag_description = |name: &str| {
+        tags.iter()
+            .find(|tag| tag.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            .and_then(|tag| tag.get("description"))
+            .and_then(serde_json::Value::as_str)
+    };
+
+    let catalogs = tag_description("Catalogs")
+        .ok_or_else(|| "generated spec is missing Catalogs tag description".to_string())?;
+    let delta = tag_description("DeltaCommits")
+        .ok_or_else(|| "generated spec is missing DeltaCommits tag description".to_string())?;
+    let credentials = tag_description("TemporaryCredentials").ok_or_else(|| {
+        "generated spec is missing TemporaryCredentials tag description".to_string()
+    })?;
+
+    assert!(
+        catalogs.contains("Authoritative"),
+        "Catalogs tag must describe authoritative CRUD: {catalogs}"
+    );
+    assert!(
+        delta.contains("coordinator state"),
+        "DeltaCommits tag must describe the coordinator-backed implementation: {delta}"
+    );
+    assert!(
+        credentials.contains("not authoritative"),
+        "TemporaryCredentials tag must describe scaffolded non-authoritative behavior: {credentials}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_openapi_paths_align_with_vendored_spec() -> Result<(), String> {
     let ours =
         serde_json::to_value(openapi()).map_err(|err| format!("serialize openapi: {err}"))?;

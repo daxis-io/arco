@@ -10,6 +10,8 @@
 //! - `PUT    /namespaces/{ns}/tables/{name}` - Update table
 //! - `DELETE /namespaces/{ns}/tables/{name}` - Drop table
 
+#![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -283,10 +285,12 @@ pub(crate) async fn register_table(
     let columns: Vec<arco_catalog::ColumnDefinition> = req
         .columns
         .iter()
-        .map(|c| arco_catalog::ColumnDefinition {
+        .enumerate()
+        .map(|(ordinal, c)| arco_catalog::ColumnDefinition {
             name: c.name.clone(),
             data_type: c.data_type.clone(),
             is_nullable: c.nullable,
+            ordinal: ordinal as i32,
             description: c.description.clone(),
         })
         .collect();

@@ -1,0 +1,12 @@
+{
+  "dimensions": [
+    {
+      "name": "date",
+      "value": {"dateValue": "2026-04-09"}
+    },
+    {
+      "name": "region",
+      "value": {"stringValue": "us-east"}
+    }
+  ]
+}

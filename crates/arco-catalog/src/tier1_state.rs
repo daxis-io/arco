@@ -37,6 +37,8 @@ pub async fn load_catalog_state(
         CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "columns.parquet");
     let catalogs_path =
         CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "catalogs.parquet");
+    let commits_path =
+        CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "commits.parquet");
 
     let catalogs = match storage.get_raw(&catalogs_path).await {
         Ok(bytes) => parquet_util::read_catalogs(&bytes)?,
@@ -67,11 +69,20 @@ pub async fn load_catalog_state(
         Err(e) => return Err(e.into()),
     };
 
+    let commits = match storage.get_raw(&commits_path).await {
+        Ok(bytes) => parquet_util::read_commits(&bytes)?,
+        Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
+            Vec::new()
+        }
+        Err(e) => return Err(e.into()),
+    };
+
     Ok(CatalogState {
         catalogs,
         namespaces,
         tables,
         columns,
+        commits,
     })
 }
 

@@ -29,16 +29,19 @@ pub async fn write_catalog_snapshot<S: StatePutStore + ?Sized>(
     let namespaces_bytes = parquet_util::write_namespaces(&state.namespaces)?;
     let tables_bytes = parquet_util::write_tables(&state.tables)?;
     let columns_bytes = parquet_util::write_columns(&state.columns)?;
+    let commits_bytes = parquet_util::write_commits(&state.commits)?;
 
     let catalogs_key = StateKey::snapshot_file(CatalogDomain::Catalog, version, "catalogs.parquet");
     let ns_key = StateKey::snapshot_file(CatalogDomain::Catalog, version, "namespaces.parquet");
     let tables_key = StateKey::snapshot_file(CatalogDomain::Catalog, version, "tables.parquet");
     let cols_key = StateKey::snapshot_file(CatalogDomain::Catalog, version, "columns.parquet");
+    let commits_key = StateKey::snapshot_file(CatalogDomain::Catalog, version, "commits.parquet");
 
     put_state_if_absent(storage, &catalogs_key, catalogs_bytes.clone()).await?;
     put_state_if_absent(storage, &ns_key, namespaces_bytes.clone()).await?;
     put_state_if_absent(storage, &tables_key, tables_bytes.clone()).await?;
     put_state_if_absent(storage, &cols_key, columns_bytes.clone()).await?;
+    put_state_if_absent(storage, &commits_key, commits_bytes.clone()).await?;
 
     let mut info = SnapshotInfo::new(version, snapshot_dir.as_ref().to_string());
     info.add_file(SnapshotFile {
@@ -67,6 +70,13 @@ pub async fn write_catalog_snapshot<S: StatePutStore + ?Sized>(
         checksum_sha256: sha256_hex(&columns_bytes),
         byte_size: columns_bytes.len() as u64,
         row_count: state.columns.len() as u64,
+        position_range: None,
+    });
+    info.add_file(SnapshotFile {
+        path: "commits.parquet".to_string(),
+        checksum_sha256: sha256_hex(&commits_bytes),
+        byte_size: commits_bytes.len() as u64,
+        row_count: state.commits.len() as u64,
         position_range: None,
     });
 

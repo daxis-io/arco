@@ -4,6 +4,11 @@
 //! a logical data entity (table, view, file collection) with associated
 //! metadata, lineage, and governance information.
 //!
+//! This module is part of the crate's public compatibility surface. Downstream
+//! users import asset types through both `arco_catalog::asset` and crate-root
+//! re-exports, so changes here require coordination and explicit compatibility
+//! coverage.
+//!
 //! # Asset Keys
 //!
 //! Assets are uniquely identified by their key, which consists of:

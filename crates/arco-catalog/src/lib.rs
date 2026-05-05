@@ -4,7 +4,7 @@
 //!
 //! This crate implements the catalog domain, providing:
 //!
-//! - **Asset Registry**: Discover and manage data assets (tables, views, etc.)
+//! - **Catalog Registry**: Discover and manage catalogs, schemas, and tables
 //! - **Lineage Tracking**: Execution-based lineage captured from real runs
 //! - **Search**: Fast discovery of assets across the catalog
 //! - **Parquet-Native Storage**: Metadata stored as queryable Parquet files
@@ -67,7 +67,7 @@
 //!
 //! // API writes go through the facade and publish immutable snapshots synchronously.
 //! let writer = CatalogWriter::new(storage).with_sync_compactor(compactor);
-//! // writer.create_namespace(...).await?;
+//! // writer.create_schema("default", "sales", None, Default::default()).await?;
 //! ```
 
 #![forbid(unsafe_code)]
@@ -128,7 +128,7 @@ pub use tier1_writer::Tier1Writer;
 pub use write_options::{IdempotencyKey, SnapshotVersion, WriteOptions};
 pub use writer::{
     Catalog, CatalogWriter, Column, ColumnDefinition, EventSource, LineageEdge, Namespace,
-    RegisterTableInSchemaRequest, RegisterTableRequest, Table, TablePatch,
+    RegisterTableInSchemaRequest, RegisterTableRequest, Schema, Table, TablePatch,
 };
 
 /// Creates a publish permit issuer for sync compaction.
@@ -152,5 +152,5 @@ pub mod prelude {
     pub use crate::reader::CatalogReader;
     pub use crate::tier1_writer::Tier1Writer;
     pub use crate::write_options::{IdempotencyKey, SnapshotVersion, WriteOptions};
-    pub use crate::writer::CatalogWriter;
+    pub use crate::writer::{CatalogWriter, Namespace, Schema};
 }

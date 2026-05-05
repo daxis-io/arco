@@ -292,6 +292,7 @@ dependencies = [
  "anyhow",
  "arco-catalog",
  "arco-core",
+ "async-trait",
  "axum 0.7.9",
  "bytes",
  "chrono",
@@ -362,6 +363,7 @@ name = "arco-flow"
 version = "0.1.5"
 dependencies = [
  "arco-core",
+ "arco-proto",
  "arrow 54.3.1",
  "async-trait",
  "axum 0.7.9",
@@ -383,6 +385,7 @@ dependencies = [
  "parquet 54.3.1",
  "petgraph 0.7.1",
  "proptest",
+ "prost-types 0.13.5",
  "reqwest",
  "serde",
  "serde_json",
@@ -463,6 +466,7 @@ dependencies = [
 name = "arco-proto"
 version = "0.1.5"
 dependencies = [
+ "chrono",
  "http",
  "prost 0.13.5",
  "prost-types 0.13.5",
@@ -7185,6 +7189,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
  "walkdir",

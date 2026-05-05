@@ -289,6 +289,25 @@ impl From<CatalogError> for IcebergError {
                     error_type: "CommitFailedException",
                 }
             }
+            CatalogError::RequestFailed {
+                http_status,
+                message,
+            } => match http_status {
+                400 => Self::BadRequest {
+                    message,
+                    error_type: "BadRequestException",
+                },
+                404 => Self::NotFound {
+                    message,
+                    error_type: "NotFoundException",
+                },
+                409 | 412 => Self::Conflict {
+                    message,
+                    error_type: "CommitFailedException",
+                },
+                406 | 501 => Self::UnsupportedOperation { message },
+                _ => Self::Internal { message },
+            },
             CatalogError::Storage { message } => Self::ServiceUnavailable {
                 message,
                 retry_after_seconds: None,

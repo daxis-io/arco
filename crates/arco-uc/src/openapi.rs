@@ -8,17 +8,19 @@ use utoipa::OpenApi;
     info(
         title = "Unity Catalog API (Arco facade)",
         version = env!("CARGO_PKG_VERSION"),
-        description = "Unity Catalog OSS parity facade for Arco (contract pinned by vendored OpenAPI spec)."
+        description = "Unity Catalog OSS parity facade for Arco. Catalog/schema/table CRUD is backed by Arco's authoritative catalog ledger and manifest-published snapshots; remaining non-CRUD parity endpoints are scaffolded or domain-specific preview surfaces unless documented otherwise."
     ),
     paths(
         crate::routes::openapi::get_openapi_json,
         crate::routes::catalogs::get_catalogs,
         crate::routes::catalogs::post_catalogs,
         crate::routes::catalogs::get_catalog,
+        crate::routes::catalogs::update_catalog,
         crate::routes::catalogs::delete_catalog,
         crate::routes::schemas::get_schemas,
         crate::routes::schemas::post_schemas,
         crate::routes::schemas::get_schema,
+        crate::routes::schemas::update_schema,
         crate::routes::schemas::delete_schema,
         crate::routes::tables::get_tables,
         crate::routes::tables::post_tables,
@@ -36,11 +38,11 @@ use utoipa::OpenApi;
     ),
     tags(
         (name = "OpenAPI", description = "OpenAPI specification endpoint"),
-        (name = "Catalogs", description = "Catalog operations"),
-        (name = "Schemas", description = "Schema operations"),
-        (name = "Tables", description = "Table operations"),
-        (name = "DeltaCommits", description = "Delta commit coordinator operations"),
-        (name = "TemporaryCredentials", description = "Temporary credential vending operations"),
+        (name = "Catalogs", description = "Authoritative catalog CRUD over Arco's catalog ledger."),
+        (name = "Schemas", description = "Authoritative schema CRUD over Arco's catalog ledger."),
+        (name = "Tables", description = "Authoritative table CRUD over Arco's catalog ledger."),
+        (name = "DeltaCommits", description = "Delta commit coordinator operations backed by coordinator state, not catalog DDL."),
+        (name = "TemporaryCredentials", description = "Scaffolded or placeholder credential vending operations; not authoritative catalog-governance state."),
     ),
 )]
 pub struct UnityCatalogApiDoc;

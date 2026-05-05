@@ -14,6 +14,8 @@
 
 Arco unifies a **file-native catalog** and an **execution-first orchestration** layer into one operational metadata system. It stores metadata as immutable, queryable files on object storage and treats deterministic planning, replayable history, and explainability as product requirements.
 
+Current authoritative scope is narrower than the broadest catalog/control-plane framing sometimes used in design discussions. The repo has executable proof for catalog DDL, lineage/search materialization, orchestration transactions, and Delta coordinated commit state. Broader governance domains such as grants, permissions, credential bindings, and policy-style metadata are still partial or planned. See `docs/guide/src/reference/control-plane-scope.md`.
+
 ### Key Differentiators
 
 | Feature | Description |
@@ -90,10 +92,21 @@ cargo fmt --all --check
 cargo clippy --workspace --all-features -- -D warnings
 ```
 
+### Protobuf Contract Notes
+
+- `proto/` is the authoritative protobuf source tree.
+- The generated `arco-proto` types are part of the supported cross-process contract.
+- `arco.*.v1` remains in the pre-freeze hard cut window until
+  `proto-baselines/post-hard-cut-v1.binpb` is regenerated for the expanded API.
+- Protobuf JSON field compatibility is enforced as part of the post-cut schema baseline, not treated as accidental serialization behavior.
+- Run `cargo xtask proto-breaking-check` to verify compatibility against the frozen post-cut baseline at `proto-baselines/post-hard-cut-v1.binpb`.
+- Regenerate that frozen baseline image with `buf build proto --exclude-source-info -o proto-baselines/post-hard-cut-v1.binpb`.
+
 ### Local CI/Gate Parity
 
 ```bash
 cargo xtask doctor
+cargo xtask proto-breaking-check
 cargo xtask adr-check
 cargo xtask verify-integrity
 cargo xtask parity-matrix-check

@@ -7,9 +7,8 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 
 use arco_core::control_plane_transactions::{
-    CatalogTxReceipt, ControlPlaneTxDomain, ControlPlaneTxKind, ControlPlaneTxPaths,
-    ControlPlaneTxRecord, ControlPlaneTxStatus, DomainCommit, RootTxManifest, RootTxManifestDomain,
-    RootTxReceipt,
+    CatalogTxReceipt, ControlPlaneIdempotencyRecord, ControlPlaneTxDomain, ControlPlaneTxPaths,
+    ControlPlaneTxRecord, DomainCommit, RootTxManifest, RootTxManifestDomain, RootTxReceipt,
 };
 
 #[test]
@@ -55,39 +54,99 @@ fn control_plane_transaction_paths_are_stable() {
 
 #[test]
 fn control_plane_transaction_record_serializes_camel_case_fields() {
-    let visible_at = Utc.with_ymd_and_hms(2026, 3, 29, 14, 12, 3).unwrap();
-    let record = ControlPlaneTxRecord {
-        tx_id: "01JQTX".to_string(),
-        kind: ControlPlaneTxKind::CatalogDdl,
-        status: ControlPlaneTxStatus::Visible,
-        repair_pending: true,
-        request_id: "01JQREQ".to_string(),
-        idempotency_key: "client-key".to_string(),
-        request_hash: "sha256:req".to_string(),
-        lock_path: "locks/catalog.lock.json".to_string(),
-        fencing_token: 42,
-        prepared_at: visible_at,
-        visible_at: Some(visible_at),
-        result: Some(CatalogTxReceipt {
-            tx_id: "01JQTX".to_string(),
-            event_id: "01JQEVENT".to_string(),
-            commit_id: "01JQCOMMIT".to_string(),
-            manifest_id: "00000000000000000117".to_string(),
-            snapshot_version: 17,
-            pointer_version: "\"etag-123\"".to_string(),
-            read_token: "catalog:00000000000000000117".to_string(),
-            visible_at,
-        }),
-    };
+    let record: ControlPlaneTxRecord<CatalogTxReceipt> =
+        serde_json::from_value(serde_json::json!({
+            "txId": "01JQTX",
+            "kind": "catalog_ddl",
+            "status": "VISIBLE",
+            "repairPending": true,
+            "requestId": "01JQREQ",
+            "idempotencyKey": "client-key",
+            "requestHash": "sha256:req",
+            "lockPath": "locks/catalog.lock.json",
+            "fencingToken": 42,
+            "preparedAt": "2026-03-29T14:12:03Z",
+            "visibleAt": "2026-03-29T14:12:03Z",
+            "result": {
+                "txId": "01JQTX",
+                "eventId": "01JQEVENT",
+                "commitId": "01JQCOMMIT",
+                "manifestId": "00000000000000000117",
+                "snapshotVersion": 17,
+                "pointerVersion": "\"etag-123\"",
+                "readToken": "catalog:00000000000000000117",
+                "visibleAt": "2026-03-29T14:12:03Z"
+            }
+        }))
+        .expect("deserialize");
 
     let json = serde_json::to_value(&record).expect("serialize");
     assert_eq!(json["txId"], "01JQTX");
     assert_eq!(json["kind"], "catalog_ddl");
     assert_eq!(json["status"], "VISIBLE");
     assert_eq!(json["repairPending"], true);
+    assert_eq!(json["requestId"], "01JQREQ");
+    assert_eq!(json["idempotencyKey"], "client-key");
     assert_eq!(json["lockPath"], "locks/catalog.lock.json");
     assert_eq!(json["fencingToken"], 42);
     assert_eq!(json["result"]["manifestId"], "00000000000000000117");
+}
+
+#[test]
+fn transaction_record_tolerates_missing_audit_fields() {
+    let record: ControlPlaneTxRecord<CatalogTxReceipt> =
+        serde_json::from_value(serde_json::json!({
+            "txId": "01JQTX",
+            "kind": "catalog_ddl",
+            "status": "VISIBLE",
+            "repairPending": false,
+            "requestHash": "sha256:req",
+            "lockPath": "locks/catalog.lock.json",
+            "fencingToken": 42,
+            "preparedAt": "2026-03-29T14:12:03Z"
+        }))
+        .expect("deserialize");
+
+    let json = serde_json::to_value(&record).expect("serialize");
+    assert_eq!(json["txId"], "01JQTX");
+    assert_eq!(json["requestId"], "");
+    assert_eq!(json["idempotencyKey"], "");
+}
+
+#[test]
+fn idempotency_record_serializes_audit_and_replay_fields() {
+    let record: ControlPlaneIdempotencyRecord = serde_json::from_value(serde_json::json!({
+        "txId": "01JQTX",
+        "kind": "catalog_ddl",
+        "requestId": "01JQREQ",
+        "idempotencyKey": "client-key",
+        "requestHash": "sha256:req",
+        "createdAt": "2026-03-29T14:12:03Z"
+    }))
+    .expect("deserialize");
+
+    let json = serde_json::to_value(&record).expect("serialize");
+    assert_eq!(json["txId"], "01JQTX");
+    assert_eq!(json["kind"], "catalog_ddl");
+    assert_eq!(json["requestId"], "01JQREQ");
+    assert_eq!(json["idempotencyKey"], "client-key");
+    assert_eq!(json["requestHash"], "sha256:req");
+}
+
+#[test]
+fn idempotency_record_tolerates_missing_audit_fields() {
+    let record: ControlPlaneIdempotencyRecord = serde_json::from_value(serde_json::json!({
+        "txId": "01JQTX",
+        "kind": "catalog_ddl",
+        "requestHash": "sha256:req",
+        "createdAt": "2026-03-29T14:12:03Z"
+    }))
+    .expect("deserialize");
+
+    let json = serde_json::to_value(&record).expect("serialize");
+    assert_eq!(json["txId"], "01JQTX");
+    assert_eq!(json["requestId"], "");
+    assert_eq!(json["idempotencyKey"], "");
 }
 
 #[test]

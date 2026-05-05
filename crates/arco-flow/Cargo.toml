@@ -27,6 +27,7 @@ test-utils = ["arco-core/test-utils", "http-client", "dep:proptest", "dep:tempfi
 
 [dependencies]
 arco-core = { path = "../arco-core" }
+arco-proto = { path = "../arco-proto" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -78,6 +79,7 @@ reqwest = { workspace = true, optional = true }
 gcp_auth = { workspace = true, optional = true }
 base64 = { workspace = true }
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+prost-types = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

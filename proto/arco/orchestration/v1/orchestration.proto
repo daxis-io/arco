@@ -1,0 +1,535 @@
+syntax = "proto3";
+
+package arco.orchestration.v1;
+
+import "arco/common/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/daxis-io/arco/proto/arco/orchestration/v1";
+option java_multiple_files = true;
+option java_package = "com.arco.orchestration.v1";
+
+message TaskDef {
+  string key = 1;
+  repeated string depends_on = 2;
+  optional string asset_key = 3;
+  arco.common.v1.PartitionKey partition_key = 4;
+  uint32 max_attempts = 5;
+  uint32 heartbeat_timeout_sec = 6;
+}
+
+message ResourceRequirements {
+  uint64 memory_bytes = 1;
+  uint64 cpu_millicores = 2;
+  uint64 timeout_ms = 3;
+}
+
+message TaskKey {
+  optional string asset_key = 1;
+  arco.common.v1.PartitionKey partition_key = 2;
+  TaskOperation operation = 3;
+}
+
+enum TaskOperation {
+  TASK_OPERATION_UNSPECIFIED = 0;
+  TASK_OPERATION_MATERIALIZE = 1;
+  TASK_OPERATION_CHECK = 2;
+}
+
+message DependencyEdge {
+  string source_task_key = 1;
+  string target_task_key = 2;
+}
+
+// Runtime-accurate orchestration run states.
+//
+// Public HTTP/UI adapters may collapse these into smaller presentation enums,
+// but this protobuf surface intentionally preserves the richer execution truth.
+enum RunState {
+  RUN_STATE_UNSPECIFIED = 0;
+  RUN_STATE_PENDING = 1;
+  RUN_STATE_RUNNING = 2;
+  RUN_STATE_CANCELLING = 3;
+  RUN_STATE_SUCCEEDED = 4;
+  RUN_STATE_FAILED = 5;
+  RUN_STATE_CANCELLED = 6;
+  RUN_STATE_TIMED_OUT = 7;
+}
+
+// Runtime-accurate task states for cross-process and replay-safe orchestration contracts.
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_PLANNED = 1;
+  TASK_STATE_PENDING = 2;
+  TASK_STATE_READY = 3;
+  TASK_STATE_QUEUED = 4;
+  TASK_STATE_DISPATCHED = 5;
+  TASK_STATE_RUNNING = 6;
+  TASK_STATE_SUCCEEDED = 7;
+  TASK_STATE_FAILED = 8;
+  TASK_STATE_SKIPPED = 9;
+  TASK_STATE_CANCELLED = 10;
+  TASK_STATE_RETRY_WAIT = 11;
+}
+
+enum TriggerType {
+  TRIGGER_TYPE_UNSPECIFIED = 0;
+  TRIGGER_TYPE_MANUAL = 1;
+  TRIGGER_TYPE_SCHEDULED = 2;
+  TRIGGER_TYPE_SENSOR = 3;
+  TRIGGER_TYPE_BACKFILL = 4;
+}
+
+message RunTrigger {
+  TriggerType type = 1;
+  optional string triggered_by = 2;
+  google.protobuf.Timestamp triggered_at = 3;
+  optional string schedule_name = 4;
+}
+
+enum TaskOutcome {
+  TASK_OUTCOME_UNSPECIFIED = 0;
+  TASK_OUTCOME_SUCCEEDED = 1;
+  TASK_OUTCOME_FAILED = 2;
+  TASK_OUTCOME_SKIPPED = 3;
+  TASK_OUTCOME_CANCELLED = 4;
+}
+
+enum OutputVisibilityState {
+  OUTPUT_VISIBILITY_STATE_UNSPECIFIED = 0;
+  OUTPUT_VISIBILITY_STATE_PENDING = 1;
+  OUTPUT_VISIBILITY_STATE_VISIBLE = 2;
+  OUTPUT_VISIBILITY_STATE_FAILED = 3;
+}
+
+enum TaskErrorCategory {
+  TASK_ERROR_CATEGORY_UNSPECIFIED = 0;
+  TASK_ERROR_CATEGORY_USER_CODE = 1;
+  TASK_ERROR_CATEGORY_DATA_QUALITY = 2;
+  TASK_ERROR_CATEGORY_INFRASTRUCTURE = 3;
+  TASK_ERROR_CATEGORY_CONFIGURATION = 4;
+  TASK_ERROR_CATEGORY_TIMEOUT = 5;
+  TASK_ERROR_CATEGORY_CANCELLED = 6;
+  TASK_ERROR_CATEGORY_UNKNOWN = 7;
+}
+
+message TaskError {
+  TaskErrorCategory category = 1;
+  string message = 2;
+  optional string detail = 3;
+  optional bool retryable = 4;
+}
+
+message TaskMetrics {
+  optional uint64 cpu_time_ms = 1;
+  optional uint64 peak_memory_bytes = 2;
+  optional uint64 io_read_bytes = 3;
+  optional uint64 io_write_bytes = 4;
+}
+
+// Worker-reported callback output before publication visibility is known.
+// This is distinct from the published/read-model `TaskOutput`.
+message TaskCallbackOutput {
+  optional string materialization_id = 1;
+  optional uint64 row_count = 2;
+  optional uint64 byte_size = 3;
+  optional string output_path = 4;
+  optional string delta_table = 5;
+  optional int64 delta_version = 6;
+  optional string delta_partition = 7;
+}
+
+// Published file metadata owned by the orchestration output contract.
+message FileEntry {
+  string path = 1;
+  uint64 size_bytes = 2;
+  optional uint64 row_count = 3;
+  optional string content_hash = 4;
+  optional string format = 5;
+}
+
+// Published/read-model output with visibility semantics.
+// This is the externally visible outcome, not the worker callback payload.
+message TaskOutput {
+  optional string materialization_id = 1;
+  repeated FileEntry files = 2;
+  optional uint64 row_count = 3;
+  optional uint64 byte_size = 4;
+  OutputVisibilityState visibility_state = 5;
+  google.protobuf.Timestamp published_at = 6;
+  TaskError publish_error = 7;
+}
+
+message TaskExecution {
+  string task_key = 1;
+  TaskState state = 2;
+  uint32 attempt = 3;
+  google.protobuf.Timestamp queued_at = 4;
+  google.protobuf.Timestamp started_at = 5;
+  google.protobuf.Timestamp completed_at = 6;
+  optional string worker_id = 7;
+  TaskOutput output = 8;
+  TaskError error = 9;
+  TaskMetrics metrics = 10;
+  TaskKey semantic_key = 11;
+  int32 priority = 12;
+}
+
+message Run {
+  string run_id = 1;
+  string plan_id = 2;
+  RunState state = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp started_at = 5;
+  google.protobuf.Timestamp completed_at = 6;
+  repeated TaskExecution task_executions = 7;
+  map<string, string> labels = 8;
+  RunTrigger trigger = 9;
+}
+
+message ManualTrigger {
+  string user_id = 1;
+  optional string request_id = 2;
+}
+
+message ScheduleTrigger {
+  string schedule_id = 1;
+  optional string tick_id = 2;
+}
+
+message MaterializationTrigger {
+  string upstream_materialization_id = 1;
+}
+
+message WebhookTrigger {
+  string webhook_id = 1;
+}
+
+message SensorTrigger {
+  string sensor_id = 1;
+  optional string cursor = 2;
+  optional string eval_id = 3;
+}
+
+message BackfillTrigger {
+  string backfill_id = 1;
+  optional string chunk_id = 2;
+}
+
+message TriggerInfo {
+  oneof trigger {
+    ManualTrigger manual = 1;
+    ScheduleTrigger schedule = 2;
+    MaterializationTrigger materialization = 3;
+    WebhookTrigger webhook = 4;
+    SensorTrigger sensor = 5;
+    BackfillTrigger backfill = 6;
+  }
+}
+
+enum TimerType {
+  TIMER_TYPE_UNSPECIFIED = 0;
+  TIMER_TYPE_RETRY = 1;
+  TIMER_TYPE_HEARTBEAT_CHECK = 2;
+  TIMER_TYPE_CRON = 3;
+  TIMER_TYPE_SLA_CHECK = 4;
+}
+
+enum TickStatus {
+  TICK_STATUS_UNSPECIFIED = 0;
+  TICK_STATUS_TRIGGERED = 1;
+  TICK_STATUS_SKIPPED = 2;
+  TICK_STATUS_FAILED = 3;
+}
+
+message PushTriggerSource {
+  string message_id = 1;
+}
+
+message PollTriggerSource {
+  int64 poll_epoch = 1;
+}
+
+message TriggerSource {
+  oneof source {
+    PushTriggerSource push = 1;
+    PollTriggerSource poll = 2;
+  }
+}
+
+enum SensorEvalStatus {
+  SENSOR_EVAL_STATUS_UNSPECIFIED = 0;
+  SENSOR_EVAL_STATUS_TRIGGERED = 1;
+  SENSOR_EVAL_STATUS_NO_NEW_DATA = 2;
+  SENSOR_EVAL_STATUS_ERROR = 3;
+  SENSOR_EVAL_STATUS_SKIPPED_STALE_CURSOR = 4;
+}
+
+message RunRequest {
+  string run_key = 1;
+  string request_fingerprint = 2;
+  repeated string asset_selection = 3;
+  repeated string partition_selection = 4;
+}
+
+enum BackfillState {
+  BACKFILL_STATE_UNSPECIFIED = 0;
+  BACKFILL_STATE_PENDING = 1;
+  BACKFILL_STATE_RUNNING = 2;
+  BACKFILL_STATE_PAUSED = 3;
+  BACKFILL_STATE_SUCCEEDED = 4;
+  BACKFILL_STATE_FAILED = 5;
+  BACKFILL_STATE_CANCELLED = 6;
+}
+
+enum ChunkState {
+  CHUNK_STATE_UNSPECIFIED = 0;
+  CHUNK_STATE_PENDING = 1;
+  CHUNK_STATE_PLANNED = 2;
+  CHUNK_STATE_RUNNING = 3;
+  CHUNK_STATE_SUCCEEDED = 4;
+  CHUNK_STATE_FAILED = 5;
+}
+
+message PartitionRangeSelector {
+  string start = 1;
+  string end = 2;
+}
+
+message ExplicitPartitionSelector {
+  repeated string partition_keys = 1;
+}
+
+message FilterPartitionSelector {
+  map<string, string> filters = 1;
+}
+
+message PartitionSelector {
+  oneof selector {
+    PartitionRangeSelector range = 1;
+    ExplicitPartitionSelector explicit = 2;
+    FilterPartitionSelector filter = 3;
+  }
+}
+
+message RunTriggered {
+  string run_id = 1;
+  string plan_id = 2;
+  TriggerInfo trigger = 3;
+  repeated string root_assets = 4;
+  optional string run_key = 5;
+  map<string, string> labels = 6;
+  optional string code_version = 7;
+}
+
+message PlanCreated {
+  string run_id = 1;
+  string plan_id = 2;
+  repeated TaskDef tasks = 3;
+}
+
+message RunCancelRequested {
+  string run_id = 1;
+  optional string reason = 2;
+  string requested_by = 3;
+}
+
+message TaskStarted {
+  string run_id = 1;
+  string task_key = 2;
+  uint32 attempt = 3;
+  string attempt_id = 4;
+  string worker_id = 5;
+}
+
+message TaskHeartbeat {
+  string run_id = 1;
+  string task_key = 2;
+  uint32 attempt = 3;
+  string attempt_id = 4;
+  string worker_id = 5;
+  google.protobuf.Timestamp heartbeat_at = 6;
+  optional uint32 progress_pct = 7;
+  optional string message = 8;
+}
+
+message TaskFinished {
+  string run_id = 1;
+  string task_key = 2;
+  uint32 attempt = 3;
+  string attempt_id = 4;
+  string worker_id = 5;
+  TaskOutcome outcome = 6;
+  TaskCallbackOutput callback_output = 7;
+  TaskError error = 8;
+  TaskMetrics metrics = 9;
+  optional string cancelled_during_phase = 10;
+  reserved 11;
+  reserved "partial_progress_json";
+  optional string asset_key = 12;
+  arco.common.v1.PartitionKey partition_key = 13;
+  optional string code_version = 14;
+}
+
+message TaskOutputVisibilityChanged {
+  string run_id = 1;
+  string task_key = 2;
+  uint32 attempt = 3;
+  string attempt_id = 4;
+  OutputVisibilityState visibility_state = 5;
+  google.protobuf.Timestamp published_at = 6;
+  optional string publish_error = 7;
+}
+
+message DispatchRequested {
+  string run_id = 1;
+  string task_key = 2;
+  uint32 attempt = 3;
+  string attempt_id = 4;
+  string worker_queue = 5;
+  string dispatch_id = 6;
+}
+
+message TimerRequested {
+  string timer_id = 1;
+  TimerType timer_type = 2;
+  optional string run_id = 3;
+  optional string task_key = 4;
+  optional uint32 attempt = 5;
+  google.protobuf.Timestamp fire_at = 6;
+}
+
+message DispatchEnqueued {
+  string dispatch_id = 1;
+  optional string run_id = 2;
+  optional string task_key = 3;
+  optional uint32 attempt = 4;
+  string cloud_task_id = 5;
+}
+
+message TimerEnqueued {
+  string timer_id = 1;
+  optional string run_id = 2;
+  optional string task_key = 3;
+  optional uint32 attempt = 4;
+  string cloud_task_id = 5;
+}
+
+message TimerFired {
+  string timer_id = 1;
+  TimerType timer_type = 2;
+  optional string run_id = 3;
+  optional string task_key = 4;
+  optional uint32 attempt = 5;
+}
+
+message ScheduleDefinitionUpserted {
+  string schedule_id = 1;
+  string cron_expression = 2;
+  string timezone = 3;
+  uint32 catchup_window_minutes = 4;
+  repeated string asset_selection = 5;
+  uint32 max_catchup_ticks = 6;
+  bool enabled = 7;
+}
+
+message ScheduleTicked {
+  string schedule_id = 1;
+  google.protobuf.Timestamp scheduled_for = 2;
+  string tick_id = 3;
+  string definition_version = 4;
+  repeated string asset_selection = 5;
+  repeated string partition_selection = 6;
+  TickStatus status = 7;
+  optional string skipped_reason = 8;
+  optional string failure_message = 9;
+  optional string run_key = 10;
+  optional string request_fingerprint = 11;
+}
+
+message SensorEvaluated {
+  string sensor_id = 1;
+  string eval_id = 2;
+  optional string cursor_before = 3;
+  optional string cursor_after = 4;
+  optional uint32 expected_state_version = 5;
+  TriggerSource trigger_source = 6;
+  repeated RunRequest run_requests = 7;
+  SensorEvalStatus status = 8;
+  optional string error_message = 9;
+}
+
+message RunRequested {
+  string run_key = 1;
+  string request_fingerprint = 2;
+  repeated string asset_selection = 3;
+  repeated string partition_selection = 4;
+  TriggerInfo trigger = 5;
+  map<string, string> labels = 6;
+}
+
+message BackfillCreated {
+  string backfill_id = 1;
+  string client_request_id = 2;
+  repeated string asset_selection = 3;
+  PartitionSelector partition_selector = 4;
+  uint32 total_partitions = 5;
+  uint32 chunk_size = 6;
+  uint32 max_concurrent_runs = 7;
+  optional string parent_backfill_id = 8;
+}
+
+message BackfillChunkPlanned {
+  string backfill_id = 1;
+  string chunk_id = 2;
+  uint32 chunk_index = 3;
+  repeated string partition_keys = 4;
+  string run_key = 5;
+  string request_fingerprint = 6;
+}
+
+message BackfillStateChanged {
+  string backfill_id = 1;
+  BackfillState from_state = 2;
+  BackfillState to_state = 3;
+  uint32 state_version = 4;
+  optional string changed_by = 5;
+}
+
+// Authoritative typed orchestration event envelope for cross-process commits.
+//
+// This file intentionally exposes the append-only event contract consumed by
+// `CommitOrchestrationBatch` and root transactions. Storage-only event shapes
+// should live outside the public proto tree instead of being tunneled here as
+// ad hoc JSON payloads.
+message OrchestrationEventEnvelope {
+  string event_id = 1;
+  uint32 event_version = 2;
+  google.protobuf.Timestamp timestamp = 3;
+  string source = 4;
+  string idempotency_key = 5;
+  optional string correlation_id = 6;
+  optional string causation_id = 7;
+
+  oneof event {
+    RunTriggered run_triggered = 20;
+    PlanCreated plan_created = 21;
+    RunCancelRequested run_cancel_requested = 22;
+    TaskStarted task_started = 23;
+    TaskHeartbeat task_heartbeat = 24;
+    TaskFinished task_finished = 25;
+    DispatchRequested dispatch_requested = 26;
+    TimerRequested timer_requested = 27;
+    DispatchEnqueued dispatch_enqueued = 28;
+    TimerEnqueued timer_enqueued = 29;
+    TimerFired timer_fired = 30;
+    ScheduleDefinitionUpserted schedule_definition_upserted = 31;
+    ScheduleTicked schedule_ticked = 32;
+    SensorEvaluated sensor_evaluated = 33;
+    RunRequested run_requested = 34;
+    BackfillCreated backfill_created = 35;
+    BackfillChunkPlanned backfill_chunk_planned = 36;
+    BackfillStateChanged backfill_state_changed = 37;
+    TaskOutputVisibilityChanged task_output_visibility_changed = 38;
+  }
+}

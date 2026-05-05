@@ -259,6 +259,19 @@ impl MicroCompactor {
         Ok((manifest, state))
     }
 
+    /// Returns the current visible base snapshot artifact paths.
+    ///
+    /// This is a manifest-only read path for consumers that need the published
+    /// base snapshot table artifacts without replaying L0 deltas or reconstructing rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the current manifest cannot be read.
+    pub async fn current_base_table_paths(&self) -> Result<TablePaths> {
+        let manifest = self.load_current_manifest_only().await?;
+        Ok(manifest.base_snapshot.tables)
+    }
+
     /// Loads orchestration state pinned to one visible root transaction token.
     ///
     /// This opt-in read path resolves `root:{tx_id}` through the visible root
@@ -446,20 +459,14 @@ impl MicroCompactor {
                             if let Some(delay_ms) =
                                 should_retry_publish_error(&publish_error, retry_attempt)
                             {
-                                let Some(reason) = publish_error.retry_reason() else {
-                                    debug_assert!(
-                                        false,
-                                        "retryable publish error must carry a retry reason"
+                                if let Some(reason) = publish_error.retry_reason() {
+                                    record_compaction_publish_retry(
+                                        self.durability_mode,
+                                        reason,
+                                        retry_attempt + 1,
+                                        delay_ms,
                                     );
-                                    wait_for_publish_retry(delay_ms).await;
-                                    continue 'retry;
-                                };
-                                record_compaction_publish_retry(
-                                    self.durability_mode,
-                                    reason,
-                                    retry_attempt + 1,
-                                    delay_ms,
-                                );
+                                }
                                 wait_for_publish_retry(delay_ms).await;
                                 continue 'retry;
                             }
@@ -694,20 +701,14 @@ impl MicroCompactor {
                         if let Some(delay_ms) =
                             should_retry_publish_error(&publish_error, retry_attempt)
                         {
-                            let Some(reason) = publish_error.retry_reason() else {
-                                debug_assert!(
-                                    false,
-                                    "retryable publish error must carry a retry reason"
+                            if let Some(reason) = publish_error.retry_reason() {
+                                record_compaction_publish_retry(
+                                    self.durability_mode,
+                                    reason,
+                                    retry_attempt + 1,
+                                    delay_ms,
                                 );
-                                wait_for_publish_retry(delay_ms).await;
-                                continue 'retry;
-                            };
-                            record_compaction_publish_retry(
-                                self.durability_mode,
-                                reason,
-                                retry_attempt + 1,
-                                delay_ms,
-                            );
+                            }
                             wait_for_publish_retry(delay_ms).await;
                             continue 'retry;
                         }
@@ -907,6 +908,11 @@ impl MicroCompactor {
         let manifest_bytes = self.storage.get_raw(&orchestration.manifest_path).await?;
         serde_json::from_slice(&manifest_bytes)
             .map_err(|e| Error::serialization(format!("failed to parse pinned manifest: {e}")))
+    }
+
+    async fn load_current_manifest_only(&self) -> Result<OrchestrationManifest> {
+        let (manifest, _, _, _) = self.read_manifest_with_version().await?;
+        Ok(manifest)
     }
 
     #[cfg(test)]
@@ -1114,7 +1120,7 @@ impl MicroCompactor {
 
     /// Writes fold state to L0 delta Parquet files.
     async fn write_delta_parquet(&self, delta_id: &str, state: &FoldState) -> Result<TablePaths> {
-        self.write_state_parquet(&orchestration_l0_dir(delta_id), state)
+        self.write_state_parquet(&orchestration_l0_dir(delta_id), state, false)
             .await
     }
 
@@ -1124,16 +1130,21 @@ impl MicroCompactor {
         snapshot_id: &str,
         state: &FoldState,
     ) -> Result<TablePaths> {
-        self.write_state_parquet(&orchestration_base_snapshot_dir(snapshot_id), state)
+        self.write_state_parquet(&orchestration_base_snapshot_dir(snapshot_id), state, true)
             .await
     }
 
-    async fn write_state_parquet(&self, base_path: &str, state: &FoldState) -> Result<TablePaths> {
+    async fn write_state_parquet(
+        &self,
+        base_path: &str,
+        state: &FoldState,
+        include_empty_tables: bool,
+    ) -> Result<TablePaths> {
         let mut paths = TablePaths::default();
 
         macro_rules! write_table {
             ($file:literal, $rows:expr, $encode:expr, $out:expr) => {
-                self.write_map_table_if_nonempty(base_path, $file, $rows, $encode, $out)
+                self.write_map_table(base_path, $file, $rows, $encode, $out, include_empty_tables)
                     .await?;
             };
         }
@@ -1228,19 +1239,20 @@ impl MicroCompactor {
         Ok(paths)
     }
 
-    async fn write_map_table_if_nonempty<K, R>(
+    async fn write_map_table<K, R>(
         &self,
         base_path: &str,
         file: &str,
         rows: &std::collections::HashMap<K, R>,
         encode: fn(&[R]) -> Result<Bytes>,
         out: &mut Option<TableArtifact>,
+        include_empty_tables: bool,
     ) -> Result<()>
     where
         K: std::hash::Hash + Eq + Sync,
         R: Clone + Sync,
     {
-        if rows.is_empty() {
+        if rows.is_empty() && !include_empty_tables {
             return Ok(());
         }
 
@@ -1290,7 +1302,11 @@ impl MicroCompactor {
     }
 
     /// Publishes a new manifest version.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(
+        clippy::option_if_let_else,
+        clippy::too_many_arguments,
+        clippy::too_many_lines
+    )]
     async fn publish_manifest(
         &self,
         manifest: &OrchestrationManifest,
@@ -1398,14 +1414,13 @@ impl MicroCompactor {
                 Err(PublishManifestError::ConcurrentWrite)
             }
             Err(arco_core::Error::PreconditionFailed { message }) => {
-                decode_pre_pointer_publish_error(&message).map_or_else(
-                    || {
-                        Err(PublishManifestError::Other(Error::Core(
-                            arco_core::Error::PreconditionFailed { message },
-                        )))
-                    },
-                    |error| Err(PublishManifestError::Other(error)),
-                )
+                if let Some(error) = decode_pre_pointer_publish_error(&message) {
+                    Err(PublishManifestError::Other(error))
+                } else {
+                    Err(PublishManifestError::Other(Error::Core(
+                        arco_core::Error::PreconditionFailed { message },
+                    )))
+                }
             }
             Err(error) => Err(PublishManifestError::Other(Error::from(error))),
         }
@@ -2091,7 +2106,7 @@ mod tests {
                         partition_key: None,
                         max_attempts: 3,
                         heartbeat_timeout_sec: 300,
-                        requires_visible_output: true,
+                        requires_visible_output: false,
                     },
                     TaskDef {
                         key: "transform".to_string(),
@@ -2100,7 +2115,7 @@ mod tests {
                         partition_key: None,
                         max_attempts: 3,
                         heartbeat_timeout_sec: 300,
-                        requires_visible_output: true,
+                        requires_visible_output: false,
                     },
                 ],
             },

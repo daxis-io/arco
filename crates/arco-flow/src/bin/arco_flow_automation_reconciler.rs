@@ -252,7 +252,7 @@ fn process_fired_timers(
                                 error: None,
                                 metrics: None,
                                 cancelled_during_phase: None,
-                                partial_progress: None,
+                                partial_progress_json: None,
                                 asset_key: task_row.and_then(|row| row.asset_key.clone()),
                                 partition_key: task_row.and_then(|row| row.partition_key.clone()),
                                 code_version,

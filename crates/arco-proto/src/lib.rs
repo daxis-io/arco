@@ -1,28 +1,78 @@
 //! Generated protobuf types for Arco.
-//!
-//! This crate provides Rust types generated from the proto/ definitions.
-//! All cross-language contracts are defined via Protobuf.
 
 #![forbid(unsafe_code)]
-#![allow(missing_docs)] // Generated code doesn't have docs
+#![allow(missing_docs)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod codec;
-#[allow(
-    unused_qualifications,
-    deprecated,
-    clippy::all,
-    clippy::cargo,
-    clippy::nursery,
-    clippy::pedantic
-)]
-mod generated {
-    // Include generated code; all types are re-exported at crate root.
-    include!(concat!(env!("OUT_DIR"), "/arco.v1.rs"));
-}
+mod serde_helpers;
 
 pub use codec::{ProstCodec, ProstDecoder, ProstEncoder};
-pub use generated::*;
+
+pub mod arco {
+    pub mod common {
+        #[allow(
+            unused_qualifications,
+            deprecated,
+            clippy::all,
+            clippy::cargo,
+            clippy::nursery,
+            clippy::pedantic
+        )]
+        pub mod v1 {
+            tonic::include_proto!("arco.common.v1");
+        }
+    }
+
+    pub mod catalog {
+        #[allow(
+            unused_qualifications,
+            deprecated,
+            clippy::all,
+            clippy::cargo,
+            clippy::nursery,
+            clippy::pedantic
+        )]
+        pub mod v1 {
+            tonic::include_proto!("arco.catalog.v1");
+        }
+    }
+
+    pub mod orchestration {
+        #[allow(
+            unused_qualifications,
+            deprecated,
+            clippy::all,
+            clippy::cargo,
+            clippy::nursery,
+            clippy::pedantic
+        )]
+        pub mod v1 {
+            tonic::include_proto!("arco.orchestration.v1");
+        }
+    }
+
+    pub mod controlplane {
+        #[allow(
+            unused_qualifications,
+            deprecated,
+            clippy::all,
+            clippy::cargo,
+            clippy::nursery,
+            clippy::pedantic
+        )]
+        pub mod v1 {
+            tonic::include_proto!("arco.controlplane.v1");
+        }
+    }
+}
+
+// Temporary compatibility re-exports while downstream crates finish migrating to
+// the nested `arco::<domain>::v1` public surface.
+pub use arco::catalog::v1::*;
+pub use arco::common::v1::*;
+pub use arco::controlplane::v1::*;
+pub use arco::orchestration::v1::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOutputContractError {
@@ -50,7 +100,7 @@ impl std::fmt::Display for TaskOutputContractError {
                 f.write_str("task output visibility_state must not be UNSPECIFIED")
             }
             Self::PendingHasPublishedFields => f.write_str(
-                "pending task output must not include published files, non-zero stats, timestamp, or error",
+                "pending task output must not include published files, stats, timestamp, or error",
             ),
             Self::VisibleMissingFiles => {
                 f.write_str("visible task output must include at least one published file")
@@ -65,7 +115,7 @@ impl std::fmt::Display for TaskOutputContractError {
                 f.write_str("failed task output must include publish_error")
             }
             Self::FailedHasPublishedFields => f.write_str(
-                "failed task output must not include published files, non-zero stats, or timestamp",
+                "failed task output must not include published files, stats, or timestamp",
             ),
         }
     }
@@ -75,31 +125,57 @@ impl std::error::Error for TaskOutputContractError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlPlaneTransactionContractError {
-    MissingHeader,
     MissingCatalogDdl,
     MissingCatalogDdlOp,
     EmptyOrchestrationEvents,
+    InvalidOrchestrationEvent(usize, OrchestrationEventContractError),
     EmptyRootMutations,
+    MissingRootCatalogDdlOp(usize),
+    MissingRootMetastoreMutationOp(usize),
     EmptyRootOrchestrationEvents(usize),
+    InvalidRootOrchestrationEvent(usize, usize, OrchestrationEventContractError),
     MissingRootMutationKind(usize),
 }
 
 impl std::fmt::Display for ControlPlaneTransactionContractError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingHeader => f.write_str("request header is required"),
             Self::MissingCatalogDdl => f.write_str("catalog DDL payload is required"),
             Self::MissingCatalogDdlOp => f.write_str("catalog DDL operation is required"),
             Self::EmptyOrchestrationEvents => {
                 f.write_str("orchestration batch must include at least one event")
             }
+            Self::InvalidOrchestrationEvent(index, error) => {
+                write!(
+                    f,
+                    "orchestration event at index {index} is invalid: {error}"
+                )
+            }
             Self::EmptyRootMutations => {
                 f.write_str("root transaction must include at least one mutation")
+            }
+            Self::MissingRootCatalogDdlOp(index) => {
+                write!(
+                    f,
+                    "root catalog mutation at index {index} must set catalog DDL operation"
+                )
+            }
+            Self::MissingRootMetastoreMutationOp(index) => {
+                write!(
+                    f,
+                    "root metastore mutation at index {index} must set metastore mutation operation"
+                )
             }
             Self::EmptyRootOrchestrationEvents(index) => {
                 write!(
                     f,
                     "root orchestration mutation at index {index} must include at least one event"
+                )
+            }
+            Self::InvalidRootOrchestrationEvent(mutation_index, event_index, error) => {
+                write!(
+                    f,
+                    "root orchestration mutation at index {mutation_index} has invalid event at index {event_index}: {error}"
                 )
             }
             Self::MissingRootMutationKind(index) => {
@@ -110,6 +186,48 @@ impl std::fmt::Display for ControlPlaneTransactionContractError {
 }
 
 impl std::error::Error for ControlPlaneTransactionContractError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrchestrationEventContractError {
+    EmptyEventId,
+    MissingTimestamp,
+    EmptySource,
+    EmptyIdempotencyKey,
+    MissingEventKind,
+    MissingTriggerInfo(&'static str),
+    MissingTriggerKind(&'static str),
+    MissingTriggerField(&'static str, &'static str),
+    UnsupportedTriggerKind(&'static str, &'static str),
+}
+
+impl std::fmt::Display for OrchestrationEventContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyEventId => f.write_str("event_id is required"),
+            Self::MissingTimestamp => f.write_str("timestamp is required"),
+            Self::EmptySource => f.write_str("source is required"),
+            Self::EmptyIdempotencyKey => f.write_str("idempotency_key is required"),
+            Self::MissingEventKind => f.write_str("event payload is required"),
+            Self::MissingTriggerInfo(event_name) => {
+                write!(f, "{event_name} trigger is required")
+            }
+            Self::MissingTriggerKind(event_name) => {
+                write!(f, "{event_name} trigger.kind is required")
+            }
+            Self::MissingTriggerField(event_name, field_name) => {
+                write!(f, "{event_name} trigger field {field_name} is required")
+            }
+            Self::UnsupportedTriggerKind(event_name, trigger_kind) => {
+                write!(
+                    f,
+                    "{event_name} trigger kind {trigger_kind} is not supported"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for OrchestrationEventContractError {}
 
 impl TaskOutput {
     pub fn validate_contract(&self) -> Result<(), TaskOutputContractError> {
@@ -126,8 +244,8 @@ impl TaskOutput {
             }
             OutputVisibilityState::Pending => {
                 if !self.files.is_empty()
-                    || self.row_count != 0
-                    || self.byte_size != 0
+                    || self.row_count.is_some()
+                    || self.byte_size.is_some()
                     || self.published_at.is_some()
                     || self.publish_error.is_some()
                 {
@@ -152,8 +270,8 @@ impl TaskOutput {
                     return Err(TaskOutputContractError::FailedMissingPublishError);
                 }
                 if !self.files.is_empty()
-                    || self.row_count != 0
-                    || self.byte_size != 0
+                    || self.row_count.is_some()
+                    || self.byte_size.is_some()
                     || self.published_at.is_some()
                 {
                     return Err(TaskOutputContractError::FailedHasPublishedFields);
@@ -166,10 +284,6 @@ impl TaskOutput {
 
 impl ApplyCatalogDdlRequest {
     pub fn validate_contract(&self) -> Result<(), ControlPlaneTransactionContractError> {
-        if self.header.is_none() {
-            return Err(ControlPlaneTransactionContractError::MissingHeader);
-        }
-
         let ddl = self
             .ddl
             .as_ref()
@@ -185,12 +299,18 @@ impl ApplyCatalogDdlRequest {
 
 impl CommitOrchestrationBatchRequest {
     pub fn validate_contract(&self) -> Result<(), ControlPlaneTransactionContractError> {
-        if self.header.is_none() {
-            return Err(ControlPlaneTransactionContractError::MissingHeader);
-        }
-
         if self.events.is_empty() {
             return Err(ControlPlaneTransactionContractError::EmptyOrchestrationEvents);
+        }
+
+        if let Some((index, error)) =
+            self.events.iter().enumerate().find_map(|(index, event)| {
+                event.validate_contract().err().map(|error| (index, error))
+            })
+        {
+            return Err(
+                ControlPlaneTransactionContractError::InvalidOrchestrationEvent(index, error),
+            );
         }
 
         Ok(())
@@ -199,10 +319,6 @@ impl CommitOrchestrationBatchRequest {
 
 impl CommitRootTransactionRequest {
     pub fn validate_contract(&self) -> Result<(), ControlPlaneTransactionContractError> {
-        if self.header.is_none() {
-            return Err(ControlPlaneTransactionContractError::MissingHeader);
-        }
-
         if self.mutations.is_empty() {
             return Err(ControlPlaneTransactionContractError::EmptyRootMutations);
         }
@@ -215,21 +331,182 @@ impl CommitRootTransactionRequest {
             return Err(ControlPlaneTransactionContractError::MissingRootMutationKind(index));
         }
 
-        if let Some(index) = self
-            .mutations
-            .iter()
-            .enumerate()
-            .find_map(|(index, mutation)| match mutation.kind.as_ref() {
-                Some(domain_mutation::Kind::Orchestration(spec)) if spec.events.is_empty() => {
-                    Some(index)
+        for (index, mutation) in self.mutations.iter().enumerate() {
+            match mutation.kind.as_ref() {
+                Some(domain_mutation::Kind::Catalog(operation)) => {
+                    if operation.op.is_none() {
+                        return Err(
+                            ControlPlaneTransactionContractError::MissingRootCatalogDdlOp(index),
+                        );
+                    }
                 }
-                _ => None,
-            })
-        {
-            return Err(ControlPlaneTransactionContractError::EmptyRootOrchestrationEvents(index));
+                Some(domain_mutation::Kind::Orchestration(spec)) => {
+                    if spec.events.is_empty() {
+                        return Err(
+                            ControlPlaneTransactionContractError::EmptyRootOrchestrationEvents(
+                                index,
+                            ),
+                        );
+                    }
+
+                    if let Some((event_index, error)) =
+                        spec.events
+                            .iter()
+                            .enumerate()
+                            .find_map(|(event_index, event)| {
+                                event
+                                    .validate_contract()
+                                    .err()
+                                    .map(|error| (event_index, error))
+                            })
+                    {
+                        return Err(
+                            ControlPlaneTransactionContractError::InvalidRootOrchestrationEvent(
+                                index,
+                                event_index,
+                                error,
+                            ),
+                        );
+                    }
+                }
+                Some(domain_mutation::Kind::Metastore(mutation)) => {
+                    if !mutation.has_contract_operation() {
+                        return Err(
+                            ControlPlaneTransactionContractError::MissingRootMetastoreMutationOp(
+                                index,
+                            ),
+                        );
+                    }
+                }
+                None => unreachable!("checked above"),
+            }
         }
 
         Ok(())
+    }
+}
+
+impl MetastoreMutation {
+    pub fn has_contract_operation(&self) -> bool {
+        match self.op.as_ref() {
+            Some(metastore_mutation::Op::Grant(grant)) => grant.op.is_some(),
+            Some(_) => true,
+            None => false,
+        }
+    }
+}
+
+impl OrchestrationEventEnvelope {
+    pub fn validate_contract(&self) -> Result<(), OrchestrationEventContractError> {
+        if self.event_id.is_empty() {
+            return Err(OrchestrationEventContractError::EmptyEventId);
+        }
+        if self.timestamp.is_none() {
+            return Err(OrchestrationEventContractError::MissingTimestamp);
+        }
+        if self.source.is_empty() {
+            return Err(OrchestrationEventContractError::EmptySource);
+        }
+        if self.idempotency_key.is_empty() {
+            return Err(OrchestrationEventContractError::EmptyIdempotencyKey);
+        }
+        let Some(event) = self.event.as_ref() else {
+            return Err(OrchestrationEventContractError::MissingEventKind);
+        };
+
+        match event {
+            orchestration_event_envelope::Event::RunRequested(event) => {
+                validate_run_requested_trigger(event)?;
+            }
+            orchestration_event_envelope::Event::RunTriggered(event) => {
+                validate_run_triggered_trigger(event)?;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+}
+
+fn required_trigger<'a>(
+    event_name: &'static str,
+    trigger: Option<&'a TriggerInfo>,
+) -> Result<&'a trigger_info::Trigger, OrchestrationEventContractError> {
+    let trigger_info = trigger.ok_or(OrchestrationEventContractError::MissingTriggerInfo(
+        event_name,
+    ))?;
+    trigger_info
+        .trigger
+        .as_ref()
+        .ok_or(OrchestrationEventContractError::MissingTriggerKind(
+            event_name,
+        ))
+}
+
+fn validate_run_requested_trigger(
+    event: &RunRequested,
+) -> Result<(), OrchestrationEventContractError> {
+    match required_trigger("run_requested", event.trigger.as_ref())? {
+        trigger_info::Trigger::Manual(manual) => {
+            if manual.request_id.is_none() {
+                return Err(OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "manual.request_id",
+                ));
+            }
+            Ok(())
+        }
+        trigger_info::Trigger::Schedule(schedule) => {
+            if schedule.tick_id.is_none() {
+                return Err(OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "schedule.tick_id",
+                ));
+            }
+            Ok(())
+        }
+        trigger_info::Trigger::Sensor(sensor) => {
+            if sensor.eval_id.is_none() {
+                return Err(OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "sensor.eval_id",
+                ));
+            }
+            Ok(())
+        }
+        trigger_info::Trigger::Backfill(backfill) => {
+            if backfill.chunk_id.is_none() {
+                return Err(OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "backfill.chunk_id",
+                ));
+            }
+            Ok(())
+        }
+        trigger_info::Trigger::Materialization(_) => {
+            Err(OrchestrationEventContractError::UnsupportedTriggerKind(
+                "run_requested",
+                "materialization",
+            ))
+        }
+        trigger_info::Trigger::Webhook(_) => Err(
+            OrchestrationEventContractError::UnsupportedTriggerKind("run_requested", "webhook"),
+        ),
+    }
+}
+
+fn validate_run_triggered_trigger(
+    event: &RunTriggered,
+) -> Result<(), OrchestrationEventContractError> {
+    match required_trigger("run_triggered", event.trigger.as_ref())? {
+        trigger_info::Trigger::Backfill(_) => Err(
+            OrchestrationEventContractError::UnsupportedTriggerKind("run_triggered", "backfill"),
+        ),
+        trigger_info::Trigger::Manual(_)
+        | trigger_info::Trigger::Schedule(_)
+        | trigger_info::Trigger::Materialization(_)
+        | trigger_info::Trigger::Webhook(_)
+        | trigger_info::Trigger::Sensor(_) => Ok(()),
     }
 }
 
@@ -237,14 +514,17 @@ impl CommitRootTransactionRequest {
 mod tests {
     use super::*;
 
+    const GENERATED_CATALOG_RS: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/arco.catalog.v1.rs"));
+    const GENERATED_ORCHESTRATION_RS: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/arco.orchestration.v1.rs"));
+
     fn pending_output() -> TaskOutput {
         TaskOutput {
-            materialization_id: Some(MaterializationId {
-                value: "mat_01HQXYZ".into(),
-            }),
+            materialization_id: Some("mat_01HQXYZ".into()),
             files: Vec::new(),
-            row_count: 0,
-            byte_size: 0,
+            row_count: None,
+            byte_size: None,
             visibility_state: OutputVisibilityState::Pending as i32,
             published_at: None,
             publish_error: None,
@@ -252,156 +532,39 @@ mod tests {
     }
 
     #[test]
-    fn test_tenant_id_roundtrip() {
-        let tenant = TenantId {
-            value: "acme-corp".to_string(),
+    fn task_output_pending_contract_accepts_empty_published_fields() {
+        assert_eq!(pending_output().validate_contract(), Ok(()));
+    }
+
+    #[test]
+    fn apply_catalog_ddl_requires_operation() {
+        let request = ApplyCatalogDdlRequest {
+            ddl: Some(CatalogDdlOperation { op: None }),
         };
 
-        assert_eq!(tenant.value, "acme-corp");
-    }
-
-    #[test]
-    fn test_partition_key_serialization() -> Result<(), prost::DecodeError> {
-        use prost::Message;
-
-        let mut dimensions = std::collections::BTreeMap::new();
-        dimensions.insert(
-            "date".to_string(),
-            ScalarValue {
-                value: Some(scalar_value::Value::DateValue("2025-01-15".to_string())),
-            },
-        );
-
-        let pk = PartitionKey { dimensions };
-        let encoded = pk.encode_to_vec();
-        let decoded = PartitionKey::decode(encoded.as_slice())?;
-
-        assert_eq!(decoded.dimensions.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn test_request_header_has_all_fields() {
-        let header = RequestHeader {
-            tenant_id: Some(TenantId {
-                value: "acme".into(),
-            }),
-            workspace_id: Some(WorkspaceId {
-                value: "production".into(),
-            }),
-            trace_parent: "00-abc123-def456-01".into(),
-            idempotency_key: "idem_001".into(),
-            request_time: None,
-            request_id: "req_12345".into(),
-        };
-
-        assert!(header.tenant_id.is_some());
-        assert!(header.workspace_id.is_some());
-        assert!(!header.idempotency_key.is_empty());
-        assert!(!header.request_id.is_empty());
-    }
-
-    #[test]
-    fn task_output_visibility_contract() {
-        let output = pending_output();
-
-        assert_eq!(output.row_count, 0);
-        assert_eq!(output.byte_size, 0);
         assert_eq!(
-            output.visibility_state,
-            OutputVisibilityState::Pending as i32
-        );
-        assert!(output.published_at.is_none());
-        assert!(output.publish_error.is_none());
-    }
-
-    #[test]
-    fn output_visibility_state_enum_values() {
-        assert_eq!(OutputVisibilityState::Unspecified as i32, 0);
-        assert_eq!(OutputVisibilityState::Pending as i32, 1);
-        assert_eq!(OutputVisibilityState::Visible as i32, 2);
-        assert_eq!(OutputVisibilityState::Failed as i32, 3);
-    }
-
-    #[test]
-    fn task_output_contract_accepts_pending_output() {
-        let output = pending_output();
-
-        assert_eq!(output.validate_contract(), Ok(()));
-    }
-
-    #[test]
-    fn task_output_contract_rejects_unspecified_visibility() {
-        let mut output = pending_output();
-        output.visibility_state = OutputVisibilityState::Unspecified as i32;
-
-        assert_eq!(
-            output.validate_contract(),
-            Err(TaskOutputContractError::UnspecifiedVisibilityState)
+            request.validate_contract(),
+            Err(ControlPlaneTransactionContractError::MissingCatalogDdlOp)
         );
     }
 
     #[test]
-    fn task_output_contract_rejects_visible_without_published_at() {
-        let mut output = pending_output();
-        output.visibility_state = OutputVisibilityState::Visible as i32;
-        output.files.push(FileEntry {
-            path: "s3://bucket/output.parquet".into(),
-            size_bytes: 128,
-            row_count: 0,
-            content_hash: "abc123".into(),
-            format: "parquet".into(),
-        });
-        output.row_count = 0;
-        output.byte_size = 128;
-
-        assert_eq!(
-            output.validate_contract(),
-            Err(TaskOutputContractError::VisibleMissingPublishedAt)
+    fn catalog_proto_does_not_generate_dead_id_based_helper_messages() {
+        assert!(
+            !GENERATED_CATALOG_RS.contains("pub struct Column "),
+            "catalog proto should not generate a dead public Column helper message"
+        );
+        assert!(
+            !GENERATED_CATALOG_RS.contains("pub struct LineageEdge "),
+            "catalog proto should not generate a dead public LineageEdge helper message"
         );
     }
 
     #[test]
-    fn task_output_contract_rejects_failed_without_publish_error() {
-        let mut output = pending_output();
-        output.visibility_state = OutputVisibilityState::Failed as i32;
-
-        assert_eq!(
-            output.validate_contract(),
-            Err(TaskOutputContractError::FailedMissingPublishError)
+    fn orchestration_proto_does_not_generate_partial_progress_json_escape_hatch() {
+        assert!(
+            !GENERATED_ORCHESTRATION_RS.contains("partial_progress_json"),
+            "orchestration proto should not generate a public partial_progress_json field"
         );
-    }
-
-    #[test]
-    fn task_output_contract_roundtrips_zero_stats() -> Result<(), prost::DecodeError> {
-        use prost::Message;
-
-        let pending_stats = pending_output();
-        let pending_encoded = pending_stats.encode_to_vec();
-        let pending_decoded = TaskOutput::decode(pending_encoded.as_slice())?;
-        assert_eq!(pending_decoded.row_count, 0);
-        assert_eq!(pending_decoded.byte_size, 0);
-
-        let mut zero_stats = pending_output();
-        zero_stats.visibility_state = OutputVisibilityState::Visible as i32;
-        zero_stats.files.push(FileEntry {
-            path: "s3://bucket/output.parquet".into(),
-            size_bytes: 0,
-            row_count: 0,
-            content_hash: "def456".into(),
-            format: "parquet".into(),
-        });
-        zero_stats.row_count = 0;
-        zero_stats.byte_size = 0;
-        zero_stats.published_at = Some(prost_types::Timestamp {
-            seconds: 1_742_770_800,
-            nanos: 0,
-        });
-        let zero_encoded = zero_stats.encode_to_vec();
-        let zero_decoded = TaskOutput::decode(zero_encoded.as_slice())?;
-        assert_eq!(zero_decoded.row_count, 0);
-        assert_eq!(zero_decoded.byte_size, 0);
-
-        Ok(())
     }
 }

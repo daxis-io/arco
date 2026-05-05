@@ -11,6 +11,7 @@
 
 # Local directories
 .worktrees/
+/target-review/
 
 # OS
 .DS_Store

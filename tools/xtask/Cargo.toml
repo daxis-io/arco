@@ -19,3 +19,6 @@ hex = { workspace = true }
 chrono = { workspace = true }
 arco-core = { path = "../../crates/arco-core" }
 arco-catalog = { path = "../../crates/arco-catalog" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

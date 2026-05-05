@@ -5,8 +5,8 @@
 //! apply changes, then write a new snapshot.
 
 use crate::parquet_util::{
-    CatalogRecord, ColumnRecord, LineageEdgeRecord, NamespaceRecord, SearchPostingRecord,
-    TableRecord,
+    CatalogCommitRecord, CatalogRecord, ColumnRecord, LineageEdgeRecord, NamespaceRecord,
+    SearchPostingRecord, TableRecord,
 };
 
 /// In-memory state for the catalog domain (namespaces, tables, columns).
@@ -20,6 +20,8 @@ pub struct CatalogState {
     pub tables: Vec<TableRecord>,
     /// Column records.
     pub columns: Vec<ColumnRecord>,
+    /// Visible catalog publication history.
+    pub commits: Vec<CatalogCommitRecord>,
 }
 
 impl CatalogState {

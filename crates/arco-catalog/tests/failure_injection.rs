@@ -45,6 +45,8 @@ pub struct FailingBackend {
     inner: MemoryBackend,
     /// Paths that should fail on next write (exact match).
     fail_on_write: Arc<RwLock<HashSet<String>>>,
+    /// Paths that should return a synthetic precondition failure on next write.
+    fail_precondition_on_write: Arc<RwLock<HashSet<String>>>,
     /// Paths that should fail on next read (exact match).
     fail_on_read: Arc<RwLock<HashSet<String>>>,
     /// If true, fail all operations (simulates total backend failure).
@@ -57,6 +59,7 @@ impl FailingBackend {
         Self {
             inner: MemoryBackend::new(),
             fail_on_write: Arc::new(RwLock::new(HashSet::new())),
+            fail_precondition_on_write: Arc::new(RwLock::new(HashSet::new())),
             fail_on_read: Arc::new(RwLock::new(HashSet::new())),
             fail_all: AtomicBool::new(false),
         }
@@ -67,6 +70,14 @@ impl FailingBackend {
     /// The failure is consumed after one use (single-shot).
     pub fn fail_on_write(&self, path: &str) {
         self.fail_on_write.write().unwrap().insert(path.to_string());
+    }
+
+    /// Configure the backend to return a single-shot precondition failure.
+    pub fn fail_precondition_on_write(&self, path: &str) {
+        self.fail_precondition_on_write
+            .write()
+            .unwrap()
+            .insert(path.to_string());
     }
 
     /// Configure the backend to fail reads from the specified path.
@@ -85,6 +96,17 @@ impl FailingBackend {
             return true;
         }
         self.fail_on_write.write().unwrap().remove(path)
+    }
+
+    /// Check if a write should return a precondition failure.
+    fn should_fail_precondition_write(&self, path: &str) -> bool {
+        if self.fail_all.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.fail_precondition_on_write
+            .write()
+            .unwrap()
+            .remove(path)
     }
 
     /// Check if a read should fail (and consume the failure if so).
@@ -135,6 +157,15 @@ impl StorageBackend for FailingBackend {
                 message: format!("Injected write failure: {path}"),
                 source: None,
             });
+        }
+        if self.should_fail_precondition_write(path) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let current_version = self
+                .inner
+                .head(path)
+                .await?
+                .map_or_else(|| "0".to_string(), |meta| meta.version);
+            return Ok(WriteResult::PreconditionFailed { current_version });
         }
         self.inner.put(path, data, precondition).await
     }
@@ -348,6 +379,66 @@ async fn tier1_reader_sees_only_committed_state() {
     );
 }
 
+/// Test that same-head retries keep `commits.parquet` aligned with the visible head.
+#[tokio::test]
+async fn tier1_retry_keeps_visible_commit_projection_in_sync() {
+    let backend = Arc::new(FailingBackend::new());
+    let storage =
+        ScopedStorage::new(backend.clone(), TEST_TENANT, TEST_WORKSPACE).expect("scoped storage");
+    let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
+
+    writer.initialize().await.expect("initialize");
+    writer
+        .create_catalog("default", None, WriteOptions::default())
+        .await
+        .expect("create default catalog");
+
+    let first_snapshot_manifest = scoped_path(
+        TEST_TENANT,
+        TEST_WORKSPACE,
+        "manifests/catalog/00000000000000000002.json",
+    );
+    backend.fail_precondition_on_write(&first_snapshot_manifest);
+
+    let commit = writer
+        .create_namespace_transaction("retry-safe", None, WriteOptions::default())
+        .await
+        .expect("create namespace transaction after retry");
+
+    let pointer_bytes = storage
+        .get_raw("manifests/catalog.pointer.json")
+        .await
+        .expect("catalog pointer bytes");
+    let pointer: DomainManifestPointer =
+        serde_json::from_slice(&pointer_bytes).expect("parse catalog pointer");
+    let manifest_bytes = storage
+        .get_raw(&pointer.manifest_path)
+        .await
+        .expect("catalog manifest bytes");
+    let manifest: CatalogDomainManifest =
+        serde_json::from_slice(&manifest_bytes).expect("parse catalog manifest");
+    let commits_bytes = storage
+        .get_raw(&format!(
+            "snapshots/catalog/v{}/commits.parquet",
+            manifest.snapshot_version
+        ))
+        .await
+        .expect("catalog commits bytes");
+    let commit_rows = arco_catalog::parquet_util::read_commits(&commits_bytes)
+        .expect("parse catalog commits parquet");
+    let latest = commit_rows
+        .last()
+        .expect("latest visible commit row must exist");
+
+    assert_eq!(latest.commit_ulid, commit.commit_id);
+    assert_eq!(
+        latest.commit_ulid,
+        manifest.last_commit_id.expect("manifest commit id")
+    );
+    assert_eq!(latest.published_at, manifest.updated_at.timestamp_millis());
+}
+
 /// Test idempotent initialization survives backend hiccups.
 #[tokio::test]
 async fn tier1_initialize_idempotent_after_failure() {
@@ -438,6 +529,8 @@ async fn sync_compact_does_not_create_legacy_manifest_mirror_or_report_repair_pe
         catalog_id: None,
         name: "repair-pending-ns".to_string(),
         description: Some("repair pending".to_string()),
+        properties_json: None,
+        storage_root: None,
         created_at: 1_710_000_000_000,
         updated_at: 1_710_000_000_000,
     };

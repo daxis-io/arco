@@ -22,9 +22,11 @@ use crate::manifest::{
     CatalogDomainManifest, DomainManifestPointer, LineageManifest, SearchManifest,
     compute_manifest_hash, next_manifest_id,
 };
-use crate::parquet_util::SearchPostingRecord;
+use crate::parquet_util::{CatalogCommitRecord, SearchPostingRecord};
 use crate::sync_compact_permit_issuer;
-use crate::tier1_events::{CatalogDdlEvent, CatalogDdlEventV2, LineageDdlEvent};
+use crate::tier1_events::{
+    CatalogDdlEvent, CatalogDdlEventV2, CatalogDdlEventV3, CatalogDdlEventV4, LineageDdlEvent,
+};
 use crate::tier1_snapshot;
 use crate::tier1_state;
 
@@ -132,6 +134,21 @@ pub struct Tier1Compactor {
     cas_max_retries: u32,
 }
 
+#[derive(Debug, Clone, Default)]
+struct CatalogCommitMetadata {
+    operation: Option<String>,
+    object_type: Option<String>,
+    object_id: Option<String>,
+    object_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReservedCatalogCommit {
+    previous_manifest_id: String,
+    commit_ulid: String,
+    published_at: chrono::DateTime<Utc>,
+}
+
 impl Tier1Compactor {
     /// Creates a new Tier-1 compactor.
     #[must_use]
@@ -178,7 +195,7 @@ impl Tier1Compactor {
             .await
     }
 
-    /// Performs Tier 1 compaction for the requested domain and event set.
+    /// Synchronously compacts pending event paths into the current domain manifest.
     ///
     /// # Errors
     ///
@@ -202,15 +219,16 @@ impl Tier1Compactor {
             CatalogDomain::Catalog | CatalogDomain::Lineage | CatalogDomain::Search => {}
         }
 
-        let mut event_paths = validate_event_paths(domain, event_paths)?;
+        // Preserve the caller-supplied order for explicit event batches. This is
+        // required for multi-event mutations like force deletes that must apply
+        // table drops before namespace/catalog deletes.
+        let event_paths = validate_event_paths(domain, event_paths)?;
 
         if event_paths.is_empty() && domain != CatalogDomain::Search {
             return Err(Tier1CompactionError::ProcessingError {
                 message: "no event paths provided".to_string(),
             });
         }
-
-        event_paths.sort();
 
         let lock_path = self.storage.lock(domain);
         let lock = DistributedLock::new(self.storage.backend().clone(), &lock_path);
@@ -270,6 +288,7 @@ impl Tier1Compactor {
             .and_then(|name| name.strip_suffix(".json"))
             .map(str::to_string);
         let publisher = Publisher::new(&self.storage);
+        let mut reserved_commit: Option<ReservedCatalogCommit> = None;
 
         for attempt in 1..=self.cas_max_retries {
             let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
@@ -312,48 +331,70 @@ impl Tier1Compactor {
                 .await
                 .map_err(map_processing_error)?;
 
+            let mut commit_metadata = CatalogCommitMetadata::default();
             for path in &event_paths {
                 let event = read_catalog_event(&self.storage, path).await?;
+                if event_paths.len() == 1 {
+                    commit_metadata = catalog_commit_metadata(&event);
+                }
                 apply_catalog_event(&mut state, event)?;
             }
 
             let next_version = manifest.snapshot_version + 1;
-            let snapshot =
-                tier1_snapshot::write_catalog_snapshot(&self.storage, next_version, &state)
-                    .await
-                    .map_err(map_processing_error)?;
-
-            let commit_ulid = next_commit_ulid(prev_manifest.commit_ulid.as_deref())?;
-
-            manifest.snapshot_version = snapshot.version;
-            manifest.snapshot_path.clone_from(&snapshot.path);
-            manifest.snapshot = Some(snapshot.clone());
-            manifest.updated_at = Utc::now();
-            manifest.parent_hash = Some(prev_raw_hash.clone());
-            manifest.fencing_token = Some(fencing_token);
-            manifest.epoch = fencing_token;
-            manifest.commit_ulid = Some(commit_ulid.clone());
-            manifest.previous_manifest_path = Some(previous_manifest_path.clone());
-            manifest.writer_session_id = Some(issuer.resource().to_string());
-            manifest.watermark_event_id.clone_from(&last_event_id);
-            manifest.manifest_id = next_available_manifest_id(
+            let next_commit = reserved_commit
+                .as_ref()
+                .filter(|commit| commit.previous_manifest_id == prev_manifest.manifest_id)
+                .cloned()
+                .unwrap_or(ReservedCatalogCommit {
+                    previous_manifest_id: prev_manifest.manifest_id.clone(),
+                    commit_ulid: next_commit_ulid(prev_manifest.commit_ulid.as_deref())?,
+                    published_at: Utc::now(),
+                });
+            reserved_commit = Some(next_commit.clone());
+            let manifest_id = next_available_manifest_id(
                 &self.storage,
                 CatalogDomain::Catalog,
                 &prev_manifest.manifest_id,
             )
             .await?;
+            let snapshot_manifest_path =
+                CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, &manifest_id);
+
+            state.commits.push(build_catalog_commit_record(
+                &next_commit.commit_ulid,
+                next_version,
+                next_commit.published_at.timestamp_millis(),
+                fencing_token,
+                last_event_id.clone(),
+                commit_metadata,
+            )?);
+
+            let mut snapshot =
+                tier1_snapshot::write_catalog_snapshot(&self.storage, next_version, &state)
+                    .await
+                    .map_err(map_processing_error)?;
+            snapshot.published_at = next_commit.published_at;
+
+            manifest.snapshot_version = snapshot.version;
+            manifest.snapshot_path.clone_from(&snapshot.path);
+            manifest.snapshot = Some(snapshot.clone());
+            manifest.updated_at = next_commit.published_at;
+            manifest.parent_hash = Some(prev_raw_hash.clone());
+            manifest.fencing_token = Some(fencing_token);
+            manifest.epoch = fencing_token;
+            manifest.commit_ulid = Some(next_commit.commit_ulid.clone());
+            manifest.previous_manifest_path = Some(previous_manifest_path.clone());
+            manifest.writer_session_id = Some(issuer.resource().to_string());
+            manifest.watermark_event_id.clone_from(&last_event_id);
+            manifest.manifest_id = manifest_id;
 
             manifest
                 .validate_succession(&prev_manifest, &prev_raw_hash)
                 .map_err(|message| Tier1CompactionError::ProcessingError { message })?;
 
-            manifest.last_commit_id = Some(commit_ulid.clone());
+            manifest.last_commit_id = Some(next_commit.commit_ulid.clone());
 
             let manifest_bytes = serde_json::to_vec(&manifest).map_err(map_processing_error)?;
-            let snapshot_manifest_path = CatalogPaths::domain_manifest_snapshot(
-                CatalogDomain::Catalog,
-                &manifest.manifest_id,
-            );
             match self
                 .storage
                 .put_raw(
@@ -389,14 +430,14 @@ impl Tier1Compactor {
                 || {
                     issuer.issue_create_permit_with_commit_ulid(
                         CatalogDomain::Catalog.as_str(),
-                        commit_ulid.clone(),
+                        next_commit.commit_ulid.clone(),
                     )
                 },
                 |expected| {
                     issuer.issue_permit_with_commit_ulid(
                         CatalogDomain::Catalog.as_str(),
                         expected.to_string(),
-                        commit_ulid.clone(),
+                        next_commit.commit_ulid.clone(),
                     )
                 },
             );
@@ -415,7 +456,7 @@ impl Tier1Compactor {
                 WriteResult::Success { version } => {
                     return Ok(Tier1CompactionResult {
                         manifest_version: version,
-                        commit_ulid,
+                        commit_ulid: next_commit.commit_ulid,
                         manifest_id: manifest.manifest_id,
                         events_processed,
                         snapshot_version: manifest.snapshot_version,
@@ -866,6 +907,135 @@ fn validate_event_paths(
 enum ParsedCatalogDdlEvent {
     V1(CatalogDdlEvent),
     V2(CatalogDdlEventV2),
+    V3(CatalogDdlEventV3),
+    V4(CatalogDdlEventV4),
+}
+
+fn catalog_commit_metadata(event: &ParsedCatalogDdlEvent) -> CatalogCommitMetadata {
+    match event {
+        ParsedCatalogDdlEvent::V1(event) => match event {
+            CatalogDdlEvent::NamespaceCreated { namespace } => CatalogCommitMetadata {
+                operation: Some("namespace_created".to_string()),
+                object_type: Some("namespace".to_string()),
+                object_id: Some(namespace.id.clone()),
+                object_name: Some(namespace.name.clone()),
+            },
+            CatalogDdlEvent::NamespaceUpdated { namespace } => CatalogCommitMetadata {
+                operation: Some("namespace_updated".to_string()),
+                object_type: Some("namespace".to_string()),
+                object_id: Some(namespace.id.clone()),
+                object_name: Some(namespace.name.clone()),
+            },
+            CatalogDdlEvent::NamespaceDeleted {
+                namespace_id,
+                namespace_name,
+            } => CatalogCommitMetadata {
+                operation: Some("namespace_deleted".to_string()),
+                object_type: Some("namespace".to_string()),
+                object_id: Some(namespace_id.clone()),
+                object_name: Some(namespace_name.clone()),
+            },
+            CatalogDdlEvent::TableRegistered { table, .. } => CatalogCommitMetadata {
+                operation: Some("table_registered".to_string()),
+                object_type: Some("table".to_string()),
+                object_id: Some(table.id.clone()),
+                object_name: Some(table.name.clone()),
+            },
+            CatalogDdlEvent::TableUpdated { table } => CatalogCommitMetadata {
+                operation: Some("table_updated".to_string()),
+                object_type: Some("table".to_string()),
+                object_id: Some(table.id.clone()),
+                object_name: Some(table.name.clone()),
+            },
+            CatalogDdlEvent::TableDropped {
+                table_id,
+                table_name,
+                ..
+            } => CatalogCommitMetadata {
+                operation: Some("table_dropped".to_string()),
+                object_type: Some("table".to_string()),
+                object_id: Some(table_id.clone()),
+                object_name: Some(table_name.clone()),
+            },
+            CatalogDdlEvent::TableRenamed {
+                table_id, new_name, ..
+            } => CatalogCommitMetadata {
+                operation: Some("table_renamed".to_string()),
+                object_type: Some("table".to_string()),
+                object_id: Some(table_id.clone()),
+                object_name: Some(new_name.clone()),
+            },
+        },
+        ParsedCatalogDdlEvent::V2(event) => match event {
+            CatalogDdlEventV2::CatalogCreated { catalog } => CatalogCommitMetadata {
+                operation: Some("catalog_created".to_string()),
+                object_type: Some("catalog".to_string()),
+                object_id: Some(catalog.id.clone()),
+                object_name: Some(catalog.name.clone()),
+            },
+        },
+        ParsedCatalogDdlEvent::V3(event) => match event {
+            CatalogDdlEventV3::CatalogUpdated { catalog } => CatalogCommitMetadata {
+                operation: Some("catalog_updated".to_string()),
+                object_type: Some("catalog".to_string()),
+                object_id: Some(catalog.id.clone()),
+                object_name: Some(catalog.name.clone()),
+            },
+            CatalogDdlEventV3::CatalogDeleted {
+                catalog_id,
+                catalog_name,
+            } => CatalogCommitMetadata {
+                operation: Some("catalog_deleted".to_string()),
+                object_type: Some("catalog".to_string()),
+                object_id: Some(catalog_id.clone()),
+                object_name: Some(catalog_name.clone()),
+            },
+        },
+        ParsedCatalogDdlEvent::V4(event) => match event {
+            CatalogDdlEventV4::CatalogRenamed { catalog, .. } => CatalogCommitMetadata {
+                operation: Some("catalog_renamed".to_string()),
+                object_type: Some("catalog".to_string()),
+                object_id: Some(catalog.id.clone()),
+                object_name: Some(catalog.name.clone()),
+            },
+            CatalogDdlEventV4::NamespaceRenamed { namespace, .. } => CatalogCommitMetadata {
+                operation: Some("namespace_renamed".to_string()),
+                object_type: Some("namespace".to_string()),
+                object_id: Some(namespace.id.clone()),
+                object_name: Some(namespace.name.clone()),
+            },
+        },
+    }
+}
+
+fn build_catalog_commit_record(
+    commit_ulid: &str,
+    snapshot_version: u64,
+    published_at: i64,
+    fencing_token: u64,
+    watermark_event_id: Option<String>,
+    metadata: CatalogCommitMetadata,
+) -> Result<CatalogCommitRecord, Tier1CompactionError> {
+    let snapshot_version =
+        i64::try_from(snapshot_version).map_err(|_| Tier1CompactionError::ProcessingError {
+            message: format!("snapshot_version {snapshot_version} does not fit in i64"),
+        })?;
+    let fencing_token =
+        i64::try_from(fencing_token).map_err(|_| Tier1CompactionError::ProcessingError {
+            message: format!("fencing_token {fencing_token} does not fit in i64"),
+        })?;
+
+    Ok(CatalogCommitRecord {
+        commit_ulid: commit_ulid.to_string(),
+        snapshot_version,
+        published_at,
+        fencing_token,
+        watermark_event_id,
+        operation: metadata.operation,
+        object_type: metadata.object_type,
+        object_id: metadata.object_id,
+        object_name: metadata.object_name,
+    })
 }
 
 async fn read_catalog_event(
@@ -908,6 +1078,16 @@ async fn read_catalog_event(
             let payload: CatalogDdlEventV2 =
                 serde_json::from_value(envelope.payload).map_err(map_processing_error)?;
             Ok(ParsedCatalogDdlEvent::V2(payload))
+        }
+        CatalogDdlEventV3::EVENT_VERSION => {
+            let payload: CatalogDdlEventV3 =
+                serde_json::from_value(envelope.payload).map_err(map_processing_error)?;
+            Ok(ParsedCatalogDdlEvent::V3(payload))
+        }
+        CatalogDdlEventV4::EVENT_VERSION => {
+            let payload: CatalogDdlEventV4 =
+                serde_json::from_value(envelope.payload).map_err(map_processing_error)?;
+            Ok(ParsedCatalogDdlEvent::V4(payload))
         }
         other => Err(Tier1CompactionError::ProcessingError {
             message: format!(
@@ -961,6 +1141,8 @@ fn apply_catalog_event(
     match event {
         ParsedCatalogDdlEvent::V1(event) => apply_catalog_event_v1(state, event),
         ParsedCatalogDdlEvent::V2(event) => apply_catalog_event_v2(state, event),
+        ParsedCatalogDdlEvent::V3(event) => apply_catalog_event_v3(state, event),
+        ParsedCatalogDdlEvent::V4(event) => apply_catalog_event_v4(state, event),
     }
 }
 
@@ -1215,6 +1397,185 @@ fn apply_catalog_event_v2(
     Ok(())
 }
 
+fn apply_catalog_event_v3(
+    state: &mut crate::state::CatalogState,
+    event: CatalogDdlEventV3,
+) -> Result<(), Tier1CompactionError> {
+    match event {
+        CatalogDdlEventV3::CatalogUpdated { catalog } => {
+            let Some(existing) = state
+                .catalogs
+                .iter_mut()
+                .find(|candidate| candidate.id == catalog.id)
+            else {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog '{}' not found", catalog.id),
+                });
+            };
+
+            if existing.name != catalog.name {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog identity mismatch for {}", catalog.id),
+                });
+            }
+
+            if existing == &catalog {
+                return Ok(());
+            }
+
+            *existing = catalog;
+        }
+        CatalogDdlEventV3::CatalogDeleted {
+            catalog_id,
+            catalog_name,
+        } => {
+            let index = state
+                .catalogs
+                .iter()
+                .position(|catalog| catalog.id == catalog_id);
+
+            let Some(index) = index else {
+                return Ok(());
+            };
+
+            let Some(existing) = state.catalogs.get(index) else {
+                return Ok(());
+            };
+            if existing.name != catalog_name {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog name mismatch for {catalog_id}"),
+                });
+            }
+
+            let default_catalog_id = state
+                .catalogs
+                .iter()
+                .find(|catalog| catalog.name == "default")
+                .map(|catalog| catalog.id.as_str());
+            if state.namespaces.iter().any(|namespace| {
+                namespace.catalog_id.as_deref().or(default_catalog_id) == Some(catalog_id.as_str())
+            }) {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog '{catalog_name}' contains schemas"),
+                });
+            }
+
+            state.catalogs.remove(index);
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_catalog_event_v4(
+    state: &mut crate::state::CatalogState,
+    event: CatalogDdlEventV4,
+) -> Result<(), Tier1CompactionError> {
+    match event {
+        CatalogDdlEventV4::CatalogRenamed { catalog, old_name } => {
+            let Some(index) = state
+                .catalogs
+                .iter()
+                .position(|candidate| candidate.id == catalog.id)
+            else {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog '{}' not found", catalog.id),
+                });
+            };
+            let Some(existing) = state.catalogs.get(index) else {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog '{}' not found", catalog.id),
+                });
+            };
+
+            if existing.name != old_name {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog identity mismatch for {}", catalog.id),
+                });
+            }
+
+            if old_name != catalog.name
+                && state
+                    .catalogs
+                    .iter()
+                    .any(|candidate| candidate.id != catalog.id && candidate.name == catalog.name)
+            {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog '{}' already exists", catalog.name),
+                });
+            }
+
+            if existing == &catalog {
+                return Ok(());
+            }
+
+            let Some(existing) = state.catalogs.get_mut(index) else {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog '{}' not found", catalog.id),
+                });
+            };
+            *existing = catalog;
+        }
+        CatalogDdlEventV4::NamespaceRenamed {
+            namespace,
+            old_name,
+        } => {
+            let default_catalog_id = state
+                .catalogs
+                .iter()
+                .find(|catalog| catalog.name == "default")
+                .map(|catalog| catalog.id.as_str());
+            let Some(index) = state
+                .namespaces
+                .iter()
+                .position(|candidate| candidate.id == namespace.id)
+            else {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("namespace '{}' not found", namespace.id),
+                });
+            };
+            let Some(existing) = state.namespaces.get(index) else {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("namespace '{}' not found", namespace.id),
+                });
+            };
+
+            if existing.name != old_name {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("namespace identity mismatch for {}", namespace.id),
+                });
+            }
+
+            let target_catalog_id = namespace.catalog_id.as_deref().or(default_catalog_id);
+            if old_name != namespace.name
+                && state.namespaces.iter().any(|candidate| {
+                    candidate.id != namespace.id
+                        && candidate.name == namespace.name
+                        && candidate.catalog_id.as_deref().or(default_catalog_id)
+                            == target_catalog_id
+                })
+            {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("namespace '{}' already exists", namespace.name),
+                });
+            }
+
+            if existing == &namespace {
+                return Ok(());
+            }
+
+            let Some(existing) = state.namespaces.get_mut(index) else {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("namespace '{}' not found", namespace.id),
+                });
+            };
+            *existing = namespace;
+        }
+    }
+
+    Ok(())
+}
+
 #[allow(clippy::unnecessary_wraps)]
 fn apply_lineage_event(
     state: &mut crate::state::LineageState,
@@ -1437,6 +1798,8 @@ mod tests {
                 catalog_id: None,
                 name: "sales".to_string(),
                 description: Some("Sales".to_string()),
+                properties_json: None,
+                storage_root: None,
                 created_at: now,
                 updated_at: now,
             }],
@@ -1447,6 +1810,8 @@ mod tests {
                 description: Some("Orders".to_string()),
                 location: None,
                 format: None,
+                table_type: None,
+                properties_json: None,
                 created_at: now,
                 updated_at: now,
             }],
@@ -1459,6 +1824,7 @@ mod tests {
                 ordinal: 0,
                 description: None,
             }],
+            commits: Vec::new(),
         };
 
         let snapshot = tier1_snapshot::write_catalog_snapshot(&storage, 1, &state)

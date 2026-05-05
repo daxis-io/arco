@@ -14,6 +14,8 @@
 //! - `GET  /catalogs/{catalog}/schemas/{schema}/tables` - List tables in a schema
 //! - `GET  /catalogs/{catalog}/schemas/{schema}/tables/{name}` - Get table by name
 
+#![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -273,12 +275,6 @@ pub(crate) async fn create_catalog(
     let options = arco_catalog::write_options::WriteOptions::default()
         .with_actor(format!("api:{}", ctx.tenant))
         .with_request_id(&ctx.request_id);
-
-    let options = if let Some(key) = ctx.idempotency_key.as_ref() {
-        options.with_idempotency_key(key)
-    } else {
-        options
-    };
 
     let create_result = writer
         .create_catalog(&req.name, req.description.as_deref(), options)
@@ -545,12 +541,6 @@ pub(crate) async fn create_schema(
         .with_actor(format!("api:{}", ctx.tenant))
         .with_request_id(&ctx.request_id);
 
-    let options = if let Some(key) = ctx.idempotency_key.as_ref() {
-        options.with_idempotency_key(key)
-    } else {
-        options
-    };
-
     let create_result = writer
         .create_schema(&catalog, &req.name, req.description.as_deref(), options)
         .await;
@@ -781,19 +771,15 @@ pub(crate) async fn register_table_in_schema(
         .with_actor(format!("api:{}", ctx.tenant))
         .with_request_id(&ctx.request_id);
 
-    let options = if let Some(key) = ctx.idempotency_key.as_ref() {
-        options.with_idempotency_key(key)
-    } else {
-        options
-    };
-
     let columns = req
         .columns
         .into_iter()
-        .map(|c| arco_catalog::ColumnDefinition {
+        .enumerate()
+        .map(|(ordinal, c)| arco_catalog::ColumnDefinition {
             name: c.name,
             data_type: c.data_type,
             is_nullable: c.nullable,
+            ordinal: ordinal as i32,
             description: c.description,
         })
         .collect();
@@ -807,6 +793,8 @@ pub(crate) async fn register_table_in_schema(
                 description: req.description,
                 location: req.location,
                 format: Some(requested_format.clone()),
+                table_type: None,
+                properties: None,
                 columns,
             },
             options,

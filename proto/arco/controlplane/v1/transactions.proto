@@ -1,0 +1,215 @@
+syntax = "proto3";
+
+package arco.controlplane.v1;
+
+import "arco/catalog/v1/catalog.proto";
+import "arco/catalog/v1/metastore.proto";
+import "arco/orchestration/v1/orchestration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/daxis-io/arco/proto/arco/controlplane/v1";
+option java_multiple_files = true;
+option java_package = "com.arco.controlplane.v1";
+
+service ControlPlaneTransactionService {
+  rpc ApplyCatalogDdl(ApplyCatalogDdlRequest) returns (ApplyCatalogDdlResponse);
+  rpc GetCatalogTransaction(GetCatalogTransactionRequest) returns (GetCatalogTransactionResponse);
+  rpc CommitOrchestrationBatch(CommitOrchestrationBatchRequest) returns (CommitOrchestrationBatchResponse);
+  rpc GetOrchestrationTransaction(GetOrchestrationTransactionRequest) returns (GetOrchestrationTransactionResponse);
+  rpc CommitRootTransaction(CommitRootTransactionRequest) returns (CommitRootTransactionResponse);
+  rpc GetRootTransaction(GetRootTransactionRequest) returns (GetRootTransactionResponse);
+}
+
+enum TransactionStatus {
+  TRANSACTION_STATUS_UNSPECIFIED = 0;
+  TRANSACTION_STATUS_PREPARED = 1;
+  TRANSACTION_STATUS_VISIBLE = 2;
+  TRANSACTION_STATUS_ABORTED = 3;
+}
+
+enum TransactionDomain {
+  TRANSACTION_DOMAIN_UNSPECIFIED = 0;
+  TRANSACTION_DOMAIN_CATALOG = 1;
+  TRANSACTION_DOMAIN_ORCHESTRATION = 2;
+  TRANSACTION_DOMAIN_ROOT = 3;
+}
+
+message ApplyCatalogDdlRequest {
+  reserved 1, 20;
+  reserved "header", "require_visible";
+
+  arco.catalog.v1.CatalogDdlOperation ddl = 2;
+}
+
+message ApplyCatalogDdlResponse {
+  CatalogTxReceipt receipt = 1;
+  bool repair_pending = 2;
+}
+
+message CatalogTxReceipt {
+  string tx_id = 1;
+  string event_id = 2;
+  string commit_id = 3;
+  string manifest_id = 4;
+  uint64 snapshot_version = 5;
+  string pointer_version = 6;
+  string read_token = 7;
+  google.protobuf.Timestamp visible_at = 8;
+}
+
+message CatalogTxStatus {
+  string tx_id = 1;
+  TransactionStatus status = 2;
+  reserved 3, 4;
+  reserved "request_id", "idempotency_key";
+  string request_hash = 5;
+  string lock_path = 6;
+  uint64 fencing_token = 7;
+  google.protobuf.Timestamp prepared_at = 8;
+  google.protobuf.Timestamp visible_at = 9;
+  CatalogTxReceipt result = 10;
+  bool repair_pending = 11;
+}
+
+message GetCatalogTransactionRequest {
+  reserved 1;
+  reserved "header";
+
+  string tx_id = 2;
+}
+
+message GetCatalogTransactionResponse {
+  CatalogTxStatus status = 1;
+}
+
+message CommitOrchestrationBatchRequest {
+  reserved 1, 3, 4;
+  reserved "header", "require_visible", "allow_inline_merge";
+
+  // Public typed orchestration event contract. Keep storage-internal-only
+  // envelopes out of this surface instead of relying on undocumented payloads.
+  repeated arco.orchestration.v1.OrchestrationEventEnvelope events = 2;
+}
+
+message CommitOrchestrationBatchResponse {
+  OrchestrationTxReceipt receipt = 1;
+  bool repair_pending = 2;
+}
+
+message OrchestrationTxReceipt {
+  string tx_id = 1;
+  string commit_id = 2;
+  string manifest_id = 3;
+  string revision_ulid = 4;
+  string delta_id = 5;
+  string pointer_version = 6;
+  uint32 events_processed = 7;
+  string read_token = 8;
+  google.protobuf.Timestamp visible_at = 9;
+}
+
+message OrchestrationTxStatus {
+  string tx_id = 1;
+  TransactionStatus status = 2;
+  reserved 3, 4;
+  reserved "request_id", "idempotency_key";
+  string request_hash = 5;
+  string lock_path = 6;
+  uint64 fencing_token = 7;
+  google.protobuf.Timestamp prepared_at = 8;
+  google.protobuf.Timestamp visible_at = 9;
+  OrchestrationTxReceipt result = 10;
+  bool repair_pending = 11;
+}
+
+message GetOrchestrationTransactionRequest {
+  reserved 1;
+  reserved "header";
+
+  string tx_id = 2;
+}
+
+message GetOrchestrationTransactionResponse {
+  OrchestrationTxStatus status = 1;
+}
+
+message OrchestrationBatchSpec {
+  repeated arco.orchestration.v1.OrchestrationEventEnvelope events = 1;
+}
+
+message DomainMutation {
+  oneof kind {
+    arco.catalog.v1.CatalogDdlOperation catalog = 1;
+    OrchestrationBatchSpec orchestration = 2;
+    arco.catalog.v1.MetastoreMutation metastore = 3;
+  }
+}
+
+message CommitRootTransactionRequest {
+  reserved 1;
+  reserved "header";
+
+  repeated DomainMutation mutations = 2;
+}
+
+message CommitRootTransactionResponse {
+  RootTxReceipt receipt = 1;
+  bool repair_pending = 2;
+}
+
+message DomainCommit {
+  TransactionDomain domain = 1;
+  string tx_id = 2;
+  string commit_id = 3;
+  string manifest_id = 4;
+  string manifest_path = 5;
+  string read_token = 6;
+}
+
+message RootTxParticipant {
+  TransactionDomain domain = 1;
+  string lock_path = 2;
+  string tx_id = 3;
+  string manifest_id = 4;
+  string manifest_path = 5;
+}
+
+message RootTxReceipt {
+  string tx_id = 1;
+  string root_commit_id = 2;
+  reserved 3, 5;
+  reserved "root_manifest_id", "pointer_version";
+  string super_manifest_path = 4;
+  repeated DomainCommit domain_commits = 6;
+  string read_token = 7;
+  google.protobuf.Timestamp visible_at = 8;
+}
+
+message RootTxStatus {
+  string tx_id = 1;
+  TransactionStatus status = 2;
+  reserved 3, 4;
+  reserved "request_id", "idempotency_key";
+  string request_hash = 5;
+  string lock_path = 6;
+  uint64 fencing_token = 7;
+  google.protobuf.Timestamp prepared_at = 8;
+  google.protobuf.Timestamp visible_at = 9;
+  reserved 10, 12;
+  reserved "root_manifest_id", "pointer_version";
+  string super_manifest_path = 11;
+  bool repair_pending = 13;
+  repeated RootTxParticipant domains = 14;
+  RootTxReceipt result = 15;
+}
+
+message GetRootTransactionRequest {
+  reserved 1;
+  reserved "header";
+
+  string tx_id = 2;
+}
+
+message GetRootTransactionResponse {
+  RootTxStatus status = 1;
+}

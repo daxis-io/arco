@@ -70,6 +70,15 @@ pub enum CatalogError {
         message: String,
     },
 
+    /// Replayed terminal request failure with a preserved HTTP status code.
+    #[error("{message}")]
+    RequestFailed {
+        /// Original HTTP status code for the failed request.
+        http_status: u16,
+        /// Original failure message.
+        message: String,
+    },
+
     /// An internal invariant was violated (bug or corrupted state).
     #[error("invariant violation: {message}")]
     InvariantViolation {
@@ -102,6 +111,7 @@ impl CatalogError {
             Self::AlreadyExists { .. } | Self::CasFailed { .. } => Some(409),
             Self::NotFound { .. } => Some(404),
             Self::PreconditionFailed { .. } => Some(412),
+            Self::RequestFailed { http_status, .. } => Some(*http_status),
             Self::UnsupportedOperation { .. } => Some(406),
             Self::Storage { .. }
             | Self::Serialization { .. }

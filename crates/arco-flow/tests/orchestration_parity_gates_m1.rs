@@ -252,7 +252,7 @@ fn task_finished_event(
             error: None,
             metrics: None,
             cancelled_during_phase: None,
-            partial_progress: None,
+            partial_progress_json: None,
             asset_key: None,
             partition_key: None,
             code_version: None,

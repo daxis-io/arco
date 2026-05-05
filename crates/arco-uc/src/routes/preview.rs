@@ -1,16 +1,11 @@
-//! Shared helpers for Unity Catalog preview interoperability handlers.
-
-use arco_core::ScopedStorage;
-use arco_core::error::Error as CoreError;
-use arco_core::storage::{WritePrecondition, WriteResult};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+//! Shared validation and pagination helpers for UC routes.
+//!
+//! Catalog/schema/table CRUD no longer uses preview JSON storage. The remaining
+//! explicit preview surfaces (for example Delta preview endpoints) keep their
+//! own state handling; this module now exists only for generic request parsing.
 
 use crate::error::{UnityCatalogError, UnityCatalogResult};
 
-pub const CATALOGS_PREFIX: &str = "unity-catalog-preview/catalogs";
-pub const SCHEMAS_PREFIX: &str = "unity-catalog-preview/schemas";
-pub const TABLES_PREFIX: &str = "unity-catalog-preview/tables";
 pub const DEFAULT_PAGE_SIZE: usize = 100;
 
 pub struct Pagination {
@@ -18,27 +13,14 @@ pub struct Pagination {
     limit: usize,
 }
 
-pub fn catalog_path(name: &str) -> String {
-    format!("{CATALOGS_PREFIX}/{name}.json")
-}
+impl Pagination {
+    pub const fn start(&self) -> usize {
+        self.start
+    }
 
-pub fn schema_prefix(catalog_name: &str) -> String {
-    format!("{SCHEMAS_PREFIX}/{catalog_name}/")
-}
-
-pub fn schema_path(catalog_name: &str, schema_name: &str) -> String {
-    format!("{}{schema_name}.json", schema_prefix(catalog_name))
-}
-
-pub fn table_prefix(catalog_name: &str, schema_name: &str) -> String {
-    format!("{TABLES_PREFIX}/{catalog_name}/{schema_name}/")
-}
-
-pub fn table_path(catalog_name: &str, schema_name: &str, table_name: &str) -> String {
-    format!(
-        "{}{table_name}.json",
-        table_prefix(catalog_name, schema_name)
-    )
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
 }
 
 pub fn require_identifier(value: Option<String>, field: &str) -> UnityCatalogResult<String> {
@@ -91,114 +73,6 @@ fn validate_identifier(value: &str, field: &str) -> UnityCatalogResult<()> {
     })
 }
 
-pub async fn write_json_if_absent<T: Serialize + Sync>(
-    storage: &ScopedStorage,
-    path: &str,
-    value: &T,
-    operation_name: &str,
-) -> UnityCatalogResult<WriteResult> {
-    let bytes = serde_json::to_vec(value).map_err(|err| UnityCatalogError::Internal {
-        message: format!("failed to serialize {operation_name}: {err}"),
-    })?;
-    storage
-        .put_raw(path, bytes.into(), WritePrecondition::DoesNotExist)
-        .await
-        .map_err(|err| storage_error(operation_name, err))
-}
-
-pub async fn read_json_page<T: DeserializeOwned>(
-    storage: &ScopedStorage,
-    prefix: &str,
-    operation_name: &str,
-    pagination: &Pagination,
-) -> UnityCatalogResult<(Vec<T>, Option<String>)> {
-    let mut object_paths = storage
-        .list(prefix)
-        .await
-        .map_err(|err| storage_error(operation_name, err))?;
-    object_paths.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-
-    if pagination.start >= object_paths.len() {
-        return Ok((Vec::new(), None));
-    }
-
-    let end = pagination
-        .start
-        .saturating_add(pagination.limit)
-        .min(object_paths.len());
-    let page_len = end.saturating_sub(pagination.start);
-    let mut parsed = Vec::with_capacity(page_len);
-    for object_path in object_paths.iter().skip(pagination.start).take(page_len) {
-        let body = storage
-            .get_raw(object_path.as_str())
-            .await
-            .map_err(|err| storage_error(operation_name, err))?;
-        let value =
-            serde_json::from_slice::<T>(&body).map_err(|err| UnityCatalogError::Internal {
-                message: format!(
-                    "failed to parse {operation_name} payload at {}: {err}",
-                    object_path.as_str()
-                ),
-            })?;
-        parsed.push(value);
-    }
-
-    let next_page_token = (end < object_paths.len()).then(|| end.to_string());
-    Ok((parsed, next_page_token))
-}
-
-pub async fn read_json_object<T: DeserializeOwned>(
-    storage: &ScopedStorage,
-    path: &str,
-    operation_name: &str,
-) -> UnityCatalogResult<T> {
-    let body = storage
-        .get_raw(path)
-        .await
-        .map_err(|err| storage_error(operation_name, err))?;
-    serde_json::from_slice::<T>(&body).map_err(|err| UnityCatalogError::Internal {
-        message: format!("failed to parse {operation_name} payload at {path}: {err}"),
-    })
-}
-
-pub async fn object_exists(
-    storage: &ScopedStorage,
-    path: &str,
-    operation_name: &str,
-) -> UnityCatalogResult<bool> {
-    storage
-        .head_raw(path)
-        .await
-        .map(|meta| meta.is_some())
-        .map_err(|err| storage_error(operation_name, err))
-}
-
-pub async fn list_paths(
-    storage: &ScopedStorage,
-    prefix: &str,
-    operation_name: &str,
-) -> UnityCatalogResult<Vec<String>> {
-    let scoped = storage
-        .list(prefix)
-        .await
-        .map_err(|err| storage_error(operation_name, err))?;
-    Ok(scoped
-        .into_iter()
-        .map(|path| path.as_str().to_string())
-        .collect())
-}
-
-pub async fn delete_path(
-    storage: &ScopedStorage,
-    path: &str,
-    operation_name: &str,
-) -> UnityCatalogResult<()> {
-    storage
-        .delete(path)
-        .await
-        .map_err(|err| storage_error(operation_name, err))
-}
-
 pub fn parse_pagination(
     page_token: Option<&str>,
     max_results: Option<i32>,
@@ -239,18 +113,5 @@ fn parse_max_results(
             })?;
             Ok(value.min(max_page_size))
         }
-    }
-}
-
-fn storage_error(operation_name: &str, err: CoreError) -> UnityCatalogError {
-    match err {
-        CoreError::NotFound(_) | CoreError::ResourceNotFound { .. } => {
-            UnityCatalogError::NotFound {
-                message: format!("{operation_name} resource not found"),
-            }
-        }
-        other => UnityCatalogError::Internal {
-            message: format!("failed to {operation_name}: {other}"),
-        },
     }
 }

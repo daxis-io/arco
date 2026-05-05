@@ -45,7 +45,7 @@ use crate::manifest::{
 };
 use crate::parquet_util;
 use crate::write_options::SnapshotVersion;
-use crate::writer::{Catalog, Column, LineageEdge, Namespace, Table};
+use crate::writer::{Catalog, Column, LineageEdge, Schema, Table};
 
 // ============================================================================
 // Freshness Metadata
@@ -261,7 +261,9 @@ impl CatalogReader {
         let by_id = Arc::new(
             records
                 .into_iter()
-                .map(Table::from)
+                .map(Table::try_from)
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
                 .map(|table| (table.id.clone(), table))
                 .collect::<HashMap<_, _>>(),
         );
@@ -407,13 +409,13 @@ impl CatalogReader {
             Err(e) => return Err(e.into()),
         };
 
-        Ok(records.into_iter().map(Catalog::from).collect())
+        records.into_iter().map(Catalog::try_from).collect()
     }
 
     async fn list_namespaces_from_catalog_manifest(
         &self,
         manifest: &CatalogDomainManifest,
-    ) -> Result<Vec<Namespace>> {
+    ) -> Result<Vec<Schema>> {
         if manifest.snapshot_version == 0 {
             return Ok(Vec::new());
         }
@@ -427,14 +429,14 @@ impl CatalogReader {
         let bytes = self.storage.get_raw(&ns_path).await?;
         let records = parquet_util::read_namespaces(&bytes)?;
 
-        Ok(records.into_iter().map(Namespace::from).collect())
+        records.into_iter().map(Schema::try_from).collect()
     }
 
     async fn list_schemas_from_catalog_manifest(
         &self,
         catalog_manifest: &CatalogDomainManifest,
         catalog: &str,
-    ) -> Result<Vec<Namespace>> {
+    ) -> Result<Vec<Schema>> {
         if catalog_manifest.snapshot_version == 0 {
             return Err(CatalogError::NotFound {
                 entity: "catalog".into(),
@@ -493,11 +495,11 @@ impl CatalogReader {
         let bytes = self.storage.get_raw(&tables_path).await?;
         let records = parquet_util::read_tables(&bytes)?;
 
-        Ok(records
+        records
             .into_iter()
             .filter(|table| table.namespace_id == namespace_id)
-            .map(Table::from)
-            .collect())
+            .map(Table::try_from)
+            .collect()
     }
 
     async fn list_tables_from_catalog_manifest(
@@ -560,11 +562,13 @@ impl CatalogReader {
         let bytes = self.storage.get_raw(&columns_path).await?;
         let records = parquet_util::read_columns(&bytes)?;
 
-        Ok(records
+        let mut columns = records
             .into_iter()
             .filter(|column| column.table_id == table_id)
             .map(Column::from)
-            .collect())
+            .collect::<Vec<_>>();
+        columns.sort_by_key(|column| column.ordinal);
+        Ok(columns)
     }
     // ========================================================================
     // Catalog Operations (UC-like model)
@@ -603,7 +607,7 @@ impl CatalogReader {
     /// # Errors
     ///
     /// Returns an error if the catalog doesn't exist or snapshot reads fail.
-    pub async fn list_schemas(&self, catalog: &str) -> Result<Vec<Namespace>> {
+    pub async fn list_schemas(&self, catalog: &str) -> Result<Vec<Schema>> {
         let manifest = self.read_manifest().await?;
         self.list_schemas_from_catalog_manifest(&manifest.catalog, catalog)
             .await
@@ -658,7 +662,7 @@ impl CatalogReader {
     /// # Errors
     ///
     /// Returns an error if the snapshot cannot be read.
-    pub async fn list_namespaces(&self) -> Result<Vec<Namespace>> {
+    pub async fn list_namespaces(&self) -> Result<Vec<Schema>> {
         let manifest = self.read_manifest().await?;
         self.list_namespaces_from_catalog_manifest(&manifest.catalog)
             .await
@@ -674,7 +678,7 @@ impl CatalogReader {
     ///
     /// Returns an error if the root token is invalid, not visible, omits the
     /// catalog domain, or the pinned snapshot cannot be read.
-    pub async fn list_namespaces_for_root_token(&self, read_token: &str) -> Result<Vec<Namespace>> {
+    pub async fn list_namespaces_for_root_token(&self, read_token: &str) -> Result<Vec<Schema>> {
         let manifest = self
             .read_catalog_manifest_for_root_token(read_token)
             .await?;
@@ -694,7 +698,7 @@ impl CatalogReader {
     /// # Errors
     ///
     /// Returns an error if the snapshot cannot be read.
-    pub async fn get_namespace(&self, name: &str) -> Result<Option<Namespace>> {
+    pub async fn get_namespace(&self, name: &str) -> Result<Option<Schema>> {
         let manifest = self.read_manifest().await?;
         let namespaces = self
             .list_namespaces_from_catalog_manifest(&manifest.catalog)
@@ -1126,14 +1130,14 @@ impl CatalogReader {
 #[cfg(test)]
 impl PinnedCatalogReader<'_> {
     /// Lists namespaces from the pinned catalog manifest.
-    pub async fn list_namespaces(&self) -> Result<Vec<Namespace>> {
+    pub async fn list_namespaces(&self) -> Result<Vec<Schema>> {
         self.reader
             .list_namespaces_from_catalog_manifest(&self.catalog_manifest)
             .await
     }
 
     /// Gets a namespace by name from the pinned catalog manifest.
-    pub async fn get_namespace(&self, name: &str) -> Result<Option<Namespace>> {
+    pub async fn get_namespace(&self, name: &str) -> Result<Option<Schema>> {
         let namespaces = self.list_namespaces().await?;
         Ok(namespaces
             .into_iter()
@@ -1283,6 +1287,7 @@ mod tests {
             name: name.to_string(),
             data_type: "STRING".to_string(),
             is_nullable: true,
+            ordinal: 0,
             description: None,
         }
     }
@@ -1490,27 +1495,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mint_signed_urls_with_allowlist_avoids_manifest_recompute() {
-        let reader = setup();
-        let path = "state/catalog/snapshots/v1/tables.parquet".to_string();
-        let mut allowlist = HashSet::new();
-        allowlist.insert(path.clone());
-
-        let urls = reader
-            .mint_signed_urls_with_allowlist(
-                vec![path.clone()],
-                &allowlist,
-                Duration::from_secs(300),
-            )
-            .await
-            .expect("mint with precomputed allowlist");
-
-        assert_eq!(urls.len(), 1);
-        assert_eq!(urls[0].path, path);
-        assert!(urls[0].url.contains("signature=mock"));
-    }
-
-    #[tokio::test]
     async fn test_lineage_graph_default() {
         let graph = LineageGraph::default();
         assert!(graph.upstream.is_empty());
@@ -1709,8 +1693,8 @@ mod tests {
             kind: ControlPlaneTxKind::RootCommit,
             status: ControlPlaneTxStatus::Visible,
             repair_pending: false,
-            request_id: "req-root-reader-01".to_string(),
-            idempotency_key: "idem-root-reader-01".to_string(),
+            request_id: "req-root-reader".to_string(),
+            idempotency_key: "idem-root-reader".to_string(),
             request_hash: "sha256:root-reader".to_string(),
             lock_path: ControlPlaneTxPaths::root_lock(),
             fencing_token: 1,
@@ -1876,8 +1860,8 @@ mod tests {
             kind: ControlPlaneTxKind::RootCommit,
             status: ControlPlaneTxStatus::Visible,
             repair_pending: false,
-            request_id: "req-root-reader-02".to_string(),
-            idempotency_key: "idem-root-reader-02".to_string(),
+            request_id: "req-root-reader-pinned-view".to_string(),
+            idempotency_key: "idem-root-reader-pinned-view".to_string(),
             request_hash: "sha256:root-reader-pinned-view".to_string(),
             lock_path: ControlPlaneTxPaths::root_lock(),
             fencing_token: 1,

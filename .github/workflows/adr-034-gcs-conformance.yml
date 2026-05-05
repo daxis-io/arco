@@ -1,0 +1,65 @@
+name: ADR-034 GCS Conformance
+
+on:
+  schedule:
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  gcs-conformance:
+    name: GCS Storage Conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.85
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-targets: "false"
+
+      - name: Check GCS conformance prerequisites
+        id: prereq
+        run: |
+          if [ -n "${{ vars.ARCO_TEST_GCS_BUCKET }}" ] && [ -n "${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}" ] && [ -n "${{ vars.GCP_SERVICE_ACCOUNT }}" ]; then
+            echo "auth_mode=oidc" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ vars.ARCO_TEST_GCS_BUCKET }}" ] && [ -n "${{ secrets.GCP_SA_KEY_API }}" ]; then
+            echo "auth_mode=key" >> "$GITHUB_OUTPUT"
+          else
+            echo "auth_mode=skip" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authenticate to GCP via OIDC
+        if: steps.prereq.outputs.auth_mode == 'oidc'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Authenticate to GCP via service-account key
+        if: steps.prereq.outputs.auth_mode == 'key'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_API }}
+
+      - name: Run GCS storage conformance suite
+        if: steps.prereq.outputs.auth_mode != 'skip'
+        env:
+          ARCO_TEST_GCS_BUCKET: ${{ vars.ARCO_TEST_GCS_BUCKET }}
+        run: |
+          cargo test --locked -p arco-core --test storage_backend_conformance \
+            gcs_backend_satisfies_storage_conformance -- --ignored --nocapture
+
+      - name: Skip GCS storage conformance suite
+        if: steps.prereq.outputs.auth_mode == 'skip'
+        run: |
+          echo "Skipping ADR-034 GCS conformance: missing vars.ARCO_TEST_GCS_BUCKET and GCP auth configuration"

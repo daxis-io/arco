@@ -265,6 +265,9 @@ jobs:
       - name: Lint protos
         run: buf lint proto/
 
+      - name: Check frozen post-cut baseline
+        run: cargo xtask proto-breaking-check
+
       - name: Check breaking changes
         if: github.event_name == 'pull_request'
         run: |

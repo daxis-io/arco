@@ -301,7 +301,6 @@ pub fn record_repair_automation_findings(
 }
 
 /// Sets the current repair backlog count and age.
-#[allow(clippy::cast_precision_loss)]
 pub fn set_repair_backlog(
     domain: CatalogDomain,
     tenant_id: &str,
@@ -311,6 +310,8 @@ pub fn set_repair_backlog(
     count: u64,
     age_seconds: f64,
 ) {
+    #[allow(clippy::cast_precision_loss)]
+    let count = count as f64;
     gauge!(
         REPAIR_BACKLOG_COUNT,
         "domain" => domain.as_str().to_string(),
@@ -319,7 +320,7 @@ pub fn set_repair_backlog(
         "tenant_id" => tenant_id.to_string(),
         "workspace_id" => workspace_id.to_string()
     )
-    .set(count as f64);
+    .set(count);
     gauge!(
         REPAIR_BACKLOG_AGE_SECONDS,
         "domain" => domain.as_str().to_string(),

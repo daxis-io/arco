@@ -16,6 +16,8 @@
 # Reference
 
 - [Documentation Map](./reference/documentation-map.md)
+- [Control-Plane Scope](./reference/control-plane-scope.md)
+- [Object-Native Catalog Architecture](./reference/object-native-catalog-architecture.md)
 - [Configuration](./reference/configuration.md)
 - [API](./reference/api.md)
 - [Evidence Policy](./reference/evidence-policy.md)

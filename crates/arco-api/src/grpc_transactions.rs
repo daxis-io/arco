@@ -1,5 +1,7 @@
 //! gRPC transport adapters for control-plane transaction APIs.
 
+#![allow(clippy::needless_pass_by_value, clippy::redundant_pub_crate)]
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -7,11 +9,11 @@ use axum::http::{HeaderMap, HeaderValue};
 use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Code, Request, Response, Status};
 
-use arco_proto::control_plane_transaction_service_server::{
+use arco_proto::arco::controlplane::v1::control_plane_transaction_service_server::{
     ControlPlaneTransactionService as ControlPlaneTransactionGrpc,
     ControlPlaneTransactionServiceServer,
 };
-use arco_proto::{
+use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CommitOrchestrationBatchRequest,
     CommitOrchestrationBatchResponse, CommitRootTransactionRequest, CommitRootTransactionResponse,
     GetCatalogTransactionRequest, GetCatalogTransactionResponse,
@@ -37,7 +39,7 @@ const RETRY_AFTER_HEADER: &str = "retry-after";
 
 /// Returns the generated tonic service for transaction RPCs.
 #[must_use]
-pub fn service(
+pub(crate) fn service(
     state: Arc<AppState>,
 ) -> ControlPlaneTransactionServiceServer<GrpcControlPlaneTransactionService> {
     ControlPlaneTransactionServiceServer::new(GrpcControlPlaneTransactionService { state })
@@ -45,7 +47,7 @@ pub fn service(
 
 /// Tonic transport adapter for transaction RPCs.
 #[derive(Debug, Clone)]
-pub struct GrpcControlPlaneTransactionService {
+pub(crate) struct GrpcControlPlaneTransactionService {
     state: Arc<AppState>,
 }
 
@@ -88,7 +90,7 @@ impl GrpcControlPlaneTransactionService {
                     crate::audit::REASON_INVALID_TOKEN
                 };
                 crate::audit::emit_auth_deny(self.state.as_ref(), &request_id, resource, reason);
-                Err(api_error_to_status(&error))
+                Err(api_error_to_status(error))
             }
         }
     }
@@ -163,7 +165,7 @@ fn insert_metadata_header(
     headers.insert(header_name, value);
 }
 
-fn api_error_to_status(error: &ApiError) -> Status {
+fn api_error_to_status(error: ApiError) -> Status {
     let code = match error.status() {
         axum::http::StatusCode::BAD_REQUEST | axum::http::StatusCode::UNPROCESSABLE_ENTITY => {
             Code::InvalidArgument
@@ -276,7 +278,8 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
         &self,
         request: Request<ApplyCatalogDdlRequest>,
     ) -> Result<Response<ApplyCatalogDdlResponse>, Status> {
-        const RESOURCE: &str = "/arco.v1.ControlPlaneTransactionService/ApplyCatalogDdl";
+        const RESOURCE: &str =
+            "/arco.controlplane.v1.ControlPlaneTransactionService/ApplyCatalogDdl";
         let start = Instant::now();
         let result = async {
             let (ctx, rate_limit) = self
@@ -291,11 +294,11 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
             );
             let _guard = span.enter();
             let service = ControlPlaneTransactionService::new(self.state.as_ref(), ctx.clone())
-                .map_err(|error| api_error_to_status(&error))?;
+                .map_err(api_error_to_status)?;
             let response = service
                 .apply_catalog_ddl(request.into_inner())
                 .await
-                .map_err(|error| api_error_to_status(&error))?;
+                .map_err(api_error_to_status)?;
             let mut response = Response::new(response);
             apply_success_metadata(&mut response, &ctx.request_id, rate_limit);
             Ok(response)
@@ -308,7 +311,8 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
         &self,
         request: Request<GetCatalogTransactionRequest>,
     ) -> Result<Response<GetCatalogTransactionResponse>, Status> {
-        const RESOURCE: &str = "/arco.v1.ControlPlaneTransactionService/GetCatalogTransaction";
+        const RESOURCE: &str =
+            "/arco.controlplane.v1.ControlPlaneTransactionService/GetCatalogTransaction";
         let start = Instant::now();
         let result = async {
             let (ctx, rate_limit) = self
@@ -323,11 +327,11 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
             );
             let _guard = span.enter();
             let service = ControlPlaneTransactionService::new(self.state.as_ref(), ctx.clone())
-                .map_err(|error| api_error_to_status(&error))?;
+                .map_err(api_error_to_status)?;
             let response = service
                 .get_catalog_transaction(request.into_inner())
                 .await
-                .map_err(|error| api_error_to_status(&error))?;
+                .map_err(api_error_to_status)?;
             let mut response = Response::new(response);
             apply_success_metadata(&mut response, &ctx.request_id, rate_limit);
             Ok(response)
@@ -340,7 +344,8 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
         &self,
         request: Request<CommitOrchestrationBatchRequest>,
     ) -> Result<Response<CommitOrchestrationBatchResponse>, Status> {
-        const RESOURCE: &str = "/arco.v1.ControlPlaneTransactionService/CommitOrchestrationBatch";
+        const RESOURCE: &str =
+            "/arco.controlplane.v1.ControlPlaneTransactionService/CommitOrchestrationBatch";
         let start = Instant::now();
         let result = async {
             let (ctx, rate_limit) = self
@@ -355,11 +360,11 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
             );
             let _guard = span.enter();
             let service = ControlPlaneTransactionService::new(self.state.as_ref(), ctx.clone())
-                .map_err(|error| api_error_to_status(&error))?;
+                .map_err(api_error_to_status)?;
             let response = service
                 .commit_orchestration_batch(request.into_inner())
                 .await
-                .map_err(|error| api_error_to_status(&error))?;
+                .map_err(api_error_to_status)?;
             let mut response = Response::new(response);
             apply_success_metadata(&mut response, &ctx.request_id, rate_limit);
             Ok(response)
@@ -373,7 +378,7 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
         request: Request<GetOrchestrationTransactionRequest>,
     ) -> Result<Response<GetOrchestrationTransactionResponse>, Status> {
         const RESOURCE: &str =
-            "/arco.v1.ControlPlaneTransactionService/GetOrchestrationTransaction";
+            "/arco.controlplane.v1.ControlPlaneTransactionService/GetOrchestrationTransaction";
         let start = Instant::now();
         let result = async {
             let (ctx, rate_limit) = self
@@ -388,11 +393,11 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
             );
             let _guard = span.enter();
             let service = ControlPlaneTransactionService::new(self.state.as_ref(), ctx.clone())
-                .map_err(|error| api_error_to_status(&error))?;
+                .map_err(api_error_to_status)?;
             let response = service
                 .get_orchestration_transaction(request.into_inner())
                 .await
-                .map_err(|error| api_error_to_status(&error))?;
+                .map_err(api_error_to_status)?;
             let mut response = Response::new(response);
             apply_success_metadata(&mut response, &ctx.request_id, rate_limit);
             Ok(response)
@@ -405,7 +410,8 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
         &self,
         request: Request<CommitRootTransactionRequest>,
     ) -> Result<Response<CommitRootTransactionResponse>, Status> {
-        const RESOURCE: &str = "/arco.v1.ControlPlaneTransactionService/CommitRootTransaction";
+        const RESOURCE: &str =
+            "/arco.controlplane.v1.ControlPlaneTransactionService/CommitRootTransaction";
         let start = Instant::now();
         let result = async {
             let (ctx, rate_limit) = self
@@ -420,11 +426,11 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
             );
             let _guard = span.enter();
             let service = ControlPlaneTransactionService::new(self.state.as_ref(), ctx.clone())
-                .map_err(|error| api_error_to_status(&error))?;
+                .map_err(api_error_to_status)?;
             let response = service
                 .commit_root_transaction(request.into_inner())
                 .await
-                .map_err(|error| api_error_to_status(&error))?;
+                .map_err(api_error_to_status)?;
             let mut response = Response::new(response);
             apply_success_metadata(&mut response, &ctx.request_id, rate_limit);
             Ok(response)
@@ -437,7 +443,8 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
         &self,
         request: Request<GetRootTransactionRequest>,
     ) -> Result<Response<GetRootTransactionResponse>, Status> {
-        const RESOURCE: &str = "/arco.v1.ControlPlaneTransactionService/GetRootTransaction";
+        const RESOURCE: &str =
+            "/arco.controlplane.v1.ControlPlaneTransactionService/GetRootTransaction";
         let start = Instant::now();
         let result = async {
             let (ctx, rate_limit) = self
@@ -452,11 +459,11 @@ impl ControlPlaneTransactionGrpc for GrpcControlPlaneTransactionService {
             );
             let _guard = span.enter();
             let service = ControlPlaneTransactionService::new(self.state.as_ref(), ctx.clone())
-                .map_err(|error| api_error_to_status(&error))?;
+                .map_err(api_error_to_status)?;
             let response = service
                 .get_root_transaction(request.into_inner())
                 .await
-                .map_err(|error| api_error_to_status(&error))?;
+                .map_err(api_error_to_status)?;
             let mut response = Response::new(response);
             apply_success_metadata(&mut response, &ctx.request_id, rate_limit);
             Ok(response)

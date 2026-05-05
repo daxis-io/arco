@@ -547,7 +547,7 @@ pub fn record_orch_repair_automation_findings(mode: &str, scope: &str, findings:
 }
 
 /// Sets the current orchestration repair backlog count and age.
-#[allow(clippy::cast_precision_loss)] // Gauge values are operationally bounded.
+#[allow(clippy::cast_precision_loss)]
 pub fn set_orch_repair_backlog(
     tenant_id: &str,
     workspace_id: &str,

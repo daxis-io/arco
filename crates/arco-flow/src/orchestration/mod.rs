@@ -41,6 +41,7 @@ pub mod events;
 pub mod flow_service;
 pub mod ids;
 pub mod ledger;
+pub mod proto;
 pub mod run_key;
 pub mod runtime;
 pub mod selection;

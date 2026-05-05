@@ -177,6 +177,11 @@ fn current_lineage_edges_schema() -> GoldenSchema {
     )
 }
 
+/// Get current `commits` schema from code.
+fn current_commits_schema() -> GoldenSchema {
+    schema_to_golden("commits", &arco_catalog::parquet_util::commit_schema())
+}
+
 // ============================================================================
 // Golden Schema Generator (run with --ignored)
 // ============================================================================
@@ -193,6 +198,7 @@ fn generate_golden_schemas() {
         ("tables", current_tables_schema()),
         ("columns", current_columns_schema()),
         ("lineage_edges", current_lineage_edges_schema()),
+        ("commits", current_commits_schema()),
     ];
 
     for (name, schema) in schemas {
@@ -271,6 +277,19 @@ fn contract_lineage_edges_parquet_schema_backward_compatible() {
     }
 }
 
+#[test]
+fn contract_commits_parquet_schema_backward_compatible() {
+    let golden = load_golden_schema("commits");
+    let current = current_commits_schema();
+
+    if let Err(msg) = is_backward_compatible(&golden, &current) {
+        panic!(
+            "Commits schema is NOT backward compatible with golden:\n{msg}\n\
+             See docs/adr/adr-006-schema-evolution.md for migration guidance."
+        );
+    }
+}
+
 // ============================================================================
 // Schema Structure Tests (Golden files must be valid)
 // ============================================================================
@@ -284,6 +303,7 @@ fn golden_schemas_are_valid_and_parseable() {
         "tables",
         "columns",
         "lineage_edges",
+        "commits",
     ];
 
     for name in schemas {
@@ -304,6 +324,7 @@ fn current_schemas_match_golden_field_count() {
         ("tables", current_tables_schema()),
         ("columns", current_columns_schema()),
         ("lineage_edges", current_lineage_edges_schema()),
+        ("commits", current_commits_schema()),
     ];
 
     for (name, current) in test_cases {
@@ -502,6 +523,8 @@ fn contract_namespaces_roundtrip_preserves_schema() {
             catalog_id: None,
             name: "default".into(),
             description: Some("Default namespace".into()),
+            properties_json: None,
+            storage_root: None,
             created_at: 1_700_000_000_000,
             updated_at: 1_700_000_000_000,
         },
@@ -510,6 +533,8 @@ fn contract_namespaces_roundtrip_preserves_schema() {
             catalog_id: Some("cat_001".into()),
             name: "analytics".into(),
             description: None,
+            properties_json: None,
+            storage_root: None,
             created_at: 1_700_000_001_000,
             updated_at: 1_700_000_001_000,
         },
@@ -539,6 +564,8 @@ fn contract_catalogs_roundtrip_preserves_schema() {
             id: "cat_001".into(),
             name: "default".into(),
             description: Some("Default catalog".into()),
+            properties_json: None,
+            storage_root: None,
             created_at: 1_700_000_000_000,
             updated_at: 1_700_000_000_000,
         },
@@ -546,6 +573,8 @@ fn contract_catalogs_roundtrip_preserves_schema() {
             id: "cat_002".into(),
             name: "analytics".into(),
             description: None,
+            properties_json: None,
+            storage_root: None,
             created_at: 1_700_000_001_000,
             updated_at: 1_700_000_001_000,
         },
@@ -575,6 +604,8 @@ fn contract_tables_roundtrip_preserves_schema() {
         description: Some("User table".into()),
         location: Some("s3://bucket/users".into()),
         format: Some("parquet".into()),
+        table_type: None,
+        properties_json: None,
         created_at: 1_700_000_000_000,
         updated_at: 1_700_000_000_000,
     }];
@@ -659,6 +690,8 @@ fn contract_namespaces_parquet_write_is_deterministic() {
             catalog_id: None,
             name: "default".into(),
             description: Some("Default namespace".into()),
+            properties_json: None,
+            storage_root: None,
             created_at: 1_700_000_000_000,
             updated_at: 1_700_000_000_000,
         },
@@ -667,6 +700,8 @@ fn contract_namespaces_parquet_write_is_deterministic() {
             catalog_id: Some("cat_001".into()),
             name: "analytics".into(),
             description: None,
+            properties_json: None,
+            storage_root: None,
             created_at: 1_700_000_001_000,
             updated_at: 1_700_000_001_000,
         },
@@ -687,6 +722,8 @@ fn contract_catalogs_parquet_write_is_deterministic() {
             id: "cat_001".into(),
             name: "default".into(),
             description: Some("Default catalog".into()),
+            properties_json: None,
+            storage_root: None,
             created_at: 1_700_000_000_000,
             updated_at: 1_700_000_000_000,
         },
@@ -694,6 +731,8 @@ fn contract_catalogs_parquet_write_is_deterministic() {
             id: "cat_002".into(),
             name: "analytics".into(),
             description: None,
+            properties_json: None,
+            storage_root: None,
             created_at: 1_700_000_001_000,
             updated_at: 1_700_000_001_000,
         },
@@ -716,6 +755,8 @@ fn contract_tables_parquet_write_is_deterministic() {
         description: Some("User table".into()),
         location: Some("s3://bucket/users".into()),
         format: Some("parquet".into()),
+        table_type: None,
+        properties_json: None,
         created_at: 1_700_000_000_000,
         updated_at: 1_700_000_000_000,
     }];

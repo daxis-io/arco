@@ -19,6 +19,7 @@ use crate::orchestration::{
 
 /// Action returned by run request bridge reconciliation.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum RunBridgeAction {
     /// Emit `RunTriggered` + `PlanCreated` events for a pending run request.
     EmitRunEvents {

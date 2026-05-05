@@ -1,6 +1,10 @@
 //! Table routes for the Unity Catalog facade.
+//!
+//! These handlers expose UC-shaped table operations over Arco's authoritative
+//! catalog ledger and manifest-published snapshot path.
 
 use arco_catalog::{CatalogError, CatalogReader};
+use arco_catalog::{ColumnDefinition, RegisterTableInSchemaRequest};
 use axum::Json;
 use axum::Router;
 use axum::extract::{Extension, Path, Query, State};
@@ -10,11 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-use arco_core::storage::WriteResult;
-
 use crate::context::UnityCatalogRequestContext;
 use crate::error::{UnityCatalogError, UnityCatalogErrorResponse, UnityCatalogResult};
-use crate::routes::preview::{self, catalog_path, schema_path, table_path, table_prefix};
+use crate::routes::{common, preview};
 use crate::state::UnityCatalogState;
 
 /// Table route group.
@@ -118,6 +120,119 @@ pub(crate) struct ListTablesResponse {
     next_page_token: Option<String>,
 }
 
+fn table_info_base(
+    catalog_name: &str,
+    schema_name: &str,
+    table: arco_catalog::writer::Table,
+) -> TableInfo {
+    TableInfo {
+        name: table.name.clone(),
+        catalog_name: catalog_name.to_string(),
+        schema_name: schema_name.to_string(),
+        full_name: format!("{catalog_name}.{schema_name}.{}", table.name),
+        table_type: table.table_type,
+        data_source_format: table.format.map(|format| format.to_ascii_uppercase()),
+        columns: None,
+        storage_location: table.location,
+        comment: table.description,
+        properties: table.properties,
+    }
+}
+
+fn column_value(column: arco_catalog::writer::Column) -> Value {
+    let data_type = column.data_type.clone();
+    let mut value = json!({
+        "name": column.name,
+        "type_text": data_type,
+        "type_name": column.data_type,
+        "position": column.ordinal,
+        "nullable": column.is_nullable,
+    });
+    if let Some(comment) = column.description {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("comment".to_string(), Value::String(comment));
+        }
+    }
+    value
+}
+
+async fn table_info_with_columns(
+    reader: &CatalogReader,
+    catalog_name: &str,
+    schema_name: &str,
+    table: arco_catalog::writer::Table,
+) -> Result<TableInfo, CatalogError> {
+    let columns = reader
+        .get_columns(&table.id)
+        .await?
+        .into_iter()
+        .map(column_value)
+        .collect::<Vec<_>>();
+    let mut info = table_info_base(catalog_name, schema_name, table);
+    info.columns = Some(columns);
+    Ok(info)
+}
+
+fn paginate_tables(
+    tables: &[TableInfo],
+    pagination: &preview::Pagination,
+) -> (Vec<TableInfo>, Option<String>) {
+    let start = pagination.start();
+    if start >= tables.len() {
+        return (Vec::new(), None);
+    }
+
+    let end = start.saturating_add(pagination.limit()).min(tables.len());
+    let next_page_token = (end < tables.len()).then(|| end.to_string());
+    (
+        tables
+            .get(start..end)
+            .map_or_else(Vec::new, ToOwned::to_owned),
+        next_page_token,
+    )
+}
+
+fn column_definitions(columns: &[Value]) -> UnityCatalogResult<Vec<ColumnDefinition>> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(ordinal, column)| {
+            let ordinal = i32::try_from(ordinal).map_err(|_| UnityCatalogError::BadRequest {
+                message: "too many columns: column ordinal exceeds i32".to_string(),
+            })?;
+            let name = column.get("name").and_then(Value::as_str).ok_or_else(|| {
+                UnityCatalogError::BadRequest {
+                    message: format!("invalid columns[{ordinal}].name: expected string"),
+                }
+            })?;
+            let data_type = column
+                .get("type_text")
+                .or_else(|| column.get("type_name"))
+                .or_else(|| column.get("type"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| UnityCatalogError::BadRequest {
+                    message: format!(
+                        "invalid columns[{ordinal}]: expected one of type_text, type_name, or type"
+                    ),
+                })?;
+            Ok(ColumnDefinition {
+                name: name.to_string(),
+                data_type: data_type.to_string(),
+                is_nullable: column
+                    .get("nullable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                ordinal,
+                description: column
+                    .get("comment")
+                    .or_else(|| column.get("description"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
 /// Lists tables.
 ///
 /// # Errors
@@ -161,7 +276,7 @@ pub(crate) async fn get_tables(
         schema_name = %schema_name,
         page_token = ?query.page_token,
         max_results = ?query.max_results,
-        "unity catalog preview list tables"
+        "unity catalog list tables from authoritative catalog state"
     );
     let pagination = preview::parse_pagination(
         query.page_token.as_deref(),
@@ -170,39 +285,20 @@ pub(crate) async fn get_tables(
         50,
     )?;
 
-    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
-
-    let catalog_exists = preview::object_exists(
-        &scoped_storage,
-        &catalog_path(&catalog_name),
-        "check catalog",
-    )
-    .await?;
-    if !catalog_exists {
-        return Err(UnityCatalogError::NotFound {
+    let reader = common::authoritative_catalog_reader(&state, &ctx)
+        .await?
+        .ok_or_else(|| UnityCatalogError::NotFound {
             message: format!("catalog not found: {catalog_name}"),
-        });
-    }
-
-    let schema_exists = preview::object_exists(
-        &scoped_storage,
-        &schema_path(&catalog_name, &schema_name),
-        "check schema",
-    )
-    .await?;
-    if !schema_exists {
-        return Err(UnityCatalogError::NotFound {
-            message: format!("schema not found: {catalog_name}.{schema_name}"),
-        });
-    }
-
-    let (tables, next_page_token) = preview::read_json_page::<TableInfo>(
-        &scoped_storage,
-        &table_prefix(&catalog_name, &schema_name),
-        "list tables",
-        &pagination,
-    )
-    .await?;
+        })?;
+    let mut tables = reader
+        .list_tables_in_schema(&catalog_name, &schema_name)
+        .await
+        .map_err(common::map_catalog_error)?
+        .into_iter()
+        .map(|table| table_info_base(&catalog_name, &schema_name, table))
+        .collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    let (tables, next_page_token) = paginate_tables(&tables, &pagination);
     tracing::debug!(
         tenant = %ctx.tenant,
         workspace = %ctx.workspace,
@@ -211,7 +307,7 @@ pub(crate) async fn get_tables(
         schema_name = %schema_name,
         tables = tables.len(),
         next_page_token = ?next_page_token,
-        "unity catalog preview listed tables"
+        "unity catalog listed tables from authoritative catalog state"
     );
 
     Ok(Json(ListTablesResponse {
@@ -274,72 +370,42 @@ pub(crate) async fn post_tables(
         table_name = %name,
         table_type = %table_type,
         data_source_format = %data_source_format,
-        "unity catalog preview create table"
+        "unity catalog create table on authoritative catalog state"
     );
-    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
 
-    let catalog_exists = preview::object_exists(
-        &scoped_storage,
-        &catalog_path(&catalog_name),
-        "check catalog",
-    )
-    .await?;
-    if !catalog_exists {
-        return Err(UnityCatalogError::NotFound {
-            message: format!("catalog not found: {catalog_name}"),
-        });
-    }
+    let authoritative_columns = column_definitions(&columns)?;
+    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
+    let table = writer
+        .register_table_in_schema(
+            &catalog_name,
+            &schema_name,
+            RegisterTableInSchemaRequest {
+                name: name.clone(),
+                description: payload.comment.clone(),
+                location: Some(storage_location.clone()),
+                format: Some(data_source_format.to_ascii_lowercase()),
+                table_type: Some(table_type.clone()),
+                properties: payload.properties.clone(),
+                columns: authoritative_columns,
+            },
+            common::writer_options(&ctx),
+        )
+        .await
+        .map_err(common::map_catalog_error)?;
 
-    let schema_exists = preview::object_exists(
-        &scoped_storage,
-        &schema_path(&catalog_name, &schema_name),
-        "check schema",
-    )
-    .await?;
-    if !schema_exists {
-        return Err(UnityCatalogError::NotFound {
-            message: format!("schema not found: {catalog_name}.{schema_name}"),
-        });
-    }
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalog_name = %catalog_name,
+        schema_name = %schema_name,
+        table_name = %name,
+        "unity catalog created table on authoritative catalog state"
+    );
 
-    let table = TableInfo {
-        name: name.clone(),
-        catalog_name: catalog_name.clone(),
-        schema_name: schema_name.clone(),
-        full_name: format!("{catalog_name}.{schema_name}.{name}"),
-        table_type: Some(table_type),
-        data_source_format: Some(data_source_format),
-        columns: Some(columns),
-        storage_location: Some(storage_location),
-        comment: payload.comment,
-        properties: payload.properties,
-    };
-
-    let write_result = preview::write_json_if_absent(
-        &scoped_storage,
-        &table_path(&catalog_name, &schema_name, &name),
-        &table,
-        "create table",
-    )
-    .await?;
-
-    match write_result {
-        WriteResult::Success { .. } => {
-            tracing::debug!(
-                tenant = %ctx.tenant,
-                workspace = %ctx.workspace,
-                request_id = %ctx.request_id,
-                catalog_name = %catalog_name,
-                schema_name = %schema_name,
-                table_name = %name,
-                "unity catalog preview table created"
-            );
-            Ok(Json(table))
-        }
-        WriteResult::PreconditionFailed { .. } => Err(UnityCatalogError::Conflict {
-            message: format!("table already exists: {catalog_name}.{schema_name}.{name}"),
-        }),
-    }
+    let mut response = table_info_base(&catalog_name, &schema_name, table);
+    response.columns = Some(columns);
+    Ok(Json(response))
 }
 
 /// Gets a table by full name (`catalog.schema.table`).
@@ -377,41 +443,24 @@ pub(crate) async fn get_table(
         catalog_name = %catalog_name,
         schema_name = %schema_name,
         table_name = %table_name,
-        "unity catalog preview get table"
+        "unity catalog get table from authoritative catalog state"
     );
 
-    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
-    let path = table_path(&catalog_name, &schema_name, &table_name);
-    let exists = preview::object_exists(&scoped_storage, &path, "check table").await?;
-    if exists {
-        let table =
-            preview::read_json_object::<TableInfo>(&scoped_storage, &path, "get table").await?;
-        return Ok(Json(table));
-    }
-
-    // Fallback for catalog-native tables that exist in Tier-1 snapshots but were not
-    // created through preview CRUD object paths.
-    let reader = CatalogReader::new(scoped_storage.clone());
-    let table = reader
-        .get_table_in_schema(&catalog_name, &schema_name, &table_name)
-        .await
-        .map_err(map_catalog_error)?
+    let reader = common::authoritative_catalog_reader(&state, &ctx)
+        .await?
         .ok_or_else(|| UnityCatalogError::NotFound {
             message: format!("table not found: {catalog_name}.{schema_name}.{table_name}"),
         })?;
-
-    let table = TableInfo {
-        name: table.name,
-        catalog_name: catalog_name.clone(),
-        schema_name: schema_name.clone(),
-        full_name: format!("{catalog_name}.{schema_name}.{table_name}"),
-        table_type: None,
-        data_source_format: table.format.map(|format| format.to_ascii_uppercase()),
-        columns: None,
-        storage_location: table.location,
-        comment: table.description,
-        properties: None,
-    };
+    let table = reader
+        .get_table_in_schema(&catalog_name, &schema_name, &table_name)
+        .await
+        .map_err(common::map_catalog_error)?
+        .ok_or_else(|| UnityCatalogError::NotFound {
+            message: format!("table not found: {catalog_name}.{schema_name}.{table_name}"),
+        })?;
+    let table = table_info_with_columns(&reader, &catalog_name, &schema_name, table)
+        .await
+        .map_err(common::map_catalog_error)?;
     Ok(Json(table))
 }
 
@@ -446,32 +495,19 @@ pub(crate) async fn delete_table(
         catalog_name = %catalog_name,
         schema_name = %schema_name,
         table_name = %table_name,
-        "unity catalog preview delete table"
+        "unity catalog delete table from authoritative catalog state"
     );
 
-    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
-    let path = table_path(&catalog_name, &schema_name, &table_name);
-    let exists = preview::object_exists(&scoped_storage, &path, "check table").await?;
-    if !exists {
-        let reader = CatalogReader::new(scoped_storage.clone());
-        let native = reader
-            .get_table_in_schema(&catalog_name, &schema_name, &table_name)
-            .await
-            .map_err(map_catalog_error)?;
-        if native.is_some() {
-            return Err(UnityCatalogError::NotImplemented {
-                message: format!(
-                    "operation not supported: delete catalog-native table {catalog_name}.{schema_name}.{table_name}"
-                ),
-            });
-        }
-
-        return Err(UnityCatalogError::NotFound {
-            message: format!("table not found: {catalog_name}.{schema_name}.{table_name}"),
-        });
-    }
-
-    preview::delete_path(&scoped_storage, &path, "delete table").await?;
+    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
+    writer
+        .drop_table_in_schema_transaction(
+            &catalog_name,
+            &schema_name,
+            &table_name,
+            common::writer_options(&ctx),
+        )
+        .await
+        .map_err(common::map_catalog_error)?;
     Ok((StatusCode::OK, Json(json!({}))))
 }
 
@@ -522,26 +558,4 @@ fn parse_table_full_name(full_name: &str) -> UnityCatalogResult<(String, String,
     let schema_name = preview::require_identifier(Some(schema_name.to_string()), "schema_name")?;
     let table_name = preview::require_identifier(Some(table_name.to_string()), "name")?;
     Ok((catalog_name, schema_name, table_name))
-}
-
-fn map_catalog_error(err: CatalogError) -> UnityCatalogError {
-    match err {
-        CatalogError::Validation { message } => UnityCatalogError::BadRequest { message },
-        CatalogError::AlreadyExists { entity, name } => UnityCatalogError::Conflict {
-            message: format!("already exists: {entity} {name}"),
-        },
-        CatalogError::NotFound { entity, name } => UnityCatalogError::NotFound {
-            message: format!("not found: {entity} {name}"),
-        },
-        CatalogError::PreconditionFailed { message } | CatalogError::CasFailed { message } => {
-            UnityCatalogError::Conflict { message }
-        }
-        CatalogError::UnsupportedOperation { message } => UnityCatalogError::NotImplemented {
-            message: format!("unsupported operation: {message}"),
-        },
-        CatalogError::Storage { message }
-        | CatalogError::Serialization { message }
-        | CatalogError::Parquet { message }
-        | CatalogError::InvariantViolation { message } => UnityCatalogError::Internal { message },
-    }
 }

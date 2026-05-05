@@ -1,6 +1,14 @@
 # Catalog
 
-The catalog domain tracks data assets, schemas, lineage, and governance metadata.
+The catalog domain tracks data assets, schemas, lineage, and search-oriented metadata today.
+
+Arco already proves authoritative control-plane behavior for:
+
+- catalogs, schemas, tables, and columns
+- lineage projections
+- search projections derived from current catalog state
+
+Broader governance scope remains narrower than the highest-level architectural framing sometimes implies. Grants, permissions, credentials, and policy-style metadata are not yet fully implemented as authoritative catalog-ledger objects in the current repo. Use `docs/guide/src/reference/control-plane-scope.md` when describing implementation status.
 
 ## What the Catalog Stores
 
@@ -20,6 +28,10 @@ The catalog domain tracks data assets, schemas, lineage, and governance metadata
 - Server-side querying is centered on DataFusion.
 - Browser-oriented read paths are enabled through scoped signed URL workflows.
 - Catalog reads are designed to remain deterministic and auditable.
+
+Catalog reads stay pointer-first: `/api/v1/query` is the initial SQL surface
+for `system.*` tables, and those tables are queryable projections over
+manifest-selected Parquet artifacts rather than the commit point for control-plane truth.
 
 ## Security and Isolation
 

@@ -122,7 +122,7 @@ impl ControlPlaneTxPaths {
     }
 }
 
-/// Shared transaction record stored under `transactions/{domain}/{tx_id}.json`.
+/// Shared transaction status record stored under `transactions/{domain}/{tx_id}.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControlPlaneTxRecord<TResult> {
@@ -136,8 +136,10 @@ pub struct ControlPlaneTxRecord<TResult> {
     #[serde(default)]
     pub repair_pending: bool,
     /// Unique request identifier for this attempt.
+    #[serde(default)]
     pub request_id: String,
     /// Caller idempotency key for replay detection.
+    #[serde(default)]
     pub idempotency_key: String,
     /// Canonical request payload hash.
     pub request_hash: String,
@@ -272,8 +274,10 @@ pub struct ControlPlaneIdempotencyRecord {
     /// Logical operation kind.
     pub kind: ControlPlaneTxKind,
     /// Unique request identifier for this attempt.
+    #[serde(default)]
     pub request_id: String,
     /// Caller idempotency key.
+    #[serde(default)]
     pub idempotency_key: String,
     /// Canonical request payload hash.
     pub request_hash: String,

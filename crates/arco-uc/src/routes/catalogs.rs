@@ -1,19 +1,24 @@
 //! Catalog routes for the Unity Catalog facade.
+//!
+//! These handlers expose UC-shaped catalog operations over Arco's authoritative
+//! catalog ledger and manifest-published snapshot path.
 
+#![allow(clippy::option_option)]
+
+use arco_catalog::writer::CatalogPatch;
+use arco_catalog::{CatalogError, CatalogReader};
 use axum::Json;
 use axum::Router;
-use axum::extract::{Extension, OriginalUri, Path, Query, State};
-use axum::http::{Method, StatusCode};
+use axum::extract::{Extension, Path, Query, State};
+use axum::http::StatusCode;
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-use arco_core::storage::WriteResult;
-
 use crate::context::UnityCatalogRequestContext;
 use crate::error::{UnityCatalogError, UnityCatalogErrorResponse, UnityCatalogResult};
-use crate::routes::preview::{self, catalog_path};
+use crate::routes::{common, preview};
 use crate::state::UnityCatalogState;
 
 /// Catalog route group.
@@ -65,6 +70,29 @@ pub(crate) struct CreateCatalogRequestBody {
     storage_root: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct UpdateCatalogPayload {
+    #[serde(default, deserialize_with = "common::deserialize_nullable_patch_field")]
+    comment: Option<Option<String>>,
+    #[serde(default, deserialize_with = "common::deserialize_nullable_patch_field")]
+    properties: Option<Option<BTreeMap<String, String>>>,
+    new_name: Option<String>,
+    #[serde(default, deserialize_with = "common::deserialize_nullable_patch_field")]
+    storage_root: Option<Option<String>>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+#[schema(title = "UpdateCatalogRequestBody")]
+pub(crate) struct UpdateCatalogRequestBody {
+    comment: Option<String>,
+    properties: Option<BTreeMap<String, String>>,
+    new_name: Option<String>,
+    storage_root: Option<String>,
+}
+
 /// Response payload for a catalog object.
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub(crate) struct CatalogInfo {
@@ -80,6 +108,74 @@ pub(crate) struct ListCatalogsResponse {
     catalogs: Vec<CatalogInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     next_page_token: Option<String>,
+}
+
+fn catalog_info(catalog: arco_catalog::writer::Catalog) -> CatalogInfo {
+    CatalogInfo {
+        name: catalog.name,
+        comment: catalog.description,
+        properties: catalog.properties,
+        storage_root: catalog.storage_root,
+    }
+}
+
+fn paginate_catalogs(
+    catalogs: &[CatalogInfo],
+    pagination: &preview::Pagination,
+) -> (Vec<CatalogInfo>, Option<String>) {
+    let start = pagination.start();
+    if start >= catalogs.len() {
+        return (Vec::new(), None);
+    }
+
+    let end = start.saturating_add(pagination.limit()).min(catalogs.len());
+    let next_page_token = (end < catalogs.len()).then(|| end.to_string());
+    (
+        catalogs
+            .get(start..end)
+            .map_or_else(Vec::new, ToOwned::to_owned),
+        next_page_token,
+    )
+}
+
+fn validate_storage_root(value: Option<String>) -> UnityCatalogResult<Option<String>> {
+    value
+        .map(|storage_root| preview::require_non_empty_string(Some(storage_root), "storage_root"))
+        .transpose()
+}
+
+fn validate_storage_root_patch(
+    value: Option<Option<String>>,
+) -> UnityCatalogResult<Option<Option<String>>> {
+    value
+        .map(|storage_root| {
+            storage_root
+                .map(|storage_root| {
+                    preview::require_non_empty_string(Some(storage_root), "storage_root")
+                })
+                .transpose()
+        })
+        .transpose()
+}
+
+fn reject_unknown_catalog_patch_fields(extra: &BTreeMap<String, Value>) -> UnityCatalogResult<()> {
+    if extra.is_empty() {
+        return Ok(());
+    }
+
+    let fields = extra.keys().cloned().collect::<Vec<_>>().join(", ");
+    Err(UnityCatalogError::BadRequest {
+        message: format!("unexpected fields in catalog patch: {fields}"),
+    })
+}
+
+fn map_delete_catalog_error(err: CatalogError) -> UnityCatalogError {
+    match err {
+        CatalogError::Validation { message } if message.contains("cannot delete") => {
+            UnityCatalogError::Conflict { message }
+        }
+        other => common::map_catalog_error(other),
+    }
 }
 
 /// Lists catalogs.
@@ -116,7 +212,7 @@ pub(crate) async fn get_catalogs(
         request_id = %ctx.request_id,
         page_token = ?query.page_token,
         max_results = ?query.max_results,
-        "unity catalog preview list catalogs"
+        "unity catalog list catalogs from authoritative catalog state"
     );
 
     let pagination = preview::parse_pagination(
@@ -126,21 +222,25 @@ pub(crate) async fn get_catalogs(
         1000,
     )?;
 
-    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
-    let (catalogs, next_page_token) = preview::read_json_page::<CatalogInfo>(
-        &scoped_storage,
-        preview::CATALOGS_PREFIX,
-        "list catalogs",
-        &pagination,
-    )
-    .await?;
+    let mut catalogs = match common::authoritative_catalog_reader(&state, &ctx).await? {
+        Some(reader) => reader
+            .list_catalogs()
+            .await
+            .map_err(common::map_catalog_error)?
+            .into_iter()
+            .map(catalog_info)
+            .collect::<Vec<_>>(),
+        None => Vec::new(),
+    };
+    catalogs.sort_by(|left, right| left.name.cmp(&right.name));
+    let (catalogs, next_page_token) = paginate_catalogs(&catalogs, &pagination);
     tracing::debug!(
         tenant = %ctx.tenant,
         workspace = %ctx.workspace,
         request_id = %ctx.request_id,
         catalogs = catalogs.len(),
         next_page_token = ?next_page_token,
-        "unity catalog preview listed catalogs"
+        "unity catalog listed catalogs from authoritative catalog state"
     );
 
     Ok(Json(ListCatalogsResponse {
@@ -178,44 +278,35 @@ pub(crate) async fn post_catalogs(
     let _ = payload.extra;
 
     let name = preview::require_identifier(payload.name, "name")?;
+    let storage_root = validate_storage_root(payload.storage_root)?;
     tracing::debug!(
         tenant = %ctx.tenant,
         workspace = %ctx.workspace,
         request_id = %ctx.request_id,
         catalog_name = %name,
-        "unity catalog preview create catalog"
+        "unity catalog create catalog on authoritative catalog state"
     );
-    let catalog = CatalogInfo {
-        name: name.clone(),
-        comment: payload.comment,
-        properties: payload.properties,
-        storage_root: payload.storage_root,
-    };
 
-    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
-    let write_result = preview::write_json_if_absent(
-        &scoped_storage,
-        &catalog_path(&name),
-        &catalog,
-        "create catalog",
-    )
-    .await?;
+    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
+    let catalog = writer
+        .create_catalog_with_metadata(
+            &name,
+            payload.comment.as_deref(),
+            payload.properties,
+            storage_root.as_deref(),
+            common::writer_options(&ctx),
+        )
+        .await
+        .map_err(common::map_catalog_error)?;
 
-    match write_result {
-        WriteResult::Success { .. } => {
-            tracing::debug!(
-                tenant = %ctx.tenant,
-                workspace = %ctx.workspace,
-                request_id = %ctx.request_id,
-                catalog_name = %name,
-                "unity catalog preview catalog created"
-            );
-            Ok(Json(catalog))
-        }
-        WriteResult::PreconditionFailed { .. } => Err(UnityCatalogError::Conflict {
-            message: format!("catalog already exists: {name}"),
-        }),
-    }
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalog_name = %name,
+        "unity catalog created catalog on authoritative catalog state"
+    );
+    Ok(Json(catalog_info(catalog)))
 }
 
 /// Gets a catalog by name.
@@ -246,24 +337,25 @@ pub(crate) async fn get_catalog(
         workspace = %ctx.workspace,
         request_id = %ctx.request_id,
         catalog_name = %name,
-        "unity catalog preview get catalog"
+        "unity catalog get catalog from authoritative catalog state"
     );
 
-    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
-    let path = catalog_path(&name);
-    let exists = preview::object_exists(&scoped_storage, &path, "check catalog").await?;
-    if !exists {
-        return Err(UnityCatalogError::NotFound {
+    let reader = common::authoritative_catalog_reader(&state, &ctx)
+        .await?
+        .ok_or_else(|| UnityCatalogError::NotFound {
             message: format!("catalog not found: {name}"),
-        });
-    }
-
-    let catalog =
-        preview::read_json_object::<CatalogInfo>(&scoped_storage, &path, "get catalog").await?;
-    Ok(Json(catalog))
+        })?;
+    let catalog = reader
+        .get_catalog(&name)
+        .await
+        .map_err(common::map_catalog_error)?
+        .ok_or_else(|| UnityCatalogError::NotFound {
+            message: format!("catalog not found: {name}"),
+        })?;
+    Ok(Json(catalog_info(catalog)))
 }
 
-/// `PATCH /catalogs/{name}` (known UC operation; currently unsupported).
+/// Updates a catalog.
 #[utoipa::path(
     patch,
     path = "/catalogs/{name}",
@@ -271,12 +363,55 @@ pub(crate) async fn get_catalog(
     params(
         ("name" = String, Path, description = "Catalog name"),
     ),
+    request_body = UpdateCatalogRequestBody,
     responses(
-        (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
+        (status = 200, description = "The catalog was successfully updated.", body = CatalogInfo),
+        (status = 400, description = "Bad request.", body = UnityCatalogErrorResponse),
+        (status = 401, description = "Unauthorized.", body = UnityCatalogErrorResponse),
+        (status = 403, description = "Forbidden.", body = UnityCatalogErrorResponse),
+        (status = 404, description = "Not found.", body = UnityCatalogErrorResponse),
+        (status = 409, description = "Conflict.", body = UnityCatalogErrorResponse),
+        (status = 500, description = "Internal server error.", body = UnityCatalogErrorResponse),
     )
 )]
-pub(crate) async fn update_catalog(method: Method, uri: OriginalUri) -> UnityCatalogError {
-    super::common::known_but_unsupported(&method, &uri)
+pub(crate) async fn update_catalog(
+    State(state): State<UnityCatalogState>,
+    Extension(ctx): Extension<UnityCatalogRequestContext>,
+    Path(name): Path<String>,
+    payload: Json<UpdateCatalogPayload>,
+) -> UnityCatalogResult<Json<CatalogInfo>> {
+    let name = preview::require_identifier(Some(name), "name")?;
+    let Json(payload) = payload;
+    reject_unknown_catalog_patch_fields(&payload.extra)?;
+    let new_name = payload
+        .new_name
+        .map(|new_name| preview::require_identifier(Some(new_name), "new_name"))
+        .transpose()?;
+    let storage_root = validate_storage_root_patch(payload.storage_root)?;
+
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        request_id = %ctx.request_id,
+        catalog_name = %name,
+        "unity catalog update catalog on authoritative catalog state"
+    );
+
+    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
+    let catalog = writer
+        .patch_catalog(
+            &name,
+            CatalogPatch {
+                description: payload.comment,
+                new_name,
+                properties: payload.properties,
+                storage_root,
+            },
+            common::writer_options(&ctx),
+        )
+        .await
+        .map_err(common::map_catalog_error)?;
+    Ok(Json(catalog_info(catalog)))
 }
 
 /// Deletes a catalog.
@@ -314,46 +449,26 @@ pub(crate) async fn delete_catalog(
         request_id = %ctx.request_id,
         catalog_name = %name,
         force,
-        "unity catalog preview delete catalog"
+        "unity catalog delete catalog from authoritative catalog state"
     );
 
-    let scoped_storage = ctx.scoped_storage(state.storage.clone())?;
-    let catalog = catalog_path(&name);
-    let exists = preview::object_exists(&scoped_storage, &catalog, "check catalog").await?;
-    if !exists {
-        return Err(UnityCatalogError::NotFound {
-            message: format!("catalog not found: {name}"),
-        });
-    }
-
-    let schemas = preview::list_paths(
-        &scoped_storage,
-        &preview::schema_prefix(&name),
-        "list catalog schemas",
-    )
-    .await?;
-    if !schemas.is_empty() && !force {
-        return Err(UnityCatalogError::Conflict {
-            message: format!("catalog is not empty: {name}"),
-        });
-    }
-
-    if force {
-        let tables = preview::list_paths(
-            &scoped_storage,
-            &format!("{}/{name}/", preview::TABLES_PREFIX),
-            "list catalog tables",
-        )
-        .await?;
-        for table_path in tables {
-            preview::delete_path(&scoped_storage, &table_path, "delete catalog table").await?;
-        }
-
-        for schema_path in schemas {
-            preview::delete_path(&scoped_storage, &schema_path, "delete catalog schema").await?;
+    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
+    if !force {
+        let reader = CatalogReader::new(writer.storage().clone());
+        let schemas = reader
+            .list_schemas(&name)
+            .await
+            .map_err(common::map_catalog_error)?;
+        if !schemas.is_empty() {
+            return Err(UnityCatalogError::Conflict {
+                message: format!("catalog is not empty: {name}"),
+            });
         }
     }
 
-    preview::delete_path(&scoped_storage, &catalog, "delete catalog").await?;
+    writer
+        .delete_catalog(&name, force, common::writer_options(&ctx))
+        .await
+        .map_err(map_delete_catalog_error)?;
     Ok((StatusCode::OK, Json(json!({}))))
 }

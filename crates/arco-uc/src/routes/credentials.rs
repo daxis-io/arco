@@ -1,4 +1,7 @@
 //! Temporary credential routes for the Unity Catalog facade.
+//!
+//! These routes are currently parity scaffolding and placeholder behavior, not
+//! a fully implemented catalog-ledger credential control plane.
 
 use axum::Json;
 use axum::Router;

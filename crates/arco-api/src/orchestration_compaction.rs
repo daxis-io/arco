@@ -88,17 +88,9 @@ pub async fn append_events_and_compact_with_result(
     request_id: Option<&str>,
 ) -> Result<OrchestrationCommitOutcome, ApiError> {
     if events.is_empty() {
-        return Ok(OrchestrationCommitOutcome {
-            event_paths: Vec::new(),
-            lock_path: orchestration_compaction_lock_path().to_string(),
-            fencing_token: 0,
-            manifest_id: String::new(),
-            manifest_revision: String::new(),
-            pointer_version: String::new(),
-            delta_id: None,
-            events_processed: 0,
-            repair_pending: false,
-        });
+        return Err(ApiError::bad_request(
+            "orchestration batch must include at least one event",
+        ));
     }
 
     let lock_path = orchestration_compaction_lock_path();
@@ -182,7 +174,7 @@ async fn compact_orchestration_events_with_fencing(
             request_id,
         )
         .await
-        .map_err(|error| map_flow_compaction_error(&error))?;
+        .map_err(map_flow_compaction_error)?;
         return require_visible_compaction(response);
     }
 
@@ -190,7 +182,7 @@ async fn compact_orchestration_events_with_fencing(
     let result = compactor
         .compact_events_fenced(event_paths, fencing_token, lock_path)
         .await
-        .map_err(|error| map_flow_compaction_error(&error))?;
+        .map_err(map_flow_compaction_error)?;
     require_visible_compaction(OrchestrationCompactionResult {
         events_processed: result.events_processed,
         delta_id: result.delta_id,
@@ -244,7 +236,8 @@ fn require_visible_compaction(
     )))
 }
 
-fn map_flow_compaction_error(error: &FlowError) -> ApiError {
+#[allow(clippy::needless_pass_by_value)]
+fn map_flow_compaction_error(error: FlowError) -> ApiError {
     match error {
         FlowError::StaleFencingToken { .. }
         | FlowError::FencingLockUnavailable { .. }
@@ -501,7 +494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_events_and_compact_noop_when_empty() {
+    async fn append_events_and_compact_rejects_empty_batch() {
         let result = append_events_and_compact(
             &Config::default(),
             sample_storage(),
@@ -509,7 +502,12 @@ mod tests {
             None,
         )
         .await;
-        assert!(result.expect("empty append").is_empty());
+        let err = result.expect_err("empty append must fail");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.message(),
+            "orchestration batch must include at least one event"
+        );
     }
 
     #[tokio::test]
@@ -770,5 +768,26 @@ mod tests {
 
         let (_manifest, state) = compactor.load_state().await.expect("load state");
         assert!(state.runs.contains_key("run_release_failure"));
+    }
+
+    #[test]
+    fn require_visible_compaction_rejects_persisted_not_visible_results() {
+        let error = require_visible_compaction(OrchestrationCompactionResult {
+            events_processed: 1,
+            delta_id: None,
+            manifest_id: "00000000000000000001".to_string(),
+            manifest_revision: "manifest-rev".to_string(),
+            pointer_version: "ptr-1".to_string(),
+            repair_pending: false,
+            visibility_status: VisibilityStatus::PersistedNotVisible,
+        })
+        .expect_err("non-visible orchestration compaction must fail the API contract");
+
+        assert!(
+            error
+                .message()
+                .contains("orchestration compaction did not become visible"),
+            "unexpected visible-contract error: {error:?}"
+        );
     }
 }

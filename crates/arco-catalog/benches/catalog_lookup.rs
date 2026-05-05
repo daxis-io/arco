@@ -42,6 +42,8 @@ async fn setup_catalog(
             catalog_id: None,
             name: format!("namespace_{i}"),
             description: Some(format!("Namespace {i} for benchmarking")),
+            properties_json: None,
+            storage_root: None,
             created_at: now_ms,
             updated_at: now_ms,
         })
@@ -57,6 +59,8 @@ async fn setup_catalog(
                 description: Some(format!("Table {t} in {}", ns.name)),
                 location: Some(format!("gs://bucket/{}/{}/table_{t}", ns.id, ns.name)),
                 format: Some("parquet".to_string()),
+                table_type: None,
+                properties_json: None,
                 created_at: now_ms,
                 updated_at: now_ms,
             })

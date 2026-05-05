@@ -1,0 +1,51 @@
+{
+  "name": "commits",
+  "version": 1,
+  "fields": [
+    {
+      "name": "commit_ulid",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "snapshot_version",
+      "data_type": "Int64",
+      "nullable": false
+    },
+    {
+      "name": "published_at",
+      "data_type": "Int64",
+      "nullable": false
+    },
+    {
+      "name": "fencing_token",
+      "data_type": "Int64",
+      "nullable": false
+    },
+    {
+      "name": "watermark_event_id",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "operation",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "object_type",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "object_id",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "object_name",
+      "data_type": "Utf8",
+      "nullable": true
+    }
+  ]
+}

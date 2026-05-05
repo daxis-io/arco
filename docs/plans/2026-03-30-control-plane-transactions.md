@@ -1,10 +1,11 @@
 # Control-Plane Transactions Implementation Plan
 
+> **Execution note:** Implement this plan task-by-task.
 > Follow-up note for remaining transport and orchestration receipt identity items: [2026-04-04-control-plane-transactions-follow-up.md](2026-04-04-control-plane-transactions-follow-up.md)
 
 **Goal:** Add a transaction-oriented protobuf surface and shared Rust path/type scaffolding for catalog, orchestration, and tx-scoped root read tokens.
 
-**Architecture:** Introduce a dedicated `transactions.proto` that reuses `RequestHeader`, uses transport-neutral request/response envelopes, and models visibility-scoped transaction receipts/status lookups with explicit `repair_pending` state. Catalog and orchestration stay pointer-published. Root transactions use `transactions/root/{tx_id}.json` plus `transactions/root/{tx_id}.manifest.json` as a pinned super-manifest, without adding a global latest-root pointer or changing ordinary catalog/orchestration readers.
+**Architecture:** Introduce a dedicated `transactions.proto` that keeps request metadata in transport headers, reserves removed transport-envelope and visibility fields on the wire, and models visibility-scoped transaction receipts/status lookups with explicit `repair_pending` state. Catalog and orchestration stay pointer-published. Root transactions use `transactions/root/{tx_id}.json` plus `transactions/root/{tx_id}.manifest.json` as a pinned super-manifest, without adding a global latest-root pointer or changing ordinary catalog/orchestration readers. The orchestration batch input is an explicit public typed event contract, not a generic JSON envelope.
 
 **Tech Stack:** Protobuf, `prost`, Rust, `serde`, `cargo test`.
 

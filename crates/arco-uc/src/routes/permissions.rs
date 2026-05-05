@@ -1,4 +1,7 @@
 //! Permission endpoints for the UC facade.
+//!
+//! This module currently provides parity-shaped scaffolding only. It is not yet
+//! backed by an authoritative grants or policy store in the Arco control plane.
 
 use axum::Json;
 use axum::Router;

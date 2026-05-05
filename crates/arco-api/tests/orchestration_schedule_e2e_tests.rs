@@ -11,6 +11,7 @@ use tower::ServiceExt;
 use arco_api::server::ServerBuilder;
 use arco_core::ScopedStorage;
 use arco_core::storage::{MemoryBackend, StorageBackend};
+use arco_flow::orchestration::callbacks::TaskOutput as CallbackTaskOutput;
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_flow::orchestration::controllers::ScheduleController;
 use arco_flow::orchestration::events::{
@@ -821,16 +822,22 @@ async fn lineage_metadata_flows_from_task_output_to_catalog_and_run_read_surface
                 outcome: TaskOutcome::Succeeded,
                 materialization_id: Some("mat_lineage_api_q3".to_string()),
                 error_message: None,
-                output: Some(serde_json::json!({
-                    "materializationId": "mat_lineage_api_q3",
-                    "deltaTable": task_key,
-                    "deltaVersion": 17,
-                    "deltaPartition": partition_key
-                })),
+                output: Some(CallbackTaskOutput {
+                    materialization_id: Some("mat_lineage_api_q3".to_string()),
+                    row_count: None,
+                    byte_size: None,
+                    output_path: None,
+                    delta_table: Some(task_key.to_string()),
+                    delta_version: Some(17),
+                    delta_partition: Some(partition_key.to_string()),
+                    output_visibility_state: None,
+                    published_at: None,
+                    publish_error: None,
+                }),
                 error: None,
                 metrics: None,
                 cancelled_during_phase: None,
-                partial_progress: None,
+                partial_progress_json: None,
                 asset_key: Some(task_key.to_string()),
                 partition_key: Some(partition_key.to_string()),
                 code_version: Some("code_v1".to_string()),

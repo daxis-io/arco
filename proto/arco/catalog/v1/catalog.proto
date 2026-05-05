@@ -1,0 +1,107 @@
+syntax = "proto3";
+
+package arco.catalog.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/daxis-io/arco/proto/arco/catalog/v1";
+option java_multiple_files = true;
+option java_package = "com.arco.catalog.v1";
+
+message Catalog {
+  // Canonical public noun for the top namespace level.
+  string catalog = 1;
+  optional string display_name = 2;
+  optional string description = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+message Schema {
+  string catalog = 1;
+  string schema = 2;
+  optional string description = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+// Supported table formats across catalog contracts.
+enum TableFormat {
+  TABLE_FORMAT_UNSPECIFIED = 0;
+  TABLE_FORMAT_DELTA = 1;
+  TABLE_FORMAT_ICEBERG = 2;
+  TABLE_FORMAT_PARQUET = 3;
+}
+
+message Table {
+  string catalog = 1;
+  string schema = 2;
+  string table = 3;
+  optional string description = 4;
+  optional string location = 5;
+  TableFormat format = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+message ColumnDefinition {
+  string name = 1;
+  string data_type = 2;
+  bool is_nullable = 3;
+  int32 ordinal = 4;
+  optional string description = 5;
+}
+
+message CreateCatalogOp {
+  string catalog = 1;
+  optional string description = 2;
+}
+
+message CreateSchemaOp {
+  string catalog = 1;
+  string schema = 2;
+  optional string description = 3;
+}
+
+message RegisterTableOp {
+  string catalog = 1;
+  string schema = 2;
+  string table = 3;
+  optional string description = 4;
+  optional string location = 5;
+  TableFormat format = 6;
+  repeated ColumnDefinition columns = 7;
+}
+
+message UpdateTableOp {
+  string catalog = 1;
+  string schema = 2;
+  string table = 3;
+  optional string description = 4;
+  optional string location = 5;
+  optional TableFormat format = 6;
+}
+
+message DropTableOp {
+  string catalog = 1;
+  string schema = 2;
+  string table = 3;
+}
+
+message RenameTableOp {
+  string catalog = 1;
+  string schema = 2;
+  string table = 3;
+  string new_table = 4;
+}
+
+message CatalogDdlOperation {
+  oneof op {
+    CreateCatalogOp create_catalog = 1;
+    CreateSchemaOp create_schema = 2;
+    RegisterTableOp register_table = 3;
+    UpdateTableOp update_table = 4;
+    DropTableOp drop_table = 5;
+    RenameTableOp rename_table = 6;
+  }
+}

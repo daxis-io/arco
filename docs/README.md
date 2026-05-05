@@ -8,6 +8,8 @@ files in repository root.
 - Quick project overview: `README.md`
 - User/developer guide (mdBook source): `docs/guide/src/`
 - High-level docs index: `docs/guide/src/reference/documentation-map.md`
+- Object-native catalog target architecture:
+  `docs/guide/src/reference/object-native-catalog-architecture.md`
 
 ## Documentation Areas
 

@@ -1,0 +1,97 @@
+{
+  "grant": {
+    "grant": {
+      "grant": {
+        "grantId": "grant_01",
+        "objectId": "table_01",
+        "objectType": "TABLE",
+        "principal": "user:alice@example.com",
+        "privilege": "SELECT",
+        "grantedBy": "user:admin@example.com"
+      }
+    }
+  },
+  "revoke": {
+    "grant": {
+      "revoke": {
+        "grantId": "grant_02",
+        "objectId": "table_01",
+        "objectType": "TABLE",
+        "principal": "user:bob@example.com",
+        "privilege": "MODIFY",
+        "grantedBy": "user:admin@example.com"
+      }
+    }
+  },
+  "storageCredential": {
+    "storageCredential": {
+      "credentialId": "cred_01",
+      "name": "lakehouse-prod",
+      "cloud": "aws",
+      "owner": "group:data-platform"
+    }
+  },
+  "externalLocation": {
+    "externalLocation": {
+      "locationId": "loc_01",
+      "name": "raw-prod",
+      "url": "s3://bucket/raw",
+      "credentialId": "cred_01",
+      "owner": "group:data-platform"
+    }
+  },
+  "workspaceBinding": {
+    "workspaceBinding": {
+      "bindingId": "binding_01",
+      "workspaceId": "workspace_01",
+      "objectId": "loc_01",
+      "objectType": "EXTERNAL_LOCATION"
+    }
+  },
+  "governanceAttachment": {
+    "governanceAttachment": {
+      "attachmentId": "attach_01",
+      "objectId": "table_01",
+      "objectType": "TABLE",
+      "attachmentType": "CLASSIFICATION",
+      "value": "restricted",
+      "createdBy": "user:admin@example.com"
+    }
+  },
+  "volume": {
+    "volume": {
+      "volumeId": "volume_01",
+      "catalog": "default",
+      "schema": "raw",
+      "volume": "landing",
+      "storageLocation": "s3://bucket/volumes/landing",
+      "owner": "group:data-platform"
+    }
+  },
+  "function": {
+    "function": {
+      "functionId": "function_01",
+      "catalog": "default",
+      "schema": "raw",
+      "function": "normalize_email",
+      "owner": "group:data-platform"
+    }
+  },
+  "registeredModel": {
+    "registeredModel": {
+      "modelId": "model_01",
+      "catalog": "default",
+      "schema": "ml",
+      "model": "churn",
+      "owner": "group:ml-platform"
+    }
+  },
+  "modelVersion": {
+    "modelVersion": {
+      "modelVersionId": "model_version_01",
+      "modelId": "model_01",
+      "version": "1",
+      "storageLocation": "s3://bucket/models/churn/1"
+    }
+  }
+}

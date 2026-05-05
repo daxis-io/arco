@@ -281,12 +281,6 @@ pub(crate) async fn create_catalog(
         .with_actor(format!("api:{}", ctx.tenant))
         .with_request_id(&ctx.request_id);
 
-    let options = if let Some(key) = ctx.idempotency_key.as_ref() {
-        options.with_idempotency_key(key)
-    } else {
-        options
-    };
-
     let create_result = writer
         .create_catalog(&req.name, req.description.as_deref(), options)
         .await;
@@ -486,12 +480,6 @@ pub(crate) async fn create_schema(
     let options = arco_catalog::write_options::WriteOptions::default()
         .with_actor(format!("api:{}", ctx.tenant))
         .with_request_id(&ctx.request_id);
-
-    let options = if let Some(key) = ctx.idempotency_key.as_ref() {
-        options.with_idempotency_key(key)
-    } else {
-        options
-    };
 
     let create_result = writer
         .create_schema(

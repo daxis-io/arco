@@ -1,11 +1,22 @@
 //! Shared runtime service for single-domain control-plane transactions.
 
+#![allow(
+    clippy::future_not_send,
+    clippy::match_same_arms,
+    clippy::option_option,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_wraps,
+    clippy::unused_self
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use base64::Engine as _;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use prost::Message;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -15,7 +26,7 @@ use arco_catalog::idempotency::canonical_request_hash;
 use arco_catalog::write_options::WriteOptions;
 use arco_catalog::writer::CatalogTransactionCommit;
 use arco_catalog::{
-    CatalogWriter, ColumnDefinition, RegisterTableRequest, TablePatch, Tier1Compactor,
+    CatalogWriter, ColumnDefinition, RegisterTableInSchemaRequest, TablePatch, Tier1Compactor,
 };
 use arco_core::ScopedStorage;
 use arco_core::catalog_paths::{CatalogDomain, CatalogPaths};
@@ -27,20 +38,26 @@ use arco_core::control_plane_transactions::{
 };
 use arco_core::lock::{DEFAULT_LOCK_TTL, DistributedLock};
 use arco_core::storage::WritePrecondition;
-use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
+use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData, SourceRef};
+use arco_flow::orchestration::proto::event_from_proto_envelope;
 use arco_flow::orchestration_compaction_lock_path;
-use arco_proto::catalog_ddl_operation::Op as CatalogDdlOp;
-use arco_proto::domain_mutation::Kind as RootMutationKind;
-use arco_proto::{
-    AlterTableOp, ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, AssetFormat, CatalogTxStatus,
-    CommitOrchestrationBatchRequest, CommitOrchestrationBatchResponse,
-    CommitRootTransactionRequest, CommitRootTransactionResponse, CreateNamespaceOp, DomainMutation,
-    DropTableOp, GetCatalogTransactionRequest, GetCatalogTransactionResponse,
+use arco_proto::arco::catalog::v1::{
+    CatalogDdlOperation, CreateCatalogOp, CreateSchemaOp, DropTableOp, MetastoreMutation,
+    RegisterTableOp, RenameTableOp, TableFormat as ProtoTableFormat, UpdateTableOp,
+    catalog_ddl_operation,
+};
+use arco_proto::arco::controlplane::v1::{
+    ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CatalogTxReceipt as ProtoCatalogTxReceipt,
+    CatalogTxStatus, CommitOrchestrationBatchRequest, CommitOrchestrationBatchResponse,
+    CommitRootTransactionRequest, CommitRootTransactionResponse, DomainCommit as ProtoDomainCommit,
+    DomainMutation, GetCatalogTransactionRequest, GetCatalogTransactionResponse,
     GetOrchestrationTransactionRequest, GetOrchestrationTransactionResponse,
     GetRootTransactionRequest, GetRootTransactionResponse, OrchestrationBatchSpec,
-    OrchestrationEventEnvelope, OrchestrationTxStatus, RegisterTableOp, RequestHeader,
-    RootTxParticipant, RootTxStatus, TransactionDomain, TransactionStatus,
+    OrchestrationTxReceipt as ProtoOrchestrationTxReceipt, OrchestrationTxStatus,
+    RootTxParticipant, RootTxReceipt as ProtoRootTxReceipt, RootTxStatus, TransactionDomain,
+    TransactionStatus, domain_mutation,
 };
+use arco_proto::arco::orchestration::v1::OrchestrationEventEnvelope;
 
 use crate::context::RequestContext;
 use crate::error::ApiError;
@@ -74,17 +91,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             .validate_contract()
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
 
-        if request.require_visible == Some(false) {
-            return Err(ApiError::bad_request(
-                "ApplyCatalogDdl requires visible publication",
-            ));
-        }
-
-        let header = request
-            .header
-            .as_ref()
-            .ok_or_else(|| ApiError::bad_request("request header is required"))?;
-        let meta = self.resolve_commit_metadata(header)?;
+        let meta = self.resolve_commit_metadata()?;
         let command = CatalogMutation::from_proto(
             request
                 .ddl
@@ -103,11 +110,6 @@ impl<'a> ControlPlaneTransactionService<'a> {
         &self,
         request: GetCatalogTransactionRequest,
     ) -> Result<GetCatalogTransactionResponse, ApiError> {
-        let header = request
-            .header
-            .as_ref()
-            .ok_or_else(|| ApiError::bad_request("request header is required"))?;
-        self.validate_request_header(header)?;
         if request.tx_id.is_empty() {
             return Err(ApiError::bad_request("tx_id is required"));
         }
@@ -133,17 +135,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             .validate_contract()
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
 
-        if request.require_visible == Some(false) {
-            return Err(ApiError::bad_request(
-                "CommitOrchestrationBatch requires visible publication",
-            ));
-        }
-
-        let header = request
-            .header
-            .as_ref()
-            .ok_or_else(|| ApiError::bad_request("request header is required"))?;
-        let meta = self.resolve_commit_metadata(header)?;
+        let meta = self.resolve_commit_metadata()?;
         let batch = OrchestrationBatchMutation::from_request(&request)?;
         let outcome = self.execute_orchestration_batch(&meta, batch).await?;
         Ok(CommitOrchestrationBatchResponse {
@@ -157,11 +149,6 @@ impl<'a> ControlPlaneTransactionService<'a> {
         &self,
         request: GetOrchestrationTransactionRequest,
     ) -> Result<GetOrchestrationTransactionResponse, ApiError> {
-        let header = request
-            .header
-            .as_ref()
-            .ok_or_else(|| ApiError::bad_request("request header is required"))?;
-        self.validate_request_header(header)?;
         if request.tx_id.is_empty() {
             return Err(ApiError::bad_request("tx_id is required"));
         }
@@ -185,7 +172,6 @@ impl<'a> ControlPlaneTransactionService<'a> {
     }
 
     /// Commits a multi-domain root transaction and returns the visible receipt.
-    #[allow(clippy::too_many_lines)]
     pub async fn commit_root_transaction(
         &self,
         request: CommitRootTransactionRequest,
@@ -194,11 +180,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             .validate_contract()
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
 
-        let header = request
-            .header
-            .as_ref()
-            .ok_or_else(|| ApiError::bad_request("request header is required"))?;
-        let meta = self.resolve_commit_metadata(header)?;
+        let meta = self.resolve_commit_metadata()?;
         let mutations = request
             .mutations
             .iter()
@@ -206,15 +188,23 @@ impl<'a> ControlPlaneTransactionService<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let mut seen_domains = BTreeSet::new();
         for mutation in &mutations {
-            if !seen_domains.insert(mutation.domain()) {
+            if matches!(mutation, RootMutation::Metastore(_)) {
+                continue;
+            }
+            let domain = mutation.domain();
+            if !seen_domains.insert(domain) {
                 return Err(ApiError::bad_request(format!(
                     "duplicate root mutation for domain '{}'",
-                    mutation.domain()
+                    domain
                 )));
             }
         }
 
-        let request_hash = root_request_hash(&mutations)?;
+        let request_hash = root_request_hash(&mutations, &meta)?;
+        let idempotency_path = ControlPlaneTxPaths::idempotency(
+            ControlPlaneTxDomain::Root,
+            meta.idempotency_key.as_str(),
+        );
         let claim = self
             .claim_idempotency(
                 ControlPlaneTxDomain::Root,
@@ -228,6 +218,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             let record = self
                 .resolve_existing_visible_record::<RootTxReceipt>(
                     ControlPlaneTxDomain::Root,
+                    idempotency_path.as_str(),
                     existing,
                 )
                 .await?;
@@ -281,12 +272,18 @@ impl<'a> ControlPlaneTransactionService<'a> {
         let fencing_token = guard.fencing_token().sequence();
 
         let result = async {
+            if mutations.iter().any(RootMutation::is_metastore) {
+                return Err(ApiError::not_implemented(
+                    "metastore root mutations are not implemented yet",
+                ));
+            }
+
             let mut repair_pending = false;
             let mut domain_commits = Vec::with_capacity(mutations.len());
             let mut manifest_domains = BTreeMap::new();
 
             for mutation in mutations {
-                let participant_meta = Self::root_participant_metadata(&meta, mutation.domain());
+                let participant_meta = self.root_participant_metadata(&meta, mutation.domain());
                 match mutation {
                     RootMutation::Catalog(command) => {
                         let outcome = self
@@ -319,6 +316,11 @@ impl<'a> ControlPlaneTransactionService<'a> {
                             },
                         );
                         domain_commits.push(commit);
+                    }
+                    RootMutation::Metastore(_) => {
+                        return Err(ApiError::not_implemented(
+                            "metastore root mutations are not implemented yet",
+                        ));
                     }
                 }
             }
@@ -359,6 +361,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             self.finalize_visible(
                 ControlPlaneTxDomain::Root,
                 &tx_id,
+                idempotency_path.as_str(),
                 root_lock_path.clone(),
                 fencing_token,
                 repair_pending,
@@ -400,6 +403,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
                     .mark_visible_repair_pending::<RootTxReceipt>(
                         ControlPlaneTxDomain::Root,
                         &tx_id,
+                        idempotency_path.as_str(),
                     )
                     .await
                 {
@@ -444,11 +448,6 @@ impl<'a> ControlPlaneTransactionService<'a> {
         &self,
         request: GetRootTransactionRequest,
     ) -> Result<GetRootTransactionResponse, ApiError> {
-        let header = request
-            .header
-            .as_ref()
-            .ok_or_else(|| ApiError::bad_request("request header is required"))?;
-        self.validate_request_header(header)?;
         if request.tx_id.is_empty() {
             return Err(ApiError::bad_request("tx_id is required"));
         }
@@ -471,6 +470,10 @@ impl<'a> ControlPlaneTransactionService<'a> {
         command: CatalogMutation,
     ) -> Result<TxExecutionOutcome<CatalogTxReceipt>, ApiError> {
         let request_hash = command.request_hash()?;
+        let idempotency_path = ControlPlaneTxPaths::idempotency(
+            ControlPlaneTxDomain::Catalog,
+            meta.idempotency_key.as_str(),
+        );
         let claim = self
             .claim_idempotency(
                 ControlPlaneTxDomain::Catalog,
@@ -484,6 +487,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             let record = self
                 .resolve_existing_visible_record::<CatalogTxReceipt>(
                     ControlPlaneTxDomain::Catalog,
+                    idempotency_path.as_str(),
                     existing,
                 )
                 .await?;
@@ -521,13 +525,13 @@ impl<'a> ControlPlaneTransactionService<'a> {
         self.store_prepared(ControlPlaneTxDomain::Catalog, &prepared)
             .await?;
 
-        let writer = self.catalog_writer();
+        let writer = self.catalog_writer()?;
         if let Err(error) = writer.initialize().await.map_err(ApiError::from) {
             self.abort_transaction(ControlPlaneTxDomain::Catalog, &tx_id)
                 .await;
             return Err(error);
         }
-        let options = Self::catalog_write_options(meta);
+        let options = self.catalog_write_options(meta);
         let commit = match command
             .apply(&writer, options)
             .await
@@ -557,6 +561,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         self.finalize_visible(
             ControlPlaneTxDomain::Catalog,
             &tx_id,
+            idempotency_path.as_str(),
             commit.lock_path,
             commit.fencing_token,
             commit.repair_pending,
@@ -571,14 +576,17 @@ impl<'a> ControlPlaneTransactionService<'a> {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn execute_orchestration_batch(
         &self,
         meta: &ResolvedRequestMetadata,
         batch: OrchestrationBatchMutation,
     ) -> Result<TxExecutionOutcome<OrchestrationTxReceipt>, ApiError> {
-        let request_hash = batch.request_hash()?;
         let events = batch.events(meta)?;
+        let request_hash = batch.request_hash_for_events(&events)?;
+        let idempotency_path = ControlPlaneTxPaths::idempotency(
+            ControlPlaneTxDomain::Orchestration,
+            meta.idempotency_key.as_str(),
+        );
         let claim = self
             .claim_idempotency(
                 ControlPlaneTxDomain::Orchestration,
@@ -592,6 +600,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             let record = self
                 .resolve_existing_visible_record::<OrchestrationTxReceipt>(
                     ControlPlaneTxDomain::Orchestration,
+                    idempotency_path.as_str(),
                     existing,
                 )
                 .await?;
@@ -687,16 +696,29 @@ impl<'a> ControlPlaneTransactionService<'a> {
             }
         }
 
-        self.finalize_visible(
-            ControlPlaneTxDomain::Orchestration,
-            &tx_id,
-            commit.lock_path,
-            commit.fencing_token,
-            repair_pending,
-            visible_at,
-            receipt.clone(),
-        )
-        .await?;
+        // The commit receipt is immutable audit state. If finalize fails after this point,
+        // retries repair the visible tx/idempotency records around the stored receipt.
+        if let Err(error) = self
+            .finalize_visible(
+                ControlPlaneTxDomain::Orchestration,
+                &tx_id,
+                idempotency_path.as_str(),
+                commit.lock_path,
+                commit.fencing_token,
+                repair_pending,
+                visible_at,
+                receipt.clone(),
+            )
+            .await
+        {
+            tracing::warn!(
+                error = ?error,
+                tx_id,
+                commit_id = %receipt.commit_id,
+                "failed to finalize orchestration visibility after writing commit receipt"
+            );
+            return Err(error);
+        }
 
         Ok(TxExecutionOutcome {
             receipt,
@@ -705,6 +727,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
     }
 
     fn root_participant_metadata(
+        &self,
         meta: &ResolvedRequestMetadata,
         domain: ControlPlaneTxDomain,
     ) -> ResolvedRequestMetadata {
@@ -716,43 +739,27 @@ impl<'a> ControlPlaneTransactionService<'a> {
         }
     }
 
-    fn catalog_writer(&self) -> CatalogWriter {
+    fn catalog_writer(&self) -> Result<CatalogWriter, ApiError> {
         let compactor = self
             .state
             .sync_compactor()
             .unwrap_or_else(|| Arc::new(Tier1Compactor::new(self.storage.clone())));
-        CatalogWriter::new(self.storage.clone()).with_sync_compactor(compactor)
+        Ok(CatalogWriter::new(self.storage.clone()).with_sync_compactor(compactor))
     }
 
-    fn catalog_write_options(meta: &ResolvedRequestMetadata) -> WriteOptions {
+    fn catalog_write_options(&self, meta: &ResolvedRequestMetadata) -> WriteOptions {
         WriteOptions::default()
             .with_actor(format!("api:{}", meta.tenant))
             .with_request_id(meta.request_id.as_str())
             .with_idempotency_key(meta.idempotency_key.as_str())
     }
 
-    fn resolve_commit_metadata(
-        &self,
-        header: &RequestHeader,
-    ) -> Result<ResolvedRequestMetadata, ApiError> {
-        self.validate_request_header(header)?;
-
-        let idempotency_key = if header.idempotency_key.is_empty() {
-            self.ctx
-                .idempotency_key
-                .clone()
-                .ok_or_else(|| ApiError::bad_request("idempotency_key is required"))?
-        } else if let Some(transport_key) = self.ctx.idempotency_key.as_deref() {
-            if header.idempotency_key != transport_key {
-                return Err(ApiError::bad_request(
-                    "request header idempotency_key does not match transport idempotency key",
-                ));
-            }
-            header.idempotency_key.clone()
-        } else {
-            header.idempotency_key.clone()
-        };
-
+    fn resolve_commit_metadata(&self) -> Result<ResolvedRequestMetadata, ApiError> {
+        let idempotency_key = self
+            .ctx
+            .idempotency_key
+            .clone()
+            .ok_or_else(|| ApiError::bad_request("idempotency_key is required"))?;
         if idempotency_key.is_empty() {
             return Err(ApiError::bad_request("idempotency_key is required"));
         }
@@ -760,45 +767,9 @@ impl<'a> ControlPlaneTransactionService<'a> {
         Ok(ResolvedRequestMetadata {
             tenant: self.ctx.tenant.clone(),
             workspace: self.ctx.workspace.clone(),
-            request_id: header.request_id.clone(),
+            request_id: self.ctx.request_id.clone(),
             idempotency_key,
         })
-    }
-
-    fn validate_request_header(&self, header: &RequestHeader) -> Result<(), ApiError> {
-        let body_tenant = header
-            .tenant_id
-            .as_ref()
-            .map(|tenant| tenant.value.as_str())
-            .filter(|value| !value.is_empty())
-            .unwrap_or(self.ctx.tenant.as_str());
-        if body_tenant != self.ctx.tenant {
-            return Err(ApiError::bad_request(
-                "request header tenant_id does not match request scope",
-            ));
-        }
-
-        let body_workspace = header
-            .workspace_id
-            .as_ref()
-            .map(|workspace| workspace.value.as_str())
-            .filter(|value| !value.is_empty())
-            .unwrap_or(self.ctx.workspace.as_str());
-        if body_workspace != self.ctx.workspace {
-            return Err(ApiError::bad_request(
-                "request header workspace_id does not match request scope",
-            ));
-        }
-
-        if header.request_id.is_empty() {
-            return Err(ApiError::bad_request("request_id is required"));
-        }
-        if header.request_id != self.ctx.request_id {
-            return Err(ApiError::bad_request(
-                "request header request_id does not match transport request id",
-            ));
-        }
-        Ok(())
     }
 
     async fn claim_idempotency(
@@ -893,7 +864,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         record: &ControlPlaneTxRecord<TResult>,
     ) -> Result<(), ApiError>
     where
-        TResult: Serialize + Sync,
+        TResult: Serialize,
     {
         let path = ControlPlaneTxPaths::record(domain, record.tx_id.as_str());
         match self
@@ -908,11 +879,11 @@ impl<'a> ControlPlaneTransactionService<'a> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn finalize_visible<TResult>(
         &self,
         domain: ControlPlaneTxDomain,
         tx_id: &str,
+        idempotency_path: &str,
         lock_path: String,
         fencing_token: u64,
         repair_pending: bool,
@@ -920,7 +891,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         result: TResult,
     ) -> Result<(), ApiError>
     where
-        TResult: Serialize + DeserializeOwned + Clone + Send + Sync,
+        TResult: Serialize + DeserializeOwned + Clone,
     {
         let path = ControlPlaneTxPaths::record(domain, tx_id);
         let mut record: ControlPlaneTxRecord<TResult> = self
@@ -934,7 +905,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         record.visible_at = Some(visible_at);
         record.result = Some(result.clone());
 
-        self.persist_visible_record_and_idempotency(domain, &record)
+        self.persist_visible_record_and_idempotency(domain, idempotency_path, &record)
             .await
     }
 
@@ -942,9 +913,10 @@ impl<'a> ControlPlaneTransactionService<'a> {
         &self,
         domain: ControlPlaneTxDomain,
         tx_id: &str,
+        idempotency_path: &str,
     ) -> Result<(), ApiError>
     where
-        TResult: Serialize + DeserializeOwned + Clone + Send + Sync,
+        TResult: Serialize + DeserializeOwned + Clone,
     {
         let path = ControlPlaneTxPaths::record(domain, tx_id);
         let mut record: ControlPlaneTxRecord<TResult> = self
@@ -961,22 +933,22 @@ impl<'a> ControlPlaneTransactionService<'a> {
         }
 
         record.repair_pending = true;
-        self.persist_visible_record_and_idempotency(domain, &record)
+        self.persist_visible_record_and_idempotency(domain, idempotency_path, &record)
             .await
     }
 
     async fn persist_visible_record_and_idempotency<TResult>(
         &self,
         domain: ControlPlaneTxDomain,
+        idempotency_path: &str,
         record: &ControlPlaneTxRecord<TResult>,
     ) -> Result<(), ApiError>
     where
-        TResult: Serialize + DeserializeOwned + Clone + Send + Sync,
+        TResult: Serialize + DeserializeOwned + Clone,
     {
         let path = ControlPlaneTxPaths::record(domain, record.tx_id.as_str());
-        let idem_path = ControlPlaneTxPaths::idempotency(domain, record.idempotency_key.as_str());
         let mut idem: ControlPlaneIdempotencyRecord = self
-            .load_json_required(&idem_path)
+            .load_json_required(idempotency_path)
             .await?
             .ok_or_else(|| ApiError::internal("idempotency record missing during finalize"))?;
         idem.visible_at = record.visible_at;
@@ -990,7 +962,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             .write_json(&path, record, WritePrecondition::None)
             .await;
         let idem_write = self
-            .write_json(&idem_path, &idem, WritePrecondition::None)
+            .write_json(idempotency_path, &idem, WritePrecondition::None)
             .await;
         match (tx_write, idem_write) {
             (Ok(_), Ok(_)) => Ok(()),
@@ -1022,18 +994,34 @@ impl<'a> ControlPlaneTransactionService<'a> {
     async fn resolve_existing_visible_record<TResult>(
         &self,
         domain: ControlPlaneTxDomain,
+        idempotency_path: &str,
         existing: &ControlPlaneIdempotencyRecord,
     ) -> Result<ControlPlaneTxRecord<TResult>, ApiError>
     where
-        TResult: Serialize + DeserializeOwned + Clone + Send + Sync,
+        TResult: Serialize + DeserializeOwned + Clone,
     {
         if let Some(record) = self.load_record(domain, existing.tx_id.as_str()).await? {
             if record.status == ControlPlaneTxStatus::Visible {
+                if existing.visible_at != record.visible_at || existing.tx_record.is_none() {
+                    // Safe as a repair write: replayers converge on the same visible receipt,
+                    // and any later repair_pending flip is recovered from the canonical tx record.
+                    if let Err(error) = self
+                        .persist_visible_record_and_idempotency(domain, idempotency_path, &record)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = ?error,
+                            tx_id = existing.tx_id.as_str(),
+                            domain = %domain,
+                            "failed to repair visible idempotency record from transaction record"
+                        );
+                    }
+                }
                 return Ok(record);
             }
         }
 
-        let record = Self::record_from_idempotency(existing)?.ok_or_else(|| {
+        let record = self.record_from_idempotency(existing)?.ok_or_else(|| {
             ApiError::internal(format!(
                 "{domain} transaction record missing for tx_id '{}'",
                 existing.tx_id
@@ -1182,6 +1170,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
     }
 
     fn record_from_idempotency<TResult>(
+        &self,
         record: &ControlPlaneIdempotencyRecord,
     ) -> Result<Option<ControlPlaneTxRecord<TResult>>, ApiError>
     where
@@ -1209,7 +1198,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         precondition: WritePrecondition,
     ) -> Result<WriteOutcome, ApiError>
     where
-        T: Serialize + Sync,
+        T: Serialize,
     {
         let payload = serde_json::to_vec(value)
             .map(Bytes::from)
@@ -1239,96 +1228,97 @@ struct TxExecutionOutcome<T> {
 
 #[derive(Debug, Clone)]
 enum CatalogMutation {
-    CreateNamespace {
-        name: String,
+    CreateCatalog {
+        catalog: String,
         description: Option<String>,
-        properties: BTreeMap<String, String>,
+    },
+    CreateSchema {
+        catalog: String,
+        schema: String,
+        description: Option<String>,
     },
     RegisterTable {
-        namespace: String,
-        name: String,
+        catalog: String,
+        schema: String,
+        table: String,
         description: Option<String>,
         location: Option<String>,
         format: Option<String>,
         columns: Vec<ColumnDefinition>,
-        properties: BTreeMap<String, String>,
     },
-    #[allow(clippy::option_option)]
-    AlterTable {
-        namespace: String,
-        name: String,
+    UpdateTable {
+        catalog: String,
+        schema: String,
+        table: String,
         description: Option<Option<String>>,
         location: Option<Option<String>>,
         format: Option<Option<String>>,
     },
     DropTable {
-        namespace: String,
-        name: String,
+        catalog: String,
+        schema: String,
+        table: String,
+    },
+    RenameTable {
+        catalog: String,
+        schema: String,
+        table: String,
+        new_table: String,
     },
 }
 
 #[derive(Debug, Clone)]
 struct OrchestrationBatchMutation {
     events: Vec<OrchestrationEventEnvelope>,
-    allow_inline_merge: bool,
 }
 
 impl OrchestrationBatchMutation {
     fn from_request(request: &CommitOrchestrationBatchRequest) -> Result<Self, ApiError> {
-        Self::from_parts(&request.events, request.allow_inline_merge.unwrap_or(false))
+        Self::from_parts(&request.events)
     }
 
     fn from_spec(spec: &OrchestrationBatchSpec) -> Result<Self, ApiError> {
-        Self::from_parts(&spec.events, spec.allow_inline_merge.unwrap_or(false))
+        Self::from_parts(&spec.events)
     }
 
-    fn from_parts(
-        events: &[OrchestrationEventEnvelope],
-        allow_inline_merge: bool,
-    ) -> Result<Self, ApiError> {
+    fn from_parts(events: &[OrchestrationEventEnvelope]) -> Result<Self, ApiError> {
         if events.is_empty() {
             return Err(ApiError::bad_request(
                 "orchestration batch must include at least one event",
             ));
         }
 
-        if allow_inline_merge {
-            return Err(ApiError::bad_request(
-                "CommitOrchestrationBatch allow_inline_merge is not supported",
-            ));
-        }
-
         Ok(Self {
             events: events.to_vec(),
-            allow_inline_merge,
         })
     }
 
-    fn request_hash_value(&self) -> serde_json::Value {
-        serde_json::json!({
-            "events": self.events.iter().map(|event| serde_json::json!({
-                "event_id": event.event_id,
-                "event_type": event.event_type,
-                "event_version": event.event_version,
-                "timestamp": event.timestamp.as_ref().map(|ts| serde_json::json!({
-                    "seconds": ts.seconds,
-                    "nanos": ts.nanos,
-                })),
-                "source": event.source,
-                "idempotency_key": event.idempotency_key,
-                "correlation_id": event.correlation_id,
-                "causation_id": event.causation_id,
-                "payload_json": base64::engine::general_purpose::STANDARD.encode(&event.payload_json),
-            })).collect::<Vec<_>>(),
-            "require_visible": true,
-            "allow_inline_merge": self.allow_inline_merge,
-        })
+    fn request_hash_value(
+        &self,
+        meta: &ResolvedRequestMetadata,
+    ) -> Result<serde_json::Value, ApiError> {
+        let events = self.events(meta)?;
+        Self::request_hash_value_for_events(&sanitize_runtime_events_for_request_hash(&events))
     }
 
-    fn request_hash(&self) -> Result<String, ApiError> {
-        prefixed_request_hash(&self.request_hash_value()).map_err(|error| {
+    fn request_hash_for_events(&self, events: &[OrchestrationEvent]) -> Result<String, ApiError> {
+        prefixed_request_hash(&Self::request_hash_value_for_events(
+            &sanitize_runtime_events_for_request_hash(events),
+        )?)
+        .map_err(|error| {
             ApiError::bad_request(format!("failed to hash orchestration request: {error}"))
         })
+    }
+
+    fn request_hash_value_for_events(
+        events: &[OrchestrationEvent],
+    ) -> Result<serde_json::Value, ApiError> {
+        let events = serde_json::to_value(events).map_err(|error| {
+            ApiError::internal(format!(
+                "failed to serialize orchestration events for hashing: {error}"
+            ))
+        })?;
+        Ok(serde_json::json!({ "events": events }))
     }
 
     fn events(&self, meta: &ResolvedRequestMetadata) -> Result<Vec<OrchestrationEvent>, ApiError> {
@@ -1343,17 +1333,26 @@ impl OrchestrationBatchMutation {
 enum RootMutation {
     Catalog(CatalogMutation),
     Orchestration(OrchestrationBatchMutation),
+    Metastore(MetastoreMutation),
 }
 
 impl RootMutation {
     fn from_proto(mutation: &DomainMutation) -> Result<Self, ApiError> {
         match mutation.kind.as_ref() {
-            Some(RootMutationKind::Catalog(operation)) => {
+            Some(domain_mutation::Kind::Catalog(operation)) => {
                 Ok(Self::Catalog(CatalogMutation::from_proto(operation)?))
             }
-            Some(RootMutationKind::Orchestration(spec)) => Ok(Self::Orchestration(
+            Some(domain_mutation::Kind::Orchestration(spec)) => Ok(Self::Orchestration(
                 OrchestrationBatchMutation::from_spec(spec)?,
             )),
+            Some(domain_mutation::Kind::Metastore(mutation)) => {
+                if !mutation.has_contract_operation() {
+                    return Err(ApiError::bad_request(
+                        "metastore mutation operation is required",
+                    ));
+                }
+                Ok(Self::Metastore(mutation.clone()))
+            }
             None => Err(ApiError::bad_request("root mutation kind is required")),
         }
     }
@@ -1362,10 +1361,18 @@ impl RootMutation {
         match self {
             Self::Catalog(_) => ControlPlaneTxDomain::Catalog,
             Self::Orchestration(_) => ControlPlaneTxDomain::Orchestration,
+            Self::Metastore(_) => ControlPlaneTxDomain::Catalog,
         }
     }
 
-    fn request_hash_value(&self) -> Result<serde_json::Value, ApiError> {
+    const fn is_metastore(&self) -> bool {
+        matches!(self, Self::Metastore(_))
+    }
+
+    fn request_hash_value(
+        &self,
+        meta: &ResolvedRequestMetadata,
+    ) -> Result<serde_json::Value, ApiError> {
         match self {
             Self::Catalog(mutation) => Ok(serde_json::json!({
                 "domain": "catalog",
@@ -1373,82 +1380,100 @@ impl RootMutation {
             })),
             Self::Orchestration(batch) => Ok(serde_json::json!({
                 "domain": "orchestration",
-                "request": batch.request_hash_value(),
+                "request": batch.request_hash_value(meta)?,
+            })),
+            Self::Metastore(mutation) => Ok(serde_json::json!({
+                "domain": "metastore",
+                "request": {
+                    "protoHex": hex::encode(mutation.encode_to_vec()),
+                },
             })),
         }
     }
 }
 
 impl CatalogMutation {
-    fn from_proto(operation: &arco_proto::CatalogDdlOperation) -> Result<Self, ApiError> {
+    fn from_proto(operation: &CatalogDdlOperation) -> Result<Self, ApiError> {
         match operation.op.as_ref() {
-            Some(CatalogDdlOp::CreateNamespace(CreateNamespaceOp {
-                name,
+            Some(catalog_ddl_operation::Op::CreateCatalog(CreateCatalogOp {
+                catalog,
                 description,
-                properties,
-            })) => {
-                if !properties.is_empty() {
-                    return Err(ApiError::bad_request(
-                        "catalog namespace properties are not supported",
-                    ));
-                }
-                Ok(Self::CreateNamespace {
-                    name: name.clone(),
-                    description: description.clone(),
-                    properties: properties.clone(),
-                })
-            }
-            Some(CatalogDdlOp::RegisterTable(RegisterTableOp {
-                namespace,
-                name,
+            })) => Ok(Self::CreateCatalog {
+                catalog: catalog.clone(),
+                description: description.clone(),
+            }),
+            Some(catalog_ddl_operation::Op::CreateSchema(CreateSchemaOp {
+                catalog,
+                schema,
+                description,
+            })) => Ok(Self::CreateSchema {
+                catalog: catalog.clone(),
+                schema: schema.clone(),
+                description: description.clone(),
+            }),
+            Some(catalog_ddl_operation::Op::RegisterTable(RegisterTableOp {
+                catalog,
+                schema,
+                table,
                 description,
                 location,
                 format,
                 columns,
-                properties,
-            })) => {
-                if !properties.is_empty() {
-                    return Err(ApiError::bad_request(
-                        "catalog table properties are not supported",
-                    ));
-                }
-                Ok(Self::RegisterTable {
-                    namespace: namespace.clone(),
-                    name: name.clone(),
-                    description: description.clone(),
-                    location: location.clone(),
-                    format: format
-                        .map(parse_register_table_format)
-                        .transpose()?
-                        .flatten(),
-                    columns: columns
-                        .iter()
-                        .map(|column| ColumnDefinition {
-                            name: column.name.clone(),
-                            data_type: column.data_type.clone(),
-                            is_nullable: column.is_nullable,
-                            description: column.description.clone(),
-                        })
-                        .collect(),
-                    properties: properties.clone(),
-                })
-            }
-            Some(CatalogDdlOp::AlterTable(AlterTableOp {
-                namespace,
-                name,
+            })) => Ok(Self::RegisterTable {
+                catalog: catalog.clone(),
+                schema: schema.clone(),
+                table: table.clone(),
+                description: description.clone(),
+                location: location.clone(),
+                format: parse_table_format(*format)?,
+                columns: columns
+                    .iter()
+                    .map(|column| ColumnDefinition {
+                        name: column.name.clone(),
+                        data_type: column.data_type.clone(),
+                        is_nullable: column.is_nullable,
+                        ordinal: column.ordinal,
+                        description: column.description.clone(),
+                    })
+                    .collect(),
+            }),
+            Some(catalog_ddl_operation::Op::UpdateTable(UpdateTableOp {
+                catalog,
+                schema,
+                table,
                 description,
                 location,
                 format,
-            })) => Ok(Self::AlterTable {
-                namespace: namespace.clone(),
-                name: name.clone(),
+            })) => Ok(Self::UpdateTable {
+                catalog: catalog.clone(),
+                schema: schema.clone(),
+                table: table.clone(),
                 description: description.clone().map(Some),
                 location: location.clone().map(Some),
-                format: format.map(parse_alter_table_format).transpose()?,
+                format: format
+                    .as_ref()
+                    .map(|value| parse_table_format(*value))
+                    .transpose()?,
             }),
-            Some(CatalogDdlOp::DropTable(DropTableOp { namespace, name })) => Ok(Self::DropTable {
-                namespace: namespace.clone(),
-                name: name.clone(),
+            Some(catalog_ddl_operation::Op::DropTable(DropTableOp {
+                catalog,
+                schema,
+                table,
+            })) => Ok(Self::DropTable {
+                catalog: catalog.clone(),
+                schema: schema.clone(),
+                table: table.clone(),
+            }),
+            Some(catalog_ddl_operation::Op::RenameTable(RenameTableOp {
+                catalog,
+                schema,
+                table,
+                new_table,
+            })) => Ok(Self::RenameTable {
+                catalog: catalog.clone(),
+                schema: schema.clone(),
+                table: table.clone(),
+                new_table: new_table.clone(),
             }),
             None => Err(ApiError::bad_request("catalog DDL operation is required")),
         }
@@ -1462,29 +1487,37 @@ impl CatalogMutation {
 
     fn request_hash_value(&self) -> Result<serde_json::Value, ApiError> {
         Ok(match self {
-            Self::CreateNamespace {
-                name,
+            Self::CreateCatalog {
+                catalog,
                 description,
-                properties,
             } => serde_json::json!({
-                "type": "create_namespace",
-                "name": name,
+                "type": "create_catalog",
+                "catalog": catalog,
                 "description": description,
-                "properties": properties,
-                "require_visible": true,
+            }),
+            Self::CreateSchema {
+                catalog,
+                schema,
+                description,
+            } => serde_json::json!({
+                "type": "create_schema",
+                "catalog": catalog,
+                "schema": schema,
+                "description": description,
             }),
             Self::RegisterTable {
-                namespace,
-                name,
+                catalog,
+                schema,
+                table,
                 description,
                 location,
                 format,
                 columns,
-                properties,
             } => serde_json::json!({
                 "type": "register_table",
-                "namespace": namespace,
-                "name": name,
+                "catalog": catalog,
+                "schema": schema,
+                "table": table,
                 "description": description,
                 "location": location,
                 "format": format,
@@ -1492,14 +1525,14 @@ impl CatalogMutation {
                     "name": column.name,
                     "data_type": column.data_type,
                     "is_nullable": column.is_nullable,
+                    "ordinal": column.ordinal,
                     "description": column.description,
                 })).collect::<Vec<_>>(),
-                "properties": properties,
-                "require_visible": true,
             }),
-            Self::AlterTable {
-                namespace,
-                name,
+            Self::UpdateTable {
+                catalog,
+                schema,
+                table,
                 description,
                 location,
                 format,
@@ -1507,19 +1540,26 @@ impl CatalogMutation {
                 let mut value = serde_json::Map::new();
                 value.insert(
                     "type".to_string(),
-                    serde_json::Value::String("alter_table".to_string()),
+                    serde_json::Value::String("update_table".to_string()),
                 );
                 value.insert(
-                    "namespace".to_string(),
-                    serde_json::Value::String(namespace.clone()),
+                    "catalog".to_string(),
+                    serde_json::Value::String(catalog.clone()),
                 );
-                value.insert("name".to_string(), serde_json::Value::String(name.clone()));
+                value.insert(
+                    "schema".to_string(),
+                    serde_json::Value::String(schema.clone()),
+                );
+                value.insert(
+                    "table".to_string(),
+                    serde_json::Value::String(table.clone()),
+                );
                 if let Some(description) = description {
                     value.insert(
                         "description".to_string(),
                         serde_json::to_value(description).map_err(|error| {
                             ApiError::internal(format!(
-                                "failed to serialize alter_table description for hashing: {error}"
+                                "failed to serialize update_table description for hashing: {error}"
                             ))
                         })?,
                     );
@@ -1529,7 +1569,7 @@ impl CatalogMutation {
                         "location".to_string(),
                         serde_json::to_value(location).map_err(|error| {
                             ApiError::internal(format!(
-                                "failed to serialize alter_table location for hashing: {error}"
+                                "failed to serialize update_table location for hashing: {error}"
                             ))
                         })?,
                     );
@@ -1539,19 +1579,34 @@ impl CatalogMutation {
                         "format".to_string(),
                         serde_json::to_value(format).map_err(|error| {
                             ApiError::internal(format!(
-                                "failed to serialize alter_table format for hashing: {error}"
+                                "failed to serialize update_table format for hashing: {error}"
                             ))
                         })?,
                     );
                 }
-                value.insert("require_visible".to_string(), serde_json::Value::Bool(true));
                 serde_json::Value::Object(value)
             }
-            Self::DropTable { namespace, name } => serde_json::json!({
+            Self::DropTable {
+                catalog,
+                schema,
+                table,
+            } => serde_json::json!({
                 "type": "drop_table",
-                "namespace": namespace,
-                "name": name,
-                "require_visible": true,
+                "catalog": catalog,
+                "schema": schema,
+                "table": table,
+            }),
+            Self::RenameTable {
+                catalog,
+                schema,
+                table,
+                new_table,
+            } => serde_json::json!({
+                "type": "rename_table",
+                "catalog": catalog,
+                "schema": schema,
+                "table": table,
+                "new_table": new_table,
             }),
         })
     }
@@ -1562,47 +1617,62 @@ impl CatalogMutation {
         options: WriteOptions,
     ) -> arco_catalog::Result<CatalogTransactionCommit> {
         match self {
-            Self::CreateNamespace {
-                name, description, ..
+            Self::CreateCatalog {
+                catalog,
+                description,
             } => {
                 writer
-                    .create_namespace_transaction(name, description.as_deref(), options)
+                    .create_catalog_transaction(catalog, description.as_deref(), options)
+                    .await
+            }
+            Self::CreateSchema {
+                catalog,
+                schema,
+                description,
+            } => {
+                writer
+                    .create_schema_transaction(catalog, schema, description.as_deref(), options)
                     .await
             }
             Self::RegisterTable {
-                namespace,
-                name,
+                catalog,
+                schema,
+                table,
                 description,
                 location,
                 format,
                 columns,
-                ..
             } => {
                 writer
-                    .register_table_transaction(
-                        RegisterTableRequest {
-                            namespace: namespace.clone(),
-                            name: name.clone(),
+                    .register_table_in_schema_transaction(
+                        catalog,
+                        schema,
+                        RegisterTableInSchemaRequest {
+                            name: table.clone(),
                             description: description.clone(),
                             location: location.clone(),
                             format: format.clone(),
+                            table_type: None,
+                            properties: None,
                             columns: columns.clone(),
                         },
                         options,
                     )
                     .await
             }
-            Self::AlterTable {
-                namespace,
-                name,
+            Self::UpdateTable {
+                catalog,
+                schema,
+                table,
                 description,
                 location,
                 format,
             } => {
                 writer
-                    .update_table_transaction(
-                        namespace,
-                        name,
+                    .update_table_in_schema_transaction(
+                        catalog,
+                        schema,
+                        table,
                         TablePatch {
                             description: description.clone(),
                             location: location.clone(),
@@ -1612,9 +1682,23 @@ impl CatalogMutation {
                     )
                     .await
             }
-            Self::DropTable { namespace, name } => {
+            Self::DropTable {
+                catalog,
+                schema,
+                table,
+            } => {
                 writer
-                    .drop_table_transaction(namespace, name, options)
+                    .drop_table_in_schema_transaction(catalog, schema, table, options)
+                    .await
+            }
+            Self::RenameTable {
+                catalog,
+                schema,
+                table,
+                new_table,
+            } => {
+                writer
+                    .rename_table_in_schema_transaction(catalog, schema, table, new_table, options)
                     .await
             }
         }
@@ -1663,32 +1747,29 @@ struct TxRecordLifecycle {
     prepared_at: DateTime<Utc>,
 }
 
-fn asset_format_string(format: AssetFormat) -> Option<String> {
+fn table_format_string(format: ProtoTableFormat) -> Option<String> {
     match format {
-        AssetFormat::Unspecified => None,
-        AssetFormat::Parquet => Some("parquet".to_string()),
-        AssetFormat::Delta => Some("delta".to_string()),
-        AssetFormat::Iceberg => Some("iceberg".to_string()),
+        ProtoTableFormat::Unspecified => None,
+        ProtoTableFormat::Delta => Some("delta".to_string()),
+        ProtoTableFormat::Iceberg => Some("iceberg".to_string()),
+        ProtoTableFormat::Parquet => Some("parquet".to_string()),
     }
 }
 
-fn parse_register_table_format(value: i32) -> Result<Option<String>, ApiError> {
-    let format = AssetFormat::try_from(value)
-        .map_err(|_| ApiError::bad_request(format!("unknown asset format value: {value}")))?;
-    Ok(asset_format_string(format))
+fn parse_table_format(value: i32) -> Result<Option<String>, ApiError> {
+    let format = ProtoTableFormat::try_from(value)
+        .map_err(|_| ApiError::bad_request(format!("unknown table format value: {value}")))?;
+    Ok(table_format_string(format))
 }
 
-fn parse_alter_table_format(value: i32) -> Result<Option<String>, ApiError> {
-    let format = AssetFormat::try_from(value)
-        .map_err(|_| ApiError::bad_request(format!("unknown asset format value: {value}")))?;
-    Ok(asset_format_string(format))
-}
-
-fn root_request_hash(mutations: &[RootMutation]) -> Result<String, ApiError> {
+fn root_request_hash(
+    mutations: &[RootMutation],
+    meta: &ResolvedRequestMetadata,
+) -> Result<String, ApiError> {
     let value = serde_json::json!({
         "mutations": mutations
             .iter()
-            .map(RootMutation::request_hash_value)
+            .map(|mutation| mutation.request_hash_value(meta))
             .collect::<Result<Vec<_>, _>>()?,
     });
     prefixed_request_hash(&value)
@@ -1701,83 +1782,43 @@ fn prefixed_request_hash(
     canonical_request_hash(value).map(|hash| format!("sha256:{hash}"))
 }
 
+fn sanitize_runtime_events_for_request_hash(
+    events: &[OrchestrationEvent],
+) -> Vec<OrchestrationEvent> {
+    events
+        .iter()
+        .cloned()
+        .map(|mut event| {
+            if let OrchestrationEventData::RunRequested {
+                trigger_source_ref: SourceRef::Manual { request_id, .. },
+                ..
+            } = &mut event.data
+            {
+                request_id.clear();
+            }
+
+            event
+        })
+        .collect()
+}
+
 fn envelope_to_event(
     meta: &ResolvedRequestMetadata,
     envelope: &OrchestrationEventEnvelope,
 ) -> Result<OrchestrationEvent, ApiError> {
-    let payload =
-        serde_json::from_slice::<serde_json::Value>(&envelope.payload_json).map_err(|error| {
-            ApiError::bad_request(format!(
-                "failed to parse orchestration payload for event '{}': {error}",
-                envelope.event_id
-            ))
-        })?;
-    let mut payload_object = payload.as_object().cloned().ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "orchestration payload for event '{}' must be a JSON object",
-            envelope.event_id
-        ))
-    })?;
-    payload_object.insert(
-        "type".to_string(),
-        serde_json::Value::String(camel_to_snake(envelope.event_type.as_str())),
-    );
-    let data =
-        serde_json::from_value::<OrchestrationEventData>(serde_json::Value::Object(payload_object))
-            .map_err(|error| {
-                ApiError::bad_request(format!(
-                    "failed to decode orchestration event payload for '{}': {error}",
-                    envelope.event_id
-                ))
-            })?;
+    event_from_proto_envelope(&meta.tenant, &meta.workspace, envelope)
+        .map_err(|error| ApiError::bad_request(format!("invalid orchestration event: {error}")))
+}
 
-    if data.event_type() != envelope.event_type {
-        return Err(ApiError::bad_request(format!(
-            "orchestration event_type '{}' does not match payload type '{}'",
-            envelope.event_type,
-            data.event_type()
-        )));
-    }
-
-    Ok(OrchestrationEvent {
-        event_id: envelope.event_id.clone(),
-        event_type: envelope.event_type.clone(),
-        event_version: envelope.event_version,
-        timestamp: protobuf_timestamp_to_chrono(
-            envelope.timestamp.as_ref().ok_or_else(|| {
-                ApiError::bad_request("orchestration event timestamp is required")
-            })?,
-        )?,
-        source: envelope.source.clone(),
-        tenant_id: meta.tenant.clone(),
-        workspace_id: meta.workspace.clone(),
-        idempotency_key: envelope.idempotency_key.clone(),
-        correlation_id: envelope.correlation_id.clone(),
-        causation_id: envelope.causation_id.clone(),
-        data,
+fn chrono_to_timestamp(timestamp: DateTime<Utc>) -> Option<prost_types::Timestamp> {
+    Some(prost_types::Timestamp {
+        seconds: timestamp.timestamp(),
+        nanos: i32::try_from(timestamp.timestamp_subsec_nanos()).unwrap_or(i32::MAX),
     })
 }
 
-fn protobuf_timestamp_to_chrono(
-    timestamp: &prost_types::Timestamp,
-) -> Result<DateTime<Utc>, ApiError> {
-    DateTime::<Utc>::from_timestamp(
-        timestamp.seconds,
-        u32::try_from(timestamp.nanos)
-            .map_err(|_| ApiError::bad_request("protobuf timestamp nanos must be non-negative"))?,
-    )
-    .ok_or_else(|| ApiError::bad_request("invalid protobuf timestamp"))
-}
-
-fn chrono_to_timestamp(timestamp: DateTime<Utc>) -> prost_types::Timestamp {
-    prost_types::Timestamp {
-        seconds: timestamp.timestamp(),
-        nanos: i32::try_from(timestamp.timestamp_subsec_nanos()).unwrap_or(i32::MAX),
-    }
-}
-
-fn catalog_receipt_to_proto(receipt: &CatalogTxReceipt) -> arco_proto::CatalogTxReceipt {
-    arco_proto::CatalogTxReceipt {
+fn catalog_receipt_to_proto(receipt: &CatalogTxReceipt) -> ProtoCatalogTxReceipt {
+    ProtoCatalogTxReceipt {
         tx_id: receipt.tx_id.clone(),
         event_id: receipt.event_id.clone(),
         commit_id: receipt.commit_id.clone(),
@@ -1785,14 +1826,12 @@ fn catalog_receipt_to_proto(receipt: &CatalogTxReceipt) -> arco_proto::CatalogTx
         snapshot_version: receipt.snapshot_version,
         pointer_version: receipt.pointer_version.clone(),
         read_token: receipt.read_token.clone(),
-        visible_at: Some(chrono_to_timestamp(receipt.visible_at)),
+        visible_at: chrono_to_timestamp(receipt.visible_at),
     }
 }
 
-fn orchestration_receipt_to_proto(
-    receipt: &OrchestrationTxReceipt,
-) -> arco_proto::OrchestrationTxReceipt {
-    arco_proto::OrchestrationTxReceipt {
+fn orchestration_receipt_to_proto(receipt: &OrchestrationTxReceipt) -> ProtoOrchestrationTxReceipt {
+    ProtoOrchestrationTxReceipt {
         tx_id: receipt.tx_id.clone(),
         commit_id: receipt.commit_id.clone(),
         manifest_id: receipt.manifest_id.clone(),
@@ -1801,12 +1840,12 @@ fn orchestration_receipt_to_proto(
         pointer_version: receipt.pointer_version.clone(),
         events_processed: receipt.events_processed,
         read_token: receipt.read_token.clone(),
-        visible_at: Some(chrono_to_timestamp(receipt.visible_at)),
+        visible_at: chrono_to_timestamp(receipt.visible_at),
     }
 }
 
-fn root_receipt_to_proto(receipt: &RootTxReceipt) -> arco_proto::RootTxReceipt {
-    arco_proto::RootTxReceipt {
+fn root_receipt_to_proto(receipt: &RootTxReceipt) -> ProtoRootTxReceipt {
+    ProtoRootTxReceipt {
         tx_id: receipt.tx_id.clone(),
         root_commit_id: receipt.root_commit_id.clone(),
         super_manifest_path: receipt.super_manifest_path.clone(),
@@ -1816,7 +1855,7 @@ fn root_receipt_to_proto(receipt: &RootTxReceipt) -> arco_proto::RootTxReceipt {
             .map(domain_commit_to_proto)
             .collect(),
         read_token: receipt.read_token.clone(),
-        visible_at: Some(chrono_to_timestamp(receipt.visible_at)),
+        visible_at: chrono_to_timestamp(receipt.visible_at),
     }
 }
 
@@ -1824,13 +1863,11 @@ fn catalog_status_to_proto(record: &CatalogTxRecord) -> CatalogTxStatus {
     CatalogTxStatus {
         tx_id: record.tx_id.clone(),
         status: proto_status(record.status) as i32,
-        request_id: record.request_id.clone(),
-        idempotency_key: record.idempotency_key.clone(),
         request_hash: record.request_hash.clone(),
         lock_path: record.lock_path.clone(),
         fencing_token: record.fencing_token,
-        prepared_at: Some(chrono_to_timestamp(record.prepared_at)),
-        visible_at: record.visible_at.map(chrono_to_timestamp),
+        prepared_at: chrono_to_timestamp(record.prepared_at),
+        visible_at: record.visible_at.and_then(chrono_to_timestamp),
         result: record.result.as_ref().map(catalog_receipt_to_proto),
         repair_pending: record.repair_pending,
     }
@@ -1840,13 +1877,11 @@ fn orchestration_status_to_proto(record: &OrchestrationTxRecord) -> Orchestratio
     OrchestrationTxStatus {
         tx_id: record.tx_id.clone(),
         status: proto_status(record.status) as i32,
-        request_id: record.request_id.clone(),
-        idempotency_key: record.idempotency_key.clone(),
         request_hash: record.request_hash.clone(),
         lock_path: record.lock_path.clone(),
         fencing_token: record.fencing_token,
-        prepared_at: Some(chrono_to_timestamp(record.prepared_at)),
-        visible_at: record.visible_at.map(chrono_to_timestamp),
+        prepared_at: chrono_to_timestamp(record.prepared_at),
+        visible_at: record.visible_at.and_then(chrono_to_timestamp),
         result: record.result.as_ref().map(orchestration_receipt_to_proto),
         repair_pending: record.repair_pending,
     }
@@ -1856,13 +1891,11 @@ fn root_status_to_proto(record: &RootTxRecord) -> RootTxStatus {
     RootTxStatus {
         tx_id: record.tx_id.clone(),
         status: proto_status(record.status) as i32,
-        request_id: record.request_id.clone(),
-        idempotency_key: record.idempotency_key.clone(),
         request_hash: record.request_hash.clone(),
         lock_path: record.lock_path.clone(),
         fencing_token: record.fencing_token,
-        prepared_at: Some(chrono_to_timestamp(record.prepared_at)),
-        visible_at: record.visible_at.map(chrono_to_timestamp),
+        prepared_at: chrono_to_timestamp(record.prepared_at),
+        visible_at: record.visible_at.and_then(chrono_to_timestamp),
         super_manifest_path: record
             .result
             .as_ref()
@@ -1878,8 +1911,8 @@ fn root_status_to_proto(record: &RootTxRecord) -> RootTxStatus {
     }
 }
 
-fn domain_commit_to_proto(commit: &DomainCommit) -> arco_proto::DomainCommit {
-    arco_proto::DomainCommit {
+fn domain_commit_to_proto(commit: &DomainCommit) -> ProtoDomainCommit {
+    ProtoDomainCommit {
         domain: proto_domain(commit.domain) as i32,
         tx_id: commit.tx_id.clone(),
         commit_id: commit.commit_id.clone(),
@@ -1950,19 +1983,4 @@ fn proto_status(status: ControlPlaneTxStatus) -> TransactionStatus {
         ControlPlaneTxStatus::Visible => TransactionStatus::Visible,
         ControlPlaneTxStatus::Aborted => TransactionStatus::Aborted,
     }
-}
-
-fn camel_to_snake(value: &str) -> String {
-    let mut output = String::new();
-    for (index, ch) in value.chars().enumerate() {
-        if ch.is_uppercase() {
-            if index > 0 {
-                output.push('_');
-            }
-            output.extend(ch.to_lowercase());
-        } else {
-            output.push(ch);
-        }
-    }
-    output
 }

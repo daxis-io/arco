@@ -18,6 +18,23 @@ use support::{
     seed_orchestration_storage, test_router, test_router_with_backend,
 };
 
+const ORCHESTRATION_SYSTEM_TABLES: &[&str] = &[
+    "runs",
+    "tasks",
+    "dep_satisfaction",
+    "timers",
+    "dispatch_outbox",
+    "sensor_state",
+    "sensor_evals",
+    "partition_status",
+    "schedule_definitions",
+    "schedule_state",
+    "schedule_ticks",
+    "backfills",
+    "backfill_chunks",
+    "run_key_conflicts",
+];
+
 #[tokio::test]
 async fn query_can_select_from_system_catalog_namespaces() -> Result<()> {
     let router = seed_catalog(test_router()).await?;
@@ -117,6 +134,36 @@ async fn query_can_select_from_system_orchestration_partition_status() -> Result
 
     let response = router.oneshot(request).await.map_err(|err| match err {})?;
     assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_can_select_count_from_every_system_orchestration_table() -> Result<()> {
+    let router = seed_orchestration_router().await?;
+
+    for table in ORCHESTRATION_SYSTEM_TABLES {
+        let request = helpers::make_request(
+            Method::POST,
+            "/api/v1/query?format=json",
+            Some(serde_json::json!({
+                "sql": format!(
+                    "SELECT count(*) AS row_count FROM system.orchestration.{table}"
+                )
+            })),
+        )?;
+
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .map_err(|err| match err {})?;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "system.orchestration.{table} should be queryable"
+        );
+    }
+
     Ok(())
 }
 

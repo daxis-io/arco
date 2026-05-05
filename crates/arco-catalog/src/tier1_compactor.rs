@@ -1478,7 +1478,11 @@ fn apply_catalog_event_v4(
                     message: format!("catalog '{}' not found", catalog.id),
                 });
             };
-            let existing = &state.catalogs[index];
+            let Some(existing) = state.catalogs.get(index) else {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog '{}' not found", catalog.id),
+                });
+            };
 
             if existing.name != old_name {
                 return Err(Tier1CompactionError::ProcessingError {
@@ -1501,7 +1505,12 @@ fn apply_catalog_event_v4(
                 return Ok(());
             }
 
-            state.catalogs[index] = catalog;
+            let Some(existing) = state.catalogs.get_mut(index) else {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("catalog '{}' not found", catalog.id),
+                });
+            };
+            *existing = catalog;
         }
         CatalogDdlEventV4::NamespaceRenamed {
             namespace,
@@ -1521,7 +1530,11 @@ fn apply_catalog_event_v4(
                     message: format!("namespace '{}' not found", namespace.id),
                 });
             };
-            let existing = &state.namespaces[index];
+            let Some(existing) = state.namespaces.get(index) else {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("namespace '{}' not found", namespace.id),
+                });
+            };
 
             if existing.name != old_name {
                 return Err(Tier1CompactionError::ProcessingError {
@@ -1547,7 +1560,12 @@ fn apply_catalog_event_v4(
                 return Ok(());
             }
 
-            state.namespaces[index] = namespace;
+            let Some(existing) = state.namespaces.get_mut(index) else {
+                return Err(Tier1CompactionError::ProcessingError {
+                    message: format!("namespace '{}' not found", namespace.id),
+                });
+            };
+            *existing = namespace;
         }
     }
 

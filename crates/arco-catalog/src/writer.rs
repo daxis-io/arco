@@ -53,7 +53,7 @@ use crate::tier1_events::{
 };
 use crate::tier1_state;
 use crate::tier1_writer::Tier1Writer;
-use crate::write_options::WriteOptions;
+use crate::write_options::{IdempotencyKey, WriteOptions};
 
 /// Default lock TTL for write operations.
 const DEFAULT_LOCK_TTL: Duration = Duration::from_secs(30);
@@ -92,9 +92,8 @@ fn normalize_table_location_for_write(
     Ok(Some(trimmed))
 }
 
-fn encode_uc_properties(properties: &Option<BTreeMap<String, String>>) -> Result<Option<String>> {
+fn encode_uc_properties(properties: Option<&BTreeMap<String, String>>) -> Result<Option<String>> {
     properties
-        .as_ref()
         .map(|properties| {
             serde_json::to_string(properties).map_err(|err| CatalogError::Serialization {
                 message: format!("failed to serialize UC properties: {err}"),
@@ -192,7 +191,7 @@ impl TryFrom<&Catalog> for CatalogRecord {
             description: catalog.description.clone(),
             created_at: catalog.created_at,
             updated_at: catalog.updated_at,
-            properties_json: encode_uc_properties(&catalog.properties)?,
+            properties_json: encode_uc_properties(catalog.properties.as_ref())?,
             storage_root: catalog.storage_root.clone(),
         })
     }
@@ -226,7 +225,7 @@ impl TryFrom<&Schema> for NamespaceRecord {
             description: ns.description.clone(),
             created_at: ns.created_at,
             updated_at: ns.updated_at,
-            properties_json: encode_uc_properties(&ns.properties)?,
+            properties_json: encode_uc_properties(ns.properties.as_ref())?,
             storage_root: ns.storage_root.clone(),
         })
     }
@@ -290,7 +289,7 @@ impl TryFrom<&Table> for TableRecord {
             created_at: t.created_at,
             updated_at: t.updated_at,
             table_type: t.table_type.clone(),
-            properties_json: encode_uc_properties(&t.properties)?,
+            properties_json: encode_uc_properties(t.properties.as_ref())?,
         })
     }
 }
@@ -634,8 +633,8 @@ impl CatalogWriter {
         IdempotencyStoreImpl::new(Arc::new(self.storage.clone()))
     }
 
-    fn idempotency_request_hash(value: serde_json::Value) -> Result<String> {
-        canonical_request_hash(&value).map_err(|err| CatalogError::InvariantViolation {
+    fn idempotency_request_hash(value: &serde_json::Value) -> Result<String> {
+        canonical_request_hash(value).map_err(|err| CatalogError::InvariantViolation {
             message: format!("failed to canonicalize idempotent request: {err}"),
         })
     }
@@ -919,6 +918,7 @@ impl CatalogWriter {
     /// # Errors
     ///
     /// Returns an error if the catalog already exists or storage operations fail.
+    #[allow(clippy::too_many_lines)]
     pub async fn create_catalog_with_metadata(
         &self,
         name: &str,
@@ -927,7 +927,7 @@ impl CatalogWriter {
         storage_root: Option<&str>,
         opts: WriteOptions,
     ) -> Result<Catalog> {
-        let request_hash = Self::idempotency_request_hash(serde_json::json!({
+        let request_hash = Self::idempotency_request_hash(&serde_json::json!({
             "name": name,
             "description": description,
             "properties": properties,
@@ -937,7 +937,7 @@ impl CatalogWriter {
         let idempotency_store = self.idempotency_store();
         let idempotency = match check_idempotency(
             &idempotency_store,
-            opts.idempotency_key.as_ref().map(|key| key.as_str()),
+            opts.idempotency_key.as_ref().map(IdempotencyKey::as_str),
             CatalogOperation::CreateCatalog,
             &request_hash,
             DEFAULT_STALE_TIMEOUT,
@@ -1527,7 +1527,7 @@ impl CatalogWriter {
         storage_root: Option<&str>,
         opts: WriteOptions,
     ) -> Result<Schema> {
-        let request_hash = Self::idempotency_request_hash(serde_json::json!({
+        let request_hash = Self::idempotency_request_hash(&serde_json::json!({
             "catalog": catalog,
             "schema": schema,
             "description": description,
@@ -1538,7 +1538,7 @@ impl CatalogWriter {
         let idempotency_store = self.idempotency_store();
         let idempotency = match check_idempotency(
             &idempotency_store,
-            opts.idempotency_key.as_ref().map(|key| key.as_str()),
+            opts.idempotency_key.as_ref().map(IdempotencyKey::as_str),
             CatalogOperation::CreateSchema,
             &request_hash,
             DEFAULT_STALE_TIMEOUT,
@@ -2953,7 +2953,7 @@ impl CatalogWriter {
         req: RegisterTableInSchemaRequest,
         opts: WriteOptions,
     ) -> Result<Table> {
-        let request_hash = Self::idempotency_request_hash(serde_json::json!({
+        let request_hash = Self::idempotency_request_hash(&serde_json::json!({
             "catalog": catalog,
             "schema": schema,
             "name": req.name.clone(),
@@ -2974,7 +2974,7 @@ impl CatalogWriter {
         let idempotency_store = self.idempotency_store();
         let idempotency = match check_idempotency(
             &idempotency_store,
-            opts.idempotency_key.as_ref().map(|key| key.as_str()),
+            opts.idempotency_key.as_ref().map(IdempotencyKey::as_str),
             CatalogOperation::RegisterTableInSchema,
             &request_hash,
             DEFAULT_STALE_TIMEOUT,

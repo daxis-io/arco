@@ -87,7 +87,7 @@ anyhow = { workspace = true }
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 
 # OpenAPI
-utoipa = { version = "5.4.0", features = ["axum_extras", "chrono"] }
+utoipa = { version = "5.5.0", features = ["axum_extras", "chrono"] }
 
 # Logging
 tracing = { workspace = true }

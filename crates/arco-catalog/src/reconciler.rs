@@ -333,7 +333,6 @@ impl Reconciler {
     /// # Errors
     ///
     /// Returns an error if storage operations fail while attempting repairs.
-    #[allow(clippy::too_many_lines)]
     pub async fn repair_with_scope(
         &self,
         report: &ReconciliationReport,
@@ -415,6 +414,18 @@ impl Reconciler {
                                 );
                             }
                         }
+                    }
+                }
+                IssueType::MissingCurrentHeadLegacyMirror
+                | IssueType::StaleCurrentHeadLegacyMirror
+                | IssueType::MissingCurrentHeadCommitRecord => {
+                    result.skipped_count += 1;
+                    if let Some(domain) = Self::parse_domain(&report.domain) {
+                        crate::metrics::record_reconciler_repair(
+                            domain,
+                            issue.issue_type.as_str(),
+                            "skipped",
+                        );
                     }
                 }
                 _ => {

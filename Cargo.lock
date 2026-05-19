@@ -240,6 +240,7 @@ name = "arco-catalog"
 version = "0.1.5"
 dependencies = [
  "arco-core",
+ "arco-proto",
  "arrow 54.3.1",
  "async-trait",
  "bytes",

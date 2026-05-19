@@ -36,7 +36,7 @@ use chrono::{DateTime, Utc};
 use arco_core::control_plane_transactions::{
     ControlPlaneTxDomain, ControlPlaneTxPaths, ControlPlaneTxStatus, RootTxManifest, RootTxRecord,
 };
-use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
+use arco_core::{CatalogDomain, CatalogPaths, ControlPlaneScope, ScopedStorage};
 
 use crate::error::{CatalogError, Result};
 use crate::manifest::{
@@ -46,6 +46,9 @@ use crate::manifest::{
 use crate::parquet_util;
 use crate::write_options::SnapshotVersion;
 use crate::writer::{Catalog, Column, LineageEdge, Schema, Table};
+
+/// Replayed metastore state returned by future catalog product readers.
+pub type MetastoreProjectionState = crate::metastore::replay::MetastoreState;
 
 // ============================================================================
 // Freshness Metadata
@@ -128,6 +131,7 @@ pub struct SignedUrl {
 /// ```
 pub struct CatalogReader {
     storage: ScopedStorage,
+    scope: ControlPlaneScope,
     table_lookup_cache: RwLock<Option<TableLookupCache>>,
 }
 
@@ -161,6 +165,7 @@ impl std::fmt::Debug for CatalogReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CatalogReader")
             .field("storage", &"ScopedStorage")
+            .field("scope", &self.scope)
             .finish()
     }
 }
@@ -169,10 +174,41 @@ impl CatalogReader {
     /// Creates a new catalog reader for the given workspace.
     #[must_use]
     pub fn new(storage: ScopedStorage) -> Self {
-        Self {
+        let scope = ControlPlaneScope::workspace_alias(storage.tenant_id(), storage.workspace_id())
+            .expect("ScopedStorage tenant/workspace IDs are already validated");
+        Self::new_with_scope(storage, scope)
+    }
+
+    /// Creates a new catalog reader with an explicit control-plane scope.
+    ///
+    /// The supplied storage remains rooted at its current workspace prefix. This
+    /// keeps Task 3 as an API-threading change only; moving durable catalog paths
+    /// to metastore prefixes is handled by the later path migration tasks.
+    #[must_use]
+    pub fn new_with_scope(storage: ScopedStorage, scope: ControlPlaneScope) -> Self {
+        Self::try_new_with_scope(storage, scope)
+            .expect("explicit control-plane scope must match scoped storage")
+    }
+
+    /// Tries to create a catalog reader with an explicit control-plane scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the storage tenant/workspace does not match the
+    /// execution tenant/workspace carried by the explicit scope.
+    pub fn try_new_with_scope(storage: ScopedStorage, scope: ControlPlaneScope) -> Result<Self> {
+        validate_storage_scope(&storage, &scope)?;
+        Ok(Self {
             storage,
+            scope,
             table_lookup_cache: RwLock::new(None),
-        }
+        })
+    }
+
+    /// Returns the explicit control-plane scope for this reader.
+    #[must_use]
+    pub fn scope(&self) -> &ControlPlaneScope {
+        &self.scope
     }
 
     // ========================================================================
@@ -1039,37 +1075,9 @@ impl CatalogReader {
             }
         }
 
-        self.mint_signed_urls_with_allowlist(paths, &allowed, capped_ttl)
-            .await
-    }
-
-    /// Mints signed URLs using a caller-provided allowlist.
-    ///
-    /// This is useful when the caller already fetched domain paths and wants to
-    /// avoid recomputing manifest-derived allowlists.
-    ///
-    /// # Arguments
-    ///
-    /// * `paths` - Paths to mint URLs for (must be in the provided allowlist)
-    /// * `allowlist` - Manifest-derived allowed paths
-    /// * `ttl` - Time-to-live for the signed URLs
-    ///
-    /// # Errors
-    ///
-    /// Returns `CatalogError::Validation` if any path is not in the allowlist.
-    /// Returns an error if URL signing fails.
-    pub async fn mint_signed_urls_with_allowlist(
-        &self,
-        paths: Vec<String>,
-        allowlist: &HashSet<String>,
-        ttl: Duration,
-    ) -> Result<Vec<SignedUrl>> {
-        // Cap TTL at 1 hour for security.
-        let capped_ttl = ttl.min(Duration::from_secs(3600));
-
         // Validate all requested paths are in allowlist
         for path in &paths {
-            if !allowlist.contains(path) {
+            if !allowed.contains(path) {
                 return Err(CatalogError::Validation {
                     message: format!("path not in manifest allowlist: {}", path),
                 });
@@ -1125,6 +1133,28 @@ impl CatalogReader {
             CatalogDomain::Search => Ok(manifest.search.snapshot),
         }
     }
+}
+
+fn validate_storage_scope(storage: &ScopedStorage, scope: &ControlPlaneScope) -> Result<()> {
+    if storage.tenant_id() != scope.tenant_id() {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "storage tenant '{}' does not match control-plane tenant '{}'",
+                storage.tenant_id(),
+                scope.tenant_id()
+            ),
+        });
+    }
+    if storage.workspace_id() != scope.workspace_id() {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "storage workspace '{}' does not match control-plane workspace '{}'",
+                storage.workspace_id(),
+                scope.workspace_id()
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

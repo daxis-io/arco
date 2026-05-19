@@ -27,6 +27,12 @@ fn effective_format_uses_legacy_parquet_fallback() {
 }
 
 #[test]
+fn new_table_default_is_delta_without_rewriting_legacy_rows() {
+    assert_eq!(TableFormat::default_for_new_tables(), TableFormat::Delta);
+    assert_eq!(TableFormat::effective(None).unwrap(), TableFormat::Parquet);
+}
+
+#[test]
 fn parse_rejects_unknown_values() {
     assert!(TableFormat::parse("orc").is_err());
     assert!(TableFormat::normalize("avro").is_err());

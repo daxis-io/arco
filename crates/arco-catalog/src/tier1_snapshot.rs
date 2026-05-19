@@ -10,6 +10,7 @@ use arco_core::storage_traits::StatePutStore;
 
 use crate::error::{CatalogError, Result};
 use crate::manifest::{SnapshotFile, SnapshotInfo};
+use crate::metastore::projections::ProjectionSet;
 use crate::parquet_util;
 use crate::state::{CatalogState, LineageState, SearchState};
 
@@ -136,6 +137,32 @@ pub async fn write_search_snapshot<S: StatePutStore + ?Sized>(
     });
 
     Ok(info)
+}
+
+/// Builds snapshot metadata for an already-written metastore projection set.
+#[must_use]
+pub fn metastore_projection_snapshot_info(
+    version: u64,
+    snapshot_dir: impl Into<String>,
+    projection_set: &ProjectionSet,
+) -> SnapshotInfo {
+    let mut info = SnapshotInfo::new(version, snapshot_dir.into());
+
+    for file in &projection_set.files {
+        let bytes = match serde_json::to_vec(&file.rows) {
+            Ok(bytes) => bytes,
+            Err(_) => Vec::new(),
+        };
+        info.add_file(SnapshotFile {
+            path: file.file_name.to_string(),
+            checksum_sha256: sha256_hex(&Bytes::from(bytes.clone())),
+            byte_size: bytes.len() as u64,
+            row_count: file.rows.len() as u64,
+            position_range: None,
+        });
+    }
+
+    info
 }
 
 async fn put_state_if_absent<S: StatePutStore + ?Sized>(

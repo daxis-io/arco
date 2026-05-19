@@ -6,6 +6,9 @@ use crate::error::Result;
 use crate::parquet_util;
 use crate::state::{CatalogState, LineageState};
 
+/// Native metastore state loaded by future pointer-published projections.
+pub type MetastoreState = crate::metastore::replay::MetastoreState;
+
 /// Loads catalog state from the current snapshot path.
 ///
 /// # Errors

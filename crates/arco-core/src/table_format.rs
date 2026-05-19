@@ -2,14 +2,14 @@
 
 use crate::error::{Error, Result};
 
-/// Supported table formats across Arco control-plane APIs.
+/// Supported lakehouse table formats across Arco control-plane APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TableFormat {
-    /// Delta Lake table.
+    /// Delta Lake table, the default format for new Arco-managed tables.
     Delta,
     /// Apache Iceberg table.
     Iceberg,
-    /// Legacy/default parquet table surface.
+    /// Plain Parquet table surface, primarily for legacy rows and simple external tables.
     Parquet,
 }
 
@@ -42,6 +42,16 @@ impl TableFormat {
             Self::Iceberg => "iceberg",
             Self::Parquet => "parquet",
         }
+    }
+
+    /// Returns the default table format for new Arco table registrations.
+    ///
+    /// This is intentionally separate from [`Self::effective`]: legacy rows
+    /// without a stored format still read as Parquet, but new tables default to
+    /// Delta Lake.
+    #[must_use]
+    pub const fn default_for_new_tables() -> Self {
+        Self::Delta
     }
 
     /// Parses and returns the canonical lowercase string representation.

@@ -182,6 +182,14 @@ fn current_commits_schema() -> GoldenSchema {
     schema_to_golden("commits", &arco_catalog::parquet_util::commit_schema())
 }
 
+/// Get current `metastore_objects` schema from code.
+fn current_metastore_objects_schema() -> GoldenSchema {
+    schema_to_golden(
+        "metastore_objects",
+        &arco_catalog::metastore::projections::metastore_objects_schema(),
+    )
+}
+
 // ============================================================================
 // Golden Schema Generator (run with --ignored)
 // ============================================================================
@@ -199,6 +207,7 @@ fn generate_golden_schemas() {
         ("columns", current_columns_schema()),
         ("lineage_edges", current_lineage_edges_schema()),
         ("commits", current_commits_schema()),
+        ("metastore_objects", current_metastore_objects_schema()),
     ];
 
     for (name, schema) in schemas {
@@ -304,6 +313,7 @@ fn golden_schemas_are_valid_and_parseable() {
         "columns",
         "lineage_edges",
         "commits",
+        "metastore_objects",
     ];
 
     for name in schemas {
@@ -325,6 +335,7 @@ fn current_schemas_match_golden_field_count() {
         ("columns", current_columns_schema()),
         ("lineage_edges", current_lineage_edges_schema()),
         ("commits", current_commits_schema()),
+        ("metastore_objects", current_metastore_objects_schema()),
     ];
 
     for (name, current) in test_cases {
@@ -447,6 +458,35 @@ fn contract_lineage_edges_required_fields() {
     }
 }
 
+#[test]
+fn contract_metastore_objects_required_fields_and_redaction() {
+    let schema = arco_catalog::metastore::projections::metastore_objects_schema();
+    let required_fields = [
+        "schema_version",
+        "ledger_watermark",
+        "object_id",
+        "object_type",
+        "lifecycle_state",
+        "updated_at",
+    ];
+
+    for field_name in required_fields {
+        assert!(
+            schema.field_with_name(field_name).is_ok(),
+            "Metastore objects schema missing required field: {field_name}"
+        );
+    }
+
+    assert!(
+        schema.field_with_name("secret_material_ref").is_err(),
+        "Metastore objects projection must not expose secret material references"
+    );
+    assert!(
+        schema.field_with_name("encrypted_payload").is_err(),
+        "Metastore objects projection must not expose encrypted payloads"
+    );
+}
+
 // ============================================================================
 // Schema Field Type Tests
 // ============================================================================
@@ -462,6 +502,10 @@ fn contract_timestamp_fields_use_milliseconds() {
         (
             "lineage_edges",
             arco_catalog::parquet_util::lineage_edge_schema(),
+        ),
+        (
+            "metastore_objects",
+            arco_catalog::metastore::projections::metastore_objects_schema(),
         ),
     ];
 
@@ -492,6 +536,10 @@ fn contract_id_fields_are_strings() {
         (
             "lineage_edges",
             arco_catalog::parquet_util::lineage_edge_schema(),
+        ),
+        (
+            "metastore_objects",
+            arco_catalog::metastore::projections::metastore_objects_schema(),
         ),
     ];
 

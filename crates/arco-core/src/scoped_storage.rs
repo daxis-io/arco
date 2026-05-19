@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::catalog_paths::{CatalogDomain, CatalogPaths};
+use crate::control_plane_scope::ControlPlaneScope;
 use crate::error::{Error, Result};
 use crate::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 use async_trait::async_trait;
@@ -35,6 +36,7 @@ pub struct ScopedStorage {
     backend: Arc<dyn StorageBackend>,
     tenant_id: String,
     workspace_id: String,
+    scope_prefix: String,
 }
 
 /// Metadata about an object relative to a tenant/workspace scope.
@@ -73,8 +75,28 @@ impl ScopedStorage {
 
         Ok(Self {
             backend,
+            scope_prefix: format!("tenant={tenant_id}/workspace={workspace_id}"),
             tenant_id,
             workspace_id,
+        })
+    }
+
+    /// Creates storage rooted at the metastore authority prefix for a validated scope.
+    ///
+    /// # Errors
+    ///
+    /// This constructor currently returns `Ok` for every validated [`ControlPlaneScope`].
+    /// It returns a `Result` to match [`Self::new`] and leave room for future backend
+    /// scope checks without changing the API.
+    pub fn new_metastore_scoped(
+        backend: Arc<dyn StorageBackend>,
+        scope: &ControlPlaneScope,
+    ) -> Result<Self> {
+        Ok(Self {
+            backend,
+            tenant_id: scope.tenant_id().to_string(),
+            workspace_id: scope.workspace_id().to_string(),
+            scope_prefix: scope.metastore_storage_prefix(),
         })
     }
 
@@ -177,8 +199,8 @@ impl ScopedStorage {
 
     // === Path Construction ===
 
-    fn scope_prefix(&self) -> String {
-        format!("tenant={}/workspace={}", self.tenant_id, self.workspace_id)
+    fn scope_prefix(&self) -> &str {
+        &self.scope_prefix
     }
 
     fn scoped_path(&self, path: &str) -> String {

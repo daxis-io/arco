@@ -1,16 +1,5 @@
 //! Shared runtime service for single-domain control-plane transactions.
 
-#![allow(
-    clippy::future_not_send,
-    clippy::match_same_arms,
-    clippy::option_option,
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::uninlined_format_args,
-    clippy::unnecessary_wraps,
-    clippy::unused_self
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -1353,6 +1342,9 @@ impl RootMutation {
                 }
                 Ok(Self::Metastore(mutation.clone()))
             }
+            Some(domain_mutation::Kind::ScopedMetastore(_)) => Err(ApiError::bad_request(
+                "scoped metastore root mutations are not supported by this endpoint",
+            )),
             None => Err(ApiError::bad_request("root mutation kind is required")),
         }
     }

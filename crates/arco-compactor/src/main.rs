@@ -1628,6 +1628,119 @@ mod tests {
         })
     }
 
+    async fn seed_catalog_reconcile_state_with_old_snapshot(storage: &ScopedStorage) -> String {
+        let mut root = RootManifest::new();
+        root.normalize_paths();
+        storage
+            .put_raw(
+                CatalogPaths::ROOT_MANIFEST,
+                Bytes::from(serde_json::to_vec(&root).expect("serialize root")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write root");
+
+        let snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1);
+        let mut snapshot = arco_catalog::manifest::SnapshotInfo::new(1, snapshot_path);
+        snapshot.add_file(arco_catalog::manifest::SnapshotFile {
+            path: "current.parquet".to_string(),
+            checksum_sha256: "ab".repeat(32),
+            byte_size: 1,
+            row_count: 1,
+            position_range: None,
+        });
+        let manifest = CatalogDomainManifest {
+            manifest_id: arco_catalog::manifest::format_manifest_id(1),
+            epoch: 1,
+            previous_manifest_path: None,
+            writer_session_id: Some("route-test".to_string()),
+            snapshot_version: 1,
+            snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1),
+            snapshot: Some(snapshot),
+            watermark_event_id: None,
+            last_commit_id: None,
+            fencing_token: Some(1),
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                &manifest_path,
+                Bytes::from(serde_json::to_vec(&manifest).expect("serialize manifest")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write manifest");
+        let pointer = arco_catalog::manifest::DomainManifestPointer {
+            manifest_id: manifest.manifest_id.clone(),
+            manifest_path,
+            epoch: manifest.fencing_token.unwrap_or(manifest.epoch),
+            parent_pointer_hash: None,
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                &root.catalog_manifest_path,
+                Bytes::from(serde_json::to_vec(&pointer).expect("serialize pointer")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write pointer");
+        storage
+            .put_raw(
+                &CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "current.parquet"),
+                Bytes::from_static(b"current"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write current snapshot");
+
+        let old_snapshot =
+            CatalogPaths::snapshot_file(CatalogDomain::Catalog, 0, "old-route-test.parquet");
+        storage
+            .put_raw(
+                &old_snapshot,
+                Bytes::from_static(b"old"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write old snapshot");
+
+        old_snapshot
+    }
+
+    fn rendered_metric_value(rendered: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+        rendered.lines().find_map(|line| {
+            if !line.starts_with(name)
+                || !labels
+                    .iter()
+                    .all(|(key, value)| line.contains(&format!(r#"{key}="{value}""#)))
+            {
+                return None;
+            }
+            line.rsplit_once(' ')?.1.parse::<f64>().ok()
+        })
+    }
+
+    fn test_internal_auth_state() -> Arc<InternalAuthState> {
+        let config = InternalOidcConfig::hs256_for_tests(
+            "https://accounts.google.com",
+            "https://compactor.internal",
+            "test-secret",
+            [String::from("svc-compactor")]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::new(),
+            true,
+        );
+        let verifier = InternalOidcVerifier::new(config).expect("test verifier");
+        Arc::new(InternalAuthState {
+            verifier: Arc::new(verifier),
+            enforce: true,
+        })
+    }
+
     #[test]
     fn test_normalize_metrics_secret_trims_empty() {
         assert!(normalize_metrics_secret(Some("  ".to_string())).is_none());
@@ -1663,6 +1776,46 @@ mod tests {
             serde_json::from_str(r#"{"domain":"catalog","repair":true}"#)
                 .expect("parse reconcile request");
         assert_eq!(request.effective_repair_scope(), RepairScope::Full);
+    }
+
+    #[test]
+    fn test_repair_automation_config_defaults_to_enforce_full_scope() {
+        let config =
+            RepairAutomationConfig::from_env_reader(|_| None).expect("default repair config");
+
+        assert_eq!(config.mode, RepairAutomationMode::Enforce);
+        assert_eq!(config.interval, Duration::from_secs(300));
+        assert_eq!(config.scope, RepairScope::Full);
+        assert_eq!(
+            config.domains,
+            vec![
+                CatalogDomain::Catalog,
+                CatalogDomain::Lineage,
+                CatalogDomain::Search,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_repair_automation_config_parses_enforce_full_scope_and_domains() {
+        let config = RepairAutomationConfig::from_env_reader(|key| match key {
+            "ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE" => Some("enforce".to_string()),
+            "ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS" => Some("42".to_string()),
+            "ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE" => Some("full".to_string()),
+            "ARCO_COMPACTOR_REPAIR_AUTOMATION_DOMAINS" => {
+                Some("search, catalog, search".to_string())
+            }
+            _ => None,
+        })
+        .expect("parse repair automation config");
+
+        assert_eq!(config.mode, RepairAutomationMode::Enforce);
+        assert_eq!(config.interval, Duration::from_secs(42));
+        assert_eq!(config.scope, RepairScope::Full);
+        assert_eq!(
+            config.domains,
+            vec![CatalogDomain::Search, CatalogDomain::Catalog]
+        );
     }
 
     #[test]

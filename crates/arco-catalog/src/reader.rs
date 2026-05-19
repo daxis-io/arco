@@ -1075,9 +1075,31 @@ impl CatalogReader {
             }
         }
 
+        self.mint_signed_urls_with_allowlist(paths, &allowed, capped_ttl)
+            .await
+    }
+
+    /// Mints signed URLs using a caller-provided allowlist.
+    ///
+    /// This is used by API routes that already resolved a pinned root token and
+    /// need to mint URLs against that pinned manifest rather than the latest
+    /// catalog pointer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CatalogError::Validation` if any path is not in the allowlist.
+    /// Returns an error if URL signing fails.
+    pub async fn mint_signed_urls_with_allowlist(
+        &self,
+        paths: Vec<String>,
+        allowlist: &HashSet<String>,
+        ttl: Duration,
+    ) -> Result<Vec<SignedUrl>> {
+        let capped_ttl = ttl.min(Duration::from_secs(3600));
+
         // Validate all requested paths are in allowlist
         for path in &paths {
-            if !allowed.contains(path) {
+            if !allowlist.contains(path) {
                 return Err(CatalogError::Validation {
                     message: format!("path not in manifest allowlist: {}", path),
                 });

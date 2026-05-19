@@ -236,7 +236,6 @@ fn require_visible_compaction(
     )))
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn map_flow_compaction_error(error: FlowError) -> ApiError {
     match error {
         FlowError::StaleFencingToken { .. }
@@ -494,7 +493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_events_and_compact_rejects_empty_batch() {
+    async fn append_events_and_compact_noop_when_empty() {
         let result = append_events_and_compact(
             &Config::default(),
             sample_storage(),
@@ -502,12 +501,7 @@ mod tests {
             None,
         )
         .await;
-        let err = result.expect_err("empty append must fail");
-        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.message(),
-            "orchestration batch must include at least one event"
-        );
+        assert!(result.expect("empty append").is_empty());
     }
 
     #[tokio::test]

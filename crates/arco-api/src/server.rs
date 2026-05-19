@@ -357,6 +357,7 @@ async fn unity_catalog_auth_middleware(
         tenant: ctx.tenant.clone(),
         workspace: ctx.workspace.clone(),
         request_id: ctx.request_id.clone(),
+        user_id: ctx.user_id.clone(),
         idempotency_key: ctx.idempotency_key.clone(),
     };
     parts.extensions.insert(uc_ctx);

@@ -269,7 +269,7 @@ impl MicroCompactor {
     /// Returns an error if the current manifest cannot be read.
     pub async fn current_base_table_paths(&self) -> Result<TablePaths> {
         let manifest = self.load_current_manifest_only().await?;
-        Ok(manifest.base_snapshot.tables)
+        Ok(manifest.base_snapshot.tables.clone())
     }
 
     /// Loads orchestration state pinned to one visible root transaction token.
@@ -459,14 +459,14 @@ impl MicroCompactor {
                             if let Some(delay_ms) =
                                 should_retry_publish_error(&publish_error, retry_attempt)
                             {
-                                if let Some(reason) = publish_error.retry_reason() {
-                                    record_compaction_publish_retry(
-                                        self.durability_mode,
-                                        reason,
-                                        retry_attempt + 1,
-                                        delay_ms,
-                                    );
-                                }
+                                record_compaction_publish_retry(
+                                    self.durability_mode,
+                                    publish_error
+                                        .retry_reason()
+                                        .expect("retryable publish error must have reason"),
+                                    retry_attempt + 1,
+                                    delay_ms,
+                                );
                                 wait_for_publish_retry(delay_ms).await;
                                 continue 'retry;
                             }
@@ -701,14 +701,14 @@ impl MicroCompactor {
                         if let Some(delay_ms) =
                             should_retry_publish_error(&publish_error, retry_attempt)
                         {
-                            if let Some(reason) = publish_error.retry_reason() {
-                                record_compaction_publish_retry(
-                                    self.durability_mode,
-                                    reason,
-                                    retry_attempt + 1,
-                                    delay_ms,
-                                );
-                            }
+                            record_compaction_publish_retry(
+                                self.durability_mode,
+                                publish_error
+                                    .retry_reason()
+                                    .expect("retryable publish error must have reason"),
+                                retry_attempt + 1,
+                                delay_ms,
+                            );
                             wait_for_publish_retry(delay_ms).await;
                             continue 'retry;
                         }
@@ -1302,11 +1302,6 @@ impl MicroCompactor {
     }
 
     /// Publishes a new manifest version.
-    #[allow(
-        clippy::option_if_let_else,
-        clippy::too_many_arguments,
-        clippy::too_many_lines
-    )]
     async fn publish_manifest(
         &self,
         manifest: &OrchestrationManifest,
@@ -2106,7 +2101,6 @@ mod tests {
                         partition_key: None,
                         max_attempts: 3,
                         heartbeat_timeout_sec: 300,
-                        requires_visible_output: false,
                     },
                     TaskDef {
                         key: "transform".to_string(),
@@ -2115,7 +2109,6 @@ mod tests {
                         partition_key: None,
                         max_attempts: 3,
                         heartbeat_timeout_sec: 300,
-                        requires_visible_output: false,
                     },
                 ],
             },

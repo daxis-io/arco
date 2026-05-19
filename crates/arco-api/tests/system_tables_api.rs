@@ -35,6 +35,23 @@ const ORCHESTRATION_SYSTEM_TABLES: &[&str] = &[
     "run_key_conflicts",
 ];
 
+const DEFERRED_CATALOG_PRODUCT_SYSTEM_TABLES: &[(&str, &str)] = &[
+    ("access", "grants"),
+    ("access", "compiled_permissions"),
+    ("access", "audit"),
+    ("access", "auth_denies"),
+    ("access", "credential_mints"),
+    ("storage", "credentials"),
+    ("storage", "external_locations"),
+    ("storage", "managed_roots"),
+    ("storage", "workspace_bindings"),
+    ("catalog", "volumes"),
+    ("catalog", "functions"),
+    ("catalog", "registered_models"),
+    ("catalog", "model_versions"),
+    ("governance", "attachments"),
+];
+
 #[tokio::test]
 async fn query_can_select_from_system_catalog_namespaces() -> Result<()> {
     let router = seed_catalog(test_router()).await?;
@@ -100,6 +117,109 @@ async fn query_does_not_expose_manifest_paths_in_system_catalog_commits() -> Res
 
     let response = router.oneshot(request).await.map_err(|err| match err {})?;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_does_not_expose_system_search_token_postings() -> Result<()> {
+    let router = seed_catalog(test_router()).await?;
+
+    let request = helpers::make_request(
+        Method::POST,
+        "/api/v1/query?format=json",
+        Some(serde_json::json!({
+            "sql": "SELECT * FROM system.search.token_postings"
+        })),
+    )?;
+
+    let response = router.oneshot(request).await.map_err(|err| match err {})?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_does_not_expose_legacy_search_token_postings() -> Result<()> {
+    let router = seed_catalog(test_router()).await?;
+
+    let request = helpers::make_request(
+        Method::POST,
+        "/api/v1/query?format=json",
+        Some(serde_json::json!({
+            "sql": "SELECT * FROM search.token_postings"
+        })),
+    )?;
+
+    let response = router.oneshot(request).await.map_err(|err| match err {})?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_does_not_expose_internal_orchestration_idempotency_keys() -> Result<()> {
+    let router = seed_orchestration_router().await?;
+
+    let request = helpers::make_request(
+        Method::POST,
+        "/api/v1/query?format=json",
+        Some(serde_json::json!({
+            "sql": "SELECT * FROM system.orchestration.idempotency_keys"
+        })),
+    )?;
+
+    let response = router.oneshot(request).await.map_err(|err| match err {})?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_does_not_expose_deferred_catalog_product_system_tables() -> Result<()> {
+    let router = seed_catalog(test_router()).await?;
+
+    for (schema, table) in DEFERRED_CATALOG_PRODUCT_SYSTEM_TABLES {
+        let request = helpers::make_request(
+            Method::POST,
+            "/api/v1/query?format=json",
+            Some(serde_json::json!({
+                "sql": format!("SELECT * FROM system.{schema}.{table}")
+            })),
+        )?;
+
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .map_err(|err| match err {})?;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "system.{schema}.{table} must stay unavailable until its authoritative projection exists"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_system_catalog_tables_are_scoped_to_request_workspace() -> Result<()> {
+    let (router, _backend) = test_router_with_backend();
+    seed_catalog_in_workspace(router.clone(), "test-workspace", "analytics", "events").await?;
+    seed_catalog_in_workspace(router.clone(), "other-workspace", "finance", "payments").await?;
+
+    let (status, rows): (_, Vec<serde_json::Value>) = helpers::post_json(
+        router,
+        "/api/v1/query?format=json",
+        serde_json::json!({
+            "sql": "SELECT name FROM system.catalog.tables ORDER BY name"
+        }),
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    let table_names: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row.get("name").and_then(serde_json::Value::as_str))
+        .collect();
+    assert_eq!(table_names, vec!["events"]);
     Ok(())
 }
 
@@ -205,6 +325,48 @@ async fn query_can_select_from_empty_system_orchestration_schedule_ticks() -> Re
             .and_then(serde_json::Value::as_u64),
         Some(0)
     );
+    Ok(())
+}
+
+async fn seed_catalog_in_workspace(
+    router: axum::Router,
+    workspace: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<()> {
+    let request = helpers::make_request_with_scope(
+        Method::POST,
+        "/api/v1/namespaces",
+        "test-tenant",
+        workspace,
+        Some(serde_json::json!({
+            "name": namespace,
+            "description": format!("{namespace} namespace")
+        })),
+    )?;
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .map_err(|err| match err {})?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let request = helpers::make_request_with_scope(
+        Method::POST,
+        &format!("/api/v1/namespaces/{namespace}/tables"),
+        "test-tenant",
+        workspace,
+        Some(serde_json::json!({
+            "name": table,
+            "description": format!("{table} table"),
+            "columns": [
+                {"name": "id", "data_type": "STRING", "nullable": false}
+            ]
+        })),
+    )?;
+    let response = router.oneshot(request).await.map_err(|err| match err {})?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
     Ok(())
 }
 

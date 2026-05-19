@@ -131,7 +131,7 @@ async fn request_id_is_echoed_for_uc_route_groups() {
         true,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
     let status = send(
         &router,

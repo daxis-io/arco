@@ -29,6 +29,8 @@ pub fn unity_catalog_router(state: UnityCatalogState) -> Router {
         .merge(routes::schemas::routes())
         .merge(routes::tables::routes())
         .merge(routes::permissions::routes())
+        .merge(routes::storage_credentials::routes())
+        .merge(routes::external_locations::routes())
         .merge(routes::credentials::routes())
         .merge(routes::delta_commits::routes())
         .fallback(not_found)

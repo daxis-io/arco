@@ -79,13 +79,14 @@ pub fn emit_credentials_allow(
     state: &UnityCatalogState,
     ctx: &UnityCatalogRequestContext,
     resource: &str,
+    reason: &str,
 ) {
     emit_event(
         state,
         ctx,
         AuditAction::CredVendAllow,
         resource.to_string(),
-        REASON_CREDENTIALS_VENDED,
+        reason,
     );
 }
 

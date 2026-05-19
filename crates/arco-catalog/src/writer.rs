@@ -584,6 +584,11 @@ impl std::fmt::Debug for CatalogWriter {
 impl CatalogWriter {
     /// Creates a new catalog writer for the given storage scope.
     ///
+    /// # Panics
+    ///
+    /// Panics if the already-validated scoped storage IDs cannot form a
+    /// workspace alias scope.
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -595,6 +600,7 @@ impl CatalogWriter {
     /// let writer = CatalogWriter::new(storage).with_sync_compactor(compactor);
     /// ```
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn new(storage: ScopedStorage) -> Self {
         let scope = ControlPlaneScope::workspace_alias(storage.tenant_id(), storage.workspace_id())
             .expect("ScopedStorage tenant/workspace IDs are already validated");
@@ -606,7 +612,13 @@ impl CatalogWriter {
     /// The supplied storage remains rooted at its current workspace prefix. This
     /// keeps Task 3 as an API-threading change only; moving durable catalog paths
     /// to metastore prefixes is handled by the later path migration tasks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the explicit scope does not match the scoped storage tenant and
+    /// workspace.
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn new_with_scope(storage: ScopedStorage, scope: ControlPlaneScope) -> Self {
         Self::try_new_with_scope(storage, scope)
             .expect("explicit control-plane scope must match scoped storage")
@@ -1224,6 +1236,7 @@ impl CatalogWriter {
     /// # Errors
     ///
     /// Returns an error if the catalog doesn't exist, a rename conflicts, or storage operations fail.
+    #[allow(clippy::too_many_lines)]
     pub async fn patch_catalog(
         &self,
         name: &str,
@@ -1313,13 +1326,13 @@ impl CatalogWriter {
             name: next_name,
             description: patch
                 .description
-                .unwrap_or(existing_catalog.description.clone()),
+                .unwrap_or_else(|| existing_catalog.description.clone()),
             properties: patch
                 .properties
-                .unwrap_or(existing_catalog.properties.clone()),
+                .unwrap_or_else(|| existing_catalog.properties.clone()),
             storage_root: patch
                 .storage_root
-                .unwrap_or(existing_catalog.storage_root.clone()),
+                .unwrap_or_else(|| existing_catalog.storage_root.clone()),
             created_at: existing_catalog.created_at,
             updated_at: now,
         };
@@ -1377,6 +1390,7 @@ impl CatalogWriter {
     /// # Errors
     ///
     /// Returns an error if the catalog doesn't exist or storage operations fail.
+    #[allow(clippy::too_many_lines)]
     pub async fn delete_catalog(&self, name: &str, force: bool, opts: WriteOptions) -> Result<()> {
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
@@ -1559,6 +1573,7 @@ impl CatalogWriter {
     /// # Errors
     ///
     /// Returns an error if the catalog or schema is invalid or storage operations fail.
+    #[allow(clippy::too_many_lines)]
     pub async fn create_schema_with_metadata(
         &self,
         catalog: &str,
@@ -2105,6 +2120,7 @@ impl CatalogWriter {
     /// # Errors
     ///
     /// Returns an error if the schema doesn't exist, a rename conflicts, or storage operations fail.
+    #[allow(clippy::too_many_lines)]
     pub async fn patch_schema_in_catalog(
         &self,
         catalog: &str,
@@ -2221,13 +2237,13 @@ impl CatalogWriter {
             name: next_name,
             description: patch
                 .description
-                .unwrap_or(existing_schema.description.clone()),
+                .unwrap_or_else(|| existing_schema.description.clone()),
             properties: patch
                 .properties
-                .unwrap_or(existing_schema.properties.clone()),
+                .unwrap_or_else(|| existing_schema.properties.clone()),
             storage_root: patch
                 .storage_root
-                .unwrap_or(existing_schema.storage_root.clone()),
+                .unwrap_or_else(|| existing_schema.storage_root.clone()),
             created_at: existing_schema.created_at,
             updated_at: now,
         };
@@ -2285,6 +2301,7 @@ impl CatalogWriter {
     /// # Errors
     ///
     /// Returns an error if the catalog or schema doesn't exist.
+    #[allow(clippy::too_many_lines)]
     pub async fn delete_schema_in_catalog(
         &self,
         catalog: &str,

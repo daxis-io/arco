@@ -42,6 +42,7 @@ impl SecurableObject {
 }
 
 /// Input for permission compilation.
+#[derive(Clone, Copy)]
 pub struct PermissionCompileInput<'a> {
     /// Replayed authoritative metastore state.
     pub metastore: &'a MetastoreState,

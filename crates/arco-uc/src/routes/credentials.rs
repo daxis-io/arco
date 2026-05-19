@@ -151,8 +151,7 @@ pub(crate) async fn post_temporary_table_credentials(
         }),
         payload
             .requested_ttl_seconds
-            .map(std::time::Duration::from_secs)
-            .unwrap_or(DEFAULT_CREDENTIAL_TTL),
+            .map_or(DEFAULT_CREDENTIAL_TTL, std::time::Duration::from_secs),
     )
     .await
 }
@@ -207,8 +206,7 @@ pub(crate) async fn post_temporary_path_credentials(
         None,
         request
             .requested_ttl_seconds
-            .map(std::time::Duration::from_secs)
-            .unwrap_or(DEFAULT_CREDENTIAL_TTL),
+            .map_or(DEFAULT_CREDENTIAL_TTL, std::time::Duration::from_secs),
     )
     .await
 }
@@ -229,7 +227,7 @@ async fn vend_path_credentials(
     let decision = CredentialVendingEngine::default()
         .decide_path(
             &storage_governance,
-            CredentialVendingRequest {
+            &CredentialVendingRequest {
                 principal_id: format!("tenant:{}", ctx.tenant),
                 groups_snapshot_version: "unknown".to_string(),
                 workspace_id: ctx.workspace.clone(),
@@ -240,7 +238,6 @@ async fn vend_path_credentials(
                 client_kind: "uc".to_string(),
                 catalog_snapshot_version: metastore
                     .ledger_watermark
-                    .clone()
                     .unwrap_or_else(|| "empty".to_string()),
             },
         )

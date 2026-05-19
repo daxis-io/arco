@@ -82,7 +82,7 @@ pub struct AuthzDecision {
 impl AuthzDecision {
     /// Evaluates an authorization request against a compiled permission set.
     #[must_use]
-    pub fn evaluate(request: AuthzRequest, compiled: &CompiledPermissionSet) -> Self {
+    pub fn evaluate(request: &AuthzRequest, compiled: &CompiledPermissionSet) -> Self {
         if !compiled.fresh {
             return deny(
                 "stale_projection",

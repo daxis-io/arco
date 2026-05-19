@@ -410,6 +410,7 @@ pub fn storage_governance_rows(
 ///
 /// Returns an error if the record batch cannot be built or the Parquet write
 /// fails.
+#[allow(clippy::too_many_lines)]
 pub fn write_metastore_objects(rows: &[MetastoreObjectProjectionRecord]) -> Result<Bytes> {
     let schema = Arc::new(metastore_objects_schema());
 

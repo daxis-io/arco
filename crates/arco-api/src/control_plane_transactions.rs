@@ -1,5 +1,14 @@
 //! Shared runtime service for single-domain control-plane transactions.
 
+#![allow(
+    clippy::future_not_send,
+    clippy::option_option,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    clippy::unused_self
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -183,8 +192,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             let domain = mutation.domain();
             if !seen_domains.insert(domain) {
                 return Err(ApiError::bad_request(format!(
-                    "duplicate root mutation for domain '{}'",
-                    domain
+                    "duplicate root mutation for domain '{domain}'"
                 )));
             }
         }
@@ -1351,9 +1359,8 @@ impl RootMutation {
 
     const fn domain(&self) -> ControlPlaneTxDomain {
         match self {
-            Self::Catalog(_) => ControlPlaneTxDomain::Catalog,
+            Self::Catalog(_) | Self::Metastore(_) => ControlPlaneTxDomain::Catalog,
             Self::Orchestration(_) => ControlPlaneTxDomain::Orchestration,
-            Self::Metastore(_) => ControlPlaneTxDomain::Catalog,
         }
     }
 

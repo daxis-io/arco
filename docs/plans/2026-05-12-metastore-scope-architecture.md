@@ -1,6 +1,6 @@
 # Metastore Scope Architecture Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **For implementers:** Execute this plan task-by-task with verification after each phase.
 
 **Goal:** Make `metastore_id` a first-class logical catalog authority scope while preserving the current `tenant + workspace` path model through a compatibility alias.
 

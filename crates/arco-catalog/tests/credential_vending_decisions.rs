@@ -19,7 +19,7 @@ fn credential_vending_allows_governed_gcs_path_with_clamped_ttl_and_audit_id() -
 
     let decision = engine.decide_path(
         &state,
-        CredentialVendingRequest {
+        &CredentialVendingRequest {
             principal_id: "user_alice".to_string(),
             groups_snapshot_version: "groups-rev-1".to_string(),
             workspace_id: "workspace1".to_string(),
@@ -56,7 +56,7 @@ fn credential_vending_denies_ungoverned_paths_with_audit_id() -> Result<()> {
 
     let decision = engine.decide_path(
         &state,
-        CredentialVendingRequest {
+        &CredentialVendingRequest {
             principal_id: "user_alice".to_string(),
             groups_snapshot_version: "groups-rev-1".to_string(),
             workspace_id: "workspace1".to_string(),
@@ -84,7 +84,7 @@ fn credential_vending_denies_unsupported_operations_closed() -> Result<()> {
 
     let decision = engine.decide_path(
         &state,
-        CredentialVendingRequest {
+        &CredentialVendingRequest {
             principal_id: "user_alice".to_string(),
             groups_snapshot_version: "groups-rev-1".to_string(),
             workspace_id: "workspace1".to_string(),
@@ -132,7 +132,7 @@ fn credential_vending_denies_external_locations_backed_by_disabled_credentials()
 
     let decision = engine.decide_path(
         &state,
-        CredentialVendingRequest {
+        &CredentialVendingRequest {
             principal_id: "user_alice".to_string(),
             groups_snapshot_version: "groups-rev-1".to_string(),
             workspace_id: "workspace1".to_string(),

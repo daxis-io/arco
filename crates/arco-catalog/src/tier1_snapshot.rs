@@ -149,10 +149,7 @@ pub fn metastore_projection_snapshot_info(
     let mut info = SnapshotInfo::new(version, snapshot_dir.into());
 
     for file in &projection_set.files {
-        let bytes = match serde_json::to_vec(&file.rows) {
-            Ok(bytes) => bytes,
-            Err(_) => Vec::new(),
-        };
+        let bytes = serde_json::to_vec(&file.rows).unwrap_or_default();
         info.add_file(SnapshotFile {
             path: file.file_name.to_string(),
             checksum_sha256: sha256_hex(&Bytes::from(bytes.clone())),

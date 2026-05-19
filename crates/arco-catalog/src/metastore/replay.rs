@@ -141,7 +141,13 @@ impl MetastoreState {
     ///
     /// This convenience method panics only if serialization of the in-memory
     /// state fails, which would be a programming error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if canonical JSON serialization of the in-memory metastore state
+    /// fails.
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn deterministic_digest(&self) -> String {
         self.try_deterministic_digest()
             .expect("metastore state serialization should be deterministic")

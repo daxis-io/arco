@@ -93,7 +93,10 @@ impl StorageGovernanceState {
     }
 
     /// Returns redacted storage credential metadata.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Reserved for future projection validation failures.
     pub fn get_storage_credential(
         &self,
         credential_id: &str,

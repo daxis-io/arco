@@ -1,8 +1,8 @@
 # Catalog Product Surface Execution Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **For implementers:** Execute this plan task-by-task with verification after each phase.
 
-**Goal:** Execute `docs/plans/2026-05-07-catalog-product-surface.md` safely as a multi-phase catalog platform program with review checkpoints, green commits, and no accidental "API parity as architecture" drift.
+**Goal:** Execute the catalog product surface plan safely as a multi-phase catalog platform program with review checkpoints, green commits, and no accidental "API parity as architecture" drift.
 
 **Architecture:** Treat the source plan as the product contract and this file as the delivery playbook. Execute in small reviewable phases, starting with design/security contracts, then native state, then enforcement, then adapters and system tables. Every phase must preserve the Arco-native ledger/projection/pointer model and must keep compatibility APIs as adapters over authoritative Arco state.
 
@@ -14,13 +14,13 @@
 
 Primary plan:
 
-- `docs/plans/2026-05-07-catalog-product-surface.md`
+- catalog product surface plan
 
 Related plans:
 
-- `docs/plans/2026-05-07-managed-delta-correctness-governance.md`
-- `docs/plans/2026-04-20-system-catalog-tables.md`
-- `docs/plans/2026-04-23-authoritative-metastore-governance-surface.md`
+- managed Delta correctness governance plan
+- system catalog tables plan
+- authoritative metastore governance surface plan
 
 ## Execution Status (2026-05-11)
 
@@ -90,8 +90,7 @@ If there is unrelated dirty work, create a new git worktree rather than editing 
 Read:
 
 ```bash
-sed -n '1,220p' docs/plans/2026-05-07-catalog-product-surface.md
-rg -n "^### Task|^## Verification Matrix|^## Acceptance Criteria|^## Test Hygiene Policy" docs/plans/2026-05-07-catalog-product-surface.md
+Review the catalog product surface plan through the acceptance criteria and test hygiene sections.
 sed -n '1,220p' docs/guide/src/reference/control-plane-scope.md
 sed -n '1,220p' docs/guide/src/reference/system-catalog.md
 ```
@@ -394,7 +393,7 @@ Stop and ask before continuing if:
 
 ## Execution Prompt
 
-Use this prompt in a fresh Codex session that continues after the current branch
+Use this prompt in a fresh implementation session that continues after the current branch
 status:
 
 ```text
@@ -402,7 +401,7 @@ You are in /Users/ethanurbanski/arco.
 
 Use the `executing-plans` skill. Also use `using-git-worktrees` if the current worktree is dirty or if you need an isolated implementation branch.
 
-Execute `docs/plans/2026-05-08-catalog-product-surface-execution.md`, using `docs/plans/2026-05-07-catalog-product-surface.md` as the source product plan.
+Execute this catalog product surface execution plan, using the catalog product surface plan as the source product plan.
 
 Start with Preflight and Phase 3 only, unless review explicitly asks for a corrective follow-up to Phases 0-2. Do not start Phase 4 until I review the Phase 3 report.
 

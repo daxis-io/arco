@@ -1,6 +1,6 @@
 # Orchestration Product Lessons From Rivers Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **For implementers:** Execute this plan task-by-task with verification after each phase.
 
 **Goal:** Adopt the useful Rivers orchestration product lessons into Arco while preserving Arco's file-native, pointer-published control-plane architecture.
 

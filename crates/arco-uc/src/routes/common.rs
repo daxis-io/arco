@@ -119,16 +119,14 @@ pub(crate) fn authz_denial_reason(
     let Ok(compiled_permissions) = compiled_permissions.read() else {
         return Some("permissions_unavailable".to_string());
     };
-    let decision = AuthzDecision::evaluate(
-        AuthzRequest::new(
-            principal_id.clone(),
-            object_id.to_string(),
-            object_type.to_string(),
-            privilege,
-        )
-        .with_request_id(&ctx.request_id),
-        &compiled_permissions,
-    );
+    let request = AuthzRequest::new(
+        principal_id.clone(),
+        object_id.to_string(),
+        object_type.to_string(),
+        privilege,
+    )
+    .with_request_id(&ctx.request_id);
+    let decision = AuthzDecision::evaluate(&request, &compiled_permissions);
     if decision.outcome == DecisionOutcome::Allow {
         None
     } else {

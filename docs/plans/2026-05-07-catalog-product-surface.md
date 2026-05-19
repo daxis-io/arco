@@ -1,6 +1,6 @@
 # Catalog Product Surface Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **For implementers:** Execute this plan task-by-task with verification after each phase.
 
 **Goal:** Build Arco into a first-class file-native lakehouse catalog and
 metastore for open table formats, with Delta Lake as the primary managed
@@ -89,7 +89,7 @@ The product goal is not "UC parity." It is:
 - `crates/arco-uc/src/routes/permissions.rs` is scaffolded and not backed by compiled grants.
 - `crates/arco-uc/src/routes/credentials.rs` has placeholder temporary credential behavior.
 - UC inventory documents volumes, functions, models, credentials, external locations, and grants as useful prior art, but Arco should implement them natively.
-- The existing `docs/plans/2026-04-23-authoritative-metastore-governance-surface.md` is the runtime companion for portions of this product surface; it must continue to treat UC as compatibility prior art, not the product north star.
+- The existing authoritative metastore governance surface plan is the runtime companion for portions of this product surface; it must continue to treat UC as compatibility prior art, not the product north star.
 
 ## Current Status Snapshot
 
@@ -546,7 +546,7 @@ A domain must not be marked `Implemented` unless all of the following are true:
 - Modify: `docs/guide/src/reference/unity-catalog-openapi-inventory.md`
 - Modify: `docs/guide/src/concepts/catalog.md`
 - Modify: `docs/guide/src/concepts/architecture.md`
-- Modify: `docs/plans/2026-04-23-authoritative-metastore-governance-surface.md`
+- Modify: authoritative metastore governance surface plan
 
 **Step 1: Write the product-surface ADR**
 
@@ -658,7 +658,7 @@ Expected: build completes without broken links.
 **Step 9: Commit**
 
 ```bash
-git add docs/adr/adr-037-arco-catalog-product-surface.md docs/adr/adr-038-catalog-threat-model.md docs/adr/adr-039-catalog-consistency-model.md docs/guide/src/reference/catalog-privilege-matrix.md docs/guide/src/reference/catalog-api-contract.md docs/guide/src/reference/schema-evolution-policy.md docs/guide/src/reference/credential-vending-security.md docs/guide/src/reference/control-plane-scope.md docs/guide/src/reference/unity-catalog-openapi-inventory.md docs/guide/src/concepts/catalog.md docs/guide/src/concepts/architecture.md docs/plans/2026-04-23-authoritative-metastore-governance-surface.md
+git add docs/adr/adr-037-arco-catalog-product-surface.md docs/adr/adr-038-catalog-threat-model.md docs/adr/adr-039-catalog-consistency-model.md docs/guide/src/reference/catalog-privilege-matrix.md docs/guide/src/reference/catalog-api-contract.md docs/guide/src/reference/schema-evolution-policy.md docs/guide/src/reference/credential-vending-security.md docs/guide/src/reference/control-plane-scope.md docs/guide/src/reference/unity-catalog-openapi-inventory.md docs/guide/src/concepts/catalog.md docs/guide/src/concepts/architecture.md
 git commit -m "docs: define catalog product design contract"
 ```
 

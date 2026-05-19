@@ -291,7 +291,7 @@ Use a compatibility-first migration:
 
 ## Implementation References
 
-- `docs/plans/2026-05-12-metastore-scope-architecture.md`
+- metastore scope architecture plan
 - `docs/adr/adr-005-storage-layout.md`
 - `docs/adr/adr-034-fenced-head-published-control-plane-transactions.md`
 - `docs/adr/adr-037-arco-catalog-product-surface.md`

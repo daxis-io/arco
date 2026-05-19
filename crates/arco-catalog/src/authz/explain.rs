@@ -20,6 +20,6 @@ pub fn explain_access(
 ) -> AccessExplanation {
     AccessExplanation {
         request_id: request.request_id.clone(),
-        decision: AuthzDecision::evaluate(request.clone(), compiled),
+        decision: AuthzDecision::evaluate(request, compiled),
     }
 }

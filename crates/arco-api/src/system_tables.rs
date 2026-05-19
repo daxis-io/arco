@@ -1,5 +1,7 @@
 //! Registration helpers for tenant-visible logical `system.*` tables.
 
+#![allow(clippy::redundant_pub_crate, clippy::too_many_lines)]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

@@ -220,6 +220,7 @@ impl OrchestrationReconciler {
     /// # Errors
     ///
     /// Returns an error if storage reads or deletes fail.
+    #[allow(clippy::too_many_lines)]
     pub async fn repair_with_scope(
         &self,
         report: &OrchestrationReconciliationReport,
@@ -399,7 +400,7 @@ impl OrchestrationReconciler {
             visited_paths.insert(path);
         }
         let mut previous_manifest_path = manifest.previous_manifest_path.clone();
-        while let Some(path) = previous_manifest_path {
+        while let Some(path) = previous_manifest_path.take() {
             if !visited_paths.insert(path.clone()) {
                 return Err(Error::storage(format!(
                     "cycle detected in orchestration manifest chain at {path}"
@@ -411,7 +412,7 @@ impl OrchestrationReconciler {
                 protected.manifest_paths.insert(path.clone());
             }
             Self::protect_manifest_artifacts(&manifest, &mut protected);
-            previous_manifest_path = manifest.previous_manifest_path.clone();
+            previous_manifest_path.clone_from(&manifest.previous_manifest_path);
         }
 
         Ok(protected)

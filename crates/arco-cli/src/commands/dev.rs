@@ -34,7 +34,7 @@ struct DevCheckReport {
 /// # Errors
 ///
 /// Returns an error if output serialization fails.
-pub fn execute(args: DevArgs, config: &Config) -> Result<()> {
+pub fn execute(args: &DevArgs, config: &Config) -> Result<()> {
     if !args.check {
         anyhow::bail!(
             "arco dev is not an end-to-end local orchestration loop yet; use `arco dev --check`"

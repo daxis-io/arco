@@ -32,10 +32,10 @@ impl GovernedPath {
     /// Returns the canonical URI.
     #[must_use]
     pub fn canonical_uri(&self) -> String {
-        match &self.authority {
-            Some(authority) => format!("{}://{}{}", self.scheme, authority, self.path),
-            None => format!("{}://{}", self.scheme, self.path),
-        }
+        self.authority.as_ref().map_or_else(
+            || format!("{}://{}", self.scheme, self.path),
+            |authority| format!("{}://{}{}", self.scheme, authority, self.path),
+        )
     }
 
     /// Returns true when `self` is a prefix authority for `candidate`.
@@ -49,9 +49,12 @@ impl GovernedPath {
     /// Returns true when two path authorities overlap.
     #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
+        let self_contains_other = self.path.starts_with(&other.path);
+        let other_contains_self = other.path.starts_with(&self.path);
+
         self.scheme == other.scheme
             && self.authority == other.authority
-            && (self.path.starts_with(&other.path) || other.path.starts_with(&self.path))
+            && (self_contains_other || other_contains_self)
     }
 }
 
@@ -108,17 +111,20 @@ fn percent_decode(value: &str) -> Result<String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len() {
+    while let Some(&byte) = bytes.get(index) {
+        if byte == b'%' {
+            let Some(&high_byte) = bytes.get(index + 1) else {
                 return Err(validation("incomplete percent encoding"));
-            }
-            let high = hex_value(bytes[index + 1])?;
-            let low = hex_value(bytes[index + 2])?;
+            };
+            let Some(&low_byte) = bytes.get(index + 2) else {
+                return Err(validation("incomplete percent encoding"));
+            };
+            let high = hex_value(high_byte)?;
+            let low = hex_value(low_byte)?;
             decoded.push(high * 16 + low);
             index += 3;
         } else {
-            decoded.push(bytes[index]);
+            decoded.push(byte);
             index += 1;
         }
     }

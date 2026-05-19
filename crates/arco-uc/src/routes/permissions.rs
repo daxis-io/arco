@@ -88,11 +88,7 @@ fn permission_assignments(
         .iter()
         .filter(|row| row.object_type.eq_ignore_ascii_case(&object_type))
         .filter(|row| row.object_id == full_name)
-        .filter(|row| {
-            principal_filter
-                .map(|principal| row.principal_id == principal)
-                .unwrap_or(true)
-        })
+        .filter(|row| principal_filter.is_none_or(|principal| row.principal_id == principal))
         .map(permission_assignment)
         .collect()
 }

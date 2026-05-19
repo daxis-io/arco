@@ -153,7 +153,13 @@ struct ReservedCatalogCommit {
 
 impl Tier1Compactor {
     /// Creates a new Tier-1 compactor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the already-validated scoped storage IDs cannot form a
+    /// workspace alias scope.
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn new(storage: ScopedStorage) -> Self {
         let scope = ControlPlaneScope::workspace_alias(storage.tenant_id(), storage.workspace_id())
             .expect("ScopedStorage tenant/workspace IDs are already validated");
@@ -165,7 +171,13 @@ impl Tier1Compactor {
     /// The supplied storage remains rooted at its current workspace prefix. This
     /// keeps Task 3 as an API-threading change only; moving durable catalog paths
     /// to metastore prefixes is handled by the later path migration tasks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the explicit scope does not match the scoped storage tenant and
+    /// workspace.
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn new_with_scope(storage: ScopedStorage, scope: ControlPlaneScope) -> Self {
         Self::try_new_with_scope(storage, scope)
             .expect("explicit control-plane scope must match scoped storage")

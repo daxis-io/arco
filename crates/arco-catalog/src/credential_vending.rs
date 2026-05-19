@@ -142,17 +142,17 @@ impl CredentialVendingEngine {
     pub fn decide_path(
         &self,
         state: &StorageGovernanceState,
-        request: CredentialVendingRequest,
+        request: &CredentialVendingRequest,
     ) -> Result<CredentialVendingDecision> {
         if !supports_operation(request.operation) {
             return Ok(deny("unsupported_operation", request.requested_ttl));
         }
 
-        let path_decision =
-            match state.authority_for_path(&request.workspace_id, &request.requested_path) {
-                Ok(decision) => decision,
-                Err(_) => return Ok(deny("path_not_governed", request.requested_ttl)),
-            };
+        let Ok(path_decision) =
+            state.authority_for_path(&request.workspace_id, &request.requested_path)
+        else {
+            return Ok(deny("path_not_governed", request.requested_ttl));
+        };
 
         let provider = match path_decision.authority_kind {
             PathAuthorityKind::ExternalLocation => {

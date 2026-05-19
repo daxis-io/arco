@@ -236,6 +236,7 @@ fn require_visible_compaction(
     )))
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn map_flow_compaction_error(error: FlowError) -> ApiError {
     match error {
         FlowError::StaleFencingToken { .. }

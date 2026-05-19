@@ -8,11 +8,9 @@ use arco_catalog::authz::privileges::Privilege;
 #[test]
 fn authz_decision_allows_from_compiled_permission_and_records_evidence() {
     let compiled = compiled_permissions(true);
-    let decision = AuthzDecision::evaluate(
-        AuthzRequest::new("user_alice", "table_orders", "TABLE", Privilege::Select)
-            .with_request_id("req-allow"),
-        &compiled,
-    );
+    let request = AuthzRequest::new("user_alice", "table_orders", "TABLE", Privilege::Select)
+        .with_request_id("req-allow");
+    let decision = AuthzDecision::evaluate(&request, &compiled);
 
     assert_eq!(decision.outcome, DecisionOutcome::Allow);
     assert_eq!(decision.reason_code, "direct_or_inherited_grant");
@@ -26,11 +24,9 @@ fn authz_decision_allows_from_compiled_permission_and_records_evidence() {
 #[test]
 fn authz_decision_denies_by_default_for_missing_grants() {
     let compiled = compiled_permissions(true);
-    let decision = AuthzDecision::evaluate(
-        AuthzRequest::new("user_bob", "table_orders", "TABLE", Privilege::Select)
-            .with_request_id("req-deny"),
-        &compiled,
-    );
+    let request = AuthzRequest::new("user_bob", "table_orders", "TABLE", Privilege::Select)
+        .with_request_id("req-deny");
+    let decision = AuthzDecision::evaluate(&request, &compiled);
 
     assert_eq!(decision.outcome, DecisionOutcome::Deny);
     assert_eq!(decision.reason_code, "absence_of_allow");
@@ -40,20 +36,16 @@ fn authz_decision_denies_by_default_for_missing_grants() {
 #[test]
 fn authz_decision_denies_stale_or_unknown_compiled_permissions() {
     let stale = compiled_permissions(false);
-    let decision = AuthzDecision::evaluate(
-        AuthzRequest::new("user_alice", "table_orders", "TABLE", Privilege::Select)
-            .with_request_id("req-stale"),
-        &stale,
-    );
+    let request = AuthzRequest::new("user_alice", "table_orders", "TABLE", Privilege::Select)
+        .with_request_id("req-stale");
+    let decision = AuthzDecision::evaluate(&request, &stale);
     assert_eq!(decision.outcome, DecisionOutcome::Deny);
     assert_eq!(decision.reason_code, "stale_projection");
 
     let compiled = compiled_permissions(true);
-    let decision = AuthzDecision::evaluate(
-        AuthzRequest::new("user_alice", "unknown_01", "CONNECTION", Privilege::Select)
-            .with_request_id("req-unknown"),
-        &compiled,
-    );
+    let request = AuthzRequest::new("user_alice", "unknown_01", "CONNECTION", Privilege::Select)
+        .with_request_id("req-unknown");
+    let decision = AuthzDecision::evaluate(&request, &compiled);
     assert_eq!(decision.outcome, DecisionOutcome::Deny);
     assert_eq!(decision.reason_code, "unknown_object_type");
 }
@@ -63,7 +55,7 @@ fn explain_access_matches_enforcement_decision() {
     let compiled = compiled_permissions(true);
     let request = AuthzRequest::new("user_bob", "table_orders", "TABLE", Privilege::Select)
         .with_request_id("req-explain");
-    let decision = AuthzDecision::evaluate(request.clone(), &compiled);
+    let decision = AuthzDecision::evaluate(&request, &compiled);
     let explanation = explain_access(&request, &compiled);
 
     assert_eq!(explanation.decision.outcome, decision.outcome);

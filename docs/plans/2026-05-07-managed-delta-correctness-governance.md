@@ -1,6 +1,6 @@
 # Managed Delta Correctness And Governance Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **For implementers:** Execute this plan task-by-task with verification after each phase.
 
 **Goal:** Make Arco-managed Delta tables catalog-authoritative: table identity, storage location, protocol/features, write permissions, temporary credentials, and commit coordination are governed by Arco-native control-plane state instead of ad hoc object-store behavior or UC facade assumptions.
 
@@ -77,7 +77,7 @@ This plan depends on the catalog product Phase 0 contracts:
 - `docs/guide/src/reference/schema-evolution-policy.md`
 - `docs/guide/src/reference/credential-vending-security.md`
 
-Execute `docs/plans/2026-05-07-catalog-product-surface.md` Task 0 first. If
+Execute the catalog product surface plan Task 0 first. If
 this managed-Delta plan is executed independently before Task 0 lands, Task 1
 must create these shared contract files instead of modifying missing paths.
 

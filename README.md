@@ -75,6 +75,14 @@ arco-core       Shared primitives (tenant context, IDs, errors)
 
 Task execution runs in external workers via a canonical dispatch envelope. The browser query path uses DuckDB-WASM against signed URLs - no always-on infrastructure required.
 
+## Proto compatibility
+
+The pre-freeze hard cut is complete. The current `arco.*.v1` packages are the
+durable public proto surface represented by the frozen post-cut baseline. New
+`v1` changes must be additive and must preserve binary and ProtoJSON
+compatibility. Run `cargo xtask proto-breaking-check` before merging proto
+changes.
+
 ## Contributing
 
 - [Contributing guide](CONTRIBUTING.md)

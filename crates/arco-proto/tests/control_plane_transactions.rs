@@ -11,11 +11,11 @@
 use prost::Message;
 
 use arco_proto::arco::catalog::v1::{
-    Catalog, CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp, DropTableOp,
-    ExternalLocation, Function, GovernanceAttachment, Grant, GrantMutation, MetastoreMutation,
-    ModelVersion, RegisterTableOp, RegisteredModel, RenameTableOp, Schema, StorageCredential,
-    Table, TableFormat, UpdateTableOp, Volume, WorkspaceBinding, catalog_ddl_operation,
-    metastore_mutation,
+    Catalog, CatalogControlPlaneScope, CatalogDdlOperation, ColumnDefinition, CreateCatalogOp,
+    CreateSchemaOp, DropTableOp, ExternalLocation, Function, GovernanceAttachment, Grant,
+    GrantMutation, MetastoreMutation, ModelVersion, RegisterTableOp, RegisteredModel,
+    RenameTableOp, Schema, StorageCredential, Table, TableFormat, UpdateTableOp, Volume,
+    WorkspaceBinding, catalog_ddl_operation, metastore_mutation,
 };
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CatalogTxReceipt, CatalogTxStatus,
@@ -24,8 +24,8 @@ use arco_proto::arco::controlplane::v1::{
     GetCatalogTransactionRequest, GetCatalogTransactionResponse,
     GetOrchestrationTransactionRequest, GetOrchestrationTransactionResponse,
     GetRootTransactionRequest, GetRootTransactionResponse, OrchestrationBatchSpec,
-    OrchestrationTxReceipt, OrchestrationTxStatus, RootTxReceipt, RootTxStatus, TransactionDomain,
-    TransactionStatus, domain_mutation,
+    OrchestrationTxReceipt, OrchestrationTxStatus, RootTxReceipt, RootTxStatus,
+    ScopedMetastoreMutation, TransactionDomain, TransactionStatus, domain_mutation,
 };
 use arco_proto::arco::orchestration::v1::{
     BackfillTrigger, FileEntry, ManualTrigger, MaterializationTrigger, OrchestrationEventEnvelope,
@@ -33,7 +33,10 @@ use arco_proto::arco::orchestration::v1::{
     TaskCallbackOutput, TaskError, TaskErrorCategory, TaskFinished, TaskOutcome, TaskOutput,
     TriggerInfo, WebhookTrigger, orchestration_event_envelope, trigger_info,
 };
-use arco_proto::{ControlPlaneTransactionContractError, OrchestrationEventContractError};
+use arco_proto::{
+    CatalogControlPlaneScopeContractError, ControlPlaneTransactionContractError,
+    OrchestrationEventContractError,
+};
 
 #[test]
 fn control_plane_transaction_messages_compile_and_roundtrip_basic_fields() {
@@ -311,6 +314,7 @@ fn metastore_contract_exposes_stable_id_objects() {
         privilege: "SELECT".to_string(),
         granted_by: "user:admin@example.com".to_string(),
         created_at: None,
+        ..Default::default()
     };
 
     let storage_credential = StorageCredential {
@@ -320,6 +324,7 @@ fn metastore_contract_exposes_stable_id_objects() {
         owner: "group:data-platform".to_string(),
         created_at: None,
         updated_at: None,
+        ..Default::default()
     };
 
     let external_location = ExternalLocation {
@@ -330,6 +335,7 @@ fn metastore_contract_exposes_stable_id_objects() {
         owner: "group:data-platform".to_string(),
         created_at: None,
         updated_at: None,
+        ..Default::default()
     };
     let binding = WorkspaceBinding {
         binding_id: "binding_01".to_string(),
@@ -337,6 +343,7 @@ fn metastore_contract_exposes_stable_id_objects() {
         object_id: external_location.location_id.clone(),
         object_type: "EXTERNAL_LOCATION".to_string(),
         created_at: None,
+        ..Default::default()
     };
     let attachment = GovernanceAttachment {
         attachment_id: "attach_01".to_string(),
@@ -346,6 +353,7 @@ fn metastore_contract_exposes_stable_id_objects() {
         value: "restricted".to_string(),
         created_by: "user:admin@example.com".to_string(),
         created_at: None,
+        ..Default::default()
     };
     let volume = Volume {
         volume_id: "volume_01".to_string(),
@@ -356,6 +364,7 @@ fn metastore_contract_exposes_stable_id_objects() {
         owner: "group:data-platform".to_string(),
         created_at: None,
         updated_at: None,
+        ..Default::default()
     };
     let function = Function {
         function_id: "function_01".to_string(),
@@ -365,6 +374,7 @@ fn metastore_contract_exposes_stable_id_objects() {
         owner: "group:data-platform".to_string(),
         created_at: None,
         updated_at: None,
+        ..Default::default()
     };
     let model = RegisteredModel {
         model_id: "model_01".to_string(),
@@ -374,6 +384,7 @@ fn metastore_contract_exposes_stable_id_objects() {
         owner: "group:ml-platform".to_string(),
         created_at: None,
         updated_at: None,
+        ..Default::default()
     };
     let model_version = ModelVersion {
         model_version_id: "model_version_01".to_string(),
@@ -382,6 +393,7 @@ fn metastore_contract_exposes_stable_id_objects() {
         storage_location: "s3://bucket/models/churn/1".to_string(),
         created_at: None,
         updated_at: None,
+        ..Default::default()
     };
     let empty_mutation = MetastoreMutation { op: None };
 
@@ -843,6 +855,7 @@ fn metastore_root_transaction_accepts_mutations() {
                         owner: "group:data-platform".to_string(),
                         created_at: None,
                         updated_at: None,
+                        ..Default::default()
                     },
                 )),
             })),
@@ -850,6 +863,180 @@ fn metastore_root_transaction_accepts_mutations() {
     };
 
     assert_eq!(request.validate_contract(), Ok(()));
+}
+
+#[test]
+fn scoped_metastore_root_transaction_carries_scope_and_stable_object_id() {
+    let request = CommitRootTransactionRequest {
+        mutations: vec![DomainMutation {
+            kind: Some(domain_mutation::Kind::ScopedMetastore(
+                ScopedMetastoreMutation {
+                    scope: Some(CatalogControlPlaneScope {
+                        tenant_id: "tenant_01".to_string(),
+                        workspace_id: "workspace_01".to_string(),
+                        metastore_id: "metastore_01".to_string(),
+                        request_id: "request_01".to_string(),
+                    }),
+                    mutation: Some(MetastoreMutation {
+                        op: Some(metastore_mutation::Op::StorageCredential(
+                            StorageCredential {
+                                credential_id: "cred_01".to_string(),
+                                name: "lakehouse-prod".to_string(),
+                                cloud: "aws".to_string(),
+                                owner: "group:data-platform".to_string(),
+                                created_at: None,
+                                updated_at: None,
+                                ..Default::default()
+                            },
+                        )),
+                    }),
+                },
+            )),
+        }],
+    };
+
+    request
+        .validate_contract()
+        .expect("scoped metastore mutation should be valid");
+
+    let decoded = CommitRootTransactionRequest::decode(request.encode_to_vec().as_slice())
+        .expect("scoped metastore request should roundtrip");
+    let Some(domain_mutation::Kind::ScopedMetastore(scoped)) = decoded
+        .mutations
+        .first()
+        .and_then(|mutation| mutation.kind.as_ref())
+    else {
+        panic!("expected scoped metastore mutation");
+    };
+    let scope = scoped.scope.as_ref().expect("scope should roundtrip");
+    assert_eq!(scope.tenant_id, "tenant_01");
+    assert_eq!(scope.workspace_id, "workspace_01");
+    assert_eq!(scope.metastore_id, "metastore_01");
+    assert_eq!(scope.request_id, "request_01");
+
+    let Some(MetastoreMutation {
+        op: Some(metastore_mutation::Op::StorageCredential(storage_credential)),
+    }) = scoped.mutation.as_ref()
+    else {
+        panic!("expected storage credential mutation");
+    };
+    assert_eq!(storage_credential.credential_id, "cred_01");
+}
+
+#[test]
+fn scoped_metastore_root_transaction_uses_workspace_alias_when_metastore_is_omitted() {
+    let scope = CatalogControlPlaneScope {
+        tenant_id: "tenant_01".to_string(),
+        workspace_id: "workspace_01".to_string(),
+        metastore_id: String::new(),
+        request_id: "request_01".to_string(),
+    };
+
+    assert!(scope.metastore_id.is_empty());
+    assert_eq!(scope.effective_metastore_id(), "workspace_01");
+}
+
+#[test]
+fn scoped_metastore_root_transaction_rejects_missing_scope() {
+    let request = CommitRootTransactionRequest {
+        mutations: vec![DomainMutation {
+            kind: Some(domain_mutation::Kind::ScopedMetastore(
+                ScopedMetastoreMutation {
+                    scope: None,
+                    mutation: Some(MetastoreMutation {
+                        op: Some(metastore_mutation::Op::StorageCredential(
+                            StorageCredential {
+                                credential_id: "cred_01".to_string(),
+                                name: "lakehouse-prod".to_string(),
+                                cloud: "aws".to_string(),
+                                owner: "group:data-platform".to_string(),
+                                created_at: None,
+                                updated_at: None,
+                                ..Default::default()
+                            },
+                        )),
+                    }),
+                },
+            )),
+        }],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(ControlPlaneTransactionContractError::MissingRootMetastoreScope(0))
+    );
+}
+
+#[test]
+fn scoped_metastore_root_transaction_rejects_empty_required_scope_fields() {
+    for (scope, expected_error) in [
+        (
+            CatalogControlPlaneScope {
+                tenant_id: String::new(),
+                workspace_id: "workspace_01".to_string(),
+                metastore_id: "metastore_01".to_string(),
+                request_id: "request_01".to_string(),
+            },
+            CatalogControlPlaneScopeContractError::EmptyTenantId,
+        ),
+        (
+            CatalogControlPlaneScope {
+                tenant_id: "tenant_01".to_string(),
+                workspace_id: String::new(),
+                metastore_id: "metastore_01".to_string(),
+                request_id: "request_01".to_string(),
+            },
+            CatalogControlPlaneScopeContractError::EmptyWorkspaceId,
+        ),
+        (
+            CatalogControlPlaneScope {
+                tenant_id: "tenant_01".to_string(),
+                workspace_id: "workspace_01".to_string(),
+                metastore_id: "metastore_01".to_string(),
+                request_id: String::new(),
+            },
+            CatalogControlPlaneScopeContractError::EmptyRequestId,
+        ),
+        (
+            CatalogControlPlaneScope {
+                tenant_id: "tenant_01".to_string(),
+                workspace_id: String::new(),
+                metastore_id: String::new(),
+                request_id: "request_01".to_string(),
+            },
+            CatalogControlPlaneScopeContractError::EmptyEffectiveMetastoreId,
+        ),
+    ] {
+        let request = CommitRootTransactionRequest {
+            mutations: vec![DomainMutation {
+                kind: Some(domain_mutation::Kind::ScopedMetastore(
+                    ScopedMetastoreMutation {
+                        scope: Some(scope),
+                        mutation: Some(MetastoreMutation {
+                            op: Some(metastore_mutation::Op::StorageCredential(
+                                StorageCredential {
+                                    credential_id: "cred_01".to_string(),
+                                    name: "lakehouse-prod".to_string(),
+                                    cloud: "aws".to_string(),
+                                    owner: "group:data-platform".to_string(),
+                                    created_at: None,
+                                    updated_at: None,
+                                    ..Default::default()
+                                },
+                            )),
+                        }),
+                    },
+                )),
+            }],
+        };
+
+        assert_eq!(
+            request.validate_contract(),
+            Err(
+                ControlPlaneTransactionContractError::InvalidRootMetastoreScope(0, expected_error,)
+            )
+        );
+    }
 }
 
 #[test]

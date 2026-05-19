@@ -25,7 +25,11 @@ message Schema {
   google.protobuf.Timestamp updated_at = 5;
 }
 
-// Supported table formats across catalog contracts.
+// Supported lakehouse table formats across catalog contracts.
+//
+// Arco table creation defaults to Delta Lake when callers omit a format.
+// TABLE_FORMAT_UNSPECIFIED remains the protobuf zero value; legacy persisted
+// catalog rows without a stored format are interpreted outside this wire enum.
 enum TableFormat {
   TABLE_FORMAT_UNSPECIFIED = 0;
   TABLE_FORMAT_DELTA = 1;

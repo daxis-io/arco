@@ -12,11 +12,11 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 
-#[cfg(any(feature = "gcp", feature = "test-utils"))]
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
 use arco_core::Error as CoreError;
 use arco_core::VisibilityStatus;
 use arco_flow::compaction_client::compact_orchestration_events_fenced;
-#[cfg(any(feature = "gcp", feature = "test-utils"))]
+#[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
 use arco_flow::error::Error as FlowError;
 use arco_flow::orchestration_compaction::OrchestrationCompactRequest;
 
@@ -185,19 +185,20 @@ async fn compaction_client_sends_static_bearer_token_when_configured() {
     )
     .await;
 
-    #[cfg(any(feature = "gcp", feature = "test-utils"))]
+    #[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
     assert!(
         result.is_ok(),
         "expected compaction request to succeed with auth header, got: {result:?}"
     );
 
-    #[cfg(not(any(feature = "gcp", feature = "test-utils")))]
+    #[cfg(not(any(feature = "gcp", feature = "test-utils", feature = "http-client")))]
     {
-        let err = result.expect_err("expected configuration error without gcp/test-utils feature");
+        let err =
+            result.expect_err("expected configuration error without gcp/test-utils/http-client");
         assert!(
             err.to_string()
                 .contains("orchestration compaction requires the 'gcp', 'test-utils', or 'http-client' feature"),
-            "unexpected error when gcp/test-utils feature is disabled: {err}"
+            "unexpected error when gcp/test-utils/http-client feature is disabled: {err}"
         );
     }
 }
@@ -247,7 +248,7 @@ async fn compaction_client_sends_fencing_token_and_lock_path() {
     )
     .await;
 
-    #[cfg(any(feature = "gcp", feature = "test-utils"))]
+    #[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
     {
         let captured_request = _captured_request.expect("capture handle");
         let response = response.expect("fenced compaction should succeed");
@@ -267,13 +268,14 @@ async fn compaction_client_sends_fencing_token_and_lock_path() {
         assert_eq!(request.request_id.as_deref(), Some("req_fenced"));
     }
 
-    #[cfg(not(any(feature = "gcp", feature = "test-utils")))]
+    #[cfg(not(any(feature = "gcp", feature = "test-utils", feature = "http-client")))]
     {
-        let err = response.expect_err("expected configuration error without gcp/test-utils");
+        let err =
+            response.expect_err("expected configuration error without gcp/test-utils/http-client");
         assert!(
             err.to_string()
                 .contains("orchestration compaction requires the 'gcp', 'test-utils', or 'http-client' feature"),
-            "unexpected error when gcp/test-utils feature is disabled: {err}"
+            "unexpected error when gcp/test-utils/http-client feature is disabled: {err}"
         );
     }
 }
@@ -295,7 +297,7 @@ async fn compaction_client_maps_conflict_status_to_precondition_failed() {
     )
     .await;
 
-    #[cfg(any(feature = "gcp", feature = "test-utils"))]
+    #[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
     {
         let err = result.expect_err("conflict response must fail");
         assert!(
@@ -308,13 +310,14 @@ async fn compaction_client_maps_conflict_status_to_precondition_failed() {
         );
     }
 
-    #[cfg(not(any(feature = "gcp", feature = "test-utils")))]
+    #[cfg(not(any(feature = "gcp", feature = "test-utils", feature = "http-client")))]
     {
-        let err = result.expect_err("expected configuration error without gcp/test-utils");
+        let err =
+            result.expect_err("expected configuration error without gcp/test-utils/http-client");
         assert!(
             err.to_string()
                 .contains("orchestration compaction requires the 'gcp', 'test-utils', or 'http-client' feature"),
-            "unexpected error when gcp/test-utils feature is disabled: {err}"
+            "unexpected error when gcp/test-utils/http-client feature is disabled: {err}"
         );
     }
 }

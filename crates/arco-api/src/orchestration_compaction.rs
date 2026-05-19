@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_events_and_compact_noop_when_empty() {
+    async fn append_events_and_compact_rejects_empty_batch() {
         let result = append_events_and_compact(
             &Config::default(),
             sample_storage(),
@@ -501,7 +501,12 @@ mod tests {
             None,
         )
         .await;
-        assert!(result.expect("empty append").is_empty());
+        let err = result.expect_err("empty append must fail");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.message(),
+            "orchestration batch must include at least one event"
+        );
     }
 
     #[tokio::test]

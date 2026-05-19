@@ -9,10 +9,15 @@ We need a server-side SQL query path for catalog snapshots to support audit and 
 ## Decision
 Add `POST /api/v1/query` backed by DataFusion. The handler:
 - Validates queries are SELECT/CTE only
-- Registers snapshot parquet files from the manifest as tables in schemas `catalog`, `lineage`, and `search`
+- Registers allowlisted catalog and lineage snapshot parquet files as legacy
+  two-part schemas such as `catalog.namespaces` and `lineage.lineage_edges`
+- Registers explicit tenant-visible `system.*` tables through the system-table
+  allowlist
+- Does not expose raw search postings such as `search.token_postings` or
+  `system.search.token_postings`
 - Executes the query and returns Arrow IPC stream by default, JSON when `format=json` or `Accept: application/json`
 
 ## Consequences
 - Adds DataFusion/Arrow/Parquet dependencies to `arco-api`
 - Results are materialized in memory per request; not intended for large scans
-- Query surface is restricted to snapshot data and read-only SQL
+- Query surface is restricted to allowlisted snapshot/system data and read-only SQL

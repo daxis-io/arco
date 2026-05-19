@@ -1,155 +1,87 @@
 # Arco
 
-> **Incubating Project** - Arco is under active development and not yet ready for production use. APIs may change without notice. We welcome early feedback and contributions.
-
-**Serverless lakehouse infrastructure** - A file-native catalog and execution-first orchestration layer for modern data platforms.
+**File-native lakehouse catalog and orchestration.** A catalog and metastore
+for open table formats, with Delta Lake as the first-class managed format.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 ![Status](https://img.shields.io/badge/status-incubating-yellow.svg)
 
----
+> Arco is incubating and not yet production ready. APIs may change. Early feedback welcome.
 
-## Overview
+## What is Arco?
 
-Arco unifies a **file-native catalog** and an **execution-first orchestration** layer into one operational metadata system. It stores metadata as immutable, queryable files on object storage and treats deterministic planning, replayable history, and explainability as product requirements.
+Arco stores catalog and orchestration metadata as **Parquet files on object
+storage** no always on database, no proprietary catalog service. Query your
+metadata with SQL the same way you query your data.
 
-Current authoritative scope is narrower than the broadest catalog/control-plane framing sometimes used in design discussions. The repo has executable proof for catalog DDL, lineage/search materialization, orchestration transactions, and Delta coordinated commit state. Broader governance domains such as grants, permissions, credential bindings, and policy-style metadata are still partial or planned. See `docs/guide/src/reference/control-plane-scope.md`.
+At the catalog layer, Arco manages table identity, locations, schemas, lineage,
+and operational metadata for open lakehouse table formats. New Arco table
+registrations default to Delta Lake; Iceberg and plain Parquet are explicit
+catalog surfaces with compatibility and governance support growing over time.
 
-### Key Differentiators
+## Why Arco?
 
-| Feature | Description |
-|---------|-------------|
-| **Metadata as files** | Parquet-first storage for catalog and operational metadata, optimized for direct SQL access |
-| **Query-native reads** | Browser and server query engines read metadata directly via signed URLs, eliminating always-on infrastructure |
-| **Lineage-by-execution** | Lineage captured from real runs (inputs/outputs/partitions), not inferred from SQL parsing |
-| **Two-tier consistency** | Strong consistency for DDL; eventual consistency for high-volume operational facts |
-| **Tenant isolation** | Enforced at storage layout, service boundaries, and test gates |
+- **No catalog server to operate** - metadata lives in object storage; engines
+  read it directly via signed URLs.
+- **Query metadata with SQL** - catalog, lineage, and run history are exposed
+  as `system.*` tables.
+- **Real lineage** - captured from actual runs, not guessed from SQL parsing.
+- **Multi-tenant by design** - isolation is enforced at storage layout, service
+  boundaries, and test gates.
+- **Open table formats** - Delta Lake is the primary managed format; Iceberg
+  and plain Parquet are modeled in catalog contracts.
 
-## Documentation
-
-- Documentation map: `docs/README.md`
-- Canonical guide/reference docs (mdBook): `docs/guide/src/`
-- Architecture decisions: `docs/adr/README.md`
-- Operations runbooks: `docs/runbooks/`
-- Release process: `RELEASE.md`
-- Evidence policy: `docs/guide/src/reference/evidence-policy.md`
-
-## Architecture
-
-```
-arco/
-├── crates/
-│   ├── arco-core/       # Core abstractions: types, storage traits, tenant context
-│   ├── arco-catalog/    # Catalog service: registry, lineage, search, Parquet storage
-│   ├── arco-flow/       # Orchestration: planning, scheduling, state machine
-│   ├── arco-api/        # HTTP/gRPC composition layer
-│   ├── arco-proto/      # Protobuf definitions
-│   └── arco-compactor/  # Compaction binary for Tier 2 events
-├── proto/               # Canonical .proto files
-├── python/              # Python SDK
-└── docs/                # mdBook docs + ADRs + audits
-```
-
-## Engine Boundaries (ADR-032)
-
-Arco enforces explicit engine responsibilities in split-services deployments:
-
-- `arco-api` and `arco-flow` are control-plane services.
-- DataFusion endpoints (`/api/v1/query`, `/api/v1/query-data`) are read-only (`SELECT`/`CTE`).
-- Compactors are sole writers for state/snapshot Parquet projections.
-- Browser query path uses DuckDB-WASM via signed URLs only.
-- ETL compute runs in external workers via canonical `WorkerDispatchEnvelope`.
-
-Current cycle non-goals:
-
-- No in-process ETL engine.
-- No Spark/dbt/Flink adapter implementation.
-
-## Quick Start
+## Get Started
 
 ### Prerequisites
 
 - Rust 1.85+ (Edition 2024)
 - Protocol Buffers compiler (`protoc`)
-- mdBook (`cargo install mdbook --version 0.4.52 --locked`) for local docs builds
 
-### Build
+### Build and test
 
 ```bash
-# Clone the repository
 git clone https://github.com/daxis-io/arco.git
 cd arco
 
-# Build all crates
 cargo build --workspace
-
-# Run tests
 cargo test --workspace
-
-# Check formatting and lints
-cargo fmt --all --check
-cargo clippy --workspace --all-features -- -D warnings
 ```
 
-### Protobuf Contract Notes
-
-- `proto/` is the authoritative protobuf source tree.
-- The generated `arco-proto` types are part of the supported cross-process contract.
-- `arco.*.v1` remains in the pre-freeze hard cut window until
-  `proto-baselines/post-hard-cut-v1.binpb` is regenerated for the expanded API.
-- Protobuf JSON field compatibility is enforced as part of the post-cut schema baseline, not treated as accidental serialization behavior.
-- Run `cargo xtask proto-breaking-check` to verify compatibility against the frozen post-cut baseline at `proto-baselines/post-hard-cut-v1.binpb`.
-- Regenerate that frozen baseline image with `buf build proto --exclude-source-info -o proto-baselines/post-hard-cut-v1.binpb`.
-
-### Local CI/Gate Parity
+### Browse the docs
 
 ```bash
-cargo xtask doctor
-cargo xtask proto-breaking-check
-cargo xtask adr-check
-cargo xtask verify-integrity
-cargo xtask parity-matrix-check
-cargo xtask repo-hygiene-check
-cargo xtask uc-openapi-inventory
-git diff --exit-code -- docs/guide/src/reference/unity-catalog-openapi-inventory.md
-
-# Build docs
-cd docs/guide && mdbook build
+cargo install mdbook --version 0.4.52 --locked
+cd docs/guide && mdbook build --open
 ```
 
-## Crates
+Or jump straight to:
 
-| Crate | Description | Status |
-|-------|-------------|--------|
-| `arco-core` | Shared primitives: tenant context, IDs, errors, storage traits | Alpha |
-| `arco-catalog` | Catalog domain: asset registry, lineage, Parquet snapshots | Alpha |
-| `arco-flow` | Orchestration domain: planning, scheduling, run state | Alpha |
-| `arco-api` | HTTP/gRPC composition layer | Alpha |
-| `arco-proto` | Protobuf definitions for cross-language contracts | Alpha |
-| `arco-compactor` | Compaction binary for Tier 2 event consolidation | Alpha |
+- [Quick Start](docs/guide/src/getting-started/quickstart.md)
+- [Architecture](docs/guide/src/concepts/architecture.md)
+- [System Catalog](docs/guide/src/reference/system-catalog.md)
+
+## How it fits together
+
+```
+arco-api        HTTP/gRPC entry point (read only SQL via DataFusion)
+arco-catalog    Table format catalog, lineage, Parquet metadata snapshots
+arco-flow       Planning, scheduling, run state
+arco-compactor  Tier-2 event consolidation
+arco-proto      Cross-language protobuf contracts
+arco-core       Shared primitives (tenant context, IDs, errors)
+```
+
+Task execution runs in external workers via a canonical dispatch envelope. The browser query path uses DuckDB-WASM against signed URLs - no always-on infrastructure required.
 
 ## Contributing
 
-- Contribution guidelines: [CONTRIBUTING.md](CONTRIBUTING.md)
-- Community pathways: [COMMUNITY.md](COMMUNITY.md), [SUPPORT.md](SUPPORT.md)
-- Code of conduct: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
-
-### Development
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-features -- -D warnings
-cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
-```
-
-## Security
-
-For security vulnerabilities, please see [SECURITY.md](SECURITY.md).
+- [Contributing guide](CONTRIBUTING.md)
+- [Code of conduct](CODE_OF_CONDUCT.md)
+- [Security policy](SECURITY.md)
+- [Community & support](COMMUNITY.md)
 
 ## License
 
-Licensed under the Apache License, Version 2.0.
-
-- License text: [LICENSE](LICENSE)
-- Attribution notice: [NOTICE](NOTICE)
+Apache License 2.0 - see [LICENSE](LICENSE) and [NOTICE](NOTICE).

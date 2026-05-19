@@ -28,12 +28,27 @@ projections.
 - `system.lineage.edges`
 - `system.orchestration.{runs,tasks,dep_satisfaction,timers,dispatch_outbox,sensor_state,sensor_evals,partition_status,schedule_definitions,schedule_state,schedule_ticks,backfills,backfill_chunks,run_key_conflicts}`
 
+## Deferred Tables
+
+The initial surface does not include access, storage, governance, volume,
+function, model registry, or managed Delta operational tables. Those tables
+remain planned until their authoritative native state and safe Parquet
+projections exist:
+
+- `system.access.{grants,compiled_permissions,audit,auth_denies,credential_mints}`
+- `system.storage.{credentials,external_locations,managed_roots,workspace_bindings}`
+- `system.catalog.{volumes,functions,registered_models,model_versions}`
+- `system.governance.attachments`
+- `system.delta.{tables,commits,staged_commits,reconciliation_issues}`
+
 ## Boundaries
 
 - Truth: immutable ledger + pointer-published manifests
 - Serving path: manifest-selected Parquet artifacts
 - Operations surface: read-only system tables
-- Not exposed by default: raw ledger, raw manifests, raw search postings
+- Not exposed by default: raw ledger paths, raw manifest JSON, raw search
+  postings, and internal orchestration dedupe/index tables such as
+  `run_key_index` and `idempotency_keys`
 
 ## Consequences
 

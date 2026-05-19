@@ -9,6 +9,18 @@ The orchestration domain plans and executes data work with deterministic behavio
 - Persist execution events for replay, debugging, and parity checks.
 - Enforce idempotency keys and deterministic partition identity.
 
+## Product Boundary
+
+The control plane owns planning, scheduling, dispatch, event recording,
+projection folding, and published read models. Workers execute user code from a
+`WorkerDispatchEnvelope` and report scoped callback facts with task tokens and
+attempt identity.
+
+Execution locations describe where user code runs, such as a local worker,
+managed queue worker, Kubernetes deployment, or hosted runner. They are runtime
+routing contracts, not catalog or metastore authority. The detailed contract is
+in `docs/guide/src/reference/orchestration-product-contract.md`.
+
 ## Execution Semantics
 
 - Plans are generated from canonical inputs.
@@ -23,9 +35,13 @@ The orchestration domain plans and executes data work with deterministic behavio
 
 ## Canonical References
 
+- `docs/guide/src/reference/orchestration-product-contract.md`
 - `docs/adr/adr-010-canonical-json.md`
 - `docs/adr/adr-011-partition-identity.md`
+- `docs/adr/adr-020-orchestration-domain.md`
+- `docs/adr/adr-023-worker-contract.md`
 - `docs/adr/adr-022-dependency-satisfaction.md`
 - `docs/adr/adr-024-schedule-sensor-automation.md`
 - `docs/adr/adr-025-backfill-controller.md`
 - `docs/adr/adr-026-partition-status-tracking.md`
+- `docs/adr/adr-035-system-catalog-tables.md`

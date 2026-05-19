@@ -8,11 +8,31 @@
 
 ---
 
+## Status (2026-05-11)
+
+Partially in progress. This plan now starts from the frozen `arco.*.v1` proto
+baseline: the metastore proto skeleton, root transaction mutation envelope,
+ProtoJSON fixture, and `proto-baselines/post-hard-cut-v1.binpb` already landed
+in the pre-freeze proto expansion. This plan owns the runtime/state side:
+catalog projections, UC route behavior, credential/grant enforcement hooks, and
+derived system-table visibility.
+
+Phase 0 catalog product design now lives in ADR-037, ADR-038, ADR-039 and the
+catalog reference pages for privileges, API semantics, schema evolution, and
+credential-vending security. Treat those documents as prerequisites for runtime
+implementation in this plan.
+
+The newer catalog product plan has also landed additive native metastore object
+contracts and an initial generic metastore replay/projection kernel. Those
+slices do not complete this plan: authoritative grant enforcement, storage
+governance, credential vending, object-family projections, UC route behavior,
+and derived system-table visibility remain pending runtime work.
+
 ## Repo-Grounded Gap Summary
 
 The current repo has moved past "basic catalog CRUD is missing" as the primary gap.
 The remaining missing pieces are the surrounding metastore and governance domains
-that make a UC-like metastore authoritative rather than parity-shaped.
+that make a mature lakehouse catalog authoritative rather than parity-shaped.
 
 - `crates/arco-uc/src/routes/permissions.rs` still returns empty
   `privilege_assignments` on `GET`, and `PATCH` is explicitly unsupported.
@@ -22,9 +42,14 @@ that make a UC-like metastore authoritative rather than parity-shaped.
 - `docs/guide/src/reference/control-plane-scope.md` still marks grants/RBAC,
   credentials/external locations, governance rules, and ownership/tags as
   `Planned`.
-- `proto/arco/catalog/v1/catalog.proto` still models only catalog/schema/table
-  DDL; there is no authoritative protobuf contract yet for the broader
-  metastore/governance object model.
+- `proto/arco/catalog/v1/metastore.proto` now defines stable-ID
+  metastore/governance object and mutation contracts, and root transactions can
+  carry metastore mutations.
+- `crates/arco-catalog/src/metastore/` now has an initial replay/projection
+  kernel and an allowlisted `metastore_objects.parquet` projection. This is a
+  partial kernel, not production-backed domain state for grants, credentials,
+  external locations, volumes, functions, models, governance attachments, or
+  policy enforcement.
 - `crates/arco-uc/tests/fixtures/unitycatalog-openapi.yaml` and
   `docs/guide/src/reference/unity-catalog-openapi-inventory.md` still describe
   additional UC object families and governance surfaces that Arco does not yet
@@ -67,8 +92,8 @@ that make a UC-like metastore authoritative rather than parity-shaped.
 ## Recommended Delivery Order
 
 1. Lock the contract in docs and ADRs.
-2. Add durable metastore/governance contracts with stable IDs and snapshot
-   projections.
+2. Extend durable metastore/governance contracts only additively as needed, then
+   add stable-ID snapshot projections.
 3. Land grants/RBAC and make `/permissions/...` authoritative.
 4. Land storage credentials, external locations, bindings, and truthful
    temporary credential vending.
@@ -155,10 +180,10 @@ git add docs/adr/adr-036-authoritative-metastore-governance-surface.md docs/guid
 git commit -m "docs: define authoritative metastore governance surface"
 ```
 
-### Task 2: Add Stable-ID Metastore Contracts And Snapshot Projections
+### Task 2: Add Stable-ID Metastore Snapshot Projections
 
 **Files:**
-- Create: `proto/arco/catalog/v1/metastore.proto`
+- Modify: `proto/arco/catalog/v1/metastore.proto` only for additive runtime gaps
 - Create: `crates/arco-catalog/src/metastore_events.rs`
 - Create: `crates/arco-catalog/src/metastore_state.rs`
 - Create: `crates/arco-catalog/src/metastore_snapshot.rs`
@@ -185,13 +210,12 @@ or publish metastore/governance projections such as:
 
 Also add failures that prove stable IDs survive rename-based lookup changes.
 
-**Step 2: Add a dedicated metastore protobuf**
+**Step 2: Extend the existing metastore protobuf only if runtime gaps require it**
 
-`metastore.proto` is part of the final pre-freeze `arco.catalog.v1` hard cut.
-
-Do not keep inflating `catalog.proto` until it becomes unreadable. Add a new
-versioned contract for metastore/governance state with stable IDs and explicit
-operations for:
+`metastore.proto` is already part of the frozen `arco.catalog.v1` hard-cut
+baseline. Treat it as durable: do not rename fields, remove fields, reuse field
+numbers, or change ProtoJSON names. Add only backward-compatible fields or oneof
+variants needed by the runtime projections for:
 
 - grants and privilege mutations
 - storage credentials
@@ -219,6 +243,12 @@ Expected: PASS with the new projection names and stable-ID invariants covered
 
 Run: `cargo test -p arco-catalog --test protocol_invariants -- --nocapture`
 Expected: PASS with no ledger-scan or list-dependent correctness regressions
+
+Run: `buf lint proto/`
+Expected: PASS if `metastore.proto` changed.
+
+Run: `cargo xtask proto-breaking-check`
+Expected: PASS if `metastore.proto` changed.
 
 **Step 5: Commit**
 

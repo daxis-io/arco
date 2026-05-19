@@ -20,6 +20,16 @@ source of truth quickly.
   - `docs/guide/src/reference/control-plane-scope.md`
 - Production target architecture:
   - `docs/guide/src/reference/object-native-catalog-architecture.md`
+- Metastore and workspace scope architecture:
+  - `docs/guide/src/reference/metastore-scope-architecture.md`
+- Catalog product contracts:
+  - `docs/adr/adr-037-arco-catalog-product-surface.md`
+  - `docs/adr/adr-038-catalog-threat-model.md`
+  - `docs/adr/adr-039-catalog-consistency-model.md`
+  - `docs/guide/src/reference/catalog-privilege-matrix.md`
+  - `docs/guide/src/reference/catalog-api-contract.md`
+  - `docs/guide/src/reference/schema-evolution-policy.md`
+  - `docs/guide/src/reference/credential-vending-security.md`
 
 ## Operations and Readiness
 

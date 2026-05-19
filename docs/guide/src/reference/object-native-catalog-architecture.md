@@ -7,8 +7,11 @@ the [control-plane scope scorecard](./control-plane-scope.md).
 
 ## Design Thesis
 
-Arco Catalog should be a per-entity, CAS-headed, immutable-snapshot catalog stored
-entirely in object storage.
+Arco Catalog should be a per-entity, CAS-headed, immutable-snapshot catalog and
+metastore for open lakehouse table formats, stored entirely in object storage.
+Delta Lake is the first-class managed table format; Iceberg-facing and plain
+Parquet table surfaces must use the same object-native catalog boundary and
+declare their support level explicitly.
 
 The catalog does not use one global metastore snapshot as the common commit point.
 Instead, it uses:

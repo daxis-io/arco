@@ -8,6 +8,27 @@
 
 ---
 
+## Status (2026-05-07)
+
+Complete and merged. All seven tasks landed:
+
+- `fba3e82`: document the pre-freeze hard-cut policy in `README.md` and `proto/STYLE.md`
+- `2584ccf`: add `proto/arco/catalog/v1/metastore.proto`
+- `ca220d0`: add metastore mutations to root transactions
+- `5a922b4`: lock `crates/arco-proto/fixtures/metastore_mutation_v1.json`
+- `cc1ae21`: freeze `proto-baselines/post-hard-cut-v1.binpb`
+- `21c315a`: harden nested metastore mutation validation
+- `33898f4`: harden proto and repair helpers
+
+The pre-freeze hard cut is closed. `arco.*.v1` is now the durable public proto
+surface, and `cargo xtask proto-breaking-check` is the gate for future additive
+changes. New catalog product and metastore governance work should start from
+the frozen metastore proto baseline rather than reopening this proto expansion
+plan.
+
+The task steps below are historical execution notes for the completed hard cut,
+not current instructions for new proto work.
+
 ## Scope
 
 - Keep `arco.common.v1`, `arco.catalog.v1`, `arco.controlplane.v1`, and `arco.orchestration.v1` as the durable public packages after this cut.

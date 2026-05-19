@@ -64,6 +64,8 @@ jobs:
         with:
           version: '1.47.2'
           github_token: ${{ github.token }}
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo xtask doctor
       - run: cargo xtask adr-check
       - run: cargo xtask verify-integrity

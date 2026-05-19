@@ -15,6 +15,7 @@ fn sample_envelope() -> WorkerDispatchEnvelope {
         attempt: 2,
         attempt_id: "01HQ123ATT".to_string(),
         dispatch_id: "dispatch:run-123:analytics.daily_sales:2".to_string(),
+        execution_location_id: Some("local-dev".to_string()),
         worker_queue: "default-queue".to_string(),
         callback_base_url: "https://api.arco.dev".to_string(),
         task_token: "jwt-token".to_string(),
@@ -47,6 +48,7 @@ fn worker_dispatch_envelope_round_trips_json() {
         parsed.dispatch_id,
         "dispatch:run-123:analytics.daily_sales:2"
     );
+    assert_eq!(parsed.execution_location_id.as_deref(), Some("local-dev"));
     assert_eq!(parsed.worker_queue, "default-queue");
     assert_eq!(parsed.callback_base_url, "https://api.arco.dev");
     assert_eq!(parsed.task_token, "jwt-token");
@@ -55,6 +57,44 @@ fn worker_dispatch_envelope_round_trips_json() {
         "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
     );
     assert_eq!(parsed.payload["asset"], "analytics.daily_sales");
+}
+
+#[test]
+fn worker_dispatch_envelope_accepts_legacy_json_without_execution_location() {
+    let legacy = json!({
+        "tenant_id": "tenant-a",
+        "workspace_id": "workspace-b",
+        "run_id": "run-123",
+        "task_key": "analytics.daily_sales",
+        "attempt": 2,
+        "attempt_id": "01HQ123ATT",
+        "dispatch_id": "dispatch:run-123:analytics.daily_sales:2",
+        "worker_queue": "default-queue",
+        "callback_base_url": "https://api.arco.dev",
+        "task_token": "jwt-token",
+        "token_expires_at": "2026-01-01T00:00:00Z",
+        "payload": {
+            "asset": "analytics.daily_sales"
+        }
+    });
+
+    let parsed: WorkerDispatchEnvelope =
+        serde_json::from_value(legacy).expect("legacy envelope must deserialize");
+
+    assert_eq!(parsed.execution_location_id, None);
+    assert_eq!(parsed.worker_queue, "default-queue");
+    assert_eq!(parsed.callback_base_url, "https://api.arco.dev");
+    assert_eq!(parsed.task_token, "jwt-token");
+}
+
+#[test]
+fn worker_dispatch_envelope_omits_execution_location_when_absent() {
+    let mut envelope = sample_envelope();
+    envelope.execution_location_id = None;
+
+    let value = serde_json::to_value(&envelope).expect("serialize envelope");
+
+    assert!(value.get("execution_location_id").is_none());
 }
 
 #[test]

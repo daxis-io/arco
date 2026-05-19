@@ -292,6 +292,7 @@ async fn run_dispatch_callback_path_advances_task_state() {
         attempt,
         attempt_id: attempt_id.clone(),
         dispatch_id: dispatch_id.clone(),
+        execution_location_id: None,
         worker_queue: "default-queue".to_string(),
         callback_base_url: "https://api.arco.dev".to_string(),
         task_token: minted.token.clone(),

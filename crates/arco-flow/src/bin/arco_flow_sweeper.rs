@@ -198,6 +198,7 @@ async fn run_handler(
                     attempt,
                     attempt_id,
                     dispatch_id: original_dispatch_id.clone(),
+                    execution_location_id: None,
                     worker_queue: "default-queue".to_string(),
                     callback_base_url: state.callback_base_url.clone(),
                     task_token: minted.token,

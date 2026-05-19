@@ -21,6 +21,9 @@ pub struct WorkerDispatchEnvelope {
     pub attempt_id: String,
     /// Dispatch identifier.
     pub dispatch_id: String,
+    /// Execution-location identity selected by orchestration planning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_location_id: Option<String>,
     /// Target worker queue.
     pub worker_queue: String,
     /// Base URL workers use for task callbacks.

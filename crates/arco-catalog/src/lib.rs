@@ -77,19 +77,27 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 
 pub mod asset;
+pub mod audit;
+pub mod authz;
 pub mod compactor;
+pub mod credential_vending;
 pub mod error;
 pub mod event_writer;
 pub mod gc;
+pub mod governance;
 pub mod idempotency;
+pub mod identity;
 pub mod lock;
 pub mod manifest;
+pub mod metastore;
 pub mod metrics;
+pub mod objects;
 pub mod parquet_util;
 pub mod reader;
 pub mod reconciler;
 pub mod search_tombstone;
 mod state;
+pub mod storage_governance;
 pub mod sync_compactor;
 pub mod tier1_compactor;
 pub mod tier1_events;

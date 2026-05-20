@@ -124,6 +124,7 @@ fn metastore_storage_credential_root_request(name: &str) -> CommitRootTransactio
                         owner: "group:data-platform".to_string(),
                         created_at: None,
                         updated_at: None,
+                        ..Default::default()
                     },
                 )),
             })),

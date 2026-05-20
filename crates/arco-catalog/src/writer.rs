@@ -33,7 +33,9 @@ use uuid::Uuid;
 
 use arco_core::storage::StorageBackend;
 use arco_core::sync_compact::SyncCompactRequest;
-use arco_core::{CatalogDomain, CatalogPaths, DeltaPaths, ScopedStorage, TableFormat};
+use arco_core::{
+    CatalogDomain, CatalogPaths, ControlPlaneScope, DeltaPaths, ScopedStorage, TableFormat,
+};
 
 use crate::error::{CatalogError, Result};
 use crate::event_writer::EventWriter;
@@ -55,6 +57,9 @@ use crate::tier1_state;
 use crate::tier1_writer::Tier1Writer;
 use crate::write_options::{IdempotencyKey, WriteOptions};
 
+/// Native metastore event accepted by future catalog product writer paths.
+pub type MetastoreWriteEvent = crate::metastore::events::MetastoreEvent;
+
 /// Default lock TTL for write operations.
 const DEFAULT_LOCK_TTL: Duration = Duration::from_secs(30);
 /// Default maximum lock acquisition retries.
@@ -63,7 +68,7 @@ const DEFAULT_LOCK_MAX_RETRIES: u32 = 10;
 fn normalize_new_table_format(raw: Option<&str>) -> Result<String> {
     match raw {
         Some(value) => TableFormat::normalize(value).map_err(CatalogError::from),
-        None => Ok(TableFormat::Delta.as_str().to_string()),
+        None => Ok(TableFormat::default_for_new_tables().as_str().to_string()),
     }
 }
 
@@ -244,7 +249,7 @@ pub struct Table {
     pub description: Option<String>,
     /// Storage location.
     pub location: Option<String>,
-    /// File format (e.g., "parquet", "iceberg").
+    /// Lakehouse table format (`delta`, `iceberg`, or `parquet`).
     pub format: Option<String>,
     /// Optional UC table type (for example `EXTERNAL`).
     pub table_type: Option<String>,
@@ -395,7 +400,9 @@ pub struct RegisterTableRequest {
     pub description: Option<String>,
     /// Storage location.
     pub location: Option<String>,
-    /// File format (e.g., "parquet", "iceberg").
+    /// Lakehouse table format (`delta`, `iceberg`, or `parquet`).
+    ///
+    /// When omitted, new table registrations default to Delta Lake.
     pub format: Option<String>,
     /// Column definitions.
     pub columns: Vec<ColumnDefinition>,
@@ -410,7 +417,9 @@ pub struct RegisterTableInSchemaRequest {
     pub description: Option<String>,
     /// Storage location.
     pub location: Option<String>,
-    /// File format (e.g., "parquet", "iceberg", "delta").
+    /// Lakehouse table format (`delta`, `iceberg`, or `parquet`).
+    ///
+    /// When omitted, new table registrations default to Delta Lake.
     pub format: Option<String>,
     /// Optional UC table type (for example `EXTERNAL`).
     pub table_type: Option<String>,
@@ -551,6 +560,7 @@ impl EventSource {
 /// This ensures medium-frequency lineage writes don't block low-frequency DDL.
 pub struct CatalogWriter {
     storage: ScopedStorage,
+    scope: ControlPlaneScope,
     /// Tier-1 writer (handles catalog domain lock + CAS)
     tier1: Tier1Writer,
     /// Separate lock for lineage domain
@@ -574,6 +584,11 @@ impl std::fmt::Debug for CatalogWriter {
 impl CatalogWriter {
     /// Creates a new catalog writer for the given storage scope.
     ///
+    /// # Panics
+    ///
+    /// Panics if the already-validated scoped storage IDs cannot form a
+    /// workspace alias scope.
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -585,19 +600,51 @@ impl CatalogWriter {
     /// let writer = CatalogWriter::new(storage).with_sync_compactor(compactor);
     /// ```
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn new(storage: ScopedStorage) -> Self {
+        let scope = ControlPlaneScope::workspace_alias(storage.tenant_id(), storage.workspace_id())
+            .expect("ScopedStorage tenant/workspace IDs are already validated");
+        Self::new_with_scope(storage, scope)
+    }
+
+    /// Creates a new catalog writer with an explicit control-plane scope.
+    ///
+    /// The supplied storage remains rooted at its current workspace prefix. This
+    /// keeps Task 3 as an API-threading change only; moving durable catalog paths
+    /// to metastore prefixes is handled by the later path migration tasks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the explicit scope does not match the scoped storage tenant and
+    /// workspace.
+    #[must_use]
+    #[allow(clippy::expect_used)]
+    pub fn new_with_scope(storage: ScopedStorage, scope: ControlPlaneScope) -> Self {
+        Self::try_new_with_scope(storage, scope)
+            .expect("explicit control-plane scope must match scoped storage")
+    }
+
+    /// Tries to create a catalog writer with an explicit control-plane scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the storage tenant/workspace does not match the
+    /// execution tenant/workspace carried by the explicit scope.
+    pub fn try_new_with_scope(storage: ScopedStorage, scope: ControlPlaneScope) -> Result<Self> {
+        validate_storage_scope(&storage, &scope)?;
         let backend = storage.backend().clone();
         let lineage_lock_path = storage.lock(CatalogDomain::Lineage);
         let lineage_lock = DistributedLock::new(backend, lineage_lock_path);
 
-        Self {
+        Ok(Self {
             tier1: Tier1Writer::new(storage.clone()),
             lineage_lock,
             storage,
+            scope,
             lock_ttl: DEFAULT_LOCK_TTL,
             lock_max_retries: DEFAULT_LOCK_MAX_RETRIES,
             sync_compactor: None,
-        }
+        })
     }
 
     /// Configures the sync compaction client for Tier-1 DDL operations.
@@ -619,6 +666,12 @@ impl CatalogWriter {
     #[must_use]
     pub fn storage(&self) -> &ScopedStorage {
         &self.storage
+    }
+
+    /// Returns the explicit control-plane scope for this writer.
+    #[must_use]
+    pub fn scope(&self) -> &ControlPlaneScope {
+        &self.scope
     }
 
     fn sync_compactor(&self) -> Result<&Arc<dyn SyncCompactor>> {
@@ -711,7 +764,7 @@ impl CatalogWriter {
     }
 
     async fn replay_catalog_by_name(&self, name: &str) -> Result<Catalog> {
-        crate::reader::CatalogReader::new(self.storage.clone())
+        crate::reader::CatalogReader::new_with_scope(self.storage.clone(), self.scope.clone())
             .get_catalog(name)
             .await?
             .ok_or_else(|| CatalogError::InvariantViolation {
@@ -720,7 +773,7 @@ impl CatalogWriter {
     }
 
     async fn replay_schema_by_name(&self, catalog: &str, schema: &str) -> Result<Schema> {
-        crate::reader::CatalogReader::new(self.storage.clone())
+        crate::reader::CatalogReader::new_with_scope(self.storage.clone(), self.scope.clone())
             .list_schemas(catalog)
             .await?
             .into_iter()
@@ -736,7 +789,7 @@ impl CatalogWriter {
         schema: &str,
         table: &str,
     ) -> Result<Table> {
-        crate::reader::CatalogReader::new(self.storage.clone())
+        crate::reader::CatalogReader::new_with_scope(self.storage.clone(), self.scope.clone())
             .get_table_in_schema(catalog, schema, table)
             .await?
             .ok_or_else(|| CatalogError::InvariantViolation {
@@ -4676,6 +4729,28 @@ impl CatalogWriter {
             CatalogDomain::Executions => Ok(None),
         }
     }
+}
+
+fn validate_storage_scope(storage: &ScopedStorage, scope: &ControlPlaneScope) -> Result<()> {
+    if storage.tenant_id() != scope.tenant_id() {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "storage tenant '{}' does not match control-plane tenant '{}'",
+                storage.tenant_id(),
+                scope.tenant_id()
+            ),
+        });
+    }
+    if storage.workspace_id() != scope.workspace_id() {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "storage workspace '{}' does not match control-plane workspace '{}'",
+                storage.workspace_id(),
+                scope.workspace_id()
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

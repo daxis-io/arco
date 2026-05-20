@@ -456,17 +456,16 @@ impl MicroCompactor {
                             }
                         }
                         Err(publish_error) => {
-                            if let Some(delay_ms) =
-                                should_retry_publish_error(&publish_error, retry_attempt)
-                            {
-                                if let Some(reason) = publish_error.retry_reason() {
-                                    record_compaction_publish_retry(
-                                        self.durability_mode,
-                                        reason,
-                                        retry_attempt + 1,
-                                        delay_ms,
-                                    );
-                                }
+                            if let (Some(delay_ms), Some(retry_reason)) = (
+                                should_retry_publish_error(&publish_error, retry_attempt),
+                                publish_error.retry_reason(),
+                            ) {
+                                record_compaction_publish_retry(
+                                    self.durability_mode,
+                                    retry_reason,
+                                    retry_attempt + 1,
+                                    delay_ms,
+                                );
                                 wait_for_publish_retry(delay_ms).await;
                                 continue 'retry;
                             }
@@ -698,17 +697,16 @@ impl MicroCompactor {
                         }
                     }
                     Err(publish_error) => {
-                        if let Some(delay_ms) =
-                            should_retry_publish_error(&publish_error, retry_attempt)
-                        {
-                            if let Some(reason) = publish_error.retry_reason() {
-                                record_compaction_publish_retry(
-                                    self.durability_mode,
-                                    reason,
-                                    retry_attempt + 1,
-                                    delay_ms,
-                                );
-                            }
+                        if let (Some(delay_ms), Some(retry_reason)) = (
+                            should_retry_publish_error(&publish_error, retry_attempt),
+                            publish_error.retry_reason(),
+                        ) {
+                            record_compaction_publish_retry(
+                                self.durability_mode,
+                                retry_reason,
+                                retry_attempt + 1,
+                                delay_ms,
+                            );
                             wait_for_publish_retry(delay_ms).await;
                             continue 'retry;
                         }
@@ -1302,11 +1300,7 @@ impl MicroCompactor {
     }
 
     /// Publishes a new manifest version.
-    #[allow(
-        clippy::option_if_let_else,
-        clippy::too_many_arguments,
-        clippy::too_many_lines
-    )]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn publish_manifest(
         &self,
         manifest: &OrchestrationManifest,
@@ -1414,13 +1408,14 @@ impl MicroCompactor {
                 Err(PublishManifestError::ConcurrentWrite)
             }
             Err(arco_core::Error::PreconditionFailed { message }) => {
-                if let Some(error) = decode_pre_pointer_publish_error(&message) {
-                    Err(PublishManifestError::Other(error))
-                } else {
-                    Err(PublishManifestError::Other(Error::Core(
-                        arco_core::Error::PreconditionFailed { message },
-                    )))
-                }
+                decode_pre_pointer_publish_error(&message).map_or_else(
+                    || {
+                        Err(PublishManifestError::Other(Error::Core(
+                            arco_core::Error::PreconditionFailed { message },
+                        )))
+                    },
+                    |error| Err(PublishManifestError::Other(error)),
+                )
             }
             Err(error) => Err(PublishManifestError::Other(Error::from(error))),
         }

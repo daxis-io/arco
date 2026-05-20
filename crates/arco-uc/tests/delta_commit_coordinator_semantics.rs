@@ -4,6 +4,9 @@
 
 use std::sync::Arc;
 
+use arco_catalog::{
+    CatalogWriter, ColumnDefinition, RegisterTableInSchemaRequest, Tier1Compactor, WriteOptions,
+};
 use arco_core::ScopedStorage;
 use arco_core::storage::{MemoryBackend, WritePrecondition};
 use arco_uc::{UnityCatalogState, unity_catalog_router};
@@ -33,6 +36,57 @@ fn make_harness() -> Harness {
     let router = unity_catalog_router(state);
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1").expect("scoped storage");
     Harness { router, storage }
+}
+
+fn catalog_writer(storage: &ScopedStorage) -> CatalogWriter {
+    let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+    CatalogWriter::new(storage.clone()).with_sync_compactor(compactor)
+}
+
+async fn seed_managed_delta_table(storage: &ScopedStorage, location: &str) -> Result<Uuid, String> {
+    let writer = catalog_writer(storage);
+    writer
+        .initialize()
+        .await
+        .map_err(|err| format!("initialize catalog: {err}"))?;
+    writer
+        .create_catalog("prod", Some("production"), WriteOptions::default())
+        .await
+        .map_err(|err| format!("create catalog: {err}"))?;
+    writer
+        .create_schema(
+            "prod",
+            "analytics",
+            Some("analytics"),
+            WriteOptions::default(),
+        )
+        .await
+        .map_err(|err| format!("create schema: {err}"))?;
+    let table = writer
+        .register_table_in_schema(
+            "prod",
+            "analytics",
+            RegisterTableInSchemaRequest {
+                name: "orders".to_string(),
+                description: None,
+                location: Some(location.to_string()),
+                format: Some("delta".to_string()),
+                table_type: Some("MANAGED".to_string()),
+                properties: None,
+                columns: vec![ColumnDefinition {
+                    name: "id".to_string(),
+                    data_type: "STRING".to_string(),
+                    is_nullable: false,
+                    ordinal: 0,
+                    description: None,
+                }],
+            },
+            WriteOptions::default(),
+        )
+        .await
+        .map_err(|err| format!("seed table: {err}"))?;
+
+    Uuid::parse_str(&table.id).map_err(|err| format!("parse table id: {err}"))
 }
 
 async fn uc_request(
@@ -103,7 +157,7 @@ fn commit_info(version: i64) -> Value {
 #[tokio::test]
 async fn idempotency_replay_is_deduplicated_in_get_commits() -> Result<(), String> {
     let harness = make_harness();
-    let table_id = Uuid::now_v7();
+    let table_id = seed_managed_delta_table(&harness.storage, "gs://bucket/path").await?;
     let key = Uuid::now_v7().to_string();
 
     let commit_body = json!({
@@ -172,7 +226,7 @@ async fn idempotency_replay_is_deduplicated_in_get_commits() -> Result<(), Strin
 #[tokio::test]
 async fn stale_read_rejected_as_conflict() -> Result<(), String> {
     let harness = make_harness();
-    let table_id = Uuid::now_v7();
+    let table_id = seed_managed_delta_table(&harness.storage, "gs://bucket/path").await?;
 
     let first = uc_request(
         &harness.router,
@@ -219,7 +273,7 @@ async fn stale_read_rejected_as_conflict() -> Result<(), String> {
 #[tokio::test]
 async fn invalid_idempotency_key_is_rejected_without_staging_side_effects() -> Result<(), String> {
     let harness = make_harness();
-    let table_id = Uuid::now_v7();
+    let table_id = seed_managed_delta_table(&harness.storage, "gs://bucket/path").await?;
 
     let response = uc_request(
         &harness.router,
@@ -260,7 +314,7 @@ async fn invalid_idempotency_key_is_rejected_without_staging_side_effects() -> R
 #[tokio::test]
 async fn table_uri_mismatch_is_rejected_for_get_and_backfill() -> Result<(), String> {
     let harness = make_harness();
-    let table_id = Uuid::now_v7();
+    let table_id = seed_managed_delta_table(&harness.storage, "gs://bucket/path-a").await?;
 
     let commit = uc_request(
         &harness.router,
@@ -327,7 +381,7 @@ async fn table_uri_mismatch_is_rejected_for_get_and_backfill() -> Result<(), Str
 #[tokio::test]
 async fn unbackfilled_commit_limit_returns_too_many_requests() -> Result<(), String> {
     let harness = make_harness();
-    let table_id = Uuid::now_v7();
+    let table_id = seed_managed_delta_table(&harness.storage, "gs://bucket/path").await?;
     let coordinator_path = format!("delta/coordinator/{table_id}.json");
     let state = arco_delta::DeltaCoordinatorState {
         latest_version: 999,
@@ -385,7 +439,7 @@ async fn unbackfilled_commit_limit_returns_too_many_requests() -> Result<(), Str
 #[tokio::test]
 async fn successful_commit_cleans_staged_payload() -> Result<(), String> {
     let harness = make_harness();
-    let table_id = Uuid::now_v7();
+    let table_id = seed_managed_delta_table(&harness.storage, "gs://bucket/path").await?;
     let idempotency_key = Uuid::now_v7().to_string();
 
     let response = uc_request(
@@ -419,7 +473,7 @@ async fn successful_commit_cleans_staged_payload() -> Result<(), String> {
 #[tokio::test]
 async fn expired_inflight_is_recovered_and_unrelated_key_is_conflict() -> Result<(), String> {
     let harness = make_harness();
-    let table_id = Uuid::now_v7();
+    let table_id = seed_managed_delta_table(&harness.storage, "gs://bucket/path").await?;
     let inflight_key = Uuid::now_v7().to_string();
     let staged_path = format!("delta/staging/{table_id}/{inflight_key}.json");
     let staged_payload = json!({

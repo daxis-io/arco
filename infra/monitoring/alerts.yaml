@@ -226,6 +226,88 @@ groups:
             latency returns to normal.
           runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
 
+      - alert: ArcoControlPlaneRepairAutomationFailures
+        expr: |
+          sum by (domain, mode, scope) (
+            increase(arco_catalog_repair_automation_runs_total{status=~"check_failed|repair_failed|recheck_failed"}[15m])
+          ) > 0
+          or
+          sum by (domain, mode, scope) (
+            increase(arco_flow_orch_repair_automation_runs_total{status=~"check_failed|repair_failed|recheck_failed"}[15m])
+          ) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: arco-control-plane
+        annotations:
+          summary: "Control-plane repair automation failed (domain={{ $labels.domain }}, mode={{ $labels.mode }}, scope={{ $labels.scope }})"
+          description: |
+            The automated control-plane repair executor reported a failed check, repair, or recheck
+            in the last 15 minutes for domain={{ $labels.domain }}, mode={{ $labels.mode }},
+            scope={{ $labels.scope }}. Manual dry-run and enforce repair may be required before the
+            backlog can drain.
+          runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+
+      - alert: ArcoControlPlaneRepairBacklogAgeHigh
+        expr: |
+          max by (domain, mode, scope) (arco_catalog_repair_backlog_age_seconds) > 900
+          or
+          max by (domain, mode, scope) (arco_flow_orch_repair_backlog_age_seconds) > 900
+        for: 10m
+        labels:
+          severity: warning
+          service: arco-control-plane
+        annotations:
+          summary: "Control-plane repair backlog age exceeded 15 minutes (domain={{ $labels.domain }}, mode={{ $labels.mode }}, scope={{ $labels.scope }})"
+          description: |
+            Repairable reconciliation work has remained in the automated repair backlog for more
+            than 15 minutes for domain={{ $labels.domain }}, mode={{ $labels.mode }},
+            scope={{ $labels.scope }}. Readers stay pointer-first, but cleanup is not converging
+            fast enough.
+          runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+
+      - alert: ArcoControlPlaneRepairBacklogCountHigh
+        expr: |
+          sum by (domain, mode, scope) (arco_catalog_repair_backlog_count) > 0
+          or
+          sum by (domain, mode, scope) (arco_flow_orch_repair_backlog_count) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: arco-control-plane
+        annotations:
+          summary: "Control-plane repair backlog is non-zero (domain={{ $labels.domain }}, mode={{ $labels.mode }}, scope={{ $labels.scope }})"
+          description: |
+            Repairable reconciliation work has remained in the automated repair backlog for at
+            least 15 minutes for domain={{ $labels.domain }}, mode={{ $labels.mode }},
+            scope={{ $labels.scope }}. Production cutover is not converged until the cleanup
+            backlog returns to zero.
+          runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+
+      - alert: ArcoControlPlaneRepairCompletionLatencyHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(arco_catalog_repair_completion_latency_seconds_bucket[15m])) by (le, domain, mode, scope)
+          ) > 120
+          or
+          histogram_quantile(
+            0.95,
+            sum(rate(arco_flow_orch_repair_completion_latency_seconds_bucket[15m])) by (le, domain, mode, scope)
+          ) > 120
+        for: 15m
+        labels:
+          severity: warning
+          service: arco-control-plane
+        annotations:
+          summary: "Control-plane repair completion p95 exceeded 120 seconds (domain={{ $labels.domain }}, mode={{ $labels.mode }}, scope={{ $labels.scope }})"
+          description: |
+            Automated reconciliation cleanup is taking longer than two minutes at p95 over the
+            last 15 minutes for domain={{ $labels.domain }}, mode={{ $labels.mode }},
+            scope={{ $labels.scope }}. Treat this as production SLO degradation until cleanup
+            latency returns to normal.
+          runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
+
       - alert: ArcoFlowStaleFenceRejects
         expr: |
           sum by (reason) (increase(arco_flow_orch_compactor_stale_fencing_rejects_total[5m])) > 0

@@ -266,35 +266,11 @@ fn is_known_snapshot_table(schema: &str, table: &str) -> bool {
         (schema, table),
         ("catalog", "catalogs" | "namespaces" | "tables" | "columns")
             | ("lineage", "lineage_edges")
-            | ("search", "token_postings")
     )
 }
 
 fn is_known_system_table(schema: &str, table: &str) -> bool {
-    matches!(
-        (schema, table),
-        (
-            "catalog",
-            "catalogs" | "namespaces" | "tables" | "columns" | "commits"
-        ) | ("lineage", "edges")
-            | (
-                "orchestration",
-                "runs"
-                    | "tasks"
-                    | "dep_satisfaction"
-                    | "timers"
-                    | "dispatch_outbox"
-                    | "sensor_state"
-                    | "sensor_evals"
-                    | "partition_status"
-                    | "schedule_definitions"
-                    | "schedule_state"
-                    | "schedule_ticks"
-                    | "backfills"
-                    | "backfill_chunks"
-                    | "run_key_conflicts"
-            )
-    )
+    system_tables::is_allowlisted_system_table(schema, table)
 }
 
 fn wants_json(params: &QueryParams, headers: &HeaderMap) -> Result<bool, ApiError> {
@@ -347,17 +323,6 @@ async fn register_snapshot_tables(
             CatalogDomain::Lineage,
             &[("lineage_edges.parquet", "lineage_edges")],
             lineage_tables,
-        )
-        .await?;
-    }
-    if let Some(search_tables) = requested_tables.get("search") {
-        registered += register_domain_tables(
-            session,
-            reader,
-            storage,
-            CatalogDomain::Search,
-            &[("token_postings.parquet", "token_postings")],
-            search_tables,
         )
         .await?;
     }

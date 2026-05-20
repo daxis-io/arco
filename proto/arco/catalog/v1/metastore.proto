@@ -8,6 +8,53 @@ option go_package = "github.com/daxis-io/arco/proto/arco/catalog/v1";
 option java_multiple_files = true;
 option java_package = "com.arco.catalog.v1";
 
+enum CatalogObjectLifecycleState {
+  CATALOG_OBJECT_LIFECYCLE_STATE_UNSPECIFIED = 0;
+  CATALOG_OBJECT_LIFECYCLE_STATE_ACTIVE = 1;
+  CATALOG_OBJECT_LIFECYCLE_STATE_DELETED = 2;
+  CATALOG_OBJECT_LIFECYCLE_STATE_DISABLED = 3;
+}
+
+enum PrincipalType {
+  PRINCIPAL_TYPE_UNSPECIFIED = 0;
+  PRINCIPAL_TYPE_USER = 1;
+  PRINCIPAL_TYPE_SERVICE_PRINCIPAL = 2;
+  PRINCIPAL_TYPE_WORKLOAD = 3;
+  PRINCIPAL_TYPE_GROUP = 4;
+  PRINCIPAL_TYPE_EXTERNAL_SUBJECT = 5;
+}
+
+message CatalogControlPlaneScope {
+  string tenant_id = 1;
+  string workspace_id = 2;
+  string metastore_id = 3;
+  string request_id = 4;
+}
+
+message Principal {
+  string principal_id = 1;
+  PrincipalType principal_type = 2;
+  string display_name = 3;
+  string owner = 4;
+  CatalogObjectLifecycleState lifecycle_state = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+  optional string comment = 8;
+  map<string, string> properties = 9;
+}
+
+message GroupMembership {
+  string membership_id = 1;
+  string group_principal_id = 2;
+  string member_principal_id = 3;
+  uint64 group_revision = 4;
+  CatalogObjectLifecycleState lifecycle_state = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+  optional string comment = 8;
+  map<string, string> properties = 9;
+}
+
 message Grant {
   string grant_id = 1;
   string object_id = 2;
@@ -16,6 +63,11 @@ message Grant {
   string privilege = 5;
   string granted_by = 6;
   google.protobuf.Timestamp created_at = 7;
+  string owner = 8;
+  CatalogObjectLifecycleState lifecycle_state = 9;
+  google.protobuf.Timestamp updated_at = 10;
+  optional string comment = 11;
+  map<string, string> properties = 12;
 }
 
 message StorageCredential {
@@ -25,6 +77,21 @@ message StorageCredential {
   string owner = 4;
   google.protobuf.Timestamp created_at = 5;
   google.protobuf.Timestamp updated_at = 6;
+  CatalogObjectLifecycleState lifecycle_state = 7;
+  optional string comment = 8;
+  map<string, string> properties = 9;
+}
+
+message ServiceCredential {
+  string service_credential_id = 1;
+  string name = 2;
+  string service = 3;
+  string owner = 4;
+  CatalogObjectLifecycleState lifecycle_state = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+  optional string comment = 8;
+  map<string, string> properties = 9;
 }
 
 message ExternalLocation {
@@ -35,6 +102,35 @@ message ExternalLocation {
   string owner = 5;
   google.protobuf.Timestamp created_at = 6;
   google.protobuf.Timestamp updated_at = 7;
+  CatalogObjectLifecycleState lifecycle_state = 8;
+  optional string comment = 9;
+  map<string, string> properties = 10;
+}
+
+message ExternalServiceConnection {
+  string connection_id = 1;
+  string name = 2;
+  string service_credential_id = 3;
+  string service = 4;
+  string owner = 5;
+  CatalogObjectLifecycleState lifecycle_state = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+  optional string comment = 9;
+  map<string, string> properties = 10;
+}
+
+message ManagedStorageRoot {
+  string root_id = 1;
+  string name = 2;
+  string workspace_id = 3;
+  string url = 4;
+  string owner = 5;
+  CatalogObjectLifecycleState lifecycle_state = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+  optional string comment = 9;
+  map<string, string> properties = 10;
 }
 
 message WorkspaceBinding {
@@ -43,6 +139,11 @@ message WorkspaceBinding {
   string object_id = 3;
   string object_type = 4;
   google.protobuf.Timestamp created_at = 5;
+  string owner = 6;
+  CatalogObjectLifecycleState lifecycle_state = 7;
+  google.protobuf.Timestamp updated_at = 8;
+  optional string comment = 9;
+  map<string, string> properties = 10;
 }
 
 message GovernanceAttachment {
@@ -53,6 +154,25 @@ message GovernanceAttachment {
   string value = 5;
   string created_by = 6;
   google.protobuf.Timestamp created_at = 7;
+  string owner = 8;
+  CatalogObjectLifecycleState lifecycle_state = 9;
+  google.protobuf.Timestamp updated_at = 10;
+  optional string comment = 11;
+  map<string, string> properties = 12;
+}
+
+message PolicyAttachment {
+  string policy_attachment_id = 1;
+  string object_id = 2;
+  string object_type = 3;
+  string policy_id = 4;
+  string policy_type = 5;
+  string owner = 6;
+  CatalogObjectLifecycleState lifecycle_state = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+  optional string comment = 10;
+  map<string, string> properties = 11;
 }
 
 message Volume {
@@ -64,6 +184,9 @@ message Volume {
   string owner = 6;
   google.protobuf.Timestamp created_at = 7;
   google.protobuf.Timestamp updated_at = 8;
+  CatalogObjectLifecycleState lifecycle_state = 9;
+  optional string comment = 10;
+  map<string, string> properties = 11;
 }
 
 message Function {
@@ -74,6 +197,22 @@ message Function {
   string owner = 5;
   google.protobuf.Timestamp created_at = 6;
   google.protobuf.Timestamp updated_at = 7;
+  CatalogObjectLifecycleState lifecycle_state = 8;
+  optional string comment = 9;
+  map<string, string> properties = 10;
+}
+
+message View {
+  string view_id = 1;
+  string catalog = 2;
+  string schema = 3;
+  string view = 4;
+  string owner = 5;
+  CatalogObjectLifecycleState lifecycle_state = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+  optional string comment = 9;
+  map<string, string> properties = 10;
 }
 
 message RegisteredModel {
@@ -84,6 +223,9 @@ message RegisteredModel {
   string owner = 5;
   google.protobuf.Timestamp created_at = 6;
   google.protobuf.Timestamp updated_at = 7;
+  CatalogObjectLifecycleState lifecycle_state = 8;
+  optional string comment = 9;
+  map<string, string> properties = 10;
 }
 
 message ModelVersion {
@@ -93,6 +235,43 @@ message ModelVersion {
   string storage_location = 4;
   google.protobuf.Timestamp created_at = 5;
   google.protobuf.Timestamp updated_at = 6;
+  string owner = 7;
+  CatalogObjectLifecycleState lifecycle_state = 8;
+  optional string comment = 9;
+  map<string, string> properties = 10;
+}
+
+message Share {
+  string share_id = 1;
+  string name = 2;
+  string owner = 3;
+  CatalogObjectLifecycleState lifecycle_state = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+  optional string comment = 7;
+  map<string, string> properties = 8;
+}
+
+message Provider {
+  string provider_id = 1;
+  string name = 2;
+  string owner = 3;
+  CatalogObjectLifecycleState lifecycle_state = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+  optional string comment = 7;
+  map<string, string> properties = 8;
+}
+
+message Recipient {
+  string recipient_id = 1;
+  string name = 2;
+  string owner = 3;
+  CatalogObjectLifecycleState lifecycle_state = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+  optional string comment = 7;
+  map<string, string> properties = 8;
 }
 
 message GrantMutation {
@@ -113,5 +292,15 @@ message MetastoreMutation {
     Function function = 7;
     RegisteredModel registered_model = 8;
     ModelVersion model_version = 9;
+    Principal principal = 10;
+    GroupMembership group_membership = 11;
+    ServiceCredential service_credential = 12;
+    ExternalServiceConnection external_service_connection = 13;
+    ManagedStorageRoot managed_storage_root = 14;
+    View view = 15;
+    PolicyAttachment policy_attachment = 16;
+    Share share = 17;
+    Provider provider = 18;
+    Recipient recipient = 19;
   }
 }

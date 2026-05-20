@@ -240,7 +240,17 @@ pub mod helpers {
         uri: &str,
         body: Option<serde_json::Value>,
     ) -> Result<Request<Body>> {
-        make_request_with_headers(method, uri, body, &[])
+        make_request_with_scope(method, uri, "test-tenant", "test-workspace", body)
+    }
+
+    pub fn make_request_with_scope(
+        method: Method,
+        uri: &str,
+        tenant: &str,
+        workspace: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<Request<Body>> {
+        make_request_with_scope_and_headers(method, uri, tenant, workspace, body, &[])
     }
 
     pub fn make_request_with_headers(
@@ -249,11 +259,29 @@ pub mod helpers {
         body: Option<serde_json::Value>,
         headers: &[(&str, &str)],
     ) -> Result<Request<Body>> {
+        make_request_with_scope_and_headers(
+            method,
+            uri,
+            "test-tenant",
+            "test-workspace",
+            body,
+            headers,
+        )
+    }
+
+    pub fn make_request_with_scope_and_headers(
+        method: Method,
+        uri: &str,
+        tenant: &str,
+        workspace: &str,
+        body: Option<serde_json::Value>,
+        headers: &[(&str, &str)],
+    ) -> Result<Request<Body>> {
         let mut builder = Request::builder()
             .method(method)
             .uri(uri)
-            .header("X-Tenant-Id", "test-tenant")
-            .header("X-Workspace-Id", "test-workspace")
+            .header("X-Tenant-Id", tenant)
+            .header("X-Workspace-Id", workspace)
             .header(header::CONTENT_TYPE, "application/json");
 
         for (key, value) in headers {

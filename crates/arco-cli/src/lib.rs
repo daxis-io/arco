@@ -5,6 +5,7 @@
 //! ## Commands
 //!
 //! - `arco deploy` - Deploy an asset manifest
+//! - `arco dev --check` - Check local orchestration development readiness
 //! - `arco run` - Trigger a materialization run
 //! - `arco status` - Check run status
 //! - `arco logs` - View task logs
@@ -75,6 +76,8 @@ impl Cli {
 pub enum Commands {
     /// Deploy an asset manifest.
     Deploy(commands::deploy::DeployArgs),
+    /// Check local orchestration development readiness.
+    Dev(commands::dev::DevArgs),
     /// Trigger a materialization run.
     Run(commands::run::RunArgs),
     /// Check run status.
@@ -135,5 +138,22 @@ mod tests {
         assert_eq!(config.workspace_id.as_deref(), Some("workspace-123"));
         assert_eq!(config.api_token.as_deref(), Some("token-abc"));
         assert!(matches!(config.format, OutputFormat::Json));
+    }
+
+    #[test]
+    fn dev_check_is_the_only_advertised_dev_mode() {
+        let cli = Cli::parse_from(["arco", "dev", "--check"]);
+
+        let Commands::Dev(args) = cli.command else {
+            panic!("expected dev command");
+        };
+        assert!(args.check);
+    }
+
+    #[test]
+    fn bare_dev_command_is_rejected_until_end_to_end_loop_exists() {
+        let result = Cli::try_parse_from(["arco", "dev"]);
+
+        assert!(result.is_err());
     }
 }

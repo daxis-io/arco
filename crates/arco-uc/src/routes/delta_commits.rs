@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use crate::context::UnityCatalogRequestContext;
 use crate::error::{UnityCatalogError, UnityCatalogErrorResponse, UnityCatalogResult};
+use crate::routes::common;
 use crate::state::UnityCatalogState;
 
 /// Delta commit route group.
@@ -122,12 +123,59 @@ fn validate_table_uri(table_uri: &str) -> UnityCatalogResult<()> {
     Ok(())
 }
 
-fn table_uri_mismatch_error(table_id: Uuid, expected: &str, actual: &str) -> UnityCatalogError {
+fn table_uri_mismatch_error(table_id: Uuid) -> UnityCatalogError {
     UnityCatalogError::BadRequest {
-        message: format!(
-            "table_uri mismatch for table {table_id}: expected {expected}, got {actual}"
-        ),
+        message: format!("table_uri mismatch for table {table_id}"),
     }
+}
+
+async fn require_catalog_managed_delta_table(
+    state: &UnityCatalogState,
+    ctx: &UnityCatalogRequestContext,
+    table_id: Uuid,
+    table_uri: &str,
+) -> UnityCatalogResult<()> {
+    let table_id_text = table_id.to_string();
+    let reader = common::authoritative_catalog_reader(state, ctx)
+        .await?
+        .ok_or_else(|| UnityCatalogError::NotFound {
+            message: format!("table not found: {table_id_text}"),
+        })?;
+    let table = reader
+        .get_table_by_id(&table_id_text)
+        .await
+        .map_err(common::map_catalog_error)?
+        .ok_or_else(|| UnityCatalogError::NotFound {
+            message: format!("table not found: {table_id_text}"),
+        })?;
+
+    let is_delta = table
+        .format
+        .as_deref()
+        .is_some_and(|format| format.eq_ignore_ascii_case("delta"));
+    let is_managed = table
+        .table_type
+        .as_deref()
+        .is_none_or(|table_type| table_type.eq_ignore_ascii_case("managed"));
+    if !is_delta || !is_managed {
+        return Err(UnityCatalogError::Conflict {
+            message: format!(
+                "delta preview commits require a managed Delta table: {table_id_text}"
+            ),
+        });
+    }
+
+    let location = table
+        .location
+        .as_deref()
+        .ok_or_else(|| UnityCatalogError::BadRequest {
+            message: format!("table has no storage location: {table_id_text}"),
+        })?;
+    if location != table_uri {
+        return Err(table_uri_mismatch_error(table_id));
+    }
+
+    Ok(())
 }
 
 fn validate_idempotency_key(idempotency_key: &str) -> UnityCatalogResult<()> {
@@ -302,7 +350,7 @@ async fn store_backfill_state(
             },
             table_uri: match (current.table_uri.as_ref(), state.table_uri.as_ref()) {
                 (Some(existing), Some(incoming)) if existing != incoming => {
-                    return Err(table_uri_mismatch_error(table_id, existing, incoming));
+                    return Err(table_uri_mismatch_error(table_id));
                 }
                 (Some(existing), _) => Some(existing.clone()),
                 (None, Some(incoming)) => Some(incoming.clone()),
@@ -559,11 +607,7 @@ fn ensure_table_uri_matches(
 ) -> UnityCatalogResult<()> {
     if let Some(expected_table_uri) = expected_table_uri {
         if requested_table_uri != expected_table_uri {
-            return Err(table_uri_mismatch_error(
-                table_id,
-                expected_table_uri,
-                requested_table_uri,
-            ));
+            return Err(table_uri_mismatch_error(table_id));
         }
     }
 
@@ -645,6 +689,7 @@ pub(crate) async fn get_delta_preview_commits(
     })?;
 
     let storage = ctx.scoped_storage(state.storage.clone())?;
+    require_catalog_managed_delta_table(&state, &ctx, table_id, &table_uri).await?;
     let coordinator_state = load_coordinator_state(&storage, table_id).await?;
     let backfill_state = load_backfill_state(&storage, table_id).await?;
     let log_objects = load_delta_log_objects(&storage, table_id).await?;
@@ -876,7 +921,6 @@ pub(crate) async fn post_delta_preview_commits(
     let table_id = Uuid::parse_str(&table_id).map_err(|_| UnityCatalogError::BadRequest {
         message: "table_id must be a UUID".to_string(),
     })?;
-    let storage = ctx.scoped_storage(state.storage.clone())?;
 
     let has_commit = commit_info.is_some();
     let has_backfill = latest_backfilled_version.is_some();
@@ -886,6 +930,9 @@ pub(crate) async fn post_delta_preview_commits(
                 .to_string(),
         });
     }
+
+    let storage = ctx.scoped_storage(state.storage.clone())?;
+    require_catalog_managed_delta_table(&state, &ctx, table_id, &table_uri).await?;
 
     if let Some(commit_info) = commit_info {
         handle_commit_registration(

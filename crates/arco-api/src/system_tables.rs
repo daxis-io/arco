@@ -61,6 +61,37 @@ const LINEAGE_SYSTEM_TABLES: &[SystemTableSpec] = &[SystemTableSpec {
 }];
 
 const ORCHESTRATION_SCHEMA: &str = "orchestration";
+const ORCHESTRATION_SYSTEM_TABLES: &[&str] = &[
+    "runs",
+    "tasks",
+    "dep_satisfaction",
+    "timers",
+    "dispatch_outbox",
+    "sensor_state",
+    "sensor_evals",
+    "partition_status",
+    "schedule_definitions",
+    "schedule_state",
+    "schedule_ticks",
+    "backfills",
+    "backfill_chunks",
+    "run_key_conflicts",
+];
+
+/// Returns true when `system.{schema}.{table}` is part of the current
+/// tenant-visible system catalog surface.
+pub(crate) fn is_allowlisted_system_table(schema: &str, table: &str) -> bool {
+    match schema {
+        "catalog" => spec_table_is_allowlisted(CATALOG_SYSTEM_TABLES, table),
+        "lineage" => spec_table_is_allowlisted(LINEAGE_SYSTEM_TABLES, table),
+        ORCHESTRATION_SCHEMA => ORCHESTRATION_SYSTEM_TABLES.contains(&table),
+        _ => false,
+    }
+}
+
+fn spec_table_is_allowlisted(specs: &[SystemTableSpec], table: &str) -> bool {
+    specs.iter().any(|spec| spec.table == table)
+}
 
 /// Registers allowlisted projections under logical `system.*` names.
 ///
@@ -357,4 +388,65 @@ async fn register_table_artifact(
         .register_table(table_name.to_string(), table)
         .map_err(|err| ApiError::internal(format!("failed to register system table: {err}")))?;
     Ok(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_allowlisted_system_table;
+
+    #[test]
+    fn system_table_allowlist_includes_current_catalog_lineage_and_orchestration_surface() {
+        for (schema, table) in [
+            ("catalog", "catalogs"),
+            ("catalog", "namespaces"),
+            ("catalog", "tables"),
+            ("catalog", "columns"),
+            ("catalog", "commits"),
+            ("lineage", "edges"),
+            ("orchestration", "runs"),
+            ("orchestration", "tasks"),
+            ("orchestration", "dep_satisfaction"),
+            ("orchestration", "timers"),
+            ("orchestration", "dispatch_outbox"),
+            ("orchestration", "sensor_state"),
+            ("orchestration", "sensor_evals"),
+            ("orchestration", "partition_status"),
+            ("orchestration", "schedule_definitions"),
+            ("orchestration", "schedule_state"),
+            ("orchestration", "schedule_ticks"),
+            ("orchestration", "backfills"),
+            ("orchestration", "backfill_chunks"),
+            ("orchestration", "run_key_conflicts"),
+        ] {
+            assert!(
+                is_allowlisted_system_table(schema, table),
+                "system.{schema}.{table} should be in the current allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn system_table_allowlist_defers_unbacked_catalog_product_tables() {
+        for (schema, table) in [
+            ("access", "grants"),
+            ("access", "compiled_permissions"),
+            ("access", "audit"),
+            ("access", "auth_denies"),
+            ("access", "credential_mints"),
+            ("storage", "credentials"),
+            ("storage", "external_locations"),
+            ("storage", "managed_roots"),
+            ("storage", "workspace_bindings"),
+            ("catalog", "volumes"),
+            ("catalog", "functions"),
+            ("catalog", "registered_models"),
+            ("catalog", "model_versions"),
+            ("governance", "attachments"),
+        ] {
+            assert!(
+                !is_allowlisted_system_table(schema, table),
+                "system.{schema}.{table} must stay deferred until authoritative projections exist"
+            );
+        }
+    }
 }

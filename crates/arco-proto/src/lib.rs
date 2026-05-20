@@ -135,6 +135,16 @@ pub enum ControlPlaneTransactionContractError {
     EmptyRootOrchestrationEvents(usize),
     InvalidRootOrchestrationEvent(usize, usize, OrchestrationEventContractError),
     MissingRootMutationKind(usize),
+    MissingRootMetastoreScope(usize),
+    InvalidRootMetastoreScope(usize, CatalogControlPlaneScopeContractError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogControlPlaneScopeContractError {
+    EmptyTenantId,
+    EmptyWorkspaceId,
+    EmptyEffectiveMetastoreId,
+    EmptyRequestId,
 }
 
 impl std::fmt::Display for ControlPlaneTransactionContractError {
@@ -181,11 +191,36 @@ impl std::fmt::Display for ControlPlaneTransactionContractError {
             Self::MissingRootMutationKind(index) => {
                 write!(f, "root mutation at index {index} must set kind")
             }
+            Self::MissingRootMetastoreScope(index) => {
+                write!(
+                    f,
+                    "root scoped metastore mutation at index {index} must set scope"
+                )
+            }
+            Self::InvalidRootMetastoreScope(index, error) => {
+                write!(
+                    f,
+                    "root scoped metastore mutation at index {index} has invalid scope: {error}"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for ControlPlaneTransactionContractError {}
+
+impl std::fmt::Display for CatalogControlPlaneScopeContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyTenantId => f.write_str("tenant_id is required"),
+            Self::EmptyWorkspaceId => f.write_str("workspace_id is required"),
+            Self::EmptyEffectiveMetastoreId => f.write_str("effective metastore_id is required"),
+            Self::EmptyRequestId => f.write_str("request_id is required"),
+        }
+    }
+}
+
+impl std::error::Error for CatalogControlPlaneScopeContractError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrchestrationEventContractError {
@@ -378,8 +413,52 @@ impl CommitRootTransactionRequest {
                         );
                     }
                 }
+                Some(domain_mutation::Kind::ScopedMetastore(mutation)) => {
+                    if !mutation.has_contract_operation() {
+                        return Err(
+                            ControlPlaneTransactionContractError::MissingRootMetastoreMutationOp(
+                                index,
+                            ),
+                        );
+                    }
+                    let scope = mutation.scope.as_ref().ok_or(
+                        ControlPlaneTransactionContractError::MissingRootMetastoreScope(index),
+                    )?;
+                    scope.validate_contract().map_err(|error| {
+                        ControlPlaneTransactionContractError::InvalidRootMetastoreScope(
+                            index, error,
+                        )
+                    })?;
+                }
                 None => unreachable!("checked above"),
             }
+        }
+
+        Ok(())
+    }
+}
+
+impl CatalogControlPlaneScope {
+    pub fn effective_metastore_id(&self) -> &str {
+        if self.metastore_id.is_empty() {
+            self.workspace_id.as_str()
+        } else {
+            self.metastore_id.as_str()
+        }
+    }
+
+    pub fn validate_contract(&self) -> Result<(), CatalogControlPlaneScopeContractError> {
+        if self.tenant_id.is_empty() {
+            return Err(CatalogControlPlaneScopeContractError::EmptyTenantId);
+        }
+        if self.effective_metastore_id().is_empty() {
+            return Err(CatalogControlPlaneScopeContractError::EmptyEffectiveMetastoreId);
+        }
+        if self.workspace_id.is_empty() {
+            return Err(CatalogControlPlaneScopeContractError::EmptyWorkspaceId);
+        }
+        if self.request_id.is_empty() {
+            return Err(CatalogControlPlaneScopeContractError::EmptyRequestId);
         }
 
         Ok(())
@@ -393,6 +472,14 @@ impl MetastoreMutation {
             Some(_) => true,
             None => false,
         }
+    }
+}
+
+impl ScopedMetastoreMutation {
+    pub fn has_contract_operation(&self) -> bool {
+        self.mutation
+            .as_ref()
+            .is_some_and(MetastoreMutation::has_contract_operation)
     }
 }
 

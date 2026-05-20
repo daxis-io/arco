@@ -206,6 +206,7 @@ async fn run_handler(
             attempt: *attempt,
             attempt_id: attempt_id.clone(),
             dispatch_id: dispatch_id.clone(),
+            execution_location_id: None,
             worker_queue: worker_queue.clone(),
             callback_base_url: state.callback_base_url.clone(),
             task_token: minted.token,

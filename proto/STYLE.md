@@ -87,6 +87,14 @@ public API surface. After the post-hard-cut baseline is regenerated, `v1`
 changes must be additive and must preserve binary and ProtoJSON compatibility.
 Future broad reshapes require new `v2` packages.
 
+## Pre-Freeze Hard-Cut Policy
+
+The documented pre-freeze hard cut is complete. The current `arco.*.v1`
+packages are the durable public proto surface represented by the frozen
+post-cut baseline. New v1 changes must be additive and must preserve binary
+and ProtoJSON compatibility. Run `cargo xtask proto-breaking-check` before
+merging proto changes. Future broad reshapes require new `v2` packages.
+
 A small allowlist of cross-domain value objects in `arco.common.v1` is still annotated with
 `serde::{Serialize, Deserialize}` derives in
 [crates/arco-proto/build.rs](../crates/arco-proto/build.rs) because those shapes are persisted in

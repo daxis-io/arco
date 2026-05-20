@@ -15,6 +15,7 @@
 #![warn(clippy::pedantic)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+pub mod audit;
 pub mod context;
 pub mod error;
 pub mod openapi;

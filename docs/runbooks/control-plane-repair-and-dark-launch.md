@@ -73,6 +73,69 @@ After legacy current-head side-effect removal, `full` is the production default 
 orphan cleanup is the remaining steady-state work. `current_head_only` is retained only for
 request/config compatibility and should stay empty in steady state.
 
+## Production Contract
+
+PI-3 production behavior in the checked-in repo:
+
+- `arco-flow-compactor` accepts only canonical fenced orchestration requests carrying
+  `fencing_token` and `lock_path`
+- the legacy orchestration `epoch` request alias is rejected with HTTP `400`
+- partially populated orchestration request shapes are rejected with HTTP `400`
+- active API and flow-service writers use the shared fenced append-and-compact path
+- PI-1 and PI-2 orchestration compatibility request toggles are removed from this artifact
+- if temporary compatibility fallback is required, roll back the affected services to the last
+  PI-2-compatible build; there is no runtime compatibility switch in PI-3
+
+## Runtime Controls
+
+Writer and repair targeting:
+
+- `ARCO_FLOW_COMPACTOR_URL`
+  - optional on `arco_flow_automation_reconciler`, `arco_flow_dispatcher`,
+    `arco_flow_sweeper`, and `arco_flow_timer_ingest`
+  - when set, those services append events and compact through the remote orchestration compactor
+    using the fenced request contract
+  - when unset, those services use inline fenced compaction with the same visibility contract
+- `ARCO_ORCH_COMPACTOR_URL`
+  - optional on API deployments that emit orchestration ledger events
+  - when set, API orchestration writers target the remote orchestration compactor with canonical
+    fenced requests
+  - API remote orchestration compaction uses the same hardened client semantics as flow-service
+    writers: bounded request timeouts, transient retry handling, and automatic bearer auth for
+    Cloud Run targets (or static bearer userinfo in local/test URLs)
+  - when unset, API orchestration writers use inline fenced compaction with the same visibility
+    contract
+- `ARCO_COMPACTOR_URL`
+  - catalog API writers use this to target the selected catalog compactor deployment
+
+Repair automation defaults in PI-3:
+
+- `ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_MODE`
+  - default: `enforce`
+  - supported values: `disabled`, `dry_run`, `enforce`
+- `ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS`
+  - default: `300`
+- `ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_SCOPE`
+  - default: `current_head_only`
+  - supported values: `current_head_only`, `full`
+- `ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE`
+  - default: `enforce`
+  - supported values: `disabled`, `dry_run`, `enforce`
+- `ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS`
+  - default: `300`
+- `ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE`
+  - default: `full`
+  - supported values: `current_head_only`, `full`
+- `ARCO_COMPACTOR_REPAIR_AUTOMATION_DOMAINS`
+  - default: `catalog,lineage,search`
+
+These env vars are read once during service startup. Apply changes through the deployment mechanism
+for the affected service and restart or redeploy before running the probes below.
+
+After legacy current-head side-effect removal, `full` is the production default because generic
+orphan cleanup is the remaining steady-state work. `current_head_only` is retained only for
+request/config compatibility and should stay empty in steady state.
+
 ## Preconditions
 
 - Target the intended production tenant or workspace only after PI-3 code is deployed everywhere in

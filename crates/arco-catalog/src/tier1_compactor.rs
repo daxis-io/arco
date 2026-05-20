@@ -14,7 +14,8 @@ use arco_core::storage::{StorageBackend, WriteResult};
 use arco_core::storage_keys::ManifestKey;
 use arco_core::sync_compact::SyncCompactRequest;
 use arco_core::{
-    CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths, ScopedStorage, VisibilityStatus,
+    CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths, ControlPlaneScope,
+    ScopedStorage, VisibilityStatus,
 };
 
 use crate::error::{CatalogError, Result as CatalogResult};
@@ -131,6 +132,7 @@ impl From<Tier1CompactionError> for CatalogError {
 /// Compactor for Tier-1 DDL operations using explicit event paths.
 pub struct Tier1Compactor {
     storage: ScopedStorage,
+    scope: ControlPlaneScope,
     cas_max_retries: u32,
 }
 
@@ -151,12 +153,58 @@ struct ReservedCatalogCommit {
 
 impl Tier1Compactor {
     /// Creates a new Tier-1 compactor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the already-validated scoped storage IDs cannot form a
+    /// workspace alias scope.
     #[must_use]
+    #[allow(clippy::expect_used)]
     pub fn new(storage: ScopedStorage) -> Self {
-        Self {
+        let scope = ControlPlaneScope::workspace_alias(storage.tenant_id(), storage.workspace_id())
+            .expect("ScopedStorage tenant/workspace IDs are already validated");
+        Self::new_with_scope(storage, scope)
+    }
+
+    /// Creates a new Tier-1 compactor with an explicit control-plane scope.
+    ///
+    /// The supplied storage remains rooted at its current workspace prefix. This
+    /// keeps Task 3 as an API-threading change only; moving durable catalog paths
+    /// to metastore prefixes is handled by the later path migration tasks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the explicit scope does not match the scoped storage tenant and
+    /// workspace.
+    #[must_use]
+    #[allow(clippy::expect_used)]
+    pub fn new_with_scope(storage: ScopedStorage, scope: ControlPlaneScope) -> Self {
+        Self::try_new_with_scope(storage, scope)
+            .expect("explicit control-plane scope must match scoped storage")
+    }
+
+    /// Tries to create a Tier-1 compactor with an explicit control-plane scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the storage tenant/workspace does not match the
+    /// execution tenant/workspace carried by the explicit scope.
+    pub fn try_new_with_scope(
+        storage: ScopedStorage,
+        scope: ControlPlaneScope,
+    ) -> CatalogResult<Self> {
+        validate_storage_scope(&storage, &scope)?;
+        Ok(Self {
             storage,
+            scope,
             cas_max_retries: 5,
-        }
+        })
+    }
+
+    /// Returns the explicit control-plane scope for this compactor.
+    #[must_use]
+    pub fn scope(&self) -> &ControlPlaneScope {
+        &self.scope
     }
 
     /// Handles a synchronous compaction request.
@@ -186,6 +234,9 @@ impl Tier1Compactor {
             domain = %request.domain,
             event_count = request.event_paths.len(),
             fencing_token = request.fencing_token,
+            tenant_id = %self.scope.tenant_id(),
+            workspace_id = %self.scope.workspace_id(),
+            metastore_id = %self.scope.metastore_id(),
             lock_path = request.lock_path.as_deref().unwrap_or(""),
             request_id = request.request_id.as_deref().unwrap_or(""),
             "handling sync compaction request"
@@ -858,6 +909,28 @@ impl Tier1Compactor {
             message: "search manifest update lost CAS race after max retries".to_string(),
         })
     }
+}
+
+fn validate_storage_scope(storage: &ScopedStorage, scope: &ControlPlaneScope) -> CatalogResult<()> {
+    if storage.tenant_id() != scope.tenant_id() {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "storage tenant '{}' does not match control-plane tenant '{}'",
+                storage.tenant_id(),
+                scope.tenant_id()
+            ),
+        });
+    }
+    if storage.workspace_id() != scope.workspace_id() {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "storage workspace '{}' does not match control-plane workspace '{}'",
+                storage.workspace_id(),
+                scope.workspace_id()
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn parse_domain(domain: &str) -> Result<CatalogDomain, Tier1CompactionError> {

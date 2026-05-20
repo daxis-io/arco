@@ -12,6 +12,9 @@ use crate::parquet_util::{
     CatalogRecord, ColumnRecord, LineageEdgeRecord, NamespaceRecord, TableRecord,
 };
 
+/// Native metastore events used by the catalog product kernel.
+pub type MetastoreDdlEvent = crate::metastore::events::MetastoreEvent;
+
 /// Catalog domain DDL events (namespaces, tables, columns).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

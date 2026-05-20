@@ -124,4 +124,24 @@ WARNING: This API is experimental and will change in future versions.
 
 <!-- BEGIN MANUAL -->
 
+These endpoint groups are prior art and compatibility targets, not Arco's
+architectural source of truth. Production-backed compatibility routes must be
+adapters over Arco-native stable IDs, ledger-backed state, compiled
+authorization decisions, and pointer-published projections.
+
+| Endpoint group | Arco support level | Notes |
+|---|---|---|
+| Catalogs | `compatible-partial` | Backed by authoritative Arco catalog state for implemented catalog metadata fields. |
+| Schemas | `compatible-partial` | Backed by authoritative Arco catalog state for implemented schema metadata fields. |
+| Tables | `compatible-partial` | Table create/get/list uses Arco catalog state for implemented fields. New native registrations default to Delta Lake; Iceberg and plain Parquet are explicit table-format surfaces. Managed Delta governance remains active work. |
+| DeltaCommits | `compatible-partial` | Coordinator mechanics exist; stronger catalog-bound managed Delta validation is planned. |
+| Grants | `scaffolded` | Route shape exists, but compiled grants and authoritative permission mutations are not implemented. |
+| Credentials | `scaffolded` | Route shape exists, but storage credential state and secret-safe projections are not authoritative. |
+| External Locations | `scaffolded` | Route shape exists, but governed path binding and overlap checks are planned. |
+| TemporaryCredentials | `scaffolded` | Placeholder behavior only until credential vending uses compiled authorization and provider-scoped minting. |
+| Volumes | `planned` | Product object family is planned; do not treat route parity as authoritative behavior. |
+| Functions | `planned` | Metadata object family is planned; execution semantics are out of first-tranche scope. |
+| RegisteredModels / ModelVersions | `planned` | Metadata and artifact ownership are planned before model-version credential vending. |
+| Metastores | `compatible-partial` | Summary/discovery shape only; Arco does not depend on a UC metastore service. |
+
 <!-- END MANUAL -->

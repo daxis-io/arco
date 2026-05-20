@@ -30,6 +30,7 @@ fn main() -> Result<()> {
     runtime.block_on(async {
         match cli.command {
             Commands::Deploy(args) => arco_cli::commands::deploy::execute(args, &config).await,
+            Commands::Dev(args) => arco_cli::commands::dev::execute(&args, &config),
             Commands::Run(args) => arco_cli::commands::run::execute(args, &config).await,
             Commands::Status(args) => arco_cli::commands::status::execute(args, &config).await,
             Commands::Logs(args) => arco_cli::commands::logs::execute(&args, &config),

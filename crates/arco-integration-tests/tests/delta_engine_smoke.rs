@@ -3,9 +3,13 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use arco_api::config::{Config, Posture};
 use arco_api::server::ServerBuilder;
+use arco_catalog::CatalogReader;
+use arco_core::ScopedStorage;
+use arco_core::storage::MemoryBackend;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use serde::Deserialize;
@@ -87,7 +91,11 @@ struct NativeTable {
 }
 
 async fn run_engine_flow(engine: &str) {
-    let server = ServerBuilder::new().config(test_config()).build();
+    let backend = Arc::new(MemoryBackend::new());
+    let server = ServerBuilder::new()
+        .config(test_config())
+        .storage_backend(backend.clone())
+        .build();
     let router = server.test_router();
 
     let tenant = "acme";
@@ -161,7 +169,18 @@ async fn run_engine_flow(engine: &str) {
     .await;
     assert_eq!(discover.status, StatusCode::OK);
 
-    let uc_table_id = Uuid::now_v7();
+    let catalog_storage =
+        ScopedStorage::new(backend.clone(), tenant, workspace).expect("scoped storage");
+    let uc_table = CatalogReader::new(catalog_storage)
+        .get_table_in_schema(&catalog_name, &schema_name, &table_name)
+        .await
+        .expect("read created UC table")
+        .expect("created UC table");
+    let uc_table_id = uc_table.id;
+    let uc_table_uri = uc_table
+        .location
+        .unwrap_or_else(|| storage_location.clone());
+
     let mut uc_headers = BTreeMap::new();
     uc_headers.insert("Idempotency-Key", Uuid::now_v7().to_string());
     uc_headers.insert("X-Request-Id", format!("smoke-{engine}-uc"));
@@ -173,8 +192,8 @@ async fn run_engine_flow(engine: &str) {
         tenant,
         workspace,
         json!({
-            "table_id": uc_table_id,
-            "table_uri": format!("gs://smoke/{tenant}/{workspace}/{engine}/managed"),
+            "table_id": &uc_table_id,
+            "table_uri": &uc_table_uri,
             "commit_info": {
                 "version": 0,
                 "timestamp": 1,
@@ -195,8 +214,8 @@ async fn run_engine_flow(engine: &str) {
         tenant,
         workspace,
         json!({
-            "table_id": uc_table_id,
-            "table_uri": format!("gs://smoke/{tenant}/{workspace}/{engine}/managed"),
+            "table_id": &uc_table_id,
+            "table_uri": &uc_table_uri,
             "start_version": 0
         }),
         None,

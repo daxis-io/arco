@@ -2,11 +2,9 @@
 
 #![allow(
     clippy::future_not_send,
-    clippy::match_same_arms,
     clippy::option_option,
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    clippy::uninlined_format_args,
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
@@ -194,8 +192,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             let domain = mutation.domain();
             if !seen_domains.insert(domain) {
                 return Err(ApiError::bad_request(format!(
-                    "duplicate root mutation for domain '{}'",
-                    domain
+                    "duplicate root mutation for domain '{domain}'"
                 )));
             }
         }
@@ -1353,15 +1350,17 @@ impl RootMutation {
                 }
                 Ok(Self::Metastore(mutation.clone()))
             }
+            Some(domain_mutation::Kind::ScopedMetastore(_)) => Err(ApiError::bad_request(
+                "scoped metastore root mutations are not supported by this endpoint",
+            )),
             None => Err(ApiError::bad_request("root mutation kind is required")),
         }
     }
 
     const fn domain(&self) -> ControlPlaneTxDomain {
         match self {
-            Self::Catalog(_) => ControlPlaneTxDomain::Catalog,
+            Self::Catalog(_) | Self::Metastore(_) => ControlPlaneTxDomain::Catalog,
             Self::Orchestration(_) => ControlPlaneTxDomain::Orchestration,
-            Self::Metastore(_) => ControlPlaneTxDomain::Catalog,
         }
     }
 

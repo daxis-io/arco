@@ -38,6 +38,7 @@ pub mod backpressure;
 pub mod canonical_json;
 pub mod catalog_event;
 pub mod catalog_paths;
+pub mod control_plane_scope;
 pub mod control_plane_transactions;
 pub mod error;
 pub mod flow_paths;
@@ -69,6 +70,7 @@ pub mod tenant;
 pub mod prelude {
     pub use crate::catalog_event::{CatalogEvent, CatalogEventPayload};
     pub use crate::catalog_paths::{CatalogDomain, CatalogPaths};
+    pub use crate::control_plane_scope::ControlPlaneScope;
     pub use crate::control_plane_transactions::{
         CatalogTxReceipt, CatalogTxRecord, ControlPlaneIdempotencyRecord, ControlPlaneTxDomain,
         ControlPlaneTxKind, ControlPlaneTxPaths, ControlPlaneTxRecord, ControlPlaneTxStatus,
@@ -110,6 +112,7 @@ pub mod prelude {
 // Re-export key types at crate root for ergonomics
 pub use catalog_event::{CatalogEvent, CatalogEventPayload};
 pub use catalog_paths::{CatalogDomain, CatalogPaths};
+pub use control_plane_scope::ControlPlaneScope;
 pub use control_plane_transactions::{
     CatalogTxReceipt, CatalogTxRecord, ControlPlaneIdempotencyRecord, ControlPlaneTxDomain,
     ControlPlaneTxKind, ControlPlaneTxPaths, ControlPlaneTxRecord, ControlPlaneTxStatus,

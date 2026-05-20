@@ -268,7 +268,7 @@ async fn test_patch_permissions_remains_scaffolded() {
 }
 
 #[tokio::test]
-async fn test_post_temporary_table_credentials_remains_scaffolded() {
+async fn test_post_temporary_table_credentials_denies_without_governance_binding() {
     let seeded = seeded_router().await;
     let app = seeded.app;
     let response = app
@@ -291,7 +291,16 @@ async fn test_post_temporary_table_credentials_remains_scaffolded() {
         .await
         .expect("response");
 
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body bytes");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("path_not_governed"))
+    );
 }
 
 #[tokio::test]

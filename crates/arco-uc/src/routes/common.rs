@@ -2,9 +2,11 @@
 
 use std::sync::Arc;
 
+use arco_catalog::authz::decision::{AuthzDecision, AuthzRequest, DecisionOutcome};
+use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::write_options::WriteOptions;
 use arco_catalog::{CatalogError, CatalogReader, CatalogWriter, Tier1Compactor};
-use arco_core::{CatalogPaths, ScopedStorage};
+use arco_core::{CatalogPaths, ControlPlaneScope, ScopedStorage};
 use serde::{Deserialize, Deserializer};
 
 use crate::context::UnityCatalogRequestContext;
@@ -89,6 +91,63 @@ pub(crate) fn scoped_storage(
     ctx: &UnityCatalogRequestContext,
 ) -> Result<ScopedStorage, UnityCatalogError> {
     ctx.scoped_storage(state.storage.clone())
+}
+
+pub(crate) fn control_plane_scope(
+    ctx: &UnityCatalogRequestContext,
+) -> Result<ControlPlaneScope, UnityCatalogError> {
+    ControlPlaneScope::workspace_alias(ctx.tenant.as_str(), ctx.workspace.as_str()).map_err(|err| {
+        UnityCatalogError::BadRequest {
+            message: err.to_string(),
+        }
+    })
+}
+
+pub(crate) fn authz_denial_reason(
+    state: &UnityCatalogState,
+    ctx: &UnityCatalogRequestContext,
+    object_id: &str,
+    object_type: &str,
+    privilege: Privilege,
+) -> Option<String> {
+    let Some(principal_id) = ctx.user_id.as_ref() else {
+        return Some("unauthenticated_principal".to_string());
+    };
+    let Some(compiled_permissions) = state.compiled_permissions.as_ref() else {
+        return Some("permissions_unavailable".to_string());
+    };
+    let Ok(compiled_permissions) = compiled_permissions.read() else {
+        return Some("permissions_unavailable".to_string());
+    };
+    let request = AuthzRequest::new(
+        principal_id.clone(),
+        object_id.to_string(),
+        object_type.to_string(),
+        privilege,
+    )
+    .with_request_id(&ctx.request_id);
+    let decision = AuthzDecision::evaluate(&request, &compiled_permissions);
+    if decision.outcome == DecisionOutcome::Allow {
+        None
+    } else {
+        Some(format!("authz_{}", decision.reason_code))
+    }
+}
+
+pub(crate) fn require_authz(
+    state: &UnityCatalogState,
+    ctx: &UnityCatalogRequestContext,
+    object_id: &str,
+    object_type: &str,
+    privilege: Privilege,
+    message_prefix: &str,
+) -> Result<(), UnityCatalogError> {
+    if let Some(reason_code) = authz_denial_reason(state, ctx, object_id, object_type, privilege) {
+        return Err(UnityCatalogError::Forbidden {
+            message: format!("{message_prefix}:{reason_code}"),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) async fn authoritative_catalog_reader(

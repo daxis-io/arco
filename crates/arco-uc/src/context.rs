@@ -25,6 +25,8 @@ pub struct UnityCatalogRequestContext {
     pub workspace: String,
     /// Request ID for tracing/correlation.
     pub request_id: String,
+    /// Optional authenticated user/principal identifier for audit events.
+    pub user_id: Option<String>,
     /// Optional idempotency key (safe retries).
     pub idempotency_key: Option<String>,
 }
@@ -64,6 +66,9 @@ impl UnityCatalogRequestContext {
             tenant,
             workspace,
             request_id,
+            // Authenticated principals must be injected by trusted middleware.
+            // Client-supplied identity headers are not authoritative here.
+            user_id: None,
             idempotency_key: header_string(headers, "Idempotency-Key"),
         })
     }

@@ -1,0 +1,51 @@
+{
+  "name": "metastore_objects",
+  "version": 1,
+  "fields": [
+    {
+      "name": "schema_version",
+      "data_type": "Int32",
+      "nullable": false
+    },
+    {
+      "name": "ledger_watermark",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "object_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "object_type",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "name",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "owner",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "lifecycle_state",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "updated_at",
+      "data_type": "Int64",
+      "nullable": false
+    },
+    {
+      "name": "properties_json",
+      "data_type": "Utf8",
+      "nullable": true
+    }
+  ]
+}

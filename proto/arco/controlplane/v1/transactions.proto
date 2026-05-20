@@ -137,11 +137,17 @@ message OrchestrationBatchSpec {
   repeated arco.orchestration.v1.OrchestrationEventEnvelope events = 1;
 }
 
+message ScopedMetastoreMutation {
+  arco.catalog.v1.CatalogControlPlaneScope scope = 1;
+  arco.catalog.v1.MetastoreMutation mutation = 2;
+}
+
 message DomainMutation {
   oneof kind {
     arco.catalog.v1.CatalogDdlOperation catalog = 1;
     OrchestrationBatchSpec orchestration = 2;
     arco.catalog.v1.MetastoreMutation metastore = 3;
+    ScopedMetastoreMutation scoped_metastore = 4;
   }
 }
 

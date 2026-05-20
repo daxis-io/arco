@@ -8,6 +8,24 @@
 
 ---
 
+## Status (2026-05-07)
+
+Complete and merged. All five tasks landed in the proto hard-cut follow-up
+series:
+
+- `befcf73`: lock protobuf JSON policy and `WIRE_JSON` checking
+- `7472923`: realign catalog public read models to `catalog/schema/table`
+- `37d5759`: document the orchestration contract boundary
+- `a109a7a`: verify adapter and transaction test updates
+- `8e85ced`: finalize control-plane realignment follow-ups
+
+The remaining slices below were intentionally deferred as future work, not left
+as bugs in this plan:
+
+- shrinking `arco.common.v1`
+- broader catalog mutation/read-model unification
+- deeper orchestration public/internal event surface reduction
+
 ### Task 1: Lock the Protobuf JSON policy
 
 **Files:**

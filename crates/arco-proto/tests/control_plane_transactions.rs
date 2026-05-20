@@ -11,11 +11,11 @@
 use prost::Message;
 
 use arco_proto::arco::catalog::v1::{
-    Catalog, CatalogControlPlaneScope, CatalogDdlOperation, ColumnDefinition, CreateCatalogOp,
-    CreateSchemaOp, DropTableOp, ExternalLocation, Function, GovernanceAttachment, Grant,
-    GrantMutation, MetastoreMutation, ModelVersion, RegisterTableOp, RegisteredModel,
-    RenameTableOp, Schema, StorageCredential, Table, TableFormat, UpdateTableOp, Volume,
-    WorkspaceBinding, catalog_ddl_operation, metastore_mutation,
+    Catalog, CatalogControlPlaneScope, CatalogDdlOperation, CatalogObjectLifecycleState,
+    ColumnDefinition, CreateCatalogOp, CreateSchemaOp, DropTableOp, ExternalLocation, Function,
+    GovernanceAttachment, Grant, GrantMutation, MetastoreMutation, ModelVersion, RegisterTableOp,
+    RegisteredModel, RenameTableOp, Schema, StorageCredential, Table, TableFormat, UpdateTableOp,
+    Volume, WorkspaceBinding, catalog_ddl_operation, metastore_mutation,
 };
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CatalogTxReceipt, CatalogTxStatus,
@@ -34,7 +34,8 @@ use arco_proto::arco::orchestration::v1::{
     TriggerInfo, WebhookTrigger, orchestration_event_envelope, trigger_info,
 };
 use arco_proto::{
-    CatalogControlPlaneScopeContractError, ControlPlaneTransactionContractError,
+    CatalogControlPlaneScopeContractError, CatalogDdlContractError,
+    ControlPlaneTransactionContractError, MetastoreMutationContractError,
     OrchestrationEventContractError,
 };
 
@@ -260,7 +261,7 @@ fn catalog_ddl_surface_covers_authoritative_operations() {
             table: "events".to_string(),
             description: Some("raw events".to_string()),
             location: Some("s3://bucket/raw/events".to_string()),
-            format: TableFormat::Delta as i32,
+            format: Some(TableFormat::Delta as i32),
             columns: vec![ColumnDefinition {
                 name: "event_id".to_string(),
                 data_type: "string".to_string(),
@@ -504,6 +505,101 @@ fn apply_catalog_ddl_rejects_missing_operation() {
         request.validate_contract(),
         Err(ControlPlaneTransactionContractError::MissingCatalogDdlOp)
     );
+}
+
+#[test]
+fn apply_catalog_ddl_rejects_empty_required_catalog_fields() {
+    let request = ApplyCatalogDdlRequest {
+        ddl: Some(CatalogDdlOperation {
+            op: Some(catalog_ddl_operation::Op::CreateCatalog(CreateCatalogOp {
+                catalog: String::new(),
+                description: None,
+            })),
+        }),
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(ControlPlaneTransactionContractError::InvalidCatalogDdl(
+            CatalogDdlContractError::EmptyField {
+                message: "create_catalog",
+                field: "catalog",
+            },
+        ))
+    );
+}
+
+#[test]
+fn apply_catalog_ddl_accepts_omitted_register_table_format() {
+    let request = ApplyCatalogDdlRequest {
+        ddl: Some(CatalogDdlOperation {
+            op: Some(catalog_ddl_operation::Op::RegisterTable(RegisterTableOp {
+                catalog: "default".to_string(),
+                schema: "raw".to_string(),
+                table: "events".to_string(),
+                description: None,
+                location: None,
+                format: None,
+                columns: vec![ColumnDefinition {
+                    name: "event_id".to_string(),
+                    data_type: "string".to_string(),
+                    is_nullable: false,
+                    ordinal: 0,
+                    description: None,
+                }],
+            })),
+        }),
+    };
+
+    assert_eq!(request.validate_contract(), Ok(()));
+}
+
+#[test]
+fn apply_catalog_ddl_rejects_explicit_unspecified_register_table_format() {
+    let request = ApplyCatalogDdlRequest {
+        ddl: Some(CatalogDdlOperation {
+            op: Some(catalog_ddl_operation::Op::RegisterTable(RegisterTableOp {
+                catalog: "default".to_string(),
+                schema: "raw".to_string(),
+                table: "events".to_string(),
+                description: None,
+                location: None,
+                format: Some(TableFormat::Unspecified as i32),
+                columns: vec![ColumnDefinition {
+                    name: "event_id".to_string(),
+                    data_type: "string".to_string(),
+                    is_nullable: false,
+                    ordinal: 0,
+                    description: None,
+                }],
+            })),
+        }),
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(ControlPlaneTransactionContractError::InvalidCatalogDdl(
+            CatalogDdlContractError::UnspecifiedTableFormat("register_table")
+        ))
+    );
+}
+
+#[test]
+fn apply_catalog_ddl_accepts_explicit_unspecified_update_table_format_as_clear() {
+    let request = ApplyCatalogDdlRequest {
+        ddl: Some(CatalogDdlOperation {
+            op: Some(catalog_ddl_operation::Op::UpdateTable(UpdateTableOp {
+                catalog: "default".to_string(),
+                schema: "raw".to_string(),
+                table: "events".to_string(),
+                description: None,
+                location: None,
+                format: Some(TableFormat::Unspecified as i32),
+            })),
+        }),
+    };
+
+    assert_eq!(request.validate_contract(), Ok(()));
 }
 
 #[test]
@@ -853,6 +949,7 @@ fn metastore_root_transaction_accepts_mutations() {
                         name: "lakehouse-prod".to_string(),
                         cloud: "aws".to_string(),
                         owner: "group:data-platform".to_string(),
+                        lifecycle_state: CatalogObjectLifecycleState::Active as i32,
                         created_at: None,
                         updated_at: None,
                         ..Default::default()
@@ -884,6 +981,7 @@ fn scoped_metastore_root_transaction_carries_scope_and_stable_object_id() {
                                 name: "lakehouse-prod".to_string(),
                                 cloud: "aws".to_string(),
                                 owner: "group:data-platform".to_string(),
+                                lifecycle_state: CatalogObjectLifecycleState::Active as i32,
                                 created_at: None,
                                 updated_at: None,
                                 ..Default::default()
@@ -924,6 +1022,73 @@ fn scoped_metastore_root_transaction_carries_scope_and_stable_object_id() {
 }
 
 #[test]
+fn metastore_root_transaction_rejects_empty_required_fields() {
+    let request = CommitRootTransactionRequest {
+        mutations: vec![DomainMutation {
+            kind: Some(domain_mutation::Kind::Metastore(MetastoreMutation {
+                op: Some(metastore_mutation::Op::StorageCredential(
+                    StorageCredential {
+                        credential_id: "cred_01".to_string(),
+                        name: String::new(),
+                        cloud: "aws".to_string(),
+                        owner: "group:data-platform".to_string(),
+                        lifecycle_state: CatalogObjectLifecycleState::Active as i32,
+                        created_at: None,
+                        updated_at: None,
+                        ..Default::default()
+                    },
+                )),
+            })),
+        }],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(
+            ControlPlaneTransactionContractError::InvalidRootMetastoreMutation(
+                0,
+                MetastoreMutationContractError::EmptyField {
+                    message: "storage_credential",
+                    field: "name",
+                },
+            )
+        )
+    );
+}
+
+#[test]
+fn metastore_root_transaction_rejects_unspecified_public_enums() {
+    let request = CommitRootTransactionRequest {
+        mutations: vec![DomainMutation {
+            kind: Some(domain_mutation::Kind::Metastore(MetastoreMutation {
+                op: Some(metastore_mutation::Op::StorageCredential(
+                    StorageCredential {
+                        credential_id: "cred_01".to_string(),
+                        name: "lakehouse-prod".to_string(),
+                        cloud: "aws".to_string(),
+                        owner: "group:data-platform".to_string(),
+                        lifecycle_state: CatalogObjectLifecycleState::Unspecified as i32,
+                        created_at: None,
+                        updated_at: None,
+                        ..Default::default()
+                    },
+                )),
+            })),
+        }],
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(
+            ControlPlaneTransactionContractError::InvalidRootMetastoreMutation(
+                0,
+                MetastoreMutationContractError::UnspecifiedLifecycleState("storage_credential"),
+            )
+        )
+    );
+}
+
+#[test]
 fn scoped_metastore_root_transaction_uses_workspace_alias_when_metastore_is_omitted() {
     let scope = CatalogControlPlaneScope {
         tenant_id: "tenant_01".to_string(),
@@ -950,6 +1115,7 @@ fn scoped_metastore_root_transaction_rejects_missing_scope() {
                                 name: "lakehouse-prod".to_string(),
                                 cloud: "aws".to_string(),
                                 owner: "group:data-platform".to_string(),
+                                lifecycle_state: CatalogObjectLifecycleState::Active as i32,
                                 created_at: None,
                                 updated_at: None,
                                 ..Default::default()
@@ -1019,6 +1185,7 @@ fn scoped_metastore_root_transaction_rejects_empty_required_scope_fields() {
                                     name: "lakehouse-prod".to_string(),
                                     cloud: "aws".to_string(),
                                     owner: "group:data-platform".to_string(),
+                                    lifecycle_state: CatalogObjectLifecycleState::Active as i32,
                                     created_at: None,
                                     updated_at: None,
                                     ..Default::default()

@@ -127,16 +127,47 @@ impl std::error::Error for TaskOutputContractError {}
 pub enum ControlPlaneTransactionContractError {
     MissingCatalogDdl,
     MissingCatalogDdlOp,
+    InvalidCatalogDdl(CatalogDdlContractError),
     EmptyOrchestrationEvents,
     InvalidOrchestrationEvent(usize, OrchestrationEventContractError),
     EmptyRootMutations,
     MissingRootCatalogDdlOp(usize),
+    InvalidRootCatalogDdl(usize, CatalogDdlContractError),
     MissingRootMetastoreMutationOp(usize),
+    InvalidRootMetastoreMutation(usize, MetastoreMutationContractError),
     EmptyRootOrchestrationEvents(usize),
     InvalidRootOrchestrationEvent(usize, usize, OrchestrationEventContractError),
     MissingRootMutationKind(usize),
     MissingRootMetastoreScope(usize),
     InvalidRootMetastoreScope(usize, CatalogControlPlaneScopeContractError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogDdlContractError {
+    EmptyField {
+        message: &'static str,
+        field: &'static str,
+    },
+    EmptyColumnField {
+        column_index: usize,
+        field: &'static str,
+    },
+    UnknownTableFormat(i32),
+    UnspecifiedTableFormat(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetastoreMutationContractError {
+    MissingOperation,
+    MissingGrantOperation,
+    EmptyField {
+        message: &'static str,
+        field: &'static str,
+    },
+    UnknownLifecycleState(&'static str, i32),
+    UnspecifiedLifecycleState(&'static str),
+    UnknownPrincipalType(i32),
+    UnspecifiedPrincipalType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +183,9 @@ impl std::fmt::Display for ControlPlaneTransactionContractError {
         match self {
             Self::MissingCatalogDdl => f.write_str("catalog DDL payload is required"),
             Self::MissingCatalogDdlOp => f.write_str("catalog DDL operation is required"),
+            Self::InvalidCatalogDdl(error) => {
+                write!(f, "catalog DDL operation is invalid: {error}")
+            }
             Self::EmptyOrchestrationEvents => {
                 f.write_str("orchestration batch must include at least one event")
             }
@@ -170,10 +204,22 @@ impl std::fmt::Display for ControlPlaneTransactionContractError {
                     "root catalog mutation at index {index} must set catalog DDL operation"
                 )
             }
+            Self::InvalidRootCatalogDdl(index, error) => {
+                write!(
+                    f,
+                    "root catalog mutation at index {index} is invalid: {error}"
+                )
+            }
             Self::MissingRootMetastoreMutationOp(index) => {
                 write!(
                     f,
                     "root metastore mutation at index {index} must set metastore mutation operation"
+                )
+            }
+            Self::InvalidRootMetastoreMutation(index, error) => {
+                write!(
+                    f,
+                    "root metastore mutation at index {index} is invalid: {error}"
                 )
             }
             Self::EmptyRootOrchestrationEvents(index) => {
@@ -208,6 +254,59 @@ impl std::fmt::Display for ControlPlaneTransactionContractError {
 }
 
 impl std::error::Error for ControlPlaneTransactionContractError {}
+
+impl std::fmt::Display for CatalogDdlContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyField { message, field } => {
+                write!(f, "{message}.{field} is required")
+            }
+            Self::EmptyColumnField {
+                column_index,
+                field,
+            } => {
+                write!(
+                    f,
+                    "register_table.columns[{column_index}].{field} is required"
+                )
+            }
+            Self::UnknownTableFormat(value) => {
+                write!(f, "unknown table format value: {value}")
+            }
+            Self::UnspecifiedTableFormat(message) => {
+                write!(f, "{message}.format must not be TABLE_FORMAT_UNSPECIFIED")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CatalogDdlContractError {}
+
+impl std::fmt::Display for MetastoreMutationContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingOperation => f.write_str("metastore mutation operation is required"),
+            Self::MissingGrantOperation => f.write_str("grant mutation operation is required"),
+            Self::EmptyField { message, field } => {
+                write!(f, "{message}.{field} is required")
+            }
+            Self::UnknownLifecycleState(message, value) => {
+                write!(f, "{message}.lifecycle_state has unknown value: {value}")
+            }
+            Self::UnspecifiedLifecycleState(message) => {
+                write!(f, "{message}.lifecycle_state must not be UNSPECIFIED")
+            }
+            Self::UnknownPrincipalType(value) => {
+                write!(f, "principal.principal_type has unknown value: {value}")
+            }
+            Self::UnspecifiedPrincipalType => {
+                f.write_str("principal.principal_type must not be UNSPECIFIED")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MetastoreMutationContractError {}
 
 impl std::fmt::Display for CatalogControlPlaneScopeContractError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -327,6 +426,8 @@ impl ApplyCatalogDdlRequest {
         if ddl.op.is_none() {
             return Err(ControlPlaneTransactionContractError::MissingCatalogDdlOp);
         }
+        ddl.validate_contract()
+            .map_err(ControlPlaneTransactionContractError::InvalidCatalogDdl)?;
 
         Ok(())
     }
@@ -374,6 +475,9 @@ impl CommitRootTransactionRequest {
                             ControlPlaneTransactionContractError::MissingRootCatalogDdlOp(index),
                         );
                     }
+                    operation.validate_contract().map_err(|error| {
+                        ControlPlaneTransactionContractError::InvalidRootCatalogDdl(index, error)
+                    })?;
                 }
                 Some(domain_mutation::Kind::Orchestration(spec)) => {
                     if spec.events.is_empty() {
@@ -412,6 +516,11 @@ impl CommitRootTransactionRequest {
                             ),
                         );
                     }
+                    mutation.validate_contract().map_err(|error| {
+                        ControlPlaneTransactionContractError::InvalidRootMetastoreMutation(
+                            index, error,
+                        )
+                    })?;
                 }
                 Some(domain_mutation::Kind::ScopedMetastore(mutation)) => {
                     if !mutation.has_contract_operation() {
@@ -421,6 +530,11 @@ impl CommitRootTransactionRequest {
                             ),
                         );
                     }
+                    mutation.validate_contract().map_err(|error| {
+                        ControlPlaneTransactionContractError::InvalidRootMetastoreMutation(
+                            index, error,
+                        )
+                    })?;
                     let scope = mutation.scope.as_ref().ok_or(
                         ControlPlaneTransactionContractError::MissingRootMetastoreScope(index),
                     )?;
@@ -431,6 +545,67 @@ impl CommitRootTransactionRequest {
                     })?;
                 }
                 None => unreachable!("checked above"),
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl CatalogDdlOperation {
+    pub fn validate_contract(&self) -> Result<(), CatalogDdlContractError> {
+        let Some(op) = self.op.as_ref() else {
+            return Ok(());
+        };
+
+        match op {
+            catalog_ddl_operation::Op::CreateCatalog(op) => {
+                validate_catalog_field("create_catalog", "catalog", &op.catalog)?;
+            }
+            catalog_ddl_operation::Op::CreateSchema(op) => {
+                validate_catalog_field("create_schema", "catalog", &op.catalog)?;
+                validate_catalog_field("create_schema", "schema", &op.schema)?;
+            }
+            catalog_ddl_operation::Op::RegisterTable(op) => {
+                validate_catalog_field("register_table", "catalog", &op.catalog)?;
+                validate_catalog_field("register_table", "schema", &op.schema)?;
+                validate_catalog_field("register_table", "table", &op.table)?;
+                if let Some(format) = op.format {
+                    validate_table_format_value("register_table", format)?;
+                }
+                for (index, column) in op.columns.iter().enumerate() {
+                    if column.name.is_empty() {
+                        return Err(CatalogDdlContractError::EmptyColumnField {
+                            column_index: index,
+                            field: "name",
+                        });
+                    }
+                    if column.data_type.is_empty() {
+                        return Err(CatalogDdlContractError::EmptyColumnField {
+                            column_index: index,
+                            field: "data_type",
+                        });
+                    }
+                }
+            }
+            catalog_ddl_operation::Op::UpdateTable(op) => {
+                validate_catalog_field("update_table", "catalog", &op.catalog)?;
+                validate_catalog_field("update_table", "schema", &op.schema)?;
+                validate_catalog_field("update_table", "table", &op.table)?;
+                if let Some(format) = op.format {
+                    validate_known_table_format_value(format)?;
+                }
+            }
+            catalog_ddl_operation::Op::DropTable(op) => {
+                validate_catalog_field("drop_table", "catalog", &op.catalog)?;
+                validate_catalog_field("drop_table", "schema", &op.schema)?;
+                validate_catalog_field("drop_table", "table", &op.table)?;
+            }
+            catalog_ddl_operation::Op::RenameTable(op) => {
+                validate_catalog_field("rename_table", "catalog", &op.catalog)?;
+                validate_catalog_field("rename_table", "schema", &op.schema)?;
+                validate_catalog_field("rename_table", "table", &op.table)?;
+                validate_catalog_field("rename_table", "new_table", &op.new_table)?;
             }
         }
 
@@ -473,6 +648,40 @@ impl MetastoreMutation {
             None => false,
         }
     }
+
+    pub fn validate_contract(&self) -> Result<(), MetastoreMutationContractError> {
+        let Some(op) = self.op.as_ref() else {
+            return Err(MetastoreMutationContractError::MissingOperation);
+        };
+
+        match op {
+            metastore_mutation::Op::Grant(mutation) => validate_grant_mutation(mutation),
+            metastore_mutation::Op::StorageCredential(value) => validate_storage_credential(value),
+            metastore_mutation::Op::ExternalLocation(value) => validate_external_location(value),
+            metastore_mutation::Op::WorkspaceBinding(value) => validate_workspace_binding(value),
+            metastore_mutation::Op::GovernanceAttachment(value) => {
+                validate_governance_attachment(value)
+            }
+            metastore_mutation::Op::Volume(value) => validate_volume(value),
+            metastore_mutation::Op::Function(value) => validate_function(value),
+            metastore_mutation::Op::RegisteredModel(value) => validate_registered_model(value),
+            metastore_mutation::Op::ModelVersion(value) => validate_model_version(value),
+            metastore_mutation::Op::Principal(value) => validate_principal(value),
+            metastore_mutation::Op::GroupMembership(value) => validate_group_membership(value),
+            metastore_mutation::Op::ServiceCredential(value) => validate_service_credential(value),
+            metastore_mutation::Op::ExternalServiceConnection(value) => {
+                validate_external_service_connection(value)
+            }
+            metastore_mutation::Op::ManagedStorageRoot(value) => {
+                validate_managed_storage_root(value)
+            }
+            metastore_mutation::Op::View(value) => validate_view(value),
+            metastore_mutation::Op::PolicyAttachment(value) => validate_policy_attachment(value),
+            metastore_mutation::Op::Share(value) => validate_share(value),
+            metastore_mutation::Op::Provider(value) => validate_provider(value),
+            metastore_mutation::Op::Recipient(value) => validate_recipient(value),
+        }
+    }
 }
 
 impl ScopedMetastoreMutation {
@@ -481,6 +690,311 @@ impl ScopedMetastoreMutation {
             .as_ref()
             .is_some_and(MetastoreMutation::has_contract_operation)
     }
+
+    pub fn validate_contract(&self) -> Result<(), MetastoreMutationContractError> {
+        self.mutation
+            .as_ref()
+            .ok_or(MetastoreMutationContractError::MissingOperation)?
+            .validate_contract()
+    }
+}
+
+fn validate_catalog_field(
+    message: &'static str,
+    field: &'static str,
+    value: &str,
+) -> Result<(), CatalogDdlContractError> {
+    if value.is_empty() {
+        Err(CatalogDdlContractError::EmptyField { message, field })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_table_format_value(
+    message: &'static str,
+    value: i32,
+) -> Result<(), CatalogDdlContractError> {
+    let format = validate_known_table_format_value(value)?;
+    if format == TableFormat::Unspecified {
+        Err(CatalogDdlContractError::UnspecifiedTableFormat(message))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_known_table_format_value(value: i32) -> Result<TableFormat, CatalogDdlContractError> {
+    TableFormat::try_from(value).map_err(|_| CatalogDdlContractError::UnknownTableFormat(value))
+}
+
+fn validate_required_metastore_field(
+    message: &'static str,
+    field: &'static str,
+    value: &str,
+) -> Result<(), MetastoreMutationContractError> {
+    if value.is_empty() {
+        Err(MetastoreMutationContractError::EmptyField { message, field })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_lifecycle_state(
+    message: &'static str,
+    value: i32,
+) -> Result<(), MetastoreMutationContractError> {
+    let state = CatalogObjectLifecycleState::try_from(value)
+        .map_err(|_| MetastoreMutationContractError::UnknownLifecycleState(message, value))?;
+    if state == CatalogObjectLifecycleState::Unspecified {
+        Err(MetastoreMutationContractError::UnspecifiedLifecycleState(
+            message,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_principal_type(value: i32) -> Result<(), MetastoreMutationContractError> {
+    let principal_type = PrincipalType::try_from(value)
+        .map_err(|_| MetastoreMutationContractError::UnknownPrincipalType(value))?;
+    if principal_type == PrincipalType::Unspecified {
+        Err(MetastoreMutationContractError::UnspecifiedPrincipalType)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_grant_mutation(mutation: &GrantMutation) -> Result<(), MetastoreMutationContractError> {
+    let Some(op) = mutation.op.as_ref() else {
+        return Err(MetastoreMutationContractError::MissingGrantOperation);
+    };
+    match op {
+        grant_mutation::Op::Grant(value) | grant_mutation::Op::Revoke(value) => {
+            validate_grant(value)
+        }
+    }
+}
+
+fn validate_grant(value: &Grant) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("grant", "grant_id", &value.grant_id)?;
+    validate_required_metastore_field("grant", "object_id", &value.object_id)?;
+    validate_required_metastore_field("grant", "object_type", &value.object_type)?;
+    validate_required_metastore_field("grant", "principal", &value.principal)?;
+    validate_required_metastore_field("grant", "privilege", &value.privilege)?;
+    validate_required_metastore_field("grant", "granted_by", &value.granted_by)?;
+    validate_lifecycle_state("grant", value.lifecycle_state)
+}
+
+fn validate_storage_credential(
+    value: &StorageCredential,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("storage_credential", "credential_id", &value.credential_id)?;
+    validate_required_metastore_field("storage_credential", "name", &value.name)?;
+    validate_required_metastore_field("storage_credential", "cloud", &value.cloud)?;
+    validate_required_metastore_field("storage_credential", "owner", &value.owner)?;
+    validate_lifecycle_state("storage_credential", value.lifecycle_state)
+}
+
+fn validate_service_credential(
+    value: &ServiceCredential,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field(
+        "service_credential",
+        "service_credential_id",
+        &value.service_credential_id,
+    )?;
+    validate_required_metastore_field("service_credential", "name", &value.name)?;
+    validate_required_metastore_field("service_credential", "service", &value.service)?;
+    validate_required_metastore_field("service_credential", "owner", &value.owner)?;
+    validate_lifecycle_state("service_credential", value.lifecycle_state)
+}
+
+fn validate_external_location(
+    value: &ExternalLocation,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("external_location", "location_id", &value.location_id)?;
+    validate_required_metastore_field("external_location", "name", &value.name)?;
+    validate_required_metastore_field("external_location", "url", &value.url)?;
+    validate_required_metastore_field("external_location", "credential_id", &value.credential_id)?;
+    validate_required_metastore_field("external_location", "owner", &value.owner)?;
+    validate_lifecycle_state("external_location", value.lifecycle_state)
+}
+
+fn validate_external_service_connection(
+    value: &ExternalServiceConnection,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field(
+        "external_service_connection",
+        "connection_id",
+        &value.connection_id,
+    )?;
+    validate_required_metastore_field("external_service_connection", "name", &value.name)?;
+    validate_required_metastore_field(
+        "external_service_connection",
+        "service_credential_id",
+        &value.service_credential_id,
+    )?;
+    validate_required_metastore_field("external_service_connection", "service", &value.service)?;
+    validate_required_metastore_field("external_service_connection", "owner", &value.owner)?;
+    validate_lifecycle_state("external_service_connection", value.lifecycle_state)
+}
+
+fn validate_managed_storage_root(
+    value: &ManagedStorageRoot,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("managed_storage_root", "root_id", &value.root_id)?;
+    validate_required_metastore_field("managed_storage_root", "name", &value.name)?;
+    validate_required_metastore_field("managed_storage_root", "workspace_id", &value.workspace_id)?;
+    validate_required_metastore_field("managed_storage_root", "url", &value.url)?;
+    validate_required_metastore_field("managed_storage_root", "owner", &value.owner)?;
+    validate_lifecycle_state("managed_storage_root", value.lifecycle_state)
+}
+
+fn validate_workspace_binding(
+    value: &WorkspaceBinding,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("workspace_binding", "binding_id", &value.binding_id)?;
+    validate_required_metastore_field("workspace_binding", "workspace_id", &value.workspace_id)?;
+    validate_required_metastore_field("workspace_binding", "object_id", &value.object_id)?;
+    validate_required_metastore_field("workspace_binding", "object_type", &value.object_type)?;
+    validate_lifecycle_state("workspace_binding", value.lifecycle_state)
+}
+
+fn validate_governance_attachment(
+    value: &GovernanceAttachment,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field(
+        "governance_attachment",
+        "attachment_id",
+        &value.attachment_id,
+    )?;
+    validate_required_metastore_field("governance_attachment", "object_id", &value.object_id)?;
+    validate_required_metastore_field("governance_attachment", "object_type", &value.object_type)?;
+    validate_required_metastore_field(
+        "governance_attachment",
+        "attachment_type",
+        &value.attachment_type,
+    )?;
+    validate_required_metastore_field("governance_attachment", "value", &value.value)?;
+    validate_required_metastore_field("governance_attachment", "created_by", &value.created_by)?;
+    validate_lifecycle_state("governance_attachment", value.lifecycle_state)
+}
+
+fn validate_policy_attachment(
+    value: &PolicyAttachment,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field(
+        "policy_attachment",
+        "policy_attachment_id",
+        &value.policy_attachment_id,
+    )?;
+    validate_required_metastore_field("policy_attachment", "object_id", &value.object_id)?;
+    validate_required_metastore_field("policy_attachment", "object_type", &value.object_type)?;
+    validate_required_metastore_field("policy_attachment", "policy_id", &value.policy_id)?;
+    validate_required_metastore_field("policy_attachment", "policy_type", &value.policy_type)?;
+    validate_required_metastore_field("policy_attachment", "owner", &value.owner)?;
+    validate_lifecycle_state("policy_attachment", value.lifecycle_state)
+}
+
+fn validate_volume(value: &Volume) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("volume", "volume_id", &value.volume_id)?;
+    validate_required_metastore_field("volume", "catalog", &value.catalog)?;
+    validate_required_metastore_field("volume", "schema", &value.schema)?;
+    validate_required_metastore_field("volume", "volume", &value.volume)?;
+    validate_required_metastore_field("volume", "storage_location", &value.storage_location)?;
+    validate_required_metastore_field("volume", "owner", &value.owner)?;
+    validate_lifecycle_state("volume", value.lifecycle_state)
+}
+
+fn validate_function(value: &Function) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("function", "function_id", &value.function_id)?;
+    validate_required_metastore_field("function", "catalog", &value.catalog)?;
+    validate_required_metastore_field("function", "schema", &value.schema)?;
+    validate_required_metastore_field("function", "function", &value.function)?;
+    validate_required_metastore_field("function", "owner", &value.owner)?;
+    validate_lifecycle_state("function", value.lifecycle_state)
+}
+
+fn validate_view(value: &View) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("view", "view_id", &value.view_id)?;
+    validate_required_metastore_field("view", "catalog", &value.catalog)?;
+    validate_required_metastore_field("view", "schema", &value.schema)?;
+    validate_required_metastore_field("view", "view", &value.view)?;
+    validate_required_metastore_field("view", "owner", &value.owner)?;
+    validate_lifecycle_state("view", value.lifecycle_state)
+}
+
+fn validate_registered_model(
+    value: &RegisteredModel,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("registered_model", "model_id", &value.model_id)?;
+    validate_required_metastore_field("registered_model", "catalog", &value.catalog)?;
+    validate_required_metastore_field("registered_model", "schema", &value.schema)?;
+    validate_required_metastore_field("registered_model", "model", &value.model)?;
+    validate_required_metastore_field("registered_model", "owner", &value.owner)?;
+    validate_lifecycle_state("registered_model", value.lifecycle_state)
+}
+
+fn validate_model_version(value: &ModelVersion) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field(
+        "model_version",
+        "model_version_id",
+        &value.model_version_id,
+    )?;
+    validate_required_metastore_field("model_version", "model_id", &value.model_id)?;
+    validate_required_metastore_field("model_version", "version", &value.version)?;
+    validate_required_metastore_field(
+        "model_version",
+        "storage_location",
+        &value.storage_location,
+    )?;
+    validate_lifecycle_state("model_version", value.lifecycle_state)
+}
+
+fn validate_share(value: &Share) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("share", "share_id", &value.share_id)?;
+    validate_required_metastore_field("share", "name", &value.name)?;
+    validate_required_metastore_field("share", "owner", &value.owner)?;
+    validate_lifecycle_state("share", value.lifecycle_state)
+}
+
+fn validate_provider(value: &Provider) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("provider", "provider_id", &value.provider_id)?;
+    validate_required_metastore_field("provider", "name", &value.name)?;
+    validate_required_metastore_field("provider", "owner", &value.owner)?;
+    validate_lifecycle_state("provider", value.lifecycle_state)
+}
+
+fn validate_recipient(value: &Recipient) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("recipient", "recipient_id", &value.recipient_id)?;
+    validate_required_metastore_field("recipient", "name", &value.name)?;
+    validate_required_metastore_field("recipient", "owner", &value.owner)?;
+    validate_lifecycle_state("recipient", value.lifecycle_state)
+}
+
+fn validate_principal(value: &Principal) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("principal", "principal_id", &value.principal_id)?;
+    validate_principal_type(value.principal_type)?;
+    validate_required_metastore_field("principal", "display_name", &value.display_name)?;
+    validate_required_metastore_field("principal", "owner", &value.owner)?;
+    validate_lifecycle_state("principal", value.lifecycle_state)
+}
+
+fn validate_group_membership(
+    value: &GroupMembership,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("group_membership", "membership_id", &value.membership_id)?;
+    validate_required_metastore_field(
+        "group_membership",
+        "group_principal_id",
+        &value.group_principal_id,
+    )?;
+    validate_required_metastore_field(
+        "group_membership",
+        "member_principal_id",
+        &value.member_principal_id,
+    )?;
+    validate_lifecycle_state("group_membership", value.lifecycle_state)
 }
 
 impl OrchestrationEventEnvelope {

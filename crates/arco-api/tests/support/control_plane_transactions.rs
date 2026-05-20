@@ -23,7 +23,7 @@ use arco_core::storage::{
 };
 use arco_proto::arco::catalog::v1::{
     CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp, DropTableOp,
-    RegisterTableOp, RenameTableOp, TableFormat, UpdateTableOp, catalog_ddl_operation,
+    RegisterTableOp, RenameTableOp, UpdateTableOp, catalog_ddl_operation,
 };
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, CommitOrchestrationBatchRequest, CommitRootTransactionRequest,
@@ -267,7 +267,7 @@ pub fn catalog_register_table_in_schema_request_with_columns(
                 table: table_name.to_string(),
                 description: Some("control-plane transaction table".to_string()),
                 location: None,
-                format: TableFormat::Unspecified as i32,
+                format: None,
                 columns,
             })),
         }),

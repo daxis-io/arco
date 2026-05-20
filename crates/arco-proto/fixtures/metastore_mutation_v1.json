@@ -7,7 +7,8 @@
         "objectType": "TABLE",
         "principal": "user:alice@example.com",
         "privilege": "SELECT",
-        "grantedBy": "user:admin@example.com"
+        "grantedBy": "user:admin@example.com",
+        "lifecycleState": 1
       }
     }
   },
@@ -19,7 +20,8 @@
         "objectType": "TABLE",
         "principal": "user:bob@example.com",
         "privilege": "MODIFY",
-        "grantedBy": "user:admin@example.com"
+        "grantedBy": "user:admin@example.com",
+        "lifecycleState": 1
       }
     }
   },
@@ -28,7 +30,8 @@
       "credentialId": "cred_01",
       "name": "lakehouse-prod",
       "cloud": "aws",
-      "owner": "group:data-platform"
+      "owner": "group:data-platform",
+      "lifecycleState": 1
     }
   },
   "externalLocation": {
@@ -37,7 +40,8 @@
       "name": "raw-prod",
       "url": "s3://bucket/raw",
       "credentialId": "cred_01",
-      "owner": "group:data-platform"
+      "owner": "group:data-platform",
+      "lifecycleState": 1
     }
   },
   "workspaceBinding": {
@@ -45,7 +49,8 @@
       "bindingId": "binding_01",
       "workspaceId": "workspace_01",
       "objectId": "loc_01",
-      "objectType": "EXTERNAL_LOCATION"
+      "objectType": "EXTERNAL_LOCATION",
+      "lifecycleState": 1
     }
   },
   "governanceAttachment": {
@@ -55,7 +60,8 @@
       "objectType": "TABLE",
       "attachmentType": "CLASSIFICATION",
       "value": "restricted",
-      "createdBy": "user:admin@example.com"
+      "createdBy": "user:admin@example.com",
+      "lifecycleState": 1
     }
   },
   "volume": {
@@ -65,7 +71,8 @@
       "schema": "raw",
       "volume": "landing",
       "storageLocation": "s3://bucket/volumes/landing",
-      "owner": "group:data-platform"
+      "owner": "group:data-platform",
+      "lifecycleState": 1
     }
   },
   "function": {
@@ -74,7 +81,8 @@
       "catalog": "default",
       "schema": "raw",
       "function": "normalize_email",
-      "owner": "group:data-platform"
+      "owner": "group:data-platform",
+      "lifecycleState": 1
     }
   },
   "registeredModel": {
@@ -83,7 +91,8 @@
       "catalog": "default",
       "schema": "ml",
       "model": "churn",
-      "owner": "group:ml-platform"
+      "owner": "group:ml-platform",
+      "lifecycleState": 1
     }
   },
   "modelVersion": {
@@ -91,7 +100,8 @@
       "modelVersionId": "model_version_01",
       "modelId": "model_01",
       "version": "1",
-      "storageLocation": "s3://bucket/models/churn/1"
+      "storageLocation": "s3://bucket/models/churn/1",
+      "lifecycleState": 1
     }
   }
 }

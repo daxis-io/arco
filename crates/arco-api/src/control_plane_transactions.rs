@@ -52,8 +52,8 @@ use arco_proto::arco::controlplane::v1::{
     GetOrchestrationTransactionRequest, GetOrchestrationTransactionResponse,
     GetRootTransactionRequest, GetRootTransactionResponse, OrchestrationBatchSpec,
     OrchestrationTxReceipt as ProtoOrchestrationTxReceipt, OrchestrationTxStatus,
-    RootTxParticipant, RootTxReceipt as ProtoRootTxReceipt, RootTxStatus, TransactionDomain,
-    TransactionStatus, domain_mutation,
+    RootTxParticipant, RootTxReceipt as ProtoRootTxReceipt, RootTxStatus, ScopedMetastoreMutation,
+    TransactionDomain, TransactionStatus, domain_mutation,
 };
 use arco_proto::arco::orchestration::v1::OrchestrationEventEnvelope;
 
@@ -186,7 +186,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let mut seen_domains = BTreeSet::new();
         for mutation in &mutations {
-            if matches!(mutation, RootMutation::Metastore(_)) {
+            if mutation.is_metastore() {
                 continue;
             }
             let domain = mutation.domain();
@@ -315,6 +315,11 @@ impl<'a> ControlPlaneTransactionService<'a> {
                         domain_commits.push(commit);
                     }
                     RootMutation::Metastore(_) => {
+                        return Err(ApiError::not_implemented(
+                            "metastore root mutations are not implemented yet",
+                        ));
+                    }
+                    RootMutation::ScopedMetastore(_) => {
                         return Err(ApiError::not_implemented(
                             "metastore root mutations are not implemented yet",
                         ));
@@ -1331,6 +1336,7 @@ enum RootMutation {
     Catalog(CatalogMutation),
     Orchestration(OrchestrationBatchMutation),
     Metastore(MetastoreMutation),
+    ScopedMetastore(ScopedMetastoreMutation),
 }
 
 impl RootMutation {
@@ -1350,22 +1356,29 @@ impl RootMutation {
                 }
                 Ok(Self::Metastore(mutation.clone()))
             }
-            Some(domain_mutation::Kind::ScopedMetastore(_)) => Err(ApiError::bad_request(
-                "scoped metastore root mutations are not supported by this endpoint",
-            )),
+            Some(domain_mutation::Kind::ScopedMetastore(mutation)) => {
+                if !mutation.has_contract_operation() {
+                    return Err(ApiError::bad_request(
+                        "metastore mutation operation is required",
+                    ));
+                }
+                Ok(Self::ScopedMetastore(mutation.clone()))
+            }
             None => Err(ApiError::bad_request("root mutation kind is required")),
         }
     }
 
     const fn domain(&self) -> ControlPlaneTxDomain {
         match self {
-            Self::Catalog(_) | Self::Metastore(_) => ControlPlaneTxDomain::Catalog,
+            Self::Catalog(_) | Self::Metastore(_) | Self::ScopedMetastore(_) => {
+                ControlPlaneTxDomain::Catalog
+            }
             Self::Orchestration(_) => ControlPlaneTxDomain::Orchestration,
         }
     }
 
     const fn is_metastore(&self) -> bool {
-        matches!(self, Self::Metastore(_))
+        matches!(self, Self::Metastore(_) | Self::ScopedMetastore(_))
     }
 
     fn request_hash_value(
@@ -1382,6 +1395,12 @@ impl RootMutation {
                 "request": batch.request_hash_value(meta)?,
             })),
             Self::Metastore(mutation) => Ok(serde_json::json!({
+                "domain": "metastore",
+                "request": {
+                    "protoHex": hex::encode(mutation.encode_to_vec()),
+                },
+            })),
+            Self::ScopedMetastore(mutation) => Ok(serde_json::json!({
                 "domain": "metastore",
                 "request": {
                     "protoHex": hex::encode(mutation.encode_to_vec()),
@@ -1424,7 +1443,7 @@ impl CatalogMutation {
                 table: table.clone(),
                 description: description.clone(),
                 location: location.clone(),
-                format: parse_table_format(*format)?,
+                format: (*format).map(parse_table_format).transpose()?,
                 columns: columns
                     .iter()
                     .map(|column| ColumnDefinition {
@@ -1449,10 +1468,7 @@ impl CatalogMutation {
                 table: table.clone(),
                 description: description.clone().map(Some),
                 location: location.clone().map(Some),
-                format: format
-                    .as_ref()
-                    .map(|value| parse_table_format(*value))
-                    .transpose()?,
+                format: (*format).map(parse_table_format_patch).transpose()?,
             }),
             Some(catalog_ddl_operation::Op::DropTable(DropTableOp {
                 catalog,
@@ -1746,19 +1762,28 @@ struct TxRecordLifecycle {
     prepared_at: DateTime<Utc>,
 }
 
-fn table_format_string(format: ProtoTableFormat) -> Option<String> {
+fn parse_table_format(value: i32) -> Result<String, ApiError> {
+    let format = ProtoTableFormat::try_from(value)
+        .map_err(|_| ApiError::bad_request(format!("unknown table format value: {value}")))?;
     match format {
-        ProtoTableFormat::Unspecified => None,
-        ProtoTableFormat::Delta => Some("delta".to_string()),
-        ProtoTableFormat::Iceberg => Some("iceberg".to_string()),
-        ProtoTableFormat::Parquet => Some("parquet".to_string()),
+        ProtoTableFormat::Unspecified => Err(ApiError::bad_request(
+            "table format must not be TABLE_FORMAT_UNSPECIFIED",
+        )),
+        ProtoTableFormat::Delta => Ok("delta".to_string()),
+        ProtoTableFormat::Iceberg => Ok("iceberg".to_string()),
+        ProtoTableFormat::Parquet => Ok("parquet".to_string()),
     }
 }
 
-fn parse_table_format(value: i32) -> Result<Option<String>, ApiError> {
+fn parse_table_format_patch(value: i32) -> Result<Option<String>, ApiError> {
     let format = ProtoTableFormat::try_from(value)
         .map_err(|_| ApiError::bad_request(format!("unknown table format value: {value}")))?;
-    Ok(table_format_string(format))
+    match format {
+        ProtoTableFormat::Unspecified => Ok(None),
+        ProtoTableFormat::Delta => Ok(Some("delta".to_string())),
+        ProtoTableFormat::Iceberg => Ok(Some("iceberg".to_string())),
+        ProtoTableFormat::Parquet => Ok(Some("parquet".to_string())),
+    }
 }
 
 fn root_request_hash(

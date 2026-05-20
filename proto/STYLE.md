@@ -79,21 +79,30 @@ Regenerate the baseline with
 `buf build proto -o proto-baselines/post-hard-cut-v1.binpb`. Keep source info in
 the image because CI's pinned Buf version validates it for breaking checks.
 
-## Pre-Freeze Hard-Cut Policy
+## Alpha/Beta Hard-Cut Policy
 
-The current `arco.*.v1` packages are allowed to receive intentional breaking
-changes only as part of the documented pre-freeze hard cut that expands the
-public API surface. After the post-hard-cut baseline is regenerated, `v1`
-changes must be additive and must preserve binary and ProtoJSON compatibility.
-Future broad reshapes require new `v2` packages.
+The old `arco.v1` package was intentionally removed during the alpha/beta hard
+cut and replaced by domain-aligned packages:
 
-## Pre-Freeze Hard-Cut Policy
+- `arco.common.v1`
+- `arco.catalog.v1`
+- `arco.orchestration.v1`
+- `arco.controlplane.v1`
 
-The documented pre-freeze hard cut is complete. The current `arco.*.v1`
-packages are the durable public proto surface represented by the frozen
-post-cut baseline. New v1 changes must be additive and must preserve binary
-and ProtoJSON compatibility. Run `cargo xtask proto-breaking-check` before
-merging proto changes. Future broad reshapes require new `v2` packages.
+Arco is still alpha/beta software, so additional breaking `v1` changes may
+happen without introducing `v2` only when they are grouped into a documented
+hard-cut window. A hard cut must update this policy, explain the migration
+impact, regenerate `proto-baselines/post-hard-cut-v1.binpb`, and keep
+`cargo xtask proto-breaking-check` passing afterward.
+
+Outside an explicit hard-cut window, `v1` changes must be additive and must
+preserve binary and ProtoJSON compatibility with the frozen post-cut baseline.
+Once Arco declares a stable public API, broad reshapes require new `v2`
+packages.
+
+Current hard-cut migration note: `arco.catalog.v1.RegisterTableOp.format` is
+now optional. Omit the field for the Delta Lake default; explicit
+`TABLE_FORMAT_UNSPECIFIED` is invalid on `RegisterTableOp`.
 
 A small allowlist of cross-domain value objects in `arco.common.v1` is still annotated with
 `serde::{Serialize, Deserialize}` derives in

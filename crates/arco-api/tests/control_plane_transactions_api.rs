@@ -21,16 +21,17 @@ use arco_core::storage::{
 };
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_proto::arco::catalog::v1::{
-    CatalogDdlOperation, ColumnDefinition, GrantMutation, MetastoreMutation, StorageCredential,
-    metastore_mutation,
+    CatalogControlPlaneScope, CatalogDdlOperation, CatalogObjectLifecycleState, ColumnDefinition,
+    GrantMutation, MetastoreMutation, StorageCredential, TableFormat, UpdateTableOp,
+    catalog_ddl_operation, metastore_mutation,
 };
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CommitOrchestrationBatchRequest,
     CommitOrchestrationBatchResponse, CommitRootTransactionRequest, CommitRootTransactionResponse,
     DomainMutation, GetCatalogTransactionRequest, GetCatalogTransactionResponse,
     GetOrchestrationTransactionRequest, GetOrchestrationTransactionResponse,
-    GetRootTransactionRequest, GetRootTransactionResponse, TransactionDomain, TransactionStatus,
-    domain_mutation,
+    GetRootTransactionRequest, GetRootTransactionResponse, ScopedMetastoreMutation,
+    TransactionDomain, TransactionStatus, domain_mutation,
 };
 use arco_proto::arco::orchestration::v1::{orchestration_event_envelope, trigger_info};
 #[path = "support/control_plane_transactions.rs"]
@@ -122,12 +123,44 @@ fn metastore_storage_credential_root_request(name: &str) -> CommitRootTransactio
                         name: name.to_string(),
                         cloud: "aws".to_string(),
                         owner: "group:data-platform".to_string(),
+                        lifecycle_state: CatalogObjectLifecycleState::Active as i32,
                         created_at: None,
                         updated_at: None,
                         ..Default::default()
                     },
                 )),
             })),
+        }],
+    }
+}
+
+fn scoped_metastore_storage_credential_root_request(name: &str) -> CommitRootTransactionRequest {
+    CommitRootTransactionRequest {
+        mutations: vec![DomainMutation {
+            kind: Some(domain_mutation::Kind::ScopedMetastore(
+                ScopedMetastoreMutation {
+                    scope: Some(CatalogControlPlaneScope {
+                        tenant_id: "tenant-a".to_string(),
+                        workspace_id: "workspace-a".to_string(),
+                        metastore_id: "metastore-a".to_string(),
+                        request_id: "req-root-scoped-metastore-01".to_string(),
+                    }),
+                    mutation: Some(MetastoreMutation {
+                        op: Some(metastore_mutation::Op::StorageCredential(
+                            StorageCredential {
+                                credential_id: "cred_01".to_string(),
+                                name: name.to_string(),
+                                cloud: "aws".to_string(),
+                                owner: "group:data-platform".to_string(),
+                                lifecycle_state: CatalogObjectLifecycleState::Active as i32,
+                                created_at: None,
+                                updated_at: None,
+                                ..Default::default()
+                            },
+                        )),
+                    }),
+                },
+            )),
         }],
     }
 }
@@ -465,6 +498,76 @@ async fn apply_catalog_ddl_registers_updates_and_drops_tables_via_transaction_la
         .context("drop table receipt missing")?;
     let drop_record = load_catalog_tx_record(backend, &drop_receipt.tx_id).await?;
     assert_eq!(drop_record.status, ControlPlaneTxStatus::Visible);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn apply_catalog_ddl_update_table_unspecified_format_clears_stored_format() -> Result<()> {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let router = test_router_with_backend(backend.clone());
+
+    let create_schema = catalog_create_default_schema_request(
+        "idem-cat-format-clear-ns-01",
+        "req-cat-format-clear-ns-01",
+        "format_clear",
+    );
+    post_protobuf::<_, ApplyCatalogDdlResponse>(
+        router.clone(),
+        "/api/v1/transactions/applyCatalogDdl",
+        &create_schema,
+        "idem-cat-format-clear-ns-01",
+        "req-cat-format-clear-ns-01",
+    )
+    .await?;
+
+    let register = catalog_register_table_request(
+        "idem-cat-format-clear-reg-01",
+        "req-cat-format-clear-reg-01",
+        "format_clear",
+        "events",
+    );
+    post_protobuf::<_, ApplyCatalogDdlResponse>(
+        router.clone(),
+        "/api/v1/transactions/applyCatalogDdl",
+        &register,
+        "idem-cat-format-clear-reg-01",
+        "req-cat-format-clear-reg-01",
+    )
+    .await?;
+
+    let update = ApplyCatalogDdlRequest {
+        ddl: Some(CatalogDdlOperation {
+            op: Some(catalog_ddl_operation::Op::UpdateTable(UpdateTableOp {
+                catalog: "default".to_string(),
+                schema: "format_clear".to_string(),
+                table: "events".to_string(),
+                description: None,
+                location: None,
+                format: Some(TableFormat::Unspecified as i32),
+            })),
+        }),
+    };
+    let (_status, update_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router,
+        "/api/v1/transactions/applyCatalogDdl",
+        &update,
+        "idem-cat-format-clear-update-01",
+        "req-cat-format-clear-update-01",
+    )
+    .await?;
+    let update_receipt = update_response
+        .receipt
+        .context("update table receipt missing")?;
+    let update_record = load_catalog_tx_record(backend.clone(), &update_receipt.tx_id).await?;
+    assert_eq!(update_record.status, ControlPlaneTxStatus::Visible);
+
+    let reader = CatalogReader::new(scoped_storage(backend));
+    let table = reader
+        .get_table_in_schema("default", "format_clear", "events")
+        .await?
+        .context("updated table missing from reader")?;
+    assert_eq!(table.format, None);
 
     Ok(())
 }
@@ -1517,6 +1620,38 @@ async fn commit_root_transaction_hashes_metastore_mutation_payloads() -> Result<
     assert!(first_record.request_hash.starts_with("sha256:"));
     assert!(second_record.request_hash.starts_with("sha256:"));
     assert_ne!(first_record.request_hash, second_record.request_hash);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_root_transaction_scoped_metastore_uses_not_implemented_contract() -> Result<()> {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let router = test_router_with_backend(backend.clone());
+    let request = scoped_metastore_storage_credential_root_request("lakehouse-prod-scoped");
+
+    let (status, error) = post_error_json(
+        router,
+        "/api/v1/transactions/commitRootTransaction",
+        &request,
+        "idem-root-scoped-metastore-01",
+        "req-root-scoped-metastore-01",
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(error["code"], "NOT_IMPLEMENTED");
+
+    let idempotency_record = load_idempotency_record(
+        backend.clone(),
+        ControlPlaneTxDomain::Root,
+        "idem-root-scoped-metastore-01",
+    )
+    .await?;
+    let root_record = load_root_tx_record(backend, &idempotency_record.tx_id).await?;
+
+    assert!(idempotency_record.request_hash.starts_with("sha256:"));
+    assert_eq!(root_record.status, ControlPlaneTxStatus::Aborted);
 
     Ok(())
 }

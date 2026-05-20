@@ -16,7 +16,8 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 
-# Valid identifier pattern per proto/arco/v1/common.proto
+# Legacy Python asset-key identifier pattern. The current public protobuf
+# surface is domain-aligned under proto/arco/*/v1 rather than proto/arco/v1.
 _IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
 

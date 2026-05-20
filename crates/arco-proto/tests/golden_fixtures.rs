@@ -71,15 +71,19 @@ fn partition_dimensions_use_explicit_messages_instead_of_maps() {
 }
 
 #[test]
-fn docs_name_the_frozen_v1_proto_baseline_policy() {
+fn docs_name_the_alpha_beta_hard_cut_policy() {
     let readme = include_str!("../../../README.md");
     let style = include_str!("../../../proto/STYLE.md");
 
-    assert!(readme.contains("pre-freeze hard cut is complete"));
-    assert!(readme.contains("durable public proto surface"));
+    assert!(readme.contains("old `arco.v1` protobuf package was"));
+    assert!(readme.contains("documented hard-cut window"));
+    assert!(readme.contains("`arco.controlplane.v1`"));
+    assert!(readme.contains("`RegisterTableOp.format` is optional"));
     assert!(readme.contains("cargo xtask proto-breaking-check"));
-    assert!(style.contains("pre-freeze hard cut is complete"));
-    assert!(style.contains("v1 changes must be additive"));
+    assert!(style.contains("Alpha/Beta Hard-Cut Policy"));
+    assert!(style.contains("old `arco.v1` package was intentionally removed"));
+    assert!(style.contains("explicit hard-cut window"));
+    assert!(style.contains("`arco.catalog.v1.RegisterTableOp.format` is"));
     assert!(style.contains("cargo xtask proto-breaking-check"));
 }
 
@@ -113,4 +117,17 @@ fn metastore_mutation_protojson_field_names_are_contract() {
     assert!(json.to_string().contains("registeredModel"));
     assert!(json.to_string().contains("modelVersion"));
     assert!(json.to_string().contains("lakehouse-prod"));
+}
+
+#[test]
+fn metastore_mutation_fixture_uses_valid_public_defaults() {
+    let fixture = include_str!("../fixtures/metastore_mutation_v1.json");
+    let parsed: BTreeMap<String, MetastoreMutation> =
+        serde_json::from_str(fixture).expect("metastore mutation fixture should parse");
+
+    for (name, mutation) in parsed {
+        mutation
+            .validate_contract()
+            .unwrap_or_else(|error| panic!("{name} fixture should be valid: {error}"));
+    }
 }

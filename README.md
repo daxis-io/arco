@@ -38,6 +38,7 @@ catalog surfaces with compatibility and governance support growing over time.
 
 - Rust 1.85+ (Edition 2024)
 - Protocol Buffers compiler (`protoc`)
+- Buf 1.69.0
 
 ### Build and test
 

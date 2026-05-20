@@ -29,6 +29,8 @@ cargo xtask verify-integrity
 cargo xtask repo-hygiene-check
 cargo xtask adr-check
 cargo xtask parity-matrix-check
+cargo xtask proto-breaking-check
+cargo xtask ci-parity
 cargo xtask uc-openapi-inventory
 git diff --exit-code -- docs/guide/src/reference/unity-catalog-openapi-inventory.md
 cargo check --workspace --all-features

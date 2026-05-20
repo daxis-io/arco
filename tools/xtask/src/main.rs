@@ -28,7 +28,7 @@ use arco_core::{CatalogDomain, CatalogPaths, Error as CoreError, ScopedStorage};
 mod versions {
     pub const RUST_CHANNEL: &str = "1.85";
     pub const CARGO_DENY_MIN: &str = "0.18.9";
-    pub const BUF_VERSION: &str = "1.47.2";
+    pub const BUF_VERSION: &str = "1.69.0";
 }
 
 const PROTO_POST_HARD_CUT_BASELINE: &str = "proto-baselines/post-hard-cut-v1.binpb";
@@ -54,6 +54,8 @@ enum Commands {
     AdrCheck,
     /// Enforce repository hygiene invariants
     RepoHygieneCheck,
+    /// Verify local CI helper coverage matches release-critical GitHub Actions gates
+    CiParity,
     /// Check the frozen post-hard-cut protobuf contract baseline
     ProtoBreakingCheck,
     /// Verify catalog integrity (schemas, golden files, workspace checks)
@@ -94,6 +96,7 @@ fn main() -> Result<()> {
         Commands::Doctor => run_doctor(),
         Commands::AdrCheck => run_adr_check(),
         Commands::RepoHygieneCheck => run_repo_hygiene_check(),
+        Commands::CiParity => run_ci_parity_check(),
         Commands::ProtoBreakingCheck => run_proto_breaking_check(),
         Commands::ParityMatrixCheck => run_parity_matrix_check(),
         Commands::UcOpenapiInventory => run_uc_openapi_inventory(),
@@ -368,6 +371,168 @@ fn run_proto_breaking_check() -> Result<()> {
 
     println!("\nFrozen post-cut protobuf contract baseline check passed!");
     Ok(())
+}
+
+fn run_ci_parity_check() -> Result<()> {
+    println!("Checking local CI parity guardrails...\n");
+
+    let ci = read_text(".github/workflows/ci.yml")?;
+    let security_audit = read_text(".github/workflows/security-audit.yml")?;
+    let release_sbom = read_text(".github/workflows/release-sbom.yml")?;
+    let deny_toml = read_text("deny.toml")?;
+
+    let mut errors = Vec::new();
+
+    require_contains(&mut errors, "ci.yml", &ci, "Install protoc");
+    require_contains(&mut errors, "ci.yml", &ci, "cargo xtask doctor");
+    require_contains(&mut errors, "ci.yml", &ci, "cargo xtask verify-integrity");
+    require_contains(
+        &mut errors,
+        "ci.yml",
+        &ci,
+        "cargo xtask engine-boundary-check",
+    );
+    require_contains(
+        &mut errors,
+        "ci.yml",
+        &ci,
+        "cargo xtask parity-matrix-check",
+    );
+    require_contains(&mut errors, "ci.yml", &ci, "cargo xtask repo-hygiene-check");
+    require_contains(&mut errors, "ci.yml", &ci, "buf lint proto/");
+    require_contains(
+        &mut errors,
+        "ci.yml",
+        &ci,
+        "cargo xtask proto-breaking-check",
+    );
+    require_contains(
+        &mut errors,
+        "ci.yml",
+        &ci,
+        &format!("version: '{}'", versions::BUF_VERSION),
+    );
+    require_contains(&mut errors, "ci.yml", &ci, "uv sync --locked --extra dev");
+    require_absent(&mut errors, "ci.yml", &ci, "pip install -e \".[dev]\"");
+
+    require_contains(
+        &mut errors,
+        "security-audit.yml",
+        &security_audit,
+        "uv sync --locked --extra dev",
+    );
+    require_contains(
+        &mut errors,
+        "security-audit.yml",
+        &security_audit,
+        "pip-audit==${PIP_AUDIT_VERSION}",
+    );
+    require_absent(
+        &mut errors,
+        "security-audit.yml",
+        &security_audit,
+        "pip install -e \".[dev]\"",
+    );
+
+    require_contains(&mut errors, "deny.toml", &deny_toml, "yanked = \"deny\"");
+    require_contains(
+        &mut errors,
+        "release-sbom.yml",
+        &release_sbom,
+        "if [ \"${run_conclusion}\" = \"success\" ] && [ \"${discipline_conclusion}\" = \"success\" ]; then",
+    );
+    require_absent(
+        &mut errors,
+        "release-sbom.yml",
+        &release_sbom,
+        "falling back to successful CI run conclusion",
+    );
+    require_workflow_actions_pinned(&mut errors)?;
+
+    if !errors.is_empty() {
+        println!("CI parity errors:");
+        for err in &errors {
+            println!("  - {err}");
+        }
+        anyhow::bail!("CI parity check failed with {} issue(s)", errors.len());
+    }
+
+    println!("Local CI parity guardrails passed!");
+    Ok(())
+}
+
+fn require_workflow_actions_pinned(errors: &mut Vec<String>) -> Result<()> {
+    let workflows_dir = Path::new(".github/workflows");
+    for entry in std::fs::read_dir(workflows_dir).context("read .github/workflows")? {
+        let entry = entry.context("read workflow directory entry")?;
+        let path = entry.path();
+        let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+            continue;
+        };
+        if extension != "yml" && extension != "yaml" {
+            continue;
+        }
+
+        let workflow = std::fs::read_to_string(&path)
+            .with_context(|| format!("read workflow {}", path.display()))?;
+        for (line_number, line) in workflow.lines().enumerate() {
+            let trimmed = line.trim();
+            let Some(reference) = workflow_action_reference(trimmed) else {
+                continue;
+            };
+            let Some((_, revision)) = reference.split_once('@') else {
+                errors.push(format!(
+                    "{}:{} uses `{reference}` without an explicit revision",
+                    path.display(),
+                    line_number + 1
+                ));
+                continue;
+            };
+            let revision = revision
+                .split_whitespace()
+                .next()
+                .expect("action reference should include a revision");
+            if !is_commit_sha(revision) {
+                errors.push(format!(
+                    "{}:{} uses floating action reference `{reference}`; pin a commit SHA and keep the tag in a comment",
+                    path.display(),
+                    line_number + 1
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn workflow_action_reference(line: &str) -> Option<&str> {
+    let reference = line
+        .strip_prefix("- uses: ")
+        .or_else(|| line.strip_prefix("uses: "))?;
+    if reference.starts_with("./") {
+        return None;
+    }
+    Some(reference)
+}
+
+fn is_commit_sha(revision: &str) -> bool {
+    revision.len() == 40 && revision.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn read_text(path: &str) -> Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("read {path}"))
+}
+
+fn require_contains(errors: &mut Vec<String>, file: &str, text: &str, needle: &str) {
+    if !text.contains(needle) {
+        errors.push(format!("{file}: missing required text `{needle}`"));
+    }
+}
+
+fn require_absent(errors: &mut Vec<String>, file: &str, text: &str, needle: &str) {
+    if text.contains(needle) {
+        errors.push(format!("{file}: forbidden text still present `{needle}`"));
+    }
 }
 
 fn run_repo_hygiene_check() -> Result<()> {
@@ -655,7 +820,7 @@ fn run_doctor() -> Result<()> {
     println!("Checking development environment...\n");
 
     let mut errors = Vec::new();
-    let mut warnings = Vec::new();
+    let warnings: Vec<String> = Vec::new();
 
     // 1. Check Rust version
     print!("  Rust toolchain... ");
@@ -677,13 +842,13 @@ fn run_doctor() -> Result<()> {
         }
     }
 
-    // 3. Check buf (optional - may not be installed locally)
+    // 3. Check buf
     print!("  buf...            ");
     match check_buf() {
         Ok(version) => println!("[ok] {version}"),
         Err(e) => {
-            println!("[warn] (optional)");
-            warnings.push(format!("buf: {e}"));
+            println!("[FAIL]");
+            errors.push(format!("buf: {e}"));
         }
     }
 
@@ -2187,10 +2352,18 @@ fn check_buf() -> Result<String> {
     let output = Command::new("buf")
         .arg("--version")
         .output()
-        .context("buf not installed (optional - CI will run it)")?;
+        .with_context(|| {
+            format!(
+                "buf not installed. Install buf {} to match CI",
+                versions::BUF_VERSION
+            )
+        })?;
 
     if !output.status.success() {
-        anyhow::bail!("not installed (optional - CI will run it)");
+        anyhow::bail!(
+            "not installed. Install buf {} to match CI",
+            versions::BUF_VERSION
+        );
     }
 
     let raw = String::from_utf8_lossy(&output.stdout);
@@ -2202,7 +2375,7 @@ fn check_buf() -> Result<String> {
 
     if local != expected {
         anyhow::bail!(
-            "version mismatch: local={}, CI={}. Install: brew install bufbuild/buf/buf",
+            "version mismatch: local={}, CI={}. Use the CI-pinned buf version for local release gates",
             local,
             expected
         );

@@ -16,6 +16,7 @@ all-features = true
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
 # In cargo-deny 0.18+, all advisories are denied by default.
 # Use "workspace" to only fail on direct workspace dependencies.
 unmaintained = "workspace"

@@ -841,6 +841,7 @@ impl CatalogWriter {
         result: Result<arco_core::sync_compact::SyncCompactResponse>,
     ) -> Result<CatalogTransactionCommit> {
         let fencing_token = guard.fencing_token().sequence();
+        let event_id_for_log = event_id.clone();
         let outcome = result.map(|response| CatalogTransactionCommit {
             event_id,
             commit_id: response.commit_ulid,
@@ -852,7 +853,14 @@ impl CatalogWriter {
             repair_pending: response.repair_pending,
         });
 
-        guard.release().await?;
+        if let Err(error) = guard.release().await {
+            tracing::warn!(
+                error = ?error,
+                event_id = event_id_for_log,
+                fencing_token,
+                "catalog transaction committed visibly but lock release failed"
+            );
+        }
         outcome
     }
 

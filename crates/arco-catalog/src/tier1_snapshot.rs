@@ -172,7 +172,15 @@ async fn put_state_if_absent<S: StatePutStore + ?Sized>(
         .await
         .map_err(CatalogError::from)?
     {
-        WriteResult::Success { .. } | WriteResult::PreconditionFailed { .. } => Ok(()),
+        WriteResult::Success { .. } => Ok(()),
+        WriteResult::PreconditionFailed { current_version } => {
+            Err(CatalogError::PreconditionFailed {
+                message: format!(
+                    "snapshot file already exists at {} with version {current_version}",
+                    key.as_ref()
+                ),
+            })
+        }
     }
 }
 

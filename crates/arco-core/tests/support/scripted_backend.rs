@@ -50,6 +50,7 @@ pub struct ScriptedRule {
     kind: ScriptedOpKind,
     path_prefix: String,
     precondition: PreconditionMatcher,
+    skip: AtomicUsize,
     remaining: AtomicUsize,
     effect: ScriptedEffect,
 }
@@ -65,6 +66,24 @@ impl ScriptedRule {
             kind: ScriptedOpKind::Put,
             path_prefix: path_prefix.into(),
             precondition,
+            skip: AtomicUsize::new(0),
+            remaining: AtomicUsize::new(times),
+            effect,
+        }
+    }
+
+    pub fn put_after(
+        path_prefix: impl Into<String>,
+        precondition: PreconditionMatcher,
+        skip: usize,
+        times: usize,
+        effect: ScriptedEffect,
+    ) -> Self {
+        Self {
+            kind: ScriptedOpKind::Put,
+            path_prefix: path_prefix.into(),
+            precondition,
+            skip: AtomicUsize::new(skip),
             remaining: AtomicUsize::new(times),
             effect,
         }
@@ -75,6 +94,7 @@ impl ScriptedRule {
             kind: ScriptedOpKind::Get,
             path_prefix: path_prefix.into(),
             precondition: PreconditionMatcher::Any,
+            skip: AtomicUsize::new(0),
             remaining: AtomicUsize::new(times),
             effect,
         }
@@ -85,6 +105,7 @@ impl ScriptedRule {
             kind: ScriptedOpKind::Head,
             path_prefix: path_prefix.into(),
             precondition: PreconditionMatcher::Any,
+            skip: AtomicUsize::new(0),
             remaining: AtomicUsize::new(times),
             effect,
         }
@@ -95,6 +116,7 @@ impl ScriptedRule {
             kind: ScriptedOpKind::List,
             path_prefix: path_prefix.into(),
             precondition: PreconditionMatcher::Any,
+            skip: AtomicUsize::new(0),
             remaining: AtomicUsize::new(times),
             effect,
         }
@@ -105,6 +127,7 @@ impl ScriptedRule {
             kind: ScriptedOpKind::Delete,
             path_prefix: path_prefix.into(),
             precondition: PreconditionMatcher::Any,
+            skip: AtomicUsize::new(0),
             remaining: AtomicUsize::new(times),
             effect,
         }
@@ -123,6 +146,12 @@ impl ScriptedRule {
     }
 
     fn consume(&self) -> Option<ScriptedEffect> {
+        let skip = self.skip.load(Ordering::SeqCst);
+        if skip > 0 {
+            self.skip.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+
         let remaining = self.remaining.load(Ordering::SeqCst);
         if remaining == 0 {
             return None;

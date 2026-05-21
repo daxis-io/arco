@@ -550,7 +550,14 @@ impl StorageBackend for FailPrefixOnNoneBackend {
     ) -> arco_core::Result<WriteResult> {
         use std::sync::atomic::Ordering;
 
-        if path.starts_with(&self.fail_prefix) && matches!(&precondition, WritePrecondition::None) {
+        // Historical tests used this helper for unguarded finalize writes. Finalize writes are
+        // now fenced, so keep the same fixture covering both old and current write modes.
+        if path.starts_with(&self.fail_prefix)
+            && matches!(
+                &precondition,
+                WritePrecondition::None | WritePrecondition::MatchesVersion(_)
+            )
+        {
             let remaining = self.remaining_failures.load(Ordering::SeqCst);
             if remaining > 0 {
                 self.remaining_failures.fetch_sub(1, Ordering::SeqCst);

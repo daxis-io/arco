@@ -10,15 +10,16 @@ use axum::http::StatusCode;
 use bytes::Bytes;
 
 use arco_catalog::CatalogReader;
-use arco_core::ControlPlaneTxDomain;
 use arco_core::catalog_event::CatalogEvent;
 use arco_core::catalog_paths::{CatalogDomain, CatalogPaths};
 use arco_core::control_plane_transactions::{
-    ControlPlaneTxPaths, ControlPlaneTxStatus, RootTxManifest, RootTxReceipt,
+    ControlPlaneIdempotencyRecord, ControlPlaneTxPaths, ControlPlaneTxStatus, RootTxManifest,
+    RootTxReceipt,
 };
 use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
 };
+use arco_core::{ControlPlaneTxDomain, ControlPlaneTxKind};
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_proto::arco::catalog::v1::{
     CatalogControlPlaneScope, CatalogDdlOperation, CatalogObjectLifecycleState, ColumnDefinition,
@@ -34,6 +35,7 @@ use arco_proto::arco::controlplane::v1::{
     TransactionDomain, TransactionStatus, domain_mutation,
 };
 use arco_proto::arco::orchestration::v1::{orchestration_event_envelope, trigger_info};
+use chrono::Utc;
 #[path = "support/control_plane_transactions.rs"]
 mod support;
 
@@ -303,6 +305,113 @@ impl StorageBackend for FailRootSuperManifestBackend {
     }
 }
 
+#[derive(Debug)]
+struct ReplaceIdempotencyBeforeFinalizeBackend {
+    inner: MemoryBackend,
+    full_idempotency_path: String,
+    idempotency_key: String,
+    request_hash: std::sync::Mutex<Option<String>>,
+    replaced: std::sync::atomic::AtomicBool,
+}
+
+impl ReplaceIdempotencyBeforeFinalizeBackend {
+    const REPLACEMENT_TX_ID: &'static str = "01K0STALECLAIMREPLACED0001";
+
+    fn new(domain: ControlPlaneTxDomain, idempotency_key: impl Into<String>) -> Self {
+        let idempotency_key = idempotency_key.into();
+        let relative_path = ControlPlaneTxPaths::idempotency(domain, &idempotency_key);
+        Self {
+            inner: MemoryBackend::new(),
+            full_idempotency_path: format!("tenant={TENANT}/workspace={WORKSPACE}/{relative_path}"),
+            idempotency_key,
+            request_hash: std::sync::Mutex::new(None),
+            replaced: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl StorageBackend for ReplaceIdempotencyBeforeFinalizeBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        use std::sync::atomic::Ordering;
+
+        if path == self.full_idempotency_path {
+            match &precondition {
+                WritePrecondition::DoesNotExist => {
+                    if let Ok(record) =
+                        serde_json::from_slice::<ControlPlaneIdempotencyRecord>(data.as_ref())
+                    {
+                        *self.request_hash.lock().expect("request hash lock") =
+                            Some(record.request_hash);
+                    }
+                }
+                WritePrecondition::None | WritePrecondition::MatchesVersion(_) => {
+                    if !self.replaced.swap(true, Ordering::SeqCst) {
+                        let request_hash = self
+                            .request_hash
+                            .lock()
+                            .expect("request hash lock")
+                            .clone()
+                            .unwrap_or_else(|| "sha256:unknown".to_string());
+                        let replacement = ControlPlaneIdempotencyRecord {
+                            tx_id: Self::REPLACEMENT_TX_ID.to_string(),
+                            kind: ControlPlaneTxKind::CatalogDdl,
+                            request_id: "req-replacement-owner".to_string(),
+                            idempotency_key: self.idempotency_key.clone(),
+                            request_hash,
+                            created_at: Utc::now(),
+                            visible_at: None,
+                            tx_record: None,
+                        };
+                        self.inner
+                            .put(
+                                path,
+                                Bytes::from(serde_json::to_vec(&replacement).map_err(|error| {
+                                    arco_core::Error::storage(format!(
+                                        "serialize replacement idempotency record: {error}"
+                                    ))
+                                })?),
+                                WritePrecondition::None,
+                            )
+                            .await?;
+                    }
+                }
+            }
+        }
+
+        self.inner.put(path, data, precondition).await
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        self.inner.head(path).await
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+}
+
 #[tokio::test]
 async fn apply_catalog_ddl_returns_visible_receipt_and_persists_lookup_record() -> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
@@ -413,6 +522,47 @@ async fn apply_catalog_ddl_replays_same_idempotency_key_and_rejects_hash_conflic
     .await?;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(error["code"], "CONFLICT");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn apply_catalog_ddl_does_not_overwrite_replaced_idempotency_marker_on_finalize() -> Result<()>
+{
+    let idempotency_key = "idem-cat-finalize-race-01";
+    let backend: Arc<dyn StorageBackend> = Arc::new(ReplaceIdempotencyBeforeFinalizeBackend::new(
+        ControlPlaneTxDomain::Catalog,
+        idempotency_key,
+    ));
+    let router = test_router_with_backend(backend.clone());
+    let request = catalog_create_default_schema_request(
+        idempotency_key,
+        "req-cat-finalize-race-01",
+        "finalize_race",
+    );
+
+    let (status, error) = post_error_json(
+        router,
+        "/api/v1/transactions/applyCatalogDdl",
+        &request,
+        idempotency_key,
+        "req-cat-finalize-race-01",
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error["code"], "CONFLICT");
+
+    let idem =
+        load_idempotency_record(backend, ControlPlaneTxDomain::Catalog, idempotency_key).await?;
+    assert_eq!(
+        idem.tx_id,
+        ReplaceIdempotencyBeforeFinalizeBackend::REPLACEMENT_TX_ID
+    );
+    assert!(
+        idem.tx_record.is_none(),
+        "stale finalize must not cache its visible record under the replacement owner"
+    );
 
     Ok(())
 }

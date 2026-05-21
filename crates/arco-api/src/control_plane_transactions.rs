@@ -896,10 +896,11 @@ impl<'a> ControlPlaneTransactionService<'a> {
         TResult: Serialize + DeserializeOwned + Clone,
     {
         let path = ControlPlaneTxPaths::record(domain, tx_id);
-        let mut record: ControlPlaneTxRecord<TResult> = self
-            .load_json_required(&path)
+        let stored = self
+            .load_json_with_version_required::<ControlPlaneTxRecord<TResult>>(&path)
             .await?
             .ok_or_else(|| ApiError::internal(format!("transaction record not found: {tx_id}")))?;
+        let mut record = stored.value;
         record.status = ControlPlaneTxStatus::Visible;
         record.lock_path = lock_path;
         record.fencing_token = fencing_token;
@@ -907,8 +908,13 @@ impl<'a> ControlPlaneTransactionService<'a> {
         record.visible_at = Some(visible_at);
         record.result = Some(result.clone());
 
-        self.persist_visible_record_and_idempotency(domain, idempotency_path, &record)
-            .await
+        self.persist_visible_record_and_idempotency(
+            domain,
+            idempotency_path,
+            &record,
+            WritePrecondition::MatchesVersion(stored.version),
+        )
+        .await
     }
 
     async fn mark_visible_repair_pending<TResult>(
@@ -921,10 +927,11 @@ impl<'a> ControlPlaneTransactionService<'a> {
         TResult: Serialize + DeserializeOwned + Clone,
     {
         let path = ControlPlaneTxPaths::record(domain, tx_id);
-        let mut record: ControlPlaneTxRecord<TResult> = self
-            .load_json_required(&path)
+        let stored = self
+            .load_json_with_version_required::<ControlPlaneTxRecord<TResult>>(&path)
             .await?
             .ok_or_else(|| ApiError::internal(format!("transaction record not found: {tx_id}")))?;
+        let mut record = stored.value;
         if record.status != ControlPlaneTxStatus::Visible {
             return Err(ApiError::internal(format!(
                 "cannot mark non-visible transaction repair_pending: {tx_id}"
@@ -935,8 +942,13 @@ impl<'a> ControlPlaneTransactionService<'a> {
         }
 
         record.repair_pending = true;
-        self.persist_visible_record_and_idempotency(domain, idempotency_path, &record)
-            .await
+        self.persist_visible_record_and_idempotency(
+            domain,
+            idempotency_path,
+            &record,
+            WritePrecondition::MatchesVersion(stored.version),
+        )
+        .await
     }
 
     async fn persist_visible_record_and_idempotency<TResult>(
@@ -944,15 +956,27 @@ impl<'a> ControlPlaneTransactionService<'a> {
         domain: ControlPlaneTxDomain,
         idempotency_path: &str,
         record: &ControlPlaneTxRecord<TResult>,
+        record_precondition: WritePrecondition,
     ) -> Result<(), ApiError>
     where
         TResult: Serialize + DeserializeOwned + Clone,
     {
         let path = ControlPlaneTxPaths::record(domain, record.tx_id.as_str());
-        let mut idem: ControlPlaneIdempotencyRecord = self
-            .load_json_required(idempotency_path)
+        let stored_idem = self
+            .load_json_with_version_required::<ControlPlaneIdempotencyRecord>(idempotency_path)
             .await?
             .ok_or_else(|| ApiError::internal("idempotency record missing during finalize"))?;
+        let mut idem = stored_idem.value;
+        if idem.tx_id != record.tx_id {
+            return Err(ApiError::conflict(format!(
+                "idempotency marker ownership changed during {domain} transaction finalize"
+            )));
+        }
+        if idem.request_hash != record.request_hash {
+            return Err(ApiError::conflict(format!(
+                "idempotency marker request hash changed during {domain} transaction finalize"
+            )));
+        }
         idem.visible_at = record.visible_at;
         idem.tx_record = Some(serde_json::to_value(record).map_err(|error| {
             ApiError::internal(format!(
@@ -960,23 +984,46 @@ impl<'a> ControlPlaneTransactionService<'a> {
             ))
         })?);
 
-        let tx_write = self
-            .write_json(&path, record, WritePrecondition::None)
-            .await;
         let idem_write = self
-            .write_json(idempotency_path, &idem, WritePrecondition::None)
+            .write_json(
+                idempotency_path,
+                &idem,
+                WritePrecondition::MatchesVersion(stored_idem.version),
+            )
             .await;
-        match (tx_write, idem_write) {
-            (Ok(_), Ok(_)) => Ok(()),
-            (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
-            (Err(error), Err(cache_error)) => {
-                tracing::warn!(
-                    error = ?cache_error,
-                    tx_id = record.tx_id.as_str(),
-                    domain = %domain,
-                    "failed to persist visible transaction record to both durable locations"
-                );
-                Err(error)
+
+        match idem_write {
+            Ok(WriteOutcome::Written) => {
+                match self.write_json(&path, record, record_precondition).await? {
+                    WriteOutcome::Written => Ok(()),
+                    WriteOutcome::PreconditionFailed => Err(ApiError::conflict(format!(
+                        "{domain} transaction record changed during finalize"
+                    ))),
+                }
+            }
+            Ok(WriteOutcome::PreconditionFailed) => Err(ApiError::conflict(format!(
+                "idempotency marker changed during {domain} transaction finalize"
+            ))),
+            Err(idempotency_error) => {
+                match self.write_json(&path, record, record_precondition).await {
+                    Ok(WriteOutcome::Written) => {}
+                    Ok(WriteOutcome::PreconditionFailed) => {
+                        tracing::warn!(
+                            tx_id = record.tx_id.as_str(),
+                            domain = %domain,
+                            "transaction record changed after idempotency finalize write failed"
+                        );
+                    }
+                    Err(record_error) => {
+                        tracing::warn!(
+                            error = ?record_error,
+                            tx_id = record.tx_id.as_str(),
+                            domain = %domain,
+                            "failed to persist visible transaction record after idempotency finalize write failed"
+                        );
+                    }
+                }
+                Err(idempotency_error)
             }
         }
     }
@@ -1002,13 +1049,25 @@ impl<'a> ControlPlaneTransactionService<'a> {
     where
         TResult: Serialize + DeserializeOwned + Clone,
     {
-        if let Some(record) = self.load_record(domain, existing.tx_id.as_str()).await? {
-            if record.status == ControlPlaneTxStatus::Visible {
-                if existing.visible_at != record.visible_at || existing.tx_record.is_none() {
+        let stored_record = self
+            .load_json_with_version_required::<ControlPlaneTxRecord<TResult>>(
+                &ControlPlaneTxPaths::record(domain, existing.tx_id.as_str()),
+            )
+            .await?;
+        if let Some(stored_record) = &stored_record {
+            if stored_record.value.status == ControlPlaneTxStatus::Visible {
+                if existing.visible_at != stored_record.value.visible_at
+                    || existing.tx_record.is_none()
+                {
                     // Safe as a repair write: replayers converge on the same visible receipt,
                     // and any later repair_pending flip is recovered from the canonical tx record.
                     if let Err(error) = self
-                        .persist_visible_record_and_idempotency(domain, idempotency_path, &record)
+                        .persist_visible_record_and_idempotency(
+                            domain,
+                            idempotency_path,
+                            &stored_record.value,
+                            WritePrecondition::MatchesVersion(stored_record.version.clone()),
+                        )
                         .await
                     {
                         tracing::warn!(
@@ -1019,7 +1078,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
                         );
                     }
                 }
-                return Ok(record);
+                return Ok(stored_record.value.clone());
             }
         }
 
@@ -1035,18 +1094,45 @@ impl<'a> ControlPlaneTransactionService<'a> {
                 existing.tx_id
             )));
         }
+        if record.tx_id != existing.tx_id
+            || record.kind != existing.kind
+            || record.request_hash != existing.request_hash
+            || (!existing.idempotency_key.is_empty()
+                && record.idempotency_key != existing.idempotency_key)
+        {
+            return Err(ApiError::internal(format!(
+                "{domain} idempotency cache does not match marker ownership for tx_id '{}'",
+                existing.tx_id
+            )));
+        }
 
         let path = ControlPlaneTxPaths::record(domain, existing.tx_id.as_str());
-        if let Err(error) = self
-            .write_json(&path, &record, WritePrecondition::None)
-            .await
-        {
-            tracing::warn!(
-                error = ?error,
-                tx_id = existing.tx_id.as_str(),
-                domain = %domain,
-                "failed to repair visible transaction record from idempotency cache"
-            );
+        let record_precondition = if let Some(stored_record) = stored_record {
+            if stored_record.value.tx_id != record.tx_id
+                || stored_record.value.kind != record.kind
+                || stored_record.value.request_hash != record.request_hash
+                || (!stored_record.value.idempotency_key.is_empty()
+                    && stored_record.value.idempotency_key != record.idempotency_key)
+            {
+                return Err(ApiError::internal(format!(
+                    "{domain} transaction record path is occupied by a different record for tx_id '{}'",
+                    existing.tx_id
+                )));
+            }
+            WritePrecondition::MatchesVersion(stored_record.version)
+        } else {
+            WritePrecondition::DoesNotExist
+        };
+        match self.write_json(&path, &record, record_precondition).await {
+            Ok(WriteOutcome::Written | WriteOutcome::PreconditionFailed) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = ?error,
+                    tx_id = existing.tx_id.as_str(),
+                    domain = %domain,
+                    "failed to repair visible transaction record from idempotency cache"
+                );
+            }
         }
 
         Ok(record)

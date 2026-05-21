@@ -1006,6 +1006,51 @@ async fn named_catalog_transaction_helpers_round_trip_and_preserve_catalog_scope
 }
 
 #[tokio::test]
+async fn catalog_transaction_helper_returns_commit_when_lock_release_fails_after_publish() {
+    let backend = Arc::new(ScriptedBackend::new());
+    let storage = scoped_storage(backend.clone());
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+    writer
+        .create_schema_transaction(
+            "default",
+            "release_failure_seed",
+            Some("seed default catalog before injecting release failure"),
+            WriteOptions::default(),
+        )
+        .await
+        .expect("seed default catalog");
+    backend.add_rule(ScriptedRule::put_after(
+        format!(
+            "tenant={TENANT}/workspace={WORKSPACE}/{}",
+            CatalogPaths::domain_lock(CatalogDomain::Catalog)
+        ),
+        PreconditionMatcher::MatchesVersion,
+        1,
+        1,
+        ScriptedEffect::Error("injected post-publish lock release failure".to_string()),
+    ));
+
+    let commit = writer
+        .create_schema_transaction(
+            "default",
+            "release_failure",
+            Some("release failure should not hide the visible commit"),
+            WriteOptions::default(),
+        )
+        .await
+        .expect("visible catalog transaction should survive lock release failure");
+
+    assert_visible_commit(&storage, &commit).await;
+    let schema = CatalogReader::new(storage)
+        .get_namespace("release_failure")
+        .await
+        .expect("read namespace")
+        .expect("namespace published despite release failure");
+    assert_eq!(schema.name, "release_failure");
+}
+
+#[tokio::test]
 async fn pointer_cas_loss_leaves_visible_head_unchanged_even_if_new_snapshot_persists() {
     let backend = Arc::new(ScriptedBackend::new());
     let storage = scoped_storage(backend.clone());
@@ -1054,5 +1099,40 @@ async fn pointer_cas_loss_leaves_visible_head_unchanged_even_if_new_snapshot_per
     assert!(
         immutable_manifests.len() >= 2,
         "losing snapshot publish may persist an immutable manifest artifact"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_file_collision_fails_publication_instead_of_reusing_existing_bytes() {
+    let backend = Arc::new(ScriptedBackend::new());
+    let storage = scoped_storage(backend.clone());
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+
+    backend.add_rule(ScriptedRule::put(
+        format!(
+            "tenant={TENANT}/workspace={WORKSPACE}/{}",
+            CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1)
+        ),
+        PreconditionMatcher::DoesNotExist,
+        1,
+        ScriptedEffect::PreconditionFailed {
+            current_version: "existing-stale-snapshot-file".to_string(),
+        },
+    ));
+
+    let error = writer
+        .create_schema_transaction(
+            "default",
+            "snapshot_collision",
+            Some("snapshot collision must fail publication"),
+            WriteOptions::default(),
+        )
+        .await
+        .expect_err("snapshot file collision must fail publication");
+
+    assert!(
+        error.to_string().contains("snapshot file already exists"),
+        "unexpected snapshot collision error: {error}"
     );
 }

@@ -93,6 +93,7 @@ pub mod metastore;
 pub mod metrics;
 pub mod objects;
 pub mod parquet_util;
+mod read_model;
 pub mod reader;
 pub mod reconciler;
 pub mod search_tombstone;

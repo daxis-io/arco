@@ -385,6 +385,10 @@ fn op_get_head_or_range_path(op: &SpyOp) -> Option<&str> {
     }
 }
 
+fn is_parquet_read_path(path: &str) -> bool {
+    path.ends_with(".parquet")
+}
+
 fn is_catalog_domain_read_path(path: &str) -> bool {
     path.ends_with("manifests/catalog.pointer.json")
         || path.ends_with("manifests/catalog.manifest.json")
@@ -501,6 +505,72 @@ async fn catalog_metadata_reads_only_catalog_domain_manifest() {
     assert!(
         unrelated_paths.is_empty(),
         "catalog metadata reads must not fetch unrelated domain manifests: {unrelated_paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn catalog_read_model_reuses_snapshot_bytes_for_hot_reads() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let spy = Arc::new(SpyBackend::new(inner));
+    let storage = scoped_storage(spy.clone());
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+    writer
+        .create_namespace("analytics", None, WriteOptions::default())
+        .await
+        .expect("create namespace");
+    writer
+        .register_table(
+            RegisterTableRequest {
+                namespace: "analytics".to_string(),
+                name: "events".to_string(),
+                description: None,
+                location: None,
+                format: None,
+                columns: vec![test_column("event_id")],
+            },
+            WriteOptions::default(),
+        )
+        .await
+        .expect("register table");
+
+    let reader = CatalogReader::new(storage);
+    let warmed_tables = reader
+        .list_tables("analytics")
+        .await
+        .expect("warm catalog read model");
+    assert_eq!(warmed_tables.len(), 1);
+
+    spy.clear_ops();
+
+    let namespaces = reader.list_namespaces().await.expect("list namespaces");
+    assert_eq!(namespaces.len(), 1);
+    assert!(
+        reader
+            .get_namespace("analytics")
+            .await
+            .expect("get namespace")
+            .is_some()
+    );
+    let tables = reader.list_tables("analytics").await.expect("list tables");
+    assert_eq!(tables.len(), 1);
+    assert!(
+        reader
+            .get_table("analytics", "events")
+            .await
+            .expect("get table")
+            .is_some()
+    );
+
+    let parquet_reads = spy
+        .ops()
+        .into_iter()
+        .filter_map(|op| op_get_head_or_range_path(&op).map(str::to_owned))
+        .filter(|path| is_parquet_read_path(path))
+        .collect::<Vec<_>>();
+    assert!(
+        parquet_reads.is_empty(),
+        "hot catalog reads must reuse decoded snapshot bytes: {parquet_reads:?}"
     );
 }
 

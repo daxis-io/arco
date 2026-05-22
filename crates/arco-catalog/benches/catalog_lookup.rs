@@ -262,6 +262,17 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("cold_list_namespaces", |b| {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 5));
+
+        b.iter(|| {
+            let reader = CatalogReader::new(storage.clone());
+            let result = rt.block_on(reader.list_namespaces());
+            black_box(result)
+        });
+    });
+
     // Benchmark: list namespaces with varying sizes
     for ns_count in [1, 10, 50] {
         group.bench_with_input(
@@ -366,6 +377,17 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
     }
 
     // Benchmark: get single table
+    group.bench_function("cold_get_table_single", |b| {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+
+        b.iter(|| {
+            let reader = CatalogReader::new(storage.clone());
+            let result = rt.block_on(reader.get_table("namespace_5", "table_5"));
+            black_box(result)
+        });
+    });
+
     group.bench_function("warm_get_table_single", |b| {
         let backend = Arc::new(MemoryBackend::new());
         let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
@@ -386,6 +408,19 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
 
         b.iter(|| {
             let result = rt.block_on(reader.get_table("namespace_5", "table_5"));
+            black_box(result)
+        });
+    });
+
+    group.bench_function("large_hot_get_table_single", |b| {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = rt.block_on(setup_catalog(backend.clone(), 100, 100));
+        let reader = CatalogReader::new(storage);
+        rt.block_on(reader.get_table("namespace_50", "table_50"))
+            .expect("warm read");
+
+        b.iter(|| {
+            let result = rt.block_on(reader.get_table("namespace_50", "table_50"));
             black_box(result)
         });
     });

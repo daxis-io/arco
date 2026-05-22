@@ -63,6 +63,31 @@ pub const EVENT_WRITER_BYTES: &str = "arco_event_writer_bytes_written_total";
 pub const EVENT_WRITER_SEQUENCE: &str = "arco_event_writer_sequence_allocation_total";
 
 // ============================================================================
+// Read Model and Enforcement Cache Metrics
+// ============================================================================
+
+/// Catalog read model cache hit counter.
+pub const CATALOG_READ_MODEL_CACHE_HIT: &str = "arco_catalog_read_model_cache_hit_total";
+
+/// Catalog read model cache miss counter.
+pub const CATALOG_READ_MODEL_CACHE_MISS: &str = "arco_catalog_read_model_cache_miss_total";
+
+/// Catalog read model refresh duration histogram.
+pub const CATALOG_READ_MODEL_REFRESH_SECONDS: &str = "arco_catalog_read_model_refresh_seconds";
+
+/// Storage-governance enforcement cache hit counter.
+pub const STORAGE_GOVERNANCE_CACHE_HIT: &str = "arco_storage_governance_cache_hit_total";
+
+/// Storage-governance enforcement cache miss counter.
+pub const STORAGE_GOVERNANCE_CACHE_MISS: &str = "arco_storage_governance_cache_miss_total";
+
+/// Storage-governance enforcement refresh duration histogram.
+pub const STORAGE_GOVERNANCE_REFRESH_SECONDS: &str = "arco_storage_governance_refresh_seconds";
+
+/// Authorization candidate rows consulted by the compiled-permission index.
+pub const AUTHZ_INDEX_CANDIDATE_ROWS: &str = "arco_authz_index_candidate_rows";
+
+// ============================================================================
 // ADR-034 Repair Metrics
 // ============================================================================
 
@@ -109,6 +134,34 @@ pub fn register_metrics() {
     describe_counter!(
         EVENT_WRITER_SEQUENCE,
         "Total sequence allocation attempts by EventWriter"
+    );
+    describe_counter!(
+        CATALOG_READ_MODEL_CACHE_HIT,
+        "Total catalog read model cache hits"
+    );
+    describe_counter!(
+        CATALOG_READ_MODEL_CACHE_MISS,
+        "Total catalog read model cache misses"
+    );
+    describe_histogram!(
+        CATALOG_READ_MODEL_REFRESH_SECONDS,
+        "Catalog read model refresh latency in seconds"
+    );
+    describe_counter!(
+        STORAGE_GOVERNANCE_CACHE_HIT,
+        "Total storage governance cache hits"
+    );
+    describe_counter!(
+        STORAGE_GOVERNANCE_CACHE_MISS,
+        "Total storage governance cache misses"
+    );
+    describe_histogram!(
+        STORAGE_GOVERNANCE_REFRESH_SECONDS,
+        "Storage governance cache refresh latency in seconds"
+    );
+    describe_histogram!(
+        AUTHZ_INDEX_CANDIDATE_ROWS,
+        "Compiled authorization candidate rows considered per decision"
     );
     describe_gauge!(STORAGE_OBJECTS_TOTAL, "Total objects in storage by prefix");
     describe_gauge!(STORAGE_BYTES_TOTAL, "Total bytes in storage by prefix");
@@ -205,6 +258,46 @@ pub fn add_event_writer_bytes_written(domain: CatalogDomain, bytes: u64) {
 /// Records a sequence allocation attempt.
 pub fn inc_event_writer_sequence_allocation(status: &str) {
     counter!(EVENT_WRITER_SEQUENCE, "status" => status.to_string()).increment(1);
+}
+
+// ============================================================================
+// Read Model and Enforcement Cache Recording
+// ============================================================================
+
+/// Records a catalog read model cache hit.
+pub fn inc_catalog_read_model_cache_hit() {
+    counter!(CATALOG_READ_MODEL_CACHE_HIT).increment(1);
+}
+
+/// Records a catalog read model cache miss.
+pub fn inc_catalog_read_model_cache_miss() {
+    counter!(CATALOG_READ_MODEL_CACHE_MISS).increment(1);
+}
+
+/// Records catalog read model refresh latency.
+pub fn record_catalog_read_model_refresh(duration_secs: f64) {
+    histogram!(CATALOG_READ_MODEL_REFRESH_SECONDS).record(duration_secs);
+}
+
+/// Records a storage-governance cache hit.
+pub fn inc_storage_governance_cache_hit() {
+    counter!(STORAGE_GOVERNANCE_CACHE_HIT).increment(1);
+}
+
+/// Records a storage-governance cache miss.
+pub fn inc_storage_governance_cache_miss() {
+    counter!(STORAGE_GOVERNANCE_CACHE_MISS).increment(1);
+}
+
+/// Records storage-governance cache refresh latency.
+pub fn record_storage_governance_refresh(duration_secs: f64) {
+    histogram!(STORAGE_GOVERNANCE_REFRESH_SECONDS).record(duration_secs);
+}
+
+/// Records compiled authorization candidate-row fanout.
+#[allow(clippy::cast_precision_loss)]
+pub fn record_authz_index_candidate_rows(rows: usize) {
+    histogram!(AUTHZ_INDEX_CANDIDATE_ROWS).record(rows as f64);
 }
 
 // ============================================================================

@@ -132,6 +132,22 @@ impl CompiledPermissionSet {
         &self.rows
     }
 
+    /// Returns the number of rows in the principal/object/object-type index bucket.
+    #[must_use]
+    pub fn candidate_row_count(
+        &self,
+        principal_id: &str,
+        object_id: &str,
+        object_type: &str,
+    ) -> usize {
+        let key = (
+            principal_id.to_string(),
+            object_id.to_string(),
+            object_type.to_ascii_uppercase(),
+        );
+        self.by_principal_object.get(&key).map_or(0, Vec::len)
+    }
+
     /// Iterates rows for principal, object, and privilege.
     pub fn rows_for_principal_object_privilege(
         &self,

@@ -609,6 +609,79 @@ async fn catalog_read_model_refreshes_after_pointer_moves() {
 }
 
 #[tokio::test]
+async fn catalog_read_model_fetches_new_snapshot_once_after_pointer_moves() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let spy = Arc::new(SpyBackend::new(inner));
+    let storage = scoped_storage(spy.clone());
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+    writer
+        .create_namespace("analytics", None, WriteOptions::default())
+        .await
+        .expect("create analytics");
+
+    let reader = CatalogReader::new(storage);
+    let namespaces = reader.list_namespaces().await.expect("warm read model");
+    assert_eq!(namespaces.len(), 1);
+
+    spy.clear_ops();
+    let hot_namespaces = reader
+        .list_namespaces()
+        .await
+        .expect("hot read on same snapshot");
+    assert_eq!(hot_namespaces.len(), 1);
+    let hot_parquet_reads = spy
+        .ops()
+        .into_iter()
+        .filter_map(|op| op_get_head_or_range_path(&op).map(str::to_owned))
+        .filter(|path| is_parquet_read_path(path))
+        .collect::<Vec<_>>();
+    assert!(
+        hot_parquet_reads.is_empty(),
+        "same-snapshot hot read must not fetch Parquet files: {hot_parquet_reads:?}"
+    );
+
+    writer
+        .create_namespace("finance", None, WriteOptions::default())
+        .await
+        .expect("create finance");
+
+    spy.clear_ops();
+    let refreshed_namespaces = reader
+        .list_namespaces()
+        .await
+        .expect("read after pointer move");
+    assert_eq!(refreshed_namespaces.len(), 2);
+    let refresh_parquet_reads = spy
+        .ops()
+        .into_iter()
+        .filter_map(|op| op_get_head_or_range_path(&op).map(str::to_owned))
+        .filter(|path| is_parquet_read_path(path))
+        .collect::<Vec<_>>();
+    assert!(
+        !refresh_parquet_reads.is_empty(),
+        "first read after pointer movement should fetch the new snapshot files"
+    );
+
+    spy.clear_ops();
+    let rehot_namespaces = reader
+        .list_namespaces()
+        .await
+        .expect("hot read on refreshed snapshot");
+    assert_eq!(rehot_namespaces.len(), 2);
+    let rehot_parquet_reads = spy
+        .ops()
+        .into_iter()
+        .filter_map(|op| op_get_head_or_range_path(&op).map(str::to_owned))
+        .filter(|path| is_parquet_read_path(path))
+        .collect::<Vec<_>>();
+    assert!(
+        rehot_parquet_reads.is_empty(),
+        "refreshed snapshot should be hot after one fetch: {rehot_parquet_reads:?}"
+    );
+}
+
+#[tokio::test]
 async fn lineage_reads_only_lineage_domain_manifest() {
     let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let spy = Arc::new(SpyBackend::new(inner));

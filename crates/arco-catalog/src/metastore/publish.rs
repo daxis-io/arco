@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Instant;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -11,6 +12,7 @@ use arco_core::ScopedStorage;
 use arco_core::storage::{ObjectMeta, WritePrecondition, WriteResult};
 
 use crate::error::{CatalogError, Result};
+use crate::metrics;
 use crate::storage_governance::StorageGovernanceState;
 
 use super::ledger::{MetastoreLedger, MetastoreLedgerWatermark};
@@ -186,6 +188,7 @@ impl PublishedStorageGovernanceCache {
             .as_ref()
         {
             if current.identity == identity {
+                metrics::inc_storage_governance_cache_hit();
                 return Ok(Arc::clone(&current.value));
             }
         }
@@ -206,12 +209,16 @@ impl PublishedStorageGovernanceCache {
             .as_ref()
         {
             if current.identity == identity {
+                metrics::inc_storage_governance_cache_hit();
                 return Ok(Arc::clone(&current.value));
             }
         }
 
+        metrics::inc_storage_governance_cache_miss();
+        let refresh_start = Instant::now();
         let loaded =
             Arc::new(load_published_storage_governance_from_manifest(storage, manifest).await?);
+        metrics::record_storage_governance_refresh(refresh_start.elapsed().as_secs_f64());
         *self
             .current
             .write()

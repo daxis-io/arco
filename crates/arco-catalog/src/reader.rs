@@ -29,7 +29,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
@@ -43,6 +43,7 @@ use crate::manifest::{
     CatalogDomainManifest, CatalogManifest, DomainManifestPointer, ExecutionsManifest,
     LineageManifest, RootManifest, SearchManifest, SnapshotInfo, TailRange,
 };
+use crate::metrics;
 use crate::parquet_util;
 use crate::read_model::{CatalogReadModel, CatalogSnapshotIdentity};
 use crate::write_options::SnapshotVersion;
@@ -325,15 +326,20 @@ impl CatalogReader {
     ) -> Result<Arc<CatalogReadModel>> {
         let identity = CatalogSnapshotIdentity::from(manifest);
         if let Some(read_model) = self.cached_catalog_read_model(&identity)? {
+            metrics::inc_catalog_read_model_cache_hit();
             return Ok(read_model);
         }
 
         let _refresh_guard = self.read_model_refresh.lock().await;
         if let Some(read_model) = self.cached_catalog_read_model(&identity)? {
+            metrics::inc_catalog_read_model_cache_hit();
             return Ok(read_model);
         }
 
+        metrics::inc_catalog_read_model_cache_miss();
+        let refresh_start = Instant::now();
         let read_model = Arc::new(CatalogReadModel::load(&self.storage, manifest).await?);
+        metrics::record_catalog_read_model_refresh(refresh_start.elapsed().as_secs_f64());
         {
             let mut cache =
                 self.read_model_cache

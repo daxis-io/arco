@@ -283,6 +283,24 @@ impl CatalogReader {
         })
     }
 
+    async fn read_catalog_domain_manifest(&self) -> Result<CatalogDomainManifest> {
+        let bytes = self
+            .read_domain_manifest_bytes(CatalogDomain::Catalog, None)
+            .await?;
+        serde_json::from_slice(&bytes).map_err(|e| CatalogError::Serialization {
+            message: format!("failed to parse catalog manifest: {}", e),
+        })
+    }
+
+    async fn read_lineage_domain_manifest(&self) -> Result<LineageManifest> {
+        let bytes = self
+            .read_domain_manifest_bytes(CatalogDomain::Lineage, None)
+            .await?;
+        serde_json::from_slice(&bytes).map_err(|e| CatalogError::Serialization {
+            message: format!("failed to parse lineage manifest: {}", e),
+        })
+    }
+
     async fn table_lookup_by_id(
         &self,
         snapshot_version: u64,
@@ -628,9 +646,8 @@ impl CatalogReader {
     ///
     /// Returns an error if the manifest cannot be read or Parquet decoding fails.
     pub async fn list_catalogs(&self) -> Result<Vec<Catalog>> {
-        let manifest = self.read_manifest().await?;
-        self.list_catalogs_from_catalog_manifest(&manifest.catalog)
-            .await
+        let manifest = self.read_catalog_domain_manifest().await?;
+        self.list_catalogs_from_catalog_manifest(&manifest).await
     }
 
     /// Gets a catalog by name.
@@ -643,7 +660,8 @@ impl CatalogReader {
     ///
     /// Returns an error if the manifest cannot be read or Parquet decoding fails.
     pub async fn get_catalog(&self, name: &str) -> Result<Option<Catalog>> {
-        let catalogs = self.list_catalogs().await?;
+        let manifest = self.read_catalog_domain_manifest().await?;
+        let catalogs = self.list_catalogs_from_catalog_manifest(&manifest).await?;
         Ok(catalogs.into_iter().find(|c| c.name == name))
     }
 
@@ -656,8 +674,8 @@ impl CatalogReader {
     ///
     /// Returns an error if the catalog doesn't exist or snapshot reads fail.
     pub async fn list_schemas(&self, catalog: &str) -> Result<Vec<Schema>> {
-        let manifest = self.read_manifest().await?;
-        self.list_schemas_from_catalog_manifest(&manifest.catalog, catalog)
+        let manifest = self.read_catalog_domain_manifest().await?;
+        self.list_schemas_from_catalog_manifest(&manifest, catalog)
             .await
     }
 
@@ -667,9 +685,9 @@ impl CatalogReader {
     ///
     /// Returns an error if the catalog or schema doesn't exist, or snapshot reads fail.
     pub async fn list_tables_in_schema(&self, catalog: &str, schema: &str) -> Result<Vec<Table>> {
-        let manifest = self.read_manifest().await?;
+        let manifest = self.read_catalog_domain_manifest().await?;
         let namespace_id = self
-            .list_schemas_from_catalog_manifest(&manifest.catalog, catalog)
+            .list_schemas_from_catalog_manifest(&manifest, catalog)
             .await?
             .iter()
             .find(|ns| ns.name == schema)
@@ -678,7 +696,7 @@ impl CatalogReader {
                 entity: "schema".into(),
                 name: format!("{catalog}.{schema}"),
             })?;
-        self.list_tables_for_namespace_id(&manifest.catalog, namespace_id.as_str())
+        self.list_tables_for_namespace_id(&manifest, namespace_id.as_str())
             .await
     }
 
@@ -711,9 +729,8 @@ impl CatalogReader {
     ///
     /// Returns an error if the snapshot cannot be read.
     pub async fn list_namespaces(&self) -> Result<Vec<Schema>> {
-        let manifest = self.read_manifest().await?;
-        self.list_namespaces_from_catalog_manifest(&manifest.catalog)
-            .await
+        let manifest = self.read_catalog_domain_manifest().await?;
+        self.list_namespaces_from_catalog_manifest(&manifest).await
     }
 
     /// Lists namespaces from a pinned root read token.
@@ -747,9 +764,9 @@ impl CatalogReader {
     ///
     /// Returns an error if the snapshot cannot be read.
     pub async fn get_namespace(&self, name: &str) -> Result<Option<Schema>> {
-        let manifest = self.read_manifest().await?;
+        let manifest = self.read_catalog_domain_manifest().await?;
         let namespaces = self
-            .list_namespaces_from_catalog_manifest(&manifest.catalog)
+            .list_namespaces_from_catalog_manifest(&manifest)
             .await?;
         Ok(namespaces.into_iter().find(|ns| ns.name == name))
     }
@@ -768,8 +785,8 @@ impl CatalogReader {
     ///
     /// Returns an error if the namespace doesn't exist or the snapshot cannot be read.
     pub async fn list_tables(&self, namespace: &str) -> Result<Vec<Table>> {
-        let manifest = self.read_manifest().await?;
-        self.list_tables_from_catalog_manifest(&manifest.catalog, namespace)
+        let manifest = self.read_catalog_domain_manifest().await?;
+        self.list_tables_from_catalog_manifest(&manifest, namespace)
             .await
     }
 
@@ -788,9 +805,9 @@ impl CatalogReader {
     ///
     /// Returns an error if the namespace doesn't exist or the snapshot cannot be read.
     pub async fn get_table(&self, namespace: &str, name: &str) -> Result<Option<Table>> {
-        let manifest = self.read_manifest().await?;
+        let manifest = self.read_catalog_domain_manifest().await?;
         let tables = self
-            .list_tables_from_catalog_manifest(&manifest.catalog, namespace)
+            .list_tables_from_catalog_manifest(&manifest, namespace)
             .await?;
         Ok(tables.into_iter().find(|t| t.name == name))
     }
@@ -805,8 +822,8 @@ impl CatalogReader {
     ///
     /// Returns an error if snapshot reads fail.
     pub async fn get_table_by_id(&self, table_id: &str) -> Result<Option<Table>> {
-        let manifest = self.read_manifest().await?;
-        self.get_table_by_id_from_catalog_manifest(&manifest.catalog, table_id)
+        let manifest = self.read_catalog_domain_manifest().await?;
+        self.get_table_by_id_from_catalog_manifest(&manifest, table_id)
             .await
     }
 
@@ -818,8 +835,8 @@ impl CatalogReader {
     ///
     /// Returns an error if the snapshot cannot be read.
     pub async fn get_columns(&self, table_id: &str) -> Result<Vec<Column>> {
-        let manifest = self.read_manifest().await?;
-        self.get_columns_from_catalog_manifest(&manifest.catalog, table_id)
+        let manifest = self.read_catalog_domain_manifest().await?;
+        self.get_columns_from_catalog_manifest(&manifest, table_id)
             .await
     }
 
@@ -840,15 +857,15 @@ impl CatalogReader {
     ///
     /// Returns an error if the snapshot cannot be read.
     pub async fn get_lineage(&self, table_id: &str) -> Result<LineageGraph> {
-        let manifest = self.read_manifest().await?;
+        let manifest = self.read_lineage_domain_manifest().await?;
 
-        if manifest.lineage.snapshot_version == 0 {
+        if manifest.snapshot_version == 0 {
             return Ok(LineageGraph::default());
         }
 
         let edges_path = CatalogPaths::snapshot_file(
             CatalogDomain::Lineage,
-            manifest.lineage.snapshot_version,
+            manifest.snapshot_version,
             "lineage_edges.parquet",
         );
 
@@ -895,28 +912,34 @@ impl CatalogReader {
     ///
     /// Returns an error if the manifest cannot be read.
     pub async fn get_freshness(&self, domain: CatalogDomain) -> Result<SnapshotFreshness> {
-        let manifest = self.read_manifest().await?;
-
         match domain {
-            CatalogDomain::Catalog => Ok(SnapshotFreshness {
-                version: SnapshotVersion::new(manifest.catalog.snapshot_version),
-                published_at: manifest
-                    .catalog
-                    .snapshot
-                    .as_ref()
-                    .map_or(manifest.catalog.updated_at, |s| s.published_at),
-                tail: None,
-            }),
-            CatalogDomain::Lineage => Ok(SnapshotFreshness {
-                version: SnapshotVersion::new(manifest.lineage.snapshot_version),
-                published_at: manifest
-                    .lineage
-                    .snapshot
-                    .as_ref()
-                    .map_or(manifest.lineage.updated_at, |s| s.published_at),
-                tail: None,
-            }),
+            CatalogDomain::Catalog => {
+                let manifest = self.read_catalog_domain_manifest().await?;
+                Ok(SnapshotFreshness {
+                    version: SnapshotVersion::new(manifest.snapshot_version),
+                    published_at: manifest
+                        .snapshot
+                        .as_ref()
+                        .map_or(manifest.updated_at, |s| s.published_at),
+                    tail: None,
+                })
+            }
+            CatalogDomain::Lineage => {
+                let manifest = self.read_lineage_domain_manifest().await?;
+                Ok(SnapshotFreshness {
+                    version: SnapshotVersion::new(manifest.snapshot_version),
+                    published_at: manifest
+                        .snapshot
+                        .as_ref()
+                        .map_or(manifest.updated_at, |s| s.published_at),
+                    tail: None,
+                })
+            }
+            // Task 1 scopes Catalog/Lineage freshness only. Executions still
+            // resolves through the root manifest path, so these domains stay on
+            // the whole-manifest helper for this slice.
             CatalogDomain::Executions => {
+                let manifest = self.read_manifest().await?;
                 let published_at = manifest
                     .executions
                     .last_compaction_at
@@ -927,15 +950,18 @@ impl CatalogReader {
                     tail: None,
                 })
             }
-            CatalogDomain::Search => Ok(SnapshotFreshness {
-                version: SnapshotVersion::new(manifest.search.snapshot_version),
-                published_at: manifest
-                    .search
-                    .snapshot
-                    .as_ref()
-                    .map_or(manifest.search.updated_at, |s| s.published_at),
-                tail: None,
-            }),
+            CatalogDomain::Search => {
+                let manifest = self.read_manifest().await?;
+                Ok(SnapshotFreshness {
+                    version: SnapshotVersion::new(manifest.search.snapshot_version),
+                    published_at: manifest
+                        .search
+                        .snapshot
+                        .as_ref()
+                        .map_or(manifest.search.updated_at, |s| s.published_at),
+                    tail: None,
+                })
+            }
         }
     }
 

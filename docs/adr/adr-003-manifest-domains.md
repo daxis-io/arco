@@ -43,9 +43,10 @@ The `root.manifest.json` is the **only stable contract** for external readers:
 }
 ```
 
-Readers MUST start from root manifest and follow paths to the per-domain visibility entrypoint. This
-decouples filenames from client code and lets catalog/lineage/search readers resolve immutable
-manifest snapshots through pointers.
+Whole-manifest readers start from the root manifest and follow paths to the per-domain visibility
+entrypoint. Domain-scoped readers may read the relevant domain pointer directly. This decouples
+filenames from client code and lets catalog/lineage/search readers resolve immutable manifest
+snapshots through pointers.
 
 ### Migration Strategy (from current naming)
 

@@ -220,7 +220,8 @@ impl ScopedStorage {
 
     /// Path to the root catalog manifest.
     ///
-    /// This is the entry point - readers load this first to find domain manifests.
+    /// Legacy path for whole-manifest and external readers; domain-scoped
+    /// readers may read the relevant domain pointer directly.
     #[must_use]
     #[deprecated(
         since = "0.1.0",
@@ -367,7 +368,8 @@ impl ScopedStorage {
 
     /// Path to the root manifest (canonical).
     ///
-    /// This is the entry point for all readers per ADR-005.
+    /// Whole-manifest and external readers use this as the stable entry point;
+    /// domain-scoped readers may read the relevant domain pointer directly.
     #[must_use]
     pub fn manifest_root(&self) -> String {
         self.scoped_path(CatalogPaths::ROOT_MANIFEST)

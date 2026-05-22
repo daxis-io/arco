@@ -376,6 +376,169 @@ async fn ordinary_catalog_reads_never_list_storage() {
     );
 }
 
+fn op_get_head_or_range_path(op: &SpyOp) -> Option<&str> {
+    match op {
+        SpyOp::Get { path } | SpyOp::Head { path } | SpyOp::GetRange { path, .. } => Some(path),
+        SpyOp::Put { .. } | SpyOp::Delete { .. } | SpyOp::List { .. } | SpyOp::SignedUrl { .. } => {
+            None
+        }
+    }
+}
+
+fn is_catalog_domain_read_path(path: &str) -> bool {
+    path.ends_with("manifests/catalog.pointer.json")
+        || path.ends_with("manifests/catalog.manifest.json")
+        || path.contains("manifests/catalog/")
+        || path.contains("snapshots/catalog/")
+}
+
+#[tokio::test]
+async fn catalog_metadata_reads_only_catalog_domain_manifest() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let spy = Arc::new(SpyBackend::new(inner));
+    let storage = scoped_storage(spy.clone());
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+    writer
+        .create_catalog("default", None, WriteOptions::default())
+        .await
+        .expect("create catalog");
+    let schema = writer
+        .create_schema("default", "analytics", None, WriteOptions::default())
+        .await
+        .expect("create schema");
+    let table = writer
+        .register_table_in_schema(
+            "default",
+            "analytics",
+            RegisterTableInSchemaRequest {
+                name: "events".to_string(),
+                description: None,
+                location: None,
+                format: Some("delta".to_string()),
+                table_type: None,
+                properties: None,
+                columns: vec![test_column("event_id")],
+            },
+            WriteOptions::default(),
+        )
+        .await
+        .expect("register table");
+
+    let reader = CatalogReader::new(storage);
+    spy.clear_ops();
+    spy.set_fail_on_list(true);
+
+    let catalogs = reader.list_catalogs().await.expect("list catalogs");
+    assert!(catalogs.iter().any(|catalog| catalog.name == "default"));
+    let default_catalog = reader
+        .get_catalog("default")
+        .await
+        .expect("get catalog")
+        .expect("default catalog exists");
+    let schemas = reader.list_schemas("default").await.expect("list schemas");
+    assert!(schemas.iter().any(|candidate| candidate.id == schema.id));
+    let tables_in_schema = reader
+        .list_tables_in_schema("default", "analytics")
+        .await
+        .expect("list tables in schema");
+    assert_eq!(tables_in_schema.len(), 1);
+    assert_eq!(tables_in_schema[0].id, table.id);
+    assert_eq!(
+        reader
+            .get_table_in_schema("default", "analytics", "events")
+            .await
+            .expect("get table in schema")
+            .map(|found| found.id),
+        Some(table.id.clone())
+    );
+
+    let namespaces = reader.list_namespaces().await.expect("list namespaces");
+    assert_eq!(namespaces.len(), 1);
+    assert_eq!(
+        namespaces[0].catalog_id.as_deref(),
+        Some(default_catalog.id.as_str())
+    );
+    assert!(
+        reader
+            .get_namespace("analytics")
+            .await
+            .expect("get namespace")
+            .is_some()
+    );
+    let tables = reader.list_tables("analytics").await.expect("list tables");
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].id, table.id);
+    assert!(
+        reader
+            .get_table("analytics", "events")
+            .await
+            .expect("get table")
+            .is_some()
+    );
+    assert!(
+        reader
+            .get_table_by_id(&table.id)
+            .await
+            .expect("get table by id")
+            .is_some()
+    );
+    let columns = reader.get_columns(&table.id).await.expect("get columns");
+    assert_eq!(columns.len(), 1);
+    reader
+        .get_freshness(CatalogDomain::Catalog)
+        .await
+        .expect("get catalog freshness");
+
+    let unrelated_paths = spy
+        .ops()
+        .into_iter()
+        .filter_map(|op| op_get_head_or_range_path(&op).map(str::to_owned))
+        .filter(|path| {
+            path.contains("lineage") || path.contains("executions") || path.contains("search")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        unrelated_paths.is_empty(),
+        "catalog metadata reads must not fetch unrelated domain manifests: {unrelated_paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn lineage_reads_only_lineage_domain_manifest() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let spy = Arc::new(SpyBackend::new(inner));
+    let storage = scoped_storage(spy.clone());
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+
+    let reader = CatalogReader::new(storage);
+    spy.clear_ops();
+
+    let lineage = reader.get_lineage("missing").await.expect("get lineage");
+    assert!(lineage.upstream.is_empty());
+    assert!(lineage.downstream.is_empty());
+    reader
+        .get_freshness(CatalogDomain::Lineage)
+        .await
+        .expect("get lineage freshness");
+
+    let unrelated_paths = spy
+        .ops()
+        .into_iter()
+        .filter_map(|op| op_get_head_or_range_path(&op).map(str::to_owned))
+        .filter(|path| {
+            is_catalog_domain_read_path(path)
+                || path.contains("executions")
+                || path.contains("search")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        unrelated_paths.is_empty(),
+        "lineage reads must not fetch unrelated domain manifests: {unrelated_paths:?}"
+    );
+}
+
 #[tokio::test]
 async fn root_token_catalog_reads_never_list_storage() {
     let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());

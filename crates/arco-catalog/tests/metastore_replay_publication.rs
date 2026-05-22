@@ -5,7 +5,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arco_catalog::Result;
 use arco_catalog::metastore::events::{
     ExternalLocationRecord, GrantRecord, LifecycleState, ManagedRootRecord, MetastoreEvent,
     MetastoreMutation, PrincipalKind, PrincipalRecord, StorageCredentialRecord,
@@ -13,13 +12,15 @@ use arco_catalog::metastore::events::{
 };
 use arco_catalog::metastore::ledger::MetastoreLedger;
 use arco_catalog::metastore::projections::{
-    METASTORE_OBJECTS_PROJECTION, ProjectionRegistry, STORAGE_GOVERNANCE_PROJECTION,
-    build_projection_set,
+    METASTORE_OBJECTS_PROJECTION, ProjectionRegistry, ProjectionSet, STORAGE_GOVERNANCE_PROJECTION,
+    build_projection_set, write_metastore_objects,
 };
 use arco_catalog::metastore::publish::{
     PointerPublishResult, PublishedProjectionSet, complete_pointer_publication,
+    load_published_storage_governance, publish_metastore_projection_set,
 };
 use arco_catalog::metastore::replay::replay_events;
+use arco_catalog::{CatalogError, Result};
 use arco_core::storage::{MemoryBackend, WritePrecondition};
 use arco_core::{ControlPlaneScope, ScopedStorage};
 use bytes::Bytes;
@@ -321,6 +322,307 @@ async fn metastore_ledger_next_sequence_skips_orphan_sequence_reservations() -> 
     Ok(())
 }
 
+#[tokio::test]
+async fn metastore_ledger_latest_watermark_tracks_latest_persisted_event() -> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
+    let ledger = MetastoreLedger::new(storage);
+    let scope = test_scope();
+
+    assert!(ledger.latest_watermark().await?.is_none());
+
+    ledger
+        .append_event(&scoped_storage_credential_event(
+            &scope,
+            "event_001",
+            1,
+            "cred_01",
+        ))
+        .await?;
+    ledger
+        .append_event(&scoped_principal_event(
+            &scope,
+            "event_005",
+            5,
+            "principal_01",
+        ))
+        .await?;
+
+    let watermark = ledger
+        .latest_watermark()
+        .await?
+        .expect("non-empty ledger should have a latest watermark");
+
+    assert_eq!(watermark.event_id, "event_005");
+    assert_eq!(watermark.sequence, 5);
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_governance_projection_accepts_empty_manifest_for_empty_ledger() -> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
+
+    publish_metastore_projection_set(&storage, &ProjectionSet { files: Vec::new() }, 0).await?;
+
+    let published = load_published_storage_governance(&storage).await?;
+
+    assert_eq!(published.ledger_watermark, "empty");
+    assert!(published.state.list_storage_credentials().is_empty());
+    assert!(published.state.list_external_locations().is_empty());
+    assert!(published.state.list_managed_roots().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_governance_projection_requires_latest_ledger_watermark_after_authz_event()
+-> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
+    let ledger = MetastoreLedger::new(storage.clone());
+    let scope = test_scope();
+
+    for event in scoped_storage_governance_events(&scope) {
+        ledger.append_event(&event).await?;
+    }
+    let state_at_storage_event = ledger.replay().await?;
+    let projection_at_storage_event = build_projection_set(
+        &state_at_storage_event,
+        &ProjectionRegistry::default(),
+        "event_004",
+    )?;
+    publish_metastore_projection_set(&storage, &projection_at_storage_event, 4).await?;
+
+    ledger
+        .append_event(&scoped_principal_event(
+            &scope,
+            "event_005",
+            5,
+            "principal_01",
+        ))
+        .await?;
+
+    let err = load_published_storage_governance(&storage)
+        .await
+        .expect_err("older projection must deny after any newer metastore event");
+    assert_projection_stale(err);
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_governance_projection_uses_ledger_when_sidecar_marker_is_missing() -> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
+    let ledger = MetastoreLedger::new(storage.clone());
+    let scope = test_scope();
+
+    for event in scoped_storage_governance_events(&scope) {
+        ledger.append_event(&event).await?;
+    }
+    let state_at_storage_event = ledger.replay().await?;
+    let projection_at_storage_event = build_projection_set(
+        &state_at_storage_event,
+        &ProjectionRegistry::default(),
+        "event_004",
+    )?;
+    publish_metastore_projection_set(&storage, &projection_at_storage_event, 4).await?;
+
+    write_metastore_event_without_sidecar_marker(
+        &storage,
+        &scoped_storage_credential_event(&scope, "event_005", 5, "cred_02"),
+    )
+    .await?;
+
+    let err = load_published_storage_governance(&storage)
+        .await
+        .expect_err("ledger event without sidecar marker must still make projection stale");
+    assert_projection_stale(err);
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_governance_projection_accepts_latest_non_storage_event_watermark() -> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
+    let ledger = MetastoreLedger::new(storage.clone());
+    let scope = test_scope();
+
+    for event in scoped_storage_governance_events(&scope) {
+        ledger.append_event(&event).await?;
+    }
+    ledger
+        .append_event(&scoped_principal_event(
+            &scope,
+            "event_005",
+            5,
+            "principal_01",
+        ))
+        .await?;
+
+    let latest_state = ledger.replay().await?;
+    let latest_projection =
+        build_projection_set(&latest_state, &ProjectionRegistry::default(), "event_005")?;
+    publish_metastore_projection_set(&storage, &latest_projection, 5).await?;
+
+    let published = load_published_storage_governance(&storage).await?;
+
+    assert_eq!(published.ledger_watermark, "event_005");
+    assert_eq!(published.state.list_external_locations().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_governance_projection_denies_manifest_ahead_of_ledger() -> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
+    let ledger = MetastoreLedger::new(storage.clone());
+    let scope = test_scope();
+
+    for event in scoped_storage_governance_events(&scope) {
+        ledger.append_event(&event).await?;
+    }
+    let state = ledger.replay().await?;
+    let projection = build_projection_set(&state, &ProjectionRegistry::default(), "event_004")?;
+    publish_metastore_projection_set(&storage, &projection, 5).await?;
+
+    let err = load_published_storage_governance(&storage)
+        .await
+        .expect_err("manifest sequence ahead of ledger must deny closed");
+    assert_projection_stale(err);
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_governance_projection_denies_corrupt_projection_file() -> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
+    let ledger = MetastoreLedger::new(storage.clone());
+    let scope = test_scope();
+
+    for event in scoped_storage_governance_events(&scope) {
+        ledger.append_event(&event).await?;
+    }
+    let state = ledger.replay().await?;
+    let projection = build_projection_set(&state, &ProjectionRegistry::default(), "event_004")?;
+    publish_metastore_projection_set(&storage, &projection, 4).await?;
+
+    storage
+        .put_raw(
+            &storage_governance_snapshot_path(4),
+            Bytes::from_static(b"not a parquet file"),
+            WritePrecondition::None,
+        )
+        .await?;
+
+    let err = load_published_storage_governance(&storage)
+        .await
+        .expect_err("corrupt storage-governance projection must deny closed");
+    assert_projection_unavailable(err);
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_governance_projection_denies_row_watermark_mismatch() -> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
+    let ledger = MetastoreLedger::new(storage.clone());
+    let scope = test_scope();
+
+    for event in scoped_storage_governance_events(&scope) {
+        ledger.append_event(&event).await?;
+    }
+    let state = ledger.replay().await?;
+    let projection = build_projection_set(&state, &ProjectionRegistry::default(), "event_004")?;
+    publish_metastore_projection_set(&storage, &projection, 4).await?;
+
+    let mut rows = projection
+        .file(STORAGE_GOVERNANCE_PROJECTION)
+        .expect("storage-governance projection")
+        .rows
+        .clone();
+    for row in &mut rows {
+        row.ledger_watermark = "event_003".to_string();
+    }
+    storage
+        .put_raw(
+            &storage_governance_snapshot_path(4),
+            write_metastore_objects(&rows)?,
+            WritePrecondition::None,
+        )
+        .await?;
+
+    let err = load_published_storage_governance(&storage)
+        .await
+        .expect_err("row watermark mismatch must deny closed");
+    assert_projection_unsupported(err);
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_projection_publish_does_not_roll_back_pointer() -> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
+    let ledger = MetastoreLedger::new(storage.clone());
+    let scope = test_scope();
+
+    for event in scoped_storage_governance_events(&scope) {
+        ledger.append_event(&event).await?;
+    }
+    let state_at_storage_event = ledger.replay().await?;
+    let old_projection = build_projection_set(
+        &state_at_storage_event,
+        &ProjectionRegistry::default(),
+        "event_004",
+    )?;
+    publish_metastore_projection_set(&storage, &old_projection, 4).await?;
+
+    ledger
+        .append_event(&scoped_principal_event(
+            &scope,
+            "event_005",
+            5,
+            "principal_01",
+        ))
+        .await?;
+    let latest_state = ledger.replay().await?;
+    let latest_projection =
+        build_projection_set(&latest_state, &ProjectionRegistry::default(), "event_005")?;
+    publish_metastore_projection_set(&storage, &latest_projection, 5).await?;
+
+    let err = publish_metastore_projection_set(&storage, &old_projection, 4)
+        .await
+        .expect_err("stale publisher must not move pointer backward");
+    assert!(
+        matches!(
+            err,
+            CatalogError::PreconditionFailed { .. } | CatalogError::CasFailed { .. }
+        ),
+        "unexpected stale publish error: {err:?}"
+    );
+
+    let published = load_published_storage_governance(&storage).await?;
+    assert_eq!(published.ledger_watermark, "event_005");
+    Ok(())
+}
+
+#[test]
+fn projection_specs_hide_storage_governance_from_tenant_visibility() {
+    let registry = ProjectionRegistry::default();
+    let specs = registry.specs();
+
+    let storage_governance = specs
+        .iter()
+        .find(|spec| spec.file_name == STORAGE_GOVERNANCE_PROJECTION)
+        .expect("storage-governance projection spec");
+    let metastore_objects = specs
+        .iter()
+        .find(|spec| spec.file_name == METASTORE_OBJECTS_PROJECTION)
+        .expect("metastore object projection spec");
+
+    assert!(!storage_governance.tenant_visible);
+    assert!(metastore_objects.tenant_visible);
+}
+
 #[test]
 fn pointer_publication_is_all_or_nothing() {
     let previous = PublishedProjectionSet::empty("manifest_old", "event_001");
@@ -353,8 +655,6 @@ fn storage_governance_events() -> Vec<MetastoreEvent> {
                 lifecycle_state: LifecycleState::Active,
                 updated_at_ms: 1_800_000_000_000,
                 properties: sensitive_properties(),
-                secret_material_ref: Some("secret://credential/cred_01".to_string()),
-                encrypted_payload: Some("encrypted-secret".to_string()),
             }),
         ),
         MetastoreEvent::new(
@@ -415,6 +715,71 @@ fn test_scope() -> ControlPlaneScope {
     ControlPlaneScope::workspace_alias("tenant1", "workspace1").expect("test scope")
 }
 
+async fn write_metastore_event_without_sidecar_marker(
+    storage: &ScopedStorage,
+    event: &MetastoreEvent,
+) -> Result<()> {
+    let event_bytes = serde_json::to_vec_pretty(event).expect("event should serialize");
+    storage
+        .put_raw(
+            &format!("ledger/metastore/{}.json", event.event_id),
+            Bytes::from(event_bytes),
+            WritePrecondition::DoesNotExist,
+        )
+        .await?;
+    storage
+        .put_raw(
+            &format!("ledger/metastore-sequences/{:020}.event_id", event.sequence),
+            Bytes::copy_from_slice(event.event_id.as_bytes()),
+            WritePrecondition::DoesNotExist,
+        )
+        .await?;
+    Ok(())
+}
+
+fn assert_projection_stale(err: CatalogError) {
+    assert!(
+        matches!(
+            &err,
+            CatalogError::RequestFailed {
+                http_status: 503,
+                message
+            } if message == "storage_governance_projection_stale"
+        ),
+        "unexpected projection freshness error: {err:?}"
+    );
+}
+
+fn assert_projection_unavailable(err: CatalogError) {
+    assert!(
+        matches!(
+            &err,
+            CatalogError::RequestFailed {
+                http_status: 503,
+                message
+            } if message == "storage_governance_projection_unavailable"
+        ),
+        "unexpected projection availability error: {err:?}"
+    );
+}
+
+fn assert_projection_unsupported(err: CatalogError) {
+    assert!(
+        matches!(
+            &err,
+            CatalogError::RequestFailed {
+                http_status: 503,
+                message
+            } if message == "storage_governance_projection_unsupported"
+        ),
+        "unexpected projection support error: {err:?}"
+    );
+}
+
+fn storage_governance_snapshot_path(sequence: u64) -> String {
+    format!("snapshots/metastore/v{sequence}/{STORAGE_GOVERNANCE_PROJECTION}")
+}
+
 fn scoped_storage_credential_event(
     scope: &ControlPlaneScope,
     event_id: &str,
@@ -433,8 +798,28 @@ fn scoped_storage_credential_event(
             lifecycle_state: LifecycleState::Active,
             updated_at_ms: 1_800_000_000_000 + i64::try_from(sequence).expect("sequence fits"),
             properties: BTreeMap::new(),
-            secret_material_ref: Some(format!("secret://credential/{credential_id}")),
-            encrypted_payload: Some("encrypted-secret".to_string()),
+        }),
+    )
+}
+
+fn scoped_principal_event(
+    scope: &ControlPlaneScope,
+    event_id: &str,
+    sequence: u64,
+    principal_id: &str,
+) -> MetastoreEvent {
+    MetastoreEvent::new_scoped(
+        scope,
+        event_id,
+        sequence,
+        MetastoreMutation::PrincipalUpserted(PrincipalRecord {
+            principal_id: principal_id.to_string(),
+            name: format!("{principal_id}@example.com"),
+            principal_kind: PrincipalKind::User,
+            owner: "metastore-admin".to_string(),
+            lifecycle_state: LifecycleState::Active,
+            updated_at_ms: 1_800_000_000_000 + i64::try_from(sequence).expect("sequence fits"),
+            properties: BTreeMap::new(),
         }),
     )
 }
@@ -480,8 +865,6 @@ fn sample_events() -> Vec<MetastoreEvent> {
                 lifecycle_state: LifecycleState::Active,
                 updated_at_ms: 1_800_000_000_002,
                 properties: sensitive_properties(),
-                secret_material_ref: Some("secret://credential/cred_01".to_string()),
-                encrypted_payload: Some("encrypted-secret".to_string()),
             }),
         ),
     ]

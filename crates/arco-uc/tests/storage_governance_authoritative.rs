@@ -175,6 +175,40 @@ async fn storage_governance_routes_append_scoped_metastore_events() {
 }
 
 #[tokio::test]
+async fn storage_credential_create_does_not_persist_request_secret_material() {
+    let backend = Arc::new(MemoryBackend::new());
+    let state = state_with_metastore_manage(backend.clone());
+    let app = unity_catalog_router(state);
+
+    let response = app
+        .oneshot(trusted_json_request(
+            "POST",
+            "/storage-credentials",
+            serde_json::json!({
+                "credential_id": "cred_01",
+                "name": "lakehouse-prod",
+                "cloud": "gcs",
+                "owner": "owner",
+                "secret_material_ref": "secret://cred/01",
+                "encrypted_payload": "encrypted-token"
+            }),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let storage = ScopedStorage::new(backend, "tenant1", "workspace1").expect("scoped storage");
+    let ledger = MetastoreLedger::new(storage);
+    let events = ledger.load_events().await.expect("load events");
+    let serialized = serde_json::to_string(&events).expect("serialize events");
+
+    assert!(!serialized.contains("secret://cred/01"));
+    assert!(!serialized.contains("encrypted-token"));
+    assert!(!serialized.contains("secret_material_ref"));
+    assert!(!serialized.contains("encrypted_payload"));
+}
+
+#[tokio::test]
 async fn storage_governance_routes_deny_when_permissions_are_unavailable() {
     let state = UnityCatalogState::new(Arc::new(MemoryBackend::new()));
     let app = unity_catalog_router(state);

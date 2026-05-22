@@ -13,6 +13,15 @@ use super::replay::{MetastoreState, replay_events};
 const METASTORE_LEDGER_PREFIX: &str = "ledger/metastore/";
 const METASTORE_LEDGER_SEQUENCE_PREFIX: &str = "ledger/metastore-sequences/";
 
+/// Latest persisted metastore ledger watermark.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetastoreLedgerWatermark {
+    /// Latest metastore event ID that must be visible in a published projection.
+    pub event_id: String,
+    /// Latest metastore event sequence that must be visible in a published projection.
+    pub sequence: u64,
+}
+
 /// Append-only native metastore ledger.
 #[derive(Clone)]
 pub struct MetastoreLedger {
@@ -166,6 +175,25 @@ impl MetastoreLedger {
     pub async fn replay(&self) -> Result<MetastoreState> {
         let events = self.load_events().await?;
         replay_events(events.iter())
+    }
+
+    /// Returns the latest persisted metastore event that published projections
+    /// must include, or `None` when the ledger is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisted event loading fails.
+    pub async fn latest_watermark(&self) -> Result<Option<MetastoreLedgerWatermark>> {
+        let latest = self
+            .load_events()
+            .await?
+            .into_iter()
+            .max_by_key(|event| event.sequence)
+            .map(|event| MetastoreLedgerWatermark {
+                event_id: event.event_id,
+                sequence: event.sequence,
+            });
+        Ok(latest)
     }
 
     /// Returns the next sequence number after the current ledger contents.

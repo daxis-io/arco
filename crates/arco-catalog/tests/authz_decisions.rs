@@ -34,6 +34,35 @@ fn authz_decision_denies_by_default_for_missing_grants() {
 }
 
 #[test]
+fn authz_decision_denies_when_compiled_row_object_type_does_not_match_request() {
+    let compiled = CompiledPermissionSet::new(
+        "event_004",
+        "groups-rev-7",
+        true,
+        vec![CompiledPermissionRow {
+            principal_id: "user_alice".to_string(),
+            object_id: "workspace1".to_string(),
+            object_type: "TABLE".to_string(),
+            privilege: Privilege::Manage,
+            source: "grant".to_string(),
+            source_grant_id: Some("grant_wrong_type".to_string()),
+            source_principal_id: "user_alice".to_string(),
+            source_object_id: "workspace1".to_string(),
+            inheritance_path: "workspace1".to_string(),
+            grant_option: false,
+            group_snapshot_version: "groups-rev-7".to_string(),
+        }],
+    );
+    let request = AuthzRequest::new("user_alice", "workspace1", "METASTORE", Privilege::Manage)
+        .with_request_id("req-wrong-type");
+    let decision = AuthzDecision::evaluate(&request, &compiled);
+
+    assert_eq!(decision.outcome, DecisionOutcome::Deny);
+    assert_eq!(decision.reason_code, "absence_of_allow");
+    assert!(decision.evidence.grant_ids.is_empty());
+}
+
+#[test]
 fn authz_decision_denies_stale_or_unknown_compiled_permissions() {
     let stale = compiled_permissions(false);
     let request = AuthzRequest::new("user_alice", "table_orders", "TABLE", Privilege::Select)

@@ -4,9 +4,17 @@ use std::sync::Arc;
 
 use arco_catalog::{
     CatalogWriter, ColumnDefinition, RegisterTableInSchemaRequest, Tier1Compactor, WriteOptions,
+    authz::compiler::{CompiledPermissionRow, CompiledPermissionSet},
+    authz::privileges::Privilege,
+    metastore::{
+        ledger::MetastoreLedger,
+        projections::{ProjectionRegistry, ProjectionSet, build_projection_set},
+        publish::publish_metastore_projection_set,
+    },
 };
 use arco_core::ScopedStorage;
 use arco_core::storage::MemoryBackend;
+use arco_uc::context::UnityCatalogRequestContext;
 use arco_uc::{UnityCatalogState, unity_catalog_router};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
@@ -26,7 +34,7 @@ async fn seeded_router() -> SeededRouter {
         ScopedStorage::new(backend.clone(), "tenant1", "workspace1").expect("scoped storage");
 
     let compactor = Arc::new(Tier1Compactor::new(scoped.clone()));
-    let writer = CatalogWriter::new(scoped)
+    let writer = CatalogWriter::new(scoped.clone())
         .with_sync_compactor(compactor)
         // Tier-1 DDL now validates fencing token expiration; keep TTL comfortably above
         // any in-process compaction/IO jitter to avoid flakiness.
@@ -82,14 +90,74 @@ async fn seeded_router() -> SeededRouter {
         )
         .await
         .expect("register table");
+    let catalog_snapshot_version = publish_empty_storage_governance_projection(&scoped).await;
 
-    let state = UnityCatalogState::new(backend);
+    let state =
+        UnityCatalogState::new(backend).with_compiled_permissions(CompiledPermissionSet::new(
+            catalog_snapshot_version,
+            "groups-rev-discovery",
+            true,
+            vec![permission_row(&table.id, "TABLE", Privilege::Select)],
+        ));
     SeededRouter {
         app: unity_catalog_router(state),
         table_id: table.id,
         table_uri: table
             .location
             .unwrap_or_else(|| "gs://arco-test/tenant1/workspace1/orders".to_string()),
+    }
+}
+
+async fn publish_empty_storage_governance_projection(scoped: &ScopedStorage) -> String {
+    let ledger = MetastoreLedger::new(scoped.clone());
+    let latest = ledger
+        .latest_watermark()
+        .await
+        .expect("load latest metastore watermark");
+    let Some(latest) = latest else {
+        publish_metastore_projection_set(scoped, &ProjectionSet { files: Vec::new() }, 0)
+            .await
+            .expect("publish empty storage-governance projection");
+        return "empty".to_string();
+    };
+
+    let metastore = ledger.replay().await.expect("replay metastore");
+    let projection_set =
+        build_projection_set(&metastore, &ProjectionRegistry::default(), &latest.event_id)
+            .expect("build empty storage-governance projection set");
+    publish_metastore_projection_set(scoped, &projection_set, latest.sequence)
+        .await
+        .expect("publish empty storage-governance projection");
+    latest.event_id
+}
+
+fn permission_row(
+    object_id: &str,
+    object_type: &str,
+    privilege: Privilege,
+) -> CompiledPermissionRow {
+    CompiledPermissionRow {
+        principal_id: "user_alice".to_string(),
+        object_id: object_id.to_string(),
+        object_type: object_type.to_string(),
+        privilege,
+        source: "grant".to_string(),
+        source_grant_id: Some("grant_discovery".to_string()),
+        source_principal_id: "user_alice".to_string(),
+        source_object_id: object_id.to_string(),
+        inheritance_path: object_id.to_string(),
+        grant_option: false,
+        group_snapshot_version: "groups-rev-discovery".to_string(),
+    }
+}
+
+fn trusted_context() -> UnityCatalogRequestContext {
+    UnityCatalogRequestContext {
+        tenant: "tenant1".to_string(),
+        workspace: "workspace1".to_string(),
+        request_id: "request-discovery".to_string(),
+        user_id: Some("user_alice".to_string()),
+        idempotency_key: None,
     }
 }
 
@@ -271,25 +339,23 @@ async fn test_patch_permissions_remains_scaffolded() {
 async fn test_post_temporary_table_credentials_denies_without_governance_binding() {
     let seeded = seeded_router().await;
     let app = seeded.app;
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/temporary-table-credentials")
-                .header("content-type", "application/json")
-                .header("X-Tenant-Id", "tenant1")
-                .header("X-Workspace-Id", "workspace1")
-                .body(Body::from(
-                    json!({
-                        "table_id": seeded.table_id,
-                        "operation": "READ"
-                    })
-                    .to_string(),
-                ))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/temporary-table-credentials")
+        .header("content-type", "application/json")
+        .header("X-Tenant-Id", "tenant1")
+        .header("X-Workspace-Id", "workspace1")
+        .body(Body::from(
+            json!({
+                "table_id": seeded.table_id,
+                "operation": "READ"
+            })
+            .to_string(),
+        ))
+        .expect("request");
+    request.extensions_mut().insert(trusted_context());
+
+    let response = app.oneshot(request).await.expect("response");
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let body = to_bytes(response.into_body(), usize::MAX)
@@ -299,7 +365,7 @@ async fn test_post_temporary_table_credentials_denies_without_governance_binding
     assert!(
         payload["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("path_not_governed"))
+            .is_some_and(|message| message.contains("credential_scope_denied:access_denied"))
     );
 }
 

@@ -4,11 +4,12 @@
 use arco_catalog::CatalogReader;
 use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::credential_vending::{
-    CredentialDecision, CredentialOperation, CredentialVendingEngine, CredentialVendingRequest,
-    DEFAULT_CREDENTIAL_TTL,
+    CredentialDecision, CredentialOperation, CredentialVendingAuthorization,
+    CredentialVendingEngine, CredentialVendingRequest, DEFAULT_CREDENTIAL_TTL,
 };
-use arco_catalog::metastore::ledger::MetastoreLedger;
-use arco_catalog::storage_governance::StorageGovernanceState;
+use arco_catalog::error::CatalogError;
+use arco_catalog::metastore::publish::load_published_storage_governance;
+use arco_catalog::storage_governance::{PathDecision, StorageGovernanceState};
 use axum::Json;
 use axum::Router;
 use axum::extract::{Extension, OriginalUri, State};
@@ -21,7 +22,10 @@ use serde_json::json;
 use crate::audit;
 use crate::context::UnityCatalogRequestContext;
 use crate::error::{UnityCatalogError, UnityCatalogErrorResponse, UnityCatalogResult};
-use crate::routes::common::{authz_denial_reason, map_catalog_error, scoped_storage};
+use crate::routes::common::{
+    authz_context_denial_reason_for_watermark, authz_denial_reason_for_watermark,
+    map_catalog_error, scoped_storage,
+};
 use crate::state::UnityCatalogState;
 
 #[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
@@ -49,6 +53,7 @@ struct CredentialAuthzTarget {
     object_id: String,
     object_type: &'static str,
     privilege: Privilege,
+    permission_ledger_watermark: String,
 }
 
 /// Temporary credential route group.
@@ -124,8 +129,32 @@ pub(crate) async fn post_temporary_table_credentials(
             message: format!("unknown table operation: {operation}"),
         });
     };
+    let authz_target = CredentialAuthzTarget {
+        object_id: table_id.clone(),
+        object_type: "TABLE",
+        privilege: table_privilege_for_operation(operation),
+        permission_ledger_watermark: String::new(),
+    };
+    if let Some(reason_code) = authz_context_denial_reason_for_watermark(&state, &ctx, None) {
+        audit::emit_credentials_deny(&state, &ctx, &table_id, &reason_code);
+        return credential_denied(reason_code, None);
+    }
 
     let storage = scoped_storage(&state, &ctx)?;
+    let published = load_published_storage_governance(&storage)
+        .await
+        .map_err(credential_projection_error)?;
+    let catalog_snapshot_version = published.ledger_watermark.clone();
+    if let Some(reason_code) = credential_authz_denial_reason_for_watermark(
+        &state,
+        &ctx,
+        &authz_target,
+        Some(&catalog_snapshot_version),
+    ) {
+        audit::emit_credentials_deny(&state, &ctx, &table_id, &reason_code);
+        return credential_denied(reason_code, None);
+    }
+
     let table = CatalogReader::new(storage)
         .get_table_by_id(&table_id)
         .await
@@ -144,11 +173,7 @@ pub(crate) async fn post_temporary_table_credentials(
         &ctx,
         location,
         operation,
-        Some(CredentialAuthzTarget {
-            object_id: table_id,
-            object_type: "TABLE",
-            privilege: table_privilege_for_operation(operation),
-        }),
+        Some(authz_target),
         payload
             .requested_ttl_seconds
             .map_or(DEFAULT_CREDENTIAL_TTL, std::time::Duration::from_secs),
@@ -197,6 +222,10 @@ pub(crate) async fn post_temporary_path_credentials(
             message: format!("unknown path operation: {}", request.operation),
         });
     };
+    if let Some(reason_code) = authz_context_denial_reason_for_watermark(&state, &ctx, None) {
+        audit::emit_credentials_deny(&state, &ctx, &request.url, &reason_code);
+        return credential_denied(reason_code, None);
+    }
 
     vend_path_credentials(
         &state,
@@ -219,16 +248,54 @@ async fn vend_path_credentials(
     authz_target: Option<CredentialAuthzTarget>,
     requested_ttl: std::time::Duration,
 ) -> UnityCatalogResult<(StatusCode, Json<serde_json::Value>)> {
+    if let Some(reason_code) = authz_context_denial_reason_for_watermark(state, ctx, None) {
+        audit::emit_credentials_deny(state, ctx, &requested_path, &reason_code);
+        return credential_denied(reason_code, None);
+    }
+    if !supports_vended_operation(operation) {
+        audit::emit_credentials_deny(state, ctx, &requested_path, "unsupported_operation");
+        return credential_denied("unsupported_operation".to_string(), None);
+    }
+
     let storage = scoped_storage(state, ctx)?;
-    let ledger = MetastoreLedger::new(storage);
-    let metastore = ledger.replay().await.map_err(map_catalog_error)?;
-    let storage_governance =
-        StorageGovernanceState::from_metastore_state(&metastore).map_err(map_catalog_error)?;
+    let published = load_published_storage_governance(&storage)
+        .await
+        .map_err(credential_projection_error)?;
+    let catalog_snapshot_version = published.ledger_watermark.clone();
+    if let Some(reason_code) =
+        authz_context_denial_reason_for_watermark(state, ctx, Some(&catalog_snapshot_version))
+    {
+        audit::emit_credentials_deny(state, ctx, &requested_path, &reason_code);
+        return credential_denied(reason_code, None);
+    }
+    let storage_governance = published.state;
+
+    let Ok(path_decision) = storage_governance.authority_for_path(&ctx.workspace, &requested_path)
+    else {
+        audit::emit_credentials_deny(state, ctx, &requested_path, "path_not_governed");
+        return credential_denied("access_denied".to_string(), None);
+    };
+
+    let mut authz_target = match authz_target {
+        Some(target) => target,
+        None => storage_authz_target(&storage_governance, &path_decision, operation)?,
+    };
+    if let Some(reason_code) = credential_authz_denial_reason_for_watermark(
+        state,
+        ctx,
+        &authz_target,
+        Some(&catalog_snapshot_version),
+    ) {
+        audit::emit_credentials_deny(state, ctx, &requested_path, &reason_code);
+        return credential_denied("access_denied".to_string(), None);
+    }
+    authz_target.permission_ledger_watermark = catalog_snapshot_version.clone();
+
     let decision = CredentialVendingEngine::default()
         .decide_path(
             &storage_governance,
             &CredentialVendingRequest {
-                principal_id: format!("tenant:{}", ctx.tenant),
+                principal_id: ctx.user_id.clone().unwrap_or_default(),
                 groups_snapshot_version: "unknown".to_string(),
                 workspace_id: ctx.workspace.clone(),
                 request_id: ctx.request_id.clone(),
@@ -236,35 +303,26 @@ async fn vend_path_credentials(
                 requested_path: requested_path.clone(),
                 requested_ttl,
                 client_kind: "uc".to_string(),
-                catalog_snapshot_version: metastore
-                    .ledger_watermark
-                    .unwrap_or_else(|| "empty".to_string()),
+                catalog_snapshot_version,
+                authorization: Some(CredentialVendingAuthorization {
+                    principal_id: ctx.user_id.clone().unwrap_or_default(),
+                    object_id: authz_target.object_id.clone(),
+                    object_type: authz_target.object_type.to_string(),
+                    privilege: authz_target.privilege,
+                    permission_ledger_watermark: authz_target.permission_ledger_watermark.clone(),
+                    path_authority_object_id: path_decision.object_id.clone(),
+                    path_authority_object_type: path_authority_object_type(
+                        &storage_governance,
+                        &path_decision,
+                    )?,
+                }),
             },
         )
         .map_err(map_catalog_error)?;
 
     if decision.decision == CredentialDecision::Deny {
         audit::emit_credentials_deny(state, ctx, &requested_path, &decision.reason_code);
-        return Err(UnityCatalogError::Forbidden {
-            message: format!(
-                "credential_scope_denied:{} audit_event_id={}",
-                decision.reason_code, decision.audit_event_id
-            ),
-        });
-    }
-
-    let authz_target = match authz_target {
-        Some(target) => target,
-        None => storage_authz_target(&storage_governance, &decision, operation)?,
-    };
-    if let Some(reason_code) = credential_authz_denial_reason(state, ctx, &authz_target) {
-        audit::emit_credentials_deny(state, ctx, &requested_path, &reason_code);
-        return Err(UnityCatalogError::Forbidden {
-            message: format!(
-                "credential_scope_denied:{} audit_event_id={}",
-                reason_code, decision.audit_event_id
-            ),
-        });
+        return credential_denied(decision.reason_code, Some(&decision.audit_event_id));
     }
 
     audit::emit_credentials_allow(state, ctx, &requested_path, &decision.reason_code);
@@ -295,18 +353,19 @@ async fn vend_path_credentials(
     Ok((StatusCode::OK, Json(payload)))
 }
 
+fn credential_projection_error(err: CatalogError) -> UnityCatalogError {
+    let message = err.to_string();
+    UnityCatalogError::ServiceUnavailable {
+        message: format!("credential_scope_unavailable:{message}"),
+    }
+}
+
 fn storage_authz_target(
     state: &StorageGovernanceState,
-    decision: &arco_catalog::credential_vending::CredentialVendingDecision,
+    path_decision: &PathDecision,
     operation: CredentialOperation,
 ) -> UnityCatalogResult<CredentialAuthzTarget> {
-    let object_id =
-        decision
-            .authorized_object_id
-            .clone()
-            .ok_or_else(|| UnityCatalogError::Internal {
-                message: "missing authorized storage governance object".to_string(),
-            })?;
+    let object_id = path_decision.object_id.clone();
     let object_type = if state.get_external_location(&object_id).is_some() {
         "EXTERNAL_LOCATION"
     } else if state.get_managed_root(&object_id).is_some() {
@@ -321,21 +380,62 @@ fn storage_authz_target(
         object_id,
         object_type,
         privilege: path_privilege_for_operation(operation),
+        permission_ledger_watermark: String::new(),
     })
 }
 
-fn credential_authz_denial_reason(
+fn credential_authz_denial_reason_for_watermark(
     state: &UnityCatalogState,
     ctx: &UnityCatalogRequestContext,
     target: &CredentialAuthzTarget,
+    expected_ledger_watermark: Option<&str>,
 ) -> Option<String> {
-    authz_denial_reason(
+    authz_denial_reason_for_watermark(
         state,
         ctx,
         &target.object_id,
         target.object_type,
         target.privilege,
+        expected_ledger_watermark,
     )
+}
+
+fn path_authority_object_type(
+    state: &StorageGovernanceState,
+    path_decision: &PathDecision,
+) -> UnityCatalogResult<String> {
+    if state
+        .get_external_location(&path_decision.object_id)
+        .is_some()
+    {
+        Ok("EXTERNAL_LOCATION".to_string())
+    } else if state.get_managed_root(&path_decision.object_id).is_some() {
+        Ok("MANAGED_ROOT".to_string())
+    } else {
+        Err(UnityCatalogError::Internal {
+            message: format!(
+                "unknown authorized storage governance object: {}",
+                path_decision.object_id
+            ),
+        })
+    }
+}
+
+fn supports_vended_operation(operation: CredentialOperation) -> bool {
+    matches!(
+        operation,
+        CredentialOperation::Read | CredentialOperation::Write | CredentialOperation::List
+    )
+}
+
+fn credential_denied(
+    reason_code: String,
+    audit_event_id: Option<&str>,
+) -> UnityCatalogResult<(StatusCode, Json<serde_json::Value>)> {
+    let suffix = audit_event_id.map_or_else(String::new, |id| format!(" audit_event_id={id}"));
+    Err(UnityCatalogError::Forbidden {
+        message: format!("credential_scope_denied:{reason_code}{suffix}"),
+    })
 }
 
 fn table_privilege_for_operation(operation: CredentialOperation) -> Privilege {

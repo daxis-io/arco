@@ -116,11 +116,13 @@ impl CompiledPermissionSet {
         &self,
         principal_id: &str,
         object_id: &str,
+        object_type: &str,
         privilege: Privilege,
     ) -> impl Iterator<Item = &CompiledPermissionRow> {
         self.rows.iter().filter(move |row| {
             row.principal_id == principal_id
                 && row.object_id == object_id
+                && row.object_type.eq_ignore_ascii_case(object_type)
                 && row.privilege.implies(privilege)
         })
     }

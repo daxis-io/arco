@@ -4,6 +4,9 @@ use std::collections::BTreeMap;
 
 use crate::error::{CatalogError, Result};
 use crate::metastore::events::LifecycleState;
+use crate::metastore::projections::{
+    MetastoreObjectProjectionRecord, STORAGE_GOVERNANCE_SCHEMA_VERSION,
+};
 use crate::metastore::replay::MetastoreState;
 
 use self::bindings::WorkspaceBinding;
@@ -164,10 +167,7 @@ impl StorageGovernanceState {
                     owner: record.owner.clone(),
                     lifecycle_state: record.lifecycle_state,
                 },
-                CredentialSecret::new(
-                    record.secret_material_ref.clone().unwrap_or_default(),
-                    record.encrypted_payload.clone().unwrap_or_default(),
-                ),
+                CredentialSecret::new("", ""),
             )?;
         }
 
@@ -214,6 +214,104 @@ impl StorageGovernanceState {
                 record.owner.clone(),
             );
             binding.lifecycle_state = record.lifecycle_state;
+            state.bind_workspace(binding)?;
+        }
+
+        Ok(state)
+    }
+
+    /// Builds enforcement-grade storage-governance state from the published
+    /// redacted storage-governance projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when projection rows are stale, malformed, or unsafe for
+    /// enforcement.
+    pub fn from_projection_rows(rows: &[MetastoreObjectProjectionRecord]) -> Result<Self> {
+        let mut state = Self::default();
+
+        for row in rows
+            .iter()
+            .filter(|row| row.object_type.starts_with("storage_credential"))
+        {
+            ensure_storage_governance_schema(row)?;
+            let cloud = row
+                .object_type
+                .strip_prefix("storage_credential:")
+                .ok_or_else(|| CatalogError::Validation {
+                    message: format!(
+                        "storage governance projection credential '{}' is missing provider",
+                        row.object_id
+                    ),
+                })?;
+            state.create_storage_credential(
+                StorageCredentialMetadata {
+                    credential_id: row.object_id.clone(),
+                    name: required_projection_field(row, row.name.as_deref(), "name")?,
+                    cloud: cloud.to_string(),
+                    owner: required_projection_field(row, row.owner.as_deref(), "owner")?,
+                    lifecycle_state: lifecycle_state_from_projection(row)?,
+                },
+                CredentialSecret::new("", ""),
+            )?;
+        }
+
+        for row in rows
+            .iter()
+            .filter(|row| row.object_type == "external_location")
+        {
+            ensure_storage_governance_schema(row)?;
+            let mut location = ExternalLocation::new(
+                row.object_id.clone(),
+                required_projection_field(row, row.name.as_deref(), "name")?,
+                &required_projection_field(row, row.url.as_deref(), "url")?,
+                required_projection_field(row, row.credential_id.as_deref(), "credential_id")?,
+                required_projection_field(row, row.owner.as_deref(), "owner")?,
+            )?;
+            location.lifecycle_state = lifecycle_state_from_projection(row)?;
+            if location.lifecycle_state == LifecycleState::Active {
+                state.create_external_location(location)?;
+            } else {
+                state
+                    .external_locations
+                    .insert(location.location_id.clone(), location);
+            }
+        }
+
+        for row in rows.iter().filter(|row| row.object_type == "managed_root") {
+            ensure_storage_governance_schema(row)?;
+            let mut root = ManagedRoot::new(
+                row.object_id.clone(),
+                required_projection_field(row, row.name.as_deref(), "name")?,
+                required_projection_field(row, row.workspace_id.as_deref(), "workspace_id")?,
+                &required_projection_field(row, row.url.as_deref(), "url")?,
+                required_projection_field(row, row.owner.as_deref(), "owner")?,
+            )?;
+            root.lifecycle_state = lifecycle_state_from_projection(row)?;
+            if root.lifecycle_state == LifecycleState::Active {
+                state.create_managed_root(root)?;
+            } else {
+                state.managed_roots.insert(root.root_id.clone(), root);
+            }
+        }
+
+        for row in rows
+            .iter()
+            .filter(|row| row.object_type == "workspace_binding")
+        {
+            ensure_storage_governance_schema(row)?;
+            let mut binding = WorkspaceBinding::new(
+                row.object_id.clone(),
+                required_projection_field(row, row.workspace_id.as_deref(), "workspace_id")?,
+                required_projection_field(row, row.bound_object_id.as_deref(), "bound_object_id")?,
+                required_projection_field(
+                    row,
+                    row.bound_object_type.as_deref(),
+                    "bound_object_type",
+                )?,
+                required_projection_field(row, row.owner.as_deref(), "owner")?,
+            );
+            binding.lifecycle_state = lifecycle_state_from_projection(row)?;
             state.bind_workspace(binding)?;
         }
 
@@ -395,6 +493,50 @@ fn authority_object_type(kind: PathAuthorityKind) -> &'static str {
     match kind {
         PathAuthorityKind::ExternalLocation => "EXTERNAL_LOCATION",
         PathAuthorityKind::ManagedRoot => "MANAGED_ROOT",
+    }
+}
+
+fn ensure_storage_governance_schema(row: &MetastoreObjectProjectionRecord) -> Result<()> {
+    if row.schema_version != STORAGE_GOVERNANCE_SCHEMA_VERSION {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "unsupported storage governance projection schema version {}",
+                row.schema_version
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn required_projection_field(
+    row: &MetastoreObjectProjectionRecord,
+    value: Option<&str>,
+    field_name: &str,
+) -> Result<String> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| CatalogError::Validation {
+            message: format!(
+                "storage governance projection row '{}' missing required field '{field_name}'",
+                row.object_id
+            ),
+        })
+}
+
+fn lifecycle_state_from_projection(
+    row: &MetastoreObjectProjectionRecord,
+) -> Result<LifecycleState> {
+    match row.lifecycle_state.as_str() {
+        "active" => Ok(LifecycleState::Active),
+        "deleted" => Ok(LifecycleState::Deleted),
+        "disabled" => Ok(LifecycleState::Disabled),
+        other => Err(CatalogError::Validation {
+            message: format!(
+                "storage governance projection row '{}' has invalid lifecycle state '{other}'",
+                row.object_id
+            ),
+        }),
     }
 }
 

@@ -30,8 +30,6 @@ struct CreateStorageCredentialRequest {
     name: String,
     cloud: String,
     owner: String,
-    secret_material_ref: Option<String>,
-    encrypted_payload: Option<String>,
 }
 
 /// Storage credential route group.
@@ -83,8 +81,6 @@ async fn create_storage_credential(
             lifecycle_state: LifecycleState::Active,
             updated_at_ms: Utc::now().timestamp_millis(),
             properties: BTreeMap::new(),
-            secret_material_ref: request.secret_material_ref,
-            encrypted_payload: request.encrypted_payload,
         }),
     );
     ledger

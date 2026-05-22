@@ -122,10 +122,6 @@ pub struct StorageCredentialRecord {
     pub updated_at_ms: i64,
     /// Compatibility metadata. Not an enforcement model.
     pub properties: BTreeMap<String, String>,
-    /// Internal reference to secret material. Never exposed in projections.
-    pub secret_material_ref: Option<String>,
-    /// Internal encrypted payload. Never exposed in projections.
-    pub encrypted_payload: Option<String>,
 }
 
 /// External location metadata used by the replay kernel.

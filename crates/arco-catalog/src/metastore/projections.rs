@@ -4,11 +4,12 @@ use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::sync::Arc;
 
-use arrow::array::{Int32Array, Int64Array, StringArray};
+use arrow::array::{Array as _, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
 
@@ -80,7 +81,7 @@ impl ProjectionRegistry {
             .map(|file_name| ProjectionSpec {
                 file_name,
                 schema_version: projection_schema_version(file_name),
-                tenant_visible: true,
+                tenant_visible: file_name != STORAGE_GOVERNANCE_PROJECTION,
             })
             .collect()
     }
@@ -324,7 +325,7 @@ pub fn storage_governance_rows(
             schema_version: STORAGE_GOVERNANCE_SCHEMA_VERSION,
             ledger_watermark: ledger_watermark.to_string(),
             object_id: record.credential_id.clone(),
-            object_type: "storage_credential".to_string(),
+            object_type: format!("storage_credential:{}", record.cloud),
             name: Some(record.name.clone()),
             owner: Some(record.owner.clone()),
             lifecycle_state: record.lifecycle_state.as_str().to_string(),
@@ -521,6 +522,135 @@ pub fn write_metastore_objects(rows: &[MetastoreObjectProjectionRecord]) -> Resu
     })?;
 
     Ok(Bytes::from(cursor.into_inner()))
+}
+
+/// Reads metastore projection rows from Parquet bytes.
+///
+/// # Errors
+///
+/// Returns an error if Parquet decoding fails or required columns are missing.
+pub fn read_metastore_object_rows(bytes: &Bytes) -> Result<Vec<MetastoreObjectProjectionRecord>> {
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+        .map_err(|err| CatalogError::Parquet {
+            message: format!("metastore object parquet reader init failed: {err}"),
+        })?
+        .build()
+        .map_err(|err| CatalogError::Parquet {
+            message: format!("metastore object parquet reader build failed: {err}"),
+        })?;
+
+    let mut rows = Vec::new();
+    for batch in reader {
+        let batch = batch.map_err(|err| CatalogError::Parquet {
+            message: format!("metastore object parquet read failed: {err}"),
+        })?;
+        let schema_versions = col_i32(&batch, "schema_version")?;
+        let ledger_watermarks = col_string(&batch, "ledger_watermark")?;
+        let object_ids = col_string(&batch, "object_id")?;
+        let object_types = col_string(&batch, "object_type")?;
+        let names = col_string_optional(&batch, "name")?;
+        let owners = col_string_optional(&batch, "owner")?;
+        let lifecycle_states = col_string(&batch, "lifecycle_state")?;
+        let updated_at = col_i64(&batch, "updated_at")?;
+        let urls = col_string_optional(&batch, "url")?;
+        let credential_ids = col_string_optional(&batch, "credential_id")?;
+        let workspace_ids = col_string_optional(&batch, "workspace_id")?;
+        let bound_object_ids = col_string_optional(&batch, "bound_object_id")?;
+        let bound_object_types = col_string_optional(&batch, "bound_object_type")?;
+        let properties_json = col_string_optional(&batch, "properties_json")?;
+
+        for row_index in 0..batch.num_rows() {
+            rows.push(MetastoreObjectProjectionRecord {
+                schema_version: schema_versions.value(row_index),
+                ledger_watermark: required_string(
+                    ledger_watermarks,
+                    row_index,
+                    "ledger_watermark",
+                )?,
+                object_id: required_string(object_ids, row_index, "object_id")?,
+                object_type: required_string(object_types, row_index, "object_type")?,
+                name: optional_string(names, row_index),
+                owner: optional_string(owners, row_index),
+                lifecycle_state: required_string(lifecycle_states, row_index, "lifecycle_state")?,
+                updated_at: updated_at.value(row_index),
+                url: optional_string(urls, row_index),
+                credential_id: optional_string(credential_ids, row_index),
+                workspace_id: optional_string(workspace_ids, row_index),
+                bound_object_id: optional_string(bound_object_ids, row_index),
+                bound_object_type: optional_string(bound_object_types, row_index),
+                properties_json: optional_string(properties_json, row_index),
+            });
+        }
+    }
+
+    Ok(rows)
+}
+
+fn col_string<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| CatalogError::Parquet {
+            message: format!("missing required projection column '{name}'"),
+        })?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| CatalogError::Parquet {
+            message: format!("projection column '{name}' is not a string array"),
+        })
+}
+
+fn col_string_optional<'a>(batch: &'a RecordBatch, name: &str) -> Result<Option<&'a StringArray>> {
+    batch
+        .column_by_name(name)
+        .map(|column| {
+            column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| CatalogError::Parquet {
+                    message: format!("projection column '{name}' is not a string array"),
+                })
+        })
+        .transpose()
+}
+
+fn col_i32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int32Array> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| CatalogError::Parquet {
+            message: format!("missing required projection column '{name}'"),
+        })?
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .ok_or_else(|| CatalogError::Parquet {
+            message: format!("projection column '{name}' is not an int32 array"),
+        })
+}
+
+fn col_i64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| CatalogError::Parquet {
+            message: format!("missing required projection column '{name}'"),
+        })?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| CatalogError::Parquet {
+            message: format!("projection column '{name}' is not an int64 array"),
+        })
+}
+
+fn required_string(array: &StringArray, row_index: usize, field_name: &str) -> Result<String> {
+    if array.is_null(row_index) {
+        return Err(CatalogError::Parquet {
+            message: format!("projection row missing required string column '{field_name}'"),
+        });
+    }
+    Ok(array.value(row_index).to_string())
+}
+
+fn optional_string(array: Option<&StringArray>, row_index: usize) -> Option<String> {
+    let array = array?;
+    (!array.is_null(row_index)).then(|| array.value(row_index).to_string())
 }
 
 fn projection_schema_version(file_name: &str) -> i32 {

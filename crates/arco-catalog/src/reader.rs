@@ -350,6 +350,13 @@ impl CatalogReader {
         Ok(read_model)
     }
 
+    async fn uncached_catalog_read_model(
+        &self,
+        manifest: &CatalogDomainManifest,
+    ) -> Result<CatalogReadModel> {
+        CatalogReadModel::load(&self.storage, manifest).await
+    }
+
     async fn read_domain_manifest_bytes(
         &self,
         domain: CatalogDomain,
@@ -436,100 +443,6 @@ impl CatalogReader {
                 .await?,
         })
     }
-
-    async fn list_namespaces_from_catalog_manifest(
-        &self,
-        manifest: &CatalogDomainManifest,
-    ) -> Result<Vec<Schema>> {
-        if manifest.snapshot_version == 0 {
-            return Ok(Vec::new());
-        }
-
-        let ns_path = CatalogPaths::snapshot_file(
-            CatalogDomain::Catalog,
-            manifest.snapshot_version,
-            "namespaces.parquet",
-        );
-
-        let bytes = self.storage.get_raw(&ns_path).await?;
-        let records = parquet_util::read_namespaces(&bytes)?;
-
-        records.into_iter().map(Schema::try_from).collect()
-    }
-
-    #[cfg(test)]
-    async fn list_tables_for_namespace_id(
-        &self,
-        catalog_manifest: &CatalogDomainManifest,
-        namespace_id: &str,
-    ) -> Result<Vec<Table>> {
-        let tables_path = CatalogPaths::snapshot_file(
-            CatalogDomain::Catalog,
-            catalog_manifest.snapshot_version,
-            "tables.parquet",
-        );
-        let bytes = self.storage.get_raw(&tables_path).await?;
-        let records = parquet_util::read_tables(&bytes)?;
-
-        records
-            .into_iter()
-            .filter(|table| table.namespace_id == namespace_id)
-            .map(Table::try_from)
-            .collect()
-    }
-
-    #[cfg(test)]
-    async fn list_tables_from_catalog_manifest(
-        &self,
-        catalog_manifest: &CatalogDomainManifest,
-        namespace: &str,
-    ) -> Result<Vec<Table>> {
-        if catalog_manifest.snapshot_version == 0 {
-            return Err(CatalogError::NotFound {
-                entity: "namespace".into(),
-                name: namespace.to_string(),
-            });
-        }
-
-        let namespace_id = self
-            .list_namespaces_from_catalog_manifest(catalog_manifest)
-            .await?
-            .into_iter()
-            .find(|ns| ns.name == namespace)
-            .map(|ns| ns.id)
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "namespace".into(),
-                name: namespace.to_string(),
-            })?;
-
-        self.list_tables_for_namespace_id(catalog_manifest, namespace_id.as_str())
-            .await
-    }
-
-    #[cfg(test)]
-    async fn get_table_by_id_from_catalog_manifest(
-        &self,
-        catalog_manifest: &CatalogDomainManifest,
-        table_id: &str,
-    ) -> Result<Option<Table>> {
-        if catalog_manifest.snapshot_version == 0 {
-            return Ok(None);
-        }
-
-        let tables_path = CatalogPaths::snapshot_file(
-            CatalogDomain::Catalog,
-            catalog_manifest.snapshot_version,
-            "tables.parquet",
-        );
-        let bytes = self.storage.get_raw(&tables_path).await?;
-        let records = parquet_util::read_tables(&bytes)?;
-        let tables = records
-            .into_iter()
-            .map(Table::try_from)
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(tables.into_iter().find(|table| table.id == table_id))
-    }
     // ========================================================================
     // Catalog Operations (UC-like model)
     // ========================================================================
@@ -582,16 +495,7 @@ impl CatalogReader {
     pub async fn list_tables_in_schema(&self, catalog: &str, schema: &str) -> Result<Vec<Table>> {
         let manifest = self.read_catalog_domain_manifest().await?;
         let read_model = self.catalog_read_model(&manifest).await?;
-        let namespace_id = read_model
-            .list_schemas(catalog)?
-            .iter()
-            .find(|ns| ns.name == schema)
-            .map(|ns| ns.id.clone())
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "schema".into(),
-                name: format!("{catalog}.{schema}"),
-            })?;
-        Ok(read_model.list_tables_for_namespace_id(namespace_id.as_str()))
+        read_model.list_tables_in_schema(catalog, schema)
     }
 
     /// Gets a table by full UC-like name (catalog.schema.table).
@@ -609,8 +513,9 @@ impl CatalogReader {
         schema: &str,
         table: &str,
     ) -> Result<Option<Table>> {
-        let tables = self.list_tables_in_schema(catalog, schema).await?;
-        Ok(tables.into_iter().find(|t| t.name == table))
+        let manifest = self.read_catalog_domain_manifest().await?;
+        let read_model = self.catalog_read_model(&manifest).await?;
+        read_model.get_table_in_schema(catalog, schema, table)
     }
 
     // ========================================================================
@@ -642,7 +547,8 @@ impl CatalogReader {
         let manifest = self
             .read_catalog_manifest_for_root_token(read_token)
             .await?;
-        self.list_namespaces_from_catalog_manifest(&manifest).await
+        let read_model = self.uncached_catalog_read_model(&manifest).await?;
+        Ok(read_model.list_namespaces())
     }
 
     /// Gets a namespace by name.
@@ -1112,37 +1018,47 @@ fn validate_storage_scope(storage: &ScopedStorage, scope: &ControlPlaneScope) ->
 impl PinnedCatalogReader<'_> {
     /// Lists namespaces from the pinned catalog manifest.
     pub async fn list_namespaces(&self) -> Result<Vec<Schema>> {
-        self.reader
-            .list_namespaces_from_catalog_manifest(&self.catalog_manifest)
-            .await
+        let read_model = self
+            .reader
+            .uncached_catalog_read_model(&self.catalog_manifest)
+            .await?;
+        Ok(read_model.list_namespaces())
     }
 
     /// Gets a namespace by name from the pinned catalog manifest.
     pub async fn get_namespace(&self, name: &str) -> Result<Option<Schema>> {
-        let namespaces = self.list_namespaces().await?;
-        Ok(namespaces
-            .into_iter()
-            .find(|namespace| namespace.name == name))
+        let read_model = self
+            .reader
+            .uncached_catalog_read_model(&self.catalog_manifest)
+            .await?;
+        Ok(read_model.get_namespace(name))
     }
 
     /// Lists tables in a namespace from the pinned catalog manifest.
     pub async fn list_tables(&self, namespace: &str) -> Result<Vec<Table>> {
-        self.reader
-            .list_tables_from_catalog_manifest(&self.catalog_manifest, namespace)
-            .await
+        let read_model = self
+            .reader
+            .uncached_catalog_read_model(&self.catalog_manifest)
+            .await?;
+        read_model.list_tables(namespace)
     }
 
     /// Gets a table by namespace and name from the pinned catalog manifest.
     pub async fn get_table(&self, namespace: &str, name: &str) -> Result<Option<Table>> {
-        let tables = self.list_tables(namespace).await?;
-        Ok(tables.into_iter().find(|table| table.name == name))
+        let read_model = self
+            .reader
+            .uncached_catalog_read_model(&self.catalog_manifest)
+            .await?;
+        read_model.get_table(namespace, name)
     }
 
     /// Gets a table by table ID from the pinned catalog manifest.
     pub async fn get_table_by_id(&self, table_id: &str) -> Result<Option<Table>> {
-        self.reader
-            .get_table_by_id_from_catalog_manifest(&self.catalog_manifest, table_id)
-            .await
+        let read_model = self
+            .reader
+            .uncached_catalog_read_model(&self.catalog_manifest)
+            .await?;
+        Ok(read_model.get_table_by_id(table_id))
     }
 }
 

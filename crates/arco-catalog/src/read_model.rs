@@ -259,10 +259,35 @@ impl CatalogReadModel {
         Ok(self.list_tables_for_namespace_id(namespace_id))
     }
 
+    /// Lists tables within a schema in a catalog.
+    pub(crate) fn list_tables_in_schema(&self, catalog: &str, schema: &str) -> Result<Vec<Table>> {
+        let namespace_id = self
+            .list_schemas(catalog)?
+            .iter()
+            .find(|namespace| namespace.name == schema)
+            .map(|namespace| namespace.id.clone())
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "schema".into(),
+                name: format!("{catalog}.{schema}"),
+            })?;
+        Ok(self.list_tables_for_namespace_id(namespace_id.as_str()))
+    }
+
     /// Gets a table by legacy namespace name and table name.
     pub(crate) fn get_table(&self, namespace: &str, name: &str) -> Result<Option<Table>> {
         let tables = self.list_tables(namespace)?;
         Ok(tables.into_iter().find(|table| table.name == name))
+    }
+
+    /// Gets a table by catalog, schema, and table name.
+    pub(crate) fn get_table_in_schema(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<Table>> {
+        let tables = self.list_tables_in_schema(catalog, schema)?;
+        Ok(tables.into_iter().find(|candidate| candidate.name == table))
     }
 
     /// Gets a table by stable table identifier.

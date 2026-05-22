@@ -17,7 +17,8 @@ use std::sync::Arc;
 
 use arco_catalog::CatalogReader;
 use arco_catalog::manifest::{
-    CatalogDomainManifest, ExecutionsManifest, LineageManifest, RootManifest, SearchManifest,
+    CatalogDomainManifest, DomainManifestPointer, ExecutionsManifest, LineageManifest,
+    RootManifest, SearchManifest,
 };
 use arco_catalog::parquet_util;
 use arco_core::storage::{MemoryBackend, StorageBackend, WritePrecondition};
@@ -35,11 +36,12 @@ async fn setup_catalog(
         .expect("failed to create scoped storage");
 
     let now_ms = Utc::now().timestamp_millis();
+    let default_catalog_id = "cat-default".to_string();
 
     let namespaces: Vec<parquet_util::NamespaceRecord> = (0..num_namespaces)
         .map(|i| parquet_util::NamespaceRecord {
             id: format!("ns-{i:04}"),
-            catalog_id: None,
+            catalog_id: Some(default_catalog_id.clone()),
             name: format!("namespace_{i}"),
             description: Some(format!("Namespace {i} for benchmarking")),
             properties_json: None,
@@ -84,6 +86,23 @@ async fn setup_catalog(
 
     // Write Parquet files for snapshot version 1
     let snapshot_version = 1u64;
+
+    let catalogs = [parquet_util::CatalogRecord {
+        id: default_catalog_id,
+        name: "default".to_string(),
+        description: Some("Default benchmark catalog".to_string()),
+        created_at: now_ms,
+        updated_at: now_ms,
+        properties_json: None,
+        storage_root: None,
+    }];
+    let catalogs_bytes = parquet_util::write_catalogs(&catalogs).expect("write catalogs");
+    let catalogs_path =
+        CatalogPaths::snapshot_file(CatalogDomain::Catalog, snapshot_version, "catalogs.parquet");
+    storage
+        .put_raw(&catalogs_path, catalogs_bytes, WritePrecondition::None)
+        .await
+        .expect("put catalogs");
 
     let ns_bytes = parquet_util::write_namespaces(&namespaces).expect("write namespaces");
     let ns_path = CatalogPaths::snapshot_file(
@@ -138,6 +157,8 @@ async fn setup_catalog(
     let lineage_path = CatalogPaths::domain_manifest(CatalogDomain::Lineage);
     let executions_path = CatalogPaths::domain_manifest(CatalogDomain::Executions);
     let search_path = CatalogPaths::domain_manifest(CatalogDomain::Search);
+    let catalog_pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+    let lineage_pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Lineage);
 
     storage
         .put_raw(
@@ -172,10 +193,42 @@ async fn setup_catalog(
         .await
         .expect("put search manifest");
 
+    let catalog_pointer = DomainManifestPointer {
+        manifest_id: catalog_manifest.manifest_id.clone(),
+        manifest_path: catalog_path.clone(),
+        epoch: 0,
+        parent_pointer_hash: None,
+        updated_at: Utc::now(),
+    };
+    storage
+        .put_raw(
+            &catalog_pointer_path,
+            serde_json::to_vec(&catalog_pointer).unwrap().into(),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("put catalog pointer");
+
+    let lineage_pointer = DomainManifestPointer {
+        manifest_id: lineage_manifest.manifest_id.clone(),
+        manifest_path: lineage_path.clone(),
+        epoch: 0,
+        parent_pointer_hash: None,
+        updated_at: Utc::now(),
+    };
+    storage
+        .put_raw(
+            &lineage_pointer_path,
+            serde_json::to_vec(&lineage_pointer).unwrap().into(),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("put lineage pointer");
+
     let root_manifest = RootManifest {
         version: 1,
-        catalog_manifest_path: catalog_path,
-        lineage_manifest_path: lineage_path,
+        catalog_manifest_path: catalog_pointer_path,
+        lineage_manifest_path: lineage_pointer_path,
         executions_manifest_path: executions_path,
         search_manifest_path: search_path,
         updated_at: Utc::now(),
@@ -212,12 +265,27 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
     // Benchmark: list namespaces with varying sizes
     for ns_count in [1, 10, 50] {
         group.bench_with_input(
-            BenchmarkId::new("list_namespaces", ns_count),
+            BenchmarkId::new("warm_list_namespaces", ns_count),
+            &ns_count,
+            |b, &ns_count| {
+                let backend = Arc::new(MemoryBackend::new());
+                let storage = rt.block_on(setup_catalog(backend.clone(), ns_count, 5));
+
+                b.iter(|| {
+                    let reader = CatalogReader::new(storage.clone());
+                    let result = rt.block_on(reader.list_namespaces());
+                    black_box(result)
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("hot_list_namespaces", ns_count),
             &ns_count,
             |b, &ns_count| {
                 let backend = Arc::new(MemoryBackend::new());
                 let storage = rt.block_on(setup_catalog(backend.clone(), ns_count, 5));
                 let reader = CatalogReader::new(storage);
+                rt.block_on(reader.list_namespaces()).expect("warm read");
 
                 b.iter(|| {
                     let result = rt.block_on(reader.list_namespaces());
@@ -230,12 +298,28 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
     // Benchmark: list tables in namespace
     for tables_count in [1, 10, 50] {
         group.bench_with_input(
-            BenchmarkId::new("list_tables", tables_count),
+            BenchmarkId::new("warm_list_tables", tables_count),
+            &tables_count,
+            |b, &tables_count| {
+                let backend = Arc::new(MemoryBackend::new());
+                let storage = rt.block_on(setup_catalog(backend.clone(), 5, tables_count));
+
+                b.iter(|| {
+                    let reader = CatalogReader::new(storage.clone());
+                    let result = rt.block_on(reader.list_tables("namespace_0"));
+                    black_box(result)
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("hot_list_tables", tables_count),
             &tables_count,
             |b, &tables_count| {
                 let backend = Arc::new(MemoryBackend::new());
                 let storage = rt.block_on(setup_catalog(backend.clone(), 5, tables_count));
                 let reader = CatalogReader::new(storage);
+                rt.block_on(reader.list_tables("namespace_0"))
+                    .expect("warm read");
 
                 b.iter(|| {
                     let result = rt.block_on(reader.list_tables("namespace_0"));
@@ -245,11 +329,60 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
         );
     }
 
+    // Benchmark: list tables in schema
+    for tables_count in [1, 10, 50] {
+        group.bench_with_input(
+            BenchmarkId::new("warm_list_tables_in_schema", tables_count),
+            &tables_count,
+            |b, &tables_count| {
+                let backend = Arc::new(MemoryBackend::new());
+                let storage = rt.block_on(setup_catalog(backend.clone(), 5, tables_count));
+
+                b.iter(|| {
+                    let reader = CatalogReader::new(storage.clone());
+                    let result =
+                        rt.block_on(reader.list_tables_in_schema("default", "namespace_0"));
+                    black_box(result)
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("hot_list_tables_in_schema", tables_count),
+            &tables_count,
+            |b, &tables_count| {
+                let backend = Arc::new(MemoryBackend::new());
+                let storage = rt.block_on(setup_catalog(backend.clone(), 5, tables_count));
+                let reader = CatalogReader::new(storage);
+                rt.block_on(reader.list_tables_in_schema("default", "namespace_0"))
+                    .expect("warm read");
+
+                b.iter(|| {
+                    let result =
+                        rt.block_on(reader.list_tables_in_schema("default", "namespace_0"));
+                    black_box(result)
+                });
+            },
+        );
+    }
+
     // Benchmark: get single table
-    group.bench_function("get_table_single", |b| {
+    group.bench_function("warm_get_table_single", |b| {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+
+        b.iter(|| {
+            let reader = CatalogReader::new(storage.clone());
+            let result = rt.block_on(reader.get_table("namespace_5", "table_5"));
+            black_box(result)
+        });
+    });
+
+    group.bench_function("hot_get_table_single", |b| {
         let backend = Arc::new(MemoryBackend::new());
         let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
         let reader = CatalogReader::new(storage);
+        rt.block_on(reader.get_table("namespace_5", "table_5"))
+            .expect("warm read");
 
         b.iter(|| {
             let result = rt.block_on(reader.get_table("namespace_5", "table_5"));
@@ -257,11 +390,76 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
         });
     });
 
-    // Benchmark: get columns for table
-    group.bench_function("get_columns", |b| {
+    // Benchmark: get single table in schema
+    group.bench_function("warm_get_table_in_schema_single", |b| {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+
+        b.iter(|| {
+            let reader = CatalogReader::new(storage.clone());
+            let result =
+                rt.block_on(reader.get_table_in_schema("default", "namespace_5", "table_5"));
+            black_box(result)
+        });
+    });
+
+    group.bench_function("hot_get_table_in_schema_single", |b| {
         let backend = Arc::new(MemoryBackend::new());
         let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
         let reader = CatalogReader::new(storage);
+        rt.block_on(reader.get_table_in_schema("default", "namespace_5", "table_5"))
+            .expect("warm read");
+
+        b.iter(|| {
+            let result =
+                rt.block_on(reader.get_table_in_schema("default", "namespace_5", "table_5"));
+            black_box(result)
+        });
+    });
+
+    // Benchmark: get single table by ID
+    group.bench_function("warm_get_table_by_id", |b| {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+
+        b.iter(|| {
+            let reader = CatalogReader::new(storage.clone());
+            let result = rt.block_on(reader.get_table_by_id("ns-0005-tbl-0005"));
+            black_box(result)
+        });
+    });
+
+    group.bench_function("hot_get_table_by_id", |b| {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+        let reader = CatalogReader::new(storage);
+        rt.block_on(reader.get_table_by_id("ns-0005-tbl-0005"))
+            .expect("warm read");
+
+        b.iter(|| {
+            let result = rt.block_on(reader.get_table_by_id("ns-0005-tbl-0005"));
+            black_box(result)
+        });
+    });
+
+    // Benchmark: get columns for table
+    group.bench_function("warm_get_columns", |b| {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+
+        b.iter(|| {
+            let reader = CatalogReader::new(storage.clone());
+            let result = rt.block_on(reader.get_columns("ns-0005-tbl-0005"));
+            black_box(result)
+        });
+    });
+
+    group.bench_function("hot_get_columns", |b| {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+        let reader = CatalogReader::new(storage);
+        rt.block_on(reader.get_columns("ns-0005-tbl-0005"))
+            .expect("warm read");
 
         b.iter(|| {
             let result = rt.block_on(reader.get_columns("ns-0005-tbl-0005"));

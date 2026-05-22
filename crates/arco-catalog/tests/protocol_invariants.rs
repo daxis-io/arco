@@ -575,6 +575,40 @@ async fn catalog_read_model_reuses_snapshot_bytes_for_hot_reads() {
 }
 
 #[tokio::test]
+async fn catalog_read_model_refreshes_after_pointer_moves() {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = scoped_storage(backend.clone());
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+    writer
+        .create_namespace("analytics", None, WriteOptions::default())
+        .await
+        .expect("create analytics");
+
+    let reader = CatalogReader::new(storage.clone());
+    assert!(
+        reader
+            .get_namespace("analytics")
+            .await
+            .expect("lookup analytics")
+            .is_some()
+    );
+
+    writer
+        .create_namespace("finance", None, WriteOptions::default())
+        .await
+        .expect("create finance");
+
+    assert!(
+        reader
+            .get_namespace("finance")
+            .await
+            .expect("lookup finance after pointer move")
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn lineage_reads_only_lineage_domain_manifest() {
     let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let spy = Arc::new(SpyBackend::new(inner));
@@ -606,6 +640,54 @@ async fn lineage_reads_only_lineage_domain_manifest() {
     assert!(
         unrelated_paths.is_empty(),
         "lineage reads must not fetch unrelated domain manifests: {unrelated_paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn root_token_read_model_does_not_replace_moving_head_cache() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let spy = Arc::new(SpyBackend::new(inner));
+    let storage = scoped_storage(spy.clone());
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+    writer
+        .create_namespace("before_root", None, WriteOptions::default())
+        .await
+        .expect("create before_root");
+
+    let (pointer, manifest, _) = current_catalog_pointer(&storage).await;
+    seed_root_token_for_catalog(&storage, "01JROOTCATTOKEN000000000001", &pointer, &manifest).await;
+
+    writer
+        .create_namespace("after_root", None, WriteOptions::default())
+        .await
+        .expect("create after_root");
+
+    let reader = CatalogReader::new(storage.clone());
+    let warmed = reader.list_namespaces().await.expect("warm moving head");
+    assert!(warmed.iter().any(|ns| ns.name == "after_root"));
+
+    spy.clear_ops();
+    let pinned = reader
+        .list_namespaces_for_root_token("root:01JROOTCATTOKEN000000000001")
+        .await
+        .expect("pinned namespaces");
+    assert!(pinned.iter().any(|ns| ns.name == "before_root"));
+    assert!(!pinned.iter().any(|ns| ns.name == "after_root"));
+
+    spy.clear_ops();
+    let moving = reader.list_namespaces().await.expect("moving namespaces");
+    assert!(moving.iter().any(|ns| ns.name == "after_root"));
+
+    let parquet_reads = spy
+        .ops()
+        .into_iter()
+        .filter_map(|op| op_get_head_or_range_path(&op).map(str::to_owned))
+        .filter(|path| is_parquet_read_path(path))
+        .collect::<Vec<_>>();
+    assert!(
+        parquet_reads.is_empty(),
+        "moving-head read model must remain hot after pinned root-token read: {parquet_reads:?}"
     );
 }
 

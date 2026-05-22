@@ -45,7 +45,7 @@ fn permission_compiler_expands_transitive_groups_and_inherited_grants() {
     .expect("compile permissions");
 
     let alice_table_select = compiled
-        .rows_for_principal_object_privilege("user_alice", "table_orders", Privilege::Select)
+        .rows_for_principal_object_privilege("user_alice", "table_orders", "TABLE", Privilege::Select)
         .collect::<Vec<_>>();
     assert_eq!(alice_table_select.len(), 1);
     assert_eq!(alice_table_select[0].source_object_id, "catalog_sales");
@@ -77,7 +77,7 @@ fn permission_compiler_treats_owners_as_manage_grant_sources() {
     .expect("compile permissions");
 
     let owner_manage = compiled
-        .rows_for_principal_object_privilege("owner_sales", "table_orders", Privilege::Manage)
+        .rows_for_principal_object_privilege("owner_sales", "table_orders", "TABLE", Privilege::Manage)
         .collect::<Vec<_>>();
     assert_eq!(owner_manage.len(), 1);
     assert_eq!(owner_manage[0].source, "owner");
@@ -105,13 +105,23 @@ fn permission_compiler_omits_deleted_grants_and_disabled_principals() {
 
     assert_eq!(
         compiled
-            .rows_for_principal_object_privilege("user_disabled", "table_orders", Privilege::Select)
+            .rows_for_principal_object_privilege(
+                "user_disabled",
+                "table_orders",
+                "TABLE",
+                Privilege::Select,
+            )
             .count(),
         0
     );
     assert_eq!(
         compiled
-            .rows_for_principal_object_privilege("user_revoked", "table_orders", Privilege::Select)
+            .rows_for_principal_object_privilege(
+                "user_revoked",
+                "table_orders",
+                "TABLE",
+                Privilege::Select,
+            )
             .count(),
         0
     );
@@ -141,13 +151,23 @@ fn permission_compiler_omits_inactive_effective_members_and_inactive_owners() {
 
     assert_eq!(
         compiled
-            .rows_for_principal_object_privilege("user_disabled", "table_orders", Privilege::Select)
+            .rows_for_principal_object_privilege(
+                "user_disabled",
+                "table_orders",
+                "TABLE",
+                Privilege::Select,
+            )
             .count(),
         0
     );
     assert_eq!(
         compiled
-            .rows_for_principal_object_privilege("user_disabled", "table_orders", Privilege::Manage)
+            .rows_for_principal_object_privilege(
+                "user_disabled",
+                "table_orders",
+                "TABLE",
+                Privilege::Manage,
+            )
             .count(),
         0
     );

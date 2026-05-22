@@ -63,6 +63,74 @@ fn explain_access_matches_enforcement_decision() {
     assert_eq!(explanation.request_id, "req-explain");
 }
 
+#[test]
+fn authorization_index_matches_scan_semantics_with_many_irrelevant_rows() {
+    let mut rows = Vec::new();
+    for i in 0..1_000 {
+        rows.push(CompiledPermissionRow {
+            principal_id: format!("principal_{i}"),
+            object_id: format!("object_{i}"),
+            object_type: "TABLE".to_string(),
+            privilege: Privilege::Select,
+            source: "grant".to_string(),
+            source_grant_id: Some(format!("grant_{i}")),
+            source_principal_id: format!("principal_{i}"),
+            source_object_id: format!("object_{i}"),
+            inheritance_path: format!("object_{i}"),
+            grant_option: false,
+            group_snapshot_version: "groups_1".to_string(),
+        });
+    }
+    rows.push(CompiledPermissionRow {
+        principal_id: "alice".to_string(),
+        object_id: "table_1".to_string(),
+        object_type: "TABLE".to_string(),
+        privilege: Privilege::Select,
+        source: "grant".to_string(),
+        source_grant_id: Some("grant_allow".to_string()),
+        source_principal_id: "alice".to_string(),
+        source_object_id: "table_1".to_string(),
+        inheritance_path: "table_1".to_string(),
+        grant_option: false,
+        group_snapshot_version: "groups_1".to_string(),
+    });
+
+    let compiled = CompiledPermissionSet::new("event_1", "groups_1", true, rows);
+    let request = AuthzRequest::new("alice", "table_1", "TABLE", Privilege::Select);
+    let decision = AuthzDecision::evaluate(&request, &compiled);
+
+    assert_eq!(decision.outcome, DecisionOutcome::Allow);
+    assert_eq!(decision.evidence.grant_ids, vec!["grant_allow"]);
+}
+
+#[test]
+fn authorization_index_matches_object_type_case_insensitively() {
+    let compiled = CompiledPermissionSet::new(
+        "event_1",
+        "groups_1",
+        true,
+        vec![CompiledPermissionRow {
+            principal_id: "alice".to_string(),
+            object_id: "table_1".to_string(),
+            object_type: "table".to_string(),
+            privilege: Privilege::Select,
+            source: "grant".to_string(),
+            source_grant_id: Some("grant_lowercase_table".to_string()),
+            source_principal_id: "alice".to_string(),
+            source_object_id: "table_1".to_string(),
+            inheritance_path: "table_1".to_string(),
+            grant_option: false,
+            group_snapshot_version: "groups_1".to_string(),
+        }],
+    );
+
+    let request = AuthzRequest::new("alice", "table_1", "TABLE", Privilege::Select);
+    let decision = AuthzDecision::evaluate(&request, &compiled);
+
+    assert_eq!(decision.outcome, DecisionOutcome::Allow);
+    assert_eq!(decision.evidence.grant_ids, vec!["grant_lowercase_table"]);
+}
+
 fn compiled_permissions(fresh: bool) -> CompiledPermissionSet {
     CompiledPermissionSet::new(
         "event_004",

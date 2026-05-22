@@ -81,6 +81,9 @@ pub struct CompiledPermissionRow {
     pub group_snapshot_version: String,
 }
 
+/// Principal/object/object-type key for permission row lookup.
+type PermissionIndexKey = (String, String, String);
+
 /// Compiled permission view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledPermissionSet {
@@ -91,7 +94,8 @@ pub struct CompiledPermissionSet {
     /// Whether this view is fresh enough for enforcement.
     pub fresh: bool,
     /// Compiled permission rows.
-    pub rows: Vec<CompiledPermissionRow>,
+    rows: Vec<CompiledPermissionRow>,
+    by_principal_object: BTreeMap<PermissionIndexKey, Vec<usize>>,
 }
 
 impl CompiledPermissionSet {
@@ -103,12 +107,29 @@ impl CompiledPermissionSet {
         fresh: bool,
         rows: Vec<CompiledPermissionRow>,
     ) -> Self {
+        let mut by_principal_object: BTreeMap<PermissionIndexKey, Vec<usize>> = BTreeMap::new();
+        for (idx, row) in rows.iter().enumerate() {
+            let key = (
+                row.principal_id.clone(),
+                row.object_id.clone(),
+                row.object_type.to_ascii_uppercase(),
+            );
+            by_principal_object.entry(key).or_default().push(idx);
+        }
+
         Self {
             ledger_watermark: ledger_watermark.into(),
             group_snapshot_version: group_snapshot_version.into(),
             fresh,
             rows,
+            by_principal_object,
         }
+    }
+
+    /// Returns the compiled permission rows.
+    #[must_use]
+    pub fn rows(&self) -> &[CompiledPermissionRow] {
+        &self.rows
     }
 
     /// Iterates rows for principal, object, and privilege.
@@ -116,13 +137,25 @@ impl CompiledPermissionSet {
         &self,
         principal_id: &str,
         object_id: &str,
+        object_type: &str,
         privilege: Privilege,
     ) -> impl Iterator<Item = &CompiledPermissionRow> {
-        self.rows.iter().filter(move |row| {
-            row.principal_id == principal_id
-                && row.object_id == object_id
-                && row.privilege.implies(privilege)
-        })
+        let key = (
+            principal_id.to_string(),
+            object_id.to_string(),
+            object_type.to_ascii_uppercase(),
+        );
+        self.by_principal_object
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter_map(|idx| self.rows.get(*idx))
+            .filter(move |row| {
+                row.principal_id == principal_id
+                    && row.object_id == object_id
+                    && row.object_type.eq_ignore_ascii_case(object_type)
+            })
+            .filter(move |row| row.privilege.implies(privilege))
     }
 }
 

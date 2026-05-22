@@ -2,10 +2,10 @@
 
 This page is the catalog product privilege contract. It names the operations
 that code and tests must enforce. The first compiled grants subsystem exists
-for generic securable fixtures and UC permission adapter responses. Full
-writer-backed grant persistence, route-wide enforcement, audit, and
-domain-specific storage or credential checks remain planned unless a row below
-states otherwise.
+for generic securable fixtures and UC permission adapter responses. Selected
+storage-governance and credential-vending routes now consume that compiled view.
+Full writer-backed grant persistence, route-wide enforcement, audit, and
+complete lifecycle coverage remain planned unless a row below states otherwise.
 
 ## Principles
 
@@ -53,9 +53,11 @@ access.
 | Table | write data/commit | modify or owner plus storage authorization | Planned |
 | View | create/read/update/delete | table-like privileges on parent schema and referenced objects | Planned |
 | Volume | create/read/write/delete | volume create/read/write/manage plus storage authorization | Planned |
-| Storage credential | create/update/delete | metastore admin or credential manage | Planned |
+| Storage credential | create/list/get metadata | metastore admin or credential manage | Partial: UC routes append scoped metastore events, require compiled metastore `MANAGE`, and redact request secret material |
+| Storage credential | update/delete | metastore admin or credential manage | Planned |
 | Service credential | create/update/delete | metastore admin or service credential manage | Planned |
-| External location | create/update/delete | credential use plus external location manage | Planned |
+| External location | create/list/get metadata | metastore admin or storage governance manage | Partial: UC routes append scoped metastore events, canonicalize paths, reject overlaps, and require compiled metastore `MANAGE` |
+| External location | update/delete | credential use plus external location manage | Planned |
 | External service connection | create/update/delete | service credential use plus connection manage | Planned |
 | Managed root | create/update/delete | metastore admin or storage manage | Planned |
 | Function | create/read/execute/delete | function create, execute, manage | Planned |
@@ -96,7 +98,7 @@ or renaming a key is a product-contract change.
 | `service.connection.manage` | External service connection | service credential use plus connection manage privilege, redacted endpoint/secret metadata, audit allow and deny |
 | `governance.attachment.list` | Governance attachment | object read/manage or governance visibility privilege, redacted policy payloads, no hidden-object leakage |
 | `governance.attachment.update` | Governance attachment | object manage or governance attach privilege, typed attachment validation, no implicit policy enforcement |
-| `credential.mint` | Table, Volume, External location, Managed root, Model version, governed path | `AuthzDecision`, TTL clamp, provider failure deny, path-prefix subset, no secret leakage |
+| `credential.mint` | Table, External location, Managed root, governed path | Partial: table/path UC routes require compiled authorization, clamp TTL, enforce path-prefix subset, and avoid secret leakage; provider token material, revocation status, volume credentials, and model-version credentials remain planned |
 | `system.query` | System table | explicit system-table read scope, workspace filter, schema redaction, freshness watermark |
 | `admin.explain_access` | Any securable | safe deny reason, grant evidence visibility, no hidden policy payloads |
 | `sharing.manage` | Share, provider, recipient | stable sharing object ID, owner/admin privilege, redacted recipient/provider metadata, audit allow and deny |

@@ -8,7 +8,7 @@
 
 ---
 
-## Status (2026-05-11)
+## Status (2026-05-22)
 
 Partially in progress. This plan now starts from the frozen `arco.*.v1` proto
 baseline: the metastore proto skeleton, root transaction mutation envelope,
@@ -23,10 +23,13 @@ credential-vending security. Treat those documents as prerequisites for runtime
 implementation in this plan.
 
 The newer catalog product plan has also landed additive native metastore object
-contracts and an initial generic metastore replay/projection kernel. Those
-slices do not complete this plan: authoritative grant enforcement, storage
-governance, credential vending, object-family projections, UC route behavior,
-and derived system-table visibility remain pending runtime work.
+contracts, an initial generic metastore replay/projection kernel, partial
+compiled-permission reads, partial storage-governance UC routes, and partial
+table/path credential-vending decisions. Those slices do not complete this
+plan: writer-backed grant mutations, full route-wide enforcement, storage
+governance lifecycle operations, provider credential material, revocation
+metadata, object-family projections, and derived system-table visibility remain
+pending runtime work.
 
 ## Repo-Grounded Gap Summary
 
@@ -34,14 +37,17 @@ The current repo has moved past "basic catalog CRUD is missing" as the primary g
 The remaining missing pieces are the surrounding metastore and governance domains
 that make a mature lakehouse catalog authoritative rather than parity-shaped.
 
-- `crates/arco-uc/src/routes/permissions.rs` still returns empty
-  `privilege_assignments` on `GET`, and `PATCH` is explicitly unsupported.
-- `crates/arco-uc/src/routes/credentials.rs` still exposes placeholder or
-  unsupported temporary credential behavior rather than authoritative storage
-  credential, external location, or binding state.
-- `docs/guide/src/reference/control-plane-scope.md` still marks grants/RBAC,
-  credentials/external locations, governance rules, and ownership/tags as
-  `Planned`.
+- `crates/arco-uc/src/routes/permissions.rs` reads compiled assignments on
+  `GET`; `PATCH` is explicitly unsupported until writer-backed grant
+  persistence lands.
+- `crates/arco-uc/src/routes/credentials.rs` now supports governed table/path
+  credential decisions over compiled authorization and published storage
+  governance. Volume/model credentials, provider token material, and revocation
+  metadata remain unsupported.
+- `docs/guide/src/reference/control-plane-scope.md` marks grants/RBAC,
+  credentials, external locations, and temporary credential vending as
+  `Partial`; governance rules, ownership/tags, and broader object families
+  remain `Planned`.
 - `proto/arco/catalog/v1/metastore.proto` now defines stable-ID
   metastore/governance object and mutation contracts, and root transactions can
   carry metastore mutations.
@@ -285,11 +291,10 @@ Add failing tests that require:
 Add minimal Arco-side grant operations and compiled read APIs keyed by stable
 object ID rather than mutable names. Renames must preserve grant bindings.
 
-**Step 3: Make the UC permissions route authoritative**
+**Step 3: Complete UC permissions mutations**
 
-Replace the scaffolded handler so:
+Build on the landed compiled-permission `GET` handler so:
 
-- `GET` reads the compiled assignments from manifest-selected state
 - `PATCH` validates the request, appends authoritative mutations, and returns
   the resulting privilege assignments
 
@@ -325,16 +330,19 @@ git commit -m "feat: add authoritative grants and permissions"
 - Create: `crates/arco-uc/tests/storage_credentials_authoritative.rs`
 - Create: `crates/arco-uc/tests/external_locations_authoritative.rs`
 
-**Step 1: Write the failing storage and temp-credential tests**
+**Step 1: Write the remaining storage and temp-credential tests**
 
-Add failing tests for:
+Add focused tests for the gaps that are not already covered by
+`storage_governance_authoritative` and `credentials_authoritative`:
 
-- create/get/list/update/delete storage credentials
-- create/get/list/update/delete external locations
+- update/delete storage credentials
+- update/delete external locations
 - workspace or storage bindings that control visibility and usage
-- truthful `temporary-table-credentials`, `temporary-volume-credentials`,
-  `temporary-model-version-credentials`, and `temporary-path-credentials`
-  responses driven by authoritative state
+- provider token material and revocation metadata for
+  `temporary-table-credentials` and `temporary-path-credentials`
+- truthful `temporary-volume-credentials` and
+  `temporary-model-version-credentials` responses once authoritative object
+  ownership exists
 
 **Step 2: Add durable object and binding state**
 
@@ -343,10 +351,11 @@ authoritative objects with stable IDs and manifest-published projections. Keep
 cloud-specific vending material derived from those objects and the current authz
 decision, not as the source of truth itself.
 
-**Step 3: Replace placeholder temporary credential behavior**
+**Step 3: Complete temporary credential provider behavior**
 
-The temporary credential endpoints should stop returning placeholder empty
-credential lists or blanket `501`s for supported cases. They should:
+The landed table/path temporary credential endpoints already use compiled
+authorization and published storage governance. The remaining supported cases
+should:
 
 - load the referenced table, volume, model, or path binding from published state
 - evaluate the authoritative allow/deny decision

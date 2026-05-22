@@ -1,7 +1,6 @@
 //! Delta commit coordination routes for the Unity Catalog facade.
 //!
-//! Unlike the scaffolded permissions and temporary credential routes, this is a
-//! real implemented subsystem backed by Delta coordinator state. It is
+//! This is an implemented subsystem backed by Delta coordinator state. It is
 //! authoritative for Delta commit coordination, but it is not catalog DDL or a
 //! generic governance metadata surface.
 

@@ -8,7 +8,7 @@ use utoipa::OpenApi;
     info(
         title = "Unity Catalog API (Arco facade)",
         version = env!("CARGO_PKG_VERSION"),
-        description = "Unity Catalog OSS parity facade for Arco. Catalog/schema/table CRUD is backed by Arco's authoritative catalog ledger and manifest-published snapshots; remaining non-CRUD parity endpoints are scaffolded or domain-specific preview surfaces unless documented otherwise."
+        description = "Unity Catalog OSS parity facade for Arco. Catalog/schema/table CRUD is backed by Arco's authoritative catalog ledger and manifest-published snapshots; non-CRUD parity endpoints are documented as compatible-partial, scaffolded, or planned depending on the route group."
     ),
     paths(
         crate::routes::openapi::get_openapi_json,
@@ -42,7 +42,7 @@ use utoipa::OpenApi;
         (name = "Schemas", description = "Authoritative schema CRUD over Arco's catalog ledger."),
         (name = "Tables", description = "Authoritative table CRUD over Arco's catalog ledger."),
         (name = "DeltaCommits", description = "Delta commit coordinator operations backed by coordinator state, not catalog DDL."),
-        (name = "TemporaryCredentials", description = "Scaffolded or placeholder credential vending operations; not authoritative catalog-governance state."),
+        (name = "TemporaryCredentials", description = "Compatible-partial table/path credential decisions over compiled authorization and published storage governance; volume/model credentials, provider token material, and revocation metadata remain planned."),
     ),
 )]
 pub struct UnityCatalogApiDoc;

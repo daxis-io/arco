@@ -132,16 +132,18 @@ fn test_generated_openapi_describes_authoritative_boundary() -> Result<(), Strin
         "openapi description must state that catalog/schema/table CRUD is authoritative: {description}"
     );
     assert!(
-        description.contains("scaffold"),
-        "openapi description must state that some non-CRUD parity endpoints remain scaffolded: {description}"
+        description.contains("compatible-partial")
+            && description.contains("scaffolded")
+            && description.contains("planned"),
+        "openapi description must state the non-CRUD compatibility boundary: {description}"
     );
 
     Ok(())
 }
 
 #[test]
-fn test_generated_openapi_tags_distinguish_authoritative_and_scaffolded_surfaces()
--> Result<(), String> {
+fn test_generated_openapi_tags_distinguish_authoritative_and_partial_surfaces() -> Result<(), String>
+{
     let ours =
         serde_json::to_value(openapi()).map_err(|err| format!("serialize openapi: {err}"))?;
     let tags = ours
@@ -173,8 +175,10 @@ fn test_generated_openapi_tags_distinguish_authoritative_and_scaffolded_surfaces
         "DeltaCommits tag must describe the coordinator-backed implementation: {delta}"
     );
     assert!(
-        credentials.contains("not authoritative"),
-        "TemporaryCredentials tag must describe scaffolded non-authoritative behavior: {credentials}"
+        credentials.contains("Compatible-partial")
+            && credentials.contains("published storage governance")
+            && credentials.contains("revocation metadata remain planned"),
+        "TemporaryCredentials tag must describe the partial credential-vending boundary: {credentials}"
     );
 
     Ok(())

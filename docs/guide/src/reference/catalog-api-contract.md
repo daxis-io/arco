@@ -117,16 +117,23 @@ route family before the route is marked production-backed.
 
 ## Compatibility Labels
 
-Every route group and OpenAPI entry is labeled as `native`,
-`compatible-exact`, `compatible-partial`, `scaffolded`, or `planned`. Scaffolded
-routes must not be used for production enforcement.
+Every public route group must have one documented compatibility label:
+`native`, `compatible-exact`, `compatible-partial`, `scaffolded`, or `planned`.
+Scaffolded routes must not be used for production enforcement.
+
+The generated OpenAPI currently carries route-group descriptions, while the
+manual inventory records the repo-local support level for UC compatibility
+groups. Per-operation OpenAPI compatibility extensions or snapshots are still a
+promotion requirement before any compatibility adapter is marked
+production-backed.
 
 ## Versioning Gates
 
 - Protobuf changes follow `docs/guide/src/reference/schema-evolution-policy.md`
   and must pass the proto breaking-change gate.
 - OpenAPI changes require a checked-in diff or snapshot update with the route
-  compatibility label.
+  compatibility label once the route is promoted beyond preview or
+  compatible-partial behavior.
 - System-table schemas are public API once allowlisted and need golden-schema
   evidence.
 - A compatibility adapter cannot be promoted beyond `compatible-partial`

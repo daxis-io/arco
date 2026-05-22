@@ -315,7 +315,7 @@ async fn test_permissions_principal_filter_returns_empty_assignments() {
 }
 
 #[tokio::test]
-async fn test_patch_permissions_remains_scaffolded() {
+async fn test_patch_permissions_remains_unsupported_until_grant_writer_lands() {
     let seeded = seeded_router().await;
     let app = seeded.app;
     let response = app

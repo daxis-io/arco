@@ -93,11 +93,12 @@ pub async fn post_temporary_model_version_credentials(
     super::common::known_but_unsupported(&method, &uri)
 }
 
-/// Generates temporary table credentials (preview scaffolding).
+/// Generates temporary table credential decisions.
 ///
 /// # Errors
 ///
-/// Returns [`UnityCatalogError::NotImplemented`] while preview scaffolding is active.
+/// Returns a UC error response when the table, authorization, storage-governance
+/// projection, or requested operation is invalid for credential vending.
 #[utoipa::path(
     post,
     path = "/temporary-table-credentials",
@@ -105,7 +106,10 @@ pub async fn post_temporary_model_version_credentials(
     request_body = GenerateTemporaryTableCredentialRequestBody,
     responses(
         (status = 200, description = "Successful response."),
-        (status = 501, description = "Endpoint is scaffolded but not yet implemented.", body = UnityCatalogErrorResponse),
+        (status = 400, description = "Bad request.", body = UnityCatalogErrorResponse),
+        (status = 403, description = "Credential request denied.", body = UnityCatalogErrorResponse),
+        (status = 404, description = "Table not found.", body = UnityCatalogErrorResponse),
+        (status = 503, description = "Credential scope unavailable.", body = UnityCatalogErrorResponse),
     )
 )]
 pub(crate) async fn post_temporary_table_credentials(
@@ -201,7 +205,8 @@ pub async fn post_temporary_volume_credentials(
 ///
 /// # Errors
 ///
-/// Returns [`UnityCatalogError::BadRequest`] if `operation` is not recognized.
+/// Returns a UC error response when the operation is unknown, authorization is
+/// denied, or the published storage-governance projection is unavailable.
 #[utoipa::path(
     post,
     path = "/temporary-path-credentials",
@@ -210,6 +215,8 @@ pub async fn post_temporary_volume_credentials(
     responses(
         (status = 200, description = "Successful response."),
         (status = 400, description = "Bad request.", body = UnityCatalogErrorResponse),
+        (status = 403, description = "Credential request denied.", body = UnityCatalogErrorResponse),
+        (status = 503, description = "Credential scope unavailable.", body = UnityCatalogErrorResponse),
     )
 )]
 pub(crate) async fn post_temporary_path_credentials(

@@ -24,6 +24,13 @@ fn partition_key_fixture_preserves_explicit_dimension_order() {
 }
 
 #[test]
+fn legacy_partition_key_v1_protojson_fixture_is_rejected() {
+    let fixture = include_str!("../fixtures/partition_key_v1.json");
+    serde_json::from_str::<PartitionKey>(fixture)
+        .expect_err("old map-shaped partition key JSON must not parse as current contract");
+}
+
+#[test]
 fn scalar_value_variants_roundtrip() {
     let values = [
         ScalarValue {
@@ -80,11 +87,13 @@ fn docs_name_the_alpha_beta_hard_cut_policy() {
     assert!(readme.contains("`arco.controlplane.v1`"));
     assert!(readme.contains("`RegisterTableOp.format` is optional"));
     assert!(readme.contains("cargo xtask proto-breaking-check"));
+    assert!(readme.contains("proto=arco.controlplane.v1.ApplyCatalogDdlRequest"));
     assert!(style.contains("Alpha/Beta Hard-Cut Policy"));
     assert!(style.contains("old `arco.v1` package was intentionally removed"));
     assert!(style.contains("explicit hard-cut window"));
     assert!(style.contains("`arco.catalog.v1.RegisterTableOp.format` is"));
     assert!(style.contains("cargo xtask proto-breaking-check"));
+    assert!(style.contains("message-qualified content types"));
 }
 
 #[test]

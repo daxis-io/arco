@@ -14,13 +14,17 @@ impact, regenerate `proto-baselines/post-hard-cut-v1.binpb`, and keep
 `cargo xtask proto-breaking-check` passing afterward.
 
 Outside an explicit hard-cut window, protobuf changes must be additive, preserve
-binary and ProtoJSON compatibility, and pass `cargo xtask proto-breaking-check`
-against the frozen baseline. Once Arco declares a stable public API, breaking
+generated source, package/service, binary, and ProtoJSON compatibility, and pass
+`cargo xtask proto-breaking-check` against the frozen baseline. Once Arco declares a stable public API, breaking
 reshapes require future `v2` packages.
 
 Current hard-cut migration note: `arco.catalog.v1.RegisterTableOp.format` is an
 optional enum. Producers should omit the field for the Delta Lake default and
 must not send `TABLE_FORMAT_UNSPECIFIED` on `RegisterTableOp`.
+
+HTTP protobuf transaction routes require message-qualified content types such as
+`application/x-protobuf; proto=arco.controlplane.v1.ApplyCatalogDdlRequest` so
+legacy or generic protobuf bodies fail closed before decoding.
 
 ## Parquet And Arrow
 

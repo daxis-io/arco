@@ -1102,7 +1102,17 @@ impl CatalogWriter {
             );
 
             let result = compactor.sync_compact(request).await;
-            guard.release().await?;
+            if let Err(error) = guard.release().await {
+                if result.is_ok() {
+                    tracing::warn!(
+                        error = %error,
+                        catalog = %catalog.name,
+                        "catalog create published visibly but lock release failed"
+                    );
+                } else {
+                    return Err(error.into());
+                }
+            }
             result?;
 
             Ok(catalog)
@@ -1745,7 +1755,7 @@ impl CatalogWriter {
 
     /// Creates a schema and returns visible commit metadata for transaction APIs.
     ///
-    /// For the `default` catalog, this reuses the legacy namespace transaction path.
+    /// The `default` catalog uses the same metadata-preserving path as named catalogs.
     ///
     /// # Errors
     ///
@@ -3245,7 +3255,7 @@ impl CatalogWriter {
 
     /// Registers a table in a catalog/schema and returns visible commit metadata.
     ///
-    /// For the `default` catalog, this reuses the legacy namespace transaction path.
+    /// The `default` catalog uses the same metadata-preserving path as named catalogs.
     ///
     /// # Errors
     ///
@@ -3708,7 +3718,7 @@ impl CatalogWriter {
 
     /// Updates a table in a catalog/schema and returns visible commit metadata.
     ///
-    /// For the `default` catalog, this reuses the legacy namespace transaction path.
+    /// The `default` catalog uses the same metadata-preserving path as named catalogs.
     ///
     /// # Errors
     ///
@@ -4086,7 +4096,7 @@ impl CatalogWriter {
 
     /// Drops a table in a catalog/schema and returns visible commit metadata.
     ///
-    /// For the `default` catalog, this reuses the legacy namespace transaction path.
+    /// The `default` catalog uses the same metadata-preserving path as named catalogs.
     ///
     /// # Errors
     ///

@@ -186,6 +186,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let mut seen_domains = BTreeSet::new();
         for mutation in &mutations {
+            mutation.validate_request_scope(&meta)?;
             if mutation.is_metastore() {
                 continue;
             }
@@ -1465,6 +1466,35 @@ impl RootMutation {
 
     const fn is_metastore(&self) -> bool {
         matches!(self, Self::Metastore(_) | Self::ScopedMetastore(_))
+    }
+
+    fn validate_request_scope(&self, meta: &ResolvedRequestMetadata) -> Result<(), ApiError> {
+        let Self::ScopedMetastore(mutation) = self else {
+            return Ok(());
+        };
+        let scope = mutation
+            .scope
+            .as_ref()
+            .ok_or_else(|| ApiError::bad_request("scoped metastore scope is required"))?;
+        if scope.tenant_id != meta.tenant {
+            return Err(ApiError::bad_request(format!(
+                "scoped metastore tenant_id '{}' must match request tenant '{}'",
+                scope.tenant_id, meta.tenant
+            )));
+        }
+        if scope.workspace_id != meta.workspace {
+            return Err(ApiError::bad_request(format!(
+                "scoped metastore workspace_id '{}' must match request workspace '{}'",
+                scope.workspace_id, meta.workspace
+            )));
+        }
+        if scope.request_id != meta.request_id {
+            return Err(ApiError::bad_request(format!(
+                "scoped metastore request_id '{}' must match request_id '{}'",
+                scope.request_id, meta.request_id
+            )));
+        }
+        Ok(())
     }
 
     fn request_hash_value(

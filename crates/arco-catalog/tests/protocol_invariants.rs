@@ -1006,6 +1006,179 @@ async fn named_catalog_transaction_helpers_round_trip_and_preserve_catalog_scope
 }
 
 #[tokio::test]
+async fn catalog_reader_fails_closed_when_visible_catalog_snapshot_file_is_missing() {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = scoped_storage(backend);
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+
+    writer
+        .create_catalog(
+            "broken_visible",
+            Some("visible pointer with missing catalogs snapshot"),
+            WriteOptions::default(),
+        )
+        .await
+        .expect("create visible catalog");
+
+    let (_pointer, manifest, _pointer_version) = current_catalog_pointer(&storage).await;
+    let catalogs_path = CatalogPaths::snapshot_file(
+        CatalogDomain::Catalog,
+        manifest.snapshot_version,
+        "catalogs.parquet",
+    );
+    storage
+        .delete(&catalogs_path)
+        .await
+        .expect("delete visible catalogs snapshot file");
+
+    let error = CatalogReader::new(storage)
+        .list_catalogs()
+        .await
+        .expect_err("reader must fail closed when visible snapshot file is missing");
+    let message = error.to_string();
+    assert!(
+        message.contains("catalogs.parquet") || message.contains("not found"),
+        "missing visible snapshot should surface a storage error, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn stale_update_event_replay_does_not_rollback_table_metadata() {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = scoped_storage(backend);
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+
+    writer
+        .create_schema_transaction("default", "replay", None, WriteOptions::default())
+        .await
+        .expect("create replay schema");
+    writer
+        .register_table_in_schema_transaction(
+            "default",
+            "replay",
+            RegisterTableInSchemaRequest {
+                name: "events".to_string(),
+                description: Some("initial".to_string()),
+                location: None,
+                format: None,
+                table_type: None,
+                properties: None,
+                columns: vec![test_column("event_id")],
+            },
+            WriteOptions::default(),
+        )
+        .await
+        .expect("register replay table");
+
+    let first_update = writer
+        .update_table_in_schema_transaction(
+            "default",
+            "replay",
+            "events",
+            TablePatch {
+                description: Some(Some("first update".to_string())),
+                ..TablePatch::default()
+            },
+            WriteOptions::default(),
+        )
+        .await
+        .expect("first table update");
+    writer
+        .update_table_in_schema_transaction(
+            "default",
+            "replay",
+            "events",
+            TablePatch {
+                description: Some(Some("second update".to_string())),
+                ..TablePatch::default()
+            },
+            WriteOptions::default(),
+        )
+        .await
+        .expect("second table update");
+
+    let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+    let pointer_version_before = storage
+        .head_raw(&pointer_path)
+        .await
+        .expect("pointer head before stale replay")
+        .expect("catalog pointer exists")
+        .version;
+    let stale_event_path =
+        CatalogPaths::ledger_event(CatalogDomain::Catalog, &first_update.event_id);
+    let tier1 = Tier1Writer::new(storage.clone());
+    let guard = tier1
+        .acquire_lock(Duration::from_secs(30), 1)
+        .await
+        .expect("catalog replay lock");
+    let result = Tier1Compactor::new(storage.clone())
+        .sync_compact(
+            "catalog",
+            vec![stale_event_path],
+            guard.fencing_token().sequence(),
+        )
+        .await
+        .expect("stale event replay should be a no-op");
+    guard.release().await.expect("release replay lock");
+    assert_eq!(result.events_processed, 0);
+
+    let pointer_version_after = storage
+        .head_raw(&pointer_path)
+        .await
+        .expect("pointer head after stale replay")
+        .expect("catalog pointer exists")
+        .version;
+    assert_eq!(pointer_version_after, pointer_version_before);
+
+    let table = CatalogReader::new(storage)
+        .get_table_in_schema("default", "replay", "events")
+        .await
+        .expect("read replay table")
+        .expect("replay table exists");
+    assert_eq!(table.description.as_deref(), Some("second update"));
+}
+
+#[tokio::test]
+async fn create_catalog_returns_success_when_lock_release_fails_after_visible_publish() {
+    let backend = Arc::new(ScriptedBackend::new());
+    let storage = scoped_storage(backend.clone());
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+    backend.add_rule(ScriptedRule::put_after(
+        format!(
+            "tenant={TENANT}/workspace={WORKSPACE}/{}",
+            CatalogPaths::domain_lock(CatalogDomain::Catalog)
+        ),
+        PreconditionMatcher::MatchesVersion,
+        1,
+        1,
+        ScriptedEffect::Error("injected post-publish lock release failure".to_string()),
+    ));
+
+    let catalog = writer
+        .create_catalog(
+            "release_visible_catalog",
+            Some("release failure should not hide visible catalog"),
+            WriteOptions::with_idempotency("018f0f87-8e78-7c21-8e91-5370f332bb01"),
+        )
+        .await
+        .expect("visible create_catalog should survive lock release failure");
+    assert_eq!(catalog.name, "release_visible_catalog");
+
+    let replay = writer
+        .create_catalog(
+            "release_visible_catalog",
+            Some("release failure should not hide visible catalog"),
+            WriteOptions::with_idempotency("018f0f87-8e78-7c21-8e91-5370f332bb01"),
+        )
+        .await
+        .expect("idempotent replay should return visible catalog");
+    assert_eq!(replay.id, catalog.id);
+}
+
+#[tokio::test]
 async fn catalog_transaction_helper_returns_commit_when_lock_release_fails_after_publish() {
     let backend = Arc::new(ScriptedBackend::new());
     let storage = scoped_storage(backend.clone());

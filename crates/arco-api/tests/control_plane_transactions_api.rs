@@ -6,8 +6,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Method, Request, StatusCode, header};
 use bytes::Bytes;
+use prost::Message;
+use tower::ServiceExt;
 
 use arco_catalog::CatalogReader;
 use arco_core::catalog_event::CatalogEvent;
@@ -115,6 +118,49 @@ async fn load_catalog_ledger_event_source(
     Ok(envelope.source)
 }
 
+#[tokio::test]
+async fn http_protobuf_requests_require_current_contract_content_type() -> Result<()> {
+    let router = test_router();
+    let message = catalog_create_default_schema_request(
+        "idem-http-contract-01",
+        "req-http-contract-01",
+        "legacy_wire_guard",
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/transactions/applyCatalogDdl")
+        .header("X-Tenant-Id", TENANT)
+        .header("X-Workspace-Id", WORKSPACE)
+        .header("X-Request-Id", "req-http-contract-01")
+        .header("Idempotency-Key", "idem-http-contract-01")
+        .header(header::CONTENT_TYPE, "application/x-protobuf")
+        .body(Body::from(message.encode_to_vec()))
+        .context("build generic protobuf request")?;
+
+    let response = router.oneshot(request).await.map_err(|err| match err {})?;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+        .await
+        .context("read error response body")?;
+    let error: serde_json::Value = serde_json::from_slice(&body).with_context(|| {
+        format!(
+            "parse JSON error response (status={status}): {}",
+            String::from_utf8_lossy(&body)
+        )
+    })?;
+
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(error["code"], "UNSUPPORTED_MEDIA_TYPE");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("proto=arco.controlplane.v1.ApplyCatalogDdlRequest")
+    );
+
+    Ok(())
+}
+
 fn metastore_storage_credential_root_request(name: &str) -> CommitRootTransactionRequest {
     CommitRootTransactionRequest {
         mutations: vec![DomainMutation {
@@ -142,8 +188,8 @@ fn scoped_metastore_storage_credential_root_request(name: &str) -> CommitRootTra
             kind: Some(domain_mutation::Kind::ScopedMetastore(
                 ScopedMetastoreMutation {
                     scope: Some(CatalogControlPlaneScope {
-                        tenant_id: "tenant-a".to_string(),
-                        workspace_id: "workspace-a".to_string(),
+                        tenant_id: TENANT.to_string(),
+                        workspace_id: WORKSPACE.to_string(),
                         metastore_id: "metastore-a".to_string(),
                         request_id: "req-root-scoped-metastore-01".to_string(),
                     }),
@@ -1770,6 +1816,53 @@ async fn commit_root_transaction_hashes_metastore_mutation_payloads() -> Result<
     assert!(first_record.request_hash.starts_with("sha256:"));
     assert!(second_record.request_hash.starts_with("sha256:"));
     assert_ne!(first_record.request_hash, second_record.request_hash);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_root_transaction_rejects_scoped_metastore_scope_mismatch_before_idempotency()
+-> Result<()> {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let router = test_router_with_backend(backend.clone());
+    let mut request =
+        scoped_metastore_storage_credential_root_request("lakehouse-prod-scoped-mismatch");
+    let scoped = request
+        .mutations
+        .get_mut(0)
+        .and_then(|mutation| mutation.kind.as_mut())
+        .and_then(|kind| match kind {
+            domain_mutation::Kind::ScopedMetastore(scoped) => Some(scoped),
+            _ => None,
+        })
+        .context("scoped metastore mutation missing")?;
+    scoped
+        .scope
+        .as_mut()
+        .context("scoped metastore scope missing")?
+        .tenant_id = "other-tenant".to_string();
+
+    let (status, error) = post_error_json(
+        router,
+        "/api/v1/transactions/commitRootTransaction",
+        &request,
+        "idem-root-scoped-metastore-mismatch-01",
+        "req-root-scoped-metastore-01",
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["code"], "BAD_REQUEST");
+    assert!(
+        load_idempotency_record(
+            backend,
+            ControlPlaneTxDomain::Root,
+            "idem-root-scoped-metastore-mismatch-01",
+        )
+        .await
+        .is_err(),
+        "scope mismatches must fail before idempotency capture"
+    );
 
     Ok(())
 }

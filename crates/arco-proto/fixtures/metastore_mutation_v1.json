@@ -8,7 +8,8 @@
         "principal": "user:alice@example.com",
         "privilege": "SELECT",
         "grantedBy": "user:admin@example.com",
-        "lifecycleState": 1
+        "lifecycleState": 1,
+        "owner": "group:data-platform"
       }
     }
   },
@@ -21,7 +22,8 @@
         "principal": "user:bob@example.com",
         "privilege": "MODIFY",
         "grantedBy": "user:admin@example.com",
-        "lifecycleState": 1
+        "lifecycleState": 1,
+        "owner": "group:data-platform"
       }
     }
   },
@@ -50,7 +52,8 @@
       "workspaceId": "workspace_01",
       "objectId": "loc_01",
       "objectType": "EXTERNAL_LOCATION",
-      "lifecycleState": 1
+      "lifecycleState": 1,
+      "owner": "group:data-platform"
     }
   },
   "governanceAttachment": {
@@ -61,7 +64,8 @@
       "attachmentType": "CLASSIFICATION",
       "value": "restricted",
       "createdBy": "user:admin@example.com",
-      "lifecycleState": 1
+      "lifecycleState": 1,
+      "owner": "group:data-governance"
     }
   },
   "volume": {
@@ -101,7 +105,8 @@
       "modelId": "model_01",
       "version": "1",
       "storageLocation": "s3://bucket/models/churn/1",
-      "lifecycleState": 1
+      "lifecycleState": 1,
+      "owner": "group:ml-platform"
     }
   }
 }

@@ -31,7 +31,7 @@ use arco_proto::arco::orchestration::v1::{
     BackfillTrigger, FileEntry, ManualTrigger, MaterializationTrigger, OrchestrationEventEnvelope,
     OutputVisibilityState, RunRequested, RunTriggered, ScheduleTrigger, SensorTrigger,
     TaskCallbackOutput, TaskError, TaskErrorCategory, TaskFinished, TaskOutcome, TaskOutput,
-    TriggerInfo, WebhookTrigger, orchestration_event_envelope, trigger_info,
+    TaskStarted, TriggerInfo, WebhookTrigger, orchestration_event_envelope, trigger_info,
 };
 use arco_proto::{
     CatalogControlPlaneScopeContractError, CatalogDdlContractError,
@@ -670,6 +670,50 @@ fn commit_orchestration_batch_rejects_empty_event_identifiers() {
 }
 
 #[test]
+fn commit_orchestration_batch_rejects_empty_task_started_fields() {
+    let mut event = sample_run_requested_event();
+    event.event = Some(orchestration_event_envelope::Event::TaskStarted(
+        TaskStarted {
+            run_id: String::new(),
+            task_key: "extract".to_string(),
+            attempt: 1,
+            attempt_id: "attempt-01".to_string(),
+            worker_id: "worker-01".to_string(),
+        },
+    ));
+    let request = CommitOrchestrationBatchRequest {
+        events: vec![event],
+    };
+
+    assert!(matches!(
+        request.validate_contract(),
+        Err(ControlPlaneTransactionContractError::InvalidOrchestrationEvent(0, _))
+    ));
+}
+
+#[test]
+fn commit_orchestration_batch_rejects_zero_task_started_attempt() {
+    let mut event = sample_run_requested_event();
+    event.event = Some(orchestration_event_envelope::Event::TaskStarted(
+        TaskStarted {
+            run_id: "run-01".to_string(),
+            task_key: "extract".to_string(),
+            attempt: 0,
+            attempt_id: "attempt-01".to_string(),
+            worker_id: "worker-01".to_string(),
+        },
+    ));
+    let request = CommitOrchestrationBatchRequest {
+        events: vec![event],
+    };
+
+    assert!(matches!(
+        request.validate_contract(),
+        Err(ControlPlaneTransactionContractError::InvalidOrchestrationEvent(0, _))
+    ));
+}
+
+#[test]
 fn commit_orchestration_batch_rejects_run_requested_manual_trigger_without_request_id() {
     let mut event = sample_run_requested_event();
     event.event = Some(orchestration_event_envelope::Event::RunRequested(
@@ -895,6 +939,108 @@ fn commit_orchestration_batch_rejects_run_triggered_backfill_trigger() {
                 ),
             ),
         )
+    );
+}
+
+#[test]
+fn metastore_mutation_rejects_grant_without_owner() {
+    let mutation = MetastoreMutation {
+        op: Some(metastore_mutation::Op::Grant(GrantMutation {
+            op: Some(arco_proto::arco::catalog::v1::grant_mutation::Op::Grant(
+                Grant {
+                    grant_id: "grant_01".to_string(),
+                    object_id: "table_01".to_string(),
+                    object_type: "TABLE".to_string(),
+                    principal: "user:alice@example.com".to_string(),
+                    privilege: "SELECT".to_string(),
+                    granted_by: "user:admin@example.com".to_string(),
+                    owner: String::new(),
+                    lifecycle_state: CatalogObjectLifecycleState::Active as i32,
+                    ..Default::default()
+                },
+            )),
+        })),
+    };
+
+    assert_eq!(
+        mutation.validate_contract(),
+        Err(MetastoreMutationContractError::EmptyField {
+            message: "grant",
+            field: "owner",
+        })
+    );
+}
+
+#[test]
+fn metastore_mutation_rejects_workspace_binding_without_owner() {
+    let mutation = MetastoreMutation {
+        op: Some(metastore_mutation::Op::WorkspaceBinding(WorkspaceBinding {
+            binding_id: "binding_01".to_string(),
+            workspace_id: "workspace_01".to_string(),
+            object_id: "loc_01".to_string(),
+            object_type: "EXTERNAL_LOCATION".to_string(),
+            owner: String::new(),
+            lifecycle_state: CatalogObjectLifecycleState::Active as i32,
+            ..Default::default()
+        })),
+    };
+
+    assert_eq!(
+        mutation.validate_contract(),
+        Err(MetastoreMutationContractError::EmptyField {
+            message: "workspace_binding",
+            field: "owner",
+        })
+    );
+}
+
+#[test]
+fn metastore_mutation_rejects_governance_attachment_without_owner() {
+    let mutation = MetastoreMutation {
+        op: Some(metastore_mutation::Op::GovernanceAttachment(
+            GovernanceAttachment {
+                attachment_id: "attach_01".to_string(),
+                object_id: "table_01".to_string(),
+                object_type: "TABLE".to_string(),
+                attachment_type: "CLASSIFICATION".to_string(),
+                value: "restricted".to_string(),
+                created_by: "user:admin@example.com".to_string(),
+                owner: String::new(),
+                lifecycle_state: CatalogObjectLifecycleState::Active as i32,
+                ..Default::default()
+            },
+        )),
+    };
+
+    assert_eq!(
+        mutation.validate_contract(),
+        Err(MetastoreMutationContractError::EmptyField {
+            message: "governance_attachment",
+            field: "owner",
+        })
+    );
+}
+
+#[test]
+fn metastore_mutation_rejects_model_version_without_owner() {
+    let mutation = MetastoreMutation {
+        op: Some(metastore_mutation::Op::ModelVersion(ModelVersion {
+            model_version_id: "model_version_01".to_string(),
+            model_id: "model_01".to_string(),
+            version: "1".to_string(),
+            storage_location: "s3://bucket/models/churn/1".to_string(),
+            owner: String::new(),
+            lifecycle_state: CatalogObjectLifecycleState::Active as i32,
+            ..Default::default()
+        })),
+    };
+
+    assert_eq!(
+        mutation.validate_contract(),
+        Err(MetastoreMutationContractError::EmptyField {
+            message: "model_version",
+            field: "owner",
+        })
     );
 }
 

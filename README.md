@@ -87,11 +87,17 @@ Additional breaking `v1` proto changes may happen before the stable public API
 freeze, but they must be grouped into a documented hard-cut window and followed
 by a regenerated `proto-baselines/post-hard-cut-v1.binpb`. Outside an explicit
 hard-cut window, `v1` changes must pass `cargo xtask proto-breaking-check` and
-preserve binary and ProtoJSON compatibility with that frozen baseline.
+preserve generated source, package/service, binary, and ProtoJSON compatibility
+with that frozen baseline.
 
 Current hard-cut migration note: `RegisterTableOp.format` is optional. Omit it
 for the Delta Lake default; do not send `TABLE_FORMAT_UNSPECIFIED` on
 `RegisterTableOp`.
+
+HTTP protobuf transaction routes require a message-qualified content type such
+as `application/x-protobuf; proto=arco.controlplane.v1.ApplyCatalogDdlRequest`.
+Generic or legacy protobuf bodies are rejected before decode so old wire shapes
+cannot be reinterpreted as new mutations.
 
 ## Contributing
 

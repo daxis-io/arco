@@ -328,6 +328,12 @@ pub enum OrchestrationEventContractError {
     EmptySource,
     EmptyIdempotencyKey,
     MissingEventKind,
+    EmptyEventField(&'static str, &'static str),
+    ZeroEventField(&'static str, &'static str),
+    MissingEventTimestamp(&'static str, &'static str),
+    MissingEventMessage(&'static str, &'static str),
+    UnknownEventEnum(&'static str, &'static str, i32),
+    UnspecifiedEventEnum(&'static str, &'static str),
     MissingTriggerInfo(&'static str),
     MissingTriggerKind(&'static str),
     MissingTriggerField(&'static str, &'static str),
@@ -342,6 +348,24 @@ impl std::fmt::Display for OrchestrationEventContractError {
             Self::EmptySource => f.write_str("source is required"),
             Self::EmptyIdempotencyKey => f.write_str("idempotency_key is required"),
             Self::MissingEventKind => f.write_str("event payload is required"),
+            Self::EmptyEventField(event_name, field_name) => {
+                write!(f, "{event_name}.{field_name} is required")
+            }
+            Self::ZeroEventField(event_name, field_name) => {
+                write!(f, "{event_name}.{field_name} must be greater than zero")
+            }
+            Self::MissingEventTimestamp(event_name, field_name) => {
+                write!(f, "{event_name}.{field_name} timestamp is required")
+            }
+            Self::MissingEventMessage(event_name, field_name) => {
+                write!(f, "{event_name}.{field_name} message is required")
+            }
+            Self::UnknownEventEnum(event_name, field_name, value) => {
+                write!(f, "{event_name}.{field_name} has unknown value: {value}")
+            }
+            Self::UnspecifiedEventEnum(event_name, field_name) => {
+                write!(f, "{event_name}.{field_name} must not be UNSPECIFIED")
+            }
             Self::MissingTriggerInfo(event_name) => {
                 write!(f, "{event_name} trigger is required")
             }
@@ -782,6 +806,7 @@ fn validate_grant(value: &Grant) -> Result<(), MetastoreMutationContractError> {
     validate_required_metastore_field("grant", "principal", &value.principal)?;
     validate_required_metastore_field("grant", "privilege", &value.privilege)?;
     validate_required_metastore_field("grant", "granted_by", &value.granted_by)?;
+    validate_required_metastore_field("grant", "owner", &value.owner)?;
     validate_lifecycle_state("grant", value.lifecycle_state)
 }
 
@@ -857,6 +882,7 @@ fn validate_workspace_binding(
     validate_required_metastore_field("workspace_binding", "workspace_id", &value.workspace_id)?;
     validate_required_metastore_field("workspace_binding", "object_id", &value.object_id)?;
     validate_required_metastore_field("workspace_binding", "object_type", &value.object_type)?;
+    validate_required_metastore_field("workspace_binding", "owner", &value.owner)?;
     validate_lifecycle_state("workspace_binding", value.lifecycle_state)
 }
 
@@ -877,6 +903,7 @@ fn validate_governance_attachment(
     )?;
     validate_required_metastore_field("governance_attachment", "value", &value.value)?;
     validate_required_metastore_field("governance_attachment", "created_by", &value.created_by)?;
+    validate_required_metastore_field("governance_attachment", "owner", &value.owner)?;
     validate_lifecycle_state("governance_attachment", value.lifecycle_state)
 }
 
@@ -948,6 +975,7 @@ fn validate_model_version(value: &ModelVersion) -> Result<(), MetastoreMutationC
         "storage_location",
         &value.storage_location,
     )?;
+    validate_required_metastore_field("model_version", "owner", &value.owner)?;
     validate_lifecycle_state("model_version", value.lifecycle_state)
 }
 
@@ -1016,17 +1044,631 @@ impl OrchestrationEventEnvelope {
         };
 
         match event {
-            orchestration_event_envelope::Event::RunRequested(event) => {
-                validate_run_requested_trigger(event)?;
-            }
             orchestration_event_envelope::Event::RunTriggered(event) => {
-                validate_run_triggered_trigger(event)?;
+                validate_run_triggered_event(event)?;
             }
-            _ => {}
+            orchestration_event_envelope::Event::PlanCreated(event) => {
+                validate_plan_created_event(event)?;
+            }
+            orchestration_event_envelope::Event::RunCancelRequested(event) => {
+                validate_run_cancel_requested_event(event)?;
+            }
+            orchestration_event_envelope::Event::TaskStarted(event) => {
+                validate_task_started_event(event)?;
+            }
+            orchestration_event_envelope::Event::TaskHeartbeat(event) => {
+                validate_task_heartbeat_event(event)?;
+            }
+            orchestration_event_envelope::Event::TaskFinished(event) => {
+                validate_task_finished_event(event)?;
+            }
+            orchestration_event_envelope::Event::DispatchRequested(event) => {
+                validate_dispatch_requested_event(event)?;
+            }
+            orchestration_event_envelope::Event::TimerRequested(event) => {
+                validate_timer_requested_event(event)?;
+            }
+            orchestration_event_envelope::Event::DispatchEnqueued(event) => {
+                validate_dispatch_enqueued_event(event)?;
+            }
+            orchestration_event_envelope::Event::TimerEnqueued(event) => {
+                validate_timer_enqueued_event(event)?;
+            }
+            orchestration_event_envelope::Event::TimerFired(event) => {
+                validate_timer_fired_event(event)?;
+            }
+            orchestration_event_envelope::Event::ScheduleDefinitionUpserted(event) => {
+                validate_schedule_definition_upserted_event(event)?;
+            }
+            orchestration_event_envelope::Event::ScheduleTicked(event) => {
+                validate_schedule_ticked_event(event)?;
+            }
+            orchestration_event_envelope::Event::SensorEvaluated(event) => {
+                validate_sensor_evaluated_event(event)?;
+            }
+            orchestration_event_envelope::Event::RunRequested(event) => {
+                validate_run_requested_event(event)?;
+            }
+            orchestration_event_envelope::Event::BackfillCreated(event) => {
+                validate_backfill_created_event(event)?;
+            }
+            orchestration_event_envelope::Event::BackfillChunkPlanned(event) => {
+                validate_backfill_chunk_planned_event(event)?;
+            }
+            orchestration_event_envelope::Event::BackfillStateChanged(event) => {
+                validate_backfill_state_changed_event(event)?;
+            }
+            orchestration_event_envelope::Event::TaskOutputVisibilityChanged(event) => {
+                validate_task_output_visibility_changed_event(event)?;
+            }
         }
 
         Ok(())
     }
+}
+
+fn validate_event_string(
+    event_name: &'static str,
+    field_name: &'static str,
+    value: &str,
+) -> Result<(), OrchestrationEventContractError> {
+    if value.is_empty() {
+        Err(OrchestrationEventContractError::EmptyEventField(
+            event_name, field_name,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_event_optional_string(
+    event_name: &'static str,
+    field_name: &'static str,
+    value: Option<&String>,
+) -> Result<(), OrchestrationEventContractError> {
+    if value.is_some_and(String::is_empty) {
+        Err(OrchestrationEventContractError::EmptyEventField(
+            event_name, field_name,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_event_nonzero_u32(
+    event_name: &'static str,
+    field_name: &'static str,
+    value: u32,
+) -> Result<(), OrchestrationEventContractError> {
+    if value == 0 {
+        Err(OrchestrationEventContractError::ZeroEventField(
+            event_name, field_name,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_event_optional_nonzero_u32(
+    event_name: &'static str,
+    field_name: &'static str,
+    value: Option<u32>,
+) -> Result<(), OrchestrationEventContractError> {
+    if value == Some(0) {
+        Err(OrchestrationEventContractError::ZeroEventField(
+            event_name, field_name,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_event_positive_i64(
+    event_name: &'static str,
+    field_name: &'static str,
+    value: i64,
+) -> Result<(), OrchestrationEventContractError> {
+    if value <= 0 {
+        Err(OrchestrationEventContractError::ZeroEventField(
+            event_name, field_name,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_event_timestamp(
+    event_name: &'static str,
+    field_name: &'static str,
+    value: Option<&prost_types::Timestamp>,
+) -> Result<(), OrchestrationEventContractError> {
+    if value.is_none() {
+        Err(OrchestrationEventContractError::MissingEventTimestamp(
+            event_name, field_name,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_event_enum<TEnum>(
+    event_name: &'static str,
+    field_name: &'static str,
+    value: i32,
+    unspecified: TEnum,
+) -> Result<(), OrchestrationEventContractError>
+where
+    TEnum: TryFrom<i32> + PartialEq,
+{
+    let parsed = TEnum::try_from(value).map_err(|_| {
+        OrchestrationEventContractError::UnknownEventEnum(event_name, field_name, value)
+    })?;
+    if parsed == unspecified {
+        Err(OrchestrationEventContractError::UnspecifiedEventEnum(
+            event_name, field_name,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_event_string_list(
+    event_name: &'static str,
+    field_name: &'static str,
+    values: &[String],
+) -> Result<(), OrchestrationEventContractError> {
+    if values.is_empty() || values.iter().any(String::is_empty) {
+        Err(OrchestrationEventContractError::EmptyEventField(
+            event_name, field_name,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_task_def(
+    event_name: &'static str,
+    task: &TaskDef,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string(event_name, "tasks.key", &task.key)?;
+    validate_event_nonzero_u32(event_name, "tasks.max_attempts", task.max_attempts)?;
+    validate_event_nonzero_u32(
+        event_name,
+        "tasks.heartbeat_timeout_sec",
+        task.heartbeat_timeout_sec,
+    )
+}
+
+fn validate_task_error(
+    event_name: &'static str,
+    field_name: &'static str,
+    error: Option<&TaskError>,
+) -> Result<(), OrchestrationEventContractError> {
+    let Some(error) = error else {
+        return Ok(());
+    };
+    validate_event_enum(
+        event_name,
+        field_name,
+        error.category,
+        TaskErrorCategory::Unspecified,
+    )?;
+    validate_event_string(event_name, "error.message", &error.message)
+}
+
+fn validate_trigger_source(
+    event_name: &'static str,
+    source: Option<&TriggerSource>,
+) -> Result<(), OrchestrationEventContractError> {
+    let source = source.ok_or(OrchestrationEventContractError::MissingEventMessage(
+        event_name,
+        "trigger_source",
+    ))?;
+    match source.source.as_ref() {
+        Some(trigger_source::Source::Push(push)) => validate_event_string(
+            event_name,
+            "trigger_source.push.message_id",
+            &push.message_id,
+        ),
+        Some(trigger_source::Source::Poll(poll)) => validate_event_positive_i64(
+            event_name,
+            "trigger_source.poll.poll_epoch",
+            poll.poll_epoch,
+        ),
+        None => Err(OrchestrationEventContractError::MissingEventMessage(
+            event_name,
+            "trigger_source.source",
+        )),
+    }
+}
+
+fn validate_partition_selector(
+    event_name: &'static str,
+    selector: Option<&PartitionSelector>,
+) -> Result<(), OrchestrationEventContractError> {
+    let selector = selector.ok_or(OrchestrationEventContractError::MissingEventMessage(
+        event_name,
+        "partition_selector",
+    ))?;
+    match selector.selector.as_ref() {
+        Some(partition_selector::Selector::Range(range)) => {
+            validate_event_string(event_name, "partition_selector.range.start", &range.start)?;
+            validate_event_string(event_name, "partition_selector.range.end", &range.end)
+        }
+        Some(partition_selector::Selector::Explicit(explicit)) => validate_event_string_list(
+            event_name,
+            "partition_selector.explicit.partition_keys",
+            &explicit.partition_keys,
+        ),
+        Some(partition_selector::Selector::Filter(filter)) => {
+            if filter.filters.is_empty()
+                || filter
+                    .filters
+                    .iter()
+                    .any(|(key, value)| key.is_empty() || value.is_empty())
+            {
+                Err(OrchestrationEventContractError::EmptyEventField(
+                    event_name,
+                    "partition_selector.filter.filters",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        None => Err(OrchestrationEventContractError::MissingEventMessage(
+            event_name,
+            "partition_selector.selector",
+        )),
+    }
+}
+
+fn validate_run_triggered_event(
+    event: &RunTriggered,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("run_triggered", "run_id", &event.run_id)?;
+    validate_event_string("run_triggered", "plan_id", &event.plan_id)?;
+    validate_event_optional_string("run_triggered", "run_key", event.run_key.as_ref())?;
+    validate_event_optional_string("run_triggered", "code_version", event.code_version.as_ref())?;
+    validate_run_triggered_trigger(event)
+}
+
+fn validate_plan_created_event(event: &PlanCreated) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("plan_created", "run_id", &event.run_id)?;
+    validate_event_string("plan_created", "plan_id", &event.plan_id)?;
+    if event.tasks.is_empty() {
+        return Err(OrchestrationEventContractError::EmptyEventField(
+            "plan_created",
+            "tasks",
+        ));
+    }
+    for task in &event.tasks {
+        validate_task_def("plan_created", task)?;
+    }
+    Ok(())
+}
+
+fn validate_run_cancel_requested_event(
+    event: &RunCancelRequested,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("run_cancel_requested", "run_id", &event.run_id)?;
+    validate_event_string("run_cancel_requested", "requested_by", &event.requested_by)?;
+    validate_event_optional_string("run_cancel_requested", "reason", event.reason.as_ref())
+}
+
+fn validate_task_started_event(event: &TaskStarted) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("task_started", "run_id", &event.run_id)?;
+    validate_event_string("task_started", "task_key", &event.task_key)?;
+    validate_event_nonzero_u32("task_started", "attempt", event.attempt)?;
+    validate_event_string("task_started", "attempt_id", &event.attempt_id)?;
+    validate_event_string("task_started", "worker_id", &event.worker_id)
+}
+
+fn validate_task_heartbeat_event(
+    event: &TaskHeartbeat,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("task_heartbeat", "run_id", &event.run_id)?;
+    validate_event_string("task_heartbeat", "task_key", &event.task_key)?;
+    validate_event_nonzero_u32("task_heartbeat", "attempt", event.attempt)?;
+    validate_event_string("task_heartbeat", "attempt_id", &event.attempt_id)?;
+    validate_event_string("task_heartbeat", "worker_id", &event.worker_id)?;
+    validate_event_timestamp(
+        "task_heartbeat",
+        "heartbeat_at",
+        event.heartbeat_at.as_ref(),
+    )?;
+    validate_event_optional_string("task_heartbeat", "message", event.message.as_ref())
+}
+
+fn validate_task_finished_event(
+    event: &TaskFinished,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("task_finished", "run_id", &event.run_id)?;
+    validate_event_string("task_finished", "task_key", &event.task_key)?;
+    validate_event_nonzero_u32("task_finished", "attempt", event.attempt)?;
+    validate_event_string("task_finished", "attempt_id", &event.attempt_id)?;
+    validate_event_string("task_finished", "worker_id", &event.worker_id)?;
+    validate_event_enum(
+        "task_finished",
+        "outcome",
+        event.outcome,
+        TaskOutcome::Unspecified,
+    )?;
+    validate_task_error("task_finished", "error", event.error.as_ref())?;
+    validate_event_optional_string(
+        "task_finished",
+        "cancelled_during_phase",
+        event.cancelled_during_phase.as_ref(),
+    )?;
+    validate_event_optional_string("task_finished", "asset_key", event.asset_key.as_ref())?;
+    validate_event_optional_string("task_finished", "code_version", event.code_version.as_ref())
+}
+
+fn validate_task_output_visibility_changed_event(
+    event: &TaskOutputVisibilityChanged,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("task_output_visibility_changed", "run_id", &event.run_id)?;
+    validate_event_string(
+        "task_output_visibility_changed",
+        "task_key",
+        &event.task_key,
+    )?;
+    validate_event_nonzero_u32("task_output_visibility_changed", "attempt", event.attempt)?;
+    validate_event_string(
+        "task_output_visibility_changed",
+        "attempt_id",
+        &event.attempt_id,
+    )?;
+    validate_event_enum(
+        "task_output_visibility_changed",
+        "visibility_state",
+        event.visibility_state,
+        OutputVisibilityState::Unspecified,
+    )?;
+    validate_event_timestamp(
+        "task_output_visibility_changed",
+        "published_at",
+        event.published_at.as_ref(),
+    )?;
+    validate_event_optional_string(
+        "task_output_visibility_changed",
+        "publish_error",
+        event.publish_error.as_ref(),
+    )
+}
+
+fn validate_dispatch_requested_event(
+    event: &DispatchRequested,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("dispatch_requested", "run_id", &event.run_id)?;
+    validate_event_string("dispatch_requested", "task_key", &event.task_key)?;
+    validate_event_nonzero_u32("dispatch_requested", "attempt", event.attempt)?;
+    validate_event_string("dispatch_requested", "attempt_id", &event.attempt_id)?;
+    validate_event_string("dispatch_requested", "worker_queue", &event.worker_queue)?;
+    validate_event_string("dispatch_requested", "dispatch_id", &event.dispatch_id)
+}
+
+fn validate_timer_requested_event(
+    event: &TimerRequested,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("timer_requested", "timer_id", &event.timer_id)?;
+    validate_event_enum(
+        "timer_requested",
+        "timer_type",
+        event.timer_type,
+        TimerType::Unspecified,
+    )?;
+    validate_event_optional_string("timer_requested", "run_id", event.run_id.as_ref())?;
+    validate_event_optional_string("timer_requested", "task_key", event.task_key.as_ref())?;
+    validate_event_optional_nonzero_u32("timer_requested", "attempt", event.attempt)?;
+    validate_event_timestamp("timer_requested", "fire_at", event.fire_at.as_ref())
+}
+
+fn validate_dispatch_enqueued_event(
+    event: &DispatchEnqueued,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("dispatch_enqueued", "dispatch_id", &event.dispatch_id)?;
+    validate_event_optional_string("dispatch_enqueued", "run_id", event.run_id.as_ref())?;
+    validate_event_optional_string("dispatch_enqueued", "task_key", event.task_key.as_ref())?;
+    validate_event_optional_nonzero_u32("dispatch_enqueued", "attempt", event.attempt)?;
+    validate_event_string("dispatch_enqueued", "cloud_task_id", &event.cloud_task_id)
+}
+
+fn validate_timer_enqueued_event(
+    event: &TimerEnqueued,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("timer_enqueued", "timer_id", &event.timer_id)?;
+    validate_event_optional_string("timer_enqueued", "run_id", event.run_id.as_ref())?;
+    validate_event_optional_string("timer_enqueued", "task_key", event.task_key.as_ref())?;
+    validate_event_optional_nonzero_u32("timer_enqueued", "attempt", event.attempt)?;
+    validate_event_string("timer_enqueued", "cloud_task_id", &event.cloud_task_id)
+}
+
+fn validate_timer_fired_event(event: &TimerFired) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("timer_fired", "timer_id", &event.timer_id)?;
+    validate_event_enum(
+        "timer_fired",
+        "timer_type",
+        event.timer_type,
+        TimerType::Unspecified,
+    )?;
+    validate_event_optional_string("timer_fired", "run_id", event.run_id.as_ref())?;
+    validate_event_optional_string("timer_fired", "task_key", event.task_key.as_ref())?;
+    validate_event_optional_nonzero_u32("timer_fired", "attempt", event.attempt)
+}
+
+fn validate_schedule_definition_upserted_event(
+    event: &ScheduleDefinitionUpserted,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string(
+        "schedule_definition_upserted",
+        "schedule_id",
+        &event.schedule_id,
+    )?;
+    validate_event_string(
+        "schedule_definition_upserted",
+        "cron_expression",
+        &event.cron_expression,
+    )?;
+    validate_event_string("schedule_definition_upserted", "timezone", &event.timezone)
+}
+
+fn validate_schedule_ticked_event(
+    event: &ScheduleTicked,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("schedule_ticked", "schedule_id", &event.schedule_id)?;
+    validate_event_timestamp(
+        "schedule_ticked",
+        "scheduled_for",
+        event.scheduled_for.as_ref(),
+    )?;
+    validate_event_string("schedule_ticked", "tick_id", &event.tick_id)?;
+    validate_event_string(
+        "schedule_ticked",
+        "definition_version",
+        &event.definition_version,
+    )?;
+    validate_event_enum(
+        "schedule_ticked",
+        "status",
+        event.status,
+        TickStatus::Unspecified,
+    )?;
+    validate_event_optional_string(
+        "schedule_ticked",
+        "skipped_reason",
+        event.skipped_reason.as_ref(),
+    )?;
+    validate_event_optional_string(
+        "schedule_ticked",
+        "failure_message",
+        event.failure_message.as_ref(),
+    )?;
+    validate_event_optional_string("schedule_ticked", "run_key", event.run_key.as_ref())?;
+    validate_event_optional_string(
+        "schedule_ticked",
+        "request_fingerprint",
+        event.request_fingerprint.as_ref(),
+    )
+}
+
+fn validate_sensor_evaluated_event(
+    event: &SensorEvaluated,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("sensor_evaluated", "sensor_id", &event.sensor_id)?;
+    validate_event_string("sensor_evaluated", "eval_id", &event.eval_id)?;
+    validate_event_optional_string(
+        "sensor_evaluated",
+        "cursor_before",
+        event.cursor_before.as_ref(),
+    )?;
+    validate_event_optional_string(
+        "sensor_evaluated",
+        "cursor_after",
+        event.cursor_after.as_ref(),
+    )?;
+    validate_event_optional_nonzero_u32(
+        "sensor_evaluated",
+        "expected_state_version",
+        event.expected_state_version,
+    )?;
+    validate_trigger_source("sensor_evaluated", event.trigger_source.as_ref())?;
+    validate_event_enum(
+        "sensor_evaluated",
+        "status",
+        event.status,
+        SensorEvalStatus::Unspecified,
+    )?;
+    validate_event_optional_string(
+        "sensor_evaluated",
+        "error_message",
+        event.error_message.as_ref(),
+    )
+}
+
+fn validate_run_requested_event(
+    event: &RunRequested,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("run_requested", "run_key", &event.run_key)?;
+    validate_event_string(
+        "run_requested",
+        "request_fingerprint",
+        &event.request_fingerprint,
+    )?;
+    validate_run_requested_trigger(event)
+}
+
+fn validate_backfill_created_event(
+    event: &BackfillCreated,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("backfill_created", "backfill_id", &event.backfill_id)?;
+    validate_event_string(
+        "backfill_created",
+        "client_request_id",
+        &event.client_request_id,
+    )?;
+    validate_partition_selector("backfill_created", event.partition_selector.as_ref())?;
+    validate_event_nonzero_u32(
+        "backfill_created",
+        "total_partitions",
+        event.total_partitions,
+    )?;
+    validate_event_nonzero_u32("backfill_created", "chunk_size", event.chunk_size)?;
+    validate_event_nonzero_u32(
+        "backfill_created",
+        "max_concurrent_runs",
+        event.max_concurrent_runs,
+    )?;
+    validate_event_optional_string(
+        "backfill_created",
+        "parent_backfill_id",
+        event.parent_backfill_id.as_ref(),
+    )
+}
+
+fn validate_backfill_chunk_planned_event(
+    event: &BackfillChunkPlanned,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("backfill_chunk_planned", "backfill_id", &event.backfill_id)?;
+    validate_event_string("backfill_chunk_planned", "chunk_id", &event.chunk_id)?;
+    validate_event_string_list(
+        "backfill_chunk_planned",
+        "partition_keys",
+        &event.partition_keys,
+    )?;
+    validate_event_string("backfill_chunk_planned", "run_key", &event.run_key)?;
+    validate_event_string(
+        "backfill_chunk_planned",
+        "request_fingerprint",
+        &event.request_fingerprint,
+    )
+}
+
+fn validate_backfill_state_changed_event(
+    event: &BackfillStateChanged,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("backfill_state_changed", "backfill_id", &event.backfill_id)?;
+    validate_event_enum(
+        "backfill_state_changed",
+        "from_state",
+        event.from_state,
+        BackfillState::Unspecified,
+    )?;
+    validate_event_enum(
+        "backfill_state_changed",
+        "to_state",
+        event.to_state,
+        BackfillState::Unspecified,
+    )?;
+    validate_event_nonzero_u32(
+        "backfill_state_changed",
+        "state_version",
+        event.state_version,
+    )?;
+    validate_event_optional_string(
+        "backfill_state_changed",
+        "changed_by",
+        event.changed_by.as_ref(),
+    )
 }
 
 fn required_trigger<'a>(
@@ -1049,40 +1691,73 @@ fn validate_run_requested_trigger(
 ) -> Result<(), OrchestrationEventContractError> {
     match required_trigger("run_requested", event.trigger.as_ref())? {
         trigger_info::Trigger::Manual(manual) => {
-            if manual.request_id.is_none() {
-                return Err(OrchestrationEventContractError::MissingTriggerField(
+            validate_event_string("run_requested", "manual.user_id", &manual.user_id)?;
+            match manual.request_id.as_ref() {
+                Some(request_id) if !request_id.is_empty() => Ok(()),
+                Some(_) => Err(OrchestrationEventContractError::EmptyEventField(
                     "run_requested",
                     "manual.request_id",
-                ));
+                )),
+                None => Err(OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "manual.request_id",
+                )),
             }
-            Ok(())
         }
         trigger_info::Trigger::Schedule(schedule) => {
-            if schedule.tick_id.is_none() {
-                return Err(OrchestrationEventContractError::MissingTriggerField(
+            validate_event_string(
+                "run_requested",
+                "schedule.schedule_id",
+                &schedule.schedule_id,
+            )?;
+            match schedule.tick_id.as_ref() {
+                Some(tick_id) if !tick_id.is_empty() => Ok(()),
+                Some(_) => Err(OrchestrationEventContractError::EmptyEventField(
                     "run_requested",
                     "schedule.tick_id",
-                ));
+                )),
+                None => Err(OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "schedule.tick_id",
+                )),
             }
-            Ok(())
         }
         trigger_info::Trigger::Sensor(sensor) => {
-            if sensor.eval_id.is_none() {
-                return Err(OrchestrationEventContractError::MissingTriggerField(
+            validate_event_string("run_requested", "sensor.sensor_id", &sensor.sensor_id)?;
+            validate_event_optional_string(
+                "run_requested",
+                "sensor.cursor",
+                sensor.cursor.as_ref(),
+            )?;
+            match sensor.eval_id.as_ref() {
+                Some(eval_id) if !eval_id.is_empty() => Ok(()),
+                Some(_) => Err(OrchestrationEventContractError::EmptyEventField(
                     "run_requested",
                     "sensor.eval_id",
-                ));
+                )),
+                None => Err(OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "sensor.eval_id",
+                )),
             }
-            Ok(())
         }
         trigger_info::Trigger::Backfill(backfill) => {
-            if backfill.chunk_id.is_none() {
-                return Err(OrchestrationEventContractError::MissingTriggerField(
+            validate_event_string(
+                "run_requested",
+                "backfill.backfill_id",
+                &backfill.backfill_id,
+            )?;
+            match backfill.chunk_id.as_ref() {
+                Some(chunk_id) if !chunk_id.is_empty() => Ok(()),
+                Some(_) => Err(OrchestrationEventContractError::EmptyEventField(
                     "run_requested",
                     "backfill.chunk_id",
-                ));
+                )),
+                None => Err(OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "backfill.chunk_id",
+                )),
             }
-            Ok(())
         }
         trigger_info::Trigger::Materialization(_) => {
             Err(OrchestrationEventContractError::UnsupportedTriggerKind(
@@ -1100,14 +1775,50 @@ fn validate_run_triggered_trigger(
     event: &RunTriggered,
 ) -> Result<(), OrchestrationEventContractError> {
     match required_trigger("run_triggered", event.trigger.as_ref())? {
+        trigger_info::Trigger::Manual(manual) => {
+            validate_event_string("run_triggered", "manual.user_id", &manual.user_id)?;
+            validate_event_optional_string(
+                "run_triggered",
+                "manual.request_id",
+                manual.request_id.as_ref(),
+            )
+        }
+        trigger_info::Trigger::Schedule(schedule) => {
+            validate_event_string(
+                "run_triggered",
+                "schedule.schedule_id",
+                &schedule.schedule_id,
+            )?;
+            validate_event_optional_string(
+                "run_triggered",
+                "schedule.tick_id",
+                schedule.tick_id.as_ref(),
+            )
+        }
+        trigger_info::Trigger::Materialization(materialization) => validate_event_string(
+            "run_triggered",
+            "materialization.upstream_materialization_id",
+            &materialization.upstream_materialization_id,
+        ),
+        trigger_info::Trigger::Webhook(webhook) => {
+            validate_event_string("run_triggered", "webhook.webhook_id", &webhook.webhook_id)
+        }
+        trigger_info::Trigger::Sensor(sensor) => {
+            validate_event_string("run_triggered", "sensor.sensor_id", &sensor.sensor_id)?;
+            validate_event_optional_string(
+                "run_triggered",
+                "sensor.cursor",
+                sensor.cursor.as_ref(),
+            )?;
+            validate_event_optional_string(
+                "run_triggered",
+                "sensor.eval_id",
+                sensor.eval_id.as_ref(),
+            )
+        }
         trigger_info::Trigger::Backfill(_) => Err(
             OrchestrationEventContractError::UnsupportedTriggerKind("run_triggered", "backfill"),
         ),
-        trigger_info::Trigger::Manual(_)
-        | trigger_info::Trigger::Schedule(_)
-        | trigger_info::Trigger::Materialization(_)
-        | trigger_info::Trigger::Webhook(_)
-        | trigger_info::Trigger::Sensor(_) => Ok(()),
     }
 }
 

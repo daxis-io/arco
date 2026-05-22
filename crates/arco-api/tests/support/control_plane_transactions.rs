@@ -35,6 +35,16 @@ use arco_proto::arco::orchestration::v1::{
 };
 
 pub const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";
+const APPLY_CATALOG_DDL_REQUEST_PROTO: &str = "arco.controlplane.v1.ApplyCatalogDdlRequest";
+const GET_CATALOG_TRANSACTION_REQUEST_PROTO: &str =
+    "arco.controlplane.v1.GetCatalogTransactionRequest";
+const COMMIT_ORCHESTRATION_BATCH_REQUEST_PROTO: &str =
+    "arco.controlplane.v1.CommitOrchestrationBatchRequest";
+const GET_ORCHESTRATION_TRANSACTION_REQUEST_PROTO: &str =
+    "arco.controlplane.v1.GetOrchestrationTransactionRequest";
+const COMMIT_ROOT_TRANSACTION_REQUEST_PROTO: &str =
+    "arco.controlplane.v1.CommitRootTransactionRequest";
+const GET_ROOT_TRANSACTION_REQUEST_PROTO: &str = "arco.controlplane.v1.GetRootTransactionRequest";
 pub const TENANT: &str = "test-tenant";
 pub const WORKSPACE: &str = "test-workspace";
 
@@ -71,6 +81,25 @@ pub fn protobuf_request_without_idempotency<T: Message>(
     protobuf_request_with_transport_idempotency(path, message, None, request_id)
 }
 
+fn protobuf_content_type_for_path(path: &str) -> String {
+    let proto = if path.ends_with("/transactions/applyCatalogDdl") {
+        APPLY_CATALOG_DDL_REQUEST_PROTO
+    } else if path.ends_with("/transactions/getCatalogTransaction") {
+        GET_CATALOG_TRANSACTION_REQUEST_PROTO
+    } else if path.ends_with("/transactions/commitOrchestrationBatch") {
+        COMMIT_ORCHESTRATION_BATCH_REQUEST_PROTO
+    } else if path.ends_with("/transactions/getOrchestrationTransaction") {
+        GET_ORCHESTRATION_TRANSACTION_REQUEST_PROTO
+    } else if path.ends_with("/transactions/commitRootTransaction") {
+        COMMIT_ROOT_TRANSACTION_REQUEST_PROTO
+    } else if path.ends_with("/transactions/getRootTransaction") {
+        GET_ROOT_TRANSACTION_REQUEST_PROTO
+    } else {
+        panic!("unknown protobuf transaction path: {path}");
+    };
+    format!("{CONTENT_TYPE_PROTOBUF}; proto={proto}")
+}
+
 fn protobuf_request_with_transport_idempotency<T: Message>(
     path: &str,
     message: &T,
@@ -83,7 +112,7 @@ fn protobuf_request_with_transport_idempotency<T: Message>(
         .header("X-Tenant-Id", TENANT)
         .header("X-Workspace-Id", WORKSPACE)
         .header("X-Request-Id", request_id)
-        .header(header::CONTENT_TYPE, CONTENT_TYPE_PROTOBUF);
+        .header(header::CONTENT_TYPE, protobuf_content_type_for_path(path));
     if let Some(idempotency_key) = idempotency_key {
         builder = builder.header("Idempotency-Key", idempotency_key);
     }

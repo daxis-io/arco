@@ -92,6 +92,15 @@ impl ApiError {
         Self::new(StatusCode::CONFLICT, "CONFLICT", message)
     }
 
+    /// Returns an error response when the request media type is not supported.
+    pub fn unsupported_media_type(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "UNSUPPORTED_MEDIA_TYPE",
+            message,
+        )
+    }
+
     /// Returns an error response for failed preconditions (`If-Match`).
     pub fn precondition_failed(message: impl Into<String>) -> Self {
         Self::new(
@@ -121,6 +130,7 @@ impl ApiError {
             StatusCode::FORBIDDEN => Self::forbidden(message),
             StatusCode::NOT_FOUND => Self::not_found(message),
             StatusCode::CONFLICT => Self::conflict(message),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => Self::unsupported_media_type(message),
             StatusCode::PRECONDITION_FAILED => Self::precondition_failed(message),
             StatusCode::NOT_ACCEPTABLE => Self::not_acceptable(message),
             StatusCode::NOT_IMPLEMENTED => Self::not_implemented(message),

@@ -68,9 +68,9 @@ Before merging proto changes:
 
 ## JSON Contract Policy
 
-The public proto surface must preserve both **binary protobuf/gRPC** compatibility and
-**ProtoJSON** compatibility. The active Buf breaking policy is `WIRE_JSON` — see
-[buf.yaml](../buf.yaml).
+The public proto surface must preserve **generated source**, **package/service**,
+**binary protobuf/gRPC**, and **ProtoJSON** compatibility. The active Buf breaking
+policy is `FILE` — see [buf.yaml](../buf.yaml).
 
 The frozen post-cut baseline image lives at
 `proto-baselines/post-hard-cut-v1.binpb`. Run `cargo xtask proto-breaking-check` to verify that
@@ -96,13 +96,18 @@ impact, regenerate `proto-baselines/post-hard-cut-v1.binpb`, and keep
 `cargo xtask proto-breaking-check` passing afterward.
 
 Outside an explicit hard-cut window, `v1` changes must be additive and must
-preserve binary and ProtoJSON compatibility with the frozen post-cut baseline.
+preserve generated source, package/service, binary, and ProtoJSON compatibility with the frozen post-cut baseline.
 Once Arco declares a stable public API, broad reshapes require new `v2`
 packages.
 
 Current hard-cut migration note: `arco.catalog.v1.RegisterTableOp.format` is
 now optional. Omit the field for the Delta Lake default; explicit
 `TABLE_FORMAT_UNSPECIFIED` is invalid on `RegisterTableOp`.
+
+HTTP protobuf transaction routes must use message-qualified content types, for
+example `application/x-protobuf; proto=arco.controlplane.v1.ApplyCatalogDdlRequest`.
+This is the runtime hard-cut boundary for generic or legacy protobuf bodies that
+would otherwise share wire tags with new request messages.
 
 A small allowlist of cross-domain value objects in `arco.common.v1` is still annotated with
 `serde::{Serialize, Deserialize}` derives in

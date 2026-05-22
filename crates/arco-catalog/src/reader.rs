@@ -449,13 +449,8 @@ impl CatalogReader {
             "catalogs.parquet",
         );
 
-        let records = match self.storage.get_raw(&catalogs_path).await {
-            Ok(bytes) => parquet_util::read_catalogs(&bytes)?,
-            Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
-                Vec::new()
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let bytes = self.storage.get_raw(&catalogs_path).await?;
+        let records = parquet_util::read_catalogs(&bytes)?;
 
         records.into_iter().map(Catalog::try_from).collect()
     }
@@ -852,10 +847,7 @@ impl CatalogReader {
             "lineage_edges.parquet",
         );
 
-        let Ok(bytes) = self.storage.get_raw(&edges_path).await else {
-            return Ok(LineageGraph::default());
-        };
-
+        let bytes = self.storage.get_raw(&edges_path).await?;
         let records = parquet_util::read_lineage_edges(&bytes)?;
 
         let upstream: Vec<LineageEdge> = records

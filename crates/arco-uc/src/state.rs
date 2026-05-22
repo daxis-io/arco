@@ -5,6 +5,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use arco_catalog::authz::compiler::CompiledPermissionSet;
+use arco_catalog::metastore::publish::PublishedStorageGovernanceCache;
 use arco_core::audit::AuditEmitter;
 use arco_core::storage::StorageBackend;
 
@@ -26,6 +27,8 @@ pub struct UnityCatalogState {
     pub config: UnityCatalogConfig,
     /// Optional compiled Arco permission view used by compatibility adapters.
     pub compiled_permissions: Option<Arc<RwLock<CompiledPermissionSet>>>,
+    /// Published storage-governance projection cache for credential decisions.
+    pub storage_governance_cache: Arc<PublishedStorageGovernanceCache>,
     /// Optional security audit event emitter.
     pub audit_emitter: Option<AuditEmitter>,
 }
@@ -38,6 +41,7 @@ impl UnityCatalogState {
             storage,
             config: UnityCatalogConfig::default(),
             compiled_permissions: None,
+            storage_governance_cache: Arc::new(PublishedStorageGovernanceCache::default()),
             audit_emitter: None,
         }
     }
@@ -49,6 +53,7 @@ impl UnityCatalogState {
             storage,
             config,
             compiled_permissions: None,
+            storage_governance_cache: Arc::new(PublishedStorageGovernanceCache::default()),
             audit_emitter: None,
         }
     }

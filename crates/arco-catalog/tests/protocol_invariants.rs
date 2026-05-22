@@ -1044,6 +1044,63 @@ async fn catalog_reader_fails_closed_when_visible_catalog_snapshot_file_is_missi
 }
 
 #[tokio::test]
+async fn default_catalog_transaction_validation_failure_does_not_publish_repair_catalog() {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = scoped_storage(backend);
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+
+    let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+    let pointer_version_before = storage
+        .head_raw(&pointer_path)
+        .await
+        .expect("pointer head before failed default transaction")
+        .expect("catalog pointer exists")
+        .version;
+
+    let error = writer
+        .register_table_in_schema_transaction(
+            "default",
+            "missing_schema",
+            RegisterTableInSchemaRequest {
+                name: "events".to_string(),
+                description: None,
+                location: None,
+                format: None,
+                table_type: Some("EXTERNAL".to_string()),
+                properties: Some(BTreeMap::from([(
+                    "delta.appendOnly".to_string(),
+                    "true".to_string(),
+                )])),
+                columns: vec![test_column("event_id")],
+            },
+            WriteOptions::default(),
+        )
+        .await
+        .expect_err("missing schema must reject default scoped table transaction");
+    assert!(
+        error.to_string().contains("missing_schema"),
+        "unexpected validation error: {error}"
+    );
+
+    let catalogs = CatalogReader::new(storage.clone())
+        .list_catalogs()
+        .await
+        .expect("list catalogs after failed default transaction");
+    assert!(
+        catalogs.iter().all(|catalog| catalog.name != "default"),
+        "failed default-scoped validation must not publish the repair default catalog"
+    );
+    let pointer_version_after = storage
+        .head_raw(&pointer_path)
+        .await
+        .expect("pointer head after failed default transaction")
+        .expect("catalog pointer exists")
+        .version;
+    assert_eq!(pointer_version_after, pointer_version_before);
+}
+
+#[tokio::test]
 async fn stale_update_event_replay_does_not_rollback_table_metadata() {
     let backend = Arc::new(MemoryBackend::new());
     let storage = scoped_storage(backend);

@@ -864,6 +864,28 @@ impl CatalogWriter {
         outcome
     }
 
+    fn default_catalog_id<'a>(state: &'a crate::state::CatalogState) -> Option<&'a str> {
+        state
+            .catalogs
+            .iter()
+            .find(|catalog| catalog.name == "default")
+            .map(|catalog| catalog.id.as_str())
+    }
+
+    fn find_default_namespace<'a>(
+        state: &'a crate::state::CatalogState,
+        schema: &str,
+    ) -> Option<&'a NamespaceRecord> {
+        let default_catalog_id = Self::default_catalog_id(state);
+        state.namespaces.iter().find(|namespace| {
+            namespace.name == schema
+                && match namespace.catalog_id.as_deref() {
+                    Some(catalog_id) => Some(catalog_id) == default_catalog_id,
+                    None => true,
+                }
+        })
+    }
+
     async fn ensure_default_catalog_locked(
         &self,
         guard: &crate::lock::LockGuard<dyn StorageBackend>,
@@ -1931,6 +1953,14 @@ impl CatalogWriter {
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
+        if Self::find_default_namespace(&state, name).is_some() {
+            guard.release().await?;
+            return Err(CatalogError::AlreadyExists {
+                entity: "namespace".into(),
+                name: name.to_string(),
+            });
+        }
+
         let default_catalog = match self
             .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
             .await
@@ -1941,20 +1971,6 @@ impl CatalogWriter {
                 return Err(err);
             }
         };
-
-        let default_catalog_id = default_catalog.id.as_str();
-
-        // Check for duplicate
-        if state.namespaces.iter().any(|ns| {
-            ns.name == name
-                && ns.catalog_id.as_deref().unwrap_or(default_catalog_id) == default_catalog_id
-        }) {
-            guard.release().await?;
-            return Err(CatalogError::AlreadyExists {
-                entity: "namespace".into(),
-                name: name.to_string(),
-            });
-        }
 
         let now = Utc::now().timestamp_millis();
         let namespace = Namespace {
@@ -2040,6 +2056,14 @@ impl CatalogWriter {
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
+        if Self::find_default_namespace(&state, name).is_some() {
+            guard.release().await?;
+            return Err(CatalogError::AlreadyExists {
+                entity: "namespace".into(),
+                name: name.to_string(),
+            });
+        }
+
         let default_catalog = match self
             .ensure_default_catalog_locked_with_result(&guard, &state, compactor, &opts)
             .await
@@ -2053,17 +2077,6 @@ impl CatalogWriter {
 
         let default_catalog_repair_pending = default_catalog.repair_pending;
         let default_catalog = default_catalog.catalog;
-        let default_catalog_id = default_catalog.id.as_str();
-        if state.namespaces.iter().any(|ns| {
-            ns.name == name
-                && ns.catalog_id.as_deref().unwrap_or(default_catalog_id) == default_catalog_id
-        }) {
-            guard.release().await?;
-            return Err(CatalogError::AlreadyExists {
-                entity: "namespace".into(),
-                name: name.to_string(),
-            });
-        }
 
         let now = Utc::now().timestamp_millis();
         let namespace = Namespace {
@@ -2751,34 +2764,18 @@ impl CatalogWriter {
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
-        let default_catalog = match self
-            .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
-            .await
-        {
-            Ok(catalog) => catalog,
-            Err(err) => {
+        let ns = match Self::find_default_namespace(&state, &req.namespace) {
+            Some(namespace) => namespace,
+            None => {
                 guard.release().await?;
-                return Err(err);
+                return Err(CatalogError::NotFound {
+                    entity: "namespace".into(),
+                    name: req.namespace.clone(),
+                });
             }
         };
-
-        let default_catalog_id = default_catalog.id.as_str();
-
-        // Find namespace in the default catalog (legacy route semantics).
-        let ns = state
-            .namespaces
-            .iter()
-            .find(|ns| {
-                ns.name == req.namespace
-                    && ns.catalog_id.as_deref().unwrap_or(default_catalog_id) == default_catalog_id
-            })
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "namespace".into(),
-                name: req.namespace.clone(),
-            })?;
         let namespace_id = ns.id.clone();
 
-        // Check for duplicate table
         if state
             .tables
             .iter()
@@ -2790,6 +2787,17 @@ impl CatalogWriter {
                 name: format!("{}.{}", req.namespace, req.name),
             });
         }
+
+        let _default_catalog = match self
+            .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                guard.release().await?;
+                return Err(err);
+            }
+        };
 
         let now = Utc::now().timestamp_millis();
         let table_id = Uuid::now_v7().to_string();
@@ -2902,31 +2910,16 @@ impl CatalogWriter {
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
-        let default_catalog = match self
-            .ensure_default_catalog_locked_with_result(&guard, &state, compactor, &opts)
-            .await
-        {
-            Ok(catalog) => catalog,
-            Err(err) => {
+        let ns = match Self::find_default_namespace(&state, &req.namespace) {
+            Some(namespace) => namespace,
+            None => {
                 guard.release().await?;
-                return Err(err);
+                return Err(CatalogError::NotFound {
+                    entity: "namespace".into(),
+                    name: req.namespace.clone(),
+                });
             }
         };
-
-        let default_catalog_repair_pending = default_catalog.repair_pending;
-        let default_catalog = default_catalog.catalog;
-        let default_catalog_id = default_catalog.id.as_str();
-        let ns = state
-            .namespaces
-            .iter()
-            .find(|ns| {
-                ns.name == req.namespace
-                    && ns.catalog_id.as_deref().unwrap_or(default_catalog_id) == default_catalog_id
-            })
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "namespace".into(),
-                name: req.namespace.clone(),
-            })?;
         let namespace_id = ns.id.clone();
 
         if state
@@ -2940,6 +2933,19 @@ impl CatalogWriter {
                 name: format!("{}.{}", req.namespace, req.name),
             });
         }
+
+        let default_catalog = match self
+            .ensure_default_catalog_locked_with_result(&guard, &state, compactor, &opts)
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                guard.release().await?;
+                return Err(err);
+            }
+        };
+
+        let default_catalog_repair_pending = default_catalog.repair_pending;
 
         let now = Utc::now().timestamp_millis();
         let table_id = Uuid::now_v7().to_string();
@@ -3268,22 +3274,6 @@ impl CatalogWriter {
         req: RegisterTableInSchemaRequest,
         opts: WriteOptions,
     ) -> Result<CatalogTransactionCommit> {
-        if catalog == "default" {
-            return self
-                .register_table_transaction(
-                    RegisterTableRequest {
-                        namespace: schema.to_string(),
-                        name: req.name,
-                        description: req.description,
-                        location: req.location,
-                        format: req.format,
-                        columns: req.columns,
-                    },
-                    opts,
-                )
-                .await;
-        }
-
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -3319,45 +3309,82 @@ impl CatalogWriter {
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
-        let Some(catalog_record) = state.catalogs.iter().find(|record| record.name == catalog)
-        else {
-            guard.release().await?;
-            return Err(CatalogError::NotFound {
-                entity: "catalog".into(),
-                name: catalog.to_string(),
-            });
-        };
+        let (namespace_id, default_catalog_repair_pending) = if catalog == "default" {
+            let namespace = match Self::find_default_namespace(&state, schema) {
+                Some(namespace) => namespace,
+                None => {
+                    guard.release().await?;
+                    return Err(CatalogError::NotFound {
+                        entity: "schema".into(),
+                        name: format!("{catalog}.{schema}"),
+                    });
+                }
+            };
+            let namespace_id = namespace.id.clone();
 
-        let default_catalog_id = state
-            .catalogs
-            .iter()
-            .find(|record| record.name == "default")
-            .map(|record| record.id.as_str());
-        let catalog_id = catalog_record.id.as_str();
-        let namespace = state
-            .namespaces
-            .iter()
-            .find(|candidate| {
+            if state
+                .tables
+                .iter()
+                .any(|table| table.namespace_id == namespace_id && table.name == req.name)
+            {
+                guard.release().await?;
+                return Err(CatalogError::AlreadyExists {
+                    entity: "table".into(),
+                    name: format!("{catalog}.{schema}.{}", req.name),
+                });
+            }
+
+            match self
+                .ensure_default_catalog_locked_with_result(&guard, &state, compactor, &opts)
+                .await
+            {
+                Ok(outcome) => (namespace_id, outcome.repair_pending),
+                Err(err) => {
+                    guard.release().await?;
+                    return Err(err);
+                }
+            }
+        } else {
+            let Some(catalog_record) = state.catalogs.iter().find(|record| record.name == catalog)
+            else {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "catalog".into(),
+                    name: catalog.to_string(),
+                });
+            };
+
+            let default_catalog_id = Self::default_catalog_id(&state);
+            let catalog_id = catalog_record.id.as_str();
+            let namespace = match state.namespaces.iter().find(|candidate| {
                 candidate.name == schema
                     && candidate.catalog_id.as_deref().or(default_catalog_id) == Some(catalog_id)
-            })
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "schema".into(),
-                name: format!("{catalog}.{schema}"),
-            })?;
-        let namespace_id = namespace.id.clone();
+            }) {
+                Some(namespace) => namespace,
+                None => {
+                    guard.release().await?;
+                    return Err(CatalogError::NotFound {
+                        entity: "schema".into(),
+                        name: format!("{catalog}.{schema}"),
+                    });
+                }
+            };
+            let namespace_id = namespace.id.clone();
 
-        if state
-            .tables
-            .iter()
-            .any(|table| table.namespace_id == namespace_id && table.name == req.name)
-        {
-            guard.release().await?;
-            return Err(CatalogError::AlreadyExists {
-                entity: "table".into(),
-                name: format!("{catalog}.{schema}.{}", req.name),
-            });
-        }
+            if state
+                .tables
+                .iter()
+                .any(|table| table.namespace_id == namespace_id && table.name == req.name)
+            {
+                guard.release().await?;
+                return Err(CatalogError::AlreadyExists {
+                    entity: "table".into(),
+                    name: format!("{catalog}.{schema}.{}", req.name),
+                });
+            }
+
+            (namespace_id, false)
+        };
 
         let now = Utc::now().timestamp_millis();
         let table_id = Uuid::now_v7().to_string();
@@ -3423,6 +3450,10 @@ impl CatalogWriter {
             compactor.sync_compact(request).await,
         )
         .await
+        .map(|mut commit| {
+            commit.repair_pending |= default_catalog_repair_pending;
+            commit
+        })
     }
 
     /// Updates a table.
@@ -3478,7 +3509,31 @@ impl CatalogWriter {
         let mut state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
-        let default_catalog = match self
+        let ns = match Self::find_default_namespace(&state, namespace) {
+            Some(namespace) => namespace,
+            None => {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "namespace".into(),
+                    name: namespace.to_string(),
+                });
+            }
+        };
+        let namespace_id = ns.id.clone();
+
+        if !state
+            .tables
+            .iter()
+            .any(|table| table.namespace_id == namespace_id && table.name == name)
+        {
+            guard.release().await?;
+            return Err(CatalogError::NotFound {
+                entity: "table".into(),
+                name: format!("{}.{}", namespace, name),
+            });
+        }
+
+        let _default_catalog = match self
             .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
             .await
         {
@@ -3489,31 +3544,20 @@ impl CatalogWriter {
             }
         };
 
-        let default_catalog_id = default_catalog.id.as_str();
-
-        // Find namespace in the default catalog (legacy route semantics).
-        let ns = state
-            .namespaces
-            .iter()
-            .find(|ns| {
-                ns.name == namespace
-                    && ns.catalog_id.as_deref().unwrap_or(default_catalog_id) == default_catalog_id
-            })
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "namespace".into(),
-                name: namespace.to_string(),
-            })?;
-        let namespace_id = &ns.id;
-
-        // Find and update table
-        let table_rec = state
+        let table_rec = match state
             .tables
             .iter_mut()
-            .find(|t| &t.namespace_id == namespace_id && t.name == name)
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "table".into(),
-                name: format!("{}.{}", namespace, name),
-            })?;
+            .find(|table| table.namespace_id == namespace_id && table.name == name)
+        {
+            Some(table) => table,
+            None => {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "table".into(),
+                    name: format!("{}.{}", namespace, name),
+                });
+            }
+        };
 
         let now = Utc::now().timestamp_millis();
         table_rec.updated_at = now;
@@ -3620,6 +3664,30 @@ impl CatalogWriter {
         let mut state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
+        let ns = match Self::find_default_namespace(&state, namespace) {
+            Some(namespace) => namespace,
+            None => {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "namespace".into(),
+                    name: namespace.to_string(),
+                });
+            }
+        };
+        let namespace_id = ns.id.clone();
+
+        if !state
+            .tables
+            .iter()
+            .any(|table| table.namespace_id == namespace_id && table.name == name)
+        {
+            guard.release().await?;
+            return Err(CatalogError::NotFound {
+                entity: "table".into(),
+                name: format!("{}.{}", namespace, name),
+            });
+        }
+
         let default_catalog = match self
             .ensure_default_catalog_locked_with_result(&guard, &state, compactor, &opts)
             .await
@@ -3632,29 +3700,21 @@ impl CatalogWriter {
         };
 
         let default_catalog_repair_pending = default_catalog.repair_pending;
-        let default_catalog = default_catalog.catalog;
-        let default_catalog_id = default_catalog.id.as_str();
-        let ns = state
-            .namespaces
-            .iter()
-            .find(|ns| {
-                ns.name == namespace
-                    && ns.catalog_id.as_deref().unwrap_or(default_catalog_id) == default_catalog_id
-            })
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "namespace".into(),
-                name: namespace.to_string(),
-            })?;
-        let namespace_id = &ns.id;
 
-        let table_rec = state
+        let table_rec = match state
             .tables
             .iter_mut()
-            .find(|t| &t.namespace_id == namespace_id && t.name == name)
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "table".into(),
-                name: format!("{}.{}", namespace, name),
-            })?;
+            .find(|table| table.namespace_id == namespace_id && table.name == name)
+        {
+            Some(table) => table,
+            None => {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "table".into(),
+                    name: format!("{}.{}", namespace, name),
+                });
+            }
+        };
 
         let now = Utc::now().timestamp_millis();
         table_rec.updated_at = now;
@@ -3732,12 +3792,6 @@ impl CatalogWriter {
         patch: TablePatch,
         opts: WriteOptions,
     ) -> Result<CatalogTransactionCommit> {
-        if catalog == "default" {
-            return self
-                .update_table_transaction(schema, name, patch, opts)
-                .await;
-        }
-
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -3773,42 +3827,97 @@ impl CatalogWriter {
         let mut state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
-        let Some(catalog_record) = state.catalogs.iter().find(|record| record.name == catalog)
-        else {
-            guard.release().await?;
-            return Err(CatalogError::NotFound {
-                entity: "catalog".into(),
-                name: catalog.to_string(),
-            });
-        };
+        let (namespace_id, default_catalog_repair_pending) = if catalog == "default" {
+            let namespace = match Self::find_default_namespace(&state, schema) {
+                Some(namespace) => namespace,
+                None => {
+                    guard.release().await?;
+                    return Err(CatalogError::NotFound {
+                        entity: "schema".into(),
+                        name: format!("{catalog}.{schema}"),
+                    });
+                }
+            };
+            let namespace_id = namespace.id.clone();
 
-        let default_catalog_id = state
-            .catalogs
-            .iter()
-            .find(|record| record.name == "default")
-            .map(|record| record.id.as_str());
-        let catalog_id = catalog_record.id.as_str();
-        let namespace = state
-            .namespaces
-            .iter()
-            .find(|candidate| {
+            if !state
+                .tables
+                .iter()
+                .any(|table| table.namespace_id == namespace_id && table.name == name)
+            {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "table".into(),
+                    name: format!("{catalog}.{schema}.{name}"),
+                });
+            }
+
+            match self
+                .ensure_default_catalog_locked_with_result(&guard, &state, compactor, &opts)
+                .await
+            {
+                Ok(outcome) => (namespace_id, outcome.repair_pending),
+                Err(err) => {
+                    guard.release().await?;
+                    return Err(err);
+                }
+            }
+        } else {
+            let Some(catalog_record) = state.catalogs.iter().find(|record| record.name == catalog)
+            else {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "catalog".into(),
+                    name: catalog.to_string(),
+                });
+            };
+
+            let default_catalog_id = Self::default_catalog_id(&state);
+            let catalog_id = catalog_record.id.as_str();
+            let namespace = match state.namespaces.iter().find(|candidate| {
                 candidate.name == schema
                     && candidate.catalog_id.as_deref().or(default_catalog_id) == Some(catalog_id)
-            })
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "schema".into(),
-                name: format!("{catalog}.{schema}"),
-            })?;
-        let namespace_id = &namespace.id;
+            }) {
+                Some(namespace) => namespace,
+                None => {
+                    guard.release().await?;
+                    return Err(CatalogError::NotFound {
+                        entity: "schema".into(),
+                        name: format!("{catalog}.{schema}"),
+                    });
+                }
+            };
+            let namespace_id = namespace.id.clone();
 
-        let table_rec = state
+            if !state
+                .tables
+                .iter()
+                .any(|table| table.namespace_id == namespace_id && table.name == name)
+            {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "table".into(),
+                    name: format!("{catalog}.{schema}.{name}"),
+                });
+            }
+
+            (namespace_id, false)
+        };
+
+        let table_rec = match state
             .tables
             .iter_mut()
-            .find(|table| &table.namespace_id == namespace_id && table.name == name)
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "table".into(),
-                name: format!("{catalog}.{schema}.{name}"),
-            })?;
+            .find(|table| table.namespace_id == namespace_id && table.name == name)
+        {
+            Some(table) => table,
+            None => {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "table".into(),
+                    name: format!("{catalog}.{schema}.{name}"),
+                });
+            }
+        };
 
         let now = Utc::now().timestamp_millis();
         table_rec.updated_at = now;
@@ -3863,6 +3972,10 @@ impl CatalogWriter {
             compactor.sync_compact(request).await,
         )
         .await
+        .map(|mut commit| {
+            commit.repair_pending |= default_catalog_repair_pending;
+            commit
+        })
     }
 
     /// Drops a table.
@@ -3910,7 +4023,34 @@ impl CatalogWriter {
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
-        let default_catalog = match self
+        let ns = match Self::find_default_namespace(&state, namespace) {
+            Some(namespace) => namespace,
+            None => {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "namespace".into(),
+                    name: namespace.to_string(),
+                });
+            }
+        };
+        let namespace_id = ns.id.clone();
+
+        let table_id = match state
+            .tables
+            .iter()
+            .find(|table| table.namespace_id == namespace_id && table.name == name)
+        {
+            Some(table) => table.id.clone(),
+            None => {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "table".into(),
+                    name: format!("{}.{}", namespace, name),
+                });
+            }
+        };
+
+        let _default_catalog = match self
             .ensure_default_catalog_locked(&guard, &state, compactor, &opts)
             .await
         {
@@ -3920,34 +4060,6 @@ impl CatalogWriter {
                 return Err(err);
             }
         };
-
-        let default_catalog_id = default_catalog.id.as_str();
-
-        // Find namespace in the default catalog (legacy route semantics).
-        let ns = state
-            .namespaces
-            .iter()
-            .find(|ns| {
-                ns.name == namespace
-                    && ns.catalog_id.as_deref().unwrap_or(default_catalog_id) == default_catalog_id
-            })
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "namespace".into(),
-                name: namespace.to_string(),
-            })?;
-        let namespace_id = ns.id.clone();
-
-        // Find table
-        let table_idx = state
-            .tables
-            .iter()
-            .position(|t| t.namespace_id == namespace_id && t.name == name)
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "table".into(),
-                name: format!("{}.{}", namespace, name),
-            })?;
-
-        let table_id = state.tables[table_idx].id.clone();
 
         let event = CatalogDdlEvent::TableDropped {
             table_id: table_id.clone(),
@@ -4023,6 +4135,33 @@ impl CatalogWriter {
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
+        let ns = match Self::find_default_namespace(&state, namespace) {
+            Some(namespace) => namespace,
+            None => {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "namespace".into(),
+                    name: namespace.to_string(),
+                });
+            }
+        };
+        let namespace_id = ns.id.clone();
+
+        let table_id = match state
+            .tables
+            .iter()
+            .find(|table| table.namespace_id == namespace_id && table.name == name)
+        {
+            Some(table) => table.id.clone(),
+            None => {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "table".into(),
+                    name: format!("{}.{}", namespace, name),
+                });
+            }
+        };
+
         let default_catalog = match self
             .ensure_default_catalog_locked_with_result(&guard, &state, compactor, &opts)
             .await
@@ -4035,30 +4174,6 @@ impl CatalogWriter {
         };
 
         let default_catalog_repair_pending = default_catalog.repair_pending;
-        let default_catalog = default_catalog.catalog;
-        let default_catalog_id = default_catalog.id.as_str();
-        let ns = state
-            .namespaces
-            .iter()
-            .find(|ns| {
-                ns.name == namespace
-                    && ns.catalog_id.as_deref().unwrap_or(default_catalog_id) == default_catalog_id
-            })
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "namespace".into(),
-                name: namespace.to_string(),
-            })?;
-        let namespace_id = ns.id.clone();
-
-        let table_idx = state
-            .tables
-            .iter()
-            .position(|t| t.namespace_id == namespace_id && t.name == name)
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "table".into(),
-                name: format!("{}.{}", namespace, name),
-            })?;
-        let table_id = state.tables[table_idx].id.clone();
 
         let event = CatalogDdlEvent::TableDropped {
             table_id,
@@ -4108,10 +4223,6 @@ impl CatalogWriter {
         name: &str,
         opts: WriteOptions,
     ) -> Result<CatalogTransactionCommit> {
-        if catalog == "default" {
-            return self.drop_table_transaction(schema, name, opts).await;
-        }
-
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -4147,43 +4258,87 @@ impl CatalogWriter {
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
-        let Some(catalog_record) = state.catalogs.iter().find(|record| record.name == catalog)
-        else {
-            guard.release().await?;
-            return Err(CatalogError::NotFound {
-                entity: "catalog".into(),
-                name: catalog.to_string(),
-            });
-        };
+        let (namespace_id, table_id, default_catalog_repair_pending) = if catalog == "default" {
+            let namespace = match Self::find_default_namespace(&state, schema) {
+                Some(namespace) => namespace,
+                None => {
+                    guard.release().await?;
+                    return Err(CatalogError::NotFound {
+                        entity: "schema".into(),
+                        name: format!("{catalog}.{schema}"),
+                    });
+                }
+            };
+            let namespace_id = namespace.id.clone();
+            let table_id = match state
+                .tables
+                .iter()
+                .find(|table| table.namespace_id == namespace_id && table.name == name)
+            {
+                Some(table) => table.id.clone(),
+                None => {
+                    guard.release().await?;
+                    return Err(CatalogError::NotFound {
+                        entity: "table".into(),
+                        name: format!("{catalog}.{schema}.{name}"),
+                    });
+                }
+            };
 
-        let default_catalog_id = state
-            .catalogs
-            .iter()
-            .find(|record| record.name == "default")
-            .map(|record| record.id.as_str());
-        let catalog_id = catalog_record.id.as_str();
-        let namespace = state
-            .namespaces
-            .iter()
-            .find(|candidate| {
+            match self
+                .ensure_default_catalog_locked_with_result(&guard, &state, compactor, &opts)
+                .await
+            {
+                Ok(outcome) => (namespace_id, table_id, outcome.repair_pending),
+                Err(err) => {
+                    guard.release().await?;
+                    return Err(err);
+                }
+            }
+        } else {
+            let Some(catalog_record) = state.catalogs.iter().find(|record| record.name == catalog)
+            else {
+                guard.release().await?;
+                return Err(CatalogError::NotFound {
+                    entity: "catalog".into(),
+                    name: catalog.to_string(),
+                });
+            };
+
+            let default_catalog_id = Self::default_catalog_id(&state);
+            let catalog_id = catalog_record.id.as_str();
+            let namespace = match state.namespaces.iter().find(|candidate| {
                 candidate.name == schema
                     && candidate.catalog_id.as_deref().or(default_catalog_id) == Some(catalog_id)
-            })
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "schema".into(),
-                name: format!("{catalog}.{schema}"),
-            })?;
-        let namespace_id = namespace.id.clone();
+            }) {
+                Some(namespace) => namespace,
+                None => {
+                    guard.release().await?;
+                    return Err(CatalogError::NotFound {
+                        entity: "schema".into(),
+                        name: format!("{catalog}.{schema}"),
+                    });
+                }
+            };
+            let namespace_id = namespace.id.clone();
 
-        let table_idx = state
-            .tables
-            .iter()
-            .position(|table| table.namespace_id == namespace_id && table.name == name)
-            .ok_or_else(|| CatalogError::NotFound {
-                entity: "table".into(),
-                name: format!("{catalog}.{schema}.{name}"),
-            })?;
-        let table_id = state.tables[table_idx].id.clone();
+            let table_id = match state
+                .tables
+                .iter()
+                .find(|table| table.namespace_id == namespace_id && table.name == name)
+            {
+                Some(table) => table.id.clone(),
+                None => {
+                    guard.release().await?;
+                    return Err(CatalogError::NotFound {
+                        entity: "table".into(),
+                        name: format!("{catalog}.{schema}.{name}"),
+                    });
+                }
+            };
+
+            (namespace_id, table_id, false)
+        };
 
         let event = CatalogDdlEvent::TableDropped {
             table_id,
@@ -4213,6 +4368,10 @@ impl CatalogWriter {
             compactor.sync_compact(request).await,
         )
         .await
+        .map(|mut commit| {
+            commit.repair_pending |= default_catalog_repair_pending;
+            commit
+        })
     }
 
     /// Renames a table within the same namespace.

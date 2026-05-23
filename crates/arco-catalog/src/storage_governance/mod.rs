@@ -1,9 +1,12 @@
 //! Storage-governance domain.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::{CatalogError, Result};
 use crate::metastore::events::LifecycleState;
+use crate::metastore::projections::{
+    MetastoreObjectProjectionRecord, STORAGE_GOVERNANCE_SCHEMA_VERSION,
+};
 use crate::metastore::replay::MetastoreState;
 
 use self::bindings::WorkspaceBinding;
@@ -64,6 +67,10 @@ pub struct StorageGovernanceState {
     external_locations: BTreeMap<String, ExternalLocation>,
     managed_roots: BTreeMap<String, ManagedRoot>,
     workspace_bindings: BTreeMap<String, WorkspaceBinding>,
+    authorities_by_workspace: BTreeMap<String, Vec<PathAuthority>>,
+    authorities_by_object: BTreeMap<(String, String), PathAuthority>,
+    global_authorities: Vec<PathAuthority>,
+    bindings_by_workspace: BTreeMap<String, BTreeSet<(String, String)>>,
     #[cfg(test)]
     unsafe_authorities: BTreeMap<String, PathAuthority>,
 }
@@ -164,10 +171,7 @@ impl StorageGovernanceState {
                     owner: record.owner.clone(),
                     lifecycle_state: record.lifecycle_state,
                 },
-                CredentialSecret::new(
-                    record.secret_material_ref.clone().unwrap_or_default(),
-                    record.encrypted_payload.clone().unwrap_or_default(),
-                ),
+                CredentialSecret::new("", ""),
             )?;
         }
 
@@ -220,6 +224,104 @@ impl StorageGovernanceState {
         Ok(state)
     }
 
+    /// Builds enforcement-grade storage-governance state from the published
+    /// redacted storage-governance projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when projection rows are stale, malformed, or unsafe for
+    /// enforcement.
+    pub fn from_projection_rows(rows: &[MetastoreObjectProjectionRecord]) -> Result<Self> {
+        let mut state = Self::default();
+
+        for row in rows
+            .iter()
+            .filter(|row| row.object_type.starts_with("storage_credential"))
+        {
+            ensure_storage_governance_schema(row)?;
+            let cloud = row
+                .object_type
+                .strip_prefix("storage_credential:")
+                .ok_or_else(|| CatalogError::Validation {
+                    message: format!(
+                        "storage governance projection credential '{}' is missing provider",
+                        row.object_id
+                    ),
+                })?;
+            state.create_storage_credential(
+                StorageCredentialMetadata {
+                    credential_id: row.object_id.clone(),
+                    name: required_projection_field(row, row.name.as_deref(), "name")?,
+                    cloud: cloud.to_string(),
+                    owner: required_projection_field(row, row.owner.as_deref(), "owner")?,
+                    lifecycle_state: lifecycle_state_from_projection(row)?,
+                },
+                CredentialSecret::new("", ""),
+            )?;
+        }
+
+        for row in rows
+            .iter()
+            .filter(|row| row.object_type == "external_location")
+        {
+            ensure_storage_governance_schema(row)?;
+            let mut location = ExternalLocation::new(
+                row.object_id.clone(),
+                required_projection_field(row, row.name.as_deref(), "name")?,
+                &required_projection_field(row, row.url.as_deref(), "url")?,
+                required_projection_field(row, row.credential_id.as_deref(), "credential_id")?,
+                required_projection_field(row, row.owner.as_deref(), "owner")?,
+            )?;
+            location.lifecycle_state = lifecycle_state_from_projection(row)?;
+            if location.lifecycle_state == LifecycleState::Active {
+                state.create_external_location(location)?;
+            } else {
+                state
+                    .external_locations
+                    .insert(location.location_id.clone(), location);
+            }
+        }
+
+        for row in rows.iter().filter(|row| row.object_type == "managed_root") {
+            ensure_storage_governance_schema(row)?;
+            let mut root = ManagedRoot::new(
+                row.object_id.clone(),
+                required_projection_field(row, row.name.as_deref(), "name")?,
+                required_projection_field(row, row.workspace_id.as_deref(), "workspace_id")?,
+                &required_projection_field(row, row.url.as_deref(), "url")?,
+                required_projection_field(row, row.owner.as_deref(), "owner")?,
+            )?;
+            root.lifecycle_state = lifecycle_state_from_projection(row)?;
+            if root.lifecycle_state == LifecycleState::Active {
+                state.create_managed_root(root)?;
+            } else {
+                state.managed_roots.insert(root.root_id.clone(), root);
+            }
+        }
+
+        for row in rows
+            .iter()
+            .filter(|row| row.object_type == "workspace_binding")
+        {
+            ensure_storage_governance_schema(row)?;
+            let mut binding = WorkspaceBinding::new(
+                row.object_id.clone(),
+                required_projection_field(row, row.workspace_id.as_deref(), "workspace_id")?,
+                required_projection_field(row, row.bound_object_id.as_deref(), "bound_object_id")?,
+                required_projection_field(
+                    row,
+                    row.bound_object_type.as_deref(),
+                    "bound_object_type",
+                )?,
+                required_projection_field(row, row.owner.as_deref(), "owner")?,
+            );
+            binding.lifecycle_state = lifecycle_state_from_projection(row)?;
+            state.bind_workspace(binding)?;
+        }
+
+        Ok(state)
+    }
+
     /// Creates an external location.
     ///
     /// # Errors
@@ -244,8 +346,10 @@ impl StorageGovernanceState {
             PathAuthorityKind::ExternalLocation,
             &location.path,
         )?;
+        let authority = path_authority_for_external_location(&location);
         self.external_locations
             .insert(location.location_id.clone(), location);
+        self.index_authority(authority);
         Ok(())
     }
 
@@ -262,7 +366,9 @@ impl StorageGovernanceState {
             });
         }
         self.validate_no_overlap(&root.root_id, PathAuthorityKind::ManagedRoot, &root.path)?;
+        let authority = path_authority_for_managed_root(&root);
         self.managed_roots.insert(root.root_id.clone(), root);
+        self.index_authority(authority);
         Ok(())
     }
 
@@ -287,8 +393,15 @@ impl StorageGovernanceState {
                 ),
             });
         }
+        let binding_index = binding_index_entry(&binding);
         self.workspace_bindings
             .insert(binding.binding_id.clone(), binding);
+        if let Some((workspace_id, entry)) = binding_index {
+            self.bindings_by_workspace
+                .entry(workspace_id)
+                .or_default()
+                .insert(entry);
+        }
         Ok(())
     }
 
@@ -299,12 +412,43 @@ impl StorageGovernanceState {
     /// Returns an explicit error for not-governed, unbound, or ambiguous paths.
     pub fn authority_for_path(&self, workspace_id: &str, uri: &str) -> Result<PathDecision> {
         let path = GovernedPath::parse(uri)?;
-        let matches = self
-            .active_authorities()
+        let mut candidates = BTreeMap::<(String, String), &PathAuthority>::new();
+        for authority in self
+            .authorities_by_workspace
+            .get(workspace_id)
             .into_iter()
+            .flat_map(|authorities| authorities.iter())
             .filter(|authority| authority.path.contains(&path))
-            .filter(|authority| self.authority_bound_to_workspace(authority, workspace_id))
-            .collect::<Vec<_>>();
+        {
+            candidates.insert(authority_binding_key(authority), authority);
+        }
+        if let Some(bindings) = self.bindings_by_workspace.get(workspace_id) {
+            for binding in bindings {
+                if let Some(authority) = self.authorities_by_object.get(binding) {
+                    if authority.path.contains(&path) {
+                        candidates.insert(binding.clone(), authority);
+                    }
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            for authority in self.unsafe_authorities.values().filter(|authority| {
+                authority.lifecycle_state == LifecycleState::Active
+                    && authority.path.contains(&path)
+                    && authority.workspace_id.as_deref() == Some(workspace_id)
+            }) {
+                candidates.insert(authority_binding_key(authority), authority);
+            }
+        }
+        let mut matches = candidates.into_values().collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            right
+                .path
+                .canonical_uri()
+                .len()
+                .cmp(&left.path.canonical_uri().len())
+        });
 
         match matches.as_slice() {
             [] => Err(CatalogError::NotFound {
@@ -315,9 +459,37 @@ impl StorageGovernanceState {
                 authority.object_id.clone(),
                 authority.kind,
             )),
-            _ => Err(CatalogError::PreconditionFailed {
-                message: "ambiguous path authority".to_string(),
-            }),
+            [authority, rest @ ..] => {
+                let best_len = authority.path.canonical_uri().len();
+                if rest
+                    .iter()
+                    .any(|candidate| candidate.path.canonical_uri().len() == best_len)
+                {
+                    return Err(CatalogError::PreconditionFailed {
+                        message: "ambiguous path authority".to_string(),
+                    });
+                }
+                Ok(PathDecision::owned(
+                    authority.object_id.clone(),
+                    authority.kind,
+                ))
+            }
+        }
+    }
+
+    fn index_authority(&mut self, authority: PathAuthority) {
+        if authority.lifecycle_state != LifecycleState::Active {
+            return;
+        }
+        self.authorities_by_object
+            .insert(authority_binding_key(&authority), authority.clone());
+        if let Some(workspace_id) = authority.workspace_id.as_ref() {
+            self.authorities_by_workspace
+                .entry(workspace_id.clone())
+                .or_default()
+                .push(authority);
+        } else {
+            self.global_authorities.push(authority);
         }
     }
 
@@ -345,41 +517,19 @@ impl StorageGovernanceState {
         authorities.extend(
             self.external_locations
                 .values()
-                .map(|location| PathAuthority {
-                    object_id: location.location_id.clone(),
-                    kind: PathAuthorityKind::ExternalLocation,
-                    path: location.path.clone(),
-                    workspace_id: None,
-                    lifecycle_state: location.lifecycle_state,
-                }),
+                .map(path_authority_for_external_location),
         );
-        authorities.extend(self.managed_roots.values().map(|root| PathAuthority {
-            object_id: root.root_id.clone(),
-            kind: PathAuthorityKind::ManagedRoot,
-            path: root.path.clone(),
-            workspace_id: Some(root.workspace_id.clone()),
-            lifecycle_state: root.lifecycle_state,
-        }));
+        authorities.extend(
+            self.managed_roots
+                .values()
+                .map(path_authority_for_managed_root),
+        );
         #[cfg(test)]
         authorities.extend(self.unsafe_authorities.values().cloned());
         authorities
             .into_iter()
             .filter(|authority| authority.lifecycle_state == LifecycleState::Active)
             .collect()
-    }
-
-    fn authority_bound_to_workspace(&self, authority: &PathAuthority, workspace_id: &str) -> bool {
-        if authority.workspace_id.as_deref() == Some(workspace_id) {
-            return true;
-        }
-        self.workspace_bindings.values().any(|binding| {
-            binding.lifecycle_state == LifecycleState::Active
-                && binding.workspace_id == workspace_id
-                && binding.object_id == authority.object_id
-                && binding
-                    .object_type
-                    .eq_ignore_ascii_case(authority_object_type(authority.kind))
-        })
     }
 
     fn binding_target_exists(&self, binding: &WorkspaceBinding) -> bool {
@@ -391,10 +541,93 @@ impl StorageGovernanceState {
     }
 }
 
+fn path_authority_for_external_location(location: &ExternalLocation) -> PathAuthority {
+    PathAuthority {
+        object_id: location.location_id.clone(),
+        kind: PathAuthorityKind::ExternalLocation,
+        path: location.path.clone(),
+        workspace_id: None,
+        lifecycle_state: location.lifecycle_state,
+    }
+}
+
+fn path_authority_for_managed_root(root: &ManagedRoot) -> PathAuthority {
+    PathAuthority {
+        object_id: root.root_id.clone(),
+        kind: PathAuthorityKind::ManagedRoot,
+        path: root.path.clone(),
+        workspace_id: Some(root.workspace_id.clone()),
+        lifecycle_state: root.lifecycle_state,
+    }
+}
+
+fn binding_index_entry(binding: &WorkspaceBinding) -> Option<(String, (String, String))> {
+    (binding.lifecycle_state == LifecycleState::Active).then(|| {
+        (
+            binding.workspace_id.clone(),
+            (
+                binding.object_type.to_ascii_uppercase(),
+                binding.object_id.clone(),
+            ),
+        )
+    })
+}
+
+fn authority_binding_key(authority: &PathAuthority) -> (String, String) {
+    (
+        authority_object_type(authority.kind).to_string(),
+        authority.object_id.clone(),
+    )
+}
+
 fn authority_object_type(kind: PathAuthorityKind) -> &'static str {
     match kind {
         PathAuthorityKind::ExternalLocation => "EXTERNAL_LOCATION",
         PathAuthorityKind::ManagedRoot => "MANAGED_ROOT",
+    }
+}
+
+fn ensure_storage_governance_schema(row: &MetastoreObjectProjectionRecord) -> Result<()> {
+    if row.schema_version != STORAGE_GOVERNANCE_SCHEMA_VERSION {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "unsupported storage governance projection schema version {}",
+                row.schema_version
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn required_projection_field(
+    row: &MetastoreObjectProjectionRecord,
+    value: Option<&str>,
+    field_name: &str,
+) -> Result<String> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| CatalogError::Validation {
+            message: format!(
+                "storage governance projection row '{}' missing required field '{field_name}'",
+                row.object_id
+            ),
+        })
+}
+
+fn lifecycle_state_from_projection(
+    row: &MetastoreObjectProjectionRecord,
+) -> Result<LifecycleState> {
+    match row.lifecycle_state.as_str() {
+        "active" => Ok(LifecycleState::Active),
+        "deleted" => Ok(LifecycleState::Deleted),
+        "disabled" => Ok(LifecycleState::Disabled),
+        other => Err(CatalogError::Validation {
+            message: format!(
+                "storage governance projection row '{}' has invalid lifecycle state '{other}'",
+                row.object_id
+            ),
+        }),
     }
 }
 
@@ -403,6 +636,7 @@ mod tests {
     use super::bindings::WorkspaceBinding;
     use super::credentials::{CredentialSecret, StorageCredentialMetadata};
     use super::external_locations::ExternalLocation;
+    use super::managed_roots::ManagedRoot;
     use super::*;
 
     #[test]
@@ -443,6 +677,82 @@ mod tests {
                     "workspace1",
                     "gs://bucket/warehouse/orders/day=1/file.parquet"
                 )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn path_authority_selects_strictly_longer_internal_match() -> Result<()> {
+        let mut state = StorageGovernanceState::default();
+        state.create_storage_credential(
+            StorageCredentialMetadata::new("cred_01", "lakehouse-prod", "gcs", "owner"),
+            CredentialSecret::new("secret://cred/01", "encrypted-token"),
+        )?;
+        state.create_external_location(ExternalLocation::new(
+            "loc_orders",
+            "orders",
+            "gs://bucket/warehouse/orders",
+            "cred_01",
+            "owner",
+        )?)?;
+        state.bind_workspace(WorkspaceBinding::new(
+            "binding_01",
+            "workspace1",
+            "loc_orders",
+            "EXTERNAL_LOCATION",
+            "owner",
+        ))?;
+        state.unsafe_authorities.insert(
+            "unsafe_orders_team".to_string(),
+            PathAuthority {
+                object_id: "unsafe_orders_team".to_string(),
+                kind: PathAuthorityKind::ExternalLocation,
+                path: GovernedPath::parse("gs://bucket/warehouse/orders/team")?,
+                workspace_id: Some("workspace1".to_string()),
+                lifecycle_state: LifecycleState::Active,
+            },
+        );
+
+        assert_eq!(
+            state.authority_for_path(
+                "workspace1",
+                "gs://bucket/warehouse/orders/team/day=1/file.parquet"
+            )?,
+            PathDecision::owned("unsafe_orders_team", PathAuthorityKind::ExternalLocation)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn managed_root_binding_authorizes_bound_workspace() -> Result<()> {
+        let mut state = StorageGovernanceState::default();
+        state.create_storage_credential(
+            StorageCredentialMetadata::new("cred_01", "lakehouse-prod", "gcs", "owner"),
+            CredentialSecret::new("secret://cred/01", "encrypted-token"),
+        )?;
+        state.create_managed_root(ManagedRoot::new(
+            "root_main",
+            "main",
+            "workspace1",
+            "gs://bucket/managed",
+            "owner",
+        )?)?;
+        state.bind_workspace(WorkspaceBinding::new(
+            "binding_root",
+            "workspace2",
+            "root_main",
+            "MANAGED_ROOT",
+            "owner",
+        ))?;
+
+        assert_eq!(
+            state.authority_for_path("workspace2", "gs://bucket/managed/table/file.parquet")?,
+            PathDecision::owned("root_main", PathAuthorityKind::ManagedRoot)
+        );
+        assert!(
+            state
+                .authority_for_path("workspace3", "gs://bucket/managed/table/file.parquet")
                 .is_err()
         );
         Ok(())

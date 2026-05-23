@@ -84,7 +84,7 @@ fn permission_assignments(
 ) -> Vec<serde_json::Value> {
     let object_type = securable_type.to_ascii_uppercase();
     compiled_permissions
-        .rows
+        .rows()
         .iter()
         .filter(|row| row.object_type.eq_ignore_ascii_case(&object_type))
         .filter(|row| row.object_id == full_name)

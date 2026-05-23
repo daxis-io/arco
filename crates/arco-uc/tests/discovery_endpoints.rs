@@ -268,7 +268,7 @@ async fn test_patch_permissions_remains_scaffolded() {
 }
 
 #[tokio::test]
-async fn test_post_temporary_table_credentials_denies_without_governance_binding() {
+async fn test_post_temporary_table_credentials_denies_without_trusted_principal() {
     let seeded = seeded_router().await;
     let app = seeded.app;
     let response = app
@@ -296,10 +296,9 @@ async fn test_post_temporary_table_credentials_denies_without_governance_binding
         .await
         .expect("body bytes");
     let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body");
-    assert!(
-        payload["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("path_not_governed"))
+    assert_eq!(
+        payload["error"]["message"],
+        json!("credential_scope_denied:unauthenticated_principal")
     );
 }
 

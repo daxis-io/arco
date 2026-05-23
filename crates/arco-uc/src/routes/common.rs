@@ -110,6 +110,14 @@ pub(crate) fn authz_denial_reason(
     object_type: &str,
     privilege: Privilege,
 ) -> Option<String> {
+    authz_denial_reason_for_watermark(state, ctx, object_id, object_type, privilege, None)
+}
+
+pub(crate) fn authz_context_denial_reason_for_watermark(
+    state: &UnityCatalogState,
+    ctx: &UnityCatalogRequestContext,
+    expected_ledger_watermark: Option<&str>,
+) -> Option<String> {
     let Some(principal_id) = ctx.user_id.as_ref() else {
         return Some("unauthenticated_principal".to_string());
     };
@@ -118,6 +126,43 @@ pub(crate) fn authz_denial_reason(
     };
     let Ok(compiled_permissions) = compiled_permissions.read() else {
         return Some("permissions_unavailable".to_string());
+    };
+    if !compiled_permissions.fresh {
+        return Some("authz_stale_projection".to_string());
+    }
+    if let Some(expected_ledger_watermark) = expected_ledger_watermark {
+        if compiled_permissions.ledger_watermark != expected_ledger_watermark {
+            return Some("authz_stale_projection".to_string());
+        }
+    }
+    if principal_id.is_empty() {
+        return Some("unauthenticated_principal".to_string());
+    }
+
+    None
+}
+
+pub(crate) fn authz_denial_reason_for_watermark(
+    state: &UnityCatalogState,
+    ctx: &UnityCatalogRequestContext,
+    object_id: &str,
+    object_type: &str,
+    privilege: Privilege,
+    expected_ledger_watermark: Option<&str>,
+) -> Option<String> {
+    if let Some(reason_code) =
+        authz_context_denial_reason_for_watermark(state, ctx, expected_ledger_watermark)
+    {
+        return Some(reason_code);
+    }
+    let Some(compiled_permissions) = state.compiled_permissions.as_ref() else {
+        return Some("permissions_unavailable".to_string());
+    };
+    let Ok(compiled_permissions) = compiled_permissions.read() else {
+        return Some("permissions_unavailable".to_string());
+    };
+    let Some(principal_id) = ctx.user_id.as_ref() else {
+        return Some("unauthenticated_principal".to_string());
     };
     let request = AuthzRequest::new(
         principal_id.clone(),

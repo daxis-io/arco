@@ -3,8 +3,10 @@
 use std::time::Duration;
 
 use arco_catalog::Result;
+use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::credential_vending::{
-    CredentialDecision, CredentialOperation, CredentialVendingEngine, CredentialVendingRequest,
+    CredentialDecision, CredentialOperation, CredentialVendingAuthorization,
+    CredentialVendingEngine, CredentialVendingRequest,
 };
 use arco_catalog::metastore::events::LifecycleState;
 use arco_catalog::storage_governance::StorageGovernanceState;
@@ -29,6 +31,7 @@ fn credential_vending_allows_governed_gcs_path_with_clamped_ttl_and_audit_id() -
             requested_ttl: Duration::from_secs(7200),
             client_kind: "uc".to_string(),
             catalog_snapshot_version: "event_004".to_string(),
+            authorization: Some(path_authorization("event_004")),
         },
     )?;
 
@@ -50,6 +53,93 @@ fn credential_vending_allows_governed_gcs_path_with_clamped_ttl_and_audit_id() -
 }
 
 #[test]
+fn credential_vending_denies_without_authorization_context() -> Result<()> {
+    let state = seeded_state()?;
+    let engine = CredentialVendingEngine::default();
+
+    let decision = engine.decide_path(
+        &state,
+        &CredentialVendingRequest {
+            principal_id: "user_mallory".to_string(),
+            groups_snapshot_version: "groups-rev-1".to_string(),
+            workspace_id: "workspace1".to_string(),
+            request_id: "request-no-authz".to_string(),
+            operation: CredentialOperation::Read,
+            requested_path: "gs://bucket/warehouse/orders/day=1/".to_string(),
+            requested_ttl: Duration::from_secs(300),
+            client_kind: "uc".to_string(),
+            catalog_snapshot_version: "event_004".to_string(),
+            authorization: None,
+        },
+    )?;
+
+    assert_eq!(decision.decision, CredentialDecision::Deny);
+    assert_eq!(decision.reason_code, "authorization_required");
+    assert!(decision.authorized_path_prefixes.is_empty());
+    Ok(())
+}
+
+#[test]
+fn credential_vending_denies_stale_authorization_watermark() -> Result<()> {
+    let state = seeded_state()?;
+    let engine = CredentialVendingEngine::default();
+
+    let decision = engine.decide_path(
+        &state,
+        &CredentialVendingRequest {
+            principal_id: "user_alice".to_string(),
+            groups_snapshot_version: "groups-rev-1".to_string(),
+            workspace_id: "workspace1".to_string(),
+            request_id: "request-stale-authz".to_string(),
+            operation: CredentialOperation::Read,
+            requested_path: "gs://bucket/warehouse/orders/day=1/".to_string(),
+            requested_ttl: Duration::from_secs(300),
+            client_kind: "uc".to_string(),
+            catalog_snapshot_version: "event_004".to_string(),
+            authorization: Some(path_authorization("event_003")),
+        },
+    )?;
+
+    assert_eq!(decision.decision, CredentialDecision::Deny);
+    assert_eq!(decision.reason_code, "stale_projection");
+    assert!(decision.authorized_path_prefixes.is_empty());
+    Ok(())
+}
+
+#[test]
+fn credential_vending_denies_unsupported_authorization_object_type() -> Result<()> {
+    let state = seeded_state()?;
+    let engine = CredentialVendingEngine::default();
+    let mut authorization = path_authorization("event_004");
+    authorization.object_type = "CATALOG".to_string();
+    authorization.privilege = Privilege::ReadFiles;
+
+    let decision = engine.decide_path(
+        &state,
+        &CredentialVendingRequest {
+            principal_id: "user_alice".to_string(),
+            groups_snapshot_version: "groups-rev-1".to_string(),
+            workspace_id: "workspace1".to_string(),
+            request_id: "request-unsupported-authz-object".to_string(),
+            operation: CredentialOperation::Read,
+            requested_path: "gs://bucket/warehouse/orders/day=1/".to_string(),
+            requested_ttl: Duration::from_secs(300),
+            client_kind: "uc".to_string(),
+            catalog_snapshot_version: "event_004".to_string(),
+            authorization: Some(authorization),
+        },
+    )?;
+
+    assert_eq!(decision.decision, CredentialDecision::Deny);
+    assert_eq!(
+        decision.reason_code,
+        "authorization_unsupported_object_type"
+    );
+    assert!(decision.authorized_path_prefixes.is_empty());
+    Ok(())
+}
+
+#[test]
 fn credential_vending_denies_ungoverned_paths_with_audit_id() -> Result<()> {
     let state = seeded_state()?;
     let engine = CredentialVendingEngine::default();
@@ -66,6 +156,7 @@ fn credential_vending_denies_ungoverned_paths_with_audit_id() -> Result<()> {
             requested_ttl: Duration::from_secs(300),
             client_kind: "uc".to_string(),
             catalog_snapshot_version: "event_004".to_string(),
+            authorization: Some(path_authorization("event_004")),
         },
     )?;
 
@@ -94,6 +185,7 @@ fn credential_vending_denies_unsupported_operations_closed() -> Result<()> {
             requested_ttl: Duration::from_secs(300),
             client_kind: "uc".to_string(),
             catalog_snapshot_version: "event_004".to_string(),
+            authorization: Some(path_authorization("event_004")),
         },
     )?;
 
@@ -142,6 +234,7 @@ fn credential_vending_denies_external_locations_backed_by_disabled_credentials()
             requested_ttl: Duration::from_secs(300),
             client_kind: "uc".to_string(),
             catalog_snapshot_version: "event_004".to_string(),
+            authorization: Some(path_authorization("event_004")),
         },
     )?;
 
@@ -173,4 +266,16 @@ fn seeded_state() -> Result<StorageGovernanceState> {
         "owner",
     ))?;
     Ok(state)
+}
+
+fn path_authorization(permission_ledger_watermark: &str) -> CredentialVendingAuthorization {
+    CredentialVendingAuthorization {
+        principal_id: "user_alice".to_string(),
+        object_id: "loc_orders".to_string(),
+        object_type: "EXTERNAL_LOCATION".to_string(),
+        privilege: Privilege::ReadFiles,
+        permission_ledger_watermark: permission_ledger_watermark.to_string(),
+        path_authority_object_id: "loc_orders".to_string(),
+        path_authority_object_type: "EXTERNAL_LOCATION".to_string(),
+    }
 }

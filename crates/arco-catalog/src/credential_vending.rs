@@ -5,6 +5,7 @@ use std::time::Duration;
 use chrono::Utc;
 use ulid::Ulid;
 
+use crate::authz::privileges::Privilege;
 use crate::error::Result;
 use crate::metastore::events::LifecycleState;
 use crate::storage_governance::{PathAuthorityKind, StorageGovernanceState};
@@ -93,6 +94,27 @@ pub struct CredentialVendingRequest {
     pub client_kind: String,
     /// Catalog or metastore projection version used by the caller.
     pub catalog_snapshot_version: String,
+    /// Successful authorization evidence for this credential request.
+    pub authorization: Option<CredentialVendingAuthorization>,
+}
+
+/// Authorization evidence required before credentials can be minted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialVendingAuthorization {
+    /// Principal that was authorized.
+    pub principal_id: String,
+    /// Authorized securable object ID.
+    pub object_id: String,
+    /// Authorized securable object type.
+    pub object_type: String,
+    /// Authorized privilege.
+    pub privilege: Privilege,
+    /// Ledger watermark used by the compiled permission view.
+    pub permission_ledger_watermark: String,
+    /// Storage-governance authority ID that bounds the path scope.
+    pub path_authority_object_id: String,
+    /// Storage-governance authority type that bounds the path scope.
+    pub path_authority_object_type: String,
 }
 
 /// Result of a credential vending decision.
@@ -147,12 +169,44 @@ impl CredentialVendingEngine {
         if !supports_operation(request.operation) {
             return Ok(deny("unsupported_operation", request.requested_ttl));
         }
+        let Some(authorization) = request.authorization.as_ref() else {
+            return Ok(deny("authorization_required", request.requested_ttl));
+        };
+        if authorization.principal_id != request.principal_id {
+            return Ok(deny(
+                "authorization_principal_mismatch",
+                request.requested_ttl,
+            ));
+        }
+        if authorization.permission_ledger_watermark != request.catalog_snapshot_version {
+            return Ok(deny("stale_projection", request.requested_ttl));
+        }
+        if !supported_authorization_object_type(&authorization.object_type) {
+            return Ok(deny(
+                "authorization_unsupported_object_type",
+                request.requested_ttl,
+            ));
+        }
+        if !authorization_privilege_matches(authorization, request.operation) {
+            return Ok(deny(
+                "authorization_insufficient_privilege",
+                request.requested_ttl,
+            ));
+        }
 
         let Ok(path_decision) =
             state.authority_for_path(&request.workspace_id, &request.requested_path)
         else {
             return Ok(deny("path_not_governed", request.requested_ttl));
         };
+        let path_authority_type = authority_object_type(path_decision.authority_kind);
+        if authorization.path_authority_object_id != path_decision.object_id
+            || !authorization
+                .path_authority_object_type
+                .eq_ignore_ascii_case(path_authority_type)
+        {
+            return Ok(deny("authorization_scope_mismatch", request.requested_ttl));
+        }
 
         let provider = match path_decision.authority_kind {
             PathAuthorityKind::ExternalLocation => {
@@ -190,6 +244,40 @@ fn supports_operation(operation: CredentialOperation) -> bool {
         operation,
         CredentialOperation::Read | CredentialOperation::Write | CredentialOperation::List
     )
+}
+
+fn supported_authorization_object_type(object_type: &str) -> bool {
+    matches!(
+        object_type.to_ascii_uppercase().as_str(),
+        "TABLE" | "EXTERNAL_LOCATION" | "MANAGED_ROOT"
+    )
+}
+
+fn authorization_privilege_matches(
+    authorization: &CredentialVendingAuthorization,
+    operation: CredentialOperation,
+) -> bool {
+    let required = if authorization.object_type.eq_ignore_ascii_case("TABLE") {
+        match operation {
+            CredentialOperation::Read | CredentialOperation::List => Privilege::Select,
+            CredentialOperation::Write => Privilege::Modify,
+            CredentialOperation::Manage | CredentialOperation::Delete => Privilege::Manage,
+        }
+    } else {
+        match operation {
+            CredentialOperation::Read | CredentialOperation::List => Privilege::ReadFiles,
+            CredentialOperation::Write => Privilege::WriteFiles,
+            CredentialOperation::Manage | CredentialOperation::Delete => Privilege::Manage,
+        }
+    };
+    authorization.privilege.implies(required)
+}
+
+fn authority_object_type(kind: PathAuthorityKind) -> &'static str {
+    match kind {
+        PathAuthorityKind::ExternalLocation => "EXTERNAL_LOCATION",
+        PathAuthorityKind::ManagedRoot => "MANAGED_ROOT",
+    }
 }
 
 fn deny(reason_code: &str, max_ttl: Duration) -> CredentialVendingDecision {

@@ -54,6 +54,7 @@ impl MetastoreLedger {
     /// Returns an error if the event is unscoped, serialization or storage
     /// fails, the same event ID already exists with different content, or the
     /// replay sequence is already reserved for a different event.
+    #[allow(clippy::too_many_lines)]
     pub async fn append_event(&self, event: &MetastoreEvent) -> Result<()> {
         self.validate_event_scope(event)?;
         let path = event_path(&event.event_id);
@@ -386,19 +387,18 @@ impl MetastoreLedger {
                 {
                     return Ok(());
                 }
-                if current.watermark.sequence == candidate.sequence {
-                    if !allow_stale_pending_replacement
+                if current.watermark.sequence == candidate.sequence
+                    && (!allow_stale_pending_replacement
                         || !self
                             .can_replace_stale_pending_watermark(&current.watermark, &candidate)
-                            .await?
-                    {
-                        return Err(CatalogError::PreconditionFailed {
-                            message: format!(
-                                "metastore latest watermark sequence {} already points at '{}'",
-                                candidate.sequence, current.watermark.event_id
-                            ),
-                        });
-                    }
+                            .await?)
+                {
+                    return Err(CatalogError::PreconditionFailed {
+                        message: format!(
+                            "metastore latest watermark sequence {} already points at '{}'",
+                            candidate.sequence, current.watermark.event_id
+                        ),
+                    });
                 }
             }
 

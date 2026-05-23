@@ -11,7 +11,7 @@ use crate::writer::{Catalog, Column, Schema, Table};
 
 /// Stable identity for one published catalog snapshot.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct CatalogSnapshotIdentity {
+pub struct CatalogSnapshotIdentity {
     snapshot_version: u64,
     manifest_id: String,
     last_commit_id: Option<String>,
@@ -20,7 +20,7 @@ pub(crate) struct CatalogSnapshotIdentity {
 impl CatalogSnapshotIdentity {
     /// Builds a snapshot identity from the immutable catalog manifest metadata.
     #[must_use]
-    pub(crate) fn from_manifest(manifest: &CatalogDomainManifest) -> Self {
+    pub fn from_manifest(manifest: &CatalogDomainManifest) -> Self {
         Self {
             snapshot_version: manifest.snapshot_version,
             manifest_id: manifest.manifest_id.clone(),
@@ -37,7 +37,7 @@ impl From<&CatalogDomainManifest> for CatalogSnapshotIdentity {
 
 /// Immutable, decoded catalog snapshot state for hot metadata reads.
 #[derive(Debug, Clone)]
-pub(crate) struct CatalogReadModel {
+pub struct CatalogReadModel {
     snapshot_version: u64,
     catalogs: Vec<Catalog>,
     namespaces: Vec<Schema>,
@@ -50,18 +50,9 @@ pub(crate) struct CatalogReadModel {
 
 impl CatalogReadModel {
     /// Loads and decodes all catalog snapshot files for one manifest.
-    pub(crate) async fn load(
-        storage: &ScopedStorage,
-        manifest: &CatalogDomainManifest,
-    ) -> Result<Self> {
+    pub async fn load(storage: &ScopedStorage, manifest: &CatalogDomainManifest) -> Result<Self> {
         if manifest.snapshot_version == 0 {
-            return Ok(Self::from_parts(
-                0,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ));
+            return Ok(Self::from_parts(0, Vec::new(), Vec::new(), &[], Vec::new()));
         }
 
         let version = manifest.snapshot_version;
@@ -102,17 +93,17 @@ impl CatalogReadModel {
             .collect::<Vec<_>>();
 
         Ok(Self::from_parts(
-            version, catalogs, namespaces, tables, columns,
+            version, catalogs, namespaces, &tables, columns,
         ))
     }
 
     /// Builds an immutable read model from already-decoded snapshot parts.
     #[must_use]
-    pub(crate) fn from_parts(
+    pub fn from_parts(
         snapshot_version: u64,
         catalogs: Vec<Catalog>,
         namespaces: Vec<Schema>,
-        tables: Vec<Table>,
+        tables: &[Table],
         columns: Vec<Column>,
     ) -> Self {
         let catalogs_by_name = catalogs
@@ -133,7 +124,7 @@ impl CatalogReadModel {
             .collect::<HashMap<_, _>>();
 
         let mut tables_by_namespace_id: HashMap<String, Vec<Table>> = HashMap::new();
-        for table in &tables {
+        for table in tables {
             tables_by_namespace_id
                 .entry(table.namespace_id.clone())
                 .or_default()
@@ -165,30 +156,30 @@ impl CatalogReadModel {
 
     /// Lists catalogs from this snapshot.
     #[must_use]
-    pub(crate) fn list_catalogs(&self) -> Vec<Catalog> {
+    pub fn list_catalogs(&self) -> Vec<Catalog> {
         self.catalogs.clone()
     }
 
     /// Gets a catalog by name from this snapshot.
     #[must_use]
-    pub(crate) fn get_catalog(&self, name: &str) -> Option<Catalog> {
+    pub fn get_catalog(&self, name: &str) -> Option<Catalog> {
         self.catalogs_by_name.get(name).cloned()
     }
 
     /// Lists all namespaces from this snapshot.
     #[must_use]
-    pub(crate) fn list_namespaces(&self) -> Vec<Schema> {
+    pub fn list_namespaces(&self) -> Vec<Schema> {
         self.namespaces.clone()
     }
 
     /// Gets a namespace by name from this snapshot.
     #[must_use]
-    pub(crate) fn get_namespace(&self, name: &str) -> Option<Schema> {
+    pub fn get_namespace(&self, name: &str) -> Option<Schema> {
         self.namespaces_by_name.get(name).cloned()
     }
 
     /// Lists schemas within a catalog while preserving legacy default-catalog behavior.
-    pub(crate) fn list_schemas(&self, catalog: &str) -> Result<Vec<Schema>> {
+    pub fn list_schemas(&self, catalog: &str) -> Result<Vec<Schema>> {
         if self.snapshot_version == 0 {
             return Err(CatalogError::NotFound {
                 entity: "catalog".into(),
@@ -219,11 +210,13 @@ impl CatalogReadModel {
         Ok(self
             .namespaces
             .iter()
-            .filter(|namespace| match effective_requested_catalog_id {
-                Some(requested) => {
-                    namespace.catalog_id.as_deref().or(default_catalog_id) == Some(requested)
-                }
-                None => namespace.catalog_id.is_none(),
+            .filter(|namespace| {
+                effective_requested_catalog_id.map_or_else(
+                    || namespace.catalog_id.is_none(),
+                    |requested| {
+                        namespace.catalog_id.as_deref().or(default_catalog_id) == Some(requested)
+                    },
+                )
             })
             .cloned()
             .collect())
@@ -231,7 +224,7 @@ impl CatalogReadModel {
 
     /// Lists tables by namespace identifier.
     #[must_use]
-    pub(crate) fn list_tables_for_namespace_id(&self, namespace_id: &str) -> Vec<Table> {
+    pub fn list_tables_for_namespace_id(&self, namespace_id: &str) -> Vec<Table> {
         self.tables_by_namespace_id
             .get(namespace_id)
             .cloned()
@@ -239,7 +232,7 @@ impl CatalogReadModel {
     }
 
     /// Lists tables by legacy namespace name.
-    pub(crate) fn list_tables(&self, namespace: &str) -> Result<Vec<Table>> {
+    pub fn list_tables(&self, namespace: &str) -> Result<Vec<Table>> {
         if self.snapshot_version == 0 {
             return Err(CatalogError::NotFound {
                 entity: "namespace".into(),
@@ -260,7 +253,7 @@ impl CatalogReadModel {
     }
 
     /// Lists tables within a schema in a catalog.
-    pub(crate) fn list_tables_in_schema(&self, catalog: &str, schema: &str) -> Result<Vec<Table>> {
+    pub fn list_tables_in_schema(&self, catalog: &str, schema: &str) -> Result<Vec<Table>> {
         let namespace_id = self
             .list_schemas(catalog)?
             .iter()
@@ -274,13 +267,13 @@ impl CatalogReadModel {
     }
 
     /// Gets a table by legacy namespace name and table name.
-    pub(crate) fn get_table(&self, namespace: &str, name: &str) -> Result<Option<Table>> {
+    pub fn get_table(&self, namespace: &str, name: &str) -> Result<Option<Table>> {
         let tables = self.list_tables(namespace)?;
         Ok(tables.into_iter().find(|table| table.name == name))
     }
 
     /// Gets a table by catalog, schema, and table name.
-    pub(crate) fn get_table_in_schema(
+    pub fn get_table_in_schema(
         &self,
         catalog: &str,
         schema: &str,
@@ -292,13 +285,13 @@ impl CatalogReadModel {
 
     /// Gets a table by stable table identifier.
     #[must_use]
-    pub(crate) fn get_table_by_id(&self, table_id: &str) -> Option<Table> {
+    pub fn get_table_by_id(&self, table_id: &str) -> Option<Table> {
         self.tables_by_id.get(table_id).cloned()
     }
 
     /// Lists columns for a table by stable table identifier.
     #[must_use]
-    pub(crate) fn get_columns(&self, table_id: &str) -> Vec<Column> {
+    pub fn get_columns(&self, table_id: &str) -> Vec<Column> {
         self.columns_by_table_id
             .get(table_id)
             .cloned()

@@ -45,7 +45,12 @@ fn permission_compiler_expands_transitive_groups_and_inherited_grants() {
     .expect("compile permissions");
 
     let alice_table_select = compiled
-        .rows_for_principal_object_privilege("user_alice", "table_orders", "TABLE", Privilege::Select)
+        .rows_for_principal_object_privilege(
+            "user_alice",
+            "table_orders",
+            "TABLE",
+            Privilege::Select,
+        )
         .collect::<Vec<_>>();
     assert_eq!(alice_table_select.len(), 1);
     assert_eq!(alice_table_select[0].source_object_id, "catalog_sales");
@@ -77,7 +82,12 @@ fn permission_compiler_treats_owners_as_manage_grant_sources() {
     .expect("compile permissions");
 
     let owner_manage = compiled
-        .rows_for_principal_object_privilege("owner_sales", "table_orders", "TABLE", Privilege::Manage)
+        .rows_for_principal_object_privilege(
+            "owner_sales",
+            "table_orders",
+            "TABLE",
+            Privilege::Manage,
+        )
         .collect::<Vec<_>>();
     assert_eq!(owner_manage.len(), 1);
     assert_eq!(owner_manage[0].source, "owner");

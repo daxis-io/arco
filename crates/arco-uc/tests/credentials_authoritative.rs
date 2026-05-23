@@ -854,6 +854,8 @@ fn storage_events(scope: &ControlPlaneScope, include_binding: bool) -> Vec<Metas
                 lifecycle_state: LifecycleState::Active,
                 updated_at_ms: 1_800_000_000_000,
                 properties: BTreeMap::new(),
+                secret_material_ref: None,
+                encrypted_payload: None,
             }),
         ),
         MetastoreEvent::new_scoped(

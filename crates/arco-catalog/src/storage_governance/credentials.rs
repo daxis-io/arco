@@ -1,5 +1,7 @@
 //! Storage credential metadata.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::metastore::events::LifecycleState;
@@ -39,7 +41,7 @@ impl StorageCredentialMetadata {
 }
 
 /// Internal storage credential secret material.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CredentialSecret {
     secret_material_ref: String,
     encrypted_payload: String,
@@ -68,5 +70,14 @@ impl CredentialSecret {
     #[must_use]
     pub fn encrypted_payload(&self) -> &str {
         &self.encrypted_payload
+    }
+}
+
+impl fmt::Debug for CredentialSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CredentialSecret")
+            .field("secret_material_ref", &"<redacted>")
+            .field("encrypted_payload", &"<redacted>")
+            .finish()
     }
 }

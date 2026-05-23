@@ -1398,6 +1398,8 @@ fn storage_governance_events() -> Vec<MetastoreEvent> {
                 lifecycle_state: LifecycleState::Active,
                 updated_at_ms: 1_800_000_000_000,
                 properties: sensitive_properties(),
+                secret_material_ref: None,
+                encrypted_payload: None,
             }),
         ),
         MetastoreEvent::new(
@@ -1473,6 +1475,8 @@ fn scoped_storage_governance_events_for_scope(
                 lifecycle_state: LifecycleState::Active,
                 updated_at_ms: 1_800_000_000_000,
                 properties: sensitive_properties(),
+                secret_material_ref: None,
+                encrypted_payload: None,
             }),
         ),
         MetastoreEvent::new_scoped(
@@ -1693,6 +1697,8 @@ fn scoped_storage_credential_event(
             lifecycle_state: LifecycleState::Active,
             updated_at_ms: 1_800_000_000_000 + i64::try_from(sequence).expect("sequence fits"),
             properties: BTreeMap::new(),
+            secret_material_ref: None,
+            encrypted_payload: None,
         }),
     )
 }
@@ -1760,6 +1766,8 @@ fn sample_events() -> Vec<MetastoreEvent> {
                 lifecycle_state: LifecycleState::Active,
                 updated_at_ms: 1_800_000_000_002,
                 properties: sensitive_properties(),
+                secret_material_ref: None,
+                encrypted_payload: None,
             }),
         ),
     ]

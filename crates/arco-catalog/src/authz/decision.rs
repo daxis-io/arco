@@ -109,6 +109,7 @@ impl AuthzDecision {
             .rows_for_principal_object_privilege(
                 &request.principal_id,
                 &request.object_id,
+                &request.object_type,
                 request.privilege,
             )
             .collect::<Vec<_>>();

@@ -56,7 +56,7 @@ jobs:
           toolchain: 1.85
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - name: Install cargo-deny
-        uses: taiki-e/install-action@fa0dd4cd0a40696e6f9766370614a5ce482e6aa8 # v2
+        uses: taiki-e/install-action@d9be7d8cda89035c9c843f78bd44d4f72d8403d4 # v2
         with:
           tool: cargo-deny@0.18.9
       - name: Setup Buf
@@ -227,7 +227,7 @@ jobs:
           toolchain: 1.85
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - name: Install cargo-deny
-        uses: taiki-e/install-action@fa0dd4cd0a40696e6f9766370614a5ce482e6aa8 # v2
+        uses: taiki-e/install-action@d9be7d8cda89035c9c843f78bd44d4f72d8403d4 # v2
         with:
           tool: cargo-deny@0.18.9
       - run: cargo deny check bans licenses sources
@@ -242,7 +242,7 @@ jobs:
           toolchain: 1.85
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - name: Install cargo-deny
-        uses: taiki-e/install-action@fa0dd4cd0a40696e6f9766370614a5ce482e6aa8 # v2
+        uses: taiki-e/install-action@d9be7d8cda89035c9c843f78bd44d4f72d8403d4 # v2
         with:
           tool: cargo-deny@0.18.9
       - name: cargo-deny advisories

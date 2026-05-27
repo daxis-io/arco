@@ -81,15 +81,7 @@ pub fn cron_timer_internal_id(schedule_id: &str, fire_epoch: i64) -> String {
 /// Format: `att_{hex(sha256(dispatch_id))[0..24]}`
 #[must_use]
 pub fn deterministic_attempt_id(dispatch_id: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"attempt:");
-    hasher.update(dispatch_id.as_bytes());
-    let hash = hasher.finalize();
-
-    // Take first 12 bytes = 24 hex chars = 96 bits of entropy.
-    let hex_encoded = hex::encode(hash.get(..12).unwrap_or(&hash));
-
-    format!("att_{hex_encoded}")
+    arco_worker_contract::deterministic_attempt_id(dispatch_id)
 }
 
 /// Generate deterministic `run_id` from `run_key` (replay-safe, tenant-scoped).

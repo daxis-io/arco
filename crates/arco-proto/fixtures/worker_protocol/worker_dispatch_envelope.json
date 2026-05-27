@@ -1,0 +1,19 @@
+{
+  "tenantId": "tenant-a",
+  "workspaceId": "workspace-b",
+  "taskId": "ct1_cnVuLTEyMwBhbmFseXRpY3MuZGFpbHlfc2FsZXM",
+  "taskKey": "analytics.daily_sales",
+  "runId": "run-123",
+  "attempt": 1,
+  "attemptId": "att-123",
+  "dispatchId": "dispatch:run-123:analytics.daily_sales:1",
+  "executionLocationId": "local-dev",
+  "workerQueue": "default-queue",
+  "callbackBaseUrl": "https://callbacks.example",
+  "taskToken": "token",
+  "tokenExpiresAt": "2026-01-01T00:00:00Z",
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "payload": {
+    "partition": "date=2026-01-01"
+  }
+}

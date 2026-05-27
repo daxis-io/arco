@@ -10,6 +10,7 @@ deployments.
 Responsibility:
 - Public API surface (`/api/v1/*`, `/iceberg/*`, UC facade when enabled)
 - Task callback validation (`/api/v1/tasks/{task_id}/started|heartbeat|completed`)
+- Worker protocol OpenAPI schemas from `arco-worker-contract`
 - Sync compaction RPC clients (catalog and orchestration)
 
 Required env:
@@ -67,7 +68,7 @@ HTTP:
 
 Responsibility:
 - Reads orchestration dispatch outbox
-- Emits canonical `WorkerDispatchEnvelope`
+- Emits canonical camelCase `WorkerDispatchEnvelope` with opaque `taskId` and semantic `taskKey`
 - Enqueues work through provider adapter (Cloud Tasks first)
 
 Required env:
@@ -129,9 +130,17 @@ Orchestration write path:
 4. Operators call `POST /internal/reconcile` for current-head legacy-manifest repair, and must attach internal OIDC bearer tokens when that gate is enabled.
 
 Worker dispatch path:
-1. Dispatcher/sweeper enqueue only canonical `WorkerDispatchEnvelope`.
-2. Worker calls task callbacks on API with envelope-provided per-task token.
+1. Dispatcher/sweeper enqueue canonical `WorkerDispatchEnvelope` from `arco-worker-contract`.
+2. Worker executes `taskKey` and calls API callbacks using envelope-provided `taskId`,
+   `taskToken`, and `callbackBaseUrl`.
 3. API validates task token against dedicated `task_token` config, not user JWT config.
+4. API resolves opaque `taskId` back to `(run_id, task_key)` for orchestration state updates.
+
+Worker protocol compatibility:
+- Canonical writes use camelCase JSON.
+- Runtime readers accept legacy snake_case dispatch envelopes during migration.
+- Legacy callback paths using `taskKey` are accepted only when the key is unambiguous.
+- The language-neutral schema lives in `arco.orchestration.v1` protobuf worker messages.
 
 ## Non-goals (Current Cycle)
 

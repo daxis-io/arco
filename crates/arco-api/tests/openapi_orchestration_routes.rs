@@ -52,3 +52,62 @@ fn list_history_endpoints_do_not_document_404() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn worker_callback_endpoints_use_contract_schemas() -> Result<()> {
+    let json = arco_api::openapi::openapi_json()?;
+    let spec: serde_json::Value = serde_json::from_str(&json)?;
+
+    let paths = spec
+        .get("paths")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| anyhow::anyhow!("missing paths in OpenAPI"))?;
+
+    for path in [
+        "/api/v1/tasks/{task_id}/started",
+        "/api/v1/tasks/{task_id}/heartbeat",
+        "/api/v1/tasks/{task_id}/completed",
+    ] {
+        ensure!(paths.contains_key(path), "missing OpenAPI path: {path}");
+    }
+
+    let schemas = &spec["components"]["schemas"];
+    ensure!(
+        schemas["TaskStartedRequest"]["properties"]
+            .as_object()
+            .is_some_and(|properties| properties.contains_key("workerId")),
+        "TaskStartedRequest should expose contract camelCase fields"
+    );
+    ensure!(
+        schemas["HeartbeatRequest"]["properties"]
+            .as_object()
+            .is_some_and(|properties| properties.contains_key("progressPct")),
+        "HeartbeatRequest should expose contract camelCase fields"
+    );
+    ensure!(
+        schemas["HeartbeatRequest"]["properties"]["progressPct"]["maximum"] == 100,
+        "HeartbeatRequest progressPct should document the 0-100 contract"
+    );
+    ensure!(
+        schemas["HeartbeatRequest"]["properties"]["attempt"]["minimum"] == 1,
+        "HeartbeatRequest attempt should document one-indexed attempts"
+    );
+    ensure!(
+        schemas["TaskCompletedRequest"]["properties"]
+            .as_object()
+            .is_some_and(|properties| properties.contains_key("outcome")),
+        "TaskCompletedRequest should expose contract outcome"
+    );
+    ensure!(
+        schemas["TaskCompletedRequest"]["properties"]["attempt"]["minimum"] == 1,
+        "TaskCompletedRequest attempt should document one-indexed attempts"
+    );
+    ensure!(
+        schemas["CallbackErrorResponse"]["properties"]
+            .as_object()
+            .is_some_and(|properties| properties.contains_key("expectedAttemptId")),
+        "CallbackErrorResponse should expose contract camelCase fields"
+    );
+
+    Ok(())
+}

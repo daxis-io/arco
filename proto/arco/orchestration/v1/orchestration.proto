@@ -3,6 +3,7 @@ syntax = "proto3";
 package arco.orchestration.v1;
 
 import "arco/common/v1/common.proto";
+import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 
 option go_package = "github.com/daxis-io/arco/proto/arco/orchestration/v1";
@@ -185,6 +186,154 @@ message Run {
   repeated TaskExecution task_executions = 7;
   map<string, string> labels = 8;
   RunTrigger trigger = 9;
+}
+
+// Canonical dispatch envelope sent to external workers.
+message WorkerDispatchEnvelope {
+  string tenant_id = 1;
+  string workspace_id = 2;
+  string task_id = 3;
+  string task_key = 4;
+  string run_id = 5;
+  // One-indexed attempt number.
+  uint32 attempt = 6;
+  string attempt_id = 7;
+  string dispatch_id = 8;
+  optional string execution_location_id = 9;
+  string worker_queue = 10;
+  string callback_base_url = 11;
+  string task_token = 12;
+  google.protobuf.Timestamp token_expires_at = 13;
+  optional string traceparent = 14;
+  google.protobuf.Struct payload = 15;
+}
+
+// Request body for task-started callbacks.
+message WorkerTaskStartedRequest {
+  // One-indexed attempt number.
+  uint32 attempt = 1;
+  string attempt_id = 2;
+  string worker_id = 3;
+  optional string traceparent = 4;
+  google.protobuf.Timestamp started_at = 5;
+}
+
+// Response body for task-started callbacks.
+message WorkerTaskStartedResponse {
+  bool acknowledged = 1;
+  google.protobuf.Timestamp server_time = 2;
+}
+
+// Request body for heartbeat callbacks.
+message WorkerHeartbeatRequest {
+  // One-indexed attempt number.
+  uint32 attempt = 1;
+  string attempt_id = 2;
+  string worker_id = 3;
+  optional string traceparent = 4;
+  google.protobuf.Timestamp heartbeat_at = 5;
+  // Optional progress percentage from 0 through 100.
+  optional uint32 progress_pct = 6;
+  optional string message = 7;
+}
+
+// Response body for heartbeat callbacks.
+message WorkerHeartbeatResponse {
+  bool acknowledged = 1;
+  bool should_cancel = 2;
+  optional string cancel_reason = 3;
+  google.protobuf.Timestamp server_time = 4;
+}
+
+// Worker-reported task outcome.
+enum WorkerOutcome {
+  WORKER_OUTCOME_UNSPECIFIED = 0;
+  WORKER_OUTCOME_SUCCEEDED = 1;
+  WORKER_OUTCOME_FAILED = 2;
+  WORKER_OUTCOME_CANCELLED = 3;
+}
+
+// Worker-reported output visibility state.
+enum WorkerOutputVisibilityState {
+  WORKER_OUTPUT_VISIBILITY_STATE_UNSPECIFIED = 0;
+  WORKER_OUTPUT_VISIBILITY_STATE_PENDING = 1;
+  WORKER_OUTPUT_VISIBILITY_STATE_VISIBLE = 2;
+  WORKER_OUTPUT_VISIBILITY_STATE_FAILED = 3;
+}
+
+// Worker error category.
+enum WorkerErrorCategory {
+  WORKER_ERROR_CATEGORY_UNSPECIFIED = 0;
+  WORKER_ERROR_CATEGORY_USER_CODE = 1;
+  WORKER_ERROR_CATEGORY_DATA_QUALITY = 2;
+  WORKER_ERROR_CATEGORY_INFRASTRUCTURE = 3;
+  WORKER_ERROR_CATEGORY_CONFIGURATION = 4;
+  WORKER_ERROR_CATEGORY_TIMEOUT = 5;
+  WORKER_ERROR_CATEGORY_CANCELLED = 6;
+}
+
+// Output reported by workers on success.
+message WorkerTaskOutput {
+  optional string materialization_id = 1;
+  optional uint64 row_count = 2;
+  optional uint64 byte_size = 3;
+  optional string output_path = 4;
+  optional string delta_table = 5;
+  optional int64 delta_version = 6;
+  optional string delta_partition = 7;
+  WorkerOutputVisibilityState output_visibility_state = 8;
+  google.protobuf.Timestamp published_at = 9;
+  optional string publish_error = 10;
+}
+
+// Error details reported by workers on failure.
+message WorkerTaskError {
+  WorkerErrorCategory category = 1;
+  string message = 2;
+  optional string stack_trace = 3;
+  optional bool retryable = 4;
+}
+
+// Execution metrics reported by workers.
+message WorkerTaskMetrics {
+  optional uint64 cpu_time_ms = 1;
+  optional uint64 peak_memory_bytes = 2;
+  optional uint64 io_read_bytes = 3;
+  optional uint64 io_write_bytes = 4;
+}
+
+// Request body for task-completed callbacks.
+message WorkerTaskCompletedRequest {
+  // One-indexed attempt number.
+  uint32 attempt = 1;
+  string attempt_id = 2;
+  string worker_id = 3;
+  optional string traceparent = 4;
+  WorkerOutcome outcome = 5;
+  google.protobuf.Timestamp completed_at = 6;
+  WorkerTaskOutput output = 7;
+  WorkerTaskError error = 8;
+  WorkerTaskMetrics metrics = 9;
+  optional string cancelled_during_phase = 10;
+  google.protobuf.Struct partial_progress = 11;
+}
+
+// Response body for task-completed callbacks.
+message WorkerTaskCompletedResponse {
+  bool acknowledged = 1;
+  string final_state = 2;
+  google.protobuf.Timestamp server_time = 3;
+}
+
+// Error payload returned by callback endpoints.
+message WorkerCallbackError {
+  string error = 1;
+  string message = 2;
+  optional string state = 3;
+  optional uint32 expected_attempt = 4;
+  optional uint32 received_attempt = 5;
+  optional string expected_attempt_id = 6;
+  optional string received_attempt_id = 7;
 }
 
 message ManualTrigger {

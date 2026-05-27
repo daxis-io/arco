@@ -9,6 +9,7 @@
 | `arco-flow` | Alpha | Yes | Orchestration: planning, scheduling, run state |
 | `arco-api` | Alpha | Yes | HTTP/gRPC composition layer |
 | `arco-proto` | Alpha | Yes | Protobuf definitions (prost-generated) |
+| `arco-worker-contract` | Alpha | Yes | Versioned worker dispatch and callback protocol types |
 | `arco-compactor` | Alpha | No | Compaction binary (Cloud Function entrypoint) |
 
 ## Boundary Rules

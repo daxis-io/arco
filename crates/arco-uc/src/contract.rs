@@ -134,6 +134,12 @@ fn segments_match(expected: &[Segment], actual: &[&str]) -> bool {
 /// Returns true when the supplied method/path pair exists in the pinned UC `OpenAPI` spec.
 #[must_use]
 pub fn is_known_operation(method: &Method, path: &str) -> bool {
+    known_operation_template(method, path).is_some()
+}
+
+/// Returns the pinned UC path template for a known method/path pair.
+#[must_use]
+pub fn known_operation_template(method: &Method, path: &str) -> Option<&'static str> {
     let normalized = normalize_path(canonicalize_request_path(path));
     let actual_segments: Vec<&str> = normalized
         .split('/')
@@ -145,10 +151,12 @@ pub fn is_known_operation(method: &Method, path: &str) -> bool {
     endpoint_patterns()
         .iter()
         .filter(|pattern| pattern.method.as_str() == method_str)
-        .any(|pattern| segments_match(&pattern.segments, &actual_segments))
+        .find(|pattern| segments_match(&pattern.segments, &actual_segments))
+        .map(|pattern| pattern.path_template.as_str())
 }
 
 /// Returns true if a route is in the pinned spec and explicitly in Scope A.
+#[allow(dead_code)]
 #[must_use]
 pub fn is_scope_a_operation(method: &Method, path: &str) -> bool {
     let normalized = normalize_path(canonicalize_request_path(path));

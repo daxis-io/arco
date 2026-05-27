@@ -129,19 +129,26 @@ architectural source of truth. Production-backed compatibility routes must be
 adapters over Arco-native stable IDs, ledger-backed state, compiled
 authorization decisions, and pointer-published projections.
 
+Route-level support status is checked in code through `arco_uc::support`.
+Mounted implemented or compatible-partial routes execute normally. Known
+unsupported and planned UC operations return the UC error envelope with HTTP
+`501` and `NOT_SUPPORTED`; unknown non-UC paths remain `404`. Generated OpenAPI
+operations carry `x-arco-support-level`, `x-arco-native-backing`, and
+`x-arco-authz-boundary` extensions.
+
 | Endpoint group | Arco support level | Notes |
 |---|---|---|
-| Catalogs | `compatible-partial` | Backed by authoritative Arco catalog state for implemented catalog metadata fields. |
-| Schemas | `compatible-partial` | Backed by authoritative Arco catalog state for implemented schema metadata fields. |
-| Tables | `compatible-partial` | Table create/get/list uses Arco catalog state for implemented fields. New native registrations default to Delta Lake; Iceberg and plain Parquet are explicit table-format surfaces. Managed Delta governance remains active work. |
+| Catalogs | `implemented` | Backed by authoritative Arco catalog state for implemented catalog metadata fields; route-wide compiled-grant enforcement remains separate governance work. |
+| Schemas | `implemented` | Backed by authoritative Arco catalog state for implemented schema metadata fields; route-wide compiled-grant enforcement remains separate governance work. |
+| Tables | `implemented` | Table create/get/list/delete uses Arco catalog state for implemented fields. New native registrations default to Delta Lake; Iceberg and plain Parquet are explicit table-format surfaces. Managed Delta governance remains active work. |
 | DeltaCommits | `compatible-partial` | Coordinator mechanics exist; stronger catalog-bound managed Delta validation is planned. |
-| Grants | `scaffolded` | Route shape exists, but compiled grants and authoritative permission mutations are not implemented. |
-| Credentials | `scaffolded` | Route shape exists, but storage credential state and secret-safe projections are not authoritative. |
-| External Locations | `scaffolded` | Route shape exists, but governed path binding and overlap checks are planned. |
-| TemporaryCredentials | `scaffolded` | Placeholder behavior only until credential vending uses compiled authorization and provider-scoped minting. |
+| Grants | `compatible-partial` | `GET /permissions` reads compiled assignments; `PATCH /permissions` and writer-backed grant persistence remain unsupported. |
+| Credentials | `compatible-partial` | Arco-native `/storage-credentials` create/list/get uses scoped metastore ledger state and redacted responses. Pinned UC `/credentials` routes are known-unsupported until the compatibility path is promoted; update/delete, service credentials, and provider secret integration remain planned. |
+| External Locations | `compatible-partial` | External location create/list/get uses scoped metastore ledger state, canonical paths, and overlap checks; update/delete and broader binding lifecycle remain planned. |
+| TemporaryCredentials | `compatible-partial` | Table/path credential routes use compiled authorization and published storage governance; volume/model credentials, provider token material, and revocation metadata remain planned. |
 | Volumes | `planned` | Product object family is planned; do not treat route parity as authoritative behavior. |
 | Functions | `planned` | Metadata object family is planned; execution semantics are out of first-tranche scope. |
 | RegisteredModels / ModelVersions | `planned` | Metadata and artifact ownership are planned before model-version credential vending. |
-| Metastores | `compatible-partial` | Summary/discovery shape only; Arco does not depend on a UC metastore service. |
+| Metastores | `known-unsupported` | Pinned `/metastore_summary` is not mounted in this facade; Arco does not depend on a UC metastore service. |
 
 <!-- END MANUAL -->

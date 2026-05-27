@@ -341,6 +341,16 @@ impl StorageGovernanceState {
                 name: location.location_id,
             });
         }
+        if self
+            .external_locations
+            .values()
+            .any(|existing| existing.name == location.name)
+        {
+            return Err(CatalogError::AlreadyExists {
+                entity: "external_location_name".to_string(),
+                name: location.name,
+            });
+        }
         self.validate_no_overlap(
             &location.location_id,
             PathAuthorityKind::ExternalLocation,
@@ -755,6 +765,39 @@ mod tests {
                 .authority_for_path("workspace3", "gs://bucket/managed/table/file.parquet")
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn external_location_names_are_unique() -> Result<()> {
+        let mut state = StorageGovernanceState::default();
+        state.create_storage_credential(
+            StorageCredentialMetadata::new("cred_01", "lakehouse-prod", "gcs", "owner"),
+            CredentialSecret::new("secret://cred/01", "encrypted-token"),
+        )?;
+        state.create_external_location(ExternalLocation::new(
+            "loc_orders",
+            "orders",
+            "gs://bucket/warehouse/orders",
+            "cred_01",
+            "owner",
+        )?)?;
+
+        let err = state
+            .create_external_location(ExternalLocation::new(
+                "loc_orders_alias",
+                "orders",
+                "gs://bucket/warehouse/orders-alias",
+                "cred_01",
+                "owner",
+            )?)
+            .expect_err("duplicate external location name must be rejected");
+
+        let CatalogError::AlreadyExists { entity, name } = err else {
+            panic!("expected AlreadyExists for duplicate external location name");
+        };
+        assert_eq!(entity, "external_location_name");
+        assert_eq!(name, "orders");
         Ok(())
     }
 }

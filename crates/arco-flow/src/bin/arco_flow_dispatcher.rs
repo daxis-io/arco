@@ -15,7 +15,7 @@ use arco_core::observability::{LogFormat, init_logging};
 use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 use arco_core::{
     DEFAULT_DISPATCH_TASK_TIMEOUT_SECONDS, DEFAULT_TASK_TOKEN_TTL_SECONDS, ScopedStorage,
-    TaskTokenConfig, mint_task_token,
+    TaskTokenConfig, mint_task_token_for_attempt,
 };
 use arco_flow::dispatch::cloud_tasks::{
     CloudTasksConfig, CloudTasksDispatcher, resolve_target_audience,
@@ -191,11 +191,13 @@ async fn run_handler(
         };
 
         let callback_task_id = callback_task_id(run_id, task_key);
-        let minted = mint_task_token(
+        let minted = mint_task_token_for_attempt(
             &state.task_token_config,
             callback_task_id.clone(),
             state.tenant_id.clone(),
             state.workspace_id.clone(),
+            run_id.clone(),
+            *attempt,
             Utc::now(),
         )
         .map_err(|e| Error::configuration(format!("task token minting failed: {e}")))?;

@@ -105,6 +105,7 @@ pub mod prelude {
         DEFAULT_DISPATCH_TASK_TIMEOUT_SECONDS, DEFAULT_TASK_TOKEN_TTL_SECONDS,
         MAX_TASK_TOKEN_TTL_SECONDS, MintedTaskToken, TASK_TOKEN_CALLBACK_GRACE_SECONDS,
         TaskTokenClaims, TaskTokenConfig, decode_task_token, mint_task_token,
+        mint_task_token_for_attempt,
     };
     pub use crate::tenant::TenantId;
 }
@@ -141,5 +142,6 @@ pub use task_tokens::{
     DEFAULT_DISPATCH_TASK_TIMEOUT_SECONDS, DEFAULT_TASK_TOKEN_TTL_SECONDS,
     MAX_TASK_TOKEN_TTL_SECONDS, MintedTaskToken, TASK_TOKEN_CALLBACK_GRACE_SECONDS,
     TaskTokenClaims, TaskTokenConfig, decode_task_token, mint_task_token,
+    mint_task_token_for_attempt,
 };
 pub use tenant::TenantId;

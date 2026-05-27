@@ -276,7 +276,7 @@ where
         ctx.token_validator.as_ref(),
         task_id,
         &state,
-        attempt,
+        state.attempt,
         task_token,
     )
     .await
@@ -444,7 +444,7 @@ where
         ctx.token_validator.as_ref(),
         task_id,
         &state,
-        attempt,
+        state.attempt,
         task_token,
     )
     .await
@@ -604,7 +604,7 @@ where
         ctx.token_validator.as_ref(),
         task_id,
         &state,
-        attempt,
+        state.attempt,
         task_token,
     )
     .await
@@ -1229,6 +1229,48 @@ mod tests {
             }
             other => panic!("Expected Conflict, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_handle_task_started_cancelled_task_conflicts() {
+        let ledger = Arc::new(MockLedger::default());
+        let validator = Arc::new(MockTokenValidator::allow_all());
+        let ctx = CallbackContext::new(ledger.clone(), validator, "tenant-1", "workspace-1");
+
+        let mut lookup = MockTaskLookup::new();
+        lookup.add_task(
+            "task-1",
+            TaskState {
+                state: "CANCELLED".to_string(),
+                attempt: 1,
+                attempt_id: "att-1".to_string(),
+                run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
+                cancel_requested: false,
+            },
+        );
+
+        let request = TaskStartedRequest {
+            attempt: 1,
+            attempt_id: "att-1".to_string(),
+            worker_id: "worker-abc".to_string(),
+            traceparent: None,
+            started_at: None,
+        };
+
+        let result = handle_task_started(&ctx, "task-1", "token", request, &lookup).await;
+
+        match result {
+            CallbackResult::Conflict(err) => {
+                assert_eq!(err.error, "task_already_terminal");
+                assert_eq!(err.state.as_deref(), Some("CANCELLED"));
+            }
+            other => panic!("Expected Conflict, got {:?}", other),
+        }
+        assert!(ledger.events.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

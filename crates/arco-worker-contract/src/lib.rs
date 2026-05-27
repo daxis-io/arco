@@ -68,16 +68,20 @@ pub fn parse_callback_task_id(task_id: &str) -> Result<ParsedCallbackTaskId, Cal
     let decoded = URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|err| CallbackTaskIdError::InvalidBase64(err.to_string()))?;
-    let Some(separator) = decoded.iter().position(|byte| *byte == 0) else {
+    let mut parts = decoded.split(|byte| *byte == 0);
+    let Some(run_id_bytes) = parts.next() else {
         return Err(CallbackTaskIdError::InvalidPayload);
     };
-    if decoded[separator + 1..].contains(&0) {
+    let Some(task_key_bytes) = parts.next() else {
+        return Err(CallbackTaskIdError::InvalidPayload);
+    };
+    if parts.next().is_some() {
         return Err(CallbackTaskIdError::InvalidPayload);
     }
-    let run_id = String::from_utf8(decoded[..separator].to_vec())
-        .map_err(|_| CallbackTaskIdError::InvalidUtf8)?;
-    let task_key = String::from_utf8(decoded[separator + 1..].to_vec())
-        .map_err(|_| CallbackTaskIdError::InvalidUtf8)?;
+    let run_id =
+        String::from_utf8(run_id_bytes.to_vec()).map_err(|_| CallbackTaskIdError::InvalidUtf8)?;
+    let task_key =
+        String::from_utf8(task_key_bytes.to_vec()).map_err(|_| CallbackTaskIdError::InvalidUtf8)?;
     if run_id.is_empty() || task_key.is_empty() {
         return Err(CallbackTaskIdError::InvalidPayload);
     }

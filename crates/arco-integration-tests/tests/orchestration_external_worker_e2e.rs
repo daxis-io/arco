@@ -25,7 +25,7 @@ use arco_flow::orchestration::events::{
     OrchestrationEvent, OrchestrationEventData, TaskDef, TriggerInfo,
 };
 use arco_flow::orchestration::ledger::OrchestrationLedgerWriter;
-use arco_flow::orchestration::worker_contract::WorkerDispatchEnvelope;
+use arco_flow::orchestration::worker_contract::{WorkerDispatchEnvelope, callback_task_id};
 
 #[derive(Clone)]
 struct CompactingTestLedger {
@@ -95,6 +95,7 @@ impl TaskStateLookup for CompactorLookup {
                 attempt: row.attempt,
                 attempt_id: row.attempt_id.clone().unwrap_or_default(),
                 run_id: row.run_id.clone(),
+                task_key: row.task_key.clone(),
                 asset_key: row.asset_key.clone(),
                 partition_key: row.partition_key.clone(),
                 code_version: run.and_then(|run| run.code_version.clone()),
@@ -287,6 +288,7 @@ async fn run_dispatch_callback_path_advances_task_state() {
     let envelope = WorkerDispatchEnvelope {
         tenant_id: "tenant".to_string(),
         workspace_id: "workspace".to_string(),
+        task_id: callback_task_id(run_id, task_key),
         run_id: run_id.to_string(),
         task_key: task_key.to_string(),
         attempt,

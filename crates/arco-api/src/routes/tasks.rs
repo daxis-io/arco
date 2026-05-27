@@ -156,9 +156,11 @@ impl TaskStateLookup for ParquetTaskStateLookup {
             let matches: Vec<_> = state
                 .tasks
                 .values()
-                .filter(|row| match &parsed_callback_task_id {
-                    Some(parsed) => row.run_id == parsed.run_id && row.task_key == parsed.task_key,
-                    None => row.task_key == task_id,
+                .filter(|row| {
+                    parsed_callback_task_id.as_ref().map_or_else(
+                        || row.task_key == task_id,
+                        |parsed| row.run_id == parsed.run_id && row.task_key == parsed.task_key,
+                    )
                 })
                 .collect();
 

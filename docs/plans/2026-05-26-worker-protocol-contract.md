@@ -1,7 +1,5 @@
 # Worker Protocol Contract Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Publish a canonical, versioned worker protocol contract for embedded deployments without breaking existing snake_case dispatch readers.
 
 **Architecture:** Add a small `arco-worker-contract` crate for serde/OpenAPI-facing protocol types and helper IDs, backed by protobuf definitions under `arco.orchestration.v1`. `arco-flow`, `arco-api`, and the Python worker should consume that surface instead of redefining worker callback and dispatch shapes.

@@ -23,7 +23,7 @@ use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::routing::post;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::Serialize;
 
 use crate::context::{REQUEST_ID_HEADER, RequestContext};
@@ -31,13 +31,15 @@ use crate::error::{ApiError, ApiErrorBody};
 use crate::orchestration_compaction::CompactingLedgerWriter;
 use crate::server::AppState;
 
-use arco_core::{TaskTokenConfig, decode_task_token};
+use arco_core::{TaskTokenClaims, TaskTokenConfig, decode_task_token};
 use arco_flow::orchestration::callbacks::{
     CallbackContext, CallbackError, CallbackResult, TaskState as CallbackTaskState,
     TaskStateLookup, TaskTokenValidator, handle_heartbeat, handle_task_completed,
     handle_task_started,
 };
-use arco_flow::orchestration::compactor::{FoldState, MicroCompactor, TaskState as FoldTaskState};
+use arco_flow::orchestration::compactor::{
+    FoldState, MicroCompactor, TaskRow, TaskState as FoldTaskState,
+};
 use arco_worker_contract::parse_callback_task_id;
 pub use arco_worker_contract::{
     CallbackErrorResponse, ErrorCategory, HeartbeatRequest, HeartbeatResponse,
@@ -91,12 +93,13 @@ impl TaskTokenValidator for JwtTaskTokenValidator {
     fn validate_task_token(
         &self,
         task_id: &str,
-        _run_id: &str,
-        _attempt: u32,
+        run_id: &str,
+        attempt: u32,
         token: &str,
     ) -> impl Future<Output = Result<(), String>> + Send {
         let validator = self.clone();
         let task_id = task_id.to_string();
+        let run_id = run_id.to_string();
         let token = token.to_string();
 
         async move {
@@ -120,6 +123,16 @@ impl TaskTokenValidator for JwtTaskTokenValidator {
             if claims.workspace_id != validator.workspace {
                 return Err("workspace_mismatch".to_string());
             }
+            if let Some(claim_run_id) = claims.run_id.as_deref() {
+                if claim_run_id != run_id {
+                    return Err("run_id_mismatch".to_string());
+                }
+            }
+            if let Some(claim_attempt) = claims.attempt {
+                if claim_attempt != attempt {
+                    return Err("attempt_mismatch".to_string());
+                }
+            }
 
             Ok(())
         }
@@ -129,10 +142,14 @@ impl TaskTokenValidator for JwtTaskTokenValidator {
 #[derive(Clone)]
 struct ParquetTaskStateLookup {
     state: Arc<FoldState>,
+    run_id_scope: Option<String>,
 }
 
 impl ParquetTaskStateLookup {
-    async fn load(storage: arco_core::ScopedStorage) -> Result<Self, ApiError> {
+    async fn load(
+        storage: arco_core::ScopedStorage,
+        run_id_scope: Option<String>,
+    ) -> Result<Self, ApiError> {
         let compactor = MicroCompactor::new(storage);
         let (_, state) = compactor
             .load_state()
@@ -140,6 +157,7 @@ impl ParquetTaskStateLookup {
             .map_err(|e| ApiError::internal(format!("failed to load orchestration state: {e}")))?;
         Ok(Self {
             state: Arc::new(state),
+            run_id_scope,
         })
     }
 }
@@ -150,9 +168,25 @@ impl TaskStateLookup for ParquetTaskStateLookup {
         task_id: &str,
     ) -> impl Future<Output = Result<Option<CallbackTaskState>, String>> + Send {
         let state = Arc::clone(&self.state);
+        let run_id_scope = self.run_id_scope.clone();
         let task_id = task_id.to_string();
         async move {
             let parsed_callback_task_id = parse_callback_task_id(&task_id).ok();
+
+            if let Some(run_id) = run_id_scope {
+                let task_key = match &parsed_callback_task_id {
+                    Some(parsed) if parsed.run_id == run_id => parsed.task_key.clone(),
+                    Some(_) => return Ok(None),
+                    None => task_id.clone(),
+                };
+                let Some(row) = state.tasks.get(&(run_id, task_key)) else {
+                    return Ok(None);
+                };
+                return Ok(Some(callback_task_state_from_row(&state, row)));
+            }
+
+            // Legacy tokens do not carry run identity, so preserve the old
+            // unique-task-key lookup contract for compatibility.
             let matches: Vec<_> = state
                 .tasks
                 .values()
@@ -174,21 +208,25 @@ impl TaskStateLookup for ParquetTaskStateLookup {
             let Some(row) = matches.first() else {
                 return Ok(None);
             };
-            let run = state.runs.get(&row.run_id);
-            let cancel_requested = run.is_some_and(|run| run.cancel_requested);
-            let code_version = run.and_then(|run| run.code_version.clone());
-            Ok(Some(CallbackTaskState {
-                state: fold_task_state_label(row.state).to_string(),
-                attempt: row.attempt,
-                attempt_id: row.attempt_id.clone().unwrap_or_default(),
-                run_id: row.run_id.clone(),
-                task_key: row.task_key.clone(),
-                asset_key: row.asset_key.clone(),
-                partition_key: row.partition_key.clone(),
-                code_version,
-                cancel_requested,
-            }))
+            Ok(Some(callback_task_state_from_row(&state, row)))
         }
+    }
+}
+
+fn callback_task_state_from_row(state: &FoldState, row: &TaskRow) -> CallbackTaskState {
+    let run = state.runs.get(&row.run_id);
+    let cancel_requested = run.is_some_and(|run| run.cancel_requested);
+    let code_version = run.and_then(|run| run.code_version.clone());
+    CallbackTaskState {
+        state: fold_task_state_label(row.state).to_string(),
+        attempt: row.attempt,
+        attempt_id: row.attempt_id.clone().unwrap_or_default(),
+        run_id: row.run_id.clone(),
+        task_key: row.task_key.clone(),
+        asset_key: row.asset_key.clone(),
+        partition_key: row.partition_key.clone(),
+        code_version,
+        cancel_requested,
     }
 }
 
@@ -335,6 +373,7 @@ pub async fn task_auth_middleware(
                 return unauthorized_response(&request_id, &err.to_string());
             }
         };
+        parts.extensions.insert(claims.clone());
         (claims.tenant_id, claims.workspace_id)
     };
 
@@ -366,6 +405,7 @@ pub async fn task_auth_middleware(
 async fn build_callback_dependencies(
     ctx: &RequestContext,
     state: &AppState,
+    run_id_scope: Option<String>,
 ) -> Result<
     (
         CallbackContext<CompactingLedgerWriter, JwtTaskTokenValidator>,
@@ -375,7 +415,7 @@ async fn build_callback_dependencies(
 > {
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
-    let lookup = ParquetTaskStateLookup::load(storage.clone()).await?;
+    let lookup = ParquetTaskStateLookup::load(storage.clone(), run_id_scope).await?;
     let ledger = Arc::new(CompactingLedgerWriter::new(storage, state.config.clone()));
     let debug_allowed = state.config.debug && state.config.posture.is_dev();
     let validator = Arc::new(JwtTaskTokenValidator::new(
@@ -390,6 +430,18 @@ async fn build_callback_dependencies(
     Ok((callback_ctx, lookup))
 }
 
+fn scoped_run_id_from_claims(
+    claims: Option<&Extension<TaskTokenClaims>>,
+    task_id: &str,
+) -> Result<Option<String>, Box<CallbackError>> {
+    let Some(Extension(claims)) = claims else {
+        return Ok(None);
+    };
+    if claims.task_id != task_id {
+        return Err(Box::new(CallbackError::invalid_token("task_id_mismatch")));
+    }
+    Ok(claims.run_id.clone())
+}
 // ============================================================================
 // Route Handlers
 // ============================================================================
@@ -429,6 +481,7 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
 pub(crate) async fn task_started(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
+    claims: Option<Extension<TaskTokenClaims>>,
     headers: HeaderMap,
     Path(task_id): Path<String>,
     Json(request): Json<TaskStartedRequest>,
@@ -447,7 +500,15 @@ pub(crate) async fn task_started(
         ));
     };
 
-    let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state).await?;
+    let run_id_scope = match scoped_run_id_from_claims(claims.as_ref(), &task_id) {
+        Ok(run_id_scope) => run_id_scope,
+        Err(error) => {
+            return callback_result_response(CallbackResult::<TaskStartedResponse>::Unauthorized(
+                *error,
+            ));
+        }
+    };
+    let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state, run_id_scope).await?;
     let result = handle_task_started(&callback_ctx, &task_id, &token, request, &lookup).await;
 
     callback_result_response(result)
@@ -480,6 +541,7 @@ pub(crate) async fn task_started(
 pub(crate) async fn task_heartbeat(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
+    claims: Option<Extension<TaskTokenClaims>>,
     headers: HeaderMap,
     Path(task_id): Path<String>,
     Json(request): Json<HeartbeatRequest>,
@@ -496,7 +558,15 @@ pub(crate) async fn task_heartbeat(
         return callback_result_response(CallbackResult::<HeartbeatResponse>::Unauthorized(error));
     };
 
-    let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state).await?;
+    let run_id_scope = match scoped_run_id_from_claims(claims.as_ref(), &task_id) {
+        Ok(run_id_scope) => run_id_scope,
+        Err(error) => {
+            return callback_result_response(CallbackResult::<HeartbeatResponse>::Unauthorized(
+                *error,
+            ));
+        }
+    };
+    let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state, run_id_scope).await?;
     let result = handle_heartbeat(&callback_ctx, &task_id, &token, request, &lookup).await;
 
     callback_result_response(result)
@@ -528,6 +598,7 @@ pub(crate) async fn task_heartbeat(
 pub(crate) async fn task_completed(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
+    claims: Option<Extension<TaskTokenClaims>>,
     headers: HeaderMap,
     Path(task_id): Path<String>,
     Json(request): Json<TaskCompletedRequest>,
@@ -546,7 +617,15 @@ pub(crate) async fn task_completed(
         ));
     };
 
-    let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state).await?;
+    let run_id_scope = match scoped_run_id_from_claims(claims.as_ref(), &task_id) {
+        Ok(run_id_scope) => run_id_scope,
+        Err(error) => {
+            return callback_result_response(
+                CallbackResult::<TaskCompletedResponse>::Unauthorized(*error),
+            );
+        }
+    };
+    let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state, run_id_scope).await?;
     let result = handle_task_completed(&callback_ctx, &task_id, &token, request, &lookup).await;
 
     callback_result_response(result)
@@ -567,9 +646,12 @@ pub fn routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
     use crate::config::Posture;
     use anyhow::Result;
     use arco_core::TaskTokenClaims;
+    use arco_flow::orchestration::compactor::{RunRow, RunState as FoldRunState};
     use axum::body::Body as AxumBody;
     use axum::http::Request as AxumRequest;
     use axum::routing::get;
@@ -578,8 +660,8 @@ mod tests {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    fn task_row(run_id: &str, task_key: &str) -> arco_flow::orchestration::compactor::TaskRow {
-        arco_flow::orchestration::compactor::TaskRow {
+    fn task_row(run_id: &str, task_key: &str) -> TaskRow {
+        TaskRow {
             run_id: run_id.to_string(),
             task_key: task_key.to_string(),
             state: FoldTaskState::Running,
@@ -609,9 +691,7 @@ mod tests {
         }
     }
 
-    fn lookup_with_rows(
-        rows: Vec<arco_flow::orchestration::compactor::TaskRow>,
-    ) -> ParquetTaskStateLookup {
+    fn lookup_with_rows(rows: Vec<TaskRow>) -> ParquetTaskStateLookup {
         let mut state = FoldState::default();
         for row in rows {
             state
@@ -620,6 +700,7 @@ mod tests {
         }
         ParquetTaskStateLookup {
             state: Arc::new(state),
+            run_id_scope: None,
         }
     }
 
@@ -835,6 +916,80 @@ mod tests {
         assert_eq!(token, None);
     }
 
+    fn test_task_token_config() -> TaskTokenConfig {
+        TaskTokenConfig {
+            hs256_secret: "test-secret".to_string(),
+            issuer: None,
+            audience: None,
+            ttl_seconds: 900,
+        }
+    }
+
+    fn encode_task_token_claims(claims: Value) -> String {
+        jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(b"test-secret"),
+        )
+        .expect("token")
+    }
+
+    fn task_token_claims(task_id: &str, tenant_id: &str, workspace_id: &str) -> Value {
+        let exp = (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize;
+        serde_json::json!({
+            "taskId": task_id,
+            "tenantId": tenant_id,
+            "workspaceId": workspace_id,
+            "exp": exp
+        })
+    }
+
+    #[tokio::test]
+    async fn test_parquet_task_lookup_uses_run_id_scope_for_repeated_task_keys() {
+        let mut state = FoldState::new();
+        state.runs.insert(
+            "run-a".to_string(),
+            test_run_row("run-a", FoldRunState::Succeeded),
+        );
+        state.runs.insert(
+            "run-b".to_string(),
+            test_run_row("run-b", FoldRunState::Running),
+        );
+        state.tasks.insert(
+            ("run-a".to_string(), "extract".to_string()),
+            test_task_row("run-a", "extract", FoldTaskState::Succeeded, 1),
+        );
+        state.tasks.insert(
+            ("run-b".to_string(), "extract".to_string()),
+            test_task_row("run-b", "extract", FoldTaskState::Running, 2),
+        );
+
+        let unscoped_lookup = ParquetTaskStateLookup {
+            state: Arc::new(state.clone()),
+            run_id_scope: None,
+        };
+        let ambiguous = unscoped_lookup
+            .get_task_state("extract")
+            .await
+            .expect_err("legacy unscoped repeated task keys remain ambiguous");
+        assert_eq!(ambiguous, "task_id_ambiguous: extract");
+
+        let scoped_lookup = ParquetTaskStateLookup {
+            state: Arc::new(state),
+            run_id_scope: Some("run-b".to_string()),
+        };
+        let task = scoped_lookup
+            .get_task_state("extract")
+            .await
+            .expect("lookup")
+            .expect("scoped task");
+
+        assert_eq!(task.run_id, "run-b");
+        assert_eq!(task.state, "RUNNING");
+        assert_eq!(task.attempt, 2);
+        assert_eq!(task.attempt_id, "attempt-run-b-extract-2");
+    }
+
     #[test]
     fn test_jwt_task_token_validator_accepts_valid_token() {
         let config = TaskTokenConfig {
@@ -897,6 +1052,82 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_jwt_task_token_validator_rejects_run_id_mismatch() {
+        let config = test_task_token_config();
+        let validator = JwtTaskTokenValidator::new(&config, "tenant-1", "workspace-1", false)
+            .expect("validator");
+
+        let mut claims = task_token_claims("task-123", "tenant-1", "workspace-1");
+        claims["runId"] = serde_json::json!("run-1");
+        claims["attempt"] = serde_json::json!(1);
+        let token = encode_task_token_claims(claims);
+
+        let result =
+            tokio_test::block_on(validator.validate_task_token("task-123", "run-2", 1, &token));
+
+        assert_eq!(result.expect_err("must reject"), "run_id_mismatch");
+    }
+
+    #[test]
+    fn test_jwt_task_token_validator_rejects_attempt_mismatch() {
+        let config = test_task_token_config();
+        let validator = JwtTaskTokenValidator::new(&config, "tenant-1", "workspace-1", false)
+            .expect("validator");
+
+        let mut claims = task_token_claims("task-123", "tenant-1", "workspace-1");
+        claims["runId"] = serde_json::json!("run-1");
+        claims["attempt"] = serde_json::json!(2);
+        let token = encode_task_token_claims(claims);
+
+        let result =
+            tokio_test::block_on(validator.validate_task_token("task-123", "run-1", 1, &token));
+
+        assert_eq!(result.expect_err("must reject"), "attempt_mismatch");
+    }
+
+    #[test]
+    fn test_jwt_task_token_validator_rejects_tenant_mismatch() {
+        let config = test_task_token_config();
+        let validator = JwtTaskTokenValidator::new(&config, "tenant-2", "workspace-1", false)
+            .expect("validator");
+        let token =
+            encode_task_token_claims(task_token_claims("task-123", "tenant-1", "workspace-1"));
+
+        let result =
+            tokio_test::block_on(validator.validate_task_token("task-123", "run-1", 1, &token));
+
+        assert_eq!(result.expect_err("must reject"), "tenant_mismatch");
+    }
+
+    #[test]
+    fn test_jwt_task_token_validator_rejects_workspace_mismatch() {
+        let config = test_task_token_config();
+        let validator = JwtTaskTokenValidator::new(&config, "tenant-1", "workspace-2", false)
+            .expect("validator");
+        let token =
+            encode_task_token_claims(task_token_claims("task-123", "tenant-1", "workspace-1"));
+
+        let result =
+            tokio_test::block_on(validator.validate_task_token("task-123", "run-1", 1, &token));
+
+        assert_eq!(result.expect_err("must reject"), "workspace_mismatch");
+    }
+
+    #[test]
+    fn test_jwt_task_token_validator_accepts_legacy_token_without_scope_claims() {
+        let config = test_task_token_config();
+        let validator = JwtTaskTokenValidator::new(&config, "tenant-1", "workspace-1", false)
+            .expect("validator");
+        let token =
+            encode_task_token_claims(task_token_claims("task-123", "tenant-1", "workspace-1"));
+
+        let result =
+            tokio_test::block_on(validator.validate_task_token("task-123", "run-2", 9, &token));
+
+        assert!(result.is_ok());
+    }
+
     #[tokio::test]
     async fn test_task_auth_middleware_rejects_missing_token() -> Result<()> {
         let mut config = crate::config::Config::default();
@@ -953,6 +1184,8 @@ mod tests {
                 task_id: "task-123".to_string(),
                 tenant_id: "tenant-1".to_string(),
                 workspace_id: "workspace-1".to_string(),
+                run_id: None,
+                attempt: None,
                 exp: 2_000_000_000,
                 nbf: None,
                 iat: None,
@@ -1044,5 +1277,59 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         Ok(())
+    }
+
+    fn test_run_row(run_id: &str, state: FoldRunState) -> RunRow {
+        let terminal = state.is_terminal();
+        RunRow {
+            run_id: run_id.to_string(),
+            plan_id: format!("plan-{run_id}"),
+            state,
+            run_key: None,
+            labels: HashMap::new(),
+            code_version: Some("v1".to_string()),
+            cancel_requested: false,
+            tasks_total: 1,
+            tasks_completed: u32::from(terminal),
+            tasks_succeeded: u32::from(state == FoldRunState::Succeeded),
+            tasks_failed: u32::from(state == FoldRunState::Failed),
+            tasks_skipped: 0,
+            tasks_cancelled: u32::from(state == FoldRunState::Cancelled),
+            triggered_at: Utc::now(),
+            completed_at: terminal.then(Utc::now),
+            row_version: format!("row-{run_id}"),
+        }
+    }
+
+    fn test_task_row(run_id: &str, task_key: &str, state: FoldTaskState, attempt: u32) -> TaskRow {
+        let terminal = state.is_terminal();
+        TaskRow {
+            run_id: run_id.to_string(),
+            task_key: task_key.to_string(),
+            state,
+            attempt,
+            attempt_id: Some(format!("attempt-{run_id}-{task_key}-{attempt}")),
+            started_at: Some(Utc::now()),
+            completed_at: terminal.then(Utc::now),
+            error_message: None,
+            deps_total: 0,
+            deps_satisfied_count: 0,
+            max_attempts: 3,
+            heartbeat_timeout_sec: 300,
+            last_heartbeat_at: Some(Utc::now()),
+            ready_at: Some(Utc::now()),
+            asset_key: Some(format!("asset.{task_key}")),
+            partition_key: None,
+            requires_visible_output: false,
+            materialization_id: None,
+            output_visibility_state: None,
+            published_at: None,
+            publish_error: None,
+            delta_table: None,
+            delta_version: None,
+            delta_partition: None,
+            execution_lineage_ref: None,
+            row_version: format!("row-{run_id}-{task_key}"),
+        }
     }
 }

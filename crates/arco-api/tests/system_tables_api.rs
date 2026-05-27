@@ -2,12 +2,17 @@
 
 use anyhow::Result;
 use axum::http::{Method, StatusCode};
+use bytes::Bytes;
+use chrono::Utc;
 use tower::ServiceExt;
 
 use arco_catalog::CatalogReader;
 use arco_core::storage::StorageBackend;
-use arco_core::{CatalogDomain, ScopedStorage};
-use arco_flow::orchestration::compactor::{OrchestrationManifest, OrchestrationManifestPointer};
+use arco_core::{CatalogDomain, ScopedStorage, WritePrecondition};
+use arco_flow::orchestration::compactor::{
+    CatalogRunIndexRow, OrchestrationManifest, OrchestrationManifestPointer, RunState,
+    TableArtifact, TaskState, write_catalog_run_index,
+};
 use arco_flow::orchestration_manifest_pointer_path;
 
 #[path = "support/query.rs"]
@@ -21,6 +26,7 @@ use support::{
 const ORCHESTRATION_SYSTEM_TABLES: &[&str] = &[
     "runs",
     "tasks",
+    "catalog_run_index",
     "dep_satisfaction",
     "timers",
     "dispatch_outbox",
@@ -51,6 +57,147 @@ const DEFERRED_CATALOG_PRODUCT_SYSTEM_TABLES: &[(&str, &str)] = &[
     ("catalog", "model_versions"),
     ("governance", "attachments"),
 ];
+
+fn catalog_run_index_row(
+    org_id: &str,
+    workspace_id: &str,
+    run_id: &str,
+    task_key: &str,
+    asset_key: &str,
+) -> CatalogRunIndexRow {
+    let now = Utc::now();
+    let (target_namespace, target_table) = asset_key
+        .split_once('.')
+        .map_or((None, Some(asset_key.to_string())), |(namespace, table)| {
+            (Some(namespace.to_string()), Some(table.to_string()))
+        });
+
+    CatalogRunIndexRow {
+        schema_version: 1,
+        org_id: org_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        run_id: run_id.to_string(),
+        task_key: task_key.to_string(),
+        plan_id: "plan_01".to_string(),
+        run_key: None,
+        kind: Some("materialization".to_string()),
+        reference_id: None,
+        source_type: Some("delta".to_string()),
+        run_status: RunState::Succeeded,
+        cancel_requested: false,
+        task_status: TaskState::Succeeded,
+        asset_key: Some(asset_key.to_string()),
+        target_namespace,
+        target_table,
+        partition_key: None,
+        attempt: 1,
+        attempt_id: Some(format!("{run_id}_{task_key}_attempt_01")),
+        requires_visible_output: false,
+        materialization_id: Some(format!("{run_id}_{task_key}_mat_01")),
+        output_visibility_state: None,
+        published_at: Some(now),
+        publish_error: None,
+        delta_table: Some(asset_key.to_string()),
+        delta_version: Some(1),
+        delta_partition: None,
+        execution_lineage_ref: None,
+        started_at: Some(now),
+        last_heartbeat_at: None,
+        triggered_at: now,
+        completed_at: Some(now),
+        updated_at: now,
+        code_version: None,
+        error_message: None,
+        row_version: format!("{run_id}_{task_key}_row_01"),
+    }
+}
+
+async fn seed_catalog_run_index_manifest_with_multiple_orgs(storage: &ScopedStorage) -> Result<()> {
+    let current_org_path =
+        "state/orchestration/base/base_catalog_run_index/catalog_run_index/test-tenant.parquet";
+    let other_org_path =
+        "state/orchestration/base/base_catalog_run_index/catalog_run_index/other-tenant.parquet";
+
+    let current_row = catalog_run_index_row(
+        "test-tenant",
+        "test-workspace",
+        "run_current",
+        "extract",
+        "analytics.daily",
+    );
+    let other_row = catalog_run_index_row(
+        "other-tenant",
+        "test-workspace",
+        "run_other",
+        "extract",
+        "analytics.other",
+    );
+
+    storage
+        .put_raw(
+            current_org_path,
+            write_catalog_run_index(&[current_row])?,
+            WritePrecondition::DoesNotExist,
+        )
+        .await?;
+    storage
+        .put_raw(
+            other_org_path,
+            write_catalog_run_index(&[other_row])?,
+            WritePrecondition::DoesNotExist,
+        )
+        .await?;
+
+    let mut manifest = OrchestrationManifest::new("01KSN3SYSTEMTABLECATALOG");
+    manifest.manifest_id = "00000000000000000000".to_string();
+    manifest.base_snapshot.snapshot_id = Some("base_catalog_run_index".to_string());
+    manifest.base_snapshot.published_at = Utc::now();
+    manifest
+        .base_snapshot
+        .tables
+        .catalog_run_index_by_org
+        .insert(
+            "test-tenant".to_string(),
+            TableArtifact::legacy(current_org_path),
+        );
+    manifest
+        .base_snapshot
+        .tables
+        .catalog_run_index_by_org
+        .insert(
+            "other-tenant".to_string(),
+            TableArtifact::legacy(other_org_path),
+        );
+
+    let manifest_path = format!(
+        "state/orchestration/manifests/{}.json",
+        manifest.manifest_id
+    );
+    storage
+        .put_raw(
+            &manifest_path,
+            Bytes::from(serde_json::to_vec(&manifest)?),
+            WritePrecondition::DoesNotExist,
+        )
+        .await?;
+
+    let pointer = OrchestrationManifestPointer {
+        manifest_id: manifest.manifest_id,
+        manifest_path,
+        epoch: 0,
+        parent_pointer_hash: None,
+        updated_at: Utc::now(),
+    };
+    storage
+        .put_raw(
+            orchestration_manifest_pointer_path(),
+            Bytes::from(serde_json::to_vec(&pointer)?),
+            WritePrecondition::DoesNotExist,
+        )
+        .await?;
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn query_can_select_from_system_catalog_namespaces() -> Result<()> {
@@ -284,6 +431,47 @@ async fn query_can_select_count_from_every_system_orchestration_table() -> Resul
         );
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_catalog_run_index_reads_only_request_tenant_artifact() -> Result<()> {
+    let (router, backend) = test_router_with_backend();
+    let storage_backend: std::sync::Arc<dyn StorageBackend> = backend;
+    let storage = ScopedStorage::new(storage_backend, "test-tenant", "test-workspace")?;
+    seed_catalog_run_index_manifest_with_multiple_orgs(&storage).await?;
+
+    let (status, rows): (_, Vec<serde_json::Value>) = helpers::post_json(
+        router,
+        "/api/v1/query?format=json",
+        serde_json::json!({
+            "sql": "SELECT org_id, workspace_id, run_id, task_key, target_namespace, target_table FROM system.orchestration.catalog_run_index ORDER BY org_id"
+        }),
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("org_id"),
+        Some(&serde_json::Value::String("test-tenant".to_string()))
+    );
+    assert_eq!(
+        rows[0].get("workspace_id"),
+        Some(&serde_json::Value::String("test-workspace".to_string()))
+    );
+    assert_eq!(
+        rows[0].get("run_id"),
+        Some(&serde_json::Value::String("run_current".to_string()))
+    );
+    assert_eq!(
+        rows[0].get("target_namespace"),
+        Some(&serde_json::Value::String("analytics".to_string()))
+    );
+    assert_eq!(
+        rows[0].get("target_table"),
+        Some(&serde_json::Value::String("daily".to_string()))
+    );
     Ok(())
 }
 

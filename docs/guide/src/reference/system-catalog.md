@@ -23,6 +23,7 @@ Orchestration metadata:
 
 - `system.orchestration.runs`
 - `system.orchestration.tasks`
+- `system.orchestration.catalog_run_index`
 - `system.orchestration.dep_satisfaction`
 - `system.orchestration.timers`
 - `system.orchestration.dispatch_outbox`
@@ -67,6 +68,12 @@ order by published_at desc;
 select run_id, state
 from system.orchestration.runs
 order by created_at desc;
+```
+
+```sql
+select org_id, workspace_id, run_id, task_key, asset_key
+from system.orchestration.catalog_run_index
+order by updated_at desc;
 ```
 
 ```sql

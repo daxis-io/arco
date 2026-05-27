@@ -125,6 +125,10 @@ fn current_schemas() -> Vec<(&'static str, Schema)> {
             arco_flow::orchestration::compactor::run_key_index_parquet_schema(),
         ),
         (
+            "catalog_run_index",
+            arco_flow::orchestration::compactor::catalog_run_index_parquet_schema(),
+        ),
+        (
             "run_key_conflicts",
             arco_flow::orchestration::compactor::run_key_conflicts_parquet_schema(),
         ),

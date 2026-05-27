@@ -12,6 +12,7 @@
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use ulid::Ulid;
 
@@ -33,7 +34,8 @@ use crate::paths::{
 };
 
 use super::fold::{
-    FoldState, merge_backfill_chunk_rows, merge_backfill_rows, merge_dep_satisfaction_rows,
+    CatalogRunIndexKey, CatalogRunIndexRow, FoldState, merge_backfill_chunk_rows,
+    merge_backfill_rows, merge_catalog_run_index_rows, merge_dep_satisfaction_rows,
     merge_dispatch_outbox_rows, merge_idempotency_key_rows, merge_partition_status_rows,
     merge_run_rows, merge_schedule_definition_rows, merge_schedule_state_rows,
     merge_schedule_tick_rows, merge_sensor_eval_rows, merge_sensor_state_rows, merge_task_rows,
@@ -45,10 +47,11 @@ use super::manifest::{
     next_manifest_id,
 };
 use super::parquet_util::{
-    read_partition_status, write_backfill_chunks, write_backfills, write_dep_satisfaction,
-    write_dispatch_outbox, write_idempotency_keys, write_partition_status, write_run_key_conflicts,
-    write_run_key_index, write_runs, write_schedule_definitions, write_schedule_state,
-    write_schedule_ticks, write_sensor_evals, write_sensor_state, write_tasks, write_timers,
+    read_partition_status, write_backfill_chunks, write_backfills, write_catalog_run_index,
+    write_dep_satisfaction, write_dispatch_outbox, write_idempotency_keys, write_partition_status,
+    write_run_key_conflicts, write_run_key_index, write_runs, write_schedule_definitions,
+    write_schedule_state, write_schedule_ticks, write_sensor_evals, write_sensor_state,
+    write_tasks, write_timers,
 };
 
 const SENSOR_EVAL_RETENTION_DAYS: i64 = 30;
@@ -512,6 +515,7 @@ impl MicroCompactor {
                     serde_json::from_slice(&data).map_err(|e| Error::Serialization {
                         message: format!("failed to parse event at {path}: {e}"),
                     })?;
+                self.validate_event_scope(path, &event)?;
                 events.push((path.clone(), event));
             }
 
@@ -547,6 +551,8 @@ impl MicroCompactor {
             let row_counts = RowCounts {
                 runs: u32::try_from(delta_state.runs.len()).unwrap_or(u32::MAX),
                 tasks: u32::try_from(delta_state.tasks.len()).unwrap_or(u32::MAX),
+                catalog_run_index: u32::try_from(delta_state.catalog_run_index.len())
+                    .unwrap_or(u32::MAX),
                 dep_satisfaction: u32::try_from(delta_state.dep_satisfaction.len())
                     .unwrap_or(u32::MAX),
                 timers: u32::try_from(delta_state.timers.len()).unwrap_or(u32::MAX),
@@ -973,6 +979,14 @@ impl MicroCompactor {
             }
         }
 
+        for catalog_run_index_path in tables.catalog_run_index_by_org.values() {
+            let data = self.storage.get_raw(catalog_run_index_path.path()).await?;
+            let rows = super::parquet_util::read_catalog_run_index(&data)?;
+            for row in rows {
+                state.catalog_run_index.insert(row.primary_key(), row);
+            }
+        }
+
         if let Some(ref deps_path) = tables.dep_satisfaction {
             let data = self.storage.get_raw(deps_path.path()).await?;
             let rows = super::parquet_util::read_dep_satisfaction(&data)?;
@@ -1122,6 +1136,19 @@ impl MicroCompactor {
             .await
     }
 
+    fn validate_event_scope(&self, path: &str, event: &OrchestrationEvent) -> Result<()> {
+        let expected_tenant = self.storage.tenant_id();
+        let expected_workspace = self.storage.workspace_id();
+        if event.tenant_id == expected_tenant && event.workspace_id == expected_workspace {
+            return Ok(());
+        }
+
+        Err(Error::from(arco_core::Error::InvalidInput(format!(
+            "event scope mismatch at {path}: expected tenant_id={expected_tenant:?} workspace_id={expected_workspace:?}, got tenant_id={:?} workspace_id={:?}",
+            event.tenant_id, event.workspace_id
+        ))))
+    }
+
     /// Writes fold state to an immutable base snapshot directory.
     async fn write_base_snapshot_parquet(
         &self,
@@ -1132,6 +1159,7 @@ impl MicroCompactor {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn write_state_parquet(
         &self,
         base_path: &str,
@@ -1149,6 +1177,13 @@ impl MicroCompactor {
 
         write_table!("runs.parquet", &state.runs, write_runs, &mut paths.runs);
         write_table!("tasks.parquet", &state.tasks, write_tasks, &mut paths.tasks);
+        self.write_catalog_run_index_by_org(
+            base_path,
+            &state.catalog_run_index,
+            &mut paths.catalog_run_index_by_org,
+            include_empty_tables,
+        )
+        .await?;
         write_table!(
             "dep_satisfaction.parquet",
             &state.dep_satisfaction,
@@ -1235,6 +1270,48 @@ impl MicroCompactor {
         );
 
         Ok(paths)
+    }
+
+    async fn write_catalog_run_index_by_org(
+        &self,
+        base_path: &str,
+        rows: &std::collections::HashMap<CatalogRunIndexKey, CatalogRunIndexRow>,
+        out: &mut BTreeMap<String, TableArtifact>,
+        include_empty_tables: bool,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            if include_empty_tables {
+                let org_id = self.storage.tenant_id().to_string();
+                let bytes = write_catalog_run_index(&[])?;
+                let file = catalog_run_index_org_file(&org_id);
+                let artifact = self.write_parquet_artifact(base_path, &file, bytes).await?;
+                out.insert(org_id, artifact);
+            }
+            return Ok(());
+        }
+
+        let mut rows_by_org: BTreeMap<String, Vec<CatalogRunIndexRow>> = BTreeMap::new();
+        for row in rows.values() {
+            rows_by_org
+                .entry(row.org_id.clone())
+                .or_default()
+                .push(row.clone());
+        }
+
+        for (org_id, mut org_rows) in rows_by_org {
+            org_rows.sort_by(|left, right| {
+                left.workspace_id
+                    .cmp(&right.workspace_id)
+                    .then_with(|| left.run_id.cmp(&right.run_id))
+                    .then_with(|| left.task_key.cmp(&right.task_key))
+            });
+            let bytes = write_catalog_run_index(&org_rows)?;
+            let file = catalog_run_index_org_file(&org_id);
+            let artifact = self.write_parquet_artifact(base_path, &file, bytes).await?;
+            out.insert(org_id, artifact);
+        }
+
+        Ok(())
     }
 
     async fn write_map_table<K, R>(
@@ -1455,6 +1532,20 @@ fn merge_states(base: FoldState, delta: FoldState) -> FoldState {
             .entry(key)
             .and_modify(|existing| {
                 if let Some(merged_row) = merge_task_rows(vec![existing.clone(), row.clone()]) {
+                    *existing = merged_row;
+                }
+            })
+            .or_insert(row);
+    }
+
+    for (key, row) in delta.catalog_run_index {
+        merged
+            .catalog_run_index
+            .entry(key)
+            .and_modify(|existing| {
+                if let Some(merged_row) =
+                    merge_catalog_run_index_rows(vec![existing.clone(), row.clone()])
+                {
                     *existing = merged_row;
                 }
             })
@@ -1714,6 +1805,14 @@ fn decode_pre_pointer_publish_error(message: &str) -> Option<Error> {
     None
 }
 
+fn catalog_run_index_org_file(org_id: &str) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(org_id.as_bytes());
+    let encoded_hash = hex::encode(hash);
+    let org_hash = encoded_hash.get(..32).unwrap_or(encoded_hash.as_str());
+    format!("catalog_run_index/org-{org_hash}.parquet")
+}
+
 fn insert_changed<K, V>(
     delta: &mut std::collections::HashMap<K, V>,
     base: &std::collections::HashMap<K, V>,
@@ -1734,6 +1833,11 @@ fn delta_from_states(base: &FoldState, current: &FoldState) -> FoldState {
 
     insert_changed(&mut delta.runs, &base.runs, &current.runs);
     insert_changed(&mut delta.tasks, &base.tasks, &current.tasks);
+    insert_changed(
+        &mut delta.catalog_run_index,
+        &base.catalog_run_index,
+        &current.catalog_run_index,
+    );
     insert_changed(
         &mut delta.dep_satisfaction,
         &base.dep_satisfaction,
@@ -1804,6 +1908,7 @@ fn delta_from_states(base: &FoldState, current: &FoldState) -> FoldState {
 fn delta_state_is_empty(state: &FoldState) -> bool {
     state.runs.is_empty()
         && state.tasks.is_empty()
+        && state.catalog_run_index.is_empty()
         && state.dep_satisfaction.is_empty()
         && state.timers.is_empty()
         && state.dispatch_outbox.is_empty()
@@ -2701,6 +2806,14 @@ mod tests {
         assert_eq!(manifest.l0_count, 1);
         assert_eq!(manifest.l0_deltas.len(), 1);
         assert_eq!(manifest.l0_deltas[0].event_range.event_count, 2);
+        assert_eq!(manifest.l0_deltas[0].row_counts.catalog_run_index, 2);
+        assert!(
+            manifest.l0_deltas[0]
+                .tables
+                .catalog_run_index_by_org
+                .contains_key("tenant"),
+            "catalog run index should be published as an org-scoped manifest table artifact"
+        );
 
         let pointer_data = storage
             .get_raw(orchestration_manifest_pointer_path())
@@ -2717,6 +2830,51 @@ mod tests {
         let immutable: OrchestrationManifest =
             serde_json::from_slice(&immutable_manifest).expect("parse immutable");
         assert_eq!(immutable.manifest_id, manifest.manifest_id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compact_rejects_event_outside_storage_scope() -> Result<()> {
+        let (compactor, storage) = create_test_compactor().await?;
+
+        let event1 = make_run_triggered_event();
+        let event2 = make_plan_created_event();
+        let event3 = OrchestrationEvent::new_with_event_id(
+            "other-tenant",
+            "workspace",
+            OrchestrationEventData::TaskStarted {
+                run_id: "run_01".to_string(),
+                task_key: "extract".to_string(),
+                attempt: 1,
+                attempt_id: "attempt_01".to_string(),
+                worker_id: "worker-01".to_string(),
+            },
+            "evt_03_task_started_other_tenant",
+        );
+
+        let events = [event1, event2, event3];
+        let mut paths = Vec::new();
+        for event in events {
+            let path = orchestration_event_path("2025-01-15", &event.event_id);
+            storage
+                .put_raw(
+                    &path,
+                    Bytes::from(serde_json::to_string(&event).expect("serialize")),
+                    WritePrecondition::None,
+                )
+                .await?;
+            paths.push(path);
+        }
+
+        let err = compactor
+            .compact_events(paths)
+            .await
+            .expect_err("mismatched event scope should fail compaction");
+        assert!(
+            err.to_string().contains("event scope mismatch"),
+            "unexpected error: {err}"
+        );
 
         Ok(())
     }
@@ -2768,6 +2926,18 @@ mod tests {
                 .contains_key(&("run_01".to_string(), "transform".to_string()))
         );
         assert_eq!(state.dep_satisfaction.len(), 1);
+        assert_eq!(state.catalog_run_index.len(), 2);
+        let index_row = state
+            .catalog_run_index
+            .get(&(
+                "tenant".to_string(),
+                "workspace".to_string(),
+                "run_01".to_string(),
+                "extract".to_string(),
+            ))
+            .expect("catalog run index row should survive parquet roundtrip");
+        assert_eq!(index_row.target_namespace.as_deref(), Some("analytics"));
+        assert_eq!(index_row.target_table.as_deref(), Some("extract"));
 
         Ok(())
     }
@@ -3086,6 +3256,7 @@ mod tests {
         let latest = manifest.l0_deltas.last().expect("delta");
         assert_eq!(latest.row_counts.runs, 0);
         assert_eq!(latest.row_counts.tasks, 1);
+        assert_eq!(latest.row_counts.catalog_run_index, 1);
         assert_eq!(latest.row_counts.dep_satisfaction, 0);
         assert_eq!(latest.row_counts.timers, 0);
         assert_eq!(latest.row_counts.dispatch_outbox, 0);

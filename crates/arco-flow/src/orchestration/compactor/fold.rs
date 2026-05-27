@@ -979,6 +979,125 @@ impl RunKeyConflictRow {
     }
 }
 
+/// Primary key for catalog run index rows: (`org_id`, `workspace_id`, `run_id`, `task_key`).
+pub type CatalogRunIndexKey = (String, String, String, String);
+
+/// Catalog-facing run projection row.
+///
+/// This is a derived read model. The canonical source of truth remains the
+/// orchestration run/task state produced from ledger events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogRunIndexRow {
+    /// Projection schema version.
+    pub schema_version: u32,
+    /// Organization scope. In Arco-native state this maps to `tenant_id`.
+    pub org_id: String,
+    /// Workspace identifier.
+    pub workspace_id: String,
+    /// Run identifier.
+    pub run_id: String,
+    /// Task key within the run.
+    pub task_key: String,
+    /// Plan identifier.
+    pub plan_id: String,
+    /// Optional run key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_key: Option<String>,
+    /// Catalog-oriented run kind from run labels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// External/catalog reference id from run labels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_id: Option<String>,
+    /// Source type from run labels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_type: Option<String>,
+    /// Current run status.
+    pub run_status: RunState,
+    /// Whether cancellation has been requested while the run is still active.
+    #[serde(default)]
+    pub cancel_requested: bool,
+    /// Current task status.
+    pub task_status: TaskState,
+    /// Asset key, when the task materializes a catalog asset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_key: Option<String>,
+    /// Target namespace parsed from `asset_key`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_namespace: Option<String>,
+    /// Target table parsed from `asset_key`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_table: Option<String>,
+    /// Partition key, when the task targets a partition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition_key: Option<String>,
+    /// Current attempt number.
+    pub attempt: u32,
+    /// Current attempt id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    /// Whether this task requires visible output.
+    pub requires_visible_output: bool,
+    /// Materialization id from worker output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub materialization_id: Option<String>,
+    /// Output visibility state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_visibility_state: Option<OutputVisibilityState>,
+    /// Output publish timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<DateTime<Utc>>,
+    /// Output publish error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish_error: Option<String>,
+    /// Delta table identifier from execution output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_table: Option<String>,
+    /// Delta version from execution output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_version: Option<i64>,
+    /// Delta partition from execution output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_partition: Option<String>,
+    /// Execution lineage reference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_lineage_ref: Option<String>,
+    /// Task start timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// Latest heartbeat timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+    /// Run trigger timestamp.
+    pub triggered_at: DateTime<Utc>,
+    /// Run completion timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    /// Latest derived update timestamp.
+    pub updated_at: DateTime<Utc>,
+    /// Run code version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_version: Option<String>,
+    /// Error message for terminal failed/cancelled/skipped tasks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// ULID of the source run/task row that last modified this projection row.
+    pub row_version: String,
+}
+
+impl CatalogRunIndexRow {
+    /// Returns the primary key tuple.
+    #[must_use]
+    pub fn primary_key(&self) -> CatalogRunIndexKey {
+        (
+            self.org_id.clone(),
+            self.workspace_id.clone(),
+            self.run_id.clone(),
+            self.task_key.clone(),
+        )
+    }
+}
+
 /// Idempotency key index row.
 ///
 /// Tracks processed idempotency keys to drop duplicate events across compaction runs.
@@ -1018,6 +1137,9 @@ pub struct FoldState {
 
     /// Task rows keyed by (`run_id`, `task_key`).
     pub tasks: HashMap<(String, String), TaskRow>,
+
+    /// Catalog-facing run index keyed by (`org_id`, `workspace_id`, `run_id`, `task_key`).
+    pub catalog_run_index: HashMap<CatalogRunIndexKey, CatalogRunIndexRow>,
 
     /// Dependency edges keyed by (`run_id`, `upstream_task_key`, `downstream_task_key`).
     pub dep_satisfaction: HashMap<(String, String, String), DepSatisfactionRow>,
@@ -1148,7 +1270,7 @@ impl FoldState {
                 code_version,
                 ..
             } => {
-                self.fold_run_triggered(
+                if self.fold_run_triggered(
                     run_id,
                     plan_id,
                     run_key.clone(),
@@ -1156,10 +1278,24 @@ impl FoldState {
                     code_version.clone(),
                     &event.event_id,
                     event.timestamp,
-                );
+                ) {
+                    self.refresh_catalog_run_index_for_run(
+                        &event.tenant_id,
+                        &event.workspace_id,
+                        run_id,
+                        event.timestamp,
+                    );
+                }
             }
             OrchestrationEventData::PlanCreated { run_id, tasks, .. } => {
-                self.fold_plan_created(run_id, tasks, &event.event_id, event.timestamp);
+                if self.fold_plan_created(run_id, tasks, &event.event_id, event.timestamp) {
+                    self.refresh_catalog_run_index_for_run(
+                        &event.tenant_id,
+                        &event.workspace_id,
+                        run_id,
+                        event.timestamp,
+                    );
+                }
             }
             OrchestrationEventData::TaskStarted {
                 run_id,
@@ -1168,14 +1304,21 @@ impl FoldState {
                 attempt_id,
                 ..
             } => {
-                self.fold_task_started(
+                if self.fold_task_started(
                     run_id,
                     task_key,
                     *attempt,
                     attempt_id,
                     event.timestamp,
                     &event.event_id,
-                );
+                ) {
+                    self.refresh_catalog_run_index_for_run(
+                        &event.tenant_id,
+                        &event.workspace_id,
+                        run_id,
+                        event.timestamp,
+                    );
+                }
             }
             OrchestrationEventData::TaskHeartbeat {
                 run_id,
@@ -1187,14 +1330,21 @@ impl FoldState {
             } => {
                 // heartbeat_at is optional; use event timestamp as fallback
                 let ts = heartbeat_at.unwrap_or(event.timestamp);
-                self.fold_task_heartbeat(
+                if self.fold_task_heartbeat(
                     run_id,
                     task_key,
                     *attempt,
                     attempt_id,
                     ts,
                     &event.event_id,
-                );
+                ) {
+                    self.refresh_catalog_run_index_for_run(
+                        &event.tenant_id,
+                        &event.workspace_id,
+                        run_id,
+                        event.timestamp,
+                    );
+                }
             }
             OrchestrationEventData::TaskFinished {
                 run_id,
@@ -1210,7 +1360,7 @@ impl FoldState {
                 code_version,
                 ..
             } => {
-                self.fold_task_finished(
+                if self.fold_task_finished(
                     run_id,
                     task_key,
                     *attempt,
@@ -1226,7 +1376,14 @@ impl FoldState {
                     event.timestamp,
                     &event.tenant_id,
                     &event.workspace_id,
-                );
+                ) {
+                    self.refresh_catalog_run_index_for_run(
+                        &event.tenant_id,
+                        &event.workspace_id,
+                        run_id,
+                        event.timestamp,
+                    );
+                }
             }
             OrchestrationEventData::TaskOutputVisibilityChanged {
                 run_id,
@@ -1237,7 +1394,7 @@ impl FoldState {
                 published_at,
                 publish_error,
             } => {
-                self.fold_task_output_visibility_changed(
+                if self.fold_task_output_visibility_changed(
                     run_id,
                     task_key,
                     *attempt,
@@ -1247,7 +1404,14 @@ impl FoldState {
                     publish_error.as_deref(),
                     &event.event_id,
                     event.timestamp,
-                );
+                ) {
+                    self.refresh_catalog_run_index_for_run(
+                        &event.tenant_id,
+                        &event.workspace_id,
+                        run_id,
+                        event.timestamp,
+                    );
+                }
             }
             OrchestrationEventData::DispatchRequested {
                 run_id,
@@ -1257,7 +1421,7 @@ impl FoldState {
                 worker_queue,
                 dispatch_id,
             } => {
-                self.fold_dispatch_requested(
+                if self.fold_dispatch_requested(
                     run_id,
                     task_key,
                     *attempt,
@@ -1266,7 +1430,14 @@ impl FoldState {
                     dispatch_id,
                     &event.event_id,
                     event.timestamp,
-                );
+                ) {
+                    self.refresh_catalog_run_index_for_run(
+                        &event.tenant_id,
+                        &event.workspace_id,
+                        run_id,
+                        event.timestamp,
+                    );
+                }
             }
             OrchestrationEventData::DispatchEnqueued {
                 dispatch_id,
@@ -1336,7 +1507,14 @@ impl FoldState {
                 );
             }
             OrchestrationEventData::RunCancelRequested { run_id, .. } => {
-                self.fold_run_cancel_requested(run_id, &event.event_id, event.timestamp);
+                if self.fold_run_cancel_requested(run_id, &event.event_id, event.timestamp) {
+                    self.refresh_catalog_run_index_for_run(
+                        &event.tenant_id,
+                        &event.workspace_id,
+                        run_id,
+                        event.timestamp,
+                    );
+                }
             }
 
             // Layer 2 automation events
@@ -1508,17 +1686,20 @@ impl FoldState {
         run_id: &str,
         event_id: &str,
         timestamp: DateTime<Utc>,
-    ) {
+    ) -> bool {
         // Check if run exists and is not already terminal
         let run_is_terminal = self.runs.get(run_id).is_some_and(|r| r.state.is_terminal());
         if run_is_terminal {
-            return;
+            return false;
         }
+
+        let mut changed = false;
 
         // Set cancel_requested flag on run
         if let Some(run) = self.runs.get_mut(run_id) {
             run.cancel_requested = true;
             run.row_version = event_id.to_string();
+            changed = true;
         }
 
         // Collect task keys to cancel (non-terminal, non-running)
@@ -1537,6 +1718,7 @@ impl FoldState {
             if let Some(task) = self.tasks.get_mut(&task_key) {
                 task.state = TaskState::Cancelled;
                 task.row_version = event_id.to_string();
+                changed = true;
             }
 
             if let Some(run) = self.runs.get_mut(run_id) {
@@ -1552,8 +1734,11 @@ impl FoldState {
                 run.state = RunState::Cancelled;
                 run.completed_at = Some(timestamp);
                 run.row_version = event_id.to_string();
+                changed = true;
             }
         }
+
+        changed
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1566,9 +1751,9 @@ impl FoldState {
         code_version: Option<String>,
         event_id: &str,
         timestamp: DateTime<Utc>,
-    ) {
+    ) -> bool {
         if self.runs.contains_key(run_id) {
-            return;
+            return false;
         }
         self.runs.insert(
             run_id.to_string(),
@@ -1591,6 +1776,7 @@ impl FoldState {
                 row_version: event_id.to_string(),
             },
         );
+        true
     }
 
     fn fold_plan_created(
@@ -1599,15 +1785,17 @@ impl FoldState {
         task_defs: &[TaskDef],
         event_id: &str,
         timestamp: DateTime<Utc>,
-    ) {
+    ) -> bool {
         if self.tasks.keys().any(|(r, _)| r == run_id) {
-            return;
+            return false;
         }
+        let mut changed = false;
         // Update run with task count
         if let Some(run) = self.runs.get_mut(run_id) {
             run.tasks_total = u32::try_from(task_defs.len()).unwrap_or(u32::MAX);
             run.state = RunState::Running;
             run.row_version = event_id.to_string();
+            changed = true;
         }
 
         // Build dependency graph
@@ -1671,6 +1859,7 @@ impl FoldState {
 
             self.tasks
                 .insert((run_id.to_string(), task_def.key.clone()), task_row);
+            changed = true;
 
             // Create dependency satisfaction edges
             for upstream in &task_def.depends_on {
@@ -1690,6 +1879,8 @@ impl FoldState {
                 );
             }
         }
+
+        changed
     }
 
     fn fold_task_started(
@@ -1700,11 +1891,11 @@ impl FoldState {
         attempt_id: &str,
         timestamp: DateTime<Utc>,
         event_id: &str,
-    ) {
+    ) -> bool {
         let key = (run_id.to_string(), task_key.to_string());
         if let Some(task) = self.tasks.get_mut(&key) {
             if task.state.is_terminal() {
-                return;
+                return false;
             }
             // Update if this is a newer or equal attempt (handles retries).
             // A TaskStarted for attempt N should always override attempt < N.
@@ -1712,7 +1903,7 @@ impl FoldState {
                 if attempt == task.attempt {
                     if let Some(current_attempt_id) = task.attempt_id.as_deref() {
                         if current_attempt_id != attempt_id {
-                            return;
+                            return false;
                         }
                     }
                 }
@@ -1721,8 +1912,10 @@ impl FoldState {
                 task.attempt_id = Some(attempt_id.to_string());
                 task.started_at = Some(timestamp);
                 task.row_version = event_id.to_string();
+                return true;
             }
         }
+        false
     }
 
     fn fold_task_heartbeat(
@@ -1733,18 +1926,20 @@ impl FoldState {
         attempt_id: &str,
         heartbeat_at: DateTime<Utc>,
         event_id: &str,
-    ) {
+    ) -> bool {
         let key = (run_id.to_string(), task_key.to_string());
         if let Some(task) = self.tasks.get_mut(&key) {
             if task.state.is_terminal() {
-                return;
+                return false;
             }
             // Only update if attempt_id matches (concurrency guard per ADR-022)
             if task.attempt_id.as_deref() == Some(attempt_id) && task.attempt == attempt {
                 task.last_heartbeat_at = Some(heartbeat_at);
                 task.row_version = event_id.to_string();
+                return true;
             }
         }
+        false
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1766,7 +1961,7 @@ impl FoldState {
         timestamp: DateTime<Utc>,
         tenant_id: &str,
         workspace_id: &str,
-    ) {
+    ) -> bool {
         let key = (run_id.to_string(), task_key.to_string());
 
         if let Some(task) = self.tasks.get(&key) {
@@ -1774,7 +1969,7 @@ impl FoldState {
                 && task.attempt == attempt
                 && task.attempt_id.as_deref() == Some(attempt_id)
             {
-                return;
+                return false;
             }
         }
 
@@ -1786,7 +1981,7 @@ impl FoldState {
 
         if !is_current_attempt && self.tasks.contains_key(&key) {
             // Stale attempt event - reject to prevent state regression
-            return;
+            return false;
         }
 
         if let Some(task) = self.tasks.get_mut(&key) {
@@ -1805,6 +2000,12 @@ impl FoldState {
 
             task.state = new_state;
             task.row_version = event_id.to_string();
+            if task.asset_key.is_none() {
+                task.asset_key = asset_key.map(ToString::to_string);
+            }
+            if task.partition_key.is_none() {
+                task.partition_key = partition_key.map(ToString::to_string);
+            }
             if new_state.is_terminal() {
                 task.completed_at = Some(timestamp);
             }
@@ -1940,7 +2141,9 @@ impl FoldState {
                     event_id,
                 );
             }
+            return true;
         }
+        false
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1955,17 +2158,17 @@ impl FoldState {
         publish_error: Option<&str>,
         event_id: &str,
         timestamp: DateTime<Utc>,
-    ) {
+    ) -> bool {
         let key = (run_id.to_string(), task_key.to_string());
 
         let Some(task) = self.tasks.get_mut(&key) else {
-            return;
+            return false;
         };
 
         let is_current_attempt =
             task.attempt == attempt && task.attempt_id.as_deref() == Some(attempt_id);
         if !is_current_attempt || task.state != TaskState::Succeeded {
-            return;
+            return false;
         }
 
         if matches!(
@@ -1973,7 +2176,7 @@ impl FoldState {
             Some(OutputVisibilityState::Visible | OutputVisibilityState::Failed)
         ) && task.output_visibility_state != Some(visibility_state)
         {
-            return;
+            return false;
         }
 
         task.output_visibility_state = Some(visibility_state);
@@ -1992,6 +2195,7 @@ impl FoldState {
                 task.publish_error = publish_error.map(ToString::to_string);
             }
         }
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2005,10 +2209,11 @@ impl FoldState {
         dispatch_id: &str,
         event_id: &str,
         timestamp: DateTime<Utc>,
-    ) {
+    ) -> bool {
         let task_lookup_key = (run_id.to_string(), task_key.to_string());
         let mut outbox_attempt_id: Option<String> = None;
         let mut outbox_exists = false;
+        let mut task_changed = false;
 
         if let Some(existing) = self.dispatch_outbox.get_mut(dispatch_id) {
             outbox_exists = true;
@@ -2041,6 +2246,7 @@ impl FoldState {
                     task.attempt = attempt;
                     task.attempt_id = Some(desired_attempt_id.to_string());
                     task.row_version = event_id.to_string();
+                    task_changed = true;
                 }
             }
         }
@@ -2049,7 +2255,7 @@ impl FoldState {
             // Row already exists (e.g., DispatchEnqueued arrived first out-of-order)
             // Fill in missing critical fields regardless of event ordering
             // Don't update row_version or status - the existing row has newer state
-            return;
+            return task_changed;
         }
 
         self.dispatch_outbox.insert(
@@ -2067,6 +2273,7 @@ impl FoldState {
                 row_version: event_id.to_string(),
             },
         );
+        task_changed
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2960,6 +3167,90 @@ impl FoldState {
             });
     }
 
+    fn refresh_catalog_run_index_for_run(
+        &mut self,
+        org_id: &str,
+        workspace_id: &str,
+        run_id: &str,
+        updated_at: DateTime<Utc>,
+    ) {
+        let Some(run) = self.runs.get(run_id).cloned() else {
+            return;
+        };
+
+        let tasks: Vec<TaskRow> = self
+            .tasks
+            .iter()
+            .filter(|((candidate_run_id, _), task)| {
+                candidate_run_id == run_id && task.asset_key.is_some()
+            })
+            .map(|(_, task)| task.clone())
+            .collect();
+
+        for task in tasks {
+            let Some(asset_key) = task.asset_key.clone() else {
+                continue;
+            };
+            let (target_namespace, target_table) = parse_catalog_asset_key(&asset_key);
+            let row_version = if task.row_version >= run.row_version {
+                task.row_version.clone()
+            } else {
+                run.row_version.clone()
+            };
+            let primary_key = (
+                org_id.to_string(),
+                workspace_id.to_string(),
+                run.run_id.clone(),
+                task.task_key.clone(),
+            );
+            let row_updated_at = self
+                .catalog_run_index
+                .get(&primary_key)
+                .filter(|existing| existing.row_version == row_version)
+                .map_or(updated_at, |existing| existing.updated_at);
+
+            let row = CatalogRunIndexRow {
+                schema_version: 1,
+                org_id: primary_key.0.clone(),
+                workspace_id: primary_key.1.clone(),
+                run_id: run.run_id.clone(),
+                task_key: task.task_key.clone(),
+                plan_id: run.plan_id.clone(),
+                run_key: run.run_key.clone(),
+                kind: label_value(&run.labels, &["kind", "run_kind"]),
+                reference_id: label_value(&run.labels, &["reference_id", "referenceId"]),
+                source_type: label_value(&run.labels, &["source_type", "sourceType"]),
+                run_status: run.state,
+                cancel_requested: run.cancel_requested,
+                task_status: task.state,
+                asset_key: Some(asset_key),
+                target_namespace,
+                target_table,
+                partition_key: task.partition_key.clone(),
+                attempt: task.attempt,
+                attempt_id: task.attempt_id.clone(),
+                requires_visible_output: task.requires_visible_output,
+                materialization_id: task.materialization_id.clone(),
+                output_visibility_state: task.output_visibility_state,
+                published_at: task.published_at,
+                publish_error: task.publish_error.clone(),
+                delta_table: task.delta_table.clone(),
+                delta_version: task.delta_version,
+                delta_partition: task.delta_partition.clone(),
+                execution_lineage_ref: task.execution_lineage_ref.clone(),
+                started_at: task.started_at,
+                last_heartbeat_at: task.last_heartbeat_at,
+                triggered_at: run.triggered_at,
+                completed_at: run.completed_at,
+                updated_at: row_updated_at,
+                code_version: run.code_version.clone(),
+                error_message: task.error_message.clone(),
+                row_version,
+            };
+            self.catalog_run_index.insert(primary_key, row);
+        }
+    }
+
     fn should_drop_run_requested_for_stale_sensor_eval(
         &self,
         trigger_source_ref: &SourceRef,
@@ -3146,6 +3437,28 @@ impl FoldState {
     }
 }
 
+fn label_value(labels: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| labels.get(*key).cloned())
+}
+
+fn parse_catalog_asset_key(asset_key: &str) -> (Option<String>, Option<String>) {
+    if let Some((namespace, table)) = asset_key.split_once('/') {
+        return (
+            (!namespace.is_empty()).then(|| namespace.to_string()),
+            (!table.is_empty()).then(|| table.to_string()),
+        );
+    }
+
+    if let Some((namespace, table)) = asset_key.split_once('.') {
+        return (
+            (!namespace.is_empty()).then(|| namespace.to_string()),
+            (!table.is_empty()).then(|| table.to_string()),
+        );
+    }
+
+    (None, Some(asset_key.to_string()))
+}
+
 // ============================================================================
 // Merge Functions for Base + L0 Delta Compaction
 // ============================================================================
@@ -3176,6 +3489,16 @@ pub fn merge_task_rows(rows: Vec<TaskRow>) -> Option<TaskRow> {
 /// Merges run rows from base snapshot and L0 deltas.
 #[must_use]
 pub fn merge_run_rows(rows: Vec<RunRow>) -> Option<RunRow> {
+    rows.into_iter()
+        .reduce(|best, row| match row.row_version.cmp(&best.row_version) {
+            std::cmp::Ordering::Less => best,
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => row,
+        })
+}
+
+/// Merges catalog run index rows from base snapshot and L0 deltas.
+#[must_use]
+pub fn merge_catalog_run_index_rows(rows: Vec<CatalogRunIndexRow>) -> Option<CatalogRunIndexRow> {
     rows.into_iter()
         .reduce(|best, row| match row.row_version.cmp(&best.row_version) {
             std::cmp::Ordering::Less => best,
@@ -3401,6 +3724,25 @@ mod tests {
             attempt,
             attempt_id: attempt_id.to_string(),
             worker_id: "worker-01".to_string(),
+        })
+    }
+
+    fn task_heartbeat_event(
+        run_id: &str,
+        task_key: &str,
+        attempt: u32,
+        attempt_id: &str,
+        heartbeat_at: DateTime<Utc>,
+    ) -> OrchestrationEvent {
+        make_event(OrchestrationEventData::TaskHeartbeat {
+            run_id: run_id.to_string(),
+            task_key: task_key.to_string(),
+            attempt,
+            attempt_id: attempt_id.to_string(),
+            worker_id: "worker-01".to_string(),
+            heartbeat_at: Some(heartbeat_at),
+            progress_pct: Some(50),
+            message: Some("halfway".to_string()),
         })
     }
 
@@ -5879,6 +6221,275 @@ mod tests {
         assert!(status.last_materialization_at.is_some());
         assert!(status.last_attempt_run_id.is_some());
         assert_eq!(status.last_attempt_outcome, Some(TaskOutcome::Succeeded));
+    }
+
+    #[test]
+    fn test_catalog_run_index_tracks_asset_task_lifecycle() {
+        let mut state = FoldState::new();
+        let attempt_id = Ulid::new().to_string();
+        let heartbeat_at = Utc::now();
+        let published_at = heartbeat_at + chrono::Duration::seconds(5);
+
+        let mut triggered = run_triggered_event("run1");
+        if let OrchestrationEventData::RunTriggered {
+            labels,
+            run_key,
+            code_version,
+            ..
+        } = &mut triggered.data
+        {
+            *run_key = Some("manual:analytics.daily:2026-05-26".to_string());
+            *code_version = Some("sha-123".to_string());
+            labels.insert("kind".to_string(), "materialization".to_string());
+            labels.insert("reference_id".to_string(), "catalog-refresh-01".to_string());
+            labels.insert("source_type".to_string(), "delta".to_string());
+        }
+
+        state.fold_event(&triggered);
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "extract".into(),
+                depends_on: vec![],
+                asset_key: Some("analytics.daily".into()),
+                partition_key: Some("2026-05-26".into()),
+                max_attempts: 2,
+                heartbeat_timeout_sec: 300,
+                requires_visible_output: true,
+            }],
+        ));
+        state.fold_event(&dispatch_requested_event("run1", "extract", 1, &attempt_id));
+        let dispatched_row = state
+            .catalog_run_index
+            .get(&(
+                "tenant-test".to_string(),
+                "workspace-test".to_string(),
+                "run1".to_string(),
+                "extract".to_string(),
+            ))
+            .expect("catalog run index row should update on dispatch");
+        assert_eq!(dispatched_row.task_status, TaskState::Dispatched);
+        assert_eq!(dispatched_row.attempt, 1);
+        assert_eq!(
+            dispatched_row.attempt_id.as_deref(),
+            Some(attempt_id.as_str())
+        );
+
+        state.fold_event(&task_started_event("run1", "extract", 1, &attempt_id));
+        state.fold_event(&task_heartbeat_event(
+            "run1",
+            "extract",
+            1,
+            &attempt_id,
+            heartbeat_at,
+        ));
+        state.fold_event(&make_event(OrchestrationEventData::TaskFinished {
+            run_id: "run1".to_string(),
+            task_key: "extract".to_string(),
+            attempt: 1,
+            attempt_id: attempt_id.clone(),
+            worker_id: "worker-01".to_string(),
+            outcome: TaskOutcome::Succeeded,
+            materialization_id: Some("mat_01".to_string()),
+            error_message: None,
+            output: Some(CallbackTaskOutput {
+                materialization_id: Some("mat_01".to_string()),
+                row_count: Some(10),
+                byte_size: Some(1024),
+                output_path: Some("s3://bucket/analytics/daily".to_string()),
+                delta_table: Some("analytics.daily".to_string()),
+                delta_version: Some(42),
+                delta_partition: Some("date=2026-05-26".to_string()),
+                output_visibility_state: None,
+                published_at: None,
+                publish_error: None,
+            }),
+            error: None,
+            metrics: None,
+            cancelled_during_phase: None,
+            partial_progress_json: None,
+            asset_key: Some("analytics.daily".to_string()),
+            partition_key: Some("2026-05-26".to_string()),
+            code_version: Some("sha-123".to_string()),
+        }));
+        state.fold_event(&task_output_visibility_changed_event(
+            "run1",
+            "extract",
+            1,
+            &attempt_id,
+            OutputVisibilityState::Visible,
+            Some(published_at),
+            None,
+        ));
+
+        let row = state
+            .catalog_run_index
+            .get(&(
+                "tenant-test".to_string(),
+                "workspace-test".to_string(),
+                "run1".to_string(),
+                "extract".to_string(),
+            ))
+            .expect("catalog run index row should be derived for asset task");
+
+        assert_eq!(row.schema_version, 1);
+        assert_eq!(row.org_id, "tenant-test");
+        assert_eq!(row.workspace_id, "workspace-test");
+        assert_eq!(row.run_id, "run1");
+        assert_eq!(row.task_key, "extract");
+        assert_eq!(row.plan_id, "plan-01");
+        assert_eq!(row.run_status, RunState::Succeeded);
+        assert!(!row.cancel_requested);
+        assert_eq!(row.task_status, TaskState::Succeeded);
+        assert_eq!(
+            row.run_key.as_deref(),
+            Some("manual:analytics.daily:2026-05-26")
+        );
+        assert_eq!(row.kind.as_deref(), Some("materialization"));
+        assert_eq!(row.reference_id.as_deref(), Some("catalog-refresh-01"));
+        assert_eq!(row.source_type.as_deref(), Some("delta"));
+        assert_eq!(row.asset_key.as_deref(), Some("analytics.daily"));
+        assert_eq!(row.target_namespace.as_deref(), Some("analytics"));
+        assert_eq!(row.target_table.as_deref(), Some("daily"));
+        assert_eq!(row.partition_key.as_deref(), Some("2026-05-26"));
+        assert_eq!(row.attempt, 1);
+        assert_eq!(row.attempt_id.as_deref(), Some(attempt_id.as_str()));
+        assert_eq!(row.last_heartbeat_at, Some(heartbeat_at));
+        assert_eq!(row.materialization_id.as_deref(), Some("mat_01"));
+        assert_eq!(
+            row.output_visibility_state,
+            Some(OutputVisibilityState::Visible)
+        );
+        assert_eq!(row.published_at, Some(published_at));
+        assert_eq!(row.delta_table.as_deref(), Some("analytics.daily"));
+        assert_eq!(row.delta_version, Some(42));
+        assert_eq!(row.delta_partition.as_deref(), Some("date=2026-05-26"));
+        assert!(row.execution_lineage_ref.is_some());
+        assert_eq!(row.code_version.as_deref(), Some("sha-123"));
+        assert!(row.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_catalog_run_index_rejects_stale_attempt_regression() {
+        let mut state = FoldState::new();
+        let attempt_1_id = Ulid::new().to_string();
+        let attempt_2_id = Ulid::new().to_string();
+
+        state.fold_event(&run_triggered_event("run1"));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "extract".into(),
+                depends_on: vec![],
+                asset_key: Some("analytics.daily".into()),
+                partition_key: Some("2026-05-26".into()),
+                max_attempts: 2,
+                heartbeat_timeout_sec: 300,
+                requires_visible_output: true,
+            }],
+        ));
+        state.fold_event(&task_started_event("run1", "extract", 1, &attempt_1_id));
+        state.fold_event(&task_started_event("run1", "extract", 2, &attempt_2_id));
+        state.fold_event(&task_finished_event_with_asset(
+            "run1",
+            "extract",
+            1,
+            &attempt_1_id,
+            TaskOutcome::Succeeded,
+            Some("analytics.daily"),
+            Some("2026-05-26"),
+        ));
+        state.fold_event(&run_cancel_requested_event("run1", "user_requested"));
+
+        let row = state
+            .catalog_run_index
+            .get(&(
+                "tenant-test".to_string(),
+                "workspace-test".to_string(),
+                "run1".to_string(),
+                "extract".to_string(),
+            ))
+            .expect("catalog run index row should exist");
+
+        assert_eq!(row.attempt, 2);
+        assert_eq!(row.attempt_id.as_deref(), Some(attempt_2_id.as_str()));
+        assert_eq!(row.run_status, RunState::Running);
+        assert!(row.cancel_requested);
+        assert_eq!(row.task_status, TaskState::Running);
+        assert!(row.materialization_id.is_none());
+        assert!(row.completed_at.is_none());
+    }
+
+    #[test]
+    fn test_catalog_run_index_refreshes_retry_dispatch() {
+        let mut state = FoldState::new();
+        let attempt_1_id = Ulid::new().to_string();
+        let attempt_2_id = Ulid::new().to_string();
+
+        state.fold_event(&run_triggered_event("run1"));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "extract".into(),
+                depends_on: vec![],
+                asset_key: Some("analytics.daily".into()),
+                partition_key: Some("2026-05-26".into()),
+                max_attempts: 2,
+                heartbeat_timeout_sec: 300,
+                requires_visible_output: false,
+            }],
+        ));
+        state.fold_event(&dispatch_requested_event(
+            "run1",
+            "extract",
+            1,
+            &attempt_1_id,
+        ));
+        state.fold_event(&task_started_event("run1", "extract", 1, &attempt_1_id));
+        state.fold_event(&task_finished_event_with_asset(
+            "run1",
+            "extract",
+            1,
+            &attempt_1_id,
+            TaskOutcome::Failed,
+            Some("analytics.daily"),
+            Some("2026-05-26"),
+        ));
+
+        let retry_wait_row = state
+            .catalog_run_index
+            .get(&(
+                "tenant-test".to_string(),
+                "workspace-test".to_string(),
+                "run1".to_string(),
+                "extract".to_string(),
+            ))
+            .expect("catalog run index row should exist after failed retryable attempt");
+        assert_eq!(retry_wait_row.task_status, TaskState::RetryWait);
+        assert_eq!(retry_wait_row.attempt, 1);
+
+        state.fold_event(&dispatch_requested_event(
+            "run1",
+            "extract",
+            2,
+            &attempt_2_id,
+        ));
+
+        let dispatched_retry_row = state
+            .catalog_run_index
+            .get(&(
+                "tenant-test".to_string(),
+                "workspace-test".to_string(),
+                "run1".to_string(),
+                "extract".to_string(),
+            ))
+            .expect("catalog run index row should refresh on retry dispatch");
+        assert_eq!(dispatched_retry_row.task_status, TaskState::Dispatched);
+        assert_eq!(dispatched_retry_row.attempt, 2);
+        assert_eq!(
+            dispatched_retry_row.attempt_id.as_deref(),
+            Some(attempt_2_id.as_str())
+        );
     }
 
     #[test]

@@ -34,6 +34,11 @@ The evidence surface is `system.orchestration.*`. It is a read-only SQL view
 over published projections, not the enforcement path for authorization,
 dispatch, or correctness decisions.
 
+Catalog-facing readers that need run-backed asset metadata use the
+manifest-published `catalog_run_index` projection. It is a derived read index
+over folded run and task state, not a replacement source of truth and not a
+worker-written object path.
+
 ## Lifecycle
 
 | Product step | Owner | Contract evidence |
@@ -49,6 +54,7 @@ dispatch, or correctness decisions.
 | Sensor is evaluated | Sensor controller | `SensorEvaluated`; `system.orchestration.sensor_state` and `system.orchestration.sensor_evals` |
 | Backfill is created and chunked | Backfill controller | `BackfillCreated`, `BackfillChunkPlanned`, `BackfillStateChanged`; `system.orchestration.backfills` and `system.orchestration.backfill_chunks` |
 | Partition status changes | Projection fold | `system.orchestration.partition_status` |
+| Catalog reader enumerates run-backed asset metadata | Projection fold | Manifest-published `catalog_run_index_by_org` artifacts; see [Catalog Run Index](./catalog-run-index.md) |
 | Run-key conflict is detected | Projection fold | `system.orchestration.run_key_conflicts` |
 
 Every public orchestration claim should map to one of these event contracts,
@@ -83,6 +89,9 @@ Arco intentionally keeps these boundaries:
 - Worker payloads are explicit JSON or proto-compatible contracts.
 - System tables are read-only evidence and may lag raw event ingestion until
   compaction publishes the projection.
+- `catalog_run_index` is a pointer-published read index derived from
+  orchestration runs and tasks. Catalog readers should consume it instead of
+  listing canonical run-object prefixes.
 
 ## Avoided Models
 

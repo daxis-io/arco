@@ -26,7 +26,7 @@ projections.
 
 - `system.catalog.{catalogs,namespaces,tables,columns,commits}`
 - `system.lineage.edges`
-- `system.orchestration.{runs,tasks,dep_satisfaction,timers,dispatch_outbox,sensor_state,sensor_evals,partition_status,schedule_definitions,schedule_state,schedule_ticks,backfills,backfill_chunks,run_key_conflicts}`
+- `system.orchestration.{runs,tasks,catalog_run_index,dep_satisfaction,timers,dispatch_outbox,sensor_state,sensor_evals,partition_status,schedule_definitions,schedule_state,schedule_ticks,backfills,backfill_chunks,run_key_conflicts}`
 
 ## Deferred Tables
 

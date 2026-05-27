@@ -21,6 +21,7 @@
 - [System Catalog](./reference/system-catalog.md)
 - [Orchestration Product Contract](./reference/orchestration-product-contract.md)
 - [Orchestration Embedding](./reference/orchestration-embedding.md)
+- [Catalog Run Index](./reference/catalog-run-index.md)
 - [Catalog Privilege Matrix](./reference/catalog-privilege-matrix.md)
 - [Catalog API Contract](./reference/catalog-api-contract.md)
 - [Schema Evolution Policy](./reference/schema-evolution-policy.md)

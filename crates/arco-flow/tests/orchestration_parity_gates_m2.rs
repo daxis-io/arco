@@ -493,7 +493,7 @@ async fn parity_m2_poll_sensor_cursor_and_min_interval_survive_compactor_reload(
     }
 
     let backend = Arc::new(MemoryBackend::new());
-    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let storage = ScopedStorage::new(backend, "tenant-abc", "workspace-prod")?;
 
     let sensor_id = "01HQ456POLLSENSOR";
     let eval1_millis = Utc::now().timestamp_millis() - 120_000;

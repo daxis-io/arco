@@ -24,10 +24,7 @@ use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use utoipa::ToSchema;
+use serde::Serialize;
 
 use crate::context::{REQUEST_ID_HEADER, RequestContext};
 use crate::error::{ApiError, ApiErrorBody};
@@ -41,271 +38,13 @@ use arco_flow::orchestration::callbacks::{
     handle_task_started,
 };
 use arco_flow::orchestration::compactor::{FoldState, MicroCompactor, TaskState as FoldTaskState};
-use arco_flow::orchestration::{
-    ErrorCategory as FlowErrorCategory, HeartbeatRequest as FlowHeartbeatRequest,
-    HeartbeatResponse as FlowHeartbeatResponse, TaskCompletedRequest as FlowTaskCompletedRequest,
-    TaskCompletedResponse as FlowTaskCompletedResponse, TaskError as FlowTaskError,
-    TaskMetrics as FlowTaskMetrics, TaskOutput as FlowTaskOutput,
-    TaskOutputVisibilityState as FlowTaskOutputVisibilityState,
-    TaskStartedRequest as FlowTaskStartedRequest, TaskStartedResponse as FlowTaskStartedResponse,
-    WorkerOutcome as FlowWorkerOutcome,
+use arco_worker_contract::parse_callback_task_id;
+pub use arco_worker_contract::{
+    CallbackErrorResponse, ErrorCategory, HeartbeatRequest, HeartbeatResponse,
+    TaskCompletedRequest, TaskCompletedResponse, TaskError, TaskMetrics, TaskOutput,
+    TaskOutputVisibilityState, TaskStartedRequest, TaskStartedResponse, WorkerOutcome,
 };
 use ulid::Ulid;
-
-// ============================================================================
-// Request/Response Types (with ToSchema for OpenAPI)
-// ============================================================================
-
-/// Request body for `/v1/tasks/{task_id}/started`.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskStartedRequest {
-    /// Attempt number (1-indexed).
-    pub attempt: u32,
-    /// Attempt identifier (ULID) - concurrency guard.
-    pub attempt_id: String,
-    /// Worker identifier.
-    pub worker_id: String,
-    /// Optional W3C traceparent for distributed tracing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub traceparent: Option<String>,
-    /// When execution started (optional, uses server time if omitted).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<DateTime<Utc>>,
-}
-
-/// Response body for successful `/v1/tasks/{task_id}/started`.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskStartedResponse {
-    /// Whether the callback was acknowledged.
-    pub acknowledged: bool,
-    /// Server timestamp.
-    pub server_time: DateTime<Utc>,
-}
-
-/// Request body for `/v1/tasks/{task_id}/heartbeat`.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct HeartbeatRequest {
-    /// Attempt number.
-    pub attempt: u32,
-    /// Attempt identifier (ULID) - concurrency guard.
-    pub attempt_id: String,
-    /// Worker identifier.
-    pub worker_id: String,
-    /// Optional W3C traceparent for distributed tracing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub traceparent: Option<String>,
-    /// When heartbeat was sent (optional, uses server time if omitted).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub heartbeat_at: Option<DateTime<Utc>>,
-    /// Optional progress percentage (0-100).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub progress_pct: Option<u8>,
-    /// Optional status message.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-}
-
-/// Response body for successful `/v1/tasks/{task_id}/heartbeat`.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct HeartbeatResponse {
-    /// Whether the heartbeat was acknowledged.
-    pub acknowledged: bool,
-    /// Whether the worker should cancel.
-    pub should_cancel: bool,
-    /// Reason for cancellation (if `should_cancel` is true).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cancel_reason: Option<String>,
-    /// Server timestamp.
-    pub server_time: DateTime<Utc>,
-}
-
-/// Request body for `/v1/tasks/{task_id}/completed`.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskCompletedRequest {
-    /// Attempt number.
-    pub attempt: u32,
-    /// Attempt identifier (ULID) - concurrency guard.
-    pub attempt_id: String,
-    /// Worker identifier.
-    pub worker_id: String,
-    /// Optional W3C traceparent for distributed tracing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub traceparent: Option<String>,
-    /// Task outcome.
-    pub outcome: WorkerOutcome,
-    /// When execution completed (optional, uses server time if omitted).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<DateTime<Utc>>,
-    /// Output for successful tasks.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output: Option<TaskOutput>,
-    /// Error details for failed tasks.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<TaskError>,
-    /// Execution metrics.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metrics: Option<TaskMetrics>,
-    /// Phase when cancellation occurred (for CANCELLED outcome).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cancelled_during_phase: Option<String>,
-    /// Partial progress at cancellation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub partial_progress: Option<Value>,
-}
-
-/// Response body for successful `/v1/tasks/{task_id}/completed`.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskCompletedResponse {
-    /// Whether the completion was acknowledged.
-    pub acknowledged: bool,
-    /// Final task state.
-    pub final_state: String,
-    /// Server timestamp.
-    pub server_time: DateTime<Utc>,
-}
-
-/// Worker-reported task outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum WorkerOutcome {
-    /// Task completed successfully.
-    Succeeded,
-    /// Task failed (may retry).
-    Failed,
-    /// Task was cancelled.
-    Cancelled,
-}
-
-/// Worker-reported output visibility state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum TaskOutputVisibilityState {
-    /// Output exists but is not consumable yet.
-    Pending,
-    /// Output is published and consumable.
-    Visible,
-    /// Output failed to become visible.
-    Failed,
-}
-
-/// Output from a successful task.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskOutput {
-    /// Materialization identifier.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub materialization_id: Option<String>,
-    /// Number of rows produced.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub row_count: Option<u64>,
-    /// Size in bytes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub byte_size: Option<u64>,
-    /// Output path.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_path: Option<String>,
-    /// Delta table identifier for lineage correlation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delta_table: Option<String>,
-    /// Delta version for lineage correlation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delta_version: Option<i64>,
-    /// Delta partition for lineage correlation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delta_partition: Option<String>,
-    /// Output visibility state, when the worker/runtime can report it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_visibility_state: Option<TaskOutputVisibilityState>,
-    /// When output became visible, if applicable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub published_at: Option<DateTime<Utc>>,
-    /// Publish failure details, if applicable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub publish_error: Option<String>,
-}
-
-/// Error details from a failed task.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskError {
-    /// Error category per ADR-023.
-    pub category: ErrorCategory,
-    /// Error message.
-    pub message: String,
-    /// Stack trace (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stack_trace: Option<String>,
-    /// Whether the error is retryable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub retryable: Option<bool>,
-}
-
-/// Error category per ADR-023.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ErrorCategory {
-    /// Error in user/asset code.
-    UserCode,
-    /// Input data fails validation.
-    DataQuality,
-    /// Infrastructure/cloud errors.
-    Infrastructure,
-    /// Configuration errors.
-    Configuration,
-    /// Execution timeout.
-    Timeout,
-    /// Task was cancelled.
-    Cancelled,
-}
-
-/// Execution metrics from the worker.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskMetrics {
-    /// CPU time in milliseconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu_time_ms: Option<u64>,
-    /// Peak memory usage in bytes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub peak_memory_bytes: Option<u64>,
-    /// I/O read bytes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub io_read_bytes: Option<u64>,
-    /// I/O write bytes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub io_write_bytes: Option<u64>,
-}
-
-/// Callback error response per ADR-023.
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct CallbackErrorResponse {
-    /// Error code.
-    pub error: String,
-    /// Human-readable message.
-    pub message: String,
-    /// Current task state (for 409 Conflict).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state: Option<String>,
-    /// Expected attempt (for 409 Conflict).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expected_attempt: Option<u32>,
-    /// Received attempt (for 409 Conflict).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub received_attempt: Option<u32>,
-    /// Expected attempt ID (for 409 Conflict).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expected_attempt_id: Option<String>,
-    /// Received attempt ID (for 409 Conflict).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub received_attempt_id: Option<String>,
-}
 
 // ============================================================================
 // Callback Wiring
@@ -413,17 +152,20 @@ impl TaskStateLookup for ParquetTaskStateLookup {
         let state = Arc::clone(&self.state);
         let task_id = task_id.to_string();
         async move {
-            // Task IDs are expected to be unique task keys in orchestration state.
+            let parsed_callback_task_id = parse_callback_task_id(&task_id).ok();
             let matches: Vec<_> = state
                 .tasks
                 .values()
-                .filter(|row| row.task_key == task_id)
+                .filter(|row| match &parsed_callback_task_id {
+                    Some(parsed) => row.run_id == parsed.run_id && row.task_key == parsed.task_key,
+                    None => row.task_key == task_id,
+                })
                 .collect();
 
             if matches.is_empty() {
                 return Ok(None);
             }
-            if matches.len() > 1 {
+            if parsed_callback_task_id.is_none() && matches.len() > 1 {
                 return Err(format!("task_id_ambiguous: {task_id}"));
             }
 
@@ -438,6 +180,7 @@ impl TaskStateLookup for ParquetTaskStateLookup {
                 attempt: row.attempt,
                 attempt_id: row.attempt_id.clone().unwrap_or_default(),
                 run_id: row.run_id.clone(),
+                task_key: row.task_key.clone(),
                 asset_key: row.asset_key.clone(),
                 partition_key: row.partition_key.clone(),
                 code_version,
@@ -474,15 +217,14 @@ fn callback_error_response(error: CallbackError) -> CallbackErrorResponse {
     }
 }
 
-fn callback_result_response<T, U>(
+fn callback_result_response<T>(
     result: CallbackResult<T>,
 ) -> Result<axum::response::Response, ApiError>
 where
-    T: Into<U>,
-    U: Serialize,
+    T: Serialize,
 {
     let response = match result {
-        CallbackResult::Ok(payload) => (StatusCode::OK, Json(payload.into())).into_response(),
+        CallbackResult::Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
         CallbackResult::BadRequest(error) => (
             StatusCode::BAD_REQUEST,
             Json(callback_error_response(error)),
@@ -646,152 +388,6 @@ async fn build_callback_dependencies(
     Ok((callback_ctx, lookup))
 }
 
-impl From<TaskStartedRequest> for FlowTaskStartedRequest {
-    fn from(request: TaskStartedRequest) -> Self {
-        Self {
-            attempt: request.attempt,
-            attempt_id: request.attempt_id,
-            worker_id: request.worker_id,
-            traceparent: request.traceparent,
-            started_at: request.started_at,
-        }
-    }
-}
-
-impl From<FlowTaskStartedResponse> for TaskStartedResponse {
-    fn from(response: FlowTaskStartedResponse) -> Self {
-        Self {
-            acknowledged: response.acknowledged,
-            server_time: response.server_time,
-        }
-    }
-}
-
-impl From<HeartbeatRequest> for FlowHeartbeatRequest {
-    fn from(request: HeartbeatRequest) -> Self {
-        Self {
-            attempt: request.attempt,
-            attempt_id: request.attempt_id,
-            worker_id: request.worker_id,
-            traceparent: request.traceparent,
-            heartbeat_at: request.heartbeat_at,
-            progress_pct: request.progress_pct,
-            message: request.message,
-        }
-    }
-}
-
-impl From<FlowHeartbeatResponse> for HeartbeatResponse {
-    fn from(response: FlowHeartbeatResponse) -> Self {
-        Self {
-            acknowledged: response.acknowledged,
-            should_cancel: response.should_cancel,
-            cancel_reason: response.cancel_reason,
-            server_time: response.server_time,
-        }
-    }
-}
-
-impl From<TaskCompletedRequest> for FlowTaskCompletedRequest {
-    fn from(request: TaskCompletedRequest) -> Self {
-        Self {
-            attempt: request.attempt,
-            attempt_id: request.attempt_id,
-            worker_id: request.worker_id,
-            traceparent: request.traceparent,
-            outcome: request.outcome.into(),
-            completed_at: request.completed_at,
-            output: request.output.map(Into::into),
-            error: request.error.map(Into::into),
-            metrics: request.metrics.map(Into::into),
-            cancelled_during_phase: request.cancelled_during_phase,
-            partial_progress: request.partial_progress,
-        }
-    }
-}
-
-impl From<FlowTaskCompletedResponse> for TaskCompletedResponse {
-    fn from(response: FlowTaskCompletedResponse) -> Self {
-        Self {
-            acknowledged: response.acknowledged,
-            final_state: response.final_state,
-            server_time: response.server_time,
-        }
-    }
-}
-
-impl From<WorkerOutcome> for FlowWorkerOutcome {
-    fn from(outcome: WorkerOutcome) -> Self {
-        match outcome {
-            WorkerOutcome::Succeeded => Self::Succeeded,
-            WorkerOutcome::Failed => Self::Failed,
-            WorkerOutcome::Cancelled => Self::Cancelled,
-        }
-    }
-}
-
-impl From<TaskOutputVisibilityState> for FlowTaskOutputVisibilityState {
-    fn from(state: TaskOutputVisibilityState) -> Self {
-        match state {
-            TaskOutputVisibilityState::Pending => Self::Pending,
-            TaskOutputVisibilityState::Visible => Self::Visible,
-            TaskOutputVisibilityState::Failed => Self::Failed,
-        }
-    }
-}
-
-impl From<ErrorCategory> for FlowErrorCategory {
-    fn from(category: ErrorCategory) -> Self {
-        match category {
-            ErrorCategory::UserCode => Self::UserCode,
-            ErrorCategory::DataQuality => Self::DataQuality,
-            ErrorCategory::Infrastructure => Self::Infrastructure,
-            ErrorCategory::Configuration => Self::Configuration,
-            ErrorCategory::Timeout => Self::Timeout,
-            ErrorCategory::Cancelled => Self::Cancelled,
-        }
-    }
-}
-
-impl From<TaskOutput> for FlowTaskOutput {
-    fn from(output: TaskOutput) -> Self {
-        Self {
-            materialization_id: output.materialization_id,
-            row_count: output.row_count,
-            byte_size: output.byte_size,
-            output_path: output.output_path,
-            delta_table: output.delta_table,
-            delta_version: output.delta_version,
-            delta_partition: output.delta_partition,
-            output_visibility_state: output.output_visibility_state.map(Into::into),
-            published_at: output.published_at,
-            publish_error: output.publish_error,
-        }
-    }
-}
-
-impl From<TaskError> for FlowTaskError {
-    fn from(error: TaskError) -> Self {
-        Self {
-            category: error.category.into(),
-            message: error.message,
-            stack_trace: error.stack_trace,
-            retryable: error.retryable,
-        }
-    }
-}
-
-impl From<TaskMetrics> for FlowTaskMetrics {
-    fn from(metrics: TaskMetrics) -> Self {
-        Self {
-            cpu_time_ms: metrics.cpu_time_ms,
-            peak_memory_bytes: metrics.peak_memory_bytes,
-            io_read_bytes: metrics.io_read_bytes,
-            io_write_bytes: metrics.io_write_bytes,
-        }
-    }
-}
-
 // ============================================================================
 // Route Handlers
 // ============================================================================
@@ -844,16 +440,15 @@ pub(crate) async fn task_started(
 
     let Some(token) = extract_bearer_token(&headers) else {
         let error = CallbackError::invalid_token("missing bearer token");
-        return callback_result_response::<FlowTaskStartedResponse, TaskStartedResponse>(
-            CallbackResult::Unauthorized(error),
-        );
+        return callback_result_response(CallbackResult::<TaskStartedResponse>::Unauthorized(
+            error,
+        ));
     };
 
     let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state).await?;
-    let result =
-        handle_task_started(&callback_ctx, &task_id, &token, request.into(), &lookup).await;
+    let result = handle_task_started(&callback_ctx, &task_id, &token, request, &lookup).await;
 
-    callback_result_response::<FlowTaskStartedResponse, TaskStartedResponse>(result)
+    callback_result_response(result)
 }
 
 /// Worker heartbeat callback.
@@ -896,15 +491,13 @@ pub(crate) async fn task_heartbeat(
 
     let Some(token) = extract_bearer_token(&headers) else {
         let error = CallbackError::invalid_token("missing bearer token");
-        return callback_result_response::<FlowHeartbeatResponse, HeartbeatResponse>(
-            CallbackResult::Unauthorized(error),
-        );
+        return callback_result_response(CallbackResult::<HeartbeatResponse>::Unauthorized(error));
     };
 
     let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state).await?;
-    let result = handle_heartbeat(&callback_ctx, &task_id, &token, request.into(), &lookup).await;
+    let result = handle_heartbeat(&callback_ctx, &task_id, &token, request, &lookup).await;
 
-    callback_result_response::<FlowHeartbeatResponse, HeartbeatResponse>(result)
+    callback_result_response(result)
 }
 
 /// Worker task completed callback.
@@ -946,16 +539,15 @@ pub(crate) async fn task_completed(
 
     let Some(token) = extract_bearer_token(&headers) else {
         let error = CallbackError::invalid_token("missing bearer token");
-        return callback_result_response::<FlowTaskCompletedResponse, TaskCompletedResponse>(
-            CallbackResult::Unauthorized(error),
-        );
+        return callback_result_response(CallbackResult::<TaskCompletedResponse>::Unauthorized(
+            error,
+        ));
     };
 
     let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state).await?;
-    let result =
-        handle_task_completed(&callback_ctx, &task_id, &token, request.into(), &lookup).await;
+    let result = handle_task_completed(&callback_ctx, &task_id, &token, request, &lookup).await;
 
-    callback_result_response::<FlowTaskCompletedResponse, TaskCompletedResponse>(result)
+    callback_result_response(result)
 }
 
 // ============================================================================
@@ -979,8 +571,55 @@ mod tests {
     use axum::body::Body as AxumBody;
     use axum::http::Request as AxumRequest;
     use axum::routing::get;
+    use chrono::Utc;
     use jsonwebtoken::{Algorithm, EncodingKey, Header};
+    use serde_json::Value;
     use tower::ServiceExt;
+
+    fn task_row(run_id: &str, task_key: &str) -> arco_flow::orchestration::compactor::TaskRow {
+        arco_flow::orchestration::compactor::TaskRow {
+            run_id: run_id.to_string(),
+            task_key: task_key.to_string(),
+            state: FoldTaskState::Running,
+            attempt: 1,
+            attempt_id: Some("att-1".to_string()),
+            started_at: None,
+            completed_at: None,
+            error_message: None,
+            deps_total: 0,
+            deps_satisfied_count: 0,
+            max_attempts: 3,
+            heartbeat_timeout_sec: 300,
+            last_heartbeat_at: None,
+            ready_at: None,
+            asset_key: Some("analytics.daily".to_string()),
+            partition_key: None,
+            requires_visible_output: false,
+            materialization_id: None,
+            output_visibility_state: None,
+            published_at: None,
+            publish_error: None,
+            delta_table: None,
+            delta_version: None,
+            delta_partition: None,
+            execution_lineage_ref: None,
+            row_version: "01JTEST".to_string(),
+        }
+    }
+
+    fn lookup_with_rows(
+        rows: Vec<arco_flow::orchestration::compactor::TaskRow>,
+    ) -> ParquetTaskStateLookup {
+        let mut state = FoldState::default();
+        for row in rows {
+            state
+                .tasks
+                .insert((row.run_id.clone(), row.task_key.clone()), row);
+        }
+        ParquetTaskStateLookup {
+            state: Arc::new(state),
+        }
+    }
 
     #[test]
     fn test_started_request_deserialization() {
@@ -1052,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn test_task_output_conversion_preserves_delta_lineage() {
+    fn test_task_output_preserves_delta_lineage() {
         let output = TaskOutput {
             materialization_id: Some("mat-456".to_string()),
             row_count: Some(1000),
@@ -1066,17 +705,83 @@ mod tests {
             publish_error: None,
         };
 
-        let flow_output: FlowTaskOutput = output.into();
-        assert_eq!(flow_output.delta_table.as_deref(), Some("analytics.daily"));
-        assert_eq!(flow_output.delta_version, Some(17));
+        assert_eq!(output.delta_table.as_deref(), Some("analytics.daily"));
+        assert_eq!(output.delta_version, Some(17));
+        assert_eq!(output.delta_partition.as_deref(), Some("date=2025-01-15"));
         assert_eq!(
-            flow_output.delta_partition.as_deref(),
-            Some("date=2025-01-15")
+            output.output_visibility_state,
+            Some(TaskOutputVisibilityState::Visible)
         );
-        assert_eq!(
-            flow_output.output_visibility_state,
-            Some(FlowTaskOutputVisibilityState::Visible)
+    }
+
+    #[tokio::test]
+    async fn parquet_task_lookup_resolves_opaque_callback_task_id() -> Result<()> {
+        let lookup = lookup_with_rows(vec![
+            task_row("run-1", "extract"),
+            task_row("run-2", "extract"),
+        ]);
+        let task_id = arco_worker_contract::callback_task_id("run-2", "extract");
+
+        let state = lookup
+            .get_task_state(&task_id)
+            .await
+            .expect("lookup")
+            .expect("task state");
+
+        assert_eq!(state.run_id, "run-2");
+        assert_eq!(state.task_key, "extract");
+        assert_eq!(state.attempt_id, "att-1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parquet_task_lookup_accepts_unambiguous_legacy_task_key() -> Result<()> {
+        let lookup = lookup_with_rows(vec![task_row("run-1", "extract")]);
+
+        let state = lookup
+            .get_task_state("extract")
+            .await
+            .expect("lookup")
+            .expect("task state");
+
+        assert_eq!(state.run_id, "run-1");
+        assert_eq!(state.task_key, "extract");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parquet_task_lookup_rejects_ambiguous_legacy_task_key() -> Result<()> {
+        let lookup = lookup_with_rows(vec![
+            task_row("run-1", "extract"),
+            task_row("run-2", "extract"),
+        ]);
+
+        let err = lookup
+            .get_task_state("extract")
+            .await
+            .expect_err("ambiguous legacy task key");
+
+        assert!(err.contains("task_id_ambiguous"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_callback_response_maps_ambiguous_legacy_task_id_to_bad_request() -> Result<()> {
+        let response = callback_result_response(CallbackResult::<TaskStartedResponse>::BadRequest(
+            CallbackError::task_id_ambiguous("extract"),
+        ))
+        .expect("callback response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1024).await?;
+        let payload: Value = serde_json::from_slice(&body)?;
+        assert_eq!(payload["error"], "task_id_ambiguous");
+        assert!(
+            payload["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("opaque taskId"))
         );
+        Ok(())
     }
 
     #[test]

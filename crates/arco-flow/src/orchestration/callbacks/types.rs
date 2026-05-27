@@ -1,262 +1,14 @@
 //! Request and response types for worker callbacks per ADR-023.
 
-use chrono::{DateTime, Utc};
+pub use arco_worker_contract::{
+    ErrorCategory, HeartbeatRequest, HeartbeatResponse, TaskCompletedRequest,
+    TaskCompletedResponse, TaskError, TaskMetrics, TaskOutput, TaskOutputVisibilityState,
+    TaskStartedRequest, TaskStartedResponse, WorkerOutcome,
+};
 use serde::{Deserialize, Serialize};
 
-// ============================================================================
-// TaskStarted
-// ============================================================================
-
-/// Request body for `/v1/tasks/{task_id}/started`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskStartedRequest {
-    /// Attempt number (1-indexed).
-    pub attempt: u32,
-    /// Attempt identifier - concurrency guard.
-    pub attempt_id: String,
-    /// Worker identifier.
-    pub worker_id: String,
-    /// Optional W3C traceparent for distributed tracing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub traceparent: Option<String>,
-    /// When execution started (optional, uses server time if omitted).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<DateTime<Utc>>,
-}
-
-/// Response body for successful `/v1/tasks/{task_id}/started`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskStartedResponse {
-    /// Whether the callback was acknowledged.
-    pub acknowledged: bool,
-    /// Server timestamp.
-    pub server_time: DateTime<Utc>,
-}
-
-// ============================================================================
-// Heartbeat
-// ============================================================================
-
-/// Request body for `/v1/tasks/{task_id}/heartbeat`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HeartbeatRequest {
-    /// Attempt number.
-    pub attempt: u32,
-    /// Attempt identifier - concurrency guard.
-    pub attempt_id: String,
-    /// Worker identifier.
-    pub worker_id: String,
-    /// Optional W3C traceparent for distributed tracing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub traceparent: Option<String>,
-    /// When heartbeat was sent (optional, uses server time if omitted).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub heartbeat_at: Option<DateTime<Utc>>,
-    /// Optional progress percentage (0-100).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub progress_pct: Option<u8>,
-    /// Optional status message.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-}
-
-/// Response body for successful `/v1/tasks/{task_id}/heartbeat`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HeartbeatResponse {
-    /// Whether the heartbeat was acknowledged.
-    pub acknowledged: bool,
-    /// Whether the worker should cancel.
-    pub should_cancel: bool,
-    /// Reason for cancellation (if `should_cancel` is true).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cancel_reason: Option<String>,
-    /// Server timestamp.
-    pub server_time: DateTime<Utc>,
-}
-
-// ============================================================================
-// TaskCompleted
-// ============================================================================
-
-/// Request body for `/v1/tasks/{task_id}/completed`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskCompletedRequest {
-    /// Attempt number.
-    pub attempt: u32,
-    /// Attempt identifier - concurrency guard.
-    pub attempt_id: String,
-    /// Worker identifier.
-    pub worker_id: String,
-    /// Optional W3C traceparent for distributed tracing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub traceparent: Option<String>,
-    /// Task outcome.
-    pub outcome: WorkerOutcome,
-    /// When execution completed (optional, uses server time if omitted).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<DateTime<Utc>>,
-    /// Output for successful tasks.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output: Option<TaskOutput>,
-    /// Error details for failed tasks.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<TaskError>,
-    /// Execution metrics.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metrics: Option<TaskMetrics>,
-    /// Phase when cancellation occurred (for CANCELLED outcome).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cancelled_during_phase: Option<String>,
-    /// Partial progress at cancellation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub partial_progress: Option<serde_json::Value>,
-}
-
-/// Response body for successful `/v1/tasks/{task_id}/completed`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskCompletedResponse {
-    /// Whether the completion was acknowledged.
-    pub acknowledged: bool,
-    /// Final task state.
-    pub final_state: String,
-    /// Server timestamp.
-    pub server_time: DateTime<Utc>,
-}
-
-/// Worker-reported task outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum WorkerOutcome {
-    /// Task completed successfully.
-    Succeeded,
-    /// Task failed (may retry).
-    Failed,
-    /// Task was cancelled.
-    Cancelled,
-}
-
-/// Worker-reported output visibility state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum TaskOutputVisibilityState {
-    /// Output exists but is not consumable yet.
-    Pending,
-    /// Output is published and consumable.
-    Visible,
-    /// Output failed to become visible.
-    Failed,
-}
-
-/// Output from a successful task.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskOutput {
-    /// Materialization identifier.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub materialization_id: Option<String>,
-    /// Number of rows produced.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub row_count: Option<u64>,
-    /// Size in bytes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub byte_size: Option<u64>,
-    /// Output path.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_path: Option<String>,
-    /// Delta table identifier for lineage.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delta_table: Option<String>,
-    /// Delta version for lineage.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delta_version: Option<i64>,
-    /// Delta partition for lineage.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delta_partition: Option<String>,
-    /// Output visibility state, when the worker/runtime can report it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_visibility_state: Option<TaskOutputVisibilityState>,
-    /// When output became visible, if applicable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub published_at: Option<DateTime<Utc>>,
-    /// Publish failure details, if applicable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub publish_error: Option<String>,
-}
-
-/// Error details from a failed task.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskError {
-    /// Error category per ADR-023.
-    pub category: ErrorCategory,
-    /// Error message.
-    pub message: String,
-    /// Stack trace (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stack_trace: Option<String>,
-    /// Whether the error is retryable (optional, defaults by category).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub retryable: Option<bool>,
-}
-
-impl TaskError {
-    /// Returns the retryability, falling back to the category default.
-    #[must_use]
-    pub fn effective_retryable(&self) -> bool {
-        self.retryable
-            .unwrap_or_else(|| self.category.default_retryable())
-    }
-}
-
-/// Error category per ADR-023.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ErrorCategory {
-    /// Error in user/asset code.
-    UserCode,
-    /// Input data fails validation.
-    DataQuality,
-    /// Infrastructure/cloud errors.
-    Infrastructure,
-    /// Configuration errors.
-    Configuration,
-    /// Execution timeout.
-    Timeout,
-    /// Task was cancelled.
-    Cancelled,
-}
-
-impl ErrorCategory {
-    /// Returns whether this error category is retryable by default.
-    #[must_use]
-    pub fn default_retryable(&self) -> bool {
-        matches!(self, Self::UserCode | Self::Infrastructure | Self::Timeout)
-    }
-}
-
-/// Execution metrics from the worker.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskMetrics {
-    /// CPU time in milliseconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu_time_ms: Option<u64>,
-    /// Peak memory usage in bytes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub peak_memory_bytes: Option<u64>,
-    /// I/O read bytes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub io_read_bytes: Option<u64>,
-    /// I/O write bytes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub io_write_bytes: Option<u64>,
-}
+#[cfg(test)]
+use chrono::Utc;
 
 // ============================================================================
 // Error Responses
@@ -378,6 +130,20 @@ impl CallbackError {
         Self {
             error: "task_not_found".to_string(),
             message: format!("Task not found: {task_id}"),
+            state: None,
+            expected_attempt: None,
+            received_attempt: None,
+            expected_attempt_id: None,
+            received_attempt_id: None,
+        }
+    }
+
+    /// Creates an ambiguous legacy task-id error (400).
+    #[must_use]
+    pub fn task_id_ambiguous(task_id: &str) -> Self {
+        Self {
+            error: "task_id_ambiguous".to_string(),
+            message: format!("Legacy task id is ambiguous; use opaque taskId: {task_id}"),
             state: None,
             expected_attempt: None,
             received_attempt: None,

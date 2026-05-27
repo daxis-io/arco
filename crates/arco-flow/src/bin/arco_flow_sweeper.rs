@@ -31,6 +31,7 @@ use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventDat
 use arco_flow::orchestration::flow_service::append_events_and_compact;
 use arco_flow::orchestration::ids::{cloud_task_id, deterministic_attempt_id};
 use arco_flow::orchestration::worker_contract::WorkerDispatchEnvelope;
+use arco_worker_contract::callback_task_id;
 
 #[derive(Clone)]
 struct AppState {
@@ -181,9 +182,10 @@ async fn run_handler(
                     .filter(|id| !id.is_empty())
                     .unwrap_or_else(|| deterministic_attempt_id(&original_dispatch_id));
 
+                let callback_task_id = callback_task_id(&run_id, &task_key);
                 let minted = mint_task_token(
                     &state.task_token_config,
-                    task_key.clone(),
+                    callback_task_id.clone(),
                     state.tenant_id.clone(),
                     state.workspace_id.clone(),
                     Utc::now(),
@@ -194,6 +196,7 @@ async fn run_handler(
                     tenant_id: state.tenant_id.clone(),
                     workspace_id: state.workspace_id.clone(),
                     run_id: run_id.clone(),
+                    task_id: callback_task_id,
                     task_key: task_key.clone(),
                     attempt,
                     attempt_id,

@@ -84,6 +84,7 @@ class WorkerDispatchEnvelope:
     tenant_id: str
     workspace_id: str
     run_id: str
+    task_id: str | None
     task_key: str
     attempt: int
     attempt_id: str
@@ -95,11 +96,16 @@ class WorkerDispatchEnvelope:
     traceparent: str | None
     payload: Any
 
+    @property
+    def callback_task_id(self) -> str:
+        return self.task_id or self.task_key
+
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> WorkerDispatchEnvelope:
         tenant_id = _get_field(payload, "tenant_id", "tenantId")
         workspace_id = _get_field(payload, "workspace_id", "workspaceId")
         run_id = _get_field(payload, "run_id", "runId")
+        task_id = _get_field(payload, "task_id", "taskId")
         task_key = _get_field(payload, "task_key", "taskKey")
         attempt = _get_field(payload, "attempt", "attempt")
         attempt_id = _get_field(payload, "attempt_id", "attemptId")
@@ -134,6 +140,7 @@ class WorkerDispatchEnvelope:
             tenant_id=str(tenant_id),
             workspace_id=str(workspace_id),
             run_id=str(run_id),
+            task_id=str(task_id) if task_id else None,
             task_key=str(task_key),
             attempt=int(attempt),
             attempt_id=str(attempt_id),
@@ -185,6 +192,7 @@ class DispatchWorker:
         task_token = _select_task_token(payload.task_token, self._fallback_task_token)
         started_at = _now_iso()
         self._client.task_started(
+            task_id=payload.callback_task_id,
             task_key=payload.task_key,
             attempt=payload.attempt,
             attempt_id=payload.attempt_id,
@@ -221,6 +229,7 @@ class DispatchWorker:
         finally:
             completed_at = _now_iso()
             self._client.task_completed(
+                task_id=payload.callback_task_id,
                 task_key=payload.task_key,
                 attempt=payload.attempt,
                 attempt_id=payload.attempt_id,

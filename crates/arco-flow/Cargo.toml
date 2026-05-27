@@ -28,6 +28,7 @@ test-utils = ["arco-core/test-utils", "http-client", "dep:proptest", "dep:tempfi
 [dependencies]
 arco-core = { path = "../arco-core" }
 arco-proto = { path = "../arco-proto" }
+arco-worker-contract = { path = "../arco-worker-contract" }
 
 # Async runtime
 tokio = { workspace = true }

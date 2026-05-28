@@ -4,6 +4,7 @@
 
 - Rust `1.88` or newer
 - `protoc` (Protocol Buffers compiler)
+- Buf `1.70.0`
 - `mdbook` (for documentation builds)
 
 ## Clone and Build
@@ -25,6 +26,7 @@ cargo install cargo-llvm-cov
 ## Validate Environment
 
 ```bash
+cargo xtask doctor
 cargo xtask adr-check
 cargo xtask parity-matrix-check
 cd docs/guide && mdbook build

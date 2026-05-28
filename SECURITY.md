@@ -6,10 +6,11 @@ The Arco maintainers take security seriously. We appreciate your efforts to resp
 
 | Version | Supported          |
 | ------- | ------------------ |
+| 0.2.x   | :white_check_mark: |
 | 0.1.x   | :white_check_mark: |
 | 0.0.x   | :x: |
 
-We maintain security updates for the active supported release line and will expand this matrix as additional supported lines exist.
+We maintain security updates for the active supported release lines and will expand this matrix as additional supported lines exist.
 
 ## Reporting a Vulnerability
 

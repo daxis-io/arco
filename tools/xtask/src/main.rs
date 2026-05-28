@@ -560,10 +560,10 @@ fn run_repo_hygiene_check() -> Result<()> {
             errors.push(format!("{path}: banned term '{term}'"));
         }
 
+        let lower = text.to_ascii_lowercase();
         if scans_forbidden_path_markers(&path) {
-            let lower = text.to_ascii_lowercase();
             for marker in &forbidden_paths {
-                if lower.contains(marker) {
+                if lower.contains(marker) && !is_allowed_forbidden_path_marker(&path, marker) {
                     errors.push(format!("{path}: forbidden path reference '{marker}'"));
                 }
             }
@@ -671,8 +671,13 @@ fn forbidden_path_markers() -> [String; 3] {
 }
 
 fn scans_forbidden_path_markers(path: &str) -> bool {
-    let plans_prefix = format!("{}/{}/", "docs", "plans");
-    !path.starts_with(&plans_prefix)
+    let _ = path;
+    true
+}
+
+fn is_allowed_forbidden_path_marker(path: &str, marker: &str) -> bool {
+    let plans_marker = format!("{}/{}/", "docs", "plans");
+    path.starts_with(&plans_marker) && marker == plans_marker
 }
 
 fn banned_term_tokens() -> [String; 7] {
@@ -2556,14 +2561,39 @@ mod tests {
     }
 
     #[test]
-    fn forbidden_path_marker_scan_skips_plan_sources_only() {
+    fn forbidden_path_marker_scan_includes_plan_sources() {
         let plan_path = format!(
             "{}/{}/2026-05-08-catalog-product-surface-execution.md",
             "docs", "plans"
         );
-        assert!(!scans_forbidden_path_markers(&plan_path));
+        assert!(scans_forbidden_path_markers(&plan_path));
         assert!(scans_forbidden_path_markers(
             "docs/guide/src/reference/system-catalog.md"
+        ));
+    }
+
+    #[test]
+    fn forbidden_path_marker_exception_allows_only_plan_marker_in_plan_sources() {
+        let plan_path = format!(
+            "{}/{}/2026-05-08-catalog-product-surface-execution.md",
+            "docs", "plans"
+        );
+        let plans_marker = format!("{}/{}/", "docs", "plans");
+        let release_evidence_marker = format!("{}_{}/", "release", "evidence");
+        let catalog_evidence_marker = format!("{}/{}/{}/", "docs", "catalog-metastore", "evidence");
+
+        assert!(is_allowed_forbidden_path_marker(&plan_path, &plans_marker));
+        assert!(!is_allowed_forbidden_path_marker(
+            &plan_path,
+            &release_evidence_marker
+        ));
+        assert!(!is_allowed_forbidden_path_marker(
+            &plan_path,
+            &catalog_evidence_marker
+        ));
+        assert!(!is_allowed_forbidden_path_marker(
+            "docs/guide/src/reference/system-catalog.md",
+            &plans_marker
         ));
     }
 

@@ -189,7 +189,7 @@ struct ToolHarness {
 
 impl ToolHarness {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_with_buf_version("1.69.0")
+        Self::new_with_buf_version("1.70.0")
     }
 
     fn new_with_buf_version(buf_version: &str) -> Result<Self, Box<dyn std::error::Error>> {
@@ -219,7 +219,7 @@ fi
 set -eu
 printf '%s\n' "rustc $*" >> "{log}"
 if [ "$#" -ge 1 ] && [ "$1" = "--version" ]; then
-  printf 'rustc 1.85.0 (fake 2025-01-01)\n'
+  printf 'rustc 1.88.0 (fake 2025-01-01)\n'
 fi
 "#,
                 log = log_path.display()

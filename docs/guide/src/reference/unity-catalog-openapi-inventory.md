@@ -123,7 +123,6 @@ WARNING: This API is experimental and will change in future versions.
 ## Manual annotations
 
 <!-- BEGIN MANUAL -->
-
 These endpoint groups are prior art and compatibility targets, not Arco's
 architectural source of truth. Production-backed compatibility routes must be
 adapters over Arco-native stable IDs, ledger-backed state, compiled
@@ -143,5 +142,4 @@ authorization decisions, and pointer-published projections.
 | Functions | `planned` | Metadata object family is planned; execution semantics are out of first-tranche scope. |
 | RegisteredModels / ModelVersions | `planned` | Metadata and artifact ownership are planned before model-version credential vending. |
 | Metastores | `compatible-partial` | Summary/discovery shape only; Arco does not depend on a UC metastore service. |
-
 <!-- END MANUAL -->

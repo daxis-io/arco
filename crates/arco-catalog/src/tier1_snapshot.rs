@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use arco_core::CatalogDomain;
 use arco_core::storage::WriteResult;
 use arco_core::storage_keys::StateKey;
-use arco_core::storage_traits::StatePutStore;
+use arco_core::storage_traits::{ReadStore, StatePutStore};
 
 use crate::error::{CatalogError, Result};
 use crate::manifest::{SnapshotFile, SnapshotInfo};
@@ -19,7 +19,7 @@ use crate::state::{CatalogState, LineageState, SearchState};
 /// # Errors
 ///
 /// Returns an error if Parquet serialization or storage writes fail.
-pub async fn write_catalog_snapshot<S: StatePutStore + ?Sized>(
+pub async fn write_catalog_snapshot<S: ReadStore + StatePutStore + ?Sized>(
     storage: &S,
     version: u64,
     state: &CatalogState,
@@ -89,7 +89,7 @@ pub async fn write_catalog_snapshot<S: StatePutStore + ?Sized>(
 /// # Errors
 ///
 /// Returns an error if Parquet serialization or storage writes fail.
-pub async fn write_lineage_snapshot<S: StatePutStore + ?Sized>(
+pub async fn write_lineage_snapshot<S: ReadStore + StatePutStore + ?Sized>(
     storage: &S,
     version: u64,
     state: &LineageState,
@@ -116,7 +116,7 @@ pub async fn write_lineage_snapshot<S: StatePutStore + ?Sized>(
 ///
 /// # Errors
 /// Returns an error if serialization or storage write fails.
-pub async fn write_search_snapshot<S: StatePutStore + ?Sized>(
+pub async fn write_search_snapshot<S: ReadStore + StatePutStore + ?Sized>(
     storage: &S,
     version: u64,
     state: &SearchState,
@@ -162,21 +162,37 @@ pub fn metastore_projection_snapshot_info(
     info
 }
 
-async fn put_state_if_absent<S: StatePutStore + ?Sized>(
+async fn put_state_if_absent<S: ReadStore + StatePutStore + ?Sized>(
     storage: &S,
     key: &StateKey,
     data: Bytes,
 ) -> Result<()> {
     match storage
-        .put_state(key, data)
+        .put_state(key, data.clone())
         .await
         .map_err(CatalogError::from)?
     {
         WriteResult::Success { .. } => Ok(()),
         WriteResult::PreconditionFailed { current_version } => {
+            let existing = match storage.get(key.as_ref()).await {
+                Ok(existing) => existing,
+                Err(error) => {
+                    return Err(CatalogError::PreconditionFailed {
+                        message: format!(
+                            "snapshot file already exists at {} with version {current_version}, but existing content could not be verified: {error}",
+                            key.as_ref()
+                        ),
+                    });
+                }
+            };
+
+            if existing == data {
+                return Ok(());
+            }
+
             Err(CatalogError::PreconditionFailed {
                 message: format!(
-                    "snapshot file already exists at {} with version {current_version}",
+                    "snapshot file already exists with different content at {} with version {current_version}",
                     key.as_ref()
                 ),
             })
@@ -187,4 +203,66 @@ async fn put_state_if_absent<S: StatePutStore + ?Sized>(
 fn sha256_hex(bytes: &Bytes) -> String {
     let hash = Sha256::digest(bytes);
     hex::encode(hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arco_core::storage::MemoryBackend;
+    use arco_core::{CatalogDomain, ScopedStorage};
+
+    use super::*;
+
+    fn scoped_storage() -> ScopedStorage {
+        ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")
+            .expect("scoped storage")
+    }
+
+    #[tokio::test]
+    async fn put_state_if_absent_accepts_existing_identical_snapshot_file() {
+        let storage = scoped_storage();
+        let key = StateKey::snapshot_file(CatalogDomain::Catalog, 7, "catalogs.parquet");
+        let bytes = Bytes::from_static(b"same immutable snapshot bytes");
+
+        put_state_if_absent(&storage, &key, bytes.clone())
+            .await
+            .expect("initial write");
+
+        put_state_if_absent(&storage, &key, bytes)
+            .await
+            .expect("identical retry write should be accepted");
+    }
+
+    #[tokio::test]
+    async fn put_state_if_absent_rejects_existing_different_snapshot_file() {
+        let storage = scoped_storage();
+        let key = StateKey::snapshot_file(CatalogDomain::Catalog, 7, "catalogs.parquet");
+
+        put_state_if_absent(
+            &storage,
+            &key,
+            Bytes::from_static(b"original snapshot bytes"),
+        )
+        .await
+        .expect("initial write");
+
+        let error = put_state_if_absent(
+            &storage,
+            &key,
+            Bytes::from_static(b"different snapshot bytes"),
+        )
+        .await
+        .expect_err("different retry bytes must fail closed");
+
+        assert!(
+            matches!(
+                error,
+                CatalogError::PreconditionFailed { ref message }
+                    if message.contains("snapshot file already exists")
+                        && message.contains("different content")
+            ),
+            "unexpected error: {error}"
+        );
+    }
 }

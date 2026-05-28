@@ -136,7 +136,7 @@ Breaking changes are minimized. When they are made they will be outlined below w
 
   As a result of this change the Rust representation of an enum changes from a standard
   Rust enum into a newtype struct with associated constants.
-  
+
   For example:
 
   ```thrift
@@ -150,7 +150,7 @@ Breaking changes are minimized. When they are made they will be outlined below w
   ```
 
   used to generate:
-  
+
   ```rust
     // OLD AUTO-GENERATED RUST
     pub enum Operation {
@@ -162,11 +162,11 @@ Breaking changes are minimized. When they are made they will be outlined below w
   ```
 
   It *now* generates:
-  
+
   ```rust
     // NEW AUTO-GENERATED RUST
     pub struct Operation(pub i32);
-  
+
     impl Operation {
       pub const ADD: Operation = Operation(0);
       pub const SUBTRACT: Operation = Operation(1);
@@ -188,8 +188,8 @@ Breaking changes are minimized. When they are made they will be outlined below w
 * **[THRIFT-4536]** - Use TryFrom from std, required rust 1.34.0 or higher
 
     Previously TryFrom was from try_from crate, it is now from the std library,
-    but this functionality is only available in rust 1.34.0. Additionally, 
-    ordered-float is now re-exported under the thrift module to reduce 
+    but this functionality is only available in rust 1.34.0. Additionally,
+    ordered-float is now re-exported under the thrift module to reduce
     possible dependency mismatches.
 
 ##### Thrift 0.12.0
@@ -208,9 +208,9 @@ Breaking changes are minimized. When they are made they will be outlined below w
       DIVIDE,
     }
     ```
-    
+
     used to generate:
-    
+
     ```rust
     // OLD AUTO-GENERATED RUST
     pub enum Operation {
@@ -220,9 +220,9 @@ Breaking changes are minimized. When they are made they will be outlined below w
        DIVIDE,
      }
     ```
-  
+
     It *now* generates:
-  
+
     ```rust
     // NEW AUTO-GENERATED RUST
     pub enum Operation {
@@ -232,7 +232,7 @@ Breaking changes are minimized. When they are made they will be outlined below w
        Divide,
      }
     ```
-    
+
     You will have to change all enum variants in your code to use camel-cased names.
     This should be a search and replace.
 

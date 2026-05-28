@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust `1.85` or newer
+- Rust `1.88` or newer
 - `protoc` (Protocol Buffers compiler)
 - `mdbook` (for documentation builds)
 

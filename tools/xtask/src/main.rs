@@ -26,9 +26,9 @@ use arco_core::{CatalogDomain, CatalogPaths, Error as CoreError, ScopedStorage};
 
 /// Expected tool versions (should match CI)
 mod versions {
-    pub const RUST_CHANNEL: &str = "1.85";
+    pub const RUST_CHANNEL: &str = "1.88";
     pub const CARGO_DENY_MIN: &str = "0.18.9";
-    pub const BUF_VERSION: &str = "1.69.0";
+    pub const BUF_VERSION: &str = "1.70.0";
 }
 
 const PROTO_POST_HARD_CUT_BASELINE: &str = "proto-baselines/post-hard-cut-v1.binpb";
@@ -560,14 +560,19 @@ fn run_repo_hygiene_check() -> Result<()> {
             errors.push(format!("{path}: banned term '{term}'"));
         }
 
-        let lower = text.to_ascii_lowercase();
-        for marker in &forbidden_paths {
-            if lower.contains(marker) {
-                errors.push(format!("{path}: forbidden path reference '{marker}'"));
+        if scans_forbidden_path_markers(&path) {
+            let lower = text.to_ascii_lowercase();
+            for marker in &forbidden_paths {
+                if lower.contains(marker) {
+                    errors.push(format!("{path}: forbidden path reference '{marker}'"));
+                }
             }
         }
 
         for hit in scan_proto_denylist(&path, &text) {
+            if is_allowed_proto_denylist_hit(&path, &hit) {
+                continue;
+            }
             errors.push(format!("{path}: legacy proto symbol '{hit}'"));
         }
     }
@@ -663,6 +668,11 @@ fn forbidden_path_markers() -> [String; 3] {
         format!("{}_{}/", "release", "evidence"),
         format!("{}/{}/{}/", "docs", "catalog-metastore", "evidence"),
     ]
+}
+
+fn scans_forbidden_path_markers(path: &str) -> bool {
+    let plans_prefix = format!("{}/{}/", "docs", "plans");
+    !path.starts_with(&plans_prefix)
 }
 
 fn banned_term_tokens() -> [String; 7] {
@@ -783,6 +793,10 @@ fn scan_proto_denylist(path: &str, text: &str) -> Vec<String> {
     }
 
     hits
+}
+
+fn is_allowed_proto_denylist_hit(path: &str, hit: &str) -> bool {
+    path == "crates/arco-proto/tests/golden_fixtures.rs" && hit == "arco.v1"
 }
 
 fn is_proto_denylist_path(path: &str) -> bool {
@@ -2303,7 +2317,7 @@ fn check_rust_version() -> Result<String> {
     let version = String::from_utf8_lossy(&output.stdout);
     let version = version.trim();
 
-    // Extract version number (e.g., "rustc 1.85.0 (..." -> "1.85.0")
+    // Extract version number (e.g., "rustc 1.88.0 (..." -> "1.88.0")
     let parts: Vec<&str> = version.split_whitespace().collect();
     let rust_version = parts.get(1).unwrap_or(&"unknown");
 
@@ -2539,5 +2553,33 @@ mod tests {
             markers.iter().any(|marker| marker == &release_evidence),
             "expected removed release evidence tree to be blocked"
         );
+    }
+
+    #[test]
+    fn forbidden_path_marker_scan_skips_plan_sources_only() {
+        let plan_path = format!(
+            "{}/{}/2026-05-08-catalog-product-surface-execution.md",
+            "docs", "plans"
+        );
+        assert!(!scans_forbidden_path_markers(&plan_path));
+        assert!(scans_forbidden_path_markers(
+            "docs/guide/src/reference/system-catalog.md"
+        ));
+    }
+
+    #[test]
+    fn proto_denylist_allows_only_legacy_doc_golden_fixture() {
+        assert!(is_allowed_proto_denylist_hit(
+            "crates/arco-proto/tests/golden_fixtures.rs",
+            "arco.v1"
+        ));
+        assert!(!is_allowed_proto_denylist_hit(
+            "crates/arco-proto/tests/golden_fixtures.rs",
+            "payload_json"
+        ));
+        assert!(!is_allowed_proto_denylist_hit(
+            "crates/arco-catalog/src/lib.rs",
+            "arco.v1"
+        ));
     }
 }

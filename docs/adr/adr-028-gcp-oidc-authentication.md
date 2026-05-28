@@ -73,7 +73,7 @@ iam-smoke:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
     - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7
       with:
-        toolchain: 1.85
+        toolchain: 1.88
     - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
 
     - name: Authenticate to GCP

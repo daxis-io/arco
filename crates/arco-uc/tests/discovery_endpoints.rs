@@ -97,7 +97,10 @@ async fn seeded_router() -> SeededRouter {
             catalog_snapshot_version,
             "groups-rev-discovery",
             true,
-            vec![permission_row(&table.id, "TABLE", Privilege::Select)],
+            vec![
+                permission_row(&table.id, "TABLE", Privilege::Manage),
+                permission_row(&table.id, "TABLE", Privilege::Select),
+            ],
         ));
     SeededRouter {
         app: unity_catalog_router(state),
@@ -240,20 +243,28 @@ async fn test_delete_catalog_native_table_returns_success() {
 async fn test_get_permissions_returns_success() {
     let seeded = seeded_router().await;
     let app = seeded.app;
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/permissions/table/analytics.sales.orders")
-                .header("X-Tenant-Id", "tenant1")
-                .header("X-Workspace-Id", "workspace1")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let mut request = Request::builder()
+        .method("GET")
+        .uri("/permissions/table/analytics.sales.orders")
+        .header("X-Tenant-Id", "tenant1")
+        .header("X-Workspace-Id", "workspace1")
+        .body(Body::empty())
+        .expect("request");
+    request.extensions_mut().insert(trusted_context());
+    let response = app.oneshot(request).await.expect("response");
 
     assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body bytes");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json payload");
+    let assignments = payload
+        .get("privilege_assignments")
+        .and_then(serde_json::Value::as_array)
+        .expect("permission assignments");
+    assert_eq!(assignments.len(), 2);
+    assert_eq!(assignments[0]["principal"], "user_alice");
+    assert_eq!(assignments[0]["privileges"][0], "MANAGE");
 }
 
 #[tokio::test]
@@ -287,18 +298,15 @@ async fn test_post_temporary_path_credentials_unknown_operation_is_bad_request()
 async fn test_permissions_principal_filter_returns_empty_assignments() {
     let seeded = seeded_router().await;
     let app = seeded.app;
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/permissions/table/analytics.sales.orders?principal=someone-else")
-                .header("X-Tenant-Id", "tenant1")
-                .header("X-Workspace-Id", "workspace1")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let mut request = Request::builder()
+        .method("GET")
+        .uri("/permissions/table/analytics.sales.orders?principal=someone-else")
+        .header("X-Tenant-Id", "tenant1")
+        .header("X-Workspace-Id", "workspace1")
+        .body(Body::empty())
+        .expect("request");
+    request.extensions_mut().insert(trusted_context());
+    let response = app.oneshot(request).await.expect("response");
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX)

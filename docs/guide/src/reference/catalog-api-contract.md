@@ -160,4 +160,4 @@ Before a new public route is merged, reviewers should be able to identify:
 | Preconditions | Mutating retries and stale writes use idempotency keys, ETags, generations, or explicit protocol tokens |
 | Errors | Responses use stable codes, request IDs, retryability, and safe messages |
 | Visibility | Sensitive fields have ordinary, owner, and admin response tests |
-| Compatibility | Route group has one compatibility label and documented unsupported behavior |
+| Compatibility | Public operations have compatibility labels; route groups use a group label only when every operation shares it; unsupported behavior is documented |

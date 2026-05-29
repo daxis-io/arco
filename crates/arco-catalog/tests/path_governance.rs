@@ -251,6 +251,8 @@ fn storage_governance_events() -> Vec<MetastoreEvent> {
                 lifecycle_state: LifecycleState::Active,
                 updated_at_ms: 1_800_000_000_000,
                 properties: BTreeMap::new(),
+                secret_material_ref: Some("secret://credential/cred_01".to_string()),
+                encrypted_payload: Some("encrypted-token".to_string()),
             }),
         ),
         MetastoreEvent::new(

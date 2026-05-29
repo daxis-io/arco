@@ -410,6 +410,24 @@ fn run_ci_parity_check() -> Result<()> {
         &mut errors,
         "ci.yml",
         &ci,
+        "git diff --quiet FETCH_HEAD HEAD -- proto-baselines/post-hard-cut-v1.binpb",
+    );
+    require_contains(
+        &mut errors,
+        "ci.yml",
+        &ci,
+        "git diff --quiet FETCH_HEAD HEAD -- proto/STYLE.md",
+    );
+    require_contains(
+        &mut errors,
+        "ci.yml",
+        &ci,
+        "The frozen baseline check above remains authoritative for this hard-cut window.",
+    );
+    require_contains(
+        &mut errors,
+        "ci.yml",
+        &ci,
         &format!("version: '{}'", versions::BUF_VERSION),
     );
     require_contains(&mut errors, "ci.yml", &ci, "uv sync --locked --extra dev");

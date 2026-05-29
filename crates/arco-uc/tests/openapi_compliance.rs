@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 
 use arco_uc::openapi::openapi;
+use arco_uc::support::documented_operations;
 
 fn load_uc_spec() -> Result<serde_json::Value, String> {
     let yaml = include_str!("fixtures/unitycatalog-openapi.yaml");
@@ -110,6 +111,28 @@ const V1_TARGET_OPERATIONS: &[(&str, &str)] = &[
     ("post", "/temporary-path-credentials"),
 ];
 
+const GENERATED_UC_OPERATIONS: &[(&str, &str)] = &[
+    ("get", "/catalogs"),
+    ("post", "/catalogs"),
+    ("get", "/catalogs/{name}"),
+    ("patch", "/catalogs/{name}"),
+    ("delete", "/catalogs/{name}"),
+    ("get", "/schemas"),
+    ("post", "/schemas"),
+    ("get", "/schemas/{full_name}"),
+    ("patch", "/schemas/{full_name}"),
+    ("delete", "/schemas/{full_name}"),
+    ("get", "/tables"),
+    ("post", "/tables"),
+    ("get", "/tables/{full_name}"),
+    ("delete", "/tables/{full_name}"),
+    ("get", "/permissions/{securable_type}/{full_name}"),
+    ("get", "/delta/preview/commits"),
+    ("post", "/delta/preview/commits"),
+    ("post", "/temporary-table-credentials"),
+    ("post", "/temporary-path-credentials"),
+];
+
 #[test]
 fn test_vendored_uc_spec_is_parseable() -> Result<(), String> {
     let _spec = load_uc_spec()?;
@@ -133,7 +156,7 @@ fn test_generated_openapi_describes_authoritative_boundary() -> Result<(), Strin
     );
     assert!(
         description.contains("compatible-partial")
-            && description.contains("scaffolded")
+            && description.contains("known-unsupported")
             && description.contains("planned"),
         "openapi description must state the non-CRUD compatibility boundary: {description}"
     );
@@ -176,9 +199,9 @@ fn test_generated_openapi_tags_distinguish_authoritative_and_partial_surfaces() 
     );
     assert!(
         credentials.contains("Compatible-partial")
-            && credentials.contains("published storage governance")
+            && credentials.contains("compiled authorization")
             && credentials.contains("revocation metadata remain planned"),
-        "TemporaryCredentials tag must describe the partial credential-vending boundary: {credentials}"
+        "TemporaryCredentials tag must describe the support-registry boundary: {credentials}"
     );
 
     Ok(())
@@ -269,6 +292,79 @@ fn test_openapi_paths_align_with_vendored_spec() -> Result<(), String> {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_generated_openapi_operations_expose_arco_support_extensions() -> Result<(), String> {
+    let ours =
+        serde_json::to_value(openapi()).map_err(|err| format!("serialize openapi: {err}"))?;
+    let paths = ours
+        .get("paths")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "generated spec is missing paths".to_string())?;
+
+    for &(method, path) in GENERATED_UC_OPERATIONS {
+        let operation = paths
+            .get(path)
+            .and_then(|path_item| path_item.get(method))
+            .ok_or_else(|| format!("missing generated operation {method} {path}"))?;
+        for extension in [
+            "x-arco-support-level",
+            "x-arco-native-backing",
+            "x-arco-authz-boundary",
+        ] {
+            assert!(
+                operation
+                    .get(extension)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.is_empty()),
+                "missing {extension} on {method} {path}"
+            );
+        }
+    }
+
+    for support in documented_operations() {
+        let method = support.method.to_ascii_lowercase();
+        let operation = paths
+            .get(support.path_template)
+            .and_then(|path_item| path_item.get(method.as_str()))
+            .ok_or_else(|| {
+                format!(
+                    "missing documented registry operation {} {}",
+                    support.method, support.path_template
+                )
+            })?;
+        let support_level = operation
+            .get("x-arco-support-level")
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(
+            support_level,
+            Some(support.support_level.as_str()),
+            "support-level mismatch for {} {}",
+            support.method,
+            support.path_template
+        );
+        assert_eq!(
+            operation
+                .get("x-arco-native-backing")
+                .and_then(serde_json::Value::as_str),
+            Some(support.native_backing),
+            "native-backing mismatch for {} {}",
+            support.method,
+            support.path_template
+        );
+        assert_eq!(
+            operation
+                .get("x-arco-authz-boundary")
+                .and_then(serde_json::Value::as_str),
+            Some(support.authz_boundary),
+            "authz-boundary mismatch for {} {}",
+            support.method,
+            support.path_template
+        );
     }
 
     Ok(())

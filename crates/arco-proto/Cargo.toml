@@ -26,3 +26,6 @@ tonic = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+arco-worker-contract = { path = "../arco-worker-contract" }

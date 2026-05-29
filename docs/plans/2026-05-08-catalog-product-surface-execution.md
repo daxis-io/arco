@@ -22,7 +22,7 @@ Related plans:
 - system catalog tables plan
 - authoritative metastore governance surface plan
 
-## Execution Status (2026-05-22)
+## Execution Status (2026-05-11)
 
 The completed proto enhancement plans are closed and must not be reopened for
 new catalog product work. New protobuf changes in this program are additive
@@ -36,21 +36,11 @@ Current branch progress:
   `d2d2d19`, `90e45e3`, and `6869d6e`.
 - Phase 1 additive native metastore object contracts landed in `d14eba4`.
 - Phase 2 initial metastore replay/projection kernel landed in `2ff14e1`.
-- Phase 3 identity, grants, permission compilation, and UC `GET /permissions`
-  behavior is partially landed. Writer-backed grant mutations and
-  `PATCH /permissions` remain pending.
-- Phase 4 storage credential and external location create/list/get behavior is
-  partially landed over scoped metastore events, compiled metastore `MANAGE`,
-  redaction, path canonicalization, and overlap checks. Update/delete lifecycle
-  operations, broader bindings, and system-table exposure remain pending.
-- Phase 5 credential vending is partially landed for UC table/path credential
-  decisions over compiled authorization and published storage governance.
-  Provider token material, revocation metadata, volume credentials, and
-  model-version credentials remain pending.
+- Phase 3 identity, grants, permission compilation, and authoritative
+  `/permissions` behavior is the next major product phase.
 
-Do not restart landed slices unless review requests a corrective follow-up. The
-remaining phase work should continue as small green slices with review
-checkpoints.
+Do not restart Phases 0-2 unless review requests a corrective follow-up. The
+remaining phases should continue as small green slices with review checkpoints.
 
 ## Execution Rules
 
@@ -71,9 +61,9 @@ checkpoints.
 | 0 | Task 0 | Landed | `catalog-product-phase-0-contracts` | Docs/security/API contracts accepted |
 | 1 | Task 1 | Landed | `catalog-product-phase-1-native-contracts` | Additive proto/API compatibility gates pass |
 | 2 | Task 2 | Initial kernel landed | `catalog-product-phase-2-metastore-kernel` | Replay/projection/publish kernel accepted |
-| 3 | Task 3 | Partial | `catalog-product-phase-3-authz` | `GET /permissions` and compiled reads landed; grant writer and `PATCH /permissions` pending |
-| 4 | Task 4 | Partial | `catalog-product-phase-4-storage-governance` | Storage credential/external location create/list/get landed; update/delete, bindings, and system tables pending |
-| 5 | Tasks 5-6 | Partial | `catalog-product-phase-5-credentials-volumes` | Table/path credential decisions landed; provider minting, revocation metadata, volumes, and model credentials pending |
+| 3 | Task 3 | Next | `catalog-product-phase-3-authz` | Permission compiler and `AuthzDecision` accepted |
+| 4 | Task 4 | Pending | `catalog-product-phase-4-storage-governance` | Path governance and storage metadata accepted |
+| 5 | Tasks 5-6 | Pending | `catalog-product-phase-5-credentials-volumes` | Credential vending and volumes accepted |
 | 6 | Tasks 7-8 | Pending | `catalog-product-phase-6-governance-lineage` | Governance metadata and discovery accepted |
 | 7 | Task 9 | Pending | `catalog-product-phase-7-functions-models` | Metadata-only function/model registry accepted |
 | 8 | Task 10 | Pending | `catalog-product-phase-8-system-tables` | ACL-filtered system tables/query sandbox accepted |
@@ -100,9 +90,9 @@ If there is unrelated dirty work, create a new git worktree rather than editing 
 Read:
 
 ```bash
+Review the catalog product surface plan through the acceptance criteria and test hygiene sections.
 sed -n '1,220p' docs/guide/src/reference/control-plane-scope.md
 sed -n '1,220p' docs/guide/src/reference/system-catalog.md
-sed -n '1,220p' docs/plans/2026-05-07-catalog-product-surface.md
 ```
 
 Expected: source plan is understood before edits.
@@ -217,9 +207,7 @@ This is a high-risk phase. Keep it generic first:
 - `AuthzDecision`
 - explain-access
 
-Do not add volume-specific privilege tests until volume object state exists.
-External-location follow-ups should target the landed storage-governance route
-and credential-vending boundaries.
+Do not add volume/external-location-specific privilege tests until those object families exist.
 
 Verification:
 
@@ -260,8 +248,7 @@ If this phase adds a new redaction xtask command, run it before commit.
 Otherwise cover redaction behavior with focused tests and leave the xtask gate
 in the future hardening list.
 
-For remaining Phase 4 lifecycle work, stop for review before changing
-credential-vending behavior beyond the already landed table/path decisions.
+Stop for review before issuing credentials.
 
 ## Phase 5: Credential Vending And Volumes
 
@@ -269,10 +256,9 @@ Execute Tasks 5 and 6 as two commits or two PRs if they grow large.
 
 Order:
 
-1. Finish provider token material, expiry exposure, and revocation metadata for
-   the landed table/path credential decision path.
-2. Add volumes as governed path objects.
-3. Add volume credential vending through the shared engine.
+1. Credential vending engine for tables and governed raw paths.
+2. Volumes as governed path objects.
+3. Volume credential vending through the shared engine.
 
 Verification:
 
@@ -417,7 +403,7 @@ Use the `executing-plans` skill. Also use `using-git-worktrees` if the current w
 
 Execute this catalog product surface execution plan, using the catalog product surface plan as the source product plan.
 
-Start with Preflight and the next unfinished slice only. Do not restart already landed Phase 0-5 behavior unless review explicitly asks for a corrective follow-up.
+Start with Preflight and Phase 3 only, unless review explicitly asks for a corrective follow-up to Phases 0-2. Do not start Phase 4 until I review the Phase 3 report.
 
 Hard rules:
 - Treat Unity Catalog as prior art and compatibility surface only; Arco-native state is authoritative.
@@ -427,20 +413,19 @@ Hard rules:
 - Stop and ask if the plan conflicts with current code, if a verification command is unavailable, or if implementation would weaken the invariants in the source plan.
 - Run the verification commands listed for each phase before reporting completion.
 
-For the next authorization/storage-governance follow-up, implement only one
-tight slice from the remaining gaps:
-- writer-backed grant persistence or UC `PATCH /permissions`
-- storage credential/external location update/delete lifecycle behavior
-- provider-backed credential material and revocation metadata
-- volume or model credential support after authoritative object ownership lands
-- system-table projection exposure after safe Parquet projections land
+For Phase 3, implement only:
+- identity/principal/group membership state needed for authorization
+- grant records and permission compilation
+- `AuthzDecision` and explain-access primitives
+- authoritative UC `/permissions` behavior backed by published state
+- focused tests named for object-level authorization invariants.
 
-At the checkpoint, report:
+At the Phase 3 checkpoint, report:
 - files changed
 - authorization matrix summary
 - exact verification commands and outcomes
 - any source-plan concerns discovered
-- the next unfinished slice
+- whether Phase 4 is ready to start
 
 Then stop and wait for review.
 ```

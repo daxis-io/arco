@@ -157,6 +157,12 @@ pub struct TaskTokenClaims {
     /// Workspace identifier.
     #[serde(alias = "workspace_id", alias = "workspace")]
     pub workspace_id: String,
+    /// Optional orchestration run identifier for dispatch-attempt-scoped tokens.
+    #[serde(default, alias = "run_id", skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Optional orchestration attempt number for dispatch-attempt-scoped tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
     /// Expiry (unix timestamp seconds).
     pub exp: usize,
     /// Not-before (unix timestamp seconds).
@@ -187,25 +193,24 @@ fn timestamp_to_usize(value: i64, field: &str) -> Result<usize> {
         .map_err(|_| Error::InvalidInput(format!("{field} timestamp out of range")))
 }
 
-/// Mints a task-scoped callback token.
-///
-/// # Errors
-///
-/// Returns an error when configuration is invalid or signing fails.
-pub fn mint_task_token(
+fn mint_task_token_with_scope(
     config: &TaskTokenConfig,
-    task_id: impl Into<String>,
-    tenant_id: impl Into<String>,
-    workspace_id: impl Into<String>,
+    task_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    run_id: Option<String>,
+    attempt: Option<u32>,
     now: DateTime<Utc>,
 ) -> Result<MintedTaskToken> {
     config.validate()?;
 
     let expires_at = now + config.ttl();
     let claims = TaskTokenClaims {
-        task_id: task_id.into(),
-        tenant_id: tenant_id.into(),
-        workspace_id: workspace_id.into(),
+        task_id,
+        tenant_id,
+        workspace_id,
+        run_id,
+        attempt,
         exp: timestamp_to_usize(expires_at.timestamp(), "exp")?,
         nbf: Some(timestamp_to_usize(now.timestamp(), "nbf")?),
         iat: Some(timestamp_to_usize(now.timestamp(), "iat")?),
@@ -221,6 +226,58 @@ pub fn mint_task_token(
     .map_err(|e| Error::InvalidInput(format!("task token minting failed: {e}")))?;
 
     Ok(MintedTaskToken { token, expires_at })
+}
+
+/// Mints a task-scoped callback token.
+///
+/// # Errors
+///
+/// Returns an error when configuration is invalid or signing fails.
+pub fn mint_task_token(
+    config: &TaskTokenConfig,
+    task_id: impl Into<String>,
+    tenant_id: impl Into<String>,
+    workspace_id: impl Into<String>,
+    now: DateTime<Utc>,
+) -> Result<MintedTaskToken> {
+    mint_task_token_with_scope(
+        config,
+        task_id.into(),
+        tenant_id.into(),
+        workspace_id.into(),
+        None,
+        None,
+        now,
+    )
+}
+
+/// Mints a callback token scoped to a specific orchestration run and attempt.
+///
+/// Legacy validators still accept the resulting JWT as a task token, while
+/// validators that understand scoped claims can reject stale run or attempt
+/// callbacks.
+///
+/// # Errors
+///
+/// Returns an error when configuration is invalid or signing fails.
+pub fn mint_task_token_for_attempt(
+    config: &TaskTokenConfig,
+    task_id: impl Into<String>,
+    tenant_id: impl Into<String>,
+    workspace_id: impl Into<String>,
+    run_id: impl Into<String>,
+    attempt: u32,
+    now: DateTime<Utc>,
+) -> Result<MintedTaskToken> {
+    mint_task_token_with_scope(
+        config,
+        task_id.into(),
+        tenant_id.into(),
+        workspace_id.into(),
+        Some(run_id.into()),
+        Some(attempt),
+        now,
+    )
 }
 
 /// Decodes and validates a task-scoped callback token.
@@ -274,6 +331,55 @@ mod tests {
         assert_eq!(claims.tenant_id, "tenant-1");
         assert_eq!(claims.workspace_id, "workspace-1");
         assert!(minted.expires_at > now);
+    }
+
+    #[test]
+    fn mint_and_decode_scoped_task_token_round_trip() {
+        let config = TaskTokenConfig {
+            hs256_secret: "secret".to_string(),
+            issuer: Some("https://issuer.task".to_string()),
+            audience: Some("arco-worker-callback".to_string()),
+            ttl_seconds: 60,
+        };
+
+        let now = Utc::now();
+        let minted = mint_task_token_for_attempt(
+            &config,
+            "task-123",
+            "tenant-1",
+            "workspace-1",
+            "run-1",
+            2,
+            now,
+        )
+        .expect("mint");
+
+        let claims = decode_task_token(&config, &minted.token).expect("decode");
+
+        assert_eq!(claims.task_id, "task-123");
+        assert_eq!(claims.tenant_id, "tenant-1");
+        assert_eq!(claims.workspace_id, "workspace-1");
+        assert_eq!(claims.run_id.as_deref(), Some("run-1"));
+        assert_eq!(claims.attempt, Some(2));
+        assert!(minted.expires_at > now);
+    }
+
+    #[test]
+    fn legacy_task_token_decodes_without_scope_claims() {
+        let config = TaskTokenConfig {
+            hs256_secret: "secret".to_string(),
+            issuer: Some("https://issuer.task".to_string()),
+            audience: Some("arco-worker-callback".to_string()),
+            ttl_seconds: 60,
+        };
+
+        let minted = mint_task_token(&config, "task-123", "tenant-1", "workspace-1", Utc::now())
+            .expect("mint");
+
+        let claims = decode_task_token(&config, &minted.token).expect("decode");
+
+        assert_eq!(claims.run_id, None);
+        assert_eq!(claims.attempt, None);
     }
 
     #[test]

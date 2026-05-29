@@ -15,7 +15,7 @@ use arco_core::observability::{LogFormat, init_logging};
 use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 use arco_core::{
     DEFAULT_DISPATCH_TASK_TIMEOUT_SECONDS, DEFAULT_TASK_TOKEN_TTL_SECONDS, ScopedStorage,
-    TaskTokenConfig, mint_task_token,
+    TaskTokenConfig, mint_task_token_for_attempt,
 };
 use arco_flow::dispatch::cloud_tasks::{
     CloudTasksConfig, CloudTasksDispatcher, resolve_target_audience,
@@ -30,6 +30,7 @@ use arco_flow::orchestration::controllers::{
 use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
 use arco_flow::orchestration::flow_service::append_events_and_compact;
 use arco_flow::orchestration::worker_contract::WorkerDispatchEnvelope;
+use arco_worker_contract::callback_task_id;
 
 #[derive(Clone)]
 struct AppState {
@@ -189,11 +190,14 @@ async fn run_handler(
             continue;
         };
 
-        let minted = mint_task_token(
+        let callback_task_id = callback_task_id(run_id, task_key);
+        let minted = mint_task_token_for_attempt(
             &state.task_token_config,
-            task_key.clone(),
+            callback_task_id.clone(),
             state.tenant_id.clone(),
             state.workspace_id.clone(),
+            run_id.clone(),
+            *attempt,
             Utc::now(),
         )
         .map_err(|e| Error::configuration(format!("task token minting failed: {e}")))?;
@@ -202,6 +206,7 @@ async fn run_handler(
             tenant_id: state.tenant_id.clone(),
             workspace_id: state.workspace_id.clone(),
             run_id: run_id.clone(),
+            task_id: callback_task_id,
             task_key: task_key.clone(),
             attempt: *attempt,
             attempt_id: attempt_id.clone(),

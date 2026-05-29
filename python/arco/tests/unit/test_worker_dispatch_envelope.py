@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from arco_flow.cli.config import ArcoFlowConfig
+from arco_flow.context import AssetContext
 from arco_flow.types import AssetOut
 from arco_flow.worker.server import DispatchWorker, WorkerDispatchEnvelope
 
@@ -14,6 +15,7 @@ def _sample_envelope_dict() -> dict[str, Any]:
         "tenant_id": "tenant-a",
         "workspace_id": "workspace-b",
         "run_id": "run-123",
+        "task_id": "ct1_run-123_daily-sales",
         "task_key": "analytics.daily_sales",
         "attempt": 1,
         "attempt_id": "att-1",
@@ -25,6 +27,44 @@ def _sample_envelope_dict() -> dict[str, Any]:
         "traceparent": None,
         "payload": {"partition": "date=2026-01-01"},
     }
+
+
+def _sample_canonical_envelope_dict() -> dict[str, Any]:
+    return {
+        "tenantId": "tenant-a",
+        "workspaceId": "workspace-b",
+        "runId": "run-123",
+        "taskId": "ct1_run-123_daily-sales",
+        "taskKey": "analytics.daily_sales",
+        "attempt": 1,
+        "attemptId": "att-1",
+        "dispatchId": "dispatch:run-123:analytics.daily_sales:1",
+        "workerQueue": "default-queue",
+        "callbackBaseUrl": "https://callbacks.example",
+        "taskToken": "token-from-envelope",
+        "tokenExpiresAt": "2026-01-01T00:00:00Z",
+        "traceparent": None,
+        "payload": {"partition": "date=2026-01-01"},
+    }
+
+
+def test_worker_dispatch_envelope_accepts_canonical_task_id() -> None:
+    envelope = WorkerDispatchEnvelope.from_dict(_sample_canonical_envelope_dict())
+
+    assert envelope.task_id == "ct1_run-123_daily-sales"
+    assert envelope.callback_task_id == "ct1_run-123_daily-sales"
+    assert envelope.task_key == "analytics.daily_sales"
+
+
+def test_worker_dispatch_envelope_accepts_legacy_without_task_id() -> None:
+    payload = _sample_envelope_dict()
+    payload.pop("task_id")
+
+    envelope = WorkerDispatchEnvelope.from_dict(payload)
+
+    assert envelope.task_id is None
+    assert envelope.callback_task_id == "analytics.daily_sales"
+    assert envelope.task_key == "analytics.daily_sales"
 
 
 def test_worker_dispatch_envelope_requires_new_fields() -> None:
@@ -58,7 +98,8 @@ def test_dispatch_worker_uses_envelope_token_and_callback_url() -> None:
         def close(self) -> None:
             return
 
-    def asset_fn(_ctx: object) -> AssetOut:
+    def asset_fn(_ctx: AssetContext) -> AssetOut:
+        assert _ctx.task_id == "analytics.daily_sales"
         return AssetOut([], row_count=1)
 
     fake_client = FakeClient()
@@ -83,6 +124,10 @@ def test_dispatch_worker_uses_envelope_token_and_callback_url() -> None:
     assert len(fake_client.completed_calls) == 1
     assert fake_client.started_calls[0]["task_token"] == "token-from-envelope"
     assert fake_client.completed_calls[0]["task_token"] == "token-from-envelope"
+    assert fake_client.started_calls[0]["task_id"] == "ct1_run-123_daily-sales"
+    assert fake_client.completed_calls[0]["task_id"] == "ct1_run-123_daily-sales"
+    assert fake_client.started_calls[0]["task_key"] == "analytics.daily_sales"
+    assert fake_client.completed_calls[0]["task_key"] == "analytics.daily_sales"
     assert (
         fake_client.started_calls[0]["callback_base_url"]
         == "https://callbacks.example"

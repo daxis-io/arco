@@ -183,7 +183,7 @@ impl std::fmt::Display for StateKey {
 pub struct ManifestKey(String);
 
 impl ManifestKey {
-    /// The root manifest key (entry point for all readers).
+    /// The root manifest key (entry point for whole-manifest and external readers).
     pub const ROOT: &'static str = "manifests/root.manifest.json";
 
     /// Creates the root manifest key.

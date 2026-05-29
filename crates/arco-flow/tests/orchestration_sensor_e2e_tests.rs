@@ -224,7 +224,7 @@ impl SensorEvaluator for ErrorPollEvaluator {
 async fn push_duplicate_message_id_delivery_is_idempotent_end_to_end()
 -> arco_flow::error::Result<()> {
     let backend = Arc::new(MemoryBackend::new());
-    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let storage = ScopedStorage::new(backend, "tenant-abc", "workspace-prod")?;
 
     let sensor_id = "01HQ123SENSORXYZ";
     let handler = PushSensorHandler::with_evaluator(Arc::new(PushSingleRunEvaluator));
@@ -290,7 +290,7 @@ async fn push_duplicate_message_id_delivery_is_idempotent_end_to_end()
 async fn poll_cas_mismatch_noops_cursor_and_drops_run_requested_end_to_end()
 -> arco_flow::error::Result<()> {
     let backend = Arc::new(MemoryBackend::new());
-    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let storage = ScopedStorage::new(backend, "tenant-abc", "workspace-prod")?;
 
     let sensor_id = "01HQ456POLLSENSOR";
 
@@ -367,7 +367,7 @@ async fn poll_cas_mismatch_noops_cursor_and_drops_run_requested_end_to_end()
 async fn poll_cursor_is_durable_across_multiple_folds_and_runs_are_deterministic()
 -> arco_flow::error::Result<()> {
     let backend = Arc::new(MemoryBackend::new());
-    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let storage = ScopedStorage::new(backend, "tenant-abc", "workspace-prod")?;
 
     let sensor_id = "01HQ789POLLSENSOR";
 
@@ -442,7 +442,7 @@ async fn poll_cursor_is_durable_across_multiple_folds_and_runs_are_deterministic
 async fn poll_error_preserves_cursor_and_min_interval_backoff_is_deterministic()
 -> arco_flow::error::Result<()> {
     let backend = Arc::new(MemoryBackend::new());
-    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let storage = ScopedStorage::new(backend, "tenant-abc", "workspace-prod")?;
 
     let sensor_id = "01HQ000ERRORPOLL";
 
@@ -478,7 +478,7 @@ async fn poll_error_preserves_cursor_and_min_interval_backoff_is_deterministic()
 async fn run_key_idempotency_is_enforced_even_without_event_idempotency()
 -> arco_flow::error::Result<()> {
     let backend = Arc::new(MemoryBackend::new());
-    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let storage = ScopedStorage::new(backend, "tenant-abc", "workspace-prod")?;
 
     let sensor_id = "01HQRUNKEYSENSOR";
     let eval_id = "eval_run_key";
@@ -563,7 +563,7 @@ async fn run_key_idempotency_is_enforced_even_without_event_idempotency()
 #[tokio::test]
 async fn run_key_conflict_is_durable_across_compactor_reload() -> arco_flow::error::Result<()> {
     let backend = Arc::new(MemoryBackend::new());
-    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let storage = ScopedStorage::new(backend, "tenant-abc", "workspace-prod")?;
 
     let sensor_id = "01HQCONFLICTSENSOR";
     let eval_id = "eval_run_key_conflict";

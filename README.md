@@ -38,7 +38,6 @@ catalog surfaces with compatibility and governance support growing over time.
 
 - Rust 1.88+ (Edition 2024)
 - Protocol Buffers compiler (`protoc`)
-- Buf 1.70.0
 
 ### Build and test
 
@@ -78,26 +77,11 @@ Task execution runs in external workers via a canonical dispatch envelope. The b
 
 ## Proto compatibility
 
-Arco is still alpha/beta software. The old `arco.v1` protobuf package was
-intentionally removed and replaced by domain-aligned packages:
-`arco.common.v1`, `arco.catalog.v1`, `arco.orchestration.v1`, and
-`arco.controlplane.v1`.
-
-Additional breaking `v1` proto changes may happen before the stable public API
-freeze, but they must be grouped into a documented hard-cut window and followed
-by a regenerated `proto-baselines/post-hard-cut-v1.binpb`. Outside an explicit
-hard-cut window, `v1` changes must pass `cargo xtask proto-breaking-check` and
-preserve generated source, package/service, binary, and ProtoJSON compatibility
-with that frozen baseline.
-
-Current hard-cut migration note: `RegisterTableOp.format` is optional. Omit it
-for the Delta Lake default; do not send `TABLE_FORMAT_UNSPECIFIED` on
-`RegisterTableOp`.
-
-HTTP protobuf transaction routes require a message-qualified content type such
-as `application/x-protobuf; proto=arco.controlplane.v1.ApplyCatalogDdlRequest`.
-Generic or legacy protobuf bodies are rejected before decode so old wire shapes
-cannot be reinterpreted as new mutations.
+The pre-freeze hard cut is complete. The current `arco.*.v1` packages are the
+durable public proto surface represented by the frozen post-cut baseline. New
+`v1` changes must be additive and must preserve binary and ProtoJSON
+compatibility. Run `cargo xtask proto-breaking-check` before merging proto
+changes.
 
 ## Contributing
 

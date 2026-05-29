@@ -1,7 +1,12 @@
 //! Task 5 coverage for UC credential vending over native storage governance.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use arco_catalog::authz::compiler::{CompiledPermissionRow, CompiledPermissionSet};
 use arco_catalog::authz::privileges::Privilege;
@@ -14,12 +19,16 @@ use arco_catalog::metastore::projections::{ProjectionRegistry, build_projection_
 use arco_catalog::metastore::publish::publish_metastore_projection_set;
 use arco_catalog::{CatalogWriter, RegisterTableRequest, Tier1Compactor, WriteOptions};
 use arco_core::audit::{AuditAction, AuditEmitter, TestAuditSink};
-use arco_core::storage::MemoryBackend;
+use arco_core::error::Result as CoreResult;
+use arco_core::storage::{
+    MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+};
 use arco_core::{ControlPlaneScope, ScopedStorage};
 use arco_uc::context::UnityCatalogRequestContext;
 use arco_uc::{UnityCatalogState, unity_catalog_router};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use bytes::Bytes;
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -564,6 +573,168 @@ async fn temporary_table_credentials_resolve_table_location_through_native_catal
     assert!(!serialized_audit.contains("arco.scoped_credential"));
 }
 
+#[tokio::test]
+async fn temporary_table_credentials_load_storage_governance_once() {
+    let backend = Arc::new(MemoryBackend::new());
+    seed_and_publish_storage_governance(backend.clone(), true).await;
+    let table_id = seed_catalog_table(backend.clone()).await;
+    let spy = Arc::new(StorageGovernanceHeadCounter::new(backend));
+    let state = state_with_permissions_on_backend(
+        spy.clone(),
+        "event_003",
+        vec![permission_row(&table_id, "TABLE", Privilege::Select)],
+    );
+    let storage = ScopedStorage::new(spy.clone(), "tenant1", "workspace1").expect("scoped storage");
+    state
+        .storage_governance_cache
+        .load(&storage)
+        .await
+        .expect("prewarm storage-governance cache");
+    let baseline_heads = spy.storage_governance_heads();
+    let app = unity_catalog_router(state);
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/temporary-table-credentials",
+            serde_json::json!({
+                "table_id": table_id,
+                "operation": "READ",
+                "requested_ttl_seconds": 7200
+            }),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(
+        spy.storage_governance_heads() - baseline_heads,
+        1,
+        "table credential requests should reuse the already loaded storage-governance view"
+    );
+}
+
+struct StorageGovernanceHeadCounter {
+    inner: Arc<dyn StorageBackend>,
+    storage_governance_heads: AtomicUsize,
+}
+
+impl std::fmt::Debug for StorageGovernanceHeadCounter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageGovernanceHeadCounter")
+            .field("storage_governance_heads", &self.storage_governance_heads())
+            .finish_non_exhaustive()
+    }
+}
+
+impl StorageGovernanceHeadCounter {
+    fn new(inner: Arc<dyn StorageBackend>) -> Self {
+        Self {
+            inner,
+            storage_governance_heads: AtomicUsize::new(0),
+        }
+    }
+
+    fn storage_governance_heads(&self) -> usize {
+        self.storage_governance_heads.load(Ordering::SeqCst)
+    }
+}
+
+impl StorageBackend for StorageGovernanceHeadCounter {
+    fn get<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        path: &'life1 str,
+    ) -> Pin<Box<dyn Future<Output = CoreResult<Bytes>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: Sync + 'async_trait,
+    {
+        Box::pin(async move { self.inner.get(path).await })
+    }
+
+    fn get_range<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        path: &'life1 str,
+        range: Range<u64>,
+    ) -> Pin<Box<dyn Future<Output = CoreResult<Bytes>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: Sync + 'async_trait,
+    {
+        Box::pin(async move { self.inner.get_range(path, range).await })
+    }
+
+    fn put<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        path: &'life1 str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> Pin<Box<dyn Future<Output = CoreResult<WriteResult>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: Sync + 'async_trait,
+    {
+        Box::pin(async move { self.inner.put(path, data, precondition).await })
+    }
+
+    fn delete<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        path: &'life1 str,
+    ) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: Sync + 'async_trait,
+    {
+        Box::pin(async move { self.inner.delete(path).await })
+    }
+
+    fn list<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        prefix: &'life1 str,
+    ) -> Pin<Box<dyn Future<Output = CoreResult<Vec<ObjectMeta>>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: Sync + 'async_trait,
+    {
+        Box::pin(async move { self.inner.list(prefix).await })
+    }
+
+    fn head<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        path: &'life1 str,
+    ) -> Pin<Box<dyn Future<Output = CoreResult<Option<ObjectMeta>>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: Sync + 'async_trait,
+    {
+        Box::pin(async move {
+            if path.ends_with("storage_governance.parquet") {
+                self.storage_governance_heads.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.head(path).await
+        })
+    }
+
+    fn signed_url<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        path: &'life1 str,
+        expiry: Duration,
+    ) -> Pin<Box<dyn Future<Output = CoreResult<String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: Sync + 'async_trait,
+    {
+        Box::pin(async move { self.inner.signed_url(path, expiry).await })
+    }
+}
+
 fn state_with_permissions(
     backend: Arc<MemoryBackend>,
     rows: Vec<CompiledPermissionRow>,
@@ -573,6 +744,14 @@ fn state_with_permissions(
 
 fn state_with_permissions_at_watermark(
     backend: Arc<MemoryBackend>,
+    ledger_watermark: impl Into<String>,
+    rows: Vec<CompiledPermissionRow>,
+) -> UnityCatalogState {
+    state_with_permissions_on_backend(backend, ledger_watermark, rows)
+}
+
+fn state_with_permissions_on_backend(
+    backend: Arc<dyn StorageBackend>,
     ledger_watermark: impl Into<String>,
     rows: Vec<CompiledPermissionRow>,
 ) -> UnityCatalogState {
@@ -675,6 +854,8 @@ fn storage_events(scope: &ControlPlaneScope, include_binding: bool) -> Vec<Metas
                 lifecycle_state: LifecycleState::Active,
                 updated_at_ms: 1_800_000_000_000,
                 properties: BTreeMap::new(),
+                secret_material_ref: None,
+                encrypted_payload: None,
             }),
         ),
         MetastoreEvent::new_scoped(

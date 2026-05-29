@@ -1,0 +1,9 @@
+{
+  "error": "attempt_id_mismatch",
+  "message": "callback attempt id is stale",
+  "state": "RUNNING",
+  "expectedAttempt": 1,
+  "receivedAttempt": 1,
+  "expectedAttemptId": "att-123",
+  "receivedAttemptId": "att-456"
+}

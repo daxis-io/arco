@@ -114,7 +114,7 @@ impl CatalogPaths {
     // Constants
     // =========================================================================
 
-    /// Root manifest file path (entry point for all readers).
+    /// Root manifest file path (entry point for whole-manifest and external readers).
     pub const ROOT_MANIFEST: &'static str = "manifests/root.manifest.json";
 
     // =========================================================================

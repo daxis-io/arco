@@ -1,0 +1,186 @@
+{
+  "name": "catalog_run_index",
+  "version": 1,
+  "fields": [
+    {
+      "name": "schema_version",
+      "data_type": "UInt32",
+      "nullable": false
+    },
+    {
+      "name": "org_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "workspace_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "run_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "task_key",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "plan_id",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "run_key",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "kind",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "reference_id",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "source_type",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "run_status",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "cancel_requested",
+      "data_type": "Boolean",
+      "nullable": false
+    },
+    {
+      "name": "task_status",
+      "data_type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "asset_key",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "target_namespace",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "target_table",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "partition_key",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "attempt",
+      "data_type": "UInt32",
+      "nullable": false
+    },
+    {
+      "name": "attempt_id",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "requires_visible_output",
+      "data_type": "Boolean",
+      "nullable": false
+    },
+    {
+      "name": "materialization_id",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "output_visibility_state",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "published_at",
+      "data_type": "Int64",
+      "nullable": true
+    },
+    {
+      "name": "publish_error",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "delta_table",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "delta_version",
+      "data_type": "Int64",
+      "nullable": true
+    },
+    {
+      "name": "delta_partition",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "execution_lineage_ref",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "started_at",
+      "data_type": "Int64",
+      "nullable": true
+    },
+    {
+      "name": "last_heartbeat_at",
+      "data_type": "Int64",
+      "nullable": true
+    },
+    {
+      "name": "triggered_at",
+      "data_type": "Int64",
+      "nullable": false
+    },
+    {
+      "name": "completed_at",
+      "data_type": "Int64",
+      "nullable": true
+    },
+    {
+      "name": "updated_at",
+      "data_type": "Int64",
+      "nullable": false
+    },
+    {
+      "name": "code_version",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "error_message",
+      "data_type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "row_version",
+      "data_type": "Utf8",
+      "nullable": false
+    }
+  ]
+}

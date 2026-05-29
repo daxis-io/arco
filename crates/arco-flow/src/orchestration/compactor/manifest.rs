@@ -433,6 +433,10 @@ pub struct TablePaths {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tasks: Option<TableArtifact>,
 
+    /// Paths to org-scoped `catalog_run_index` Parquet artifacts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub catalog_run_index_by_org: BTreeMap<String, TableArtifact>,
+
     /// Path to `dep_satisfaction.parquet` (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dep_satisfaction: Option<TableArtifact>,
@@ -493,55 +497,58 @@ pub struct TablePaths {
 impl TablePaths {
     /// Returns all non-empty table paths.
     #[must_use]
-    pub fn all(&self) -> HashMap<&'static str, &str> {
+    pub fn all(&self) -> HashMap<String, &str> {
         let mut paths = HashMap::new();
         if let Some(ref p) = self.runs {
-            paths.insert("runs", p.path());
+            paths.insert("runs".to_string(), p.path());
         }
         if let Some(ref p) = self.tasks {
-            paths.insert("tasks", p.path());
+            paths.insert("tasks".to_string(), p.path());
+        }
+        for (org_id, p) in &self.catalog_run_index_by_org {
+            paths.insert(format!("catalog_run_index:{org_id}"), p.path());
         }
         if let Some(ref p) = self.dep_satisfaction {
-            paths.insert("dep_satisfaction", p.path());
+            paths.insert("dep_satisfaction".to_string(), p.path());
         }
         if let Some(ref p) = self.timers {
-            paths.insert("timers", p.path());
+            paths.insert("timers".to_string(), p.path());
         }
         if let Some(ref p) = self.dispatch_outbox {
-            paths.insert("dispatch_outbox", p.path());
+            paths.insert("dispatch_outbox".to_string(), p.path());
         }
         if let Some(ref p) = self.sensor_state {
-            paths.insert("sensor_state", p.path());
+            paths.insert("sensor_state".to_string(), p.path());
         }
         if let Some(ref p) = self.sensor_evals {
-            paths.insert("sensor_evals", p.path());
+            paths.insert("sensor_evals".to_string(), p.path());
         }
         if let Some(ref p) = self.run_key_index {
-            paths.insert("run_key_index", p.path());
+            paths.insert("run_key_index".to_string(), p.path());
         }
         if let Some(ref p) = self.run_key_conflicts {
-            paths.insert("run_key_conflicts", p.path());
+            paths.insert("run_key_conflicts".to_string(), p.path());
         }
         if let Some(ref p) = self.partition_status {
-            paths.insert("partition_status", p.path());
+            paths.insert("partition_status".to_string(), p.path());
         }
         if let Some(ref p) = self.idempotency_keys {
-            paths.insert("idempotency_keys", p.path());
+            paths.insert("idempotency_keys".to_string(), p.path());
         }
         if let Some(ref p) = self.schedule_definitions {
-            paths.insert("schedule_definitions", p.path());
+            paths.insert("schedule_definitions".to_string(), p.path());
         }
         if let Some(ref p) = self.schedule_state {
-            paths.insert("schedule_state", p.path());
+            paths.insert("schedule_state".to_string(), p.path());
         }
         if let Some(ref p) = self.schedule_ticks {
-            paths.insert("schedule_ticks", p.path());
+            paths.insert("schedule_ticks".to_string(), p.path());
         }
         if let Some(ref p) = self.backfills {
-            paths.insert("backfills", p.path());
+            paths.insert("backfills".to_string(), p.path());
         }
         if let Some(ref p) = self.backfill_chunks {
-            paths.insert("backfill_chunks", p.path());
+            paths.insert("backfill_chunks".to_string(), p.path());
         }
         paths
     }
@@ -592,6 +599,9 @@ pub struct RowCounts {
     /// Rows in tasks table.
     pub tasks: u32,
 
+    /// Rows in `catalog_run_index` table.
+    pub catalog_run_index: u32,
+
     /// Rows in `dep_satisfaction` table.
     pub dep_satisfaction: u32,
 
@@ -641,6 +651,7 @@ impl RowCounts {
     pub fn total(&self) -> u32 {
         self.runs
             + self.tasks
+            + self.catalog_run_index
             + self.dep_satisfaction
             + self.timers
             + self.dispatch_outbox
@@ -814,13 +825,21 @@ mod tests {
             "sha256:abcd1234",
             42,
         ));
+        tables.catalog_run_index_by_org.insert(
+            "org_01".to_string(),
+            TableArtifact::legacy("catalog_run_index/org_01/snapshot-01.parquet"),
+        );
 
         let all = tables.all();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 3);
         assert_eq!(all.get("runs"), Some(&"runs/snapshot-01.parquet"));
         assert_eq!(
             all.get("tasks"),
             Some(&"tasks/snapshot-01.abcd1234.parquet")
+        );
+        assert_eq!(
+            all.get("catalog_run_index:org_01"),
+            Some(&"catalog_run_index/org_01/snapshot-01.parquet")
         );
     }
 
@@ -829,6 +848,7 @@ mod tests {
         let counts = RowCounts {
             runs: 10,
             tasks: 100,
+            catalog_run_index: 3,
             dep_satisfaction: 300,
             timers: 50,
             dispatch_outbox: 40,
@@ -845,7 +865,7 @@ mod tests {
             backfill_chunks: 0,
         };
 
-        assert_eq!(counts.total(), 529);
+        assert_eq!(counts.total(), 532);
     }
 
     #[test]

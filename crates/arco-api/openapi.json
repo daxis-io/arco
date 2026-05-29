@@ -4280,7 +4280,7 @@
       },
       "CallbackErrorResponse": {
         "type": "object",
-        "description": "Callback error response per ADR-023.",
+        "description": "Error response for callback failures.",
         "required": [
           "error",
           "message"
@@ -4288,7 +4288,7 @@
         "properties": {
           "error": {
             "type": "string",
-            "description": "Error code."
+            "description": "Stable error code."
           },
           "expectedAttempt": {
             "type": [
@@ -4296,7 +4296,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "Expected attempt (for 409 Conflict).",
+            "description": "Expected attempt, when relevant.",
             "minimum": 0
           },
           "expectedAttemptId": {
@@ -4304,7 +4304,7 @@
               "string",
               "null"
             ],
-            "description": "Expected attempt ID (for 409 Conflict)."
+            "description": "Expected attempt id, when relevant."
           },
           "message": {
             "type": "string",
@@ -4316,7 +4316,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "Received attempt (for 409 Conflict).",
+            "description": "Received attempt, when relevant.",
             "minimum": 0
           },
           "receivedAttemptId": {
@@ -4324,14 +4324,14 @@
               "string",
               "null"
             ],
-            "description": "Received attempt ID (for 409 Conflict)."
+            "description": "Received attempt id, when relevant."
           },
           "state": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Current task state (for 409 Conflict)."
+            "description": "Current task state, when known."
           }
         }
       },
@@ -4974,7 +4974,7 @@
       },
       "ErrorCategory": {
         "type": "string",
-        "description": "Error category per ADR-023.",
+        "description": "Worker error category.",
         "enum": [
           "USER_CODE",
           "DATA_QUALITY",
@@ -5016,7 +5016,7 @@
       },
       "HeartbeatRequest": {
         "type": "object",
-        "description": "Request body for `/v1/tasks/{task_id}/heartbeat`.",
+        "description": "Request body for heartbeat callbacks.",
         "required": [
           "attempt",
           "attemptId",
@@ -5027,11 +5027,11 @@
             "type": "integer",
             "format": "int32",
             "description": "Attempt number.",
-            "minimum": 0
+            "minimum": 1
           },
           "attemptId": {
             "type": "string",
-            "description": "Attempt identifier (ULID) - concurrency guard."
+            "description": "Attempt identifier."
           },
           "heartbeatAt": {
             "type": [
@@ -5039,7 +5039,7 @@
               "null"
             ],
             "format": "date-time",
-            "description": "When heartbeat was sent (optional, uses server time if omitted)."
+            "description": "Worker-reported heartbeat timestamp."
           },
           "message": {
             "type": [
@@ -5054,7 +5054,8 @@
               "null"
             ],
             "format": "int32",
-            "description": "Optional progress percentage (0-100).",
+            "description": "Optional progress percentage from zero to one hundred.",
+            "maximum": 100,
             "minimum": 0
           },
           "traceparent": {
@@ -5062,7 +5063,7 @@
               "string",
               "null"
             ],
-            "description": "Optional W3C traceparent for distributed tracing."
+            "description": "Optional W3C traceparent."
           },
           "workerId": {
             "type": "string",
@@ -5072,7 +5073,7 @@
       },
       "HeartbeatResponse": {
         "type": "object",
-        "description": "Response body for successful `/v1/tasks/{task_id}/heartbeat`.",
+        "description": "Response body for heartbeat callbacks.",
         "required": [
           "acknowledged",
           "shouldCancel",
@@ -5088,7 +5089,7 @@
               "string",
               "null"
             ],
-            "description": "Reason for cancellation (if `should_cancel` is true)."
+            "description": "Optional cancellation reason."
           },
           "serverTime": {
             "type": "string",
@@ -7283,7 +7284,7 @@
       },
       "TaskCompletedRequest": {
         "type": "object",
-        "description": "Request body for `/v1/tasks/{task_id}/completed`.",
+        "description": "Request body for task-completed callbacks.",
         "required": [
           "attempt",
           "attemptId",
@@ -7295,18 +7296,18 @@
             "type": "integer",
             "format": "int32",
             "description": "Attempt number.",
-            "minimum": 0
+            "minimum": 1
           },
           "attemptId": {
             "type": "string",
-            "description": "Attempt identifier (ULID) - concurrency guard."
+            "description": "Attempt identifier."
           },
           "cancelledDuringPhase": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Phase when cancellation occurred (for CANCELLED outcome)."
+            "description": "Phase when cancellation occurred."
           },
           "completedAt": {
             "type": [
@@ -7314,7 +7315,7 @@
               "null"
             ],
             "format": "date-time",
-            "description": "When execution completed (optional, uses server time if omitted)."
+            "description": "Worker-reported completion timestamp."
           },
           "error": {
             "oneOf": [
@@ -7340,7 +7341,7 @@
           },
           "outcome": {
             "$ref": "#/components/schemas/WorkerOutcome",
-            "description": "Task outcome."
+            "description": "Worker-reported outcome."
           },
           "output": {
             "oneOf": [
@@ -7361,7 +7362,7 @@
               "string",
               "null"
             ],
-            "description": "Optional W3C traceparent for distributed tracing."
+            "description": "Optional W3C traceparent."
           },
           "workerId": {
             "type": "string",
@@ -7371,7 +7372,7 @@
       },
       "TaskCompletedResponse": {
         "type": "object",
-        "description": "Response body for successful `/v1/tasks/{task_id}/completed`.",
+        "description": "Response body for task-completed callbacks.",
         "required": [
           "acknowledged",
           "finalState",
@@ -7380,7 +7381,7 @@
         "properties": {
           "acknowledged": {
             "type": "boolean",
-            "description": "Whether the completion was acknowledged."
+            "description": "Whether the completion callback was acknowledged."
           },
           "finalState": {
             "type": "string",
@@ -7467,7 +7468,7 @@
         "properties": {
           "category": {
             "$ref": "#/components/schemas/ErrorCategory",
-            "description": "Error category per ADR-023."
+            "description": "Error category."
           },
           "message": {
             "type": "string",
@@ -7478,20 +7479,20 @@
               "boolean",
               "null"
             ],
-            "description": "Whether the error is retryable."
+            "description": "Optional retryability override."
           },
           "stackTrace": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Stack trace (optional)."
+            "description": "Optional stack trace."
           }
         }
       },
       "TaskMetrics": {
         "type": "object",
-        "description": "Execution metrics from the worker.",
+        "description": "Execution metrics reported by the worker.",
         "properties": {
           "cpuTimeMs": {
             "type": [
@@ -7587,7 +7588,7 @@
               },
               {
                 "$ref": "#/components/schemas/TaskOutputVisibilityState",
-                "description": "Output visibility state, when the worker/runtime can report it."
+                "description": "Output visibility state."
               }
             ]
           },
@@ -7596,7 +7597,7 @@
               "string",
               "null"
             ],
-            "description": "Publish failure details, if applicable."
+            "description": "Publish failure details."
           },
           "publishedAt": {
             "type": [
@@ -7604,7 +7605,7 @@
               "null"
             ],
             "format": "date-time",
-            "description": "When output became visible, if applicable."
+            "description": "Timestamp when output became visible."
           },
           "rowCount": {
             "type": [
@@ -7675,7 +7676,7 @@
       },
       "TaskStartedRequest": {
         "type": "object",
-        "description": "Request body for `/v1/tasks/{task_id}/started`.",
+        "description": "Request body for task-started callbacks.",
         "required": [
           "attempt",
           "attemptId",
@@ -7685,12 +7686,12 @@
           "attempt": {
             "type": "integer",
             "format": "int32",
-            "description": "Attempt number (1-indexed).",
-            "minimum": 0
+            "description": "Attempt number.",
+            "minimum": 1
           },
           "attemptId": {
             "type": "string",
-            "description": "Attempt identifier (ULID) - concurrency guard."
+            "description": "Attempt identifier."
           },
           "startedAt": {
             "type": [
@@ -7698,14 +7699,14 @@
               "null"
             ],
             "format": "date-time",
-            "description": "When execution started (optional, uses server time if omitted)."
+            "description": "Worker-reported start timestamp."
           },
           "traceparent": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Optional W3C traceparent for distributed tracing."
+            "description": "Optional W3C traceparent."
           },
           "workerId": {
             "type": "string",
@@ -7715,7 +7716,7 @@
       },
       "TaskStartedResponse": {
         "type": "object",
-        "description": "Response body for successful `/v1/tasks/{task_id}/started`.",
+        "description": "Response body for task-started callbacks.",
         "required": [
           "acknowledged",
           "serverTime"

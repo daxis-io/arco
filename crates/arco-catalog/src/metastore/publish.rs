@@ -1,16 +1,21 @@
 //! Pointer-publication planning for metastore projections.
 
+use std::sync::Arc;
+use std::sync::RwLock;
+use std::time::Instant;
+
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use arco_core::ScopedStorage;
-use arco_core::storage::{WritePrecondition, WriteResult};
+use arco_core::storage::{ObjectMeta, WritePrecondition, WriteResult};
 
 use crate::error::{CatalogError, Result};
+use crate::metrics;
 use crate::storage_governance::StorageGovernanceState;
 
-use super::ledger::MetastoreLedger;
+use super::ledger::{MetastoreLedger, MetastoreLedgerWatermark};
 use super::projections::{
     ProjectionSet, STORAGE_GOVERNANCE_PROJECTION, STORAGE_GOVERNANCE_SCHEMA_VERSION,
     read_metastore_object_rows,
@@ -123,6 +128,108 @@ pub struct PublishedStorageGovernance {
     pub state: StorageGovernanceState,
     /// Published ledger watermark event ID.
     pub ledger_watermark: String,
+}
+
+/// Cache for published storage-governance projection state.
+#[derive(Debug, Default)]
+pub struct PublishedStorageGovernanceCache {
+    current: RwLock<Option<PublishedStorageGovernanceCacheEntry>>,
+    refresh: tokio::sync::Mutex<()>,
+}
+
+#[derive(Debug)]
+struct PublishedStorageGovernanceCacheEntry {
+    identity: PublishedStorageGovernanceCacheIdentity,
+    value: Arc<PublishedStorageGovernance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublishedStorageGovernanceCacheIdentity {
+    tenant_id: String,
+    workspace_id: String,
+    manifest_id: String,
+    ledger_watermark: String,
+    ledger_watermark_sequence: u64,
+    files: Vec<MetastoreProjectionFileManifest>,
+    storage_governance_object: Option<PublishedStorageGovernanceObjectIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublishedStorageGovernanceObjectIdentity {
+    path: String,
+    size: u64,
+    version: String,
+    last_modified: Option<DateTime<Utc>>,
+    etag: Option<String>,
+}
+
+impl PublishedStorageGovernanceCache {
+    /// Loads the published storage-governance projection, reusing cached state
+    /// only after revalidating pointer, manifest, and latest-ledger freshness.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RequestFailed(503)` when the published projection is missing,
+    /// stale, unsupported, or corrupt.
+    pub async fn load(&self, storage: &ScopedStorage) -> Result<Arc<PublishedStorageGovernance>> {
+        let manifest = load_projection_manifest(storage).await?;
+        let latest = MetastoreLedger::new(storage.clone())
+            .latest_watermark()
+            .await?;
+        validate_storage_governance_manifest_freshness(&manifest, latest.as_ref())?;
+        let identity = storage_governance_cache_identity(storage, &manifest).await?;
+
+        if let Some(current) = self
+            .current
+            .read()
+            .map_err(|_| CatalogError::InvariantViolation {
+                message: "storage governance cache lock poisoned".to_string(),
+            })?
+            .as_ref()
+        {
+            if current.identity == identity {
+                metrics::inc_storage_governance_cache_hit();
+                return Ok(Arc::clone(&current.value));
+            }
+        }
+
+        let _guard = self.refresh.lock().await;
+        let manifest = load_projection_manifest(storage).await?;
+        let latest = MetastoreLedger::new(storage.clone())
+            .latest_watermark()
+            .await?;
+        validate_storage_governance_manifest_freshness(&manifest, latest.as_ref())?;
+        let identity = storage_governance_cache_identity(storage, &manifest).await?;
+        if let Some(current) = self
+            .current
+            .read()
+            .map_err(|_| CatalogError::InvariantViolation {
+                message: "storage governance cache lock poisoned".to_string(),
+            })?
+            .as_ref()
+        {
+            if current.identity == identity {
+                metrics::inc_storage_governance_cache_hit();
+                return Ok(Arc::clone(&current.value));
+            }
+        }
+
+        metrics::inc_storage_governance_cache_miss();
+        let refresh_start = Instant::now();
+        let loaded =
+            Arc::new(load_published_storage_governance_from_manifest(storage, manifest).await?);
+        metrics::record_storage_governance_refresh(refresh_start.elapsed().as_secs_f64());
+        *self
+            .current
+            .write()
+            .map_err(|_| CatalogError::InvariantViolation {
+                message: "storage governance cache lock poisoned".to_string(),
+            })? = Some(PublishedStorageGovernanceCacheEntry {
+            identity,
+            value: Arc::clone(&loaded),
+        });
+        Ok(loaded)
+    }
 }
 
 /// Publishes a built metastore projection set behind a pointer.
@@ -243,6 +350,15 @@ pub async fn load_published_storage_governance(
     let latest = MetastoreLedger::new(storage.clone())
         .latest_watermark()
         .await?;
+    validate_storage_governance_manifest_freshness(&manifest, latest.as_ref())?;
+
+    load_published_storage_governance_from_manifest(storage, manifest).await
+}
+
+fn validate_storage_governance_manifest_freshness(
+    manifest: &MetastoreProjectionManifest,
+    latest: Option<&MetastoreLedgerWatermark>,
+) -> Result<()> {
     match latest {
         Some(latest)
             if manifest.ledger_watermark_sequence == latest.sequence
@@ -257,27 +373,26 @@ pub async fn load_published_storage_governance(
                 && manifest.ledger_watermark == "empty"
                 && manifest.files.is_empty()
             {
-                return Ok(PublishedStorageGovernance {
-                    state: StorageGovernanceState::default(),
-                    ledger_watermark: manifest.ledger_watermark,
-                });
+                return Ok(());
             }
             return Err(projection_unavailable(
                 "storage_governance_projection_stale",
             ));
         }
     }
+    Ok(())
+}
 
-    let file = manifest
-        .files
-        .iter()
-        .find(|file| file.file_name == STORAGE_GOVERNANCE_PROJECTION)
-        .ok_or_else(|| projection_unavailable("storage_governance_projection_missing"))?;
-    if file.schema_version != STORAGE_GOVERNANCE_SCHEMA_VERSION {
-        return Err(projection_unavailable(
-            "storage_governance_projection_unsupported",
-        ));
-    }
+async fn load_published_storage_governance_from_manifest(
+    storage: &ScopedStorage,
+    manifest: MetastoreProjectionManifest,
+) -> Result<PublishedStorageGovernance> {
+    let Some(file) = validate_storage_governance_projection_file(&manifest)? else {
+        return Ok(PublishedStorageGovernance {
+            state: StorageGovernanceState::default(),
+            ledger_watermark: manifest.ledger_watermark,
+        });
+    };
 
     let bytes = storage
         .get_raw(&file.path)
@@ -285,6 +400,11 @@ pub async fn load_published_storage_governance(
         .map_err(|_| projection_unavailable("storage_governance_projection_unavailable"))?;
     let rows = read_metastore_object_rows(&bytes)
         .map_err(|_| projection_unavailable("storage_governance_projection_unavailable"))?;
+    if rows.len() as u64 != file.row_count {
+        return Err(projection_unavailable(
+            "storage_governance_projection_unsupported",
+        ));
+    }
     if rows.iter().any(|row| {
         row.schema_version != STORAGE_GOVERNANCE_SCHEMA_VERSION
             || row.ledger_watermark != manifest.ledger_watermark
@@ -420,6 +540,71 @@ fn manifest_contents_match(
         && left.ledger_watermark == right.ledger_watermark
         && left.ledger_watermark_sequence == right.ledger_watermark_sequence
         && left.files == right.files
+}
+
+async fn storage_governance_cache_identity(
+    storage: &ScopedStorage,
+    manifest: &MetastoreProjectionManifest,
+) -> Result<PublishedStorageGovernanceCacheIdentity> {
+    let storage_governance_object = match validate_storage_governance_projection_file(manifest)? {
+        Some(file) => Some(storage_governance_object_identity(storage, file).await?),
+        None => None,
+    };
+
+    Ok(PublishedStorageGovernanceCacheIdentity {
+        tenant_id: storage.tenant_id().to_string(),
+        workspace_id: storage.workspace_id().to_string(),
+        manifest_id: manifest.manifest_id.clone(),
+        ledger_watermark: manifest.ledger_watermark.clone(),
+        ledger_watermark_sequence: manifest.ledger_watermark_sequence,
+        files: manifest.files.clone(),
+        storage_governance_object,
+    })
+}
+
+async fn storage_governance_object_identity(
+    storage: &ScopedStorage,
+    file: &MetastoreProjectionFileManifest,
+) -> Result<PublishedStorageGovernanceObjectIdentity> {
+    let meta = storage
+        .head_raw(&file.path)
+        .await
+        .map_err(|_| projection_unavailable("storage_governance_projection_unavailable"))?
+        .ok_or_else(|| projection_unavailable("storage_governance_projection_unavailable"))?;
+    Ok(object_identity_from_meta(meta))
+}
+
+fn object_identity_from_meta(meta: ObjectMeta) -> PublishedStorageGovernanceObjectIdentity {
+    PublishedStorageGovernanceObjectIdentity {
+        path: meta.path,
+        size: meta.size,
+        version: meta.version,
+        last_modified: meta.last_modified,
+        etag: meta.etag,
+    }
+}
+
+fn validate_storage_governance_projection_file(
+    manifest: &MetastoreProjectionManifest,
+) -> Result<Option<&MetastoreProjectionFileManifest>> {
+    if manifest.ledger_watermark_sequence == 0
+        && manifest.ledger_watermark == "empty"
+        && manifest.files.is_empty()
+    {
+        return Ok(None);
+    }
+
+    let file = manifest
+        .files
+        .iter()
+        .find(|file| file.file_name == STORAGE_GOVERNANCE_PROJECTION)
+        .ok_or_else(|| projection_unavailable("storage_governance_projection_missing"))?;
+    if file.schema_version != STORAGE_GOVERNANCE_SCHEMA_VERSION {
+        return Err(projection_unavailable(
+            "storage_governance_projection_unsupported",
+        ));
+    }
+    Ok(Some(file))
 }
 
 fn projection_unavailable(reason: &str) -> CatalogError {

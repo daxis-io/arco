@@ -1,6 +1,8 @@
 //! Temporary credential routes for the Unity Catalog facade.
 //!
 
+use std::sync::Arc;
+
 use arco_catalog::CatalogReader;
 use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::credential_vending::{
@@ -8,7 +10,7 @@ use arco_catalog::credential_vending::{
     CredentialVendingEngine, CredentialVendingRequest, DEFAULT_CREDENTIAL_TTL,
 };
 use arco_catalog::error::CatalogError;
-use arco_catalog::metastore::publish::load_published_storage_governance;
+use arco_catalog::metastore::publish::PublishedStorageGovernance;
 use arco_catalog::storage_governance::{PathDecision, StorageGovernanceState};
 use axum::Json;
 use axum::Router;
@@ -53,7 +55,6 @@ struct CredentialAuthzTarget {
     object_id: String,
     object_type: &'static str,
     privilege: Privilege,
-    permission_ledger_watermark: String,
 }
 
 /// Temporary credential route group.
@@ -137,7 +138,6 @@ pub(crate) async fn post_temporary_table_credentials(
         object_id: table_id.clone(),
         object_type: "TABLE",
         privilege: table_privilege_for_operation(operation),
-        permission_ledger_watermark: String::new(),
     };
     if let Some(reason_code) = authz_context_denial_reason_for_watermark(&state, &ctx, None) {
         audit::emit_credentials_deny(&state, &ctx, &table_id, &reason_code);
@@ -145,7 +145,9 @@ pub(crate) async fn post_temporary_table_credentials(
     }
 
     let storage = scoped_storage(&state, &ctx)?;
-    let published = load_published_storage_governance(&storage)
+    let published = state
+        .storage_governance_cache
+        .load(&storage)
         .await
         .map_err(|err| credential_projection_error(&err))?;
     let catalog_snapshot_version = published.ledger_watermark.clone();
@@ -178,6 +180,7 @@ pub(crate) async fn post_temporary_table_credentials(
         location,
         operation,
         Some(authz_target),
+        Some(published),
         payload
             .requested_ttl_seconds
             .map_or(DEFAULT_CREDENTIAL_TTL, std::time::Duration::from_secs),
@@ -240,6 +243,7 @@ pub(crate) async fn post_temporary_path_credentials(
         request.url,
         operation,
         None,
+        None,
         request
             .requested_ttl_seconds
             .map_or(DEFAULT_CREDENTIAL_TTL, std::time::Duration::from_secs),
@@ -247,12 +251,14 @@ pub(crate) async fn post_temporary_path_credentials(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn vend_path_credentials(
     state: &UnityCatalogState,
     ctx: &UnityCatalogRequestContext,
     requested_path: String,
     operation: CredentialOperation,
     authz_target: Option<CredentialAuthzTarget>,
+    published_storage_governance: Option<Arc<PublishedStorageGovernance>>,
     requested_ttl: std::time::Duration,
 ) -> UnityCatalogResult<(StatusCode, Json<serde_json::Value>)> {
     if let Some(reason_code) = authz_context_denial_reason_for_watermark(state, ctx, None) {
@@ -264,10 +270,16 @@ async fn vend_path_credentials(
         return credential_denied("unsupported_operation", None);
     }
 
-    let storage = scoped_storage(state, ctx)?;
-    let published = load_published_storage_governance(&storage)
-        .await
-        .map_err(|err| credential_projection_error(&err))?;
+    let published = if let Some(published) = published_storage_governance {
+        published
+    } else {
+        let storage = scoped_storage(state, ctx)?;
+        state
+            .storage_governance_cache
+            .load(&storage)
+            .await
+            .map_err(|err| credential_projection_error(&err))?
+    };
     let catalog_snapshot_version = published.ledger_watermark.clone();
     if let Some(reason_code) =
         authz_context_denial_reason_for_watermark(state, ctx, Some(&catalog_snapshot_version))
@@ -275,7 +287,7 @@ async fn vend_path_credentials(
         audit::emit_credentials_deny(state, ctx, &requested_path, &reason_code);
         return credential_denied(&reason_code, None);
     }
-    let storage_governance = published.state;
+    let storage_governance = &published.state;
 
     let Ok(path_decision) = storage_governance.authority_for_path(&ctx.workspace, &requested_path)
     else {
@@ -283,9 +295,9 @@ async fn vend_path_credentials(
         return credential_denied("access_denied", None);
     };
 
-    let mut authz_target = match authz_target {
+    let authz_target = match authz_target {
         Some(target) => target,
-        None => storage_authz_target(&storage_governance, &path_decision, operation)?,
+        None => storage_authz_target(storage_governance, &path_decision, operation)?,
     };
     if let Some(reason_code) = credential_authz_denial_reason_for_watermark(
         state,
@@ -296,13 +308,11 @@ async fn vend_path_credentials(
         audit::emit_credentials_deny(state, ctx, &requested_path, &reason_code);
         return credential_denied("access_denied", None);
     }
-    authz_target
-        .permission_ledger_watermark
-        .clone_from(&catalog_snapshot_version);
+    let permission_ledger_watermark = catalog_snapshot_version.clone();
 
     let decision = CredentialVendingEngine::default()
         .decide_path(
-            &storage_governance,
+            storage_governance,
             &CredentialVendingRequest {
                 principal_id: ctx.user_id.clone().unwrap_or_default(),
                 groups_snapshot_version: "unknown".to_string(),
@@ -318,10 +328,10 @@ async fn vend_path_credentials(
                     object_id: authz_target.object_id.clone(),
                     object_type: authz_target.object_type.to_string(),
                     privilege: authz_target.privilege,
-                    permission_ledger_watermark: authz_target.permission_ledger_watermark,
+                    permission_ledger_watermark,
                     path_authority_object_id: path_decision.object_id.clone(),
                     path_authority_object_type: path_authority_object_type(
-                        &storage_governance,
+                        storage_governance,
                         &path_decision,
                     )?,
                 }),
@@ -389,7 +399,6 @@ fn storage_authz_target(
         object_id,
         object_type,
         privilege: path_privilege_for_operation(operation),
-        permission_ledger_watermark: String::new(),
     })
 }
 

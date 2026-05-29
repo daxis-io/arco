@@ -3,23 +3,6 @@
 Credential vending is an authorization decision with provider-specific minting,
 not a route-local response constructor.
 
-## Current Implementation Status
-
-The current UC-compatible implementation is `compatible-partial`:
-
-- `POST /temporary-path-credentials` and `POST /temporary-table-credentials`
-  use compiled authorization, published storage-governance state, path-scope
-  checks, TTL clamping, allow/deny audit hooks, and redacted responses.
-- Table credentials resolve the table through the native catalog before
-  delegating to the governed-path decision path.
-- `POST /temporary-volume-credentials` and
-  `POST /temporary-model-version-credentials` remain known-but-unsupported
-  operations.
-- The UC response currently exposes the decision, reason, authorized prefixes,
-  provider, credential kind, max TTL, audit event ID, and scoped credential
-  metadata. Provider token material, revocation classification, and expiry
-  timestamp exposure remain planned.
-
 ## Decision Input
 
 Credential decisions include:
@@ -36,7 +19,7 @@ Credential decisions include:
 
 ## Decision Output
 
-The full product contract is that credential decisions return:
+Credential decisions return:
 
 - `allow` or `deny`
 - stable reason code and safe reason message
@@ -46,12 +29,6 @@ The full product contract is that credential decisions return:
 - expiry and applied max TTL
 - revocation status and revocation-limit class
 - audit event ID
-
-Current UC-compatible responses implement the allow/deny, reason, path prefix,
-provider, credential kind, max TTL, audit event ID, and redaction portions of
-that contract. Expiry is calculated by the shared decision engine but is not yet
-exposed in the UC response, and revocation status is still future provider
-capability work.
 
 ## Requirements
 
@@ -102,11 +79,8 @@ contract reserves these scope classes:
 - `model_artifact_read`
 - `model_artifact_write`
 
-Path scopes are implemented for governed external-location and managed-root
-authority. Table scopes are implemented by resolving the table location through
-the native catalog and then applying the governed-path decision path. Volume and
-model-artifact scopes stay `planned` until the corresponding authoritative
-object ownership exists.
+Path and model-artifact scopes stay `planned` until the corresponding
+authoritative object/path ownership exists.
 
 ## Provider Extensibility
 

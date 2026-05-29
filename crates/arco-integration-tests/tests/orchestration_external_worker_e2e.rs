@@ -8,7 +8,7 @@ use std::sync::Arc;
 use chrono::Utc;
 
 use arco_core::{
-    MemoryBackend, ScopedStorage, TaskTokenConfig, decode_task_token, mint_task_token,
+    MemoryBackend, ScopedStorage, TaskTokenConfig, decode_task_token, mint_task_token_for_attempt,
 };
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::callbacks::{
@@ -25,7 +25,9 @@ use arco_flow::orchestration::events::{
     OrchestrationEvent, OrchestrationEventData, TaskDef, TriggerInfo,
 };
 use arco_flow::orchestration::ledger::OrchestrationLedgerWriter;
-use arco_flow::orchestration::worker_contract::WorkerDispatchEnvelope;
+use arco_flow::orchestration::worker_contract::{
+    WorkerDispatchEnvelope, callback_task_id, parse_callback_task_id,
+};
 
 #[derive(Clone)]
 struct CompactingTestLedger {
@@ -61,6 +63,7 @@ impl OrchestrationLedgerWriter for CompactingTestLedger {
 #[derive(Clone)]
 struct CompactorLookup {
     compactor: MicroCompactor,
+    run_id_scope: Option<String>,
 }
 
 impl TaskStateLookup for CompactorLookup {
@@ -70,19 +73,49 @@ impl TaskStateLookup for CompactorLookup {
     ) -> impl Future<Output = Result<Option<CallbackTaskState>, String>> + Send {
         let task_id = task_id.to_string();
         let compactor = self.compactor.clone();
+        let run_id_scope = self.run_id_scope.clone();
 
         async move {
             let (_, state) = compactor.load_state().await.map_err(|e| e.to_string())?;
+            let parsed_callback_task_id = parse_callback_task_id(&task_id).ok();
+            if let Some(run_id) = run_id_scope {
+                let task_key = match &parsed_callback_task_id {
+                    Some(parsed) if parsed.run_id == run_id => parsed.task_key.clone(),
+                    Some(_) => return Ok(None),
+                    None => task_id.clone(),
+                };
+                let Some(row) = state.tasks.get(&(run_id, task_key)) else {
+                    return Ok(None);
+                };
+                let run = state.runs.get(&row.run_id);
+                return Ok(Some(CallbackTaskState {
+                    state: fold_task_state_label(row.state).to_string(),
+                    attempt: row.attempt,
+                    attempt_id: row.attempt_id.clone().unwrap_or_default(),
+                    run_id: row.run_id.clone(),
+                    task_key: row.task_key.clone(),
+                    asset_key: row.asset_key.clone(),
+                    partition_key: row.partition_key.clone(),
+                    code_version: run.and_then(|run| run.code_version.clone()),
+                    cancel_requested: run.is_some_and(|run| run.cancel_requested),
+                }));
+            }
+
             let matches: Vec<_> = state
                 .tasks
                 .values()
-                .filter(|row| row.task_key == task_id)
+                .filter(|row| {
+                    parsed_callback_task_id.as_ref().map_or_else(
+                        || row.task_key == task_id,
+                        |parsed| row.run_id == parsed.run_id && row.task_key == parsed.task_key,
+                    )
+                })
                 .collect();
 
             if matches.is_empty() {
                 return Ok(None);
             }
-            if matches.len() > 1 {
+            if parsed_callback_task_id.is_none() && matches.len() > 1 {
                 return Err(format!("task_id_ambiguous: {task_id}"));
             }
 
@@ -95,6 +128,7 @@ impl TaskStateLookup for CompactorLookup {
                 attempt: row.attempt,
                 attempt_id: row.attempt_id.clone().unwrap_or_default(),
                 run_id: row.run_id.clone(),
+                task_key: row.task_key.clone(),
                 asset_key: row.asset_key.clone(),
                 partition_key: row.partition_key.clone(),
                 code_version: run.and_then(|run| run.code_version.clone()),
@@ -130,14 +164,15 @@ impl TaskTokenValidator for CoreTaskTokenValidator {
     fn validate_task_token(
         &self,
         task_id: &str,
-        _run_id: &str,
-        _attempt: u32,
+        run_id: &str,
+        attempt: u32,
         token: &str,
     ) -> impl Future<Output = Result<(), String>> + Send {
         let config = self.config.clone();
         let tenant_id = self.tenant_id.clone();
         let workspace_id = self.workspace_id.clone();
         let task_id = task_id.to_string();
+        let run_id = run_id.to_string();
         let token = token.to_string();
 
         async move {
@@ -150,6 +185,16 @@ impl TaskTokenValidator for CoreTaskTokenValidator {
             }
             if claims.workspace_id != workspace_id {
                 return Err("workspace_mismatch".to_string());
+            }
+            if let Some(claim_run_id) = claims.run_id.as_deref() {
+                if claim_run_id != run_id {
+                    return Err("run_id_mismatch".to_string());
+                }
+            }
+            if let Some(claim_attempt) = claims.attempt {
+                if claim_attempt != attempt {
+                    return Err("attempt_mismatch".to_string());
+                }
             }
             Ok(())
         }
@@ -281,12 +326,21 @@ async fn run_dispatch_callback_path_advances_task_state() {
         audience: Some("arco-worker-callback".to_string()),
         ttl_seconds: 900,
     };
-    let minted = mint_task_token(&token_config, task_key, "tenant", "workspace", Utc::now())
-        .expect("mint token");
+    let minted = mint_task_token_for_attempt(
+        &token_config,
+        task_key,
+        "tenant",
+        "workspace",
+        run_id,
+        attempt,
+        Utc::now(),
+    )
+    .expect("mint token");
 
     let envelope = WorkerDispatchEnvelope {
         tenant_id: "tenant".to_string(),
         workspace_id: "workspace".to_string(),
+        task_id: callback_task_id(run_id, task_key),
         run_id: run_id.to_string(),
         task_key: task_key.to_string(),
         attempt,
@@ -338,6 +392,7 @@ async fn run_dispatch_callback_path_advances_task_state() {
     );
     let lookup = CompactorLookup {
         compactor: compactor.clone(),
+        run_id_scope: Some(run_id.to_string()),
     };
 
     let started = handle_task_started(

@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
+use arco_worker_contract::callback_task_id;
+
 use super::types::{
     CallbackError, CallbackResult, HeartbeatRequest, HeartbeatResponse, TaskCompletedRequest,
     TaskCompletedResponse, TaskOutputVisibilityState, TaskStartedRequest, TaskStartedResponse,
@@ -60,6 +62,8 @@ pub struct TaskState {
     pub attempt_id: String,
     /// Run ID this task belongs to.
     pub run_id: String,
+    /// Semantic task key for event emission.
+    pub task_key: String,
     /// Asset key for this task (if any).
     pub asset_key: Option<String>,
     /// Partition key for this task (if any).
@@ -128,6 +132,61 @@ fn record_callback_metrics<T>(handler: &str, result: &CallbackResult<T>) {
 fn finish_callback<T>(handler: &str, result: CallbackResult<T>) -> CallbackResult<T> {
     record_callback_metrics(handler, &result);
     result
+}
+
+fn lookup_error<T>(handler: &str, task_id: &str, error: String) -> CallbackResult<T> {
+    if error.starts_with("task_id_ambiguous:") {
+        finish_callback(
+            handler,
+            CallbackResult::BadRequest(CallbackError::task_id_ambiguous(task_id)),
+        )
+    } else {
+        finish_callback(handler, CallbackResult::InternalError(error))
+    }
+}
+
+async fn validate_task_token_for_state<T, V>(
+    handler: &str,
+    validator: &V,
+    path_task_id: &str,
+    state: &TaskState,
+    attempt: u32,
+    task_token: &str,
+) -> Option<CallbackResult<T>>
+where
+    V: TaskTokenValidator,
+{
+    let canonical_task_id = callback_task_id(&state.run_id, &state.task_key);
+    let canonical_result = validator
+        .validate_task_token(&canonical_task_id, &state.run_id, attempt, task_token)
+        .await;
+
+    match canonical_result {
+        Ok(()) => None,
+        Err(reason) if reason == "task_id_mismatch" && path_task_id != canonical_task_id => {
+            match validator
+                .validate_task_token(path_task_id, &state.run_id, attempt, task_token)
+                .await
+            {
+                Ok(()) => None,
+                Err(legacy_reason) => {
+                    let reason = if legacy_reason == "task_id_mismatch" {
+                        reason
+                    } else {
+                        legacy_reason
+                    };
+                    Some(finish_callback(
+                        handler,
+                        CallbackResult::Unauthorized(CallbackError::invalid_token(&reason)),
+                    ))
+                }
+            }
+        }
+        Err(reason) => Some(finish_callback(
+            handler,
+            CallbackResult::Unauthorized(CallbackError::invalid_token(&reason)),
+        )),
+    }
 }
 
 fn map_output_visibility_state(state: TaskOutputVisibilityState) -> OutputVisibilityState {
@@ -200,7 +259,7 @@ where
             );
         }
         Err(e) => {
-            return finish_callback("task_started", CallbackResult::InternalError(e));
+            return lookup_error("task_started", task_id, e);
         }
     };
 
@@ -212,15 +271,17 @@ where
         tracing::Span::current().record("traceparent", tracing::field::display(traceparent));
     }
 
-    if let Err(reason) = ctx
-        .token_validator
-        .validate_task_token(task_id, &state.run_id, attempt, task_token)
-        .await
+    if let Some(result) = validate_task_token_for_state(
+        "task_started",
+        ctx.token_validator.as_ref(),
+        task_id,
+        &state,
+        state.attempt,
+        task_token,
+    )
+    .await
     {
-        return finish_callback(
-            "task_started",
-            CallbackResult::Unauthorized(CallbackError::invalid_token(&reason)),
-        );
+        return result;
     }
 
     // Check if task is already terminal
@@ -263,7 +324,7 @@ where
         &ctx.workspace_id,
         OrchestrationEventData::TaskStarted {
             run_id: state.run_id.clone(),
-            task_key: task_id.to_string(),
+            task_key: state.task_key.clone(),
             attempt,
             attempt_id: state.attempt_id.clone(),
             worker_id,
@@ -366,7 +427,7 @@ where
             );
         }
         Err(e) => {
-            return finish_callback("heartbeat", CallbackResult::InternalError(e));
+            return lookup_error("heartbeat", task_id, e);
         }
     };
 
@@ -378,15 +439,17 @@ where
         tracing::Span::current().record("traceparent", tracing::field::display(traceparent));
     }
 
-    if let Err(reason) = ctx
-        .token_validator
-        .validate_task_token(task_id, &state.run_id, attempt, task_token)
-        .await
+    if let Some(result) = validate_task_token_for_state(
+        "heartbeat",
+        ctx.token_validator.as_ref(),
+        task_id,
+        &state,
+        state.attempt,
+        task_token,
+    )
+    .await
     {
-        return finish_callback(
-            "heartbeat",
-            CallbackResult::Unauthorized(CallbackError::invalid_token(&reason)),
-        );
+        return result;
     }
 
     // Check if task is no longer active (410 Gone)
@@ -420,7 +483,7 @@ where
         &ctx.workspace_id,
         OrchestrationEventData::TaskHeartbeat {
             run_id: state.run_id.clone(),
-            task_key: task_id.to_string(),
+            task_key: state.task_key.clone(),
             attempt,
             attempt_id: state.attempt_id.clone(),
             worker_id,
@@ -524,7 +587,7 @@ where
             );
         }
         Err(e) => {
-            return finish_callback("task_completed", CallbackResult::InternalError(e));
+            return lookup_error("task_completed", task_id, e);
         }
     };
 
@@ -536,15 +599,17 @@ where
         tracing::Span::current().record("traceparent", tracing::field::display(traceparent));
     }
 
-    if let Err(reason) = ctx
-        .token_validator
-        .validate_task_token(task_id, &state.run_id, attempt, task_token)
-        .await
+    if let Some(result) = validate_task_token_for_state(
+        "task_completed",
+        ctx.token_validator.as_ref(),
+        task_id,
+        &state,
+        state.attempt,
+        task_token,
+    )
+    .await
     {
-        return finish_callback(
-            "task_completed",
-            CallbackResult::Unauthorized(CallbackError::invalid_token(&reason)),
-        );
+        return result;
     }
 
     // Check if task is already terminal
@@ -623,7 +688,7 @@ where
         &ctx.workspace_id,
         OrchestrationEventData::TaskFinished {
             run_id: state.run_id.clone(),
-            task_key: task_id.to_string(),
+            task_key: state.task_key.clone(),
             attempt,
             attempt_id: state.attempt_id.clone(),
             worker_id,
@@ -656,7 +721,7 @@ where
                 &ctx.workspace_id,
                 OrchestrationEventData::TaskOutputVisibilityChanged {
                     run_id: state.run_id.clone(),
-                    task_key: task_id.to_string(),
+                    task_key: state.task_key.clone(),
                     attempt,
                     attempt_id: state.attempt_id.clone(),
                     visibility_state: map_output_visibility_state(visibility_state),
@@ -739,6 +804,41 @@ mod tests {
         }
     }
 
+    struct RequiredTaskIdTokenValidator {
+        accepted_task_ids: Vec<String>,
+        seen_task_ids: Mutex<Vec<String>>,
+    }
+
+    impl RequiredTaskIdTokenValidator {
+        fn accepting(accepted_task_ids: Vec<String>) -> Self {
+            Self {
+                accepted_task_ids,
+                seen_task_ids: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl TaskTokenValidator for RequiredTaskIdTokenValidator {
+        async fn validate_task_token(
+            &self,
+            task_id: &str,
+            _run_id: &str,
+            _attempt: u32,
+            _token: &str,
+        ) -> Result<(), String> {
+            self.seen_task_ids.lock().unwrap().push(task_id.to_string());
+            if self
+                .accepted_task_ids
+                .iter()
+                .any(|accepted| accepted == task_id)
+            {
+                Ok(())
+            } else {
+                Err("task_id_mismatch".to_string())
+            }
+        }
+    }
+
     /// Mock task state lookup for testing.
     struct MockTaskLookup {
         tasks: HashMap<String, TaskState>,
@@ -762,6 +862,14 @@ mod tests {
         }
     }
 
+    struct ErrorTaskLookup;
+
+    impl TaskStateLookup for ErrorTaskLookup {
+        async fn get_task_state(&self, task_id: &str) -> Result<Option<TaskState>, String> {
+            Err(format!("task_id_ambiguous: {task_id}"))
+        }
+    }
+
     #[tokio::test]
     async fn test_handle_task_started_success() {
         let ledger = Arc::new(MockLedger::default());
@@ -776,6 +884,7 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
                 asset_key: Some("analytics.daily".to_string()),
                 partition_key: Some("2025-01-15".to_string()),
                 code_version: Some("v1.2.3".to_string()),
@@ -832,6 +941,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_task_started_ambiguous_legacy_task_id_is_bad_request() {
+        let ledger = Arc::new(MockLedger::default());
+        let validator = Arc::new(MockTokenValidator::allow_all());
+        let ctx = CallbackContext::new(ledger, validator, "tenant-1", "workspace-1");
+        let lookup = ErrorTaskLookup;
+
+        let request = TaskStartedRequest {
+            attempt: 1,
+            attempt_id: "att-1".to_string(),
+            worker_id: "worker-abc".to_string(),
+            traceparent: None,
+            started_at: None,
+        };
+
+        let result = handle_task_started(&ctx, "extract", "token", request, &lookup).await;
+
+        match result {
+            CallbackResult::BadRequest(err) => {
+                assert_eq!(err.error, "task_id_ambiguous");
+                assert!(err.message.contains("opaque taskId"));
+            }
+            other => panic!("Expected BadRequest, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_task_started_legacy_path_validates_canonical_callback_task_id() {
+        let ledger = Arc::new(MockLedger::default());
+        let canonical_task_id = callback_task_id("run-1", "extract");
+        let validator = Arc::new(RequiredTaskIdTokenValidator::accepting(vec![
+            canonical_task_id.clone(),
+        ]));
+        let ctx = CallbackContext::new(
+            ledger.clone(),
+            Arc::clone(&validator),
+            "tenant-1",
+            "workspace-1",
+        );
+
+        let mut lookup = MockTaskLookup::new();
+        lookup.add_task(
+            "extract",
+            TaskState {
+                state: "RUNNING".to_string(),
+                attempt: 1,
+                attempt_id: "att-1".to_string(),
+                run_id: "run-1".to_string(),
+                task_key: "extract".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
+                cancel_requested: false,
+            },
+        );
+
+        let request = TaskStartedRequest {
+            attempt: 1,
+            attempt_id: "att-1".to_string(),
+            worker_id: "worker-abc".to_string(),
+            traceparent: None,
+            started_at: None,
+        };
+
+        let result = handle_task_started(&ctx, "extract", "token", request, &lookup).await;
+
+        match result {
+            CallbackResult::Ok(response) => assert!(response.acknowledged),
+            other => panic!("Expected Ok, got {:?}", other),
+        }
+        assert_eq!(
+            validator.seen_task_ids.lock().unwrap().as_slice(),
+            &[canonical_task_id]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_task_started_legacy_path_accepts_legacy_task_key_token() {
+        let ledger = Arc::new(MockLedger::default());
+        let canonical_task_id = callback_task_id("run-1", "extract");
+        let validator = Arc::new(RequiredTaskIdTokenValidator::accepting(vec![
+            "extract".to_string(),
+        ]));
+        let ctx = CallbackContext::new(
+            ledger.clone(),
+            Arc::clone(&validator),
+            "tenant-1",
+            "workspace-1",
+        );
+
+        let mut lookup = MockTaskLookup::new();
+        lookup.add_task(
+            "extract",
+            TaskState {
+                state: "RUNNING".to_string(),
+                attempt: 1,
+                attempt_id: "att-1".to_string(),
+                run_id: "run-1".to_string(),
+                task_key: "extract".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
+                cancel_requested: false,
+            },
+        );
+
+        let request = TaskStartedRequest {
+            attempt: 1,
+            attempt_id: "att-1".to_string(),
+            worker_id: "worker-abc".to_string(),
+            traceparent: None,
+            started_at: None,
+        };
+
+        let result = handle_task_started(&ctx, "extract", "token", request, &lookup).await;
+
+        match result {
+            CallbackResult::Ok(response) => assert!(response.acknowledged),
+            other => panic!("Expected Ok, got {:?}", other),
+        }
+        assert_eq!(
+            validator.seen_task_ids.lock().unwrap().as_slice(),
+            &[canonical_task_id, "extract".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn test_handle_task_started_terminal() {
         let ledger = Arc::new(MockLedger::default());
         let validator = Arc::new(MockTokenValidator::allow_all());
@@ -845,6 +1080,7 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
                 asset_key: None,
                 partition_key: None,
                 code_version: None,
@@ -884,6 +1120,7 @@ mod tests {
                 attempt: 2,
                 attempt_id: "att-2".to_string(),
                 run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
                 asset_key: None,
                 partition_key: None,
                 code_version: None,
@@ -925,6 +1162,7 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
                 asset_key: Some("analytics.daily".to_string()),
                 partition_key: Some("2025-01-15".to_string()),
                 code_version: Some("v1.2.3".to_string()),
@@ -966,6 +1204,7 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
                 asset_key: None,
                 partition_key: None,
                 code_version: None,
@@ -993,6 +1232,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_task_started_cancelled_task_conflicts() {
+        let ledger = Arc::new(MockLedger::default());
+        let validator = Arc::new(MockTokenValidator::allow_all());
+        let ctx = CallbackContext::new(ledger.clone(), validator, "tenant-1", "workspace-1");
+
+        let mut lookup = MockTaskLookup::new();
+        lookup.add_task(
+            "task-1",
+            TaskState {
+                state: "CANCELLED".to_string(),
+                attempt: 1,
+                attempt_id: "att-1".to_string(),
+                run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
+                cancel_requested: false,
+            },
+        );
+
+        let request = TaskStartedRequest {
+            attempt: 1,
+            attempt_id: "att-1".to_string(),
+            worker_id: "worker-abc".to_string(),
+            traceparent: None,
+            started_at: None,
+        };
+
+        let result = handle_task_started(&ctx, "task-1", "token", request, &lookup).await;
+
+        match result {
+            CallbackResult::Conflict(err) => {
+                assert_eq!(err.error, "task_already_terminal");
+                assert_eq!(err.state.as_deref(), Some("CANCELLED"));
+            }
+            other => panic!("Expected Conflict, got {:?}", other),
+        }
+        assert!(ledger.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_handle_heartbeat_with_cancel() {
         let ledger = Arc::new(MockLedger::default());
         let validator = Arc::new(MockTokenValidator::allow_all());
@@ -1006,6 +1287,7 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
                 asset_key: None,
                 partition_key: None,
                 code_version: None,
@@ -1049,6 +1331,7 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
                 asset_key: None,
                 partition_key: None,
                 code_version: None,
@@ -1090,6 +1373,7 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
                 asset_key: None,
                 partition_key: None,
                 code_version: None,
@@ -1131,6 +1415,7 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
                 asset_key: None,
                 partition_key: None,
                 code_version: None,
@@ -1173,6 +1458,7 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
                 asset_key: None,
                 partition_key: None,
                 code_version: None,
@@ -1221,6 +1507,7 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
                 asset_key: Some("analytics.daily".to_string()),
                 partition_key: Some("2025-01-15".to_string()),
                 code_version: Some("v1.2.3".to_string()),
@@ -1302,6 +1589,7 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
                 asset_key: Some("analytics.daily".to_string()),
                 partition_key: Some("2025-01-15".to_string()),
                 code_version: Some("v1.2.3".to_string()),
@@ -1375,6 +1663,7 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
                 asset_key: None,
                 partition_key: None,
                 code_version: None,
@@ -1420,6 +1709,7 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
                 asset_key: None,
                 partition_key: None,
                 code_version: None,
@@ -1471,6 +1761,7 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
                 asset_key: None,
                 partition_key: None,
                 code_version: None,
@@ -1533,6 +1824,7 @@ mod tests {
                 attempt: 1,
                 attempt_id: "att-1".to_string(),
                 run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
                 asset_key: None,
                 partition_key: None,
                 code_version: None,

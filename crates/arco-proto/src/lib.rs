@@ -387,6 +387,68 @@ impl std::fmt::Display for OrchestrationEventContractError {
 
 impl std::error::Error for OrchestrationEventContractError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerCallbackContractError {
+    AttemptMustBePositive,
+    ProgressPctOutOfRange(u32),
+}
+
+impl std::fmt::Display for WorkerCallbackContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AttemptMustBePositive => f.write_str("worker callback attempt must be >= 1"),
+            Self::ProgressPctOutOfRange(value) => {
+                write!(
+                    f,
+                    "worker heartbeat progress_pct must be between 0 and 100: {value}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for WorkerCallbackContractError {}
+
+fn validate_worker_attempt(attempt: u32) -> Result<(), WorkerCallbackContractError> {
+    if attempt == 0 {
+        Err(WorkerCallbackContractError::AttemptMustBePositive)
+    } else {
+        Ok(())
+    }
+}
+
+impl WorkerDispatchEnvelope {
+    pub fn validate_contract(&self) -> Result<(), WorkerCallbackContractError> {
+        validate_worker_attempt(self.attempt)
+    }
+}
+
+impl WorkerTaskStartedRequest {
+    pub fn validate_contract(&self) -> Result<(), WorkerCallbackContractError> {
+        validate_worker_attempt(self.attempt)
+    }
+}
+
+impl WorkerHeartbeatRequest {
+    pub fn validate_contract(&self) -> Result<(), WorkerCallbackContractError> {
+        validate_worker_attempt(self.attempt)?;
+        if let Some(progress_pct) = self.progress_pct {
+            if progress_pct > 100 {
+                return Err(WorkerCallbackContractError::ProgressPctOutOfRange(
+                    progress_pct,
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl WorkerTaskCompletedRequest {
+    pub fn validate_contract(&self) -> Result<(), WorkerCallbackContractError> {
+        validate_worker_attempt(self.attempt)
+    }
+}
+
 impl TaskOutput {
     pub fn validate_contract(&self) -> Result<(), TaskOutputContractError> {
         if self.materialization_id.is_none() {

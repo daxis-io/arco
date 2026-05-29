@@ -7,6 +7,7 @@ from textwrap import dedent
 from typing import TYPE_CHECKING
 
 import pytest
+from pytest import MonkeyPatch
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -165,7 +166,9 @@ class TestManifestE2E:
 class TestCLIE2E:
     """End-to-end CLI tests."""
 
-    def test_deploy_dry_run_e2e(self, project_with_assets: Path) -> None:
+    def test_deploy_dry_run_e2e(
+        self, project_with_assets: Path, monkeypatch: MonkeyPatch
+    ) -> None:
         """Full deploy dry-run flow works."""
         from typer.testing import CliRunner
 
@@ -173,8 +176,8 @@ class TestCLIE2E:
 
         runner = CliRunner()
 
-        with runner.isolated_filesystem(temp_dir=project_with_assets):
-            result = runner.invoke(app, ["deploy", "--dry-run"])
+        monkeypatch.chdir(project_with_assets)
+        result = runner.invoke(app, ["deploy", "--dry-run"])
 
         assert result.exit_code == 0
         # Should show deployment summary or assets found message
@@ -182,7 +185,9 @@ class TestCLIE2E:
         stdout = result.stdout.lower()
         assert "assets" in stdout or "manifest" in stdout or "dry run" in stdout
 
-    def test_validate_e2e(self, project_with_assets: Path) -> None:
+    def test_validate_e2e(
+        self, project_with_assets: Path, monkeypatch: MonkeyPatch
+    ) -> None:
         """Full validate flow works."""
         from typer.testing import CliRunner
 
@@ -190,8 +195,8 @@ class TestCLIE2E:
 
         runner = CliRunner()
 
-        with runner.isolated_filesystem(temp_dir=project_with_assets):
-            result = runner.invoke(app, ["validate"])
+        monkeypatch.chdir(project_with_assets)
+        result = runner.invoke(app, ["validate"])
 
         assert result.exit_code == 0
         assert "valid" in result.stdout.lower() or "assets" in result.stdout.lower()

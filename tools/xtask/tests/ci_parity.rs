@@ -82,6 +82,27 @@ fn ci_runs_proto_contract_checks() {
 }
 
 #[test]
+fn ci_allows_documented_hard_cut_baseline_refreshes() {
+    let ci =
+        fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).expect("read CI workflow");
+
+    assert!(
+        ci.contains("git diff --quiet FETCH_HEAD HEAD -- proto-baselines/post-hard-cut-v1.binpb"),
+        "CI should identify PRs that refresh the frozen hard-cut proto baseline"
+    );
+    assert!(
+        ci.contains("git diff --quiet FETCH_HEAD HEAD -- proto/STYLE.md"),
+        "CI should require a hard-cut policy update when the proto baseline changes"
+    );
+    assert!(
+        ci.contains(
+            "The frozen baseline check above remains authoritative for this hard-cut window."
+        ),
+        "CI should keep the frozen baseline check authoritative during hard-cut refreshes"
+    );
+}
+
+#[test]
 fn cargo_deny_policy_denies_yanked_crates() {
     let deny_toml = fs::read_to_string(repo_root().join("deny.toml")).expect("read deny.toml");
 

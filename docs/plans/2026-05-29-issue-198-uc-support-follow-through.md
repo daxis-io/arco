@@ -61,7 +61,7 @@ Also extend the existing default-mount smoke test to assert `GET /api/2.1/unity-
 Run:
 
 ```bash
-CARGO_TARGET_DIR=/Users/ethanurbanski/arco/target cargo test -p arco-integration-tests --test unity_catalog_smoke custom_mount_known_uc_gaps_return_structured_501 -- --nocapture
+cargo test -p arco-integration-tests --test unity_catalog_smoke custom_mount_known_uc_gaps_return_structured_501 -- --nocapture
 ```
 
 Expected before implementation: FAIL with `404` or a missing `NOT_SUPPORTED` payload for the custom mount path.
@@ -109,8 +109,8 @@ If Axum extractor support is cleaner with `Request`, use that instead, but keep 
 Run:
 
 ```bash
-CARGO_TARGET_DIR=/Users/ethanurbanski/arco/target cargo test -p arco-integration-tests --test unity_catalog_smoke -- --nocapture
-CARGO_TARGET_DIR=/Users/ethanurbanski/arco/target cargo test -p arco-uc --test support_registry -- --nocapture
+cargo test -p arco-integration-tests --test unity_catalog_smoke -- --nocapture
+cargo test -p arco-uc --test support_registry -- --nocapture
 ```
 
 Expected after implementation: both commands pass.
@@ -169,9 +169,9 @@ Expected: build succeeds.
 Run:
 
 ```bash
-CARGO_TARGET_DIR=/Users/ethanurbanski/arco/target cargo test -p arco-integration-tests --test unity_catalog_smoke -- --nocapture
-CARGO_TARGET_DIR=/Users/ethanurbanski/arco/target cargo test -p arco-uc --test support_registry -- --nocapture
-CARGO_TARGET_DIR=/Users/ethanurbanski/arco/target cargo test -p arco-uc --test openapi_compliance -- --nocapture
+cargo test -p arco-integration-tests --test unity_catalog_smoke -- --nocapture
+cargo test -p arco-uc --test support_registry -- --nocapture
+cargo test -p arco-uc --test openapi_compliance -- --nocapture
 cargo fmt --check
 git diff --check
 cd docs/guide && mdbook build

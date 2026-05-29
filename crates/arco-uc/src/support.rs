@@ -505,6 +505,25 @@ pub(crate) fn unsupported_message(method: &Method, path: &str) -> Option<String>
     None
 }
 
+pub(crate) fn unsupported_message_for_display(
+    method: &Method,
+    match_path: &str,
+    display_path: &str,
+) -> Option<String> {
+    let method = method.as_str();
+    if let Some(matched) = operation_support(method, match_path) {
+        let operation = matched.operation;
+        if operation.support_level.returns_not_implemented() {
+            return Some(unsupported_registry_message(
+                method,
+                display_path,
+                operation,
+            ));
+        }
+    }
+    None
+}
+
 fn unsupported_registry_message(
     method: &str,
     path: &str,

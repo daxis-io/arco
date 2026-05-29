@@ -153,3 +153,36 @@ async fn custom_mount_known_uc_gaps_return_structured_501() {
     assert!(message.contains("support-level=planned"));
     assert!(message.contains("route-group=Volumes"));
 }
+
+#[tokio::test]
+async fn custom_mount_mounted_unsupported_routes_keep_registry_metadata() {
+    let mut config = uc_enabled_config();
+    config.unity_catalog.mount_prefix = "/uc".to_string();
+    let server = ServerBuilder::new().config(config).build();
+    let router = server.test_router();
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/uc/permissions/table/main.default.orders")
+                .header("Authorization", "Bearer dev-token")
+                .header("X-Tenant-Id", "acme")
+                .header("X-Workspace-Id", "analytics")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(payload["error"]["error_code"], "NOT_SUPPORTED");
+    let message = payload["error"]["message"].as_str().expect("message");
+    assert!(message.contains("PATCH /uc/permissions/table/main.default.orders"));
+    assert!(message.contains("support-level=known-unsupported"));
+    assert!(message.contains("route-group=Grants"));
+}

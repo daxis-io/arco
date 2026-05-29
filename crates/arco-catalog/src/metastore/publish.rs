@@ -142,8 +142,7 @@ pub async fn publish_metastore_projection_set(
     let ledger_watermark = projection_set
         .files
         .first()
-        .map(|file| file.ledger_watermark.clone())
-        .unwrap_or_else(|| "empty".to_string());
+        .map_or_else(|| "empty".to_string(), |file| file.ledger_watermark.clone());
 
     for file in &projection_set.files {
         let bytes = file.write_parquet()?;

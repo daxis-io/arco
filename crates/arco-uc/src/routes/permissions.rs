@@ -38,6 +38,10 @@ pub fn routes() -> Router<UnityCatalogState> {
 }
 
 /// `GET /permissions/{securable_type}/{full_name}` (Scope A).
+///
+/// # Errors
+///
+/// Returns an error when the securable cannot be resolved or permission reads are denied.
 #[utoipa::path(
     get,
     path = "/permissions/{securable_type}/{full_name}",

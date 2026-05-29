@@ -568,6 +568,7 @@ impl<S: StorageBackend> MetadataLogWalker<S> {
     ///
     /// Returns errors for unrecoverable issues; read/parse errors are recorded
     /// in the walk result statistics and skipped.
+    #[allow(clippy::cognitive_complexity)]
     pub async fn walk_with_report(
         &self,
         current_metadata_location: &str,

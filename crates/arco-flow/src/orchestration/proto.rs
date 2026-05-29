@@ -1032,6 +1032,7 @@ fn task_finished_error_from_proto(
     }
 }
 
+#[allow(clippy::single_option_map)]
 fn public_output_from_materialization(
     materialization_id: Option<&str>,
 ) -> Option<proto::TaskOutput> {

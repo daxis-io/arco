@@ -315,12 +315,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
                         );
                         domain_commits.push(commit);
                     }
-                    RootMutation::Metastore(_) => {
-                        return Err(ApiError::not_implemented(
-                            "metastore root mutations are not implemented yet",
-                        ));
-                    }
-                    RootMutation::ScopedMetastore(_) => {
+                    RootMutation::Metastore(_) | RootMutation::ScopedMetastore(_) => {
                         return Err(ApiError::not_implemented(
                             "metastore root mutations are not implemented yet",
                         ));
@@ -579,6 +574,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         })
     }
 
+    #[allow(clippy::cognitive_complexity)]
     async fn execute_orchestration_batch(
         &self,
         meta: &ResolvedRequestMetadata,
@@ -848,7 +844,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
                                 WriteOutcome::Written => {
                                     return Ok(IdempotencyClaim::Fresh(replacement));
                                 }
-                                WriteOutcome::PreconditionFailed => continue,
+                                WriteOutcome::PreconditionFailed => {}
                             }
                         }
                     }

@@ -539,7 +539,6 @@ impl Tier1Compactor {
                             message: "manifest update lost CAS race after max retries".to_string(),
                         });
                     }
-                    continue;
                 }
             }
         }
@@ -724,7 +723,6 @@ impl Tier1Compactor {
                                 .to_string(),
                         });
                     }
-                    continue;
                 }
             }
         }
@@ -918,7 +916,6 @@ impl Tier1Compactor {
                                 .to_string(),
                         });
                     }
-                    continue;
                 }
             }
         }

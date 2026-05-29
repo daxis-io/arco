@@ -1238,7 +1238,7 @@ async fn refresh_repair_backlog_metrics(
     );
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn run_repair_automation_once(state: &Arc<ServiceState>) {
     if state.repair_automation.mode == RepairAutomationMode::Disabled {
         return;

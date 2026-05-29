@@ -374,7 +374,7 @@ async fn store_backfill_state(
             .map_err(|err| map_internal_error("write delta preview backfill state", err))?;
         match write {
             WriteResult::Success { .. } => return Ok(()),
-            WriteResult::PreconditionFailed { .. } => continue,
+            WriteResult::PreconditionFailed { .. } => {}
         }
     }
 

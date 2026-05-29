@@ -1195,7 +1195,7 @@ fn validate_event_enum<TEnum>(
     event_name: &'static str,
     field_name: &'static str,
     value: i32,
-    unspecified: TEnum,
+    unspecified: &TEnum,
 ) -> Result<(), OrchestrationEventContractError>
 where
     TEnum: TryFrom<i32> + PartialEq,
@@ -1203,7 +1203,7 @@ where
     let parsed = TEnum::try_from(value).map_err(|_| {
         OrchestrationEventContractError::UnknownEventEnum(event_name, field_name, value)
     })?;
-    if parsed == unspecified {
+    if &parsed == unspecified {
         Err(OrchestrationEventContractError::UnspecifiedEventEnum(
             event_name, field_name,
         ))
@@ -1251,7 +1251,7 @@ fn validate_task_error(
         event_name,
         field_name,
         error.category,
-        TaskErrorCategory::Unspecified,
+        &TaskErrorCategory::Unspecified,
     )?;
     validate_event_string(event_name, "error.message", &error.message)
 }
@@ -1391,7 +1391,7 @@ fn validate_task_finished_event(
         "task_finished",
         "outcome",
         event.outcome,
-        TaskOutcome::Unspecified,
+        &TaskOutcome::Unspecified,
     )?;
     validate_task_error("task_finished", "error", event.error.as_ref())?;
     validate_event_optional_string(
@@ -1422,7 +1422,7 @@ fn validate_task_output_visibility_changed_event(
         "task_output_visibility_changed",
         "visibility_state",
         event.visibility_state,
-        OutputVisibilityState::Unspecified,
+        &OutputVisibilityState::Unspecified,
     )?;
     validate_event_timestamp(
         "task_output_visibility_changed",
@@ -1455,7 +1455,7 @@ fn validate_timer_requested_event(
         "timer_requested",
         "timer_type",
         event.timer_type,
-        TimerType::Unspecified,
+        &TimerType::Unspecified,
     )?;
     validate_event_optional_string("timer_requested", "run_id", event.run_id.as_ref())?;
     validate_event_optional_string("timer_requested", "task_key", event.task_key.as_ref())?;
@@ -1489,7 +1489,7 @@ fn validate_timer_fired_event(event: &TimerFired) -> Result<(), OrchestrationEve
         "timer_fired",
         "timer_type",
         event.timer_type,
-        TimerType::Unspecified,
+        &TimerType::Unspecified,
     )?;
     validate_event_optional_string("timer_fired", "run_id", event.run_id.as_ref())?;
     validate_event_optional_string("timer_fired", "task_key", event.task_key.as_ref())?;
@@ -1531,7 +1531,7 @@ fn validate_schedule_ticked_event(
         "schedule_ticked",
         "status",
         event.status,
-        TickStatus::Unspecified,
+        &TickStatus::Unspecified,
     )?;
     validate_event_optional_string(
         "schedule_ticked",
@@ -1576,7 +1576,7 @@ fn validate_sensor_evaluated_event(
         "sensor_evaluated",
         "status",
         event.status,
-        SensorEvalStatus::Unspecified,
+        &SensorEvalStatus::Unspecified,
     )?;
     validate_event_optional_string(
         "sensor_evaluated",
@@ -1651,13 +1651,13 @@ fn validate_backfill_state_changed_event(
         "backfill_state_changed",
         "from_state",
         event.from_state,
-        BackfillState::Unspecified,
+        &BackfillState::Unspecified,
     )?;
     validate_event_enum(
         "backfill_state_changed",
         "to_state",
         event.to_state,
-        BackfillState::Unspecified,
+        &BackfillState::Unspecified,
     )?;
     validate_event_nonzero_u32(
         "backfill_state_changed",

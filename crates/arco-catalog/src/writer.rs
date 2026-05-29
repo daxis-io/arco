@@ -864,7 +864,7 @@ impl CatalogWriter {
         outcome
     }
 
-    fn default_catalog_id<'a>(state: &'a crate::state::CatalogState) -> Option<&'a str> {
+    fn default_catalog_id(state: &crate::state::CatalogState) -> Option<&str> {
         state
             .catalogs
             .iter()
@@ -2721,7 +2721,11 @@ impl CatalogWriter {
     /// - Namespace doesn't exist
     /// - Table name already exists in namespace
     /// - Lock acquisition or storage operations fail
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::manual_let_else,
+        clippy::single_match_else,
+        clippy::too_many_lines
+    )]
     pub async fn register_table(
         &self,
         req: RegisterTableRequest,
@@ -2869,7 +2873,11 @@ impl CatalogWriter {
     /// # Errors
     ///
     /// Returns the same errors as [`Self::register_table`].
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::manual_let_else,
+        clippy::single_match_else,
+        clippy::too_many_lines
+    )]
     pub async fn register_table_transaction(
         &self,
         req: RegisterTableRequest,
@@ -3266,7 +3274,11 @@ impl CatalogWriter {
     /// # Errors
     ///
     /// Returns the same errors as [`Self::register_table_in_schema`].
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::manual_let_else,
+        clippy::single_match_else,
+        clippy::too_many_lines
+    )]
     pub async fn register_table_in_schema_transaction(
         &self,
         catalog: &str,
@@ -3464,7 +3476,11 @@ impl CatalogWriter {
     /// - Table doesn't exist
     /// - `opts.if_match` doesn't match current version
     /// - Lock acquisition or storage operations fail
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::manual_let_else,
+        clippy::single_match_else,
+        clippy::too_many_lines
+    )]
     pub async fn update_table(
         &self,
         namespace: &str,
@@ -3621,7 +3637,11 @@ impl CatalogWriter {
     /// # Errors
     ///
     /// Returns the same errors as [`Self::update_table`].
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::manual_let_else,
+        clippy::single_match_else,
+        clippy::too_many_lines
+    )]
     pub async fn update_table_transaction(
         &self,
         namespace: &str,
@@ -3783,7 +3803,11 @@ impl CatalogWriter {
     /// # Errors
     ///
     /// Returns the same errors as [`Self::update_table`].
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::manual_let_else,
+        clippy::single_match_else,
+        clippy::too_many_lines
+    )]
     pub async fn update_table_in_schema_transaction(
         &self,
         catalog: &str,
@@ -3985,6 +4009,7 @@ impl CatalogWriter {
     /// Returns an error if:
     /// - Table doesn't exist
     /// - Lock acquisition or storage operations fail
+    #[allow(clippy::manual_let_else, clippy::single_match_else)]
     pub async fn drop_table(&self, namespace: &str, name: &str, opts: WriteOptions) -> Result<()> {
         // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
         if let Some(expected) = &opts.if_match {
@@ -4094,6 +4119,11 @@ impl CatalogWriter {
     /// # Errors
     ///
     /// Returns the same errors as [`Self::drop_table`].
+    #[allow(
+        clippy::manual_let_else,
+        clippy::single_match_else,
+        clippy::too_many_lines
+    )]
     pub async fn drop_table_transaction(
         &self,
         namespace: &str,
@@ -4216,6 +4246,11 @@ impl CatalogWriter {
     /// # Errors
     ///
     /// Returns the same errors as [`Self::drop_table`].
+    #[allow(
+        clippy::manual_let_else,
+        clippy::single_match_else,
+        clippy::too_many_lines
+    )]
     pub async fn drop_table_in_schema_transaction(
         &self,
         catalog: &str,

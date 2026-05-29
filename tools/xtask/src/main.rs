@@ -821,7 +821,7 @@ fn run_lint() -> Result<()> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !name.starts_with("arco-") {
-            anyhow::bail!("Crate '{}' does not follow arco-* naming", name);
+            anyhow::bail!("Crate '{name}' does not follow arco-* naming");
         }
     }
 
@@ -1895,22 +1895,19 @@ async fn verify_executions_state(
         Some(snapshot_path) => {
             if !snapshot_path.starts_with(&state_dir) {
                 errors.push(format!(
-                    "Executions snapshot path '{}' is not under '{}'",
-                    snapshot_path, state_dir
+                    "Executions snapshot path '{snapshot_path}' is not under '{state_dir}'"
                 ));
             }
             if !snapshot_path.ends_with(".parquet") {
                 errors.push(format!(
-                    "Executions snapshot path '{}' does not end with .parquet",
-                    snapshot_path
+                    "Executions snapshot path '{snapshot_path}' does not end with .parquet"
                 ));
             }
             match storage.head_raw(snapshot_path).await {
                 Ok(Some(_)) => {}
-                Ok(None) => errors.push(format!("Executions snapshot missing: {}", snapshot_path)),
+                Ok(None) => errors.push(format!("Executions snapshot missing: {snapshot_path}")),
                 Err(e) => errors.push(format!(
-                    "Failed to read executions snapshot '{}': {e}",
-                    snapshot_path
+                    "Failed to read executions snapshot '{snapshot_path}': {e}"
                 )),
             }
             if manifest.snapshot_version == 0 {
@@ -2063,8 +2060,7 @@ async fn verify_catalog_manifest_history(
             Ok(previous) => previous,
             Err(e) => {
                 errors.push(format!(
-                    "Invalid catalog manifest JSON at '{}': {e}",
-                    previous_path
+                    "Invalid catalog manifest JSON at '{previous_path}': {e}"
                 ));
                 break;
             }
@@ -2073,8 +2069,7 @@ async fn verify_catalog_manifest_history(
         let previous_hash = sha256_prefixed(bytes.as_ref());
         if let Err(e) = manifest.validate_succession(&previous, &previous_hash) {
             errors.push(format!(
-                "Manifest history mismatch for '{}': {e}",
-                manifest_path
+                "Manifest history mismatch for '{manifest_path}': {e}"
             ));
         }
 
@@ -2357,10 +2352,7 @@ fn check_cargo_deny() -> Result<String> {
 
     if deny_version < min {
         anyhow::bail!(
-            "expected cargo-deny >= {}, found {}. Install: cargo install cargo-deny --version {}",
-            min,
-            deny_version,
-            min
+            "expected cargo-deny >= {min}, found {deny_version}. Install: cargo install cargo-deny --version {min}"
         );
     }
 
@@ -2394,9 +2386,7 @@ fn check_buf() -> Result<String> {
 
     if local != expected {
         anyhow::bail!(
-            "version mismatch: local={}, CI={}. Use the CI-pinned buf version for local release gates",
-            local,
-            expected
+            "version mismatch: local={local}, CI={expected}. Use the CI-pinned buf version for local release gates"
         );
     }
 

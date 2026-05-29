@@ -299,7 +299,7 @@ impl DeltaCommitCoordinator {
                         .await?;
                     match write {
                         WriteResult::PreconditionFailed { .. } | WriteResult::Success { .. } => {}
-                    };
+                    }
                 }
 
                 let read_version = inflight
@@ -438,7 +438,7 @@ impl DeltaCommitCoordinator {
                         version: new_version,
                     });
                 }
-                WriteResult::PreconditionFailed { .. } => continue,
+                WriteResult::PreconditionFailed { .. } => {}
             }
         }
 
@@ -475,7 +475,7 @@ impl DeltaCommitCoordinator {
             let put = self.store_state(&updated, Some(&version)).await?;
             match put {
                 WriteResult::Success { .. } => return Ok(()),
-                WriteResult::PreconditionFailed { .. } => continue,
+                WriteResult::PreconditionFailed { .. } => {}
             }
         }
 
@@ -521,7 +521,7 @@ impl DeltaCommitCoordinator {
             let put = self.store_state(&updated, Some(&version)).await?;
             match put {
                 WriteResult::Success { .. } => return Ok(()),
-                WriteResult::PreconditionFailed { .. } => continue,
+                WriteResult::PreconditionFailed { .. } => {}
             }
         }
 

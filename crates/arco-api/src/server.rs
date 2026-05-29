@@ -738,6 +738,7 @@ impl Server {
     /// # Errors
     ///
     /// Returns an error if the server cannot start or bind to the port.
+    #[allow(clippy::cognitive_complexity)]
     pub async fn serve(&self) -> Result<()> {
         self.validate_config()?;
 

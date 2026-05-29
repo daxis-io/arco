@@ -31,6 +31,18 @@ check_literal() {
   fi
 }
 
+check_absent() {
+  local file="$1"
+  local needle="$2"
+  local description="$3"
+
+  if grep -Fq "${needle}" "${file}"; then
+    fail "${description}"
+  else
+    pass "${description}"
+  fi
+}
+
 check_regex() {
   local file="$1"
   local pattern="$2"
@@ -50,7 +62,7 @@ check_literal "${WORKFLOW_PATH}" "name: Wait for release-tag CI success" "Workfl
 check_literal "${WORKFLOW_PATH}" "actions/workflows/ci.yml/runs?event=push&per_page=100" "Workflow queries CI workflow runs by commit SHA"
 check_literal "${WORKFLOW_PATH}" "actions/runs/\${run_id}/jobs?per_page=100" "Workflow checks CI jobs for Release Tag Discipline result"
 check_literal "${WORKFLOW_PATH}" "run_conclusion" "Workflow inspects overall CI workflow conclusion for backward compatibility"
-check_literal "${WORKFLOW_PATH}" "falling back to successful CI run conclusion" "Workflow documents fallback when older CI runs lack Release Tag Discipline job"
+check_absent "${WORKFLOW_PATH}" "falling back to successful CI run conclusion" "Workflow does not bypass Release Tag Discipline when older CI runs lack the job"
 check_literal "${WORKFLOW_PATH}" "gpg.ssh.allowedSignersFile=\".github/release-signers.allowed\"" "Workflow verifies signed tags against repository allowed-signers file"
 check_literal "${WORKFLOW_PATH}" "verify-tag \"\${RELEASE_TAG}\" > \"arco-\${RELEASE_TAG}.tag-verify.txt\"" "Workflow captures deterministic tag verification transcript"
 check_literal "${CI_WORKFLOW_PATH}" "tags: ['v*']" "CI triggers on release-like tag pushes"

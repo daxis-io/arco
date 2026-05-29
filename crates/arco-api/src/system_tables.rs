@@ -218,6 +218,7 @@ async fn register_domain_specs(
     Ok(registered)
 }
 
+#[allow(clippy::cognitive_complexity)]
 async fn register_orchestration_tables(
     storage: &ScopedStorage,
     requested_tables: &HashSet<String>,

@@ -372,7 +372,7 @@ impl Compactor {
         self.compact_domain_with_events(domain, work).await
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     async fn compact_domain_with_events(
         &self,
         domain: CatalogDomain,
@@ -696,6 +696,7 @@ impl Compactor {
         }
     }
 
+    #[allow(clippy::cognitive_complexity)]
     async fn handle_late_events(&self, domain: CatalogDomain, paths: &[String]) -> Result<()> {
         if paths.is_empty() {
             return Ok(());

@@ -391,7 +391,7 @@ impl<S: StorageBackend, P: PointerStore> MultiTableTransactionCoordinator<S, P> 
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     async fn prepare_table(
         &self,
         input: &TableCommitInput,

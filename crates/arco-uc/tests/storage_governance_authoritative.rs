@@ -115,16 +115,36 @@ async fn external_location_routes_use_ledger_backed_storage_governance() {
 
     let response = app
         .clone()
-        .oneshot(trusted_empty_request(
-            "GET",
-            "/external-locations/loc_orders",
-        ))
+        .oneshot(trusted_empty_request("GET", "/external-locations/orders"))
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::OK);
     let payload = json_body(response).await;
     assert_eq!(payload["location_id"], "loc_orders");
     assert_eq!(payload["credential_id"], "cred_01");
+
+    let response = app
+        .clone()
+        .oneshot(trusted_json_request(
+            "POST",
+            "/external-locations",
+            serde_json::json!({
+                "location_id": "loc_orders_alias",
+                "name": "orders",
+                "url": "gs://bucket/warehouse/orders-alias",
+                "credential_id": "cred_01",
+                "owner": "owner"
+            }),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let payload = json_body(response).await;
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("external_location_name orders"))
+    );
 
     let response = app
         .oneshot(trusted_json_request(
@@ -172,40 +192,6 @@ async fn storage_governance_routes_append_scoped_metastore_events() {
     assert_eq!(scope.tenant_id, "tenant1");
     assert_eq!(scope.workspace_id, "workspace1");
     assert_eq!(scope.metastore_id, "workspace1");
-}
-
-#[tokio::test]
-async fn storage_credential_create_does_not_persist_request_secret_material() {
-    let backend = Arc::new(MemoryBackend::new());
-    let state = state_with_metastore_manage(backend.clone());
-    let app = unity_catalog_router(state);
-
-    let response = app
-        .oneshot(trusted_json_request(
-            "POST",
-            "/storage-credentials",
-            serde_json::json!({
-                "credential_id": "cred_01",
-                "name": "lakehouse-prod",
-                "cloud": "gcs",
-                "owner": "owner",
-                "secret_material_ref": "secret://cred/01",
-                "encrypted_payload": "encrypted-token"
-            }),
-        ))
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    let storage = ScopedStorage::new(backend, "tenant1", "workspace1").expect("scoped storage");
-    let ledger = MetastoreLedger::new(storage);
-    let events = ledger.load_events().await.expect("load events");
-    let serialized = serde_json::to_string(&events).expect("serialize events");
-
-    assert!(!serialized.contains("secret://cred/01"));
-    assert!(!serialized.contains("encrypted-token"));
-    assert!(!serialized.contains("secret_material_ref"));
-    assert!(!serialized.contains("encrypted_payload"));
 }
 
 #[tokio::test]

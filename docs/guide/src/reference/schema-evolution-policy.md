@@ -4,27 +4,11 @@ This page summarizes compatibility rules across the catalog product surface.
 
 ## Protobuf
 
-Arco's alpha/beta proto surface intentionally replaced the original `arco.v1`
-package with domain-aligned packages: `arco.common.v1`, `arco.catalog.v1`,
-`arco.orchestration.v1`, and `arco.controlplane.v1`.
-
-During alpha/beta, additional breaking `v1` changes can happen without cutting
-`v2` only as an explicit hard-cut window. That window must document migration
-impact, regenerate `proto-baselines/post-hard-cut-v1.binpb`, and keep
-`cargo xtask proto-breaking-check` passing afterward.
-
-Outside an explicit hard-cut window, protobuf changes must be additive, preserve
-generated source, package/service, binary, and ProtoJSON compatibility, and pass
-`cargo xtask proto-breaking-check` against the frozen baseline. Once Arco declares a stable public API, breaking
-reshapes require future `v2` packages.
-
-Current hard-cut migration note: `arco.catalog.v1.RegisterTableOp.format` is an
-optional enum. Producers should omit the field for the Delta Lake default and
-must not send `TABLE_FORMAT_UNSPECIFIED` on `RegisterTableOp`.
-
-HTTP protobuf transaction routes require message-qualified content types such as
-`application/x-protobuf; proto=arco.controlplane.v1.ApplyCatalogDdlRequest` so
-legacy or generic protobuf bodies fail closed before decoding.
+The `arco.*.v1` protobuf packages are durable public API packages. Changes must
+be additive, preserve binary and ProtoJSON compatibility, and pass
+`cargo xtask proto-breaking-check` against
+`proto-baselines/post-hard-cut-v1.binpb`. Breaking reshapes require future `v2`
+packages.
 
 ## Parquet And Arrow
 

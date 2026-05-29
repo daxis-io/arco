@@ -64,6 +64,7 @@ const ORCHESTRATION_SCHEMA: &str = "orchestration";
 const ORCHESTRATION_SYSTEM_TABLES: &[&str] = &[
     "runs",
     "tasks",
+    "catalog_run_index",
     "dep_satisfaction",
     "timers",
     "dispatch_outbox",
@@ -258,6 +259,17 @@ async fn register_orchestration_tables(
         )
         .await?;
     }
+    if requested_tables.contains("catalog_run_index") {
+        registered += register_table_artifact(
+            schema_provider,
+            storage,
+            "catalog_run_index",
+            table_paths
+                .catalog_run_index_by_org
+                .get(storage.tenant_id()),
+        )
+        .await?;
+    }
     if requested_tables.contains("dep_satisfaction") {
         registered += register_table_artifact(
             schema_provider,
@@ -406,6 +418,7 @@ mod tests {
             ("lineage", "edges"),
             ("orchestration", "runs"),
             ("orchestration", "tasks"),
+            ("orchestration", "catalog_run_index"),
             ("orchestration", "dep_satisfaction"),
             ("orchestration", "timers"),
             ("orchestration", "dispatch_outbox"),

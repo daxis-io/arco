@@ -24,13 +24,8 @@ The core product promise is:
 - `crates/arco-uc/src/routes/delta_commits.rs` implements real coordinator-backed commit behavior, but it is not yet sufficiently bound to authoritative catalog table state.
 - `crates/arco-uc/src/routes/delta_commits.rs` can discover commit state from `_delta_log` listing through a table-ID-derived path; managed Delta correctness should use known-key/coordinator state in hot paths.
 - `crates/arco-uc/tests/delta_commit_coordinator_semantics.rs` tests coordinator behavior, but current coverage does not prove catalog table identity, table type, storage location, or grants are enforced.
-- `crates/arco-uc/src/routes/credentials.rs` now has partial governed
-  table/path credential behavior, but managed Delta write paths still need
-  stronger table identity, storage-location, provider-material, and revocation
-  coverage.
-- `crates/arco-uc/src/routes/permissions.rs` now exposes compiled assignments
-  on `GET /permissions`; writer-backed grant persistence and
-  `PATCH /permissions` remain unsupported.
+- `crates/arco-uc/src/routes/credentials.rs` still has placeholder temporary credential behavior.
+- `crates/arco-uc/src/routes/permissions.rs` still has scaffolded permission behavior.
 - `docs/adr/adr-030-delta-uc-metastore.md` already states the right invariants: no correctness-critical listing, catalog-managed Delta framing, staging upload, and first-class Delta metadata projections.
 - `docs/guide/src/reference/control-plane-scope.md` currently marks broader credentials, grants, and policy state as planned.
 
@@ -495,13 +490,9 @@ Cover:
 
 Check caller principal, securable object, operation, and inherited grants before staging or committing.
 
-**Step 3: Bind managed Delta to governed temporary credentials**
+**Step 3: Replace placeholder temporary credentials**
 
-Build on the existing governed table/path credential decision path. Managed
-Delta write credentials must resolve table/location, evaluate grants, enforce
-storage governance, and return the operation, storage scope, provider-specific
-credential payloads, expiry, and revocation metadata once provider minting is
-implemented.
+Issue scoped temporary credentials only after resolving table/location and evaluating grants. Responses must contain expiry, operation, storage scope, and provider-specific credential payloads.
 
 **Step 4: Run focused tests**
 

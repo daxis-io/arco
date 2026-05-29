@@ -150,9 +150,6 @@ message DomainMutation {
     // Current API adapters validate and hash these mutations, then return
     // NOT_IMPLEMENTED until metastore root commit execution is implemented.
     arco.catalog.v1.MetastoreMutation metastore = 3;
-    // Scoped form of the metastore mutation contract. The scope models tenant,
-    // workspace, and metastore authority separately; it follows the same
-    // NOT_IMPLEMENTED runtime path as unscoped metastore mutations today.
     ScopedMetastoreMutation scoped_metastore = 4;
   }
 }

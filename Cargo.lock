@@ -195,6 +195,7 @@ dependencies = [
  "arco-proto",
  "arco-test-utils",
  "arco-uc",
+ "arco-worker-contract",
  "arrow 54.3.1",
  "arrow-json",
  "async-trait",
@@ -365,6 +366,7 @@ version = "0.2.0"
 dependencies = [
  "arco-core",
  "arco-proto",
+ "arco-worker-contract",
  "arrow 54.3.1",
  "async-trait",
  "axum 0.7.9",
@@ -467,6 +469,7 @@ dependencies = [
 name = "arco-proto"
 version = "0.2.0"
 dependencies = [
+ "arco-worker-contract",
  "chrono",
  "http",
  "prost 0.13.5",
@@ -529,6 +532,20 @@ dependencies = [
  "ulid",
  "utoipa",
  "uuid",
+]
+
+[[package]]
+name = "arco-worker-contract"
+version = "0.2.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "utoipa",
 ]
 
 [[package]]

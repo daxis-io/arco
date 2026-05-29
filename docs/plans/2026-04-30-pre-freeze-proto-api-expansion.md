@@ -20,12 +20,11 @@ Complete and merged. All seven tasks landed:
 - `21c315a`: harden nested metastore mutation validation
 - `33898f4`: harden proto and repair helpers
 
-Historical note: this plan predates the alpha/beta reset policy. It records the
-hard cut that intentionally removed the old `arco.v1` package and replaced it
-with domain-aligned `arco.*.v1` packages. Current proto policy lives in
-`proto/STYLE.md`: additional breaking `v1` changes are allowed during
-alpha/beta only as an explicit baseline-reset window, and
-`cargo xtask proto-breaking-check` remains the gate outside that window.
+The pre-freeze hard cut is closed. `arco.*.v1` is now the durable public proto
+surface, and `cargo xtask proto-breaking-check` is the gate for future additive
+changes. New catalog product and metastore governance work should start from
+the frozen metastore proto baseline rather than reopening this proto expansion
+plan.
 
 The task steps below are historical execution notes for the completed hard cut,
 not current instructions for new proto work.

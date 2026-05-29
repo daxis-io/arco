@@ -216,9 +216,9 @@ fn contract_legacy_name_normalization() {
     assert_eq!(CatalogPaths::normalize_domain_name("search"), "search");
 }
 
-/// Verifies root manifest is the only stable entry point.
+/// Verifies root manifest remains stable for whole-manifest and external readers.
 #[test]
-fn contract_root_manifest_is_entry_point() {
+fn contract_root_manifest_is_whole_manifest_entry_point() {
     // Root manifest path is a constant (stable contract)
     assert_eq!(CatalogPaths::ROOT_MANIFEST, "manifests/root.manifest.json");
 

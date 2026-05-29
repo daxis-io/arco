@@ -3,6 +3,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use arco_flow::orchestration::worker_contract::WorkerDispatchEnvelope;
+use arco_worker_contract::callback_task_id;
 use chrono::{TimeZone, Utc};
 use serde_json::json;
 
@@ -10,6 +11,7 @@ fn sample_envelope() -> WorkerDispatchEnvelope {
     WorkerDispatchEnvelope {
         tenant_id: "tenant-a".to_string(),
         workspace_id: "workspace-b".to_string(),
+        task_id: callback_task_id("run-123", "analytics.daily_sales"),
         run_id: "run-123".to_string(),
         task_key: "analytics.daily_sales".to_string(),
         attempt: 2,
@@ -40,6 +42,10 @@ fn worker_dispatch_envelope_round_trips_json() {
 
     assert_eq!(parsed.tenant_id, "tenant-a");
     assert_eq!(parsed.workspace_id, "workspace-b");
+    assert_eq!(
+        parsed.task_id,
+        "ct1_cnVuLTEyMwBhbmFseXRpY3MuZGFpbHlfc2FsZXM"
+    );
     assert_eq!(parsed.run_id, "run-123");
     assert_eq!(parsed.task_key, "analytics.daily_sales");
     assert_eq!(parsed.attempt, 2);
@@ -57,6 +63,23 @@ fn worker_dispatch_envelope_round_trips_json() {
         "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
     );
     assert_eq!(parsed.payload["asset"], "analytics.daily_sales");
+}
+
+#[test]
+fn worker_dispatch_envelope_writes_canonical_camel_case_json() {
+    let envelope = sample_envelope();
+
+    let value = serde_json::to_value(&envelope).expect("serialize envelope");
+
+    assert_eq!(
+        value["taskId"],
+        "ct1_cnVuLTEyMwBhbmFseXRpY3MuZGFpbHlfc2FsZXM"
+    );
+    assert_eq!(value["taskKey"], "analytics.daily_sales");
+    assert_eq!(value["callbackBaseUrl"], "https://api.arco.dev");
+    assert_eq!(value["executionLocationId"], "local-dev");
+    assert!(value.get("task_id").is_none());
+    assert!(value.get("callback_base_url").is_none());
 }
 
 #[test]
@@ -81,6 +104,8 @@ fn worker_dispatch_envelope_accepts_legacy_json_without_execution_location() {
     let parsed: WorkerDispatchEnvelope =
         serde_json::from_value(legacy).expect("legacy envelope must deserialize");
 
+    assert_eq!(parsed.task_id, "analytics.daily_sales");
+    assert_eq!(parsed.task_key, "analytics.daily_sales");
     assert_eq!(parsed.execution_location_id, None);
     assert_eq!(parsed.worker_queue, "default-queue");
     assert_eq!(parsed.callback_base_url, "https://api.arco.dev");
@@ -94,7 +119,7 @@ fn worker_dispatch_envelope_omits_execution_location_when_absent() {
 
     let value = serde_json::to_value(&envelope).expect("serialize envelope");
 
-    assert!(value.get("execution_location_id").is_none());
+    assert!(value.get("executionLocationId").is_none());
 }
 
 #[test]
@@ -116,7 +141,7 @@ fn worker_dispatch_envelope_rejects_missing_required_fields() {
     let err = serde_json::from_value::<WorkerDispatchEnvelope>(invalid)
         .expect_err("missing callback_base_url must fail");
 
-    assert!(err.to_string().contains("callback_base_url"));
+    assert!(err.to_string().contains("callbackBaseUrl"));
 }
 
 #[test]

@@ -117,23 +117,29 @@ route family before the route is marked production-backed.
 
 ## Compatibility Labels
 
-Every public route group must have one documented compatibility label:
-`native`, `compatible-exact`, `compatible-partial`, `scaffolded`, or `planned`.
-Scaffolded routes must not be used for production enforcement.
+Every public route group must have one documented compatibility label. Unity
+Catalog compatibility routes use the route-level `arco_uc::support` registry
+with these labels: `implemented`, `compatible-partial`,
+`known-unsupported`, and `planned`. Native Arco-only surfaces may still use
+`native` when they are not compatibility adapters.
 
-The generated OpenAPI currently carries route-group descriptions, while the
-manual inventory records the repo-local support level for UC compatibility
-groups. Per-operation OpenAPI compatibility extensions or snapshots are still a
-promotion requirement before any compatibility adapter is marked
-production-backed.
+The generated OpenAPI carries per-operation support metadata for documented UC
+operations:
+
+- `x-arco-support-level`
+- `x-arco-native-backing`
+- `x-arco-authz-boundary`
+- `x-arco-known-gap` when a gap is known
+
+Known unsupported or planned UC operations must return a structured `501`
+instead of an ambiguous `404`. Unknown non-UC paths remain `404`.
 
 ## Versioning Gates
 
 - Protobuf changes follow `docs/guide/src/reference/schema-evolution-policy.md`
   and must pass the proto breaking-change gate.
 - OpenAPI changes require a checked-in diff or snapshot update with the route
-  compatibility label once the route is promoted beyond preview or
-  compatible-partial behavior.
+  compatibility label.
 - System-table schemas are public API once allowlisted and need golden-schema
   evidence.
 - A compatibility adapter cannot be promoted beyond `compatible-partial`

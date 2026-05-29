@@ -35,10 +35,10 @@ use parquet::file::properties::WriterProperties;
 use parquet::format::KeyValue;
 
 use super::fold::{
-    BackfillChunkRow, BackfillRow, DepResolution, DepSatisfactionRow, DispatchOutboxRow,
-    DispatchStatus, IdempotencyKeyRow, PartitionStatusRow, RunKeyConflictRow, RunKeyIndexRow,
-    RunRow, RunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow, SensorEvalRow,
-    SensorStateRow, TaskRow, TaskState, TimerRow, TimerState, TimerType,
+    BackfillChunkRow, BackfillRow, CatalogRunIndexRow, DepResolution, DepSatisfactionRow,
+    DispatchOutboxRow, DispatchStatus, IdempotencyKeyRow, PartitionStatusRow, RunKeyConflictRow,
+    RunKeyIndexRow, RunRow, RunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
+    SensorEvalRow, SensorStateRow, TaskRow, TaskState, TimerRow, TimerState, TimerType,
 };
 use crate::error::{Error, Result};
 use crate::orchestration::events::{
@@ -98,6 +98,47 @@ fn tasks_schema() -> Arc<Schema> {
         Field::new("delta_version", DataType::Int64, true),
         Field::new("delta_partition", DataType::Utf8, true),
         Field::new("execution_lineage_ref", DataType::Utf8, true),
+        Field::new("row_version", DataType::Utf8, false),
+    ]))
+}
+
+fn catalog_run_index_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("schema_version", DataType::UInt32, false),
+        Field::new("org_id", DataType::Utf8, false),
+        Field::new("workspace_id", DataType::Utf8, false),
+        Field::new("run_id", DataType::Utf8, false),
+        Field::new("task_key", DataType::Utf8, false),
+        Field::new("plan_id", DataType::Utf8, false),
+        Field::new("run_key", DataType::Utf8, true),
+        Field::new("kind", DataType::Utf8, true),
+        Field::new("reference_id", DataType::Utf8, true),
+        Field::new("source_type", DataType::Utf8, true),
+        Field::new("run_status", DataType::Utf8, false),
+        Field::new("cancel_requested", DataType::Boolean, false),
+        Field::new("task_status", DataType::Utf8, false),
+        Field::new("asset_key", DataType::Utf8, true),
+        Field::new("target_namespace", DataType::Utf8, true),
+        Field::new("target_table", DataType::Utf8, true),
+        Field::new("partition_key", DataType::Utf8, true),
+        Field::new("attempt", DataType::UInt32, false),
+        Field::new("attempt_id", DataType::Utf8, true),
+        Field::new("requires_visible_output", DataType::Boolean, false),
+        Field::new("materialization_id", DataType::Utf8, true),
+        Field::new("output_visibility_state", DataType::Utf8, true),
+        Field::new("published_at", DataType::Int64, true),
+        Field::new("publish_error", DataType::Utf8, true),
+        Field::new("delta_table", DataType::Utf8, true),
+        Field::new("delta_version", DataType::Int64, true),
+        Field::new("delta_partition", DataType::Utf8, true),
+        Field::new("execution_lineage_ref", DataType::Utf8, true),
+        Field::new("started_at", DataType::Int64, true),
+        Field::new("last_heartbeat_at", DataType::Int64, true),
+        Field::new("triggered_at", DataType::Int64, false),
+        Field::new("completed_at", DataType::Int64, true),
+        Field::new("updated_at", DataType::Int64, false),
+        Field::new("code_version", DataType::Utf8, true),
+        Field::new("error_message", DataType::Utf8, true),
         Field::new("row_version", DataType::Utf8, false),
     ]))
 }
@@ -367,6 +408,12 @@ pub fn sensor_evals_parquet_schema() -> Schema {
 #[must_use]
 pub fn run_key_index_parquet_schema() -> Schema {
     (*run_key_index_schema()).clone()
+}
+
+/// Returns the `catalog_run_index` schema for golden file comparison.
+#[must_use]
+pub fn catalog_run_index_parquet_schema() -> Schema {
+    (*catalog_run_index_schema()).clone()
 }
 
 /// Returns the `run_key_conflicts` schema for golden file comparison.
@@ -702,6 +749,227 @@ pub fn write_tasks(rows: &[TaskRow]) -> Result<Bytes> {
             Arc::new(delta_versions),
             Arc::new(delta_partitions),
             Arc::new(execution_lineage_refs),
+            Arc::new(row_versions),
+        ],
+    )
+    .map_err(|e| Error::parquet(format!("record batch build failed: {e}")))?;
+
+    write_single_batch(schema, &batch)
+}
+
+/// Writes `catalog_run_index.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet serialization fails.
+#[allow(clippy::too_many_lines)]
+pub fn write_catalog_run_index(rows: &[CatalogRunIndexRow]) -> Result<Bytes> {
+    let schema = catalog_run_index_schema();
+
+    let schema_versions =
+        UInt32Array::from(rows.iter().map(|r| r.schema_version).collect::<Vec<_>>());
+    let org_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.org_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let workspace_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.workspace_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let run_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.run_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let task_keys = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.task_key.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let plan_ids = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.plan_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let run_keys = StringArray::from(
+        rows.iter()
+            .map(|r| r.run_key.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let kinds = StringArray::from(rows.iter().map(|r| r.kind.as_deref()).collect::<Vec<_>>());
+    let reference_ids = StringArray::from(
+        rows.iter()
+            .map(|r| r.reference_id.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let source_types = StringArray::from(
+        rows.iter()
+            .map(|r| r.source_type.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let run_statuses = StringArray::from(
+        rows.iter()
+            .map(|r| Some(run_state_to_str(r.run_status)))
+            .collect::<Vec<_>>(),
+    );
+    let task_statuses = StringArray::from(
+        rows.iter()
+            .map(|r| Some(task_state_to_str(r.task_status)))
+            .collect::<Vec<_>>(),
+    );
+    let cancel_requested =
+        BooleanArray::from(rows.iter().map(|r| r.cancel_requested).collect::<Vec<_>>());
+    let asset_keys = StringArray::from(
+        rows.iter()
+            .map(|r| r.asset_key.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let target_namespaces = StringArray::from(
+        rows.iter()
+            .map(|r| r.target_namespace.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let target_tables = StringArray::from(
+        rows.iter()
+            .map(|r| r.target_table.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let partition_keys = StringArray::from(
+        rows.iter()
+            .map(|r| r.partition_key.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let attempts = UInt32Array::from(rows.iter().map(|r| r.attempt).collect::<Vec<_>>());
+    let attempt_ids = StringArray::from(
+        rows.iter()
+            .map(|r| r.attempt_id.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let requires_visible_output = BooleanArray::from(
+        rows.iter()
+            .map(|r| r.requires_visible_output)
+            .collect::<Vec<_>>(),
+    );
+    let materialization_ids = StringArray::from(
+        rows.iter()
+            .map(|r| r.materialization_id.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let output_visibility_states = StringArray::from(
+        rows.iter()
+            .map(|r| {
+                r.output_visibility_state
+                    .map(output_visibility_state_to_str)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let published_at = Int64Array::from(
+        rows.iter()
+            .map(|r| r.published_at.map(|t| t.timestamp_millis()))
+            .collect::<Vec<_>>(),
+    );
+    let publish_errors = StringArray::from(
+        rows.iter()
+            .map(|r| r.publish_error.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let delta_tables = StringArray::from(
+        rows.iter()
+            .map(|r| r.delta_table.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let delta_versions = Int64Array::from(rows.iter().map(|r| r.delta_version).collect::<Vec<_>>());
+    let delta_partitions = StringArray::from(
+        rows.iter()
+            .map(|r| r.delta_partition.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let execution_lineage_refs = StringArray::from(
+        rows.iter()
+            .map(|r| r.execution_lineage_ref.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let started_at = Int64Array::from(
+        rows.iter()
+            .map(|r| r.started_at.map(|t| t.timestamp_millis()))
+            .collect::<Vec<_>>(),
+    );
+    let last_heartbeat_at = Int64Array::from(
+        rows.iter()
+            .map(|r| r.last_heartbeat_at.map(|t| t.timestamp_millis()))
+            .collect::<Vec<_>>(),
+    );
+    let triggered_at = Int64Array::from(
+        rows.iter()
+            .map(|r| r.triggered_at.timestamp_millis())
+            .collect::<Vec<_>>(),
+    );
+    let completed_at = Int64Array::from(
+        rows.iter()
+            .map(|r| r.completed_at.map(|t| t.timestamp_millis()))
+            .collect::<Vec<_>>(),
+    );
+    let updated_at = Int64Array::from(
+        rows.iter()
+            .map(|r| r.updated_at.timestamp_millis())
+            .collect::<Vec<_>>(),
+    );
+    let code_versions = StringArray::from(
+        rows.iter()
+            .map(|r| r.code_version.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let error_messages = StringArray::from(
+        rows.iter()
+            .map(|r| r.error_message.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let row_versions = StringArray::from(
+        rows.iter()
+            .map(|r| Some(r.row_version.as_str()))
+            .collect::<Vec<_>>(),
+    );
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(schema_versions),
+            Arc::new(org_ids),
+            Arc::new(workspace_ids),
+            Arc::new(run_ids),
+            Arc::new(task_keys),
+            Arc::new(plan_ids),
+            Arc::new(run_keys),
+            Arc::new(kinds),
+            Arc::new(reference_ids),
+            Arc::new(source_types),
+            Arc::new(run_statuses),
+            Arc::new(cancel_requested),
+            Arc::new(task_statuses),
+            Arc::new(asset_keys),
+            Arc::new(target_namespaces),
+            Arc::new(target_tables),
+            Arc::new(partition_keys),
+            Arc::new(attempts),
+            Arc::new(attempt_ids),
+            Arc::new(requires_visible_output),
+            Arc::new(materialization_ids),
+            Arc::new(output_visibility_states),
+            Arc::new(published_at),
+            Arc::new(publish_errors),
+            Arc::new(delta_tables),
+            Arc::new(delta_versions),
+            Arc::new(delta_partitions),
+            Arc::new(execution_lineage_refs),
+            Arc::new(started_at),
+            Arc::new(last_heartbeat_at),
+            Arc::new(triggered_at),
+            Arc::new(completed_at),
+            Arc::new(updated_at),
+            Arc::new(code_versions),
+            Arc::new(error_messages),
             Arc::new(row_versions),
         ],
     )
@@ -1922,6 +2190,22 @@ fn col_bool<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BooleanArray> 
         .ok_or_else(|| Error::parquet(format!("column '{name}' is not BooleanArray")))
 }
 
+fn string_or_none(column: &StringArray, row: usize) -> Option<String> {
+    if column.is_null(row) {
+        None
+    } else {
+        Some(column.value(row).to_string())
+    }
+}
+
+fn datetime_or_none(column: &Int64Array, row: usize) -> Option<chrono::DateTime<chrono::Utc>> {
+    if column.is_null(row) {
+        None
+    } else {
+        Some(millis_to_datetime(column.value(row)))
+    }
+}
+
 fn millis_to_datetime(millis: i64) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::from_timestamp_millis(millis).unwrap_or_else(chrono::Utc::now)
 }
@@ -2155,6 +2439,106 @@ pub fn read_tasks(bytes: &Bytes) -> Result<Vec<TaskRow>> {
                         Some(col.value(row).to_string())
                     }
                 }),
+                row_version: row_version.value(row).to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Reads `catalog_run_index.parquet`.
+///
+/// # Errors
+///
+/// Returns an error if Parquet decoding fails or required columns are missing.
+#[allow(clippy::too_many_lines)]
+pub fn read_catalog_run_index(bytes: &Bytes) -> Result<Vec<CatalogRunIndexRow>> {
+    let mut out = Vec::new();
+    for batch in read_batches(bytes)? {
+        let schema_version = col_u32(&batch, "schema_version")?;
+        let org_id = col_string(&batch, "org_id")?;
+        let workspace_id = col_string(&batch, "workspace_id")?;
+        let run_id = col_string(&batch, "run_id")?;
+        let task_key = col_string(&batch, "task_key")?;
+        let plan_id = col_string(&batch, "plan_id")?;
+        let run_key = col_string(&batch, "run_key")?;
+        let kind = col_string(&batch, "kind")?;
+        let reference_id = col_string(&batch, "reference_id")?;
+        let source_type = col_string(&batch, "source_type")?;
+        let run_status = col_string(&batch, "run_status")?;
+        let cancel_requested = col_bool(&batch, "cancel_requested")?;
+        let task_status = col_string(&batch, "task_status")?;
+        let asset_key = col_string(&batch, "asset_key")?;
+        let target_namespace = col_string(&batch, "target_namespace")?;
+        let target_table = col_string(&batch, "target_table")?;
+        let partition_key = col_string(&batch, "partition_key")?;
+        let attempt = col_u32(&batch, "attempt")?;
+        let attempt_id = col_string(&batch, "attempt_id")?;
+        let requires_visible_output = col_bool(&batch, "requires_visible_output")?;
+        let materialization_id = col_string(&batch, "materialization_id")?;
+        let output_visibility_state = col_string(&batch, "output_visibility_state")?;
+        let published_at = col_i64(&batch, "published_at")?;
+        let publish_error = col_string(&batch, "publish_error")?;
+        let delta_table = col_string(&batch, "delta_table")?;
+        let delta_version = col_i64(&batch, "delta_version")?;
+        let delta_partition = col_string(&batch, "delta_partition")?;
+        let execution_lineage_ref = col_string(&batch, "execution_lineage_ref")?;
+        let started_at = col_i64(&batch, "started_at")?;
+        let last_heartbeat_at = col_i64(&batch, "last_heartbeat_at")?;
+        let triggered_at = col_i64(&batch, "triggered_at")?;
+        let completed_at = col_i64(&batch, "completed_at")?;
+        let updated_at = col_i64(&batch, "updated_at")?;
+        let code_version = col_string(&batch, "code_version")?;
+        let error_message = col_string(&batch, "error_message")?;
+        let row_version = col_string(&batch, "row_version")?;
+
+        for row in 0..batch.num_rows() {
+            out.push(CatalogRunIndexRow {
+                schema_version: schema_version.value(row),
+                org_id: org_id.value(row).to_string(),
+                workspace_id: workspace_id.value(row).to_string(),
+                run_id: run_id.value(row).to_string(),
+                task_key: task_key.value(row).to_string(),
+                plan_id: plan_id.value(row).to_string(),
+                run_key: string_or_none(run_key, row),
+                kind: string_or_none(kind, row),
+                reference_id: string_or_none(reference_id, row),
+                source_type: string_or_none(source_type, row),
+                run_status: str_to_run_state(run_status.value(row))?,
+                cancel_requested: cancel_requested.value(row),
+                task_status: str_to_task_state(task_status.value(row))?,
+                asset_key: string_or_none(asset_key, row),
+                target_namespace: string_or_none(target_namespace, row),
+                target_table: string_or_none(target_table, row),
+                partition_key: string_or_none(partition_key, row),
+                attempt: attempt.value(row),
+                attempt_id: string_or_none(attempt_id, row),
+                requires_visible_output: requires_visible_output.value(row),
+                materialization_id: string_or_none(materialization_id, row),
+                output_visibility_state: if output_visibility_state.is_null(row) {
+                    None
+                } else {
+                    Some(str_to_output_visibility_state(
+                        output_visibility_state.value(row),
+                    )?)
+                },
+                published_at: datetime_or_none(published_at, row),
+                publish_error: string_or_none(publish_error, row),
+                delta_table: string_or_none(delta_table, row),
+                delta_version: if delta_version.is_null(row) {
+                    None
+                } else {
+                    Some(delta_version.value(row))
+                },
+                delta_partition: string_or_none(delta_partition, row),
+                execution_lineage_ref: string_or_none(execution_lineage_ref, row),
+                started_at: datetime_or_none(started_at, row),
+                last_heartbeat_at: datetime_or_none(last_heartbeat_at, row),
+                triggered_at: millis_to_datetime(triggered_at.value(row)),
+                completed_at: datetime_or_none(completed_at, row),
+                updated_at: millis_to_datetime(updated_at.value(row)),
+                code_version: string_or_none(code_version, row),
+                error_message: string_or_none(error_message, row),
                 row_version: row_version.value(row).to_string(),
             });
         }
@@ -3531,6 +3915,55 @@ mod tests {
             Some("date=2025-01-15")
         );
         assert!(parsed[0].started_at.is_some());
+    }
+
+    #[test]
+    fn test_catalog_run_index_roundtrip() {
+        let triggered_at = Utc.with_ymd_and_hms(2026, 5, 26, 12, 0, 0).unwrap();
+        let updated_at = Utc.with_ymd_and_hms(2026, 5, 26, 12, 5, 0).unwrap();
+        let rows = vec![CatalogRunIndexRow {
+            schema_version: 1,
+            org_id: "org_01".to_string(),
+            workspace_id: "workspace_01".to_string(),
+            run_id: "run_01".to_string(),
+            task_key: "extract".to_string(),
+            plan_id: "plan_01".to_string(),
+            run_key: Some("manual:analytics.daily".to_string()),
+            kind: Some("materialization".to_string()),
+            reference_id: Some("catalog-refresh-01".to_string()),
+            source_type: Some("delta".to_string()),
+            run_status: RunState::Succeeded,
+            cancel_requested: false,
+            task_status: TaskState::Succeeded,
+            asset_key: Some("analytics.daily".to_string()),
+            target_namespace: Some("analytics".to_string()),
+            target_table: Some("daily".to_string()),
+            partition_key: Some("date=2026-05-26".to_string()),
+            attempt: 1,
+            attempt_id: Some("attempt_01".to_string()),
+            requires_visible_output: true,
+            materialization_id: Some("mat_01".to_string()),
+            output_visibility_state: Some(OutputVisibilityState::Visible),
+            published_at: Some(updated_at),
+            publish_error: None,
+            delta_table: Some("analytics.daily".to_string()),
+            delta_version: Some(42),
+            delta_partition: Some("date=2026-05-26".to_string()),
+            execution_lineage_ref: Some("{\"runId\":\"run_01\"}".to_string()),
+            started_at: Some(triggered_at),
+            last_heartbeat_at: Some(updated_at),
+            triggered_at,
+            completed_at: Some(updated_at),
+            updated_at,
+            code_version: Some("sha-123".to_string()),
+            error_message: None,
+            row_version: "01HXCATALOGRUNINDEX".to_string(),
+        }];
+
+        let bytes = write_catalog_run_index(&rows).expect("write");
+        let parsed = read_catalog_run_index(&bytes).expect("read");
+
+        assert_eq!(parsed, rows);
     }
 
     #[test]

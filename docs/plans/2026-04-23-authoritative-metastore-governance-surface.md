@@ -8,7 +8,7 @@
 
 ---
 
-## Status (2026-05-22)
+## Status (2026-05-11)
 
 Partially in progress. This plan now starts from the frozen `arco.*.v1` proto
 baseline: the metastore proto skeleton, root transaction mutation envelope,
@@ -23,13 +23,10 @@ credential-vending security. Treat those documents as prerequisites for runtime
 implementation in this plan.
 
 The newer catalog product plan has also landed additive native metastore object
-contracts, an initial generic metastore replay/projection kernel, partial
-compiled-permission reads, partial storage-governance UC routes, and partial
-table/path credential-vending decisions. Those slices do not complete this
-plan: writer-backed grant mutations, full route-wide enforcement, storage
-governance lifecycle operations, provider credential material, revocation
-metadata, object-family projections, and derived system-table visibility remain
-pending runtime work.
+contracts and an initial generic metastore replay/projection kernel. Those
+slices do not complete this plan: authoritative grant enforcement, storage
+governance, credential vending, object-family projections, UC route behavior,
+and derived system-table visibility remain pending runtime work.
 
 ## Repo-Grounded Gap Summary
 
@@ -37,17 +34,14 @@ The current repo has moved past "basic catalog CRUD is missing" as the primary g
 The remaining missing pieces are the surrounding metastore and governance domains
 that make a mature lakehouse catalog authoritative rather than parity-shaped.
 
-- `crates/arco-uc/src/routes/permissions.rs` reads compiled assignments on
-  `GET`; `PATCH` is explicitly unsupported until writer-backed grant
-  persistence lands.
-- `crates/arco-uc/src/routes/credentials.rs` now supports governed table/path
-  credential decisions over compiled authorization and published storage
-  governance. Volume/model credentials, provider token material, and revocation
-  metadata remain unsupported.
-- `docs/guide/src/reference/control-plane-scope.md` marks grants/RBAC,
-  credentials, external locations, and temporary credential vending as
-  `Partial`; governance rules, ownership/tags, and broader object families
-  remain `Planned`.
+- `crates/arco-uc/src/routes/permissions.rs` still returns empty
+  `privilege_assignments` on `GET`, and `PATCH` is explicitly unsupported.
+- `crates/arco-uc/src/routes/credentials.rs` still exposes placeholder or
+  unsupported temporary credential behavior rather than authoritative storage
+  credential, external location, or binding state.
+- `docs/guide/src/reference/control-plane-scope.md` still marks grants/RBAC,
+  credentials/external locations, governance rules, and ownership/tags as
+  `Planned`.
 - `proto/arco/catalog/v1/metastore.proto` now defines stable-ID
   metastore/governance object and mutation contracts, and root transactions can
   carry metastore mutations.

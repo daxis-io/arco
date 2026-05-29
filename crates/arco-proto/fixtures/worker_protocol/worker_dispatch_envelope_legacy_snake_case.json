@@ -1,0 +1,17 @@
+{
+  "tenant_id": "tenant-a",
+  "workspace_id": "workspace-b",
+  "run_id": "run-123",
+  "task_key": "analytics.daily_sales",
+  "attempt": 1,
+  "attempt_id": "att-123",
+  "dispatch_id": "dispatch:run-123:analytics.daily_sales:1",
+  "execution_location_id": "local-dev",
+  "worker_queue": "default-queue",
+  "callback_base_url": "https://callbacks.example",
+  "task_token": "token",
+  "token_expires_at": "2026-01-01T00:00:00Z",
+  "payload": {
+    "partition": "date=2026-01-01"
+  }
+}

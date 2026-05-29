@@ -18,6 +18,9 @@ use crate::state::UnityCatalogState;
 
 /// Returns a standardized UC `501` for known-but-unsupported operations.
 pub(crate) fn known_but_unsupported(method: &Method, uri: &OriginalUri) -> UnityCatalogError {
+    if let Some(message) = crate::support::unsupported_message(method, uri.0.path()) {
+        return UnityCatalogError::NotImplemented { message };
+    }
     UnityCatalogError::NotImplemented {
         message: format!("operation not supported: {method} {}", uri.0.path()),
     }

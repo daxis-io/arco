@@ -2,6 +2,7 @@
 
 use super::compiler::CompiledPermissionSet;
 use super::privileges::Privilege;
+use crate::metrics;
 
 /// Authorization outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +98,12 @@ impl AuthzDecision {
                 compiled,
             );
         }
+
+        metrics::record_authz_index_candidate_rows(compiled.candidate_row_count(
+            &request.principal_id,
+            &request.object_id,
+            &request.object_type,
+        ));
 
         let matching_rows = compiled
             .rows_for_principal_object_privilege(

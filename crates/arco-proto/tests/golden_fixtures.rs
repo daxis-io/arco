@@ -78,22 +78,16 @@ fn partition_dimensions_use_explicit_messages_instead_of_maps() {
 }
 
 #[test]
-fn docs_name_the_alpha_beta_hard_cut_policy() {
+fn docs_name_the_frozen_v1_proto_baseline_policy() {
     let readme = include_str!("../../../README.md");
     let style = include_str!("../../../proto/STYLE.md");
 
-    assert!(readme.contains("old `arco.v1` protobuf package was"));
-    assert!(readme.contains("documented hard-cut window"));
-    assert!(readme.contains("`arco.controlplane.v1`"));
-    assert!(readme.contains("`RegisterTableOp.format` is optional"));
+    assert!(readme.contains("pre-freeze hard cut is complete"));
+    assert!(readme.contains("durable public proto surface"));
     assert!(readme.contains("cargo xtask proto-breaking-check"));
-    assert!(readme.contains("proto=arco.controlplane.v1.ApplyCatalogDdlRequest"));
-    assert!(style.contains("Alpha/Beta Hard-Cut Policy"));
-    assert!(style.contains("old `arco.v1` package was intentionally removed"));
-    assert!(style.contains("explicit hard-cut window"));
-    assert!(style.contains("`arco.catalog.v1.RegisterTableOp.format` is"));
+    assert!(style.contains("pre-freeze hard cut is complete"));
+    assert!(style.contains("v1 changes must be additive"));
     assert!(style.contains("cargo xtask proto-breaking-check"));
-    assert!(style.contains("message-qualified content types"));
 }
 
 #[test]

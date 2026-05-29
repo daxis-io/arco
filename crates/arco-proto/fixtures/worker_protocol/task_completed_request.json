@@ -1,0 +1,18 @@
+{
+  "attempt": 1,
+  "attemptId": "att-123",
+  "workerId": "worker-1",
+  "outcome": "FAILED",
+  "completedAt": "2026-01-01T00:00:10Z",
+  "error": {
+    "category": "INFRASTRUCTURE",
+    "message": "transient object storage failure",
+    "retryable": true
+  },
+  "metrics": {
+    "cpuTimeMs": 12,
+    "peakMemoryBytes": 4096,
+    "ioReadBytes": 1024,
+    "ioWriteBytes": 2048
+  }
+}

@@ -1,6 +1,11 @@
 //! `OpenAPI` (3.1) specification generation for the Unity Catalog facade.
 
 use utoipa::OpenApi;
+use utoipa::openapi::OpenApi as OpenApiSpec;
+use utoipa::openapi::extensions::Extensions;
+use utoipa::openapi::path::Operation;
+
+use crate::support::documented_operations;
 
 /// `OpenAPI` documentation for the Unity Catalog OSS parity facade.
 #[derive(OpenApi)]
@@ -8,7 +13,7 @@ use utoipa::OpenApi;
     info(
         title = "Unity Catalog API (Arco facade)",
         version = env!("CARGO_PKG_VERSION"),
-        description = "Unity Catalog OSS parity facade for Arco. Catalog/schema/table CRUD is backed by Arco's authoritative catalog ledger and manifest-published snapshots; non-CRUD parity endpoints are documented as compatible-partial, scaffolded, or planned depending on the route group."
+        description = "Unity Catalog OSS parity facade for Arco. Catalog/schema/table CRUD is backed by Arco's authoritative catalog ledger and manifest-published snapshots; compatibility endpoints are documented as implemented, compatible-partial, known-unsupported, or planned depending on the route-level support registry."
     ),
     paths(
         crate::routes::openapi::get_openapi_json,
@@ -26,6 +31,7 @@ use utoipa::OpenApi;
         crate::routes::tables::post_tables,
         crate::routes::tables::get_table,
         crate::routes::tables::delete_table,
+        crate::routes::permissions::get_permissions,
         crate::routes::delta_commits::get_delta_preview_commits,
         crate::routes::delta_commits::post_delta_preview_commits,
         crate::routes::credentials::post_temporary_table_credentials,
@@ -41,6 +47,7 @@ use utoipa::OpenApi;
         (name = "Catalogs", description = "Authoritative catalog CRUD over Arco's catalog ledger."),
         (name = "Schemas", description = "Authoritative schema CRUD over Arco's catalog ledger."),
         (name = "Tables", description = "Authoritative table CRUD over Arco's catalog ledger."),
+        (name = "Permissions", description = "Compatible-partial compiled permission assignment reads; writer-backed grant mutation remains unsupported."),
         (name = "DeltaCommits", description = "Delta commit coordinator operations backed by coordinator state, not catalog DDL."),
         (name = "TemporaryCredentials", description = "Compatible-partial table/path credential decisions over compiled authorization and published storage governance; volume/model credentials, provider token material, and revocation metadata remain planned."),
     ),
@@ -50,7 +57,9 @@ pub struct UnityCatalogApiDoc;
 /// Returns the generated `OpenAPI` spec.
 #[must_use]
 pub fn openapi() -> utoipa::openapi::OpenApi {
-    UnityCatalogApiDoc::openapi()
+    let mut spec = UnityCatalogApiDoc::openapi();
+    add_support_extensions(&mut spec);
+    spec
 }
 
 /// Returns the generated `OpenAPI` spec serialized as pretty JSON.
@@ -60,6 +69,52 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
 /// Returns an error if JSON serialization fails (should not happen).
 pub fn openapi_json() -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&openapi())
+}
+
+fn add_support_extensions(spec: &mut OpenApiSpec) {
+    for operation in documented_operations() {
+        if let Some(openapi_operation) =
+            operation_mut(spec, operation.method, operation.path_template)
+        {
+            let extensions = openapi_operation
+                .extensions
+                .get_or_insert_with(Extensions::default);
+            extensions.insert(
+                "x-arco-support-level".to_string(),
+                serde_json::json!(operation.support_level.as_str()),
+            );
+            extensions.insert(
+                "x-arco-native-backing".to_string(),
+                serde_json::json!(operation.native_backing),
+            );
+            extensions.insert(
+                "x-arco-authz-boundary".to_string(),
+                serde_json::json!(operation.authz_boundary),
+            );
+            if let Some(known_gap) = operation.known_gap {
+                extensions.insert("x-arco-known-gap".to_string(), serde_json::json!(known_gap));
+            }
+        }
+    }
+}
+
+fn operation_mut<'a>(
+    spec: &'a mut OpenApiSpec,
+    method: &str,
+    path: &str,
+) -> Option<&'a mut Operation> {
+    let path_item = spec.paths.paths.get_mut(path)?;
+    match method {
+        "GET" => path_item.get.as_mut(),
+        "POST" => path_item.post.as_mut(),
+        "PATCH" => path_item.patch.as_mut(),
+        "DELETE" => path_item.delete.as_mut(),
+        "PUT" => path_item.put.as_mut(),
+        "HEAD" => path_item.head.as_mut(),
+        "OPTIONS" => path_item.options.as_mut(),
+        "TRACE" => path_item.trace.as_mut(),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

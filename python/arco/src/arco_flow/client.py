@@ -27,6 +27,19 @@ class ApiResponse:
     payload: dict[str, Any]
 
 
+def _resolve_callback_task_id(
+    *,
+    task_id: str | None,
+    task_key: str | None,
+) -> str:
+    if task_id and task_id.strip():
+        return task_id
+    if task_key and task_key.strip():
+        return task_key
+    msg = "task_id or task_key is required"
+    raise ValueError(msg)
+
+
 class ArcoFlowApiClient:
     """HTTP client for Arco Flow API endpoints."""
 
@@ -306,7 +319,8 @@ class ArcoFlowApiClient:
     def task_started(
         self,
         *,
-        task_key: str,
+        task_key: str | None = None,
+        task_id: str | None = None,
         attempt: int,
         attempt_id: str,
         worker_id: str,
@@ -315,6 +329,7 @@ class ArcoFlowApiClient:
         task_token: str,
         callback_base_url: str | None = None,
     ) -> ApiResponse:
+        callback_task_id = _resolve_callback_task_id(task_id=task_id, task_key=task_key)
         headers = self._build_headers(task_token=task_token)
         payload = {
             "attempt": attempt,
@@ -325,17 +340,70 @@ class ArcoFlowApiClient:
         }
         response = self._request_json(
             "POST",
-            f"/tasks/{task_key}/started",
+            f"/tasks/{callback_task_id}/started",
             json_body=payload,
             headers=headers,
             base_url=callback_base_url,
         )
         return ApiResponse(payload=response)
 
+    def task_heartbeat(
+        self,
+        *,
+        task_key: str | None = None,
+        task_id: str | None = None,
+        attempt: int,
+        attempt_id: str,
+        worker_id: str,
+        traceparent: str | None,
+        task_token: str,
+        callback_base_url: str | None = None,
+        heartbeat_at: str | None = None,
+        progress_pct: int | None = None,
+        message: str | None = None,
+    ) -> ApiResponse:
+        callback_task_id = _resolve_callback_task_id(task_id=task_id, task_key=task_key)
+        headers = self._build_headers(task_token=task_token)
+        payload: dict[str, Any] = {
+            "attempt": attempt,
+            "attemptId": attempt_id,
+            "workerId": worker_id,
+            "traceparent": traceparent,
+        }
+        if heartbeat_at is not None:
+            payload["heartbeatAt"] = heartbeat_at
+        if progress_pct is not None:
+            if isinstance(progress_pct, bool) or not isinstance(progress_pct, int):
+                msg = "progress_pct must be an integer from 0 to 100"
+                raise ValueError(msg)
+            if progress_pct < 0 or progress_pct > 100:
+                msg = "progress_pct must be between 0 and 100"
+                raise ValueError(msg)
+            payload["progressPct"] = progress_pct
+        if message is not None:
+            payload["message"] = message
+
+        response = self._client.request(
+            "POST",
+            self._url(f"/tasks/{callback_task_id}/heartbeat", base_url=callback_base_url),
+            json=payload,
+            headers=headers,
+        )
+        self._raise_for_status(response)
+        if not response.content or not response.text.strip():
+            return ApiResponse(
+                payload={
+                    "acknowledged": True,
+                    "shouldCancel": False,
+                },
+            )
+        return ApiResponse(payload=response.json())
+
     def task_completed(
         self,
         *,
-        task_key: str,
+        task_key: str | None = None,
+        task_id: str | None = None,
         attempt: int,
         attempt_id: str,
         worker_id: str,
@@ -347,6 +415,7 @@ class ArcoFlowApiClient:
         task_token: str,
         callback_base_url: str | None = None,
     ) -> ApiResponse:
+        callback_task_id = _resolve_callback_task_id(task_id=task_id, task_key=task_key)
         headers = self._build_headers(task_token=task_token)
         payload: dict[str, Any] = {
             "attempt": attempt,
@@ -362,7 +431,7 @@ class ArcoFlowApiClient:
             payload["error"] = error
         response = self._request_json(
             "POST",
-            f"/tasks/{task_key}/completed",
+            f"/tasks/{callback_task_id}/completed",
             json_body=payload,
             headers=headers,
             base_url=callback_base_url,

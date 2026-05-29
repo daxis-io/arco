@@ -23,7 +23,7 @@ and search indexes remain derived observability/discovery layers.
 
 ---
 
-## Status (2026-05-22)
+## Status (2026-05-11)
 
 Active on this branch. This is downstream catalog product work, not a
 continuation of the completed proto enhancement plans. The pre-freeze hard cut
@@ -37,28 +37,12 @@ Completed or partially landed slices:
   `d2d2d19`, `90e45e3`, and `6869d6e`.
 - Task 1 additive native metastore object contracts landed in `d14eba4`.
 - Task 2 initial replay/projection kernel landed in `2ff14e1`.
-- Task 3 has a partial runtime slice: generic compiled permission rows,
-  focused compiler/decision tests, and UC `GET /permissions` over compiled
-  assignments. Writer-backed grant mutations and UC `PATCH /permissions`
-  remain pending.
-- Task 4 has a partial runtime slice: UC storage credential and external
-  location create/list/get routes append scoped metastore events, replay through
-  storage-governance state, require compiled metastore `MANAGE`, redact request
-  secret material, and reject overlapping external-location paths. Update/delete
-  lifecycle operations and derived system-table exposure remain pending.
-- Task 5 has a partial runtime slice for table/path credential vending:
-  UC-compatible table/path routes use compiled authorization, published
-  storage-governance state, TTL clamping, redacted scoped credential metadata,
-  and allow/deny audit hooks. Provider token material, revocation metadata,
-  volume credentials, and model-version credentials remain pending.
 
 The landed kernel is intentionally narrow: it proves stable-ID replay,
 projection allowlisting, schema watermarking, redaction, and all-or-nothing
-publication for the initial generic metastore projection. The newer runtime
-slices do not yet make grants, storage governance, credential vending,
-object-family CRUD, or system-table visibility production-backed end to end.
-Tasks 6-11 remain active product work, and the unfinished portions of Tasks
-3-5 remain active hardening work.
+publication for the initial generic metastore projection. It does not yet make
+grants, credentials, object-family CRUD, credential vending, or system-table
+visibility production-backed. Tasks 3-11 remain active product work.
 
 ## Product Framing
 
@@ -101,9 +85,9 @@ The product goal is not "UC parity." It is:
 - Table-format contracts support Delta Lake, Iceberg, and plain Parquet. New table registrations default to Delta, while legacy rows without persisted format metadata still read as Parquet.
 - Lineage and search have real published projections.
 - System catalog tables already expose an explicit allowlist for catalog, lineage, and orchestration projections through `/api/v1/query`.
-- `proto/arco/catalog/v1/metastore.proto` defines broader metastore message shapes, but most access, storage, volume, function, model, and governance domains are not yet exposed through production-backed runtime projections.
-- `crates/arco-uc/src/routes/permissions.rs` reads compiled assignments for `GET /permissions`; writer-backed grant persistence and `PATCH /permissions` remain unsupported.
-- `crates/arco-uc/src/routes/credentials.rs` vends governed table/path credential decisions using compiled authorization and published storage governance; provider token material, revocation metadata, and volume/model credentials remain planned.
+- `proto/arco/catalog/v1/metastore.proto` defines broader metastore message shapes, but most access, storage, volume, function, model, and governance domains are not yet authoritative runtime projections.
+- `crates/arco-uc/src/routes/permissions.rs` is scaffolded and not backed by compiled grants.
+- `crates/arco-uc/src/routes/credentials.rs` has placeholder temporary credential behavior.
 - UC inventory documents volumes, functions, models, credentials, external locations, and grants as useful prior art, but Arco should implement them natively.
 - The existing authoritative metastore governance surface plan is the runtime companion for portions of this product surface; it must continue to treat UC as compatibility prior art, not the product north star.
 
@@ -122,9 +106,8 @@ allowlisted `metastore_objects.parquet` projection, while broader access,
 storage, volume, governance, function, and model projections are not
 authoritative yet.
 
-Tasks 3-5 now have partial runtime slices, but they are not complete
-production-backed domains. Tasks 6-11 remain future runtime and product work.
-In particular, `system.access.*`, `system.storage.*`,
+Tasks 3-11 remain future runtime and product work. In particular,
+`system.access.*`, `system.storage.*`,
 `system.catalog.{volumes,functions,registered_models,model_versions}`, and
 `system.governance.attachments` tables must not be registered until their
 authoritative native state and safe Parquet projections exist.
@@ -279,8 +262,7 @@ implementation:
 
 ## Compatibility Levels
 
-Every public route group must carry one of these labels in the route contract,
-manual inventory, or generated OpenAPI description:
+Every route group and generated OpenAPI entry must carry one of these labels:
 
 | Level | Meaning |
 |---|---|
@@ -290,10 +272,9 @@ manual inventory, or generated OpenAPI description:
 | `scaffolded` | Route exists for discovery or future compatibility; it must not be used for enforcement or production workflows. |
 | `planned` | Documented product intent with no route behavior. |
 
-OpenAPI is a contract artifact, not only generated documentation. Generated
-OpenAPI currently carries route-group descriptions for the UC facade; add
-snapshot tests, OpenAPI diff checks, and per-operation compatibility
-annotations before marking an adapter production-backed.
+OpenAPI is a contract artifact, not only generated documentation. Add snapshot
+tests, OpenAPI diff checks, and route-level compatibility annotations before
+marking an adapter production-backed.
 
 ## Consistency And Replay Invariants
 
@@ -1049,13 +1030,11 @@ open for S3/Azure without blocking this tranche. Model direct temporary
 credentials and remote signing as separate delegation mechanisms behind the
 same authorization decision.
 
-**Step 3: Complete provider route behavior**
+**Step 3: Replace placeholder route behavior**
 
-The landed `temporary-table-credentials` and `temporary-path-credentials`
-routes evaluate object/path, operation, compiled grants, published storage
-governance, and TTL before returning scoped credential metadata. Remaining work
-is provider token material, client capability negotiation, expiry exposure, and
-revocation metadata before these routes can be marked production-backed.
+`temporary-table-credentials` and `temporary-path-credentials` must evaluate
+object/path, operation, grants, binding, TTL, and client capabilities before
+issuing credentials.
 
 **Step 4: Materialize access audit projections**
 

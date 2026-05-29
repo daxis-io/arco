@@ -44,9 +44,10 @@ use crate::paths::{
 use crate::routes::manifests::StoredManifest;
 use crate::server::AppState;
 use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
+use arco_flow::error::Error as FlowError;
 use arco_flow::orchestration::compactor::{
-    BackfillChunkRow, BackfillRow, DepResolution, FoldState, MicroCompactor, PartitionStatusRow,
-    RunRow, RunState as FoldRunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
+    BackfillChunkRow, BackfillRow, FoldState, MicroCompactor, PartitionStatusRow, RunRow,
+    RunState as FoldRunState, ScheduleDefinitionRow, ScheduleStateRow, ScheduleTickRow,
     SensorEvalRow, SensorStateRow, TaskRow, TaskState as FoldTaskState,
 };
 use arco_flow::orchestration::controllers::{PubSubMessage, PushSensorHandler};
@@ -58,6 +59,11 @@ use arco_flow::orchestration::events::{
 use arco_flow::orchestration::run_key::{
     FingerprintPolicy, ReservationResult, RunKeyReservation, get_reservation, reservation_path,
     reserve_run_key,
+};
+use arco_flow::orchestration::state::{
+    self as flow_state, CancelRunRequest as FlowCancelRunRequest,
+    OrchestrationStateService as FlowOrchestrationStateService,
+    StateServiceError as FlowStateServiceError,
 };
 use ulid::Ulid;
 
@@ -2353,14 +2359,6 @@ fn map_run_state(state: FoldRunState) -> RunStateResponse {
     }
 }
 
-fn map_output_visibility_state(state: OutputVisibilityState) -> TaskOutputVisibilityStateResponse {
-    match state {
-        OutputVisibilityState::Pending => TaskOutputVisibilityStateResponse::Pending,
-        OutputVisibilityState::Visible => TaskOutputVisibilityStateResponse::Visible,
-        OutputVisibilityState::Failed => TaskOutputVisibilityStateResponse::Failed,
-    }
-}
-
 fn task_has_failed_required_output(task: &TaskRow) -> bool {
     task.requires_visible_output
         && task.state == FoldTaskState::Succeeded
@@ -2397,6 +2395,7 @@ fn map_run_row_state(run: &RunRow, tasks: &[&TaskRow]) -> RunStateResponse {
     map_run_state(run.state)
 }
 
+#[cfg(test)]
 fn public_run_completed_at(
     state: RunStateResponse,
     completed_at: Option<DateTime<Utc>>,
@@ -2412,20 +2411,6 @@ fn public_run_completed_at(
     }
 }
 
-fn map_task_state(state: FoldTaskState) -> TaskStateResponse {
-    match state {
-        FoldTaskState::Planned | FoldTaskState::Blocked | FoldTaskState::RetryWait => {
-            TaskStateResponse::Pending
-        }
-        FoldTaskState::Ready | FoldTaskState::Dispatched => TaskStateResponse::Queued,
-        FoldTaskState::Running => TaskStateResponse::Running,
-        FoldTaskState::Succeeded => TaskStateResponse::Succeeded,
-        FoldTaskState::Failed => TaskStateResponse::Failed,
-        FoldTaskState::Skipped => TaskStateResponse::Skipped,
-        FoldTaskState::Cancelled => TaskStateResponse::Cancelled,
-    }
-}
-
 const LABEL_PARENT_RUN_ID: &str = "arco.parent_run_id";
 const LABEL_RERUN_KIND: &str = "arco.rerun.kind";
 
@@ -2437,16 +2422,6 @@ fn rerun_kind_from_label(value: &str) -> Option<RerunKindResponse> {
     }
 }
 
-fn lineage_from_labels(
-    labels: &HashMap<String, String>,
-) -> (Option<String>, Option<RerunKindResponse>) {
-    let parent = labels.get(LABEL_PARENT_RUN_ID).cloned();
-    let kind = labels
-        .get(LABEL_RERUN_KIND)
-        .and_then(|value| rerun_kind_from_label(value));
-    (parent, kind)
-}
-
 fn rerun_reason_for_kind(kind: RerunKindResponse) -> &'static str {
     match kind {
         RerunKindResponse::FromFailure => "from_failure_unsucceeded_tasks",
@@ -2454,96 +2429,223 @@ fn rerun_reason_for_kind(kind: RerunKindResponse) -> &'static str {
     }
 }
 
-fn task_retry_attribution(task: &TaskRow) -> Option<TaskRetryAttributionResponse> {
-    if task.attempt <= 1 {
-        return None;
-    }
-
-    Some(TaskRetryAttributionResponse {
-        retries: task.attempt.saturating_sub(1),
-        reason: "prior_attempt_failed".to_string(),
-    })
-}
-
-fn dep_resolution_str(resolution: DepResolution) -> &'static str {
-    match resolution {
-        DepResolution::Success => "SUCCESS",
-        DepResolution::Failed => "FAILED",
-        DepResolution::Skipped => "SKIPPED",
-        DepResolution::Cancelled => "CANCELLED",
+fn run_response_from_flow(workspace_id: String, run: flow_state::RunDetail) -> RunResponse {
+    RunResponse {
+        run_id: run.run_id,
+        workspace_id,
+        plan_id: run.plan_id,
+        state: run_state_from_flow(run.state),
+        created_at: run.created_at,
+        started_at: run.started_at,
+        completed_at: run.completed_at,
+        tasks: run.tasks.into_iter().map(task_summary_from_flow).collect(),
+        task_counts: task_counts_from_flow(&run.task_counts),
+        labels: run.labels,
+        parent_run_id: run.parent_run_id,
+        rerun_kind: run.rerun_kind.as_deref().and_then(rerun_kind_from_label),
+        rerun_reason: run.rerun_reason,
     }
 }
 
-fn build_skip_attribution_index(
-    fold_state: &FoldState,
-    run_id: &str,
-) -> HashMap<String, TaskSkipAttributionResponse> {
-    let mut first_causes: HashMap<String, (i64, String, String, DepResolution)> = HashMap::new();
+fn list_runs_response_from_flow(page: flow_state::RunListPage) -> ListRunsResponse {
+    ListRunsResponse {
+        runs: page.runs.into_iter().map(run_list_item_from_flow).collect(),
+        next_cursor: page.next_cursor,
+    }
+}
 
-    for edge in fold_state
-        .dep_satisfaction
-        .values()
-        .filter(|edge| edge.run_id == run_id)
-    {
-        let Some(resolution) = edge.resolution else {
-            continue;
-        };
-        if matches!(resolution, DepResolution::Success) {
-            continue;
+fn run_list_item_from_flow(item: flow_state::RunListItem) -> RunListItem {
+    RunListItem {
+        run_id: item.run_id,
+        state: run_state_from_flow(item.state),
+        created_at: item.created_at,
+        completed_at: item.completed_at,
+        task_count: item.task_count,
+        tasks_succeeded: item.tasks_succeeded,
+        tasks_failed: item.tasks_failed,
+        parent_run_id: item.parent_run_id,
+        rerun_kind: item.rerun_kind.as_deref().and_then(rerun_kind_from_label),
+    }
+}
+
+fn cancel_run_response_from_flow(
+    outcome: flow_state::CancelRunOutcome,
+    cancelled_at: DateTime<Utc>,
+) -> CancelRunResponse {
+    CancelRunResponse {
+        run_id: outcome.run_id,
+        state: run_state_from_flow(outcome.state),
+        cancelled_at,
+    }
+}
+
+fn task_summary_from_flow(task: flow_state::TaskSummary) -> TaskSummary {
+    TaskSummary {
+        task_key: task.task_key,
+        asset_key: task.asset_key,
+        state: task_state_from_flow(task.state),
+        attempt: task.attempt,
+        started_at: task.started_at,
+        completed_at: task.completed_at,
+        error_message: task.error_message,
+        execution_lineage_ref: task.execution_lineage_ref,
+        delta_table: task.delta_table,
+        delta_version: task.delta_version,
+        delta_partition: task.delta_partition,
+        retry_attribution: task.retry_attribution.map(retry_attribution_from_flow),
+        skip_attribution: task.skip_attribution.map(skip_attribution_from_flow),
+        output_visibility_state: task
+            .output_visibility_state
+            .map(output_visibility_from_flow),
+        published_at: task.published_at,
+        publish_error: task.publish_error,
+    }
+}
+
+fn task_counts_from_flow(counts: &flow_state::TaskCounts) -> TaskCounts {
+    TaskCounts {
+        total: counts.total,
+        pending: counts.pending,
+        queued: counts.queued,
+        running: counts.running,
+        succeeded: counts.succeeded,
+        failed: counts.failed,
+        skipped: counts.skipped,
+        cancelled: counts.cancelled,
+    }
+}
+
+fn retry_attribution_from_flow(
+    attribution: flow_state::TaskRetryAttribution,
+) -> TaskRetryAttributionResponse {
+    TaskRetryAttributionResponse {
+        retries: attribution.retries,
+        reason: attribution.reason,
+    }
+}
+
+fn skip_attribution_from_flow(
+    attribution: flow_state::TaskSkipAttribution,
+) -> TaskSkipAttributionResponse {
+    TaskSkipAttributionResponse {
+        upstream_task_key: attribution.upstream_task_key,
+        upstream_resolution: attribution.upstream_resolution,
+    }
+}
+
+fn run_state_from_flow(state: flow_state::RunStateView) -> RunStateResponse {
+    match state {
+        flow_state::RunStateView::Pending => RunStateResponse::Pending,
+        flow_state::RunStateView::Running => RunStateResponse::Running,
+        flow_state::RunStateView::Cancelling => RunStateResponse::Cancelling,
+        flow_state::RunStateView::Succeeded => RunStateResponse::Succeeded,
+        flow_state::RunStateView::Failed => RunStateResponse::Failed,
+        flow_state::RunStateView::Cancelled => RunStateResponse::Cancelled,
+        flow_state::RunStateView::TimedOut => RunStateResponse::TimedOut,
+    }
+}
+
+fn run_state_to_flow_query(state: RunStateResponse) -> flow_state::RunStateView {
+    match state {
+        RunStateResponse::Pending => flow_state::RunStateView::Pending,
+        RunStateResponse::Running => flow_state::RunStateView::Running,
+        RunStateResponse::Cancelling => flow_state::RunStateView::Cancelling,
+        RunStateResponse::Succeeded => flow_state::RunStateView::Succeeded,
+        RunStateResponse::Failed => flow_state::RunStateView::Failed,
+        RunStateResponse::Cancelled => flow_state::RunStateView::Cancelled,
+        RunStateResponse::TimedOut => flow_state::RunStateView::TimedOut,
+    }
+}
+
+fn task_state_from_flow(state: flow_state::TaskStateView) -> TaskStateResponse {
+    match state {
+        flow_state::TaskStateView::Pending => TaskStateResponse::Pending,
+        flow_state::TaskStateView::Queued => TaskStateResponse::Queued,
+        flow_state::TaskStateView::Running => TaskStateResponse::Running,
+        flow_state::TaskStateView::Succeeded => TaskStateResponse::Succeeded,
+        flow_state::TaskStateView::Failed => TaskStateResponse::Failed,
+        flow_state::TaskStateView::Skipped => TaskStateResponse::Skipped,
+        flow_state::TaskStateView::Cancelled => TaskStateResponse::Cancelled,
+    }
+}
+
+fn output_visibility_from_flow(
+    state: flow_state::OutputVisibilityStateView,
+) -> TaskOutputVisibilityStateResponse {
+    match state {
+        flow_state::OutputVisibilityStateView::Pending => {
+            TaskOutputVisibilityStateResponse::Pending
         }
-
-        let satisfied_at = edge.satisfied_at.map_or(0, |t| t.timestamp_millis());
-        let upstream_task_key = edge.upstream_task_key.clone();
-        let row_version = edge.row_version.clone();
-
-        let replace = first_causes
-            .get(&edge.downstream_task_key)
-            .is_none_or(|current| {
-                (
-                    satisfied_at,
-                    upstream_task_key.as_str(),
-                    row_version.as_str(),
-                ) < (current.0, current.1.as_str(), current.2.as_str())
-            });
-
-        if replace {
-            first_causes.insert(
-                edge.downstream_task_key.clone(),
-                (satisfied_at, upstream_task_key, row_version, resolution),
-            );
+        flow_state::OutputVisibilityStateView::Visible => {
+            TaskOutputVisibilityStateResponse::Visible
         }
+        flow_state::OutputVisibilityStateView::Failed => TaskOutputVisibilityStateResponse::Failed,
     }
-
-    first_causes
-        .into_iter()
-        .map(
-            |(downstream_task_key, (_, upstream_task_key, _, resolution))| {
-                (
-                    downstream_task_key,
-                    TaskSkipAttributionResponse {
-                        upstream_task_key,
-                        upstream_resolution: dep_resolution_str(resolution).to_string(),
-                    },
-                )
-            },
-        )
-        .collect()
 }
 
-fn task_skip_attribution(
-    task: &TaskRow,
-    skip_attribution_index: &HashMap<String, TaskSkipAttributionResponse>,
-) -> Option<TaskSkipAttributionResponse> {
-    if task.state != FoldTaskState::Skipped {
-        return None;
-    }
+fn state_service_for_request(
+    ctx: &RequestContext,
+    state: &AppState,
+) -> Result<FlowOrchestrationStateService, ApiError> {
+    let storage = ctx.scoped_storage(state.storage_backend()?)?;
+    Ok(
+        FlowOrchestrationStateService::new(storage)
+            .with_max_run_list_limit(MAX_LIST_LIMIT as usize),
+    )
+}
 
-    skip_attribution_index
-        .get(&task.task_key)
-        .map(|attr| TaskSkipAttributionResponse {
-            upstream_task_key: attr.upstream_task_key.clone(),
-            upstream_resolution: attr.upstream_resolution.clone(),
-        })
+fn state_service_for_cancel(
+    ctx: &RequestContext,
+    state: &AppState,
+) -> Result<FlowOrchestrationStateService, ApiError> {
+    let mut service =
+        state_service_for_request(ctx, state)?.with_request_id(ctx.request_id.clone());
+    if let Some(url) = state.config.orchestration_compactor_url.clone() {
+        service = service.with_orchestration_compactor_url(url);
+    }
+    Ok(service)
+}
+
+fn api_error_from_state_service_error(error: FlowStateServiceError) -> ApiError {
+    match error {
+        FlowStateServiceError::RunNotFound { run_id } => {
+            ApiError::not_found(format!("run not found: {run_id}"))
+        }
+        FlowStateServiceError::TerminalRun { run_id, state } => ApiError::conflict(format!(
+            "run {} is already in terminal state {:?}",
+            run_id,
+            run_state_from_flow(state)
+        )),
+        FlowStateServiceError::InvalidRunListCursor { .. } => {
+            ApiError::bad_request("invalid cursor")
+        }
+        FlowStateServiceError::ZeroRunListLimit { max }
+        | FlowStateServiceError::RunListLimitTooLarge { max, .. } => {
+            ApiError::bad_request(format!("limit must be between 1 and {max}"))
+        }
+        FlowStateServiceError::Flow(error) => api_error_from_flow_error(error),
+    }
+}
+
+fn api_error_from_flow_error(error: FlowError) -> ApiError {
+    match error {
+        FlowError::RunNotFound { run_id } => {
+            ApiError::not_found(format!("run not found: {run_id}"))
+        }
+        FlowError::TaskNotFound { task_id } => {
+            ApiError::not_found(format!("task not found: {task_id}"))
+        }
+        FlowError::StaleFencingToken { .. }
+        | FlowError::FencingLockUnavailable { .. }
+        | FlowError::Core(CoreError::PreconditionFailed { .. }) => {
+            ApiError::conflict(error.to_string())
+        }
+        FlowError::Core(
+            CoreError::InvalidInput(_) | CoreError::InvalidId { .. } | CoreError::Validation { .. },
+        ) => ApiError::bad_request(error.to_string()),
+        FlowError::Core(error) => ApiError::from(error),
+        _ => ApiError::internal(format!("orchestration state service failed: {error}")),
+    }
 }
 
 fn reject_reserved_lineage_labels(labels: &HashMap<String, String>) -> Result<(), ApiError> {
@@ -2695,34 +2797,6 @@ fn parse_partition_values(
     }
 
     Ok(values)
-}
-
-fn build_task_counts(run: &RunRow, tasks: &[&TaskRow]) -> TaskCounts {
-    let mut pending = 0;
-    let mut queued = 0;
-    let mut running = 0;
-
-    for task in tasks {
-        match task.state {
-            FoldTaskState::Planned | FoldTaskState::Blocked | FoldTaskState::RetryWait => {
-                pending += 1;
-            }
-            FoldTaskState::Ready | FoldTaskState::Dispatched => queued += 1,
-            FoldTaskState::Running => running += 1,
-            _ => {}
-        }
-    }
-
-    TaskCounts {
-        total: run.tasks_total,
-        pending,
-        queued,
-        running,
-        succeeded: run.tasks_succeeded,
-        failed: run.tasks_failed,
-        skipped: run.tasks_skipped,
-        cancelled: run.tasks_cancelled,
-    }
 }
 
 fn resolve_partition_key(
@@ -4837,64 +4911,13 @@ pub(crate) async fn get_run(
     );
 
     ensure_workspace(&ctx, &workspace_id)?;
-    let fold_state = load_orchestration_state(&ctx, &state).await?;
-
-    let run = fold_state
-        .runs
-        .get(&run_id)
+    let service = state_service_for_request(&ctx, &state)?;
+    let run = service
+        .get_run(&run_id)
+        .await
+        .map_err(api_error_from_state_service_error)?
         .ok_or_else(|| ApiError::not_found(format!("run not found: {run_id}")))?;
-
-    let tasks: Vec<&TaskRow> = fold_state
-        .tasks
-        .values()
-        .filter(|row| row.run_id == run_id)
-        .collect();
-    let skip_attribution_index = build_skip_attribution_index(&fold_state, &run_id);
-
-    let task_counts = build_task_counts(run, &tasks);
-    let started_at = tasks.iter().filter_map(|row| row.started_at).min();
-    let task_summaries = tasks
-        .iter()
-        .map(|row| TaskSummary {
-            task_key: row.task_key.clone(),
-            asset_key: row.asset_key.clone(),
-            state: map_task_state(row.state),
-            attempt: row.attempt,
-            started_at: row.started_at,
-            completed_at: row.completed_at,
-            error_message: row.error_message.clone(),
-            execution_lineage_ref: row.execution_lineage_ref.clone(),
-            delta_table: row.delta_table.clone(),
-            delta_version: row.delta_version,
-            delta_partition: row.delta_partition.clone(),
-            retry_attribution: task_retry_attribution(row),
-            skip_attribution: task_skip_attribution(row, &skip_attribution_index),
-            output_visibility_state: row.output_visibility_state.map(map_output_visibility_state),
-            published_at: row.published_at,
-            publish_error: row.publish_error.clone(),
-        })
-        .collect::<Vec<_>>();
-
-    let (parent_run_id, rerun_kind) = lineage_from_labels(&run.labels);
-    let rerun_reason = rerun_kind.map(|kind| rerun_reason_for_kind(kind).to_string());
-
-    let public_state = map_run_row_state(run, &tasks);
-
-    let response = RunResponse {
-        run_id: run.run_id.clone(),
-        workspace_id,
-        plan_id: run.plan_id.clone(),
-        state: public_state,
-        created_at: run.triggered_at,
-        started_at,
-        completed_at: public_run_completed_at(public_state, run.completed_at),
-        tasks: task_summaries,
-        task_counts,
-        labels: run.labels.clone(),
-        parent_run_id,
-        rerun_kind,
-        rerun_reason,
-    };
+    let response = run_response_from_flow(workspace_id, run);
 
     Ok(Json(response))
 }
@@ -4942,30 +4965,7 @@ pub(crate) async fn list_runs(
             "limit must be between 1 and {MAX_LIST_LIMIT}"
         )));
     }
-    let fold_state = load_orchestration_state(&ctx, &state).await?;
-    let mut tasks_by_run: HashMap<String, Vec<&TaskRow>> = HashMap::new();
-    for task in fold_state.tasks.values() {
-        tasks_by_run
-            .entry(task.run_id.clone())
-            .or_default()
-            .push(task);
-    }
-
-    let mut runs: Vec<&RunRow> = fold_state.runs.values().collect();
-    if let Some(filter_state) = query.state {
-        runs.retain(|row| {
-            map_run_row_state(
-                row,
-                tasks_by_run
-                    .get(row.run_id.as_str())
-                    .map_or(&[], Vec::as_slice),
-            ) == filter_state
-        });
-    }
-
-    runs.sort_by(|a, b| b.triggered_at.cmp(&a.triggered_at));
-
-    let offset = query
+    query
         .cursor
         .as_deref()
         .map(|cursor| {
@@ -4973,47 +4973,19 @@ pub(crate) async fn list_runs(
                 .parse::<usize>()
                 .map_err(|_| ApiError::bad_request("invalid cursor"))
         })
-        .transpose()?
-        .unwrap_or(0);
+        .transpose()?;
 
-    let limit = query.limit as usize;
-    let end = (offset + limit).min(runs.len());
-    let page = runs.get(offset..end).unwrap_or_default();
-
-    let next_cursor = if end < runs.len() {
-        Some(end.to_string())
-    } else {
-        None
-    };
-
-    let items = page
-        .iter()
-        .map(|row| {
-            let (parent_run_id, rerun_kind) = lineage_from_labels(&row.labels);
-            let public_state = map_run_row_state(
-                row,
-                tasks_by_run
-                    .get(row.run_id.as_str())
-                    .map_or(&[], Vec::as_slice),
-            );
-            RunListItem {
-                run_id: row.run_id.clone(),
-                state: public_state,
-                created_at: row.triggered_at,
-                completed_at: public_run_completed_at(public_state, row.completed_at),
-                task_count: row.tasks_total,
-                tasks_succeeded: row.tasks_succeeded,
-                tasks_failed: row.tasks_failed,
-                parent_run_id,
-                rerun_kind,
-            }
+    let service = state_service_for_request(&ctx, &state)?;
+    let page = service
+        .list_runs(flow_state::RunListQuery {
+            limit: query.limit as usize,
+            cursor: query.cursor,
+            state: query.state.map(run_state_to_flow_query),
         })
-        .collect::<Vec<_>>();
+        .await
+        .map_err(api_error_from_state_service_error)?;
 
-    Ok(Json(ListRunsResponse {
-        runs: items,
-        next_cursor,
-    }))
+    Ok(Json(list_runs_response_from_flow(page)))
 }
 
 /// Cancel a run.
@@ -5051,60 +5023,17 @@ pub(crate) async fn cancel_run(
     );
 
     ensure_workspace(&ctx, &workspace_id)?;
-
-    // Load current state to check if run exists and is cancellable
-    let fold_state = load_orchestration_state(&ctx, &state).await?;
-
-    let run = fold_state
-        .runs
-        .get(&run_id)
-        .ok_or_else(|| ApiError::not_found(format!("run not found: {run_id}")))?;
-
-    // Check if run is already in a terminal state
-    if run.state.is_terminal() {
-        return Err(ApiError::conflict(format!(
-            "run {} is already in terminal state {:?}",
-            run_id, run.state
-        )));
-    }
-
-    // Check if cancellation was already requested
-    if run.cancel_requested {
-        // Idempotent - return success
-        return Ok(Json(CancelRunResponse {
+    let service = state_service_for_cancel(&ctx, &state)?;
+    let outcome = service
+        .cancel_run(FlowCancelRunRequest {
             run_id,
-            state: RunStateResponse::Cancelling,
-            cancelled_at: Utc::now(),
-        }));
-    }
-
-    // Create ledger writer
-    let backend = state.storage_backend()?;
-    let storage = ctx.scoped_storage(backend)?;
-    // Emit RunCancelRequested event
-    let cancel_event = OrchestrationEvent::new(
-        &ctx.tenant,
-        &workspace_id,
-        OrchestrationEventData::RunCancelRequested {
-            run_id: run_id.clone(),
             reason: request.reason,
             requested_by: user_id_for_events(&ctx),
-        },
-    );
+        })
+        .await
+        .map_err(api_error_from_state_service_error)?;
 
-    append_event_and_compact(
-        &state.config,
-        storage,
-        cancel_event,
-        Some(ctx.request_id.as_str()),
-    )
-    .await?;
-
-    Ok(Json(CancelRunResponse {
-        run_id,
-        state: RunStateResponse::Cancelling,
-        cancelled_at: Utc::now(),
-    }))
+    Ok(Json(cancel_run_response_from_flow(outcome, Utc::now())))
 }
 
 /// Upload task logs for a run.
@@ -6911,6 +6840,159 @@ mod tests {
         let json = serde_json::to_string(&summary).expect("serialize");
         assert!(json.contains("\"outputVisibilityState\":\"FAILED\""));
         assert!(json.contains("\"publishError\":\"publisher exhausted retries\""));
+    }
+
+    #[test]
+    fn test_flow_run_detail_adapter_preserves_run_response_shape() {
+        let created_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let started_at = DateTime::from_timestamp(1_700_000_010, 0).unwrap();
+        let completed_at = DateTime::from_timestamp(1_700_000_020, 0).unwrap();
+
+        let detail = arco_flow::orchestration::state::RunDetail {
+            run_id: "run-flow".to_string(),
+            plan_id: "plan-flow".to_string(),
+            state: arco_flow::orchestration::state::RunStateView::Failed,
+            created_at,
+            started_at: Some(started_at),
+            completed_at: Some(completed_at),
+            tasks: vec![arco_flow::orchestration::state::TaskSummary {
+                task_key: "asset.a".to_string(),
+                asset_key: Some("asset.a".to_string()),
+                state: arco_flow::orchestration::state::TaskStateView::Succeeded,
+                attempt: 2,
+                started_at: Some(started_at),
+                completed_at: Some(completed_at),
+                error_message: None,
+                execution_lineage_ref: Some("{\"runId\":\"run-flow\"}".to_string()),
+                delta_table: Some("asset.a".to_string()),
+                delta_version: Some(8),
+                delta_partition: Some("date=2026-05-26".to_string()),
+                retry_attribution: Some(arco_flow::orchestration::state::TaskRetryAttribution {
+                    retries: 1,
+                    reason: "prior_attempt_failed".to_string(),
+                }),
+                skip_attribution: None,
+                output_visibility_state: Some(
+                    arco_flow::orchestration::state::OutputVisibilityStateView::Visible,
+                ),
+                published_at: Some(completed_at),
+                publish_error: None,
+            }],
+            task_counts: arco_flow::orchestration::state::TaskCounts {
+                total: 1,
+                pending: 0,
+                queued: 0,
+                running: 0,
+                succeeded: 1,
+                failed: 0,
+                skipped: 0,
+                cancelled: 0,
+            },
+            labels: HashMap::from([("env".to_string(), "prod".to_string())]),
+            parent_run_id: Some("parent-run".to_string()),
+            rerun_kind: Some("SUBSET".to_string()),
+            rerun_reason: Some("subset_selection".to_string()),
+        };
+
+        let response = run_response_from_flow("workspace".to_string(), detail);
+
+        assert_eq!(response.run_id, "run-flow");
+        assert_eq!(response.workspace_id, "workspace");
+        assert_eq!(response.plan_id, "plan-flow");
+        assert_eq!(response.state, RunStateResponse::Failed);
+        assert_eq!(response.completed_at, Some(completed_at));
+        assert_eq!(response.task_counts.succeeded, 1);
+        assert_eq!(response.parent_run_id.as_deref(), Some("parent-run"));
+        assert_eq!(response.rerun_kind, Some(RerunKindResponse::Subset));
+        assert_eq!(response.rerun_reason.as_deref(), Some("subset_selection"));
+
+        let task = response.tasks.first().expect("task summary");
+        assert!(matches!(task.state, TaskStateResponse::Succeeded));
+        assert_eq!(
+            task.retry_attribution.as_ref().map(|value| value.retries),
+            Some(1)
+        );
+        assert_eq!(
+            task.output_visibility_state,
+            Some(TaskOutputVisibilityStateResponse::Visible)
+        );
+
+        let json = serde_json::to_value(&response).expect("serialize");
+        assert_eq!(json["runId"], "run-flow");
+        assert_eq!(json["workspaceId"], "workspace");
+        assert_eq!(json["tasks"][0]["outputVisibilityState"], "VISIBLE");
+    }
+
+    #[test]
+    fn test_flow_run_list_adapter_preserves_response_shape() {
+        let created_at = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let completed_at = DateTime::from_timestamp(1_700_000_020, 0).unwrap();
+        let page = arco_flow::orchestration::state::RunListPage {
+            runs: vec![arco_flow::orchestration::state::RunListItem {
+                run_id: "run-list".to_string(),
+                state: arco_flow::orchestration::state::RunStateView::Succeeded,
+                created_at,
+                completed_at: Some(completed_at),
+                task_count: 3,
+                tasks_succeeded: 2,
+                tasks_failed: 1,
+                parent_run_id: Some("parent-run".to_string()),
+                rerun_kind: Some("FROM_FAILURE".to_string()),
+            }],
+            next_cursor: Some("1".to_string()),
+        };
+
+        let response = list_runs_response_from_flow(page);
+
+        assert_eq!(response.next_cursor.as_deref(), Some("1"));
+        let item = response.runs.first().expect("run list item");
+        assert_eq!(item.run_id, "run-list");
+        assert_eq!(item.state, RunStateResponse::Succeeded);
+        assert_eq!(item.completed_at, Some(completed_at));
+        assert_eq!(item.task_count, 3);
+        assert_eq!(item.tasks_succeeded, 2);
+        assert_eq!(item.tasks_failed, 1);
+        assert_eq!(item.parent_run_id.as_deref(), Some("parent-run"));
+        assert_eq!(item.rerun_kind, Some(RerunKindResponse::FromFailure));
+    }
+
+    #[test]
+    fn test_flow_cancel_adapter_maps_response_and_errors() {
+        let cancelled_at = DateTime::from_timestamp(1_700_000_030, 0).unwrap();
+        let outcome = arco_flow::orchestration::state::CancelRunOutcome {
+            run_id: "run-cancel".to_string(),
+            state: arco_flow::orchestration::state::RunStateView::Cancelling,
+            disposition: arco_flow::orchestration::state::CancelRunDisposition::AlreadyRequested,
+        };
+
+        let response = cancel_run_response_from_flow(outcome, cancelled_at);
+
+        assert_eq!(response.run_id, "run-cancel");
+        assert_eq!(response.state, RunStateResponse::Cancelling);
+        assert_eq!(response.cancelled_at, cancelled_at);
+
+        let not_found = api_error_from_state_service_error(
+            arco_flow::orchestration::state::StateServiceError::RunNotFound {
+                run_id: "missing".to_string(),
+            },
+        );
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+
+        let terminal = api_error_from_state_service_error(
+            arco_flow::orchestration::state::StateServiceError::TerminalRun {
+                run_id: "done".to_string(),
+                state: arco_flow::orchestration::state::RunStateView::Succeeded,
+            },
+        );
+        assert_eq!(terminal.status(), StatusCode::CONFLICT);
+
+        let invalid_cursor = api_error_from_state_service_error(
+            arco_flow::orchestration::state::StateServiceError::InvalidRunListCursor {
+                cursor: "abc".to_string(),
+            },
+        );
+        assert_eq!(invalid_cursor.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(invalid_cursor.message(), "invalid cursor");
     }
 
     #[test]

@@ -45,6 +45,7 @@ pub mod proto;
 pub mod run_key;
 pub mod runtime;
 pub mod selection;
+pub mod state;
 pub mod worker_contract;
 
 pub use callbacks::{

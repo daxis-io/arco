@@ -36,6 +36,7 @@ arco-flow = { path = "../arco-flow", features = ["http-client"] }
 arco-iceberg = { path = "../arco-iceberg" }
 arco-uc = { path = "../arco-uc" }
 arco-proto = { path = "../arco-proto" }
+arco-worker-contract = { path = "../arco-worker-contract" }
 
 # Async runtime
 tokio = { workspace = true }

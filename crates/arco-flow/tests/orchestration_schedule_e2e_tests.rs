@@ -27,7 +27,7 @@ fn orchestration_event_path(date: &str, event_id: &str) -> String {
 async fn schedule_tick_history_survives_compactor_reload_and_is_idempotent()
 -> arco_flow::error::Result<()> {
     let backend = Arc::new(MemoryBackend::new());
-    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let storage = ScopedStorage::new(backend, "tenant-abc", "workspace-prod")?;
 
     let schedule_id = "daily-etl";
     let scheduled_for = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
@@ -144,7 +144,7 @@ async fn schedule_tick_history_survives_compactor_reload_and_is_idempotent()
 #[tokio::test]
 async fn schedule_definition_version_is_snapshotted_into_ticks() -> arco_flow::error::Result<()> {
     let backend = Arc::new(MemoryBackend::new());
-    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let storage = ScopedStorage::new(backend, "tenant-abc", "workspace-prod")?;
 
     let schedule_id = "daily-etl".to_string();
 
@@ -278,7 +278,7 @@ async fn schedule_definition_version_is_snapshotted_into_ticks() -> arco_flow::e
 async fn schedule_controller_bounded_catchup_emits_only_recent_ticks()
 -> arco_flow::error::Result<()> {
     let backend = Arc::new(MemoryBackend::new());
-    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let storage = ScopedStorage::new(backend, "tenant-abc", "workspace-prod")?;
 
     let schedule_id = "daily-etl".to_string();
 
@@ -347,7 +347,7 @@ async fn schedule_controller_bounded_catchup_emits_only_recent_ticks()
 async fn schedule_tick_run_correlation_survives_out_of_order_compaction()
 -> arco_flow::error::Result<()> {
     let backend = Arc::new(MemoryBackend::new());
-    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let storage = ScopedStorage::new(backend, "tenant-abc", "workspace-prod")?;
 
     let schedule_id = "daily-etl";
     let scheduled_for = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
@@ -433,7 +433,7 @@ async fn schedule_tick_run_correlation_survives_out_of_order_compaction()
 async fn disabled_schedule_emits_skipped_tick_without_run_request() -> arco_flow::error::Result<()>
 {
     let backend = Arc::new(MemoryBackend::new());
-    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let storage = ScopedStorage::new(backend, "tenant-abc", "workspace-prod")?;
 
     let schedule_id = "daily-etl".to_string();
 
@@ -528,7 +528,7 @@ async fn disabled_schedule_emits_skipped_tick_without_run_request() -> arco_flow
 async fn invalid_cron_emits_failed_tick_with_deterministic_tick_id() -> arco_flow::error::Result<()>
 {
     let backend = Arc::new(MemoryBackend::new());
-    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let storage = ScopedStorage::new(backend, "tenant-abc", "workspace-prod")?;
 
     let schedule_id = "daily-etl".to_string();
 

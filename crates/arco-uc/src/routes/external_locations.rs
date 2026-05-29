@@ -41,10 +41,7 @@ pub fn routes() -> Router<UnityCatalogState> {
             "/external-locations",
             post(create_external_location).get(list_external_locations),
         )
-        .route(
-            "/external-locations/:location_id",
-            get(get_external_location),
-        )
+        .route("/external-locations/:name", get(get_external_location))
 }
 
 async fn create_external_location(
@@ -128,14 +125,18 @@ async fn list_external_locations(
 async fn get_external_location(
     State(state): State<UnityCatalogState>,
     Extension(ctx): Extension<UnityCatalogRequestContext>,
-    Path(location_id): Path<String>,
+    Path(name): Path<String>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), UnityCatalogError> {
     require_storage_governance_admin(&state, &ctx)?;
     let ledger = ledger(&state, &ctx)?;
     let metastore = ledger.replay().await.map_err(map_catalog_error)?;
-    let Some(record) = metastore.external_locations.get(&location_id) else {
+    let Some(record) = metastore
+        .external_locations
+        .values()
+        .find(|record| record.name == name)
+    else {
         return Err(UnityCatalogError::NotFound {
-            message: format!("not found: external_location {location_id}"),
+            message: format!("not found: external_location {name}"),
         });
     };
 

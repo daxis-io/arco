@@ -115,16 +115,36 @@ async fn external_location_routes_use_ledger_backed_storage_governance() {
 
     let response = app
         .clone()
-        .oneshot(trusted_empty_request(
-            "GET",
-            "/external-locations/loc_orders",
-        ))
+        .oneshot(trusted_empty_request("GET", "/external-locations/orders"))
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::OK);
     let payload = json_body(response).await;
     assert_eq!(payload["location_id"], "loc_orders");
     assert_eq!(payload["credential_id"], "cred_01");
+
+    let response = app
+        .clone()
+        .oneshot(trusted_json_request(
+            "POST",
+            "/external-locations",
+            serde_json::json!({
+                "location_id": "loc_orders_alias",
+                "name": "orders",
+                "url": "gs://bucket/warehouse/orders-alias",
+                "credential_id": "cred_01",
+                "owner": "owner"
+            }),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let payload = json_body(response).await;
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("external_location_name orders"))
+    );
 
     let response = app
         .oneshot(trusted_json_request(

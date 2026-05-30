@@ -1,7 +1,5 @@
 # Issue 198 UC Support Follow-Through Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Close issue #198 by hardening the merged UC support registry follow-through so known unsupported and planned UC operations keep structured `501 NOT_SUPPORTED` behavior under custom mounts, and docs consistently describe the current partial governance surfaces.
 
 **Architecture:** Keep `arco-uc::support` mount-agnostic and match only facade-relative UC paths. The API server should preserve the actual request path in error messages but pass the nested router's current URI path to support matching, so default and custom mount prefixes share the same registry behavior. Documentation should distinguish partial UC adapter behavior from still-planned native governance writer/system-table parity.

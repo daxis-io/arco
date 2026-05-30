@@ -155,10 +155,6 @@ enum PublishManifestError {
     Other(#[from] Error),
 }
 
-const STALE_FENCING_PUBLISH_MARKER: &str = "orchestration_publish:stale_fencing";
-const FENCING_LOCK_UNAVAILABLE_PUBLISH_MARKER: &str =
-    "orchestration_publish:fencing_lock_unavailable";
-
 impl PublishManifestError {
     const fn retry_reason(&self) -> Option<PublishRetryReason> {
         match self {
@@ -401,7 +397,7 @@ impl MicroCompactor {
     /// Fenced compaction path for callers that hold the orchestration lock.
     ///
     /// This validates the canonical lock path, current lock holder, and supplied
-    /// fencing token before work starts and again immediately before pointer CAS.
+    /// fencing token before work starts and again before manifest publication.
     ///
     /// # Errors
     ///
@@ -953,7 +949,7 @@ impl MicroCompactor {
     }
 
     /// Loads state from a snapshot.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     async fn load_snapshot_state(
         &self,
         _snapshot_id: &str,
@@ -1419,6 +1415,21 @@ impl MicroCompactor {
                 message: format!("failed to serialize manifest pointer: {e}"),
             })?;
 
+        self.validate_fencing_lock(fencing_token, lock_path).await?;
+
+        if let (Some(previous_manifest), Some(previous_pointer), Some(previous_pointer_hash)) = (
+            previous_manifest,
+            previous_pointer,
+            parent_pointer_hash.as_deref(),
+        ) {
+            manifest
+                .validate_succession(previous_manifest)
+                .map_err(|message| Error::Core(arco_core::Error::Validation { message }))?;
+            pointer
+                .validate_succession(previous_pointer, previous_pointer_hash)
+                .map_err(|message| Error::Core(arco_core::Error::Validation { message }))?;
+        }
+
         let durability = match self.durability_mode {
             DurabilityMode::Visible => SnapshotPointerDurability::Visible,
             DurabilityMode::Persisted => SnapshotPointerDurability::Persisted,
@@ -1432,30 +1443,7 @@ impl MicroCompactor {
             current_pointer_version,
             None,
             durability,
-            async {
-                self.validate_fencing_lock(fencing_token, lock_path)
-                    .await
-                    .map_err(encode_pre_pointer_publish_error)?;
-
-                if let (
-                    Some(previous_manifest),
-                    Some(previous_pointer),
-                    Some(previous_pointer_hash),
-                ) = (
-                    previous_manifest,
-                    previous_pointer,
-                    parent_pointer_hash.as_deref(),
-                ) {
-                    manifest
-                        .validate_succession(previous_manifest)
-                        .map_err(|message| arco_core::Error::Validation { message })?;
-                    pointer
-                        .validate_succession(previous_pointer, previous_pointer_hash)
-                        .map_err(|message| arco_core::Error::Validation { message })?;
-                }
-
-                Ok(())
-            },
+            async { Ok(()) },
         )
         .await
         {
@@ -1485,14 +1473,9 @@ impl MicroCompactor {
                 Err(PublishManifestError::ConcurrentWrite)
             }
             Err(arco_core::Error::PreconditionFailed { message }) => {
-                decode_pre_pointer_publish_error(&message).map_or_else(
-                    || {
-                        Err(PublishManifestError::Other(Error::Core(
-                            arco_core::Error::PreconditionFailed { message },
-                        )))
-                    },
-                    |error| Err(PublishManifestError::Other(error)),
-                )
+                Err(PublishManifestError::Other(Error::Core(
+                    arco_core::Error::PreconditionFailed { message },
+                )))
             }
             Err(error) => Err(PublishManifestError::Other(Error::from(error))),
         }
@@ -1758,51 +1741,6 @@ fn hash_suffixed_artifact_path(base_path: &str, file: &str, checksum_sha256: &st
         Some((stem, ext)) => format!("{base_path}/{stem}.{short_hash}.{ext}"),
         None => format!("{base_path}/{file}.{short_hash}"),
     }
-}
-
-fn encode_pre_pointer_publish_error(error: Error) -> arco_core::Error {
-    match error {
-        Error::StaleFencingToken { expected, provided } => arco_core::Error::PreconditionFailed {
-            message: format!("{STALE_FENCING_PUBLISH_MARKER}:{expected}:{provided}"),
-        },
-        Error::FencingLockUnavailable {
-            lock_path,
-            provided,
-        } => arco_core::Error::PreconditionFailed {
-            message: format!("{FENCING_LOCK_UNAVAILABLE_PUBLISH_MARKER}:{provided}:{lock_path}"),
-        },
-        Error::Core(error) => error,
-        Error::Storage { message, source } => arco_core::Error::Storage { message, source },
-        Error::Serialization { message } => arco_core::Error::Serialization { message },
-        Error::Configuration { message }
-        | Error::Dispatch { message }
-        | Error::Parquet { message }
-        | Error::PlanGenerationFailed { message } => arco_core::Error::Validation { message },
-        other => arco_core::Error::Validation {
-            message: other.to_string(),
-        },
-    }
-}
-
-fn decode_pre_pointer_publish_error(message: &str) -> Option<Error> {
-    if let Some(rest) = message.strip_prefix(&format!("{STALE_FENCING_PUBLISH_MARKER}:")) {
-        let (expected, provided) = rest.split_once(':')?;
-        return Some(Error::StaleFencingToken {
-            expected: expected.parse().ok()?,
-            provided: provided.parse().ok()?,
-        });
-    }
-
-    if let Some(rest) = message.strip_prefix(&format!("{FENCING_LOCK_UNAVAILABLE_PUBLISH_MARKER}:"))
-    {
-        let (provided, lock_path) = rest.split_once(':')?;
-        return Some(Error::FencingLockUnavailable {
-            lock_path: lock_path.to_string(),
-            provided: provided.parse().ok()?,
-        });
-    }
-
-    None
 }
 
 fn catalog_run_index_org_file(org_id: &str) -> String {
@@ -3353,6 +3291,38 @@ mod tests {
 
         assert_eq!(row.fire_at, canonical_fire_at);
         assert_eq!(row.cloud_task_id.as_deref(), Some("t_cloud456"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_manifest_rejects_stale_fencing_before_writing_snapshot() -> Result<()> {
+        let (compactor, storage) = create_test_compactor().await?;
+
+        let mut manifest = OrchestrationManifest::new("01HQXYZ200REV");
+        manifest.manifest_id = "00000000000000000010".to_string();
+        let snapshot_path = orchestration_manifest_snapshot_path(&manifest.manifest_id);
+
+        let error = compactor
+            .publish_manifest(
+                &manifest,
+                None,
+                None,
+                None,
+                None,
+                Some(1),
+                Some(orchestration_compaction_lock_path()),
+            )
+            .await
+            .expect_err("missing fencing lock must reject publication");
+        assert!(
+            error.to_string().contains("fencing lock unavailable"),
+            "unexpected stale fencing error: {error}"
+        );
+        assert!(
+            storage.head_raw(&snapshot_path).await?.is_none(),
+            "failed fencing validation must not strand an immutable manifest snapshot"
+        );
 
         Ok(())
     }

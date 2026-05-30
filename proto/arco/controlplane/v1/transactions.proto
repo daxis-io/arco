@@ -146,6 +146,9 @@ message DomainMutation {
   oneof kind {
     arco.catalog.v1.CatalogDdlOperation catalog = 1;
     OrchestrationBatchSpec orchestration = 2;
+    // Alpha/beta frozen wire contract for future metastore root commits.
+    // Current API adapters validate and hash these mutations, then return
+    // NOT_IMPLEMENTED until metastore root commit execution is implemented.
     arco.catalog.v1.MetastoreMutation metastore = 3;
     ScopedMetastoreMutation scoped_metastore = 4;
   }

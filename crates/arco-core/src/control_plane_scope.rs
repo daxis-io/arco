@@ -10,9 +10,9 @@ use crate::error::{Error, Result};
 /// Tenant, workspace, and metastore scope for control-plane catalog state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPlaneScope {
-    tenant_id: String,
-    workspace_id: String,
-    metastore_id: String,
+    tenant: String,
+    workspace: String,
+    metastore: String,
 }
 
 impl ControlPlaneScope {
@@ -35,9 +35,9 @@ impl ControlPlaneScope {
         Self::validate_id(&metastore_id, "metastore_id")?;
 
         Ok(Self {
-            tenant_id,
-            workspace_id,
-            metastore_id,
+            tenant: tenant_id,
+            workspace: workspace_id,
+            metastore: metastore_id,
         })
     }
 
@@ -58,19 +58,19 @@ impl ControlPlaneScope {
     /// Returns the tenant ID.
     #[must_use]
     pub fn tenant_id(&self) -> &str {
-        &self.tenant_id
+        &self.tenant
     }
 
     /// Returns the workspace ID.
     #[must_use]
     pub fn workspace_id(&self) -> &str {
-        &self.workspace_id
+        &self.workspace
     }
 
     /// Returns the metastore ID.
     #[must_use]
     pub fn metastore_id(&self) -> &str {
-        &self.metastore_id
+        &self.metastore
     }
 
     /// Returns the workspace-scoped storage prefix with a trailing slash.
@@ -86,11 +86,11 @@ impl ControlPlaneScope {
     }
 
     pub(crate) fn workspace_storage_prefix(&self) -> String {
-        format!("tenant={}/workspace={}", self.tenant_id, self.workspace_id)
+        format!("tenant={}/workspace={}", self.tenant, self.workspace)
     }
 
     pub(crate) fn metastore_storage_prefix(&self) -> String {
-        format!("tenant={}/metastore={}", self.tenant_id, self.metastore_id)
+        format!("tenant={}/metastore={}", self.tenant, self.metastore)
     }
 
     fn validate_id(id: &str, field: &str) -> Result<()> {

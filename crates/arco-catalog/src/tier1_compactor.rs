@@ -332,12 +332,6 @@ impl Tier1Compactor {
         issuer: &arco_core::publish::PermitIssuer,
         fencing_token: u64,
     ) -> Result<Tier1CompactionResult, Tier1CompactionError> {
-        let events_processed = event_paths.len();
-        let last_event_id = event_paths
-            .last()
-            .and_then(|path| path.rsplit('/').next())
-            .and_then(|name| name.strip_suffix(".json"))
-            .map(str::to_string);
         let publisher = Publisher::new(&self.storage);
         let mut reserved_commit: Option<ReservedCatalogCommit> = None;
 
@@ -364,7 +358,7 @@ impl Tier1Compactor {
                     provided: fencing_token,
                 });
             }
-            let pointer_expected_version = Some(pointer_meta.version);
+            let pointer_expected_version = Some(pointer_meta.version.clone());
             let pointer_parent_hash = Some(compute_manifest_hash(&pointer_bytes));
             let previous_manifest_path = pointer.manifest_path.clone();
             let prev_bytes = self
@@ -377,15 +371,39 @@ impl Tier1Compactor {
             let mut manifest: CatalogDomainManifest =
                 serde_json::from_slice(&prev_bytes).map_err(map_processing_error)?;
             let prev_manifest = manifest.clone();
+            let unapplied_event_paths = unapplied_event_paths_after_watermark(
+                &event_paths,
+                manifest.watermark_event_id.as_deref(),
+            );
+            if unapplied_event_paths.is_empty() {
+                return Ok(Tier1CompactionResult {
+                    manifest_version: pointer_meta.version,
+                    commit_ulid: manifest
+                        .last_commit_id
+                        .clone()
+                        .or_else(|| manifest.commit_ulid.clone())
+                        .unwrap_or_default(),
+                    manifest_id: manifest.manifest_id,
+                    events_processed: 0,
+                    snapshot_version: manifest.snapshot_version,
+                    visibility_status: VisibilityStatus::Visible,
+                    repair_pending: false,
+                });
+            }
+            let events_processed = unapplied_event_paths.len();
+            let last_event_id = unapplied_event_paths
+                .last()
+                .and_then(|path| event_id_from_path(path))
+                .map(str::to_string);
 
             let mut state = tier1_state::load_catalog_state(&self.storage, &manifest.snapshot_path)
                 .await
                 .map_err(map_processing_error)?;
 
             let mut commit_metadata = CatalogCommitMetadata::default();
-            for path in &event_paths {
+            for path in &unapplied_event_paths {
                 let event = read_catalog_event(&self.storage, path).await?;
-                if event_paths.len() == 1 {
+                if unapplied_event_paths.len() == 1 {
                     commit_metadata = catalog_commit_metadata(&event);
                 }
                 apply_catalog_event(&mut state, event)?;
@@ -521,7 +539,6 @@ impl Tier1Compactor {
                             message: "manifest update lost CAS race after max retries".to_string(),
                         });
                     }
-                    continue;
                 }
             }
         }
@@ -570,7 +587,7 @@ impl Tier1Compactor {
                     provided: fencing_token,
                 });
             }
-            let pointer_expected_version = Some(pointer_meta.version);
+            let pointer_expected_version = Some(pointer_meta.version.clone());
             let pointer_parent_hash = Some(compute_manifest_hash(&pointer_bytes));
             let previous_manifest_path = pointer.manifest_path.clone();
             let prev_bytes = self
@@ -706,7 +723,6 @@ impl Tier1Compactor {
                                 .to_string(),
                         });
                     }
-                    continue;
                 }
             }
         }
@@ -900,7 +916,6 @@ impl Tier1Compactor {
                                 .to_string(),
                         });
                     }
-                    continue;
                 }
             }
         }
@@ -944,6 +959,28 @@ fn parse_domain(domain: &str) -> Result<CatalogDomain, Tier1CompactionError> {
             domain: domain.to_string(),
         }),
     }
+}
+
+fn event_id_from_path(path: &str) -> Option<&str> {
+    path.rsplit('/')
+        .next()
+        .and_then(|name| name.strip_suffix(".json"))
+}
+
+fn unapplied_event_paths_after_watermark(
+    event_paths: &[String],
+    watermark_event_id: Option<&str>,
+) -> Vec<String> {
+    let Some(watermark_event_id) = watermark_event_id else {
+        return event_paths.to_vec();
+    };
+    event_paths
+        .iter()
+        .filter(|path| {
+            event_id_from_path(path).is_none_or(|event_id| event_id > watermark_event_id)
+        })
+        .cloned()
+        .collect()
 }
 
 fn validate_event_paths(

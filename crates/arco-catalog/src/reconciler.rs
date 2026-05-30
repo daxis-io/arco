@@ -203,6 +203,7 @@ impl Reconciler {
     ///
     /// Returns an error if listing fails. Missing manifests are reported as issues
     /// in the returned report (no error).
+    #[allow(clippy::cognitive_complexity)]
     pub async fn check(&self, domain: CatalogDomain) -> Result<ReconciliationReport> {
         tracing::info!(
             tenant = %self.storage.tenant_id(),
@@ -333,7 +334,7 @@ impl Reconciler {
     /// # Errors
     ///
     /// Returns an error if storage operations fail while attempting repairs.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     pub async fn repair_with_scope(
         &self,
         report: &ReconciliationReport,

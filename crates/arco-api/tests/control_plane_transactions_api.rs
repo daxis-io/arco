@@ -6,33 +6,39 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Method, Request, StatusCode, header};
 use bytes::Bytes;
+use prost::Message;
+use tower::ServiceExt;
 
 use arco_catalog::CatalogReader;
-use arco_core::ControlPlaneTxDomain;
 use arco_core::catalog_event::CatalogEvent;
 use arco_core::catalog_paths::{CatalogDomain, CatalogPaths};
 use arco_core::control_plane_transactions::{
-    ControlPlaneTxPaths, ControlPlaneTxStatus, RootTxManifest, RootTxReceipt,
+    ControlPlaneIdempotencyRecord, ControlPlaneTxPaths, ControlPlaneTxStatus, RootTxManifest,
+    RootTxReceipt,
 };
 use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
 };
+use arco_core::{ControlPlaneTxDomain, ControlPlaneTxKind};
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_proto::arco::catalog::v1::{
-    CatalogDdlOperation, ColumnDefinition, GrantMutation, MetastoreMutation, StorageCredential,
-    metastore_mutation,
+    CatalogControlPlaneScope, CatalogDdlOperation, CatalogObjectLifecycleState, ColumnDefinition,
+    GrantMutation, MetastoreMutation, StorageCredential, TableFormat, UpdateTableOp,
+    catalog_ddl_operation, metastore_mutation,
 };
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CommitOrchestrationBatchRequest,
     CommitOrchestrationBatchResponse, CommitRootTransactionRequest, CommitRootTransactionResponse,
     DomainMutation, GetCatalogTransactionRequest, GetCatalogTransactionResponse,
     GetOrchestrationTransactionRequest, GetOrchestrationTransactionResponse,
-    GetRootTransactionRequest, GetRootTransactionResponse, TransactionDomain, TransactionStatus,
-    domain_mutation,
+    GetRootTransactionRequest, GetRootTransactionResponse, ScopedMetastoreMutation,
+    TransactionDomain, TransactionStatus, domain_mutation,
 };
 use arco_proto::arco::orchestration::v1::{orchestration_event_envelope, trigger_info};
+use chrono::Utc;
 #[path = "support/control_plane_transactions.rs"]
 mod support;
 
@@ -112,6 +118,49 @@ async fn load_catalog_ledger_event_source(
     Ok(envelope.source)
 }
 
+#[tokio::test]
+async fn http_protobuf_requests_require_current_contract_content_type() -> Result<()> {
+    let router = test_router();
+    let message = catalog_create_default_schema_request(
+        "idem-http-contract-01",
+        "req-http-contract-01",
+        "legacy_wire_guard",
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/transactions/applyCatalogDdl")
+        .header("X-Tenant-Id", TENANT)
+        .header("X-Workspace-Id", WORKSPACE)
+        .header("X-Request-Id", "req-http-contract-01")
+        .header("Idempotency-Key", "idem-http-contract-01")
+        .header(header::CONTENT_TYPE, "application/x-protobuf")
+        .body(Body::from(message.encode_to_vec()))
+        .context("build generic protobuf request")?;
+
+    let response = router.oneshot(request).await.map_err(|err| match err {})?;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+        .await
+        .context("read error response body")?;
+    let error: serde_json::Value = serde_json::from_slice(&body).with_context(|| {
+        format!(
+            "parse JSON error response (status={status}): {}",
+            String::from_utf8_lossy(&body)
+        )
+    })?;
+
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(error["code"], "UNSUPPORTED_MEDIA_TYPE");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("proto=arco.controlplane.v1.ApplyCatalogDdlRequest")
+    );
+
+    Ok(())
+}
+
 fn metastore_storage_credential_root_request(name: &str) -> CommitRootTransactionRequest {
     CommitRootTransactionRequest {
         mutations: vec![DomainMutation {
@@ -122,12 +171,44 @@ fn metastore_storage_credential_root_request(name: &str) -> CommitRootTransactio
                         name: name.to_string(),
                         cloud: "aws".to_string(),
                         owner: "group:data-platform".to_string(),
+                        lifecycle_state: CatalogObjectLifecycleState::Active as i32,
                         created_at: None,
                         updated_at: None,
                         ..Default::default()
                     },
                 )),
             })),
+        }],
+    }
+}
+
+fn scoped_metastore_storage_credential_root_request(name: &str) -> CommitRootTransactionRequest {
+    CommitRootTransactionRequest {
+        mutations: vec![DomainMutation {
+            kind: Some(domain_mutation::Kind::ScopedMetastore(
+                ScopedMetastoreMutation {
+                    scope: Some(CatalogControlPlaneScope {
+                        tenant_id: TENANT.to_string(),
+                        workspace_id: WORKSPACE.to_string(),
+                        metastore_id: "metastore-a".to_string(),
+                        request_id: "req-root-scoped-metastore-01".to_string(),
+                    }),
+                    mutation: Some(MetastoreMutation {
+                        op: Some(metastore_mutation::Op::StorageCredential(
+                            StorageCredential {
+                                credential_id: "cred_01".to_string(),
+                                name: name.to_string(),
+                                cloud: "aws".to_string(),
+                                owner: "group:data-platform".to_string(),
+                                lifecycle_state: CatalogObjectLifecycleState::Active as i32,
+                                created_at: None,
+                                updated_at: None,
+                                ..Default::default()
+                            },
+                        )),
+                    }),
+                },
+            )),
         }],
     }
 }
@@ -270,6 +351,113 @@ impl StorageBackend for FailRootSuperManifestBackend {
     }
 }
 
+#[derive(Debug)]
+struct ReplaceIdempotencyBeforeFinalizeBackend {
+    inner: MemoryBackend,
+    full_idempotency_path: String,
+    idempotency_key: String,
+    request_hash: std::sync::Mutex<Option<String>>,
+    replaced: std::sync::atomic::AtomicBool,
+}
+
+impl ReplaceIdempotencyBeforeFinalizeBackend {
+    const REPLACEMENT_TX_ID: &'static str = "01K0STALECLAIMREPLACED0001";
+
+    fn new(domain: ControlPlaneTxDomain, idempotency_key: impl Into<String>) -> Self {
+        let idempotency_key = idempotency_key.into();
+        let relative_path = ControlPlaneTxPaths::idempotency(domain, &idempotency_key);
+        Self {
+            inner: MemoryBackend::new(),
+            full_idempotency_path: format!("tenant={TENANT}/workspace={WORKSPACE}/{relative_path}"),
+            idempotency_key,
+            request_hash: std::sync::Mutex::new(None),
+            replaced: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl StorageBackend for ReplaceIdempotencyBeforeFinalizeBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        use std::sync::atomic::Ordering;
+
+        if path == self.full_idempotency_path {
+            match &precondition {
+                WritePrecondition::DoesNotExist => {
+                    if let Ok(record) =
+                        serde_json::from_slice::<ControlPlaneIdempotencyRecord>(data.as_ref())
+                    {
+                        *self.request_hash.lock().expect("request hash lock") =
+                            Some(record.request_hash);
+                    }
+                }
+                WritePrecondition::None | WritePrecondition::MatchesVersion(_) => {
+                    if !self.replaced.swap(true, Ordering::SeqCst) {
+                        let request_hash = self
+                            .request_hash
+                            .lock()
+                            .expect("request hash lock")
+                            .clone()
+                            .unwrap_or_else(|| "sha256:unknown".to_string());
+                        let replacement = ControlPlaneIdempotencyRecord {
+                            tx_id: Self::REPLACEMENT_TX_ID.to_string(),
+                            kind: ControlPlaneTxKind::CatalogDdl,
+                            request_id: "req-replacement-owner".to_string(),
+                            idempotency_key: self.idempotency_key.clone(),
+                            request_hash,
+                            created_at: Utc::now(),
+                            visible_at: None,
+                            tx_record: None,
+                        };
+                        self.inner
+                            .put(
+                                path,
+                                Bytes::from(serde_json::to_vec(&replacement).map_err(|error| {
+                                    arco_core::Error::storage(format!(
+                                        "serialize replacement idempotency record: {error}"
+                                    ))
+                                })?),
+                                WritePrecondition::None,
+                            )
+                            .await?;
+                    }
+                }
+            }
+        }
+
+        self.inner.put(path, data, precondition).await
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        self.inner.head(path).await
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+}
+
 #[tokio::test]
 async fn apply_catalog_ddl_returns_visible_receipt_and_persists_lookup_record() -> Result<()> {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
@@ -385,6 +573,47 @@ async fn apply_catalog_ddl_replays_same_idempotency_key_and_rejects_hash_conflic
 }
 
 #[tokio::test]
+async fn apply_catalog_ddl_does_not_overwrite_replaced_idempotency_marker_on_finalize() -> Result<()>
+{
+    let idempotency_key = "idem-cat-finalize-race-01";
+    let backend: Arc<dyn StorageBackend> = Arc::new(ReplaceIdempotencyBeforeFinalizeBackend::new(
+        ControlPlaneTxDomain::Catalog,
+        idempotency_key,
+    ));
+    let router = test_router_with_backend(backend.clone());
+    let request = catalog_create_default_schema_request(
+        idempotency_key,
+        "req-cat-finalize-race-01",
+        "finalize_race",
+    );
+
+    let (status, error) = post_error_json(
+        router,
+        "/api/v1/transactions/applyCatalogDdl",
+        &request,
+        idempotency_key,
+        "req-cat-finalize-race-01",
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error["code"], "CONFLICT");
+
+    let idem =
+        load_idempotency_record(backend, ControlPlaneTxDomain::Catalog, idempotency_key).await?;
+    assert_eq!(
+        idem.tx_id,
+        ReplaceIdempotencyBeforeFinalizeBackend::REPLACEMENT_TX_ID
+    );
+    assert!(
+        idem.tx_record.is_none(),
+        "stale finalize must not cache its visible record under the replacement owner"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn apply_catalog_ddl_registers_updates_and_drops_tables_via_transaction_layer() -> Result<()>
 {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
@@ -465,6 +694,76 @@ async fn apply_catalog_ddl_registers_updates_and_drops_tables_via_transaction_la
         .context("drop table receipt missing")?;
     let drop_record = load_catalog_tx_record(backend, &drop_receipt.tx_id).await?;
     assert_eq!(drop_record.status, ControlPlaneTxStatus::Visible);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn apply_catalog_ddl_update_table_unspecified_format_clears_stored_format() -> Result<()> {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let router = test_router_with_backend(backend.clone());
+
+    let create_schema = catalog_create_default_schema_request(
+        "idem-cat-format-clear-ns-01",
+        "req-cat-format-clear-ns-01",
+        "format_clear",
+    );
+    post_protobuf::<_, ApplyCatalogDdlResponse>(
+        router.clone(),
+        "/api/v1/transactions/applyCatalogDdl",
+        &create_schema,
+        "idem-cat-format-clear-ns-01",
+        "req-cat-format-clear-ns-01",
+    )
+    .await?;
+
+    let register = catalog_register_table_request(
+        "idem-cat-format-clear-reg-01",
+        "req-cat-format-clear-reg-01",
+        "format_clear",
+        "events",
+    );
+    post_protobuf::<_, ApplyCatalogDdlResponse>(
+        router.clone(),
+        "/api/v1/transactions/applyCatalogDdl",
+        &register,
+        "idem-cat-format-clear-reg-01",
+        "req-cat-format-clear-reg-01",
+    )
+    .await?;
+
+    let update = ApplyCatalogDdlRequest {
+        ddl: Some(CatalogDdlOperation {
+            op: Some(catalog_ddl_operation::Op::UpdateTable(UpdateTableOp {
+                catalog: "default".to_string(),
+                schema: "format_clear".to_string(),
+                table: "events".to_string(),
+                description: None,
+                location: None,
+                format: Some(TableFormat::Unspecified as i32),
+            })),
+        }),
+    };
+    let (_status, update_response): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router,
+        "/api/v1/transactions/applyCatalogDdl",
+        &update,
+        "idem-cat-format-clear-update-01",
+        "req-cat-format-clear-update-01",
+    )
+    .await?;
+    let update_receipt = update_response
+        .receipt
+        .context("update table receipt missing")?;
+    let update_record = load_catalog_tx_record(backend.clone(), &update_receipt.tx_id).await?;
+    assert_eq!(update_record.status, ControlPlaneTxStatus::Visible);
+
+    let reader = CatalogReader::new(scoped_storage(backend));
+    let table = reader
+        .get_table_in_schema("default", "format_clear", "events")
+        .await?
+        .context("updated table missing from reader")?;
+    assert_eq!(table.format, None);
 
     Ok(())
 }
@@ -1517,6 +1816,85 @@ async fn commit_root_transaction_hashes_metastore_mutation_payloads() -> Result<
     assert!(first_record.request_hash.starts_with("sha256:"));
     assert!(second_record.request_hash.starts_with("sha256:"));
     assert_ne!(first_record.request_hash, second_record.request_hash);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_root_transaction_rejects_scoped_metastore_scope_mismatch_before_idempotency()
+-> Result<()> {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let router = test_router_with_backend(backend.clone());
+    let mut request =
+        scoped_metastore_storage_credential_root_request("lakehouse-prod-scoped-mismatch");
+    let scoped = request
+        .mutations
+        .get_mut(0)
+        .and_then(|mutation| mutation.kind.as_mut())
+        .and_then(|kind| match kind {
+            domain_mutation::Kind::ScopedMetastore(scoped) => Some(scoped),
+            _ => None,
+        })
+        .context("scoped metastore mutation missing")?;
+    scoped
+        .scope
+        .as_mut()
+        .context("scoped metastore scope missing")?
+        .tenant_id = "other-tenant".to_string();
+
+    let (status, error) = post_error_json(
+        router,
+        "/api/v1/transactions/commitRootTransaction",
+        &request,
+        "idem-root-scoped-metastore-mismatch-01",
+        "req-root-scoped-metastore-01",
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["code"], "BAD_REQUEST");
+    assert!(
+        load_idempotency_record(
+            backend,
+            ControlPlaneTxDomain::Root,
+            "idem-root-scoped-metastore-mismatch-01",
+        )
+        .await
+        .is_err(),
+        "scope mismatches must fail before idempotency capture"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_root_transaction_scoped_metastore_uses_not_implemented_contract() -> Result<()> {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let router = test_router_with_backend(backend.clone());
+    let request = scoped_metastore_storage_credential_root_request("lakehouse-prod-scoped");
+
+    let (status, error) = post_error_json(
+        router,
+        "/api/v1/transactions/commitRootTransaction",
+        &request,
+        "idem-root-scoped-metastore-01",
+        "req-root-scoped-metastore-01",
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(error["code"], "NOT_IMPLEMENTED");
+
+    let idempotency_record = load_idempotency_record(
+        backend.clone(),
+        ControlPlaneTxDomain::Root,
+        "idem-root-scoped-metastore-01",
+    )
+    .await?;
+    let root_record = load_root_tx_record(backend, &idempotency_record.tx_id).await?;
+
+    assert!(idempotency_record.request_hash.starts_with("sha256:"));
+    assert_eq!(root_record.status, ControlPlaneTxStatus::Aborted);
 
     Ok(())
 }

@@ -26,9 +26,9 @@ use arco_core::{CatalogDomain, CatalogPaths, Error as CoreError, ScopedStorage};
 
 /// Expected tool versions (should match CI)
 mod versions {
-    pub const RUST_CHANNEL: &str = "1.85";
+    pub const RUST_CHANNEL: &str = "1.88";
     pub const CARGO_DENY_MIN: &str = "0.18.9";
-    pub const BUF_VERSION: &str = "1.47.2";
+    pub const BUF_VERSION: &str = "1.70.0";
 }
 
 const PROTO_POST_HARD_CUT_BASELINE: &str = "proto-baselines/post-hard-cut-v1.binpb";
@@ -54,6 +54,8 @@ enum Commands {
     AdrCheck,
     /// Enforce repository hygiene invariants
     RepoHygieneCheck,
+    /// Verify local CI helper coverage matches release-critical GitHub Actions gates
+    CiParity,
     /// Check the frozen post-hard-cut protobuf contract baseline
     ProtoBreakingCheck,
     /// Verify catalog integrity (schemas, golden files, workspace checks)
@@ -94,6 +96,7 @@ fn main() -> Result<()> {
         Commands::Doctor => run_doctor(),
         Commands::AdrCheck => run_adr_check(),
         Commands::RepoHygieneCheck => run_repo_hygiene_check(),
+        Commands::CiParity => run_ci_parity_check(),
         Commands::ProtoBreakingCheck => run_proto_breaking_check(),
         Commands::ParityMatrixCheck => run_parity_matrix_check(),
         Commands::UcOpenapiInventory => run_uc_openapi_inventory(),
@@ -370,6 +373,186 @@ fn run_proto_breaking_check() -> Result<()> {
     Ok(())
 }
 
+fn run_ci_parity_check() -> Result<()> {
+    println!("Checking local CI parity guardrails...\n");
+
+    let ci = read_text(".github/workflows/ci.yml")?;
+    let security_audit = read_text(".github/workflows/security-audit.yml")?;
+    let release_sbom = read_text(".github/workflows/release-sbom.yml")?;
+    let deny_toml = read_text("deny.toml")?;
+
+    let mut errors = Vec::new();
+
+    require_contains(&mut errors, "ci.yml", &ci, "Install protoc");
+    require_contains(&mut errors, "ci.yml", &ci, "cargo xtask doctor");
+    require_contains(&mut errors, "ci.yml", &ci, "cargo xtask verify-integrity");
+    require_contains(
+        &mut errors,
+        "ci.yml",
+        &ci,
+        "cargo xtask engine-boundary-check",
+    );
+    require_contains(
+        &mut errors,
+        "ci.yml",
+        &ci,
+        "cargo xtask parity-matrix-check",
+    );
+    require_contains(&mut errors, "ci.yml", &ci, "cargo xtask repo-hygiene-check");
+    require_contains(&mut errors, "ci.yml", &ci, "buf lint proto/");
+    require_contains(
+        &mut errors,
+        "ci.yml",
+        &ci,
+        "cargo xtask proto-breaking-check",
+    );
+    require_contains(
+        &mut errors,
+        "ci.yml",
+        &ci,
+        "git diff --quiet FETCH_HEAD HEAD -- proto-baselines/post-hard-cut-v1.binpb",
+    );
+    require_contains(
+        &mut errors,
+        "ci.yml",
+        &ci,
+        "git diff --quiet FETCH_HEAD HEAD -- proto/STYLE.md",
+    );
+    require_contains(
+        &mut errors,
+        "ci.yml",
+        &ci,
+        "The frozen baseline check above remains authoritative for this hard-cut window.",
+    );
+    require_contains(
+        &mut errors,
+        "ci.yml",
+        &ci,
+        &format!("version: '{}'", versions::BUF_VERSION),
+    );
+    require_contains(&mut errors, "ci.yml", &ci, "uv sync --locked --extra dev");
+    require_absent(&mut errors, "ci.yml", &ci, "pip install -e \".[dev]\"");
+
+    require_contains(
+        &mut errors,
+        "security-audit.yml",
+        &security_audit,
+        "uv sync --locked --extra dev",
+    );
+    require_contains(
+        &mut errors,
+        "security-audit.yml",
+        &security_audit,
+        "pip-audit==${PIP_AUDIT_VERSION}",
+    );
+    require_absent(
+        &mut errors,
+        "security-audit.yml",
+        &security_audit,
+        "pip install -e \".[dev]\"",
+    );
+
+    require_contains(&mut errors, "deny.toml", &deny_toml, "yanked = \"deny\"");
+    require_contains(
+        &mut errors,
+        "release-sbom.yml",
+        &release_sbom,
+        "if [ \"${run_conclusion}\" = \"success\" ] && [ \"${discipline_conclusion}\" = \"success\" ]; then",
+    );
+    require_absent(
+        &mut errors,
+        "release-sbom.yml",
+        &release_sbom,
+        "falling back to successful CI run conclusion",
+    );
+    require_workflow_actions_pinned(&mut errors)?;
+
+    if !errors.is_empty() {
+        println!("CI parity errors:");
+        for err in &errors {
+            println!("  - {err}");
+        }
+        anyhow::bail!("CI parity check failed with {} issue(s)", errors.len());
+    }
+
+    println!("Local CI parity guardrails passed!");
+    Ok(())
+}
+
+fn require_workflow_actions_pinned(errors: &mut Vec<String>) -> Result<()> {
+    let workflows_dir = Path::new(".github/workflows");
+    for entry in std::fs::read_dir(workflows_dir).context("read .github/workflows")? {
+        let entry = entry.context("read workflow directory entry")?;
+        let path = entry.path();
+        let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+            continue;
+        };
+        if extension != "yml" && extension != "yaml" {
+            continue;
+        }
+
+        let workflow = std::fs::read_to_string(&path)
+            .with_context(|| format!("read workflow {}", path.display()))?;
+        for (line_number, line) in workflow.lines().enumerate() {
+            let trimmed = line.trim();
+            let Some(reference) = workflow_action_reference(trimmed) else {
+                continue;
+            };
+            let Some((_, revision)) = reference.split_once('@') else {
+                errors.push(format!(
+                    "{}:{} uses `{reference}` without an explicit revision",
+                    path.display(),
+                    line_number + 1
+                ));
+                continue;
+            };
+            let revision = revision
+                .split_whitespace()
+                .next()
+                .expect("action reference should include a revision");
+            if !is_commit_sha(revision) {
+                errors.push(format!(
+                    "{}:{} uses floating action reference `{reference}`; pin a commit SHA and keep the tag in a comment",
+                    path.display(),
+                    line_number + 1
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn workflow_action_reference(line: &str) -> Option<&str> {
+    let reference = line
+        .strip_prefix("- uses: ")
+        .or_else(|| line.strip_prefix("uses: "))?;
+    if reference.starts_with("./") {
+        return None;
+    }
+    Some(reference)
+}
+
+fn is_commit_sha(revision: &str) -> bool {
+    revision.len() == 40 && revision.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn read_text(path: &str) -> Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("read {path}"))
+}
+
+fn require_contains(errors: &mut Vec<String>, file: &str, text: &str, needle: &str) {
+    if !text.contains(needle) {
+        errors.push(format!("{file}: missing required text `{needle}`"));
+    }
+}
+
+fn require_absent(errors: &mut Vec<String>, file: &str, text: &str, needle: &str) {
+    if text.contains(needle) {
+        errors.push(format!("{file}: forbidden text still present `{needle}`"));
+    }
+}
+
 fn run_repo_hygiene_check() -> Result<()> {
     println!("Running repository hygiene checks...\n");
 
@@ -396,13 +579,18 @@ fn run_repo_hygiene_check() -> Result<()> {
         }
 
         let lower = text.to_ascii_lowercase();
-        for marker in &forbidden_paths {
-            if lower.contains(marker) {
-                errors.push(format!("{path}: forbidden path reference '{marker}'"));
+        if scans_forbidden_path_markers(&path) {
+            for marker in &forbidden_paths {
+                if lower.contains(marker) && !is_allowed_forbidden_path_marker(&path, marker) {
+                    errors.push(format!("{path}: forbidden path reference '{marker}'"));
+                }
             }
         }
 
         for hit in scan_proto_denylist(&path, &text) {
+            if is_allowed_proto_denylist_hit(&path, &hit) {
+                continue;
+            }
             errors.push(format!("{path}: legacy proto symbol '{hit}'"));
         }
     }
@@ -498,6 +686,16 @@ fn forbidden_path_markers() -> [String; 3] {
         format!("{}_{}/", "release", "evidence"),
         format!("{}/{}/{}/", "docs", "catalog-metastore", "evidence"),
     ]
+}
+
+fn scans_forbidden_path_markers(path: &str) -> bool {
+    let _ = path;
+    true
+}
+
+fn is_allowed_forbidden_path_marker(path: &str, marker: &str) -> bool {
+    let plans_marker = format!("{}/{}/", "docs", "plans");
+    path.starts_with(&plans_marker) && marker == plans_marker
 }
 
 fn banned_term_tokens() -> [String; 7] {
@@ -620,6 +818,10 @@ fn scan_proto_denylist(path: &str, text: &str) -> Vec<String> {
     hits
 }
 
+fn is_allowed_proto_denylist_hit(path: &str, hit: &str) -> bool {
+    path == "crates/arco-proto/tests/golden_fixtures.rs" && hit == "arco.v1"
+}
+
 fn is_proto_denylist_path(path: &str) -> bool {
     if path == "tools/xtask/src/main.rs" {
         return false;
@@ -637,7 +839,7 @@ fn run_lint() -> Result<()> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !name.starts_with("arco-") {
-            anyhow::bail!("Crate '{}' does not follow arco-* naming", name);
+            anyhow::bail!("Crate '{name}' does not follow arco-* naming");
         }
     }
 
@@ -655,7 +857,7 @@ fn run_doctor() -> Result<()> {
     println!("Checking development environment...\n");
 
     let mut errors = Vec::new();
-    let mut warnings = Vec::new();
+    let warnings: Vec<String> = Vec::new();
 
     // 1. Check Rust version
     print!("  Rust toolchain... ");
@@ -677,13 +879,13 @@ fn run_doctor() -> Result<()> {
         }
     }
 
-    // 3. Check buf (optional - may not be installed locally)
+    // 3. Check buf
     print!("  buf...            ");
     match check_buf() {
         Ok(version) => println!("[ok] {version}"),
         Err(e) => {
-            println!("[warn] (optional)");
-            warnings.push(format!("buf: {e}"));
+            println!("[FAIL]");
+            errors.push(format!("buf: {e}"));
         }
     }
 
@@ -1711,22 +1913,19 @@ async fn verify_executions_state(
         Some(snapshot_path) => {
             if !snapshot_path.starts_with(&state_dir) {
                 errors.push(format!(
-                    "Executions snapshot path '{}' is not under '{}'",
-                    snapshot_path, state_dir
+                    "Executions snapshot path '{snapshot_path}' is not under '{state_dir}'"
                 ));
             }
             if !snapshot_path.ends_with(".parquet") {
                 errors.push(format!(
-                    "Executions snapshot path '{}' does not end with .parquet",
-                    snapshot_path
+                    "Executions snapshot path '{snapshot_path}' does not end with .parquet"
                 ));
             }
             match storage.head_raw(snapshot_path).await {
                 Ok(Some(_)) => {}
-                Ok(None) => errors.push(format!("Executions snapshot missing: {}", snapshot_path)),
+                Ok(None) => errors.push(format!("Executions snapshot missing: {snapshot_path}")),
                 Err(e) => errors.push(format!(
-                    "Failed to read executions snapshot '{}': {e}",
-                    snapshot_path
+                    "Failed to read executions snapshot '{snapshot_path}': {e}"
                 )),
             }
             if manifest.snapshot_version == 0 {
@@ -1879,8 +2078,7 @@ async fn verify_catalog_manifest_history(
             Ok(previous) => previous,
             Err(e) => {
                 errors.push(format!(
-                    "Invalid catalog manifest JSON at '{}': {e}",
-                    previous_path
+                    "Invalid catalog manifest JSON at '{previous_path}': {e}"
                 ));
                 break;
             }
@@ -1889,8 +2087,7 @@ async fn verify_catalog_manifest_history(
         let previous_hash = sha256_prefixed(bytes.as_ref());
         if let Err(e) = manifest.validate_succession(&previous, &previous_hash) {
             errors.push(format!(
-                "Manifest history mismatch for '{}': {e}",
-                manifest_path
+                "Manifest history mismatch for '{manifest_path}': {e}"
             ));
         }
 
@@ -2138,7 +2335,7 @@ fn check_rust_version() -> Result<String> {
     let version = String::from_utf8_lossy(&output.stdout);
     let version = version.trim();
 
-    // Extract version number (e.g., "rustc 1.85.0 (..." -> "1.85.0")
+    // Extract version number (e.g., "rustc 1.88.0 (..." -> "1.88.0")
     let parts: Vec<&str> = version.split_whitespace().collect();
     let rust_version = parts.get(1).unwrap_or(&"unknown");
 
@@ -2173,10 +2370,7 @@ fn check_cargo_deny() -> Result<String> {
 
     if deny_version < min {
         anyhow::bail!(
-            "expected cargo-deny >= {}, found {}. Install: cargo install cargo-deny --version {}",
-            min,
-            deny_version,
-            min
+            "expected cargo-deny >= {min}, found {deny_version}. Install: cargo install cargo-deny --version {min}"
         );
     }
 
@@ -2187,10 +2381,18 @@ fn check_buf() -> Result<String> {
     let output = Command::new("buf")
         .arg("--version")
         .output()
-        .context("buf not installed (optional - CI will run it)")?;
+        .with_context(|| {
+            format!(
+                "buf not installed. Install buf {} to match CI",
+                versions::BUF_VERSION
+            )
+        })?;
 
     if !output.status.success() {
-        anyhow::bail!("not installed (optional - CI will run it)");
+        anyhow::bail!(
+            "not installed. Install buf {} to match CI",
+            versions::BUF_VERSION
+        );
     }
 
     let raw = String::from_utf8_lossy(&output.stdout);
@@ -2202,9 +2404,7 @@ fn check_buf() -> Result<String> {
 
     if local != expected {
         anyhow::bail!(
-            "version mismatch: local={}, CI={}. Install: brew install bufbuild/buf/buf",
-            local,
-            expected
+            "version mismatch: local={local}, CI={expected}. Use the CI-pinned buf version for local release gates"
         );
     }
 
@@ -2366,5 +2566,58 @@ mod tests {
             markers.iter().any(|marker| marker == &release_evidence),
             "expected removed release evidence tree to be blocked"
         );
+    }
+
+    #[test]
+    fn forbidden_path_marker_scan_includes_plan_sources() {
+        let plan_path = format!(
+            "{}/{}/2026-05-08-catalog-product-surface-execution.md",
+            "docs", "plans"
+        );
+        assert!(scans_forbidden_path_markers(&plan_path));
+        assert!(scans_forbidden_path_markers(
+            "docs/guide/src/reference/system-catalog.md"
+        ));
+    }
+
+    #[test]
+    fn forbidden_path_marker_exception_allows_only_plan_marker_in_plan_sources() {
+        let plan_path = format!(
+            "{}/{}/2026-05-08-catalog-product-surface-execution.md",
+            "docs", "plans"
+        );
+        let plans_marker = format!("{}/{}/", "docs", "plans");
+        let release_evidence_marker = format!("{}_{}/", "release", "evidence");
+        let catalog_evidence_marker = format!("{}/{}/{}/", "docs", "catalog-metastore", "evidence");
+
+        assert!(is_allowed_forbidden_path_marker(&plan_path, &plans_marker));
+        assert!(!is_allowed_forbidden_path_marker(
+            &plan_path,
+            &release_evidence_marker
+        ));
+        assert!(!is_allowed_forbidden_path_marker(
+            &plan_path,
+            &catalog_evidence_marker
+        ));
+        assert!(!is_allowed_forbidden_path_marker(
+            "docs/guide/src/reference/system-catalog.md",
+            &plans_marker
+        ));
+    }
+
+    #[test]
+    fn proto_denylist_allows_only_legacy_doc_golden_fixture() {
+        assert!(is_allowed_proto_denylist_hit(
+            "crates/arco-proto/tests/golden_fixtures.rs",
+            "arco.v1"
+        ));
+        assert!(!is_allowed_proto_denylist_hit(
+            "crates/arco-proto/tests/golden_fixtures.rs",
+            "payload_json"
+        ));
+        assert!(!is_allowed_proto_denylist_hit(
+            "crates/arco-catalog/src/lib.rs",
+            "arco.v1"
+        ));
     }
 }

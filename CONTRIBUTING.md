@@ -14,7 +14,7 @@ Thanks for contributing. Arco is an Apache-2.0 project that values clear proposa
 
 ### Prerequisites
 
-- Rust 1.85+
+- Rust 1.88+
 - `protoc`
 - `mdbook` (for docs)
 

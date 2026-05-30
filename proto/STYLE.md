@@ -68,9 +68,9 @@ Before merging proto changes:
 
 ## JSON Contract Policy
 
-The public proto surface must preserve both **binary protobuf/gRPC** compatibility and
-**ProtoJSON** compatibility. The active Buf breaking policy is `WIRE_JSON` — see
-[buf.yaml](../buf.yaml).
+The public proto surface must preserve **generated source**, **package/service**,
+**binary protobuf/gRPC**, and **ProtoJSON** compatibility. The active Buf breaking
+policy is `FILE` — see [buf.yaml](../buf.yaml).
 
 The frozen post-cut baseline image lives at
 `proto-baselines/post-hard-cut-v1.binpb`. Run `cargo xtask proto-breaking-check` to verify that
@@ -79,13 +79,35 @@ Regenerate the baseline with
 `buf build proto -o proto-baselines/post-hard-cut-v1.binpb`. Keep source info in
 the image because CI's pinned Buf version validates it for breaking checks.
 
-## Pre-Freeze Hard-Cut Policy
+## Alpha/Beta Hard-Cut Policy
 
-The current `arco.*.v1` packages are allowed to receive intentional breaking
-changes only as part of the documented pre-freeze hard cut that expands the
-public API surface. After the post-hard-cut baseline is regenerated, `v1`
-changes must be additive and must preserve binary and ProtoJSON compatibility.
-Future broad reshapes require new `v2` packages.
+The old `arco.v1` package was intentionally removed during the alpha/beta hard
+cut and replaced by domain-aligned packages:
+
+- `arco.common.v1`
+- `arco.catalog.v1`
+- `arco.orchestration.v1`
+- `arco.controlplane.v1`
+
+Arco is still alpha/beta software, so additional breaking `v1` changes may
+happen without introducing `v2` only when they are grouped into a documented
+hard-cut window. A hard cut must update this policy, explain the migration
+impact, regenerate `proto-baselines/post-hard-cut-v1.binpb`, and keep
+`cargo xtask proto-breaking-check` passing afterward.
+
+Outside an explicit hard-cut window, `v1` changes must be additive and must
+preserve generated source, package/service, binary, and ProtoJSON compatibility with the frozen post-cut baseline.
+Once Arco declares a stable public API, broad reshapes require new `v2`
+packages.
+
+Current hard-cut migration note: `arco.catalog.v1.RegisterTableOp.format` is
+now optional. Omit the field for the Delta Lake default; explicit
+`TABLE_FORMAT_UNSPECIFIED` is invalid on `RegisterTableOp`.
+
+HTTP protobuf transaction routes must use message-qualified content types, for
+example `application/x-protobuf; proto=arco.controlplane.v1.ApplyCatalogDdlRequest`.
+This is the runtime hard-cut boundary for generic or legacy protobuf bodies that
+would otherwise share wire tags with new request messages.
 
 ## Pre-Freeze Hard-Cut Policy
 

@@ -474,10 +474,12 @@ impl OrchestrationReconciler {
     }
 
     async fn list_paths(&self, prefix: &str) -> Result<Vec<String>> {
-        let metas = self.storage.list_meta(prefix).await?;
+        let scoped_prefix = format!("{prefix}/");
+        let metas = self.storage.list_meta(&scoped_prefix).await?;
         Ok(metas
             .into_iter()
             .map(|meta| meta.path.to_string())
+            .filter(|path| path.starts_with(&scoped_prefix))
             .collect())
     }
 
@@ -499,12 +501,16 @@ impl OrchestrationReconciler {
     }
 
     async fn delete_prefix(&self, prefix: &str) -> Result<(u64, u64)> {
-        let entries = self.storage.list_meta(prefix).await?;
+        let scoped_prefix = format!("{prefix}/");
+        let entries = self.storage.list_meta(&scoped_prefix).await?;
         let mut deleted_objects = 0;
         let mut deleted_bytes = 0;
 
         for entry in entries {
             let path = entry.path.to_string();
+            if !path.starts_with(&scoped_prefix) {
+                continue;
+            }
             self.storage.delete(&path).await?;
             deleted_objects += 1;
             deleted_bytes += entry.size;
@@ -749,6 +755,41 @@ mod tests {
         assert_eq!(report.orphan_l0_dirs, vec![orphan_l0_dir]);
         assert!(!report.orphan_base_dirs.contains(&current_base_dir));
         assert!(!report.orphan_l0_dirs.contains(&current_l0_dir));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_ignores_manifest_sibling_prefixes() -> Result<()> {
+        let storage = create_storage().await?;
+        let (_current_manifest_path, _current_base_dir, _current_l0_dir) =
+            seed_current_manifest(&storage).await?;
+
+        let sibling_manifest_path = "state/orchestration/manifests_backup/sibling.json";
+        storage
+            .put_raw(
+                sibling_manifest_path,
+                Bytes::from_static(b"must stay outside manifest reconciliation"),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+
+        let reconciler = OrchestrationReconciler::new(storage.clone());
+        let mut report = reconciler.check().await?;
+        assert!(
+            !report
+                .orphan_manifest_snapshots
+                .contains(&sibling_manifest_path.to_string()),
+            "sibling prefix must not be reported as an orphan manifest snapshot: {report:?}"
+        );
+
+        report.checked_at -= Duration::hours(2);
+        let result = reconciler.repair(&report).await?;
+        assert_eq!(result.deleted_objects, 0);
+        assert!(
+            storage.head_raw(sibling_manifest_path).await?.is_some(),
+            "repair must not delete sibling-prefix data"
+        );
 
         Ok(())
     }

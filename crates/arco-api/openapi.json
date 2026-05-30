@@ -11,7 +11,7 @@
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
     },
-    "version": "0.1.5"
+    "version": "0.2.0"
   },
   "paths": {
     "/api/v1/browser/urls": {
@@ -65,6 +65,63 @@
           },
           "403": {
             "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/catalog/inventory": {
+      "get": {
+        "tags": [
+          "catalogs"
+        ],
+        "summary": "Get the current catalog inventory snapshot descriptor.",
+        "description": "GET /api/v1/catalog/inventory",
+        "operationId": "get_catalog_inventory",
+        "responses": {
+          "200": {
+            "description": "Catalog inventory snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogInventoryResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
             "content": {
               "application/json": {
                 "schema": {
@@ -4312,6 +4369,122 @@
           "state": {
             "$ref": "#/components/schemas/RunStateResponse",
             "description": "New state (should be CANCELLED or CANCELLING)."
+          }
+        }
+      },
+      "CatalogInventoryCounts": {
+        "type": "object",
+        "description": "Safe catalog inventory row counts.",
+        "required": [
+          "catalogs",
+          "schemas",
+          "tables",
+          "columns"
+        ],
+        "properties": {
+          "catalogs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of catalogs in the selected snapshot.",
+            "minimum": 0
+          },
+          "columns": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of columns in the selected snapshot.",
+            "minimum": 0
+          },
+          "schemas": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of schemas in the selected snapshot.",
+            "minimum": 0
+          },
+          "tables": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of tables in the selected snapshot.",
+            "minimum": 0
+          }
+        }
+      },
+      "CatalogInventoryObjectFamily": {
+        "type": "object",
+        "description": "Catalog inventory object-family descriptor.",
+        "required": [
+          "name",
+          "available",
+          "row_count",
+          "query_handle"
+        ],
+        "properties": {
+          "available": {
+            "type": "boolean",
+            "description": "Whether this family has backing snapshot metadata."
+          },
+          "name": {
+            "type": "string",
+            "description": "Logical object family name."
+          },
+          "query_handle": {
+            "type": "string",
+            "description": "Stable query handle for paging or querying this family."
+          },
+          "row_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Number of rows in the selected snapshot for this family.",
+            "minimum": 0
+          }
+        }
+      },
+      "CatalogInventoryResponse": {
+        "type": "object",
+        "description": "Catalog inventory snapshot response for browser and UI discovery.",
+        "required": [
+          "manifest_type",
+          "version",
+          "catalog_snapshot_version",
+          "catalog_manifest_id",
+          "published_at",
+          "counts",
+          "object_families"
+        ],
+        "properties": {
+          "catalog_manifest_id": {
+            "type": "string",
+            "description": "Current immutable catalog manifest ID."
+          },
+          "catalog_snapshot_version": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Current catalog snapshot version.",
+            "minimum": 0
+          },
+          "counts": {
+            "$ref": "#/components/schemas/CatalogInventoryCounts",
+            "description": "Safe row counts for catalog object families."
+          },
+          "manifest_type": {
+            "type": "string",
+            "description": "Stable response type discriminator."
+          },
+          "object_families": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogInventoryObjectFamily"
+            },
+            "description": "Object families available to catalog browser clients."
+          },
+          "published_at": {
+            "type": "string",
+            "description": "Snapshot publication timestamp (ISO 8601)."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Response schema version.",
+            "minimum": 0
           }
         }
       },

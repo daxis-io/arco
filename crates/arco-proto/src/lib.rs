@@ -127,16 +127,47 @@ impl std::error::Error for TaskOutputContractError {}
 pub enum ControlPlaneTransactionContractError {
     MissingCatalogDdl,
     MissingCatalogDdlOp,
+    InvalidCatalogDdl(CatalogDdlContractError),
     EmptyOrchestrationEvents,
     InvalidOrchestrationEvent(usize, OrchestrationEventContractError),
     EmptyRootMutations,
     MissingRootCatalogDdlOp(usize),
+    InvalidRootCatalogDdl(usize, CatalogDdlContractError),
     MissingRootMetastoreMutationOp(usize),
+    InvalidRootMetastoreMutation(usize, MetastoreMutationContractError),
     EmptyRootOrchestrationEvents(usize),
     InvalidRootOrchestrationEvent(usize, usize, OrchestrationEventContractError),
     MissingRootMutationKind(usize),
     MissingRootMetastoreScope(usize),
     InvalidRootMetastoreScope(usize, CatalogControlPlaneScopeContractError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogDdlContractError {
+    EmptyField {
+        message: &'static str,
+        field: &'static str,
+    },
+    EmptyColumnField {
+        column_index: usize,
+        field: &'static str,
+    },
+    UnknownTableFormat(i32),
+    UnspecifiedTableFormat(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetastoreMutationContractError {
+    MissingOperation,
+    MissingGrantOperation,
+    EmptyField {
+        message: &'static str,
+        field: &'static str,
+    },
+    UnknownLifecycleState(&'static str, i32),
+    UnspecifiedLifecycleState(&'static str),
+    UnknownPrincipalType(i32),
+    UnspecifiedPrincipalType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +183,9 @@ impl std::fmt::Display for ControlPlaneTransactionContractError {
         match self {
             Self::MissingCatalogDdl => f.write_str("catalog DDL payload is required"),
             Self::MissingCatalogDdlOp => f.write_str("catalog DDL operation is required"),
+            Self::InvalidCatalogDdl(error) => {
+                write!(f, "catalog DDL operation is invalid: {error}")
+            }
             Self::EmptyOrchestrationEvents => {
                 f.write_str("orchestration batch must include at least one event")
             }
@@ -170,10 +204,22 @@ impl std::fmt::Display for ControlPlaneTransactionContractError {
                     "root catalog mutation at index {index} must set catalog DDL operation"
                 )
             }
+            Self::InvalidRootCatalogDdl(index, error) => {
+                write!(
+                    f,
+                    "root catalog mutation at index {index} is invalid: {error}"
+                )
+            }
             Self::MissingRootMetastoreMutationOp(index) => {
                 write!(
                     f,
                     "root metastore mutation at index {index} must set metastore mutation operation"
+                )
+            }
+            Self::InvalidRootMetastoreMutation(index, error) => {
+                write!(
+                    f,
+                    "root metastore mutation at index {index} is invalid: {error}"
                 )
             }
             Self::EmptyRootOrchestrationEvents(index) => {
@@ -209,6 +255,59 @@ impl std::fmt::Display for ControlPlaneTransactionContractError {
 
 impl std::error::Error for ControlPlaneTransactionContractError {}
 
+impl std::fmt::Display for CatalogDdlContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyField { message, field } => {
+                write!(f, "{message}.{field} is required")
+            }
+            Self::EmptyColumnField {
+                column_index,
+                field,
+            } => {
+                write!(
+                    f,
+                    "register_table.columns[{column_index}].{field} is required"
+                )
+            }
+            Self::UnknownTableFormat(value) => {
+                write!(f, "unknown table format value: {value}")
+            }
+            Self::UnspecifiedTableFormat(message) => {
+                write!(f, "{message}.format must not be TABLE_FORMAT_UNSPECIFIED")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CatalogDdlContractError {}
+
+impl std::fmt::Display for MetastoreMutationContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingOperation => f.write_str("metastore mutation operation is required"),
+            Self::MissingGrantOperation => f.write_str("grant mutation operation is required"),
+            Self::EmptyField { message, field } => {
+                write!(f, "{message}.{field} is required")
+            }
+            Self::UnknownLifecycleState(message, value) => {
+                write!(f, "{message}.lifecycle_state has unknown value: {value}")
+            }
+            Self::UnspecifiedLifecycleState(message) => {
+                write!(f, "{message}.lifecycle_state must not be UNSPECIFIED")
+            }
+            Self::UnknownPrincipalType(value) => {
+                write!(f, "principal.principal_type has unknown value: {value}")
+            }
+            Self::UnspecifiedPrincipalType => {
+                f.write_str("principal.principal_type must not be UNSPECIFIED")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MetastoreMutationContractError {}
+
 impl std::fmt::Display for CatalogControlPlaneScopeContractError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -229,6 +328,12 @@ pub enum OrchestrationEventContractError {
     EmptySource,
     EmptyIdempotencyKey,
     MissingEventKind,
+    EmptyEventField(&'static str, &'static str),
+    ZeroEventField(&'static str, &'static str),
+    MissingEventTimestamp(&'static str, &'static str),
+    MissingEventMessage(&'static str, &'static str),
+    UnknownEventEnum(&'static str, &'static str, i32),
+    UnspecifiedEventEnum(&'static str, &'static str),
     MissingTriggerInfo(&'static str),
     MissingTriggerKind(&'static str),
     MissingTriggerField(&'static str, &'static str),
@@ -243,6 +348,24 @@ impl std::fmt::Display for OrchestrationEventContractError {
             Self::EmptySource => f.write_str("source is required"),
             Self::EmptyIdempotencyKey => f.write_str("idempotency_key is required"),
             Self::MissingEventKind => f.write_str("event payload is required"),
+            Self::EmptyEventField(event_name, field_name) => {
+                write!(f, "{event_name}.{field_name} is required")
+            }
+            Self::ZeroEventField(event_name, field_name) => {
+                write!(f, "{event_name}.{field_name} must be greater than zero")
+            }
+            Self::MissingEventTimestamp(event_name, field_name) => {
+                write!(f, "{event_name}.{field_name} timestamp is required")
+            }
+            Self::MissingEventMessage(event_name, field_name) => {
+                write!(f, "{event_name}.{field_name} message is required")
+            }
+            Self::UnknownEventEnum(event_name, field_name, value) => {
+                write!(f, "{event_name}.{field_name} has unknown value: {value}")
+            }
+            Self::UnspecifiedEventEnum(event_name, field_name) => {
+                write!(f, "{event_name}.{field_name} must not be UNSPECIFIED")
+            }
             Self::MissingTriggerInfo(event_name) => {
                 write!(f, "{event_name} trigger is required")
             }
@@ -389,6 +512,8 @@ impl ApplyCatalogDdlRequest {
         if ddl.op.is_none() {
             return Err(ControlPlaneTransactionContractError::MissingCatalogDdlOp);
         }
+        ddl.validate_contract()
+            .map_err(ControlPlaneTransactionContractError::InvalidCatalogDdl)?;
 
         Ok(())
     }
@@ -436,6 +561,9 @@ impl CommitRootTransactionRequest {
                             ControlPlaneTransactionContractError::MissingRootCatalogDdlOp(index),
                         );
                     }
+                    operation.validate_contract().map_err(|error| {
+                        ControlPlaneTransactionContractError::InvalidRootCatalogDdl(index, error)
+                    })?;
                 }
                 Some(domain_mutation::Kind::Orchestration(spec)) => {
                     if spec.events.is_empty() {
@@ -474,6 +602,11 @@ impl CommitRootTransactionRequest {
                             ),
                         );
                     }
+                    mutation.validate_contract().map_err(|error| {
+                        ControlPlaneTransactionContractError::InvalidRootMetastoreMutation(
+                            index, error,
+                        )
+                    })?;
                 }
                 Some(domain_mutation::Kind::ScopedMetastore(mutation)) => {
                     if !mutation.has_contract_operation() {
@@ -483,6 +616,11 @@ impl CommitRootTransactionRequest {
                             ),
                         );
                     }
+                    mutation.validate_contract().map_err(|error| {
+                        ControlPlaneTransactionContractError::InvalidRootMetastoreMutation(
+                            index, error,
+                        )
+                    })?;
                     let scope = mutation.scope.as_ref().ok_or(
                         ControlPlaneTransactionContractError::MissingRootMetastoreScope(index),
                     )?;
@@ -493,6 +631,67 @@ impl CommitRootTransactionRequest {
                     })?;
                 }
                 None => unreachable!("checked above"),
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl CatalogDdlOperation {
+    pub fn validate_contract(&self) -> Result<(), CatalogDdlContractError> {
+        let Some(op) = self.op.as_ref() else {
+            return Ok(());
+        };
+
+        match op {
+            catalog_ddl_operation::Op::CreateCatalog(op) => {
+                validate_catalog_field("create_catalog", "catalog", &op.catalog)?;
+            }
+            catalog_ddl_operation::Op::CreateSchema(op) => {
+                validate_catalog_field("create_schema", "catalog", &op.catalog)?;
+                validate_catalog_field("create_schema", "schema", &op.schema)?;
+            }
+            catalog_ddl_operation::Op::RegisterTable(op) => {
+                validate_catalog_field("register_table", "catalog", &op.catalog)?;
+                validate_catalog_field("register_table", "schema", &op.schema)?;
+                validate_catalog_field("register_table", "table", &op.table)?;
+                if let Some(format) = op.format {
+                    validate_table_format_value("register_table", format)?;
+                }
+                for (index, column) in op.columns.iter().enumerate() {
+                    if column.name.is_empty() {
+                        return Err(CatalogDdlContractError::EmptyColumnField {
+                            column_index: index,
+                            field: "name",
+                        });
+                    }
+                    if column.data_type.is_empty() {
+                        return Err(CatalogDdlContractError::EmptyColumnField {
+                            column_index: index,
+                            field: "data_type",
+                        });
+                    }
+                }
+            }
+            catalog_ddl_operation::Op::UpdateTable(op) => {
+                validate_catalog_field("update_table", "catalog", &op.catalog)?;
+                validate_catalog_field("update_table", "schema", &op.schema)?;
+                validate_catalog_field("update_table", "table", &op.table)?;
+                if let Some(format) = op.format {
+                    validate_known_table_format_value(format)?;
+                }
+            }
+            catalog_ddl_operation::Op::DropTable(op) => {
+                validate_catalog_field("drop_table", "catalog", &op.catalog)?;
+                validate_catalog_field("drop_table", "schema", &op.schema)?;
+                validate_catalog_field("drop_table", "table", &op.table)?;
+            }
+            catalog_ddl_operation::Op::RenameTable(op) => {
+                validate_catalog_field("rename_table", "catalog", &op.catalog)?;
+                validate_catalog_field("rename_table", "schema", &op.schema)?;
+                validate_catalog_field("rename_table", "table", &op.table)?;
+                validate_catalog_field("rename_table", "new_table", &op.new_table)?;
             }
         }
 
@@ -535,6 +734,40 @@ impl MetastoreMutation {
             None => false,
         }
     }
+
+    pub fn validate_contract(&self) -> Result<(), MetastoreMutationContractError> {
+        let Some(op) = self.op.as_ref() else {
+            return Err(MetastoreMutationContractError::MissingOperation);
+        };
+
+        match op {
+            metastore_mutation::Op::Grant(mutation) => validate_grant_mutation(mutation),
+            metastore_mutation::Op::StorageCredential(value) => validate_storage_credential(value),
+            metastore_mutation::Op::ExternalLocation(value) => validate_external_location(value),
+            metastore_mutation::Op::WorkspaceBinding(value) => validate_workspace_binding(value),
+            metastore_mutation::Op::GovernanceAttachment(value) => {
+                validate_governance_attachment(value)
+            }
+            metastore_mutation::Op::Volume(value) => validate_volume(value),
+            metastore_mutation::Op::Function(value) => validate_function(value),
+            metastore_mutation::Op::RegisteredModel(value) => validate_registered_model(value),
+            metastore_mutation::Op::ModelVersion(value) => validate_model_version(value),
+            metastore_mutation::Op::Principal(value) => validate_principal(value),
+            metastore_mutation::Op::GroupMembership(value) => validate_group_membership(value),
+            metastore_mutation::Op::ServiceCredential(value) => validate_service_credential(value),
+            metastore_mutation::Op::ExternalServiceConnection(value) => {
+                validate_external_service_connection(value)
+            }
+            metastore_mutation::Op::ManagedStorageRoot(value) => {
+                validate_managed_storage_root(value)
+            }
+            metastore_mutation::Op::View(value) => validate_view(value),
+            metastore_mutation::Op::PolicyAttachment(value) => validate_policy_attachment(value),
+            metastore_mutation::Op::Share(value) => validate_share(value),
+            metastore_mutation::Op::Provider(value) => validate_provider(value),
+            metastore_mutation::Op::Recipient(value) => validate_recipient(value),
+        }
+    }
 }
 
 impl ScopedMetastoreMutation {
@@ -543,6 +776,315 @@ impl ScopedMetastoreMutation {
             .as_ref()
             .is_some_and(MetastoreMutation::has_contract_operation)
     }
+
+    pub fn validate_contract(&self) -> Result<(), MetastoreMutationContractError> {
+        self.mutation
+            .as_ref()
+            .ok_or(MetastoreMutationContractError::MissingOperation)?
+            .validate_contract()
+    }
+}
+
+fn validate_catalog_field(
+    message: &'static str,
+    field: &'static str,
+    value: &str,
+) -> Result<(), CatalogDdlContractError> {
+    if value.is_empty() {
+        Err(CatalogDdlContractError::EmptyField { message, field })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_table_format_value(
+    message: &'static str,
+    value: i32,
+) -> Result<(), CatalogDdlContractError> {
+    let format = validate_known_table_format_value(value)?;
+    if format == TableFormat::Unspecified {
+        Err(CatalogDdlContractError::UnspecifiedTableFormat(message))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_known_table_format_value(value: i32) -> Result<TableFormat, CatalogDdlContractError> {
+    TableFormat::try_from(value).map_err(|_| CatalogDdlContractError::UnknownTableFormat(value))
+}
+
+fn validate_required_metastore_field(
+    message: &'static str,
+    field: &'static str,
+    value: &str,
+) -> Result<(), MetastoreMutationContractError> {
+    if value.is_empty() {
+        Err(MetastoreMutationContractError::EmptyField { message, field })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_lifecycle_state(
+    message: &'static str,
+    value: i32,
+) -> Result<(), MetastoreMutationContractError> {
+    let state = CatalogObjectLifecycleState::try_from(value)
+        .map_err(|_| MetastoreMutationContractError::UnknownLifecycleState(message, value))?;
+    if state == CatalogObjectLifecycleState::Unspecified {
+        Err(MetastoreMutationContractError::UnspecifiedLifecycleState(
+            message,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_principal_type(value: i32) -> Result<(), MetastoreMutationContractError> {
+    let principal_type = PrincipalType::try_from(value)
+        .map_err(|_| MetastoreMutationContractError::UnknownPrincipalType(value))?;
+    if principal_type == PrincipalType::Unspecified {
+        Err(MetastoreMutationContractError::UnspecifiedPrincipalType)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_grant_mutation(mutation: &GrantMutation) -> Result<(), MetastoreMutationContractError> {
+    let Some(op) = mutation.op.as_ref() else {
+        return Err(MetastoreMutationContractError::MissingGrantOperation);
+    };
+    match op {
+        grant_mutation::Op::Grant(value) | grant_mutation::Op::Revoke(value) => {
+            validate_grant(value)
+        }
+    }
+}
+
+fn validate_grant(value: &Grant) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("grant", "grant_id", &value.grant_id)?;
+    validate_required_metastore_field("grant", "object_id", &value.object_id)?;
+    validate_required_metastore_field("grant", "object_type", &value.object_type)?;
+    validate_required_metastore_field("grant", "principal", &value.principal)?;
+    validate_required_metastore_field("grant", "privilege", &value.privilege)?;
+    validate_required_metastore_field("grant", "granted_by", &value.granted_by)?;
+    validate_required_metastore_field("grant", "owner", &value.owner)?;
+    validate_lifecycle_state("grant", value.lifecycle_state)
+}
+
+fn validate_storage_credential(
+    value: &StorageCredential,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("storage_credential", "credential_id", &value.credential_id)?;
+    validate_required_metastore_field("storage_credential", "name", &value.name)?;
+    validate_required_metastore_field("storage_credential", "cloud", &value.cloud)?;
+    validate_required_metastore_field("storage_credential", "owner", &value.owner)?;
+    validate_lifecycle_state("storage_credential", value.lifecycle_state)
+}
+
+fn validate_service_credential(
+    value: &ServiceCredential,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field(
+        "service_credential",
+        "service_credential_id",
+        &value.service_credential_id,
+    )?;
+    validate_required_metastore_field("service_credential", "name", &value.name)?;
+    validate_required_metastore_field("service_credential", "service", &value.service)?;
+    validate_required_metastore_field("service_credential", "owner", &value.owner)?;
+    validate_lifecycle_state("service_credential", value.lifecycle_state)
+}
+
+fn validate_external_location(
+    value: &ExternalLocation,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("external_location", "location_id", &value.location_id)?;
+    validate_required_metastore_field("external_location", "name", &value.name)?;
+    validate_required_metastore_field("external_location", "url", &value.url)?;
+    validate_required_metastore_field("external_location", "credential_id", &value.credential_id)?;
+    validate_required_metastore_field("external_location", "owner", &value.owner)?;
+    validate_lifecycle_state("external_location", value.lifecycle_state)
+}
+
+fn validate_external_service_connection(
+    value: &ExternalServiceConnection,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field(
+        "external_service_connection",
+        "connection_id",
+        &value.connection_id,
+    )?;
+    validate_required_metastore_field("external_service_connection", "name", &value.name)?;
+    validate_required_metastore_field(
+        "external_service_connection",
+        "service_credential_id",
+        &value.service_credential_id,
+    )?;
+    validate_required_metastore_field("external_service_connection", "service", &value.service)?;
+    validate_required_metastore_field("external_service_connection", "owner", &value.owner)?;
+    validate_lifecycle_state("external_service_connection", value.lifecycle_state)
+}
+
+fn validate_managed_storage_root(
+    value: &ManagedStorageRoot,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("managed_storage_root", "root_id", &value.root_id)?;
+    validate_required_metastore_field("managed_storage_root", "name", &value.name)?;
+    validate_required_metastore_field("managed_storage_root", "workspace_id", &value.workspace_id)?;
+    validate_required_metastore_field("managed_storage_root", "url", &value.url)?;
+    validate_required_metastore_field("managed_storage_root", "owner", &value.owner)?;
+    validate_lifecycle_state("managed_storage_root", value.lifecycle_state)
+}
+
+fn validate_workspace_binding(
+    value: &WorkspaceBinding,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("workspace_binding", "binding_id", &value.binding_id)?;
+    validate_required_metastore_field("workspace_binding", "workspace_id", &value.workspace_id)?;
+    validate_required_metastore_field("workspace_binding", "object_id", &value.object_id)?;
+    validate_required_metastore_field("workspace_binding", "object_type", &value.object_type)?;
+    validate_required_metastore_field("workspace_binding", "owner", &value.owner)?;
+    validate_lifecycle_state("workspace_binding", value.lifecycle_state)
+}
+
+fn validate_governance_attachment(
+    value: &GovernanceAttachment,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field(
+        "governance_attachment",
+        "attachment_id",
+        &value.attachment_id,
+    )?;
+    validate_required_metastore_field("governance_attachment", "object_id", &value.object_id)?;
+    validate_required_metastore_field("governance_attachment", "object_type", &value.object_type)?;
+    validate_required_metastore_field(
+        "governance_attachment",
+        "attachment_type",
+        &value.attachment_type,
+    )?;
+    validate_required_metastore_field("governance_attachment", "value", &value.value)?;
+    validate_required_metastore_field("governance_attachment", "created_by", &value.created_by)?;
+    validate_required_metastore_field("governance_attachment", "owner", &value.owner)?;
+    validate_lifecycle_state("governance_attachment", value.lifecycle_state)
+}
+
+fn validate_policy_attachment(
+    value: &PolicyAttachment,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field(
+        "policy_attachment",
+        "policy_attachment_id",
+        &value.policy_attachment_id,
+    )?;
+    validate_required_metastore_field("policy_attachment", "object_id", &value.object_id)?;
+    validate_required_metastore_field("policy_attachment", "object_type", &value.object_type)?;
+    validate_required_metastore_field("policy_attachment", "policy_id", &value.policy_id)?;
+    validate_required_metastore_field("policy_attachment", "policy_type", &value.policy_type)?;
+    validate_required_metastore_field("policy_attachment", "owner", &value.owner)?;
+    validate_lifecycle_state("policy_attachment", value.lifecycle_state)
+}
+
+fn validate_volume(value: &Volume) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("volume", "volume_id", &value.volume_id)?;
+    validate_required_metastore_field("volume", "catalog", &value.catalog)?;
+    validate_required_metastore_field("volume", "schema", &value.schema)?;
+    validate_required_metastore_field("volume", "volume", &value.volume)?;
+    validate_required_metastore_field("volume", "storage_location", &value.storage_location)?;
+    validate_required_metastore_field("volume", "owner", &value.owner)?;
+    validate_lifecycle_state("volume", value.lifecycle_state)
+}
+
+fn validate_function(value: &Function) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("function", "function_id", &value.function_id)?;
+    validate_required_metastore_field("function", "catalog", &value.catalog)?;
+    validate_required_metastore_field("function", "schema", &value.schema)?;
+    validate_required_metastore_field("function", "function", &value.function)?;
+    validate_required_metastore_field("function", "owner", &value.owner)?;
+    validate_lifecycle_state("function", value.lifecycle_state)
+}
+
+fn validate_view(value: &View) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("view", "view_id", &value.view_id)?;
+    validate_required_metastore_field("view", "catalog", &value.catalog)?;
+    validate_required_metastore_field("view", "schema", &value.schema)?;
+    validate_required_metastore_field("view", "view", &value.view)?;
+    validate_required_metastore_field("view", "owner", &value.owner)?;
+    validate_lifecycle_state("view", value.lifecycle_state)
+}
+
+fn validate_registered_model(
+    value: &RegisteredModel,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("registered_model", "model_id", &value.model_id)?;
+    validate_required_metastore_field("registered_model", "catalog", &value.catalog)?;
+    validate_required_metastore_field("registered_model", "schema", &value.schema)?;
+    validate_required_metastore_field("registered_model", "model", &value.model)?;
+    validate_required_metastore_field("registered_model", "owner", &value.owner)?;
+    validate_lifecycle_state("registered_model", value.lifecycle_state)
+}
+
+fn validate_model_version(value: &ModelVersion) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field(
+        "model_version",
+        "model_version_id",
+        &value.model_version_id,
+    )?;
+    validate_required_metastore_field("model_version", "model_id", &value.model_id)?;
+    validate_required_metastore_field("model_version", "version", &value.version)?;
+    validate_required_metastore_field(
+        "model_version",
+        "storage_location",
+        &value.storage_location,
+    )?;
+    validate_required_metastore_field("model_version", "owner", &value.owner)?;
+    validate_lifecycle_state("model_version", value.lifecycle_state)
+}
+
+fn validate_share(value: &Share) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("share", "share_id", &value.share_id)?;
+    validate_required_metastore_field("share", "name", &value.name)?;
+    validate_required_metastore_field("share", "owner", &value.owner)?;
+    validate_lifecycle_state("share", value.lifecycle_state)
+}
+
+fn validate_provider(value: &Provider) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("provider", "provider_id", &value.provider_id)?;
+    validate_required_metastore_field("provider", "name", &value.name)?;
+    validate_required_metastore_field("provider", "owner", &value.owner)?;
+    validate_lifecycle_state("provider", value.lifecycle_state)
+}
+
+fn validate_recipient(value: &Recipient) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("recipient", "recipient_id", &value.recipient_id)?;
+    validate_required_metastore_field("recipient", "name", &value.name)?;
+    validate_required_metastore_field("recipient", "owner", &value.owner)?;
+    validate_lifecycle_state("recipient", value.lifecycle_state)
+}
+
+fn validate_principal(value: &Principal) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("principal", "principal_id", &value.principal_id)?;
+    validate_principal_type(value.principal_type)?;
+    validate_required_metastore_field("principal", "display_name", &value.display_name)?;
+    validate_required_metastore_field("principal", "owner", &value.owner)?;
+    validate_lifecycle_state("principal", value.lifecycle_state)
+}
+
+fn validate_group_membership(
+    value: &GroupMembership,
+) -> Result<(), MetastoreMutationContractError> {
+    validate_required_metastore_field("group_membership", "membership_id", &value.membership_id)?;
+    validate_required_metastore_field(
+        "group_membership",
+        "group_principal_id",
+        &value.group_principal_id,
+    )?;
+    validate_required_metastore_field(
+        "group_membership",
+        "member_principal_id",
+        &value.member_principal_id,
+    )?;
+    validate_lifecycle_state("group_membership", value.lifecycle_state)
 }
 
 impl OrchestrationEventEnvelope {
@@ -564,17 +1106,631 @@ impl OrchestrationEventEnvelope {
         };
 
         match event {
-            orchestration_event_envelope::Event::RunRequested(event) => {
-                validate_run_requested_trigger(event)?;
-            }
             orchestration_event_envelope::Event::RunTriggered(event) => {
-                validate_run_triggered_trigger(event)?;
+                validate_run_triggered_event(event)?;
             }
-            _ => {}
+            orchestration_event_envelope::Event::PlanCreated(event) => {
+                validate_plan_created_event(event)?;
+            }
+            orchestration_event_envelope::Event::RunCancelRequested(event) => {
+                validate_run_cancel_requested_event(event)?;
+            }
+            orchestration_event_envelope::Event::TaskStarted(event) => {
+                validate_task_started_event(event)?;
+            }
+            orchestration_event_envelope::Event::TaskHeartbeat(event) => {
+                validate_task_heartbeat_event(event)?;
+            }
+            orchestration_event_envelope::Event::TaskFinished(event) => {
+                validate_task_finished_event(event)?;
+            }
+            orchestration_event_envelope::Event::DispatchRequested(event) => {
+                validate_dispatch_requested_event(event)?;
+            }
+            orchestration_event_envelope::Event::TimerRequested(event) => {
+                validate_timer_requested_event(event)?;
+            }
+            orchestration_event_envelope::Event::DispatchEnqueued(event) => {
+                validate_dispatch_enqueued_event(event)?;
+            }
+            orchestration_event_envelope::Event::TimerEnqueued(event) => {
+                validate_timer_enqueued_event(event)?;
+            }
+            orchestration_event_envelope::Event::TimerFired(event) => {
+                validate_timer_fired_event(event)?;
+            }
+            orchestration_event_envelope::Event::ScheduleDefinitionUpserted(event) => {
+                validate_schedule_definition_upserted_event(event)?;
+            }
+            orchestration_event_envelope::Event::ScheduleTicked(event) => {
+                validate_schedule_ticked_event(event)?;
+            }
+            orchestration_event_envelope::Event::SensorEvaluated(event) => {
+                validate_sensor_evaluated_event(event)?;
+            }
+            orchestration_event_envelope::Event::RunRequested(event) => {
+                validate_run_requested_event(event)?;
+            }
+            orchestration_event_envelope::Event::BackfillCreated(event) => {
+                validate_backfill_created_event(event)?;
+            }
+            orchestration_event_envelope::Event::BackfillChunkPlanned(event) => {
+                validate_backfill_chunk_planned_event(event)?;
+            }
+            orchestration_event_envelope::Event::BackfillStateChanged(event) => {
+                validate_backfill_state_changed_event(event)?;
+            }
+            orchestration_event_envelope::Event::TaskOutputVisibilityChanged(event) => {
+                validate_task_output_visibility_changed_event(event)?;
+            }
         }
 
         Ok(())
     }
+}
+
+fn validate_event_string(
+    event_name: &'static str,
+    field_name: &'static str,
+    value: &str,
+) -> Result<(), OrchestrationEventContractError> {
+    if value.is_empty() {
+        Err(OrchestrationEventContractError::EmptyEventField(
+            event_name, field_name,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_event_optional_string(
+    event_name: &'static str,
+    field_name: &'static str,
+    value: Option<&String>,
+) -> Result<(), OrchestrationEventContractError> {
+    if value.is_some_and(String::is_empty) {
+        Err(OrchestrationEventContractError::EmptyEventField(
+            event_name, field_name,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_event_nonzero_u32(
+    event_name: &'static str,
+    field_name: &'static str,
+    value: u32,
+) -> Result<(), OrchestrationEventContractError> {
+    if value == 0 {
+        Err(OrchestrationEventContractError::ZeroEventField(
+            event_name, field_name,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_event_optional_nonzero_u32(
+    event_name: &'static str,
+    field_name: &'static str,
+    value: Option<u32>,
+) -> Result<(), OrchestrationEventContractError> {
+    if value == Some(0) {
+        Err(OrchestrationEventContractError::ZeroEventField(
+            event_name, field_name,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_event_positive_i64(
+    event_name: &'static str,
+    field_name: &'static str,
+    value: i64,
+) -> Result<(), OrchestrationEventContractError> {
+    if value <= 0 {
+        Err(OrchestrationEventContractError::ZeroEventField(
+            event_name, field_name,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_event_timestamp(
+    event_name: &'static str,
+    field_name: &'static str,
+    value: Option<&prost_types::Timestamp>,
+) -> Result<(), OrchestrationEventContractError> {
+    if value.is_none() {
+        Err(OrchestrationEventContractError::MissingEventTimestamp(
+            event_name, field_name,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_event_enum<TEnum>(
+    event_name: &'static str,
+    field_name: &'static str,
+    value: i32,
+    unspecified: &TEnum,
+) -> Result<(), OrchestrationEventContractError>
+where
+    TEnum: TryFrom<i32> + PartialEq,
+{
+    let parsed = TEnum::try_from(value).map_err(|_| {
+        OrchestrationEventContractError::UnknownEventEnum(event_name, field_name, value)
+    })?;
+    if &parsed == unspecified {
+        Err(OrchestrationEventContractError::UnspecifiedEventEnum(
+            event_name, field_name,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_event_string_list(
+    event_name: &'static str,
+    field_name: &'static str,
+    values: &[String],
+) -> Result<(), OrchestrationEventContractError> {
+    if values.is_empty() || values.iter().any(String::is_empty) {
+        Err(OrchestrationEventContractError::EmptyEventField(
+            event_name, field_name,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_task_def(
+    event_name: &'static str,
+    task: &TaskDef,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string(event_name, "tasks.key", &task.key)?;
+    validate_event_nonzero_u32(event_name, "tasks.max_attempts", task.max_attempts)?;
+    validate_event_nonzero_u32(
+        event_name,
+        "tasks.heartbeat_timeout_sec",
+        task.heartbeat_timeout_sec,
+    )
+}
+
+fn validate_task_error(
+    event_name: &'static str,
+    field_name: &'static str,
+    error: Option<&TaskError>,
+) -> Result<(), OrchestrationEventContractError> {
+    let Some(error) = error else {
+        return Ok(());
+    };
+    validate_event_enum(
+        event_name,
+        field_name,
+        error.category,
+        &TaskErrorCategory::Unspecified,
+    )?;
+    validate_event_string(event_name, "error.message", &error.message)
+}
+
+fn validate_trigger_source(
+    event_name: &'static str,
+    source: Option<&TriggerSource>,
+) -> Result<(), OrchestrationEventContractError> {
+    let source = source.ok_or(OrchestrationEventContractError::MissingEventMessage(
+        event_name,
+        "trigger_source",
+    ))?;
+    match source.source.as_ref() {
+        Some(trigger_source::Source::Push(push)) => validate_event_string(
+            event_name,
+            "trigger_source.push.message_id",
+            &push.message_id,
+        ),
+        Some(trigger_source::Source::Poll(poll)) => validate_event_positive_i64(
+            event_name,
+            "trigger_source.poll.poll_epoch",
+            poll.poll_epoch,
+        ),
+        None => Err(OrchestrationEventContractError::MissingEventMessage(
+            event_name,
+            "trigger_source.source",
+        )),
+    }
+}
+
+fn validate_partition_selector(
+    event_name: &'static str,
+    selector: Option<&PartitionSelector>,
+) -> Result<(), OrchestrationEventContractError> {
+    let selector = selector.ok_or(OrchestrationEventContractError::MissingEventMessage(
+        event_name,
+        "partition_selector",
+    ))?;
+    match selector.selector.as_ref() {
+        Some(partition_selector::Selector::Range(range)) => {
+            validate_event_string(event_name, "partition_selector.range.start", &range.start)?;
+            validate_event_string(event_name, "partition_selector.range.end", &range.end)
+        }
+        Some(partition_selector::Selector::Explicit(explicit)) => validate_event_string_list(
+            event_name,
+            "partition_selector.explicit.partition_keys",
+            &explicit.partition_keys,
+        ),
+        Some(partition_selector::Selector::Filter(filter)) => {
+            if filter.filters.is_empty()
+                || filter
+                    .filters
+                    .iter()
+                    .any(|(key, value)| key.is_empty() || value.is_empty())
+            {
+                Err(OrchestrationEventContractError::EmptyEventField(
+                    event_name,
+                    "partition_selector.filter.filters",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        None => Err(OrchestrationEventContractError::MissingEventMessage(
+            event_name,
+            "partition_selector.selector",
+        )),
+    }
+}
+
+fn validate_run_triggered_event(
+    event: &RunTriggered,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("run_triggered", "run_id", &event.run_id)?;
+    validate_event_string("run_triggered", "plan_id", &event.plan_id)?;
+    validate_event_optional_string("run_triggered", "run_key", event.run_key.as_ref())?;
+    validate_event_optional_string("run_triggered", "code_version", event.code_version.as_ref())?;
+    validate_run_triggered_trigger(event)
+}
+
+fn validate_plan_created_event(event: &PlanCreated) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("plan_created", "run_id", &event.run_id)?;
+    validate_event_string("plan_created", "plan_id", &event.plan_id)?;
+    if event.tasks.is_empty() {
+        return Err(OrchestrationEventContractError::EmptyEventField(
+            "plan_created",
+            "tasks",
+        ));
+    }
+    for task in &event.tasks {
+        validate_task_def("plan_created", task)?;
+    }
+    Ok(())
+}
+
+fn validate_run_cancel_requested_event(
+    event: &RunCancelRequested,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("run_cancel_requested", "run_id", &event.run_id)?;
+    validate_event_string("run_cancel_requested", "requested_by", &event.requested_by)?;
+    validate_event_optional_string("run_cancel_requested", "reason", event.reason.as_ref())
+}
+
+fn validate_task_started_event(event: &TaskStarted) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("task_started", "run_id", &event.run_id)?;
+    validate_event_string("task_started", "task_key", &event.task_key)?;
+    validate_event_nonzero_u32("task_started", "attempt", event.attempt)?;
+    validate_event_string("task_started", "attempt_id", &event.attempt_id)?;
+    validate_event_string("task_started", "worker_id", &event.worker_id)
+}
+
+fn validate_task_heartbeat_event(
+    event: &TaskHeartbeat,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("task_heartbeat", "run_id", &event.run_id)?;
+    validate_event_string("task_heartbeat", "task_key", &event.task_key)?;
+    validate_event_nonzero_u32("task_heartbeat", "attempt", event.attempt)?;
+    validate_event_string("task_heartbeat", "attempt_id", &event.attempt_id)?;
+    validate_event_string("task_heartbeat", "worker_id", &event.worker_id)?;
+    validate_event_timestamp(
+        "task_heartbeat",
+        "heartbeat_at",
+        event.heartbeat_at.as_ref(),
+    )?;
+    validate_event_optional_string("task_heartbeat", "message", event.message.as_ref())
+}
+
+fn validate_task_finished_event(
+    event: &TaskFinished,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("task_finished", "run_id", &event.run_id)?;
+    validate_event_string("task_finished", "task_key", &event.task_key)?;
+    validate_event_nonzero_u32("task_finished", "attempt", event.attempt)?;
+    validate_event_string("task_finished", "attempt_id", &event.attempt_id)?;
+    validate_event_string("task_finished", "worker_id", &event.worker_id)?;
+    validate_event_enum(
+        "task_finished",
+        "outcome",
+        event.outcome,
+        &TaskOutcome::Unspecified,
+    )?;
+    validate_task_error("task_finished", "error", event.error.as_ref())?;
+    validate_event_optional_string(
+        "task_finished",
+        "cancelled_during_phase",
+        event.cancelled_during_phase.as_ref(),
+    )?;
+    validate_event_optional_string("task_finished", "asset_key", event.asset_key.as_ref())?;
+    validate_event_optional_string("task_finished", "code_version", event.code_version.as_ref())
+}
+
+fn validate_task_output_visibility_changed_event(
+    event: &TaskOutputVisibilityChanged,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("task_output_visibility_changed", "run_id", &event.run_id)?;
+    validate_event_string(
+        "task_output_visibility_changed",
+        "task_key",
+        &event.task_key,
+    )?;
+    validate_event_nonzero_u32("task_output_visibility_changed", "attempt", event.attempt)?;
+    validate_event_string(
+        "task_output_visibility_changed",
+        "attempt_id",
+        &event.attempt_id,
+    )?;
+    validate_event_enum(
+        "task_output_visibility_changed",
+        "visibility_state",
+        event.visibility_state,
+        &OutputVisibilityState::Unspecified,
+    )?;
+    validate_event_timestamp(
+        "task_output_visibility_changed",
+        "published_at",
+        event.published_at.as_ref(),
+    )?;
+    validate_event_optional_string(
+        "task_output_visibility_changed",
+        "publish_error",
+        event.publish_error.as_ref(),
+    )
+}
+
+fn validate_dispatch_requested_event(
+    event: &DispatchRequested,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("dispatch_requested", "run_id", &event.run_id)?;
+    validate_event_string("dispatch_requested", "task_key", &event.task_key)?;
+    validate_event_nonzero_u32("dispatch_requested", "attempt", event.attempt)?;
+    validate_event_string("dispatch_requested", "attempt_id", &event.attempt_id)?;
+    validate_event_string("dispatch_requested", "worker_queue", &event.worker_queue)?;
+    validate_event_string("dispatch_requested", "dispatch_id", &event.dispatch_id)
+}
+
+fn validate_timer_requested_event(
+    event: &TimerRequested,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("timer_requested", "timer_id", &event.timer_id)?;
+    validate_event_enum(
+        "timer_requested",
+        "timer_type",
+        event.timer_type,
+        &TimerType::Unspecified,
+    )?;
+    validate_event_optional_string("timer_requested", "run_id", event.run_id.as_ref())?;
+    validate_event_optional_string("timer_requested", "task_key", event.task_key.as_ref())?;
+    validate_event_optional_nonzero_u32("timer_requested", "attempt", event.attempt)?;
+    validate_event_timestamp("timer_requested", "fire_at", event.fire_at.as_ref())
+}
+
+fn validate_dispatch_enqueued_event(
+    event: &DispatchEnqueued,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("dispatch_enqueued", "dispatch_id", &event.dispatch_id)?;
+    validate_event_optional_string("dispatch_enqueued", "run_id", event.run_id.as_ref())?;
+    validate_event_optional_string("dispatch_enqueued", "task_key", event.task_key.as_ref())?;
+    validate_event_optional_nonzero_u32("dispatch_enqueued", "attempt", event.attempt)?;
+    validate_event_string("dispatch_enqueued", "cloud_task_id", &event.cloud_task_id)
+}
+
+fn validate_timer_enqueued_event(
+    event: &TimerEnqueued,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("timer_enqueued", "timer_id", &event.timer_id)?;
+    validate_event_optional_string("timer_enqueued", "run_id", event.run_id.as_ref())?;
+    validate_event_optional_string("timer_enqueued", "task_key", event.task_key.as_ref())?;
+    validate_event_optional_nonzero_u32("timer_enqueued", "attempt", event.attempt)?;
+    validate_event_string("timer_enqueued", "cloud_task_id", &event.cloud_task_id)
+}
+
+fn validate_timer_fired_event(event: &TimerFired) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("timer_fired", "timer_id", &event.timer_id)?;
+    validate_event_enum(
+        "timer_fired",
+        "timer_type",
+        event.timer_type,
+        &TimerType::Unspecified,
+    )?;
+    validate_event_optional_string("timer_fired", "run_id", event.run_id.as_ref())?;
+    validate_event_optional_string("timer_fired", "task_key", event.task_key.as_ref())?;
+    validate_event_optional_nonzero_u32("timer_fired", "attempt", event.attempt)
+}
+
+fn validate_schedule_definition_upserted_event(
+    event: &ScheduleDefinitionUpserted,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string(
+        "schedule_definition_upserted",
+        "schedule_id",
+        &event.schedule_id,
+    )?;
+    validate_event_string(
+        "schedule_definition_upserted",
+        "cron_expression",
+        &event.cron_expression,
+    )?;
+    validate_event_string("schedule_definition_upserted", "timezone", &event.timezone)
+}
+
+fn validate_schedule_ticked_event(
+    event: &ScheduleTicked,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("schedule_ticked", "schedule_id", &event.schedule_id)?;
+    validate_event_timestamp(
+        "schedule_ticked",
+        "scheduled_for",
+        event.scheduled_for.as_ref(),
+    )?;
+    validate_event_string("schedule_ticked", "tick_id", &event.tick_id)?;
+    validate_event_string(
+        "schedule_ticked",
+        "definition_version",
+        &event.definition_version,
+    )?;
+    validate_event_enum(
+        "schedule_ticked",
+        "status",
+        event.status,
+        &TickStatus::Unspecified,
+    )?;
+    validate_event_optional_string(
+        "schedule_ticked",
+        "skipped_reason",
+        event.skipped_reason.as_ref(),
+    )?;
+    validate_event_optional_string(
+        "schedule_ticked",
+        "failure_message",
+        event.failure_message.as_ref(),
+    )?;
+    validate_event_optional_string("schedule_ticked", "run_key", event.run_key.as_ref())?;
+    validate_event_optional_string(
+        "schedule_ticked",
+        "request_fingerprint",
+        event.request_fingerprint.as_ref(),
+    )
+}
+
+fn validate_sensor_evaluated_event(
+    event: &SensorEvaluated,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("sensor_evaluated", "sensor_id", &event.sensor_id)?;
+    validate_event_string("sensor_evaluated", "eval_id", &event.eval_id)?;
+    validate_event_optional_string(
+        "sensor_evaluated",
+        "cursor_before",
+        event.cursor_before.as_ref(),
+    )?;
+    validate_event_optional_string(
+        "sensor_evaluated",
+        "cursor_after",
+        event.cursor_after.as_ref(),
+    )?;
+    validate_event_optional_nonzero_u32(
+        "sensor_evaluated",
+        "expected_state_version",
+        event.expected_state_version,
+    )?;
+    validate_trigger_source("sensor_evaluated", event.trigger_source.as_ref())?;
+    validate_event_enum(
+        "sensor_evaluated",
+        "status",
+        event.status,
+        &SensorEvalStatus::Unspecified,
+    )?;
+    validate_event_optional_string(
+        "sensor_evaluated",
+        "error_message",
+        event.error_message.as_ref(),
+    )
+}
+
+fn validate_run_requested_event(
+    event: &RunRequested,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("run_requested", "run_key", &event.run_key)?;
+    validate_event_string(
+        "run_requested",
+        "request_fingerprint",
+        &event.request_fingerprint,
+    )?;
+    validate_run_requested_trigger(event)
+}
+
+fn validate_backfill_created_event(
+    event: &BackfillCreated,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("backfill_created", "backfill_id", &event.backfill_id)?;
+    validate_event_string(
+        "backfill_created",
+        "client_request_id",
+        &event.client_request_id,
+    )?;
+    validate_partition_selector("backfill_created", event.partition_selector.as_ref())?;
+    validate_event_nonzero_u32(
+        "backfill_created",
+        "total_partitions",
+        event.total_partitions,
+    )?;
+    validate_event_nonzero_u32("backfill_created", "chunk_size", event.chunk_size)?;
+    validate_event_nonzero_u32(
+        "backfill_created",
+        "max_concurrent_runs",
+        event.max_concurrent_runs,
+    )?;
+    validate_event_optional_string(
+        "backfill_created",
+        "parent_backfill_id",
+        event.parent_backfill_id.as_ref(),
+    )
+}
+
+fn validate_backfill_chunk_planned_event(
+    event: &BackfillChunkPlanned,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("backfill_chunk_planned", "backfill_id", &event.backfill_id)?;
+    validate_event_string("backfill_chunk_planned", "chunk_id", &event.chunk_id)?;
+    validate_event_string_list(
+        "backfill_chunk_planned",
+        "partition_keys",
+        &event.partition_keys,
+    )?;
+    validate_event_string("backfill_chunk_planned", "run_key", &event.run_key)?;
+    validate_event_string(
+        "backfill_chunk_planned",
+        "request_fingerprint",
+        &event.request_fingerprint,
+    )
+}
+
+fn validate_backfill_state_changed_event(
+    event: &BackfillStateChanged,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("backfill_state_changed", "backfill_id", &event.backfill_id)?;
+    validate_event_enum(
+        "backfill_state_changed",
+        "from_state",
+        event.from_state,
+        &BackfillState::Unspecified,
+    )?;
+    validate_event_enum(
+        "backfill_state_changed",
+        "to_state",
+        event.to_state,
+        &BackfillState::Unspecified,
+    )?;
+    validate_event_nonzero_u32(
+        "backfill_state_changed",
+        "state_version",
+        event.state_version,
+    )?;
+    validate_event_optional_string(
+        "backfill_state_changed",
+        "changed_by",
+        event.changed_by.as_ref(),
+    )
 }
 
 fn required_trigger<'a>(
@@ -597,40 +1753,73 @@ fn validate_run_requested_trigger(
 ) -> Result<(), OrchestrationEventContractError> {
     match required_trigger("run_requested", event.trigger.as_ref())? {
         trigger_info::Trigger::Manual(manual) => {
-            if manual.request_id.is_none() {
-                return Err(OrchestrationEventContractError::MissingTriggerField(
+            validate_event_string("run_requested", "manual.user_id", &manual.user_id)?;
+            match manual.request_id.as_ref() {
+                Some(request_id) if !request_id.is_empty() => Ok(()),
+                Some(_) => Err(OrchestrationEventContractError::EmptyEventField(
                     "run_requested",
                     "manual.request_id",
-                ));
+                )),
+                None => Err(OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "manual.request_id",
+                )),
             }
-            Ok(())
         }
         trigger_info::Trigger::Schedule(schedule) => {
-            if schedule.tick_id.is_none() {
-                return Err(OrchestrationEventContractError::MissingTriggerField(
+            validate_event_string(
+                "run_requested",
+                "schedule.schedule_id",
+                &schedule.schedule_id,
+            )?;
+            match schedule.tick_id.as_ref() {
+                Some(tick_id) if !tick_id.is_empty() => Ok(()),
+                Some(_) => Err(OrchestrationEventContractError::EmptyEventField(
                     "run_requested",
                     "schedule.tick_id",
-                ));
+                )),
+                None => Err(OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "schedule.tick_id",
+                )),
             }
-            Ok(())
         }
         trigger_info::Trigger::Sensor(sensor) => {
-            if sensor.eval_id.is_none() {
-                return Err(OrchestrationEventContractError::MissingTriggerField(
+            validate_event_string("run_requested", "sensor.sensor_id", &sensor.sensor_id)?;
+            validate_event_optional_string(
+                "run_requested",
+                "sensor.cursor",
+                sensor.cursor.as_ref(),
+            )?;
+            match sensor.eval_id.as_ref() {
+                Some(eval_id) if !eval_id.is_empty() => Ok(()),
+                Some(_) => Err(OrchestrationEventContractError::EmptyEventField(
                     "run_requested",
                     "sensor.eval_id",
-                ));
+                )),
+                None => Err(OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "sensor.eval_id",
+                )),
             }
-            Ok(())
         }
         trigger_info::Trigger::Backfill(backfill) => {
-            if backfill.chunk_id.is_none() {
-                return Err(OrchestrationEventContractError::MissingTriggerField(
+            validate_event_string(
+                "run_requested",
+                "backfill.backfill_id",
+                &backfill.backfill_id,
+            )?;
+            match backfill.chunk_id.as_ref() {
+                Some(chunk_id) if !chunk_id.is_empty() => Ok(()),
+                Some(_) => Err(OrchestrationEventContractError::EmptyEventField(
                     "run_requested",
                     "backfill.chunk_id",
-                ));
+                )),
+                None => Err(OrchestrationEventContractError::MissingTriggerField(
+                    "run_requested",
+                    "backfill.chunk_id",
+                )),
             }
-            Ok(())
         }
         trigger_info::Trigger::Materialization(_) => {
             Err(OrchestrationEventContractError::UnsupportedTriggerKind(
@@ -648,14 +1837,50 @@ fn validate_run_triggered_trigger(
     event: &RunTriggered,
 ) -> Result<(), OrchestrationEventContractError> {
     match required_trigger("run_triggered", event.trigger.as_ref())? {
+        trigger_info::Trigger::Manual(manual) => {
+            validate_event_string("run_triggered", "manual.user_id", &manual.user_id)?;
+            validate_event_optional_string(
+                "run_triggered",
+                "manual.request_id",
+                manual.request_id.as_ref(),
+            )
+        }
+        trigger_info::Trigger::Schedule(schedule) => {
+            validate_event_string(
+                "run_triggered",
+                "schedule.schedule_id",
+                &schedule.schedule_id,
+            )?;
+            validate_event_optional_string(
+                "run_triggered",
+                "schedule.tick_id",
+                schedule.tick_id.as_ref(),
+            )
+        }
+        trigger_info::Trigger::Materialization(materialization) => validate_event_string(
+            "run_triggered",
+            "materialization.upstream_materialization_id",
+            &materialization.upstream_materialization_id,
+        ),
+        trigger_info::Trigger::Webhook(webhook) => {
+            validate_event_string("run_triggered", "webhook.webhook_id", &webhook.webhook_id)
+        }
+        trigger_info::Trigger::Sensor(sensor) => {
+            validate_event_string("run_triggered", "sensor.sensor_id", &sensor.sensor_id)?;
+            validate_event_optional_string(
+                "run_triggered",
+                "sensor.cursor",
+                sensor.cursor.as_ref(),
+            )?;
+            validate_event_optional_string(
+                "run_triggered",
+                "sensor.eval_id",
+                sensor.eval_id.as_ref(),
+            )
+        }
         trigger_info::Trigger::Backfill(_) => Err(
             OrchestrationEventContractError::UnsupportedTriggerKind("run_triggered", "backfill"),
         ),
-        trigger_info::Trigger::Manual(_)
-        | trigger_info::Trigger::Schedule(_)
-        | trigger_info::Trigger::Materialization(_)
-        | trigger_info::Trigger::Webhook(_)
-        | trigger_info::Trigger::Sensor(_) => Ok(()),
     }
 }
 

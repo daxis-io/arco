@@ -357,6 +357,31 @@ pub struct Publisher<'a, S: CasStore + ?Sized> {
     storage: &'a S,
 }
 
+fn log_publish_result(permit: &PublishPermit, key: &ManifestKey, result: &WriteResult) {
+    match result {
+        WriteResult::Success { version } => {
+            tracing::info!(
+                fencing_token = %permit.fencing_token(),
+                domain = %permit.domain(),
+                commit_ulid = %permit.commit_ulid(),
+                manifest = %key,
+                new_version = %version,
+                "Manifest published successfully"
+            );
+        }
+        WriteResult::PreconditionFailed { current_version } => {
+            tracing::warn!(
+                fencing_token = %permit.fencing_token(),
+                domain = %permit.domain(),
+                commit_ulid = %permit.commit_ulid(),
+                manifest = %key,
+                current_version = %current_version,
+                "Manifest publish failed - CAS race"
+            );
+        }
+    }
+}
+
 impl<'a, S: CasStore + ?Sized> Publisher<'a, S> {
     /// Creates a new publisher with storage backend reference.
     #[must_use]
@@ -399,28 +424,7 @@ impl<'a, S: CasStore + ?Sized> Publisher<'a, S> {
         // Always consume the permit - even on failure, you need a new one
         permit.consume();
 
-        match &result {
-            WriteResult::Success { version } => {
-                tracing::info!(
-                    fencing_token = %permit.fencing_token(),
-                    domain = %permit.domain(),
-                    commit_ulid = %permit.commit_ulid(),
-                    manifest = %key,
-                    new_version = %version,
-                    "Manifest published successfully"
-                );
-            }
-            WriteResult::PreconditionFailed { current_version } => {
-                tracing::warn!(
-                    fencing_token = %permit.fencing_token(),
-                    domain = %permit.domain(),
-                    commit_ulid = %permit.commit_ulid(),
-                    manifest = %key,
-                    current_version = %current_version,
-                    "Manifest publish failed - CAS race"
-                );
-            }
-        }
+        log_publish_result(&permit, key, &result);
 
         Ok(result)
     }

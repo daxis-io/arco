@@ -4,7 +4,7 @@
 for open table formats, with Delta Lake as the first-class managed format.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 ![Status](https://img.shields.io/badge/status-incubating-yellow.svg)
 
 > Arco is incubating and not yet production ready. APIs may change. Early feedback welcome.
@@ -36,7 +36,7 @@ catalog surfaces with compatibility and governance support growing over time.
 
 ### Prerequisites
 
-- Rust 1.85+ (Edition 2024)
+- Rust 1.88+ (Edition 2024)
 - Protocol Buffers compiler (`protoc`)
 
 ### Build and test

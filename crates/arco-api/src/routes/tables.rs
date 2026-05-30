@@ -154,7 +154,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         ("bearerAuth" = [])
     )
 )]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 pub(crate) async fn register_table(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,

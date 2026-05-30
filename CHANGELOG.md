@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-28
+### Added
+- Catalog control-plane release surface covering scoped metastore mutations, catalog product APIs, Unity Catalog compatibility inventory, and system-table contracts.
+- Orchestration control-plane contracts for root transactions, task-token callbacks, worker dispatch envelopes, and output visibility lifecycle coverage.
+- Release gates for CI parity, repository hygiene, integrity checks, proto compatibility, and release-tag discipline.
+
+### Changed
+- Raised the supported Rust toolchain and local release-doctor expectation to Rust 1.88.
+- Aligned the CI and local release-doctor Buf pin to 1.70.0.
+- Promoted workspace crates, Python packages, generated OpenAPI metadata, and release inputs to `0.2.0`.
+- Tightened release documentation around catalog governance, storage-governance compatibility, and release verification policy.
+
+### Fixed
+- Made Tier-1 catalog snapshot publication retry-safe by accepting byte-identical immutable snapshot collisions while rejecting divergent content.
+- Reconciled repository hygiene checks with intentional legacy protobuf removal documentation and internal plan-to-plan references.
+- Cleaned vendored Thrift whitespace so release diffs pass whitespace checks.
+
 ## [0.1.5] - 2026-04-11
 ### Added
 - Server-side SQL query endpoint at `/api/v1/query` backed by DataFusion with Arrow IPC or JSON output.

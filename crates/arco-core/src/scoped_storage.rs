@@ -54,6 +54,14 @@ pub struct ScopedObjectMeta {
     pub etag: Option<String>,
 }
 
+fn scoped_list_boundary(prefix: &str) -> String {
+    if prefix.is_empty() || prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/")
+    }
+}
+
 impl ScopedStorage {
     /// Creates a new scoped storage wrapper.
     ///
@@ -541,11 +549,15 @@ impl ScopedStorage {
         Self::validate_path(prefix)?;
         let full_prefix = self.scoped_path(prefix);
         let scope_prefix = format!("{}/", self.scope_prefix());
+        let boundary_prefix = scoped_list_boundary(&full_prefix);
 
         let metas = self.backend.list(&full_prefix).await?;
 
         Ok(metas
             .into_iter()
+            .filter(|m| {
+                prefix.is_empty() || m.path == full_prefix || m.path.starts_with(&boundary_prefix)
+            })
             .filter_map(|m| {
                 m.path
                     .strip_prefix(&scope_prefix)
@@ -566,10 +578,14 @@ impl ScopedStorage {
         Self::validate_path(prefix)?;
         let full_prefix = self.scoped_path(prefix);
         let scope_prefix = format!("{}/", self.scope_prefix());
+        let boundary_prefix = scoped_list_boundary(&full_prefix);
 
         let metas = self.backend.list(&full_prefix).await?;
         Ok(metas
             .into_iter()
+            .filter(|m| {
+                prefix.is_empty() || m.path == full_prefix || m.path.starts_with(&boundary_prefix)
+            })
             .filter_map(|m| {
                 m.path
                     .strip_prefix(&scope_prefix)
@@ -951,6 +967,71 @@ mod tests {
         assert!(acme_prod_files[0].as_str().contains("secret1.txt"));
         assert!(acme_staging_files[0].as_str().contains("secret2.txt"));
         assert!(globex_prod_files[0].as_str().contains("secret3.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_list_excludes_same_scope_sibling_prefixes() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
+
+        storage
+            .put_raw(
+                "state/orchestration/manifests/current.json",
+                Bytes::from("current"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("put current manifest");
+        storage
+            .put_raw(
+                "state/orchestration/manifests/deeper/next.json",
+                Bytes::from("next"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("put nested manifest");
+        storage
+            .put_raw(
+                "state/orchestration/manifests_backup/stale.json",
+                Bytes::from("stale"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("put sibling manifest backup");
+
+        let listed = storage
+            .list("state/orchestration/manifests")
+            .await
+            .expect("list manifests");
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed
+                .iter()
+                .any(|p| p.as_str() == "state/orchestration/manifests/current.json")
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|p| p.as_str() == "state/orchestration/manifests/deeper/next.json")
+        );
+        assert!(
+            listed
+                .iter()
+                .all(|p| !p.as_str().contains("manifests_backup")),
+            "same-scope sibling prefixes must not leak through scoped listing"
+        );
+
+        let listed_meta = storage
+            .list_meta("state/orchestration/manifests")
+            .await
+            .expect("list manifest metadata");
+        assert_eq!(listed_meta.len(), 2);
+        assert!(
+            listed_meta
+                .iter()
+                .all(|m| !m.path.as_str().contains("manifests_backup")),
+            "same-scope sibling metadata must not leak through scoped listing"
+        );
     }
 
     #[tokio::test]

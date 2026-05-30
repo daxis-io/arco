@@ -70,6 +70,19 @@ pub struct SnapshotFreshness {
     pub tail: Option<TailRange>,
 }
 
+/// Current catalog snapshot identity and file metadata.
+#[derive(Debug, Clone)]
+pub struct CatalogSnapshotDescriptor {
+    /// Immutable catalog manifest ID selected by the current pointer.
+    pub manifest_id: String,
+    /// Catalog snapshot version selected by the current manifest.
+    pub snapshot_version: SnapshotVersion,
+    /// When the selected snapshot was published.
+    pub published_at: DateTime<Utc>,
+    /// Optional per-file metadata for the selected snapshot.
+    pub snapshot: Option<SnapshotInfo>,
+}
+
 // ============================================================================
 // Lineage Graph
 // ============================================================================
@@ -672,10 +685,7 @@ impl CatalogReader {
             "lineage_edges.parquet",
         );
 
-        let Ok(bytes) = self.storage.get_raw(&edges_path).await else {
-            return Ok(LineageGraph::default());
-        };
-
+        let bytes = self.storage.get_raw(&edges_path).await?;
         let records = parquet_util::read_lineage_edges(&bytes)?;
 
         let upstream: Vec<LineageEdge> = records
@@ -766,6 +776,32 @@ impl CatalogReader {
                 })
             }
         }
+    }
+
+    /// Returns the current pointer-selected catalog snapshot descriptor.
+    ///
+    /// This is intended for product surfaces that need stable snapshot identity
+    /// and per-file row-count metadata without exposing raw manifest paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog manifest cannot be read.
+    pub async fn get_catalog_snapshot_descriptor(&self) -> Result<CatalogSnapshotDescriptor> {
+        let manifest = self.read_manifest().await?;
+        let published_at = manifest
+            .catalog
+            .snapshot
+            .as_ref()
+            .map_or(manifest.catalog.updated_at, |snapshot| {
+                snapshot.published_at
+            });
+
+        Ok(CatalogSnapshotDescriptor {
+            manifest_id: manifest.catalog.manifest_id,
+            snapshot_version: SnapshotVersion::new(manifest.catalog.snapshot_version),
+            published_at,
+            snapshot: manifest.catalog.snapshot,
+        })
     }
 
     // ========================================================================

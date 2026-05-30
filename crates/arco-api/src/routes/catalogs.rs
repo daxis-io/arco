@@ -30,6 +30,7 @@ use arco_catalog::idempotency::{
     CatalogOperation, IdempotencyCheck, IdempotencyStore, IdempotencyStoreImpl,
     calculate_retry_after, canonical_request_hash, check_idempotency,
 };
+use arco_catalog::manifest::SnapshotInfo;
 use arco_catalog::{CatalogReader, CatalogWriter, Tier1Compactor};
 use arco_core::TableFormat;
 
@@ -151,9 +152,55 @@ pub struct ListSchemaTablesResponse {
     pub tables: Vec<SchemaTableResponse>,
 }
 
+/// Catalog inventory snapshot response for browser and UI discovery.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CatalogInventoryResponse {
+    /// Stable response type discriminator.
+    pub manifest_type: String,
+    /// Response schema version.
+    pub version: u32,
+    /// Current catalog snapshot version.
+    pub catalog_snapshot_version: u64,
+    /// Current immutable catalog manifest ID.
+    pub catalog_manifest_id: String,
+    /// Snapshot publication timestamp (ISO 8601).
+    pub published_at: String,
+    /// Safe row counts for catalog object families.
+    pub counts: CatalogInventoryCounts,
+    /// Object families available to catalog browser clients.
+    pub object_families: Vec<CatalogInventoryObjectFamily>,
+}
+
+/// Safe catalog inventory row counts.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CatalogInventoryCounts {
+    /// Number of catalogs in the selected snapshot.
+    pub catalogs: u64,
+    /// Number of schemas in the selected snapshot.
+    pub schemas: u64,
+    /// Number of tables in the selected snapshot.
+    pub tables: u64,
+    /// Number of columns in the selected snapshot.
+    pub columns: u64,
+}
+
+/// Catalog inventory object-family descriptor.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CatalogInventoryObjectFamily {
+    /// Logical object family name.
+    pub name: String,
+    /// Whether this family has backing snapshot metadata.
+    pub available: bool,
+    /// Number of rows in the selected snapshot for this family.
+    pub row_count: u64,
+    /// Stable query handle for paging or querying this family.
+    pub query_handle: String,
+}
+
 /// Creates catalog routes.
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/catalog/inventory", get(get_catalog_inventory))
         .route("/catalogs", post(create_catalog).get(list_catalogs))
         .route("/catalogs/:name", get(get_catalog))
         .route(
@@ -168,6 +215,87 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/catalogs/:catalog/schemas/:schema/tables/:name",
             get(get_table_in_schema),
         )
+}
+
+/// Get the current catalog inventory snapshot descriptor.
+///
+/// GET /api/v1/catalog/inventory
+#[utoipa::path(
+    get,
+    path = "/api/v1/catalog/inventory",
+    tag = "catalogs",
+    responses(
+        (status = 200, description = "Catalog inventory snapshot", body = CatalogInventoryResponse),
+        (status = 401, description = "Unauthorized", body = ApiErrorBody),
+        (status = 404, description = "Not found", body = ApiErrorBody),
+        (status = 500, description = "Internal error", body = ApiErrorBody),
+    ),
+    security(
+        ("bearerAuth" = [])
+    )
+)]
+pub(crate) async fn get_catalog_inventory(
+    ctx: RequestContext,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    tracing::debug!(
+        tenant = %ctx.tenant,
+        workspace = %ctx.workspace,
+        "Getting catalog inventory snapshot"
+    );
+
+    let backend = state.storage_backend()?;
+    let storage = ctx.scoped_storage(backend)?;
+    let reader = CatalogReader::new(storage);
+    let descriptor = reader
+        .get_catalog_snapshot_descriptor()
+        .await
+        .map_err(ApiError::from)?;
+
+    let snapshot = descriptor.snapshot.as_ref();
+    let counts = CatalogInventoryCounts {
+        catalogs: snapshot_row_count(snapshot, "catalogs.parquet"),
+        schemas: snapshot_row_count(snapshot, "namespaces.parquet"),
+        tables: snapshot_row_count(snapshot, "tables.parquet"),
+        columns: snapshot_row_count(snapshot, "columns.parquet"),
+    };
+
+    let object_families = vec![
+        object_family(
+            "catalogs",
+            snapshot_contains(snapshot, "catalogs.parquet"),
+            counts.catalogs,
+            "system.catalog.catalogs",
+        ),
+        object_family(
+            "schemas",
+            snapshot_contains(snapshot, "namespaces.parquet"),
+            counts.schemas,
+            "system.catalog.namespaces",
+        ),
+        object_family(
+            "tables",
+            snapshot_contains(snapshot, "tables.parquet"),
+            counts.tables,
+            "system.catalog.tables",
+        ),
+        object_family(
+            "columns",
+            snapshot_contains(snapshot, "columns.parquet"),
+            counts.columns,
+            "system.catalog.columns",
+        ),
+    ];
+
+    Ok(Json(CatalogInventoryResponse {
+        manifest_type: "catalog_inventory_snapshot".to_string(),
+        version: 1,
+        catalog_snapshot_version: descriptor.snapshot_version.as_u64(),
+        catalog_manifest_id: descriptor.manifest_id,
+        published_at: descriptor.published_at.to_rfc3339(),
+        counts,
+        object_families,
+    }))
 }
 
 /// Create a catalog.
@@ -978,6 +1106,36 @@ fn format_timestamp(millis: i64) -> String {
     chrono::DateTime::from_timestamp_millis(millis)
         .unwrap_or_else(chrono::Utc::now)
         .to_rfc3339()
+}
+
+fn snapshot_row_count(snapshot: Option<&SnapshotInfo>, file_name: &str) -> u64 {
+    snapshot
+        .and_then(|snapshot| {
+            snapshot
+                .files
+                .iter()
+                .find(|file| file.path == file_name)
+                .map(|file| file.row_count)
+        })
+        .unwrap_or_default()
+}
+
+fn snapshot_contains(snapshot: Option<&SnapshotInfo>, file_name: &str) -> bool {
+    snapshot.is_some_and(|snapshot| snapshot.files.iter().any(|file| file.path == file_name))
+}
+
+fn object_family(
+    name: impl Into<String>,
+    available: bool,
+    row_count: u64,
+    query_handle: impl Into<String>,
+) -> CatalogInventoryObjectFamily {
+    CatalogInventoryObjectFamily {
+        name: name.into(),
+        available,
+        row_count,
+        query_handle: query_handle.into(),
+    }
 }
 
 fn effective_table_format(format: Option<&str>) -> Result<String, ApiError> {

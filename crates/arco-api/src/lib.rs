@@ -46,6 +46,7 @@
 //! server.serve().await?;
 //! ```
 
+#![allow(clippy::cognitive_complexity, clippy::result_large_err)]
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(rust_2018_idioms)]

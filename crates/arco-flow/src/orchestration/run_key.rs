@@ -141,6 +141,7 @@ pub fn reservation_path(run_key: &str) -> String {
 /// - Serialization fails
 /// - Storage write fails (non-precondition error)
 /// - Existing reservation has a hash collision (different `run_key`)
+#[allow(clippy::cognitive_complexity)]
 pub async fn reserve_run_key(
     storage: &ScopedStorage,
     reservation: &RunKeyReservation,

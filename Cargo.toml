@@ -16,11 +16,12 @@ members = [
     "crates/arco-integration-tests",
     "tools/xtask",
 ]
+exclude = ["vendor/thrift-0.17.1"]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/daxis-io/arco"
 homepage = "https://arco.dev"
@@ -157,3 +158,8 @@ debug = true
 
 [profile.bench]
 debug = true
+
+[patch.crates-io]
+# Backport apache/thrift@d5152211af61f850ec393604316804096dd4632e while
+# crates.io has no fixed Rust release for GHSA-2f9f-gq7v-9h6m.
+thrift = { path = "vendor/thrift-0.17.1" }

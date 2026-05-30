@@ -52,8 +52,8 @@ use arco_proto::arco::controlplane::v1::{
     GetOrchestrationTransactionRequest, GetOrchestrationTransactionResponse,
     GetRootTransactionRequest, GetRootTransactionResponse, OrchestrationBatchSpec,
     OrchestrationTxReceipt as ProtoOrchestrationTxReceipt, OrchestrationTxStatus,
-    RootTxParticipant, RootTxReceipt as ProtoRootTxReceipt, RootTxStatus, TransactionDomain,
-    TransactionStatus, domain_mutation,
+    RootTxParticipant, RootTxReceipt as ProtoRootTxReceipt, RootTxStatus, ScopedMetastoreMutation,
+    TransactionDomain, TransactionStatus, domain_mutation,
 };
 use arco_proto::arco::orchestration::v1::OrchestrationEventEnvelope;
 
@@ -186,7 +186,8 @@ impl<'a> ControlPlaneTransactionService<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let mut seen_domains = BTreeSet::new();
         for mutation in &mutations {
-            if matches!(mutation, RootMutation::Metastore(_)) {
+            mutation.validate_request_scope(&meta)?;
+            if mutation.is_metastore() {
                 continue;
             }
             let domain = mutation.domain();
@@ -314,7 +315,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
                         );
                         domain_commits.push(commit);
                     }
-                    RootMutation::Metastore(_) => {
+                    RootMutation::Metastore(_) | RootMutation::ScopedMetastore(_) => {
                         return Err(ApiError::not_implemented(
                             "metastore root mutations are not implemented yet",
                         ));
@@ -573,6 +574,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         })
     }
 
+    #[allow(clippy::cognitive_complexity)]
     async fn execute_orchestration_batch(
         &self,
         meta: &ResolvedRequestMetadata,
@@ -842,7 +844,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
                                 WriteOutcome::Written => {
                                     return Ok(IdempotencyClaim::Fresh(replacement));
                                 }
-                                WriteOutcome::PreconditionFailed => continue,
+                                WriteOutcome::PreconditionFailed => {}
                             }
                         }
                     }
@@ -891,10 +893,11 @@ impl<'a> ControlPlaneTransactionService<'a> {
         TResult: Serialize + DeserializeOwned + Clone,
     {
         let path = ControlPlaneTxPaths::record(domain, tx_id);
-        let mut record: ControlPlaneTxRecord<TResult> = self
-            .load_json_required(&path)
+        let stored = self
+            .load_json_with_version_required::<ControlPlaneTxRecord<TResult>>(&path)
             .await?
             .ok_or_else(|| ApiError::internal(format!("transaction record not found: {tx_id}")))?;
+        let mut record = stored.value;
         record.status = ControlPlaneTxStatus::Visible;
         record.lock_path = lock_path;
         record.fencing_token = fencing_token;
@@ -902,8 +905,13 @@ impl<'a> ControlPlaneTransactionService<'a> {
         record.visible_at = Some(visible_at);
         record.result = Some(result.clone());
 
-        self.persist_visible_record_and_idempotency(domain, idempotency_path, &record)
-            .await
+        self.persist_visible_record_and_idempotency(
+            domain,
+            idempotency_path,
+            &record,
+            WritePrecondition::MatchesVersion(stored.version),
+        )
+        .await
     }
 
     async fn mark_visible_repair_pending<TResult>(
@@ -916,10 +924,11 @@ impl<'a> ControlPlaneTransactionService<'a> {
         TResult: Serialize + DeserializeOwned + Clone,
     {
         let path = ControlPlaneTxPaths::record(domain, tx_id);
-        let mut record: ControlPlaneTxRecord<TResult> = self
-            .load_json_required(&path)
+        let stored = self
+            .load_json_with_version_required::<ControlPlaneTxRecord<TResult>>(&path)
             .await?
             .ok_or_else(|| ApiError::internal(format!("transaction record not found: {tx_id}")))?;
+        let mut record = stored.value;
         if record.status != ControlPlaneTxStatus::Visible {
             return Err(ApiError::internal(format!(
                 "cannot mark non-visible transaction repair_pending: {tx_id}"
@@ -930,8 +939,13 @@ impl<'a> ControlPlaneTransactionService<'a> {
         }
 
         record.repair_pending = true;
-        self.persist_visible_record_and_idempotency(domain, idempotency_path, &record)
-            .await
+        self.persist_visible_record_and_idempotency(
+            domain,
+            idempotency_path,
+            &record,
+            WritePrecondition::MatchesVersion(stored.version),
+        )
+        .await
     }
 
     async fn persist_visible_record_and_idempotency<TResult>(
@@ -939,15 +953,27 @@ impl<'a> ControlPlaneTransactionService<'a> {
         domain: ControlPlaneTxDomain,
         idempotency_path: &str,
         record: &ControlPlaneTxRecord<TResult>,
+        record_precondition: WritePrecondition,
     ) -> Result<(), ApiError>
     where
         TResult: Serialize + DeserializeOwned + Clone,
     {
         let path = ControlPlaneTxPaths::record(domain, record.tx_id.as_str());
-        let mut idem: ControlPlaneIdempotencyRecord = self
-            .load_json_required(idempotency_path)
+        let stored_idem = self
+            .load_json_with_version_required::<ControlPlaneIdempotencyRecord>(idempotency_path)
             .await?
             .ok_or_else(|| ApiError::internal("idempotency record missing during finalize"))?;
+        let mut idem = stored_idem.value;
+        if idem.tx_id != record.tx_id {
+            return Err(ApiError::conflict(format!(
+                "idempotency marker ownership changed during {domain} transaction finalize"
+            )));
+        }
+        if idem.request_hash != record.request_hash {
+            return Err(ApiError::conflict(format!(
+                "idempotency marker request hash changed during {domain} transaction finalize"
+            )));
+        }
         idem.visible_at = record.visible_at;
         idem.tx_record = Some(serde_json::to_value(record).map_err(|error| {
             ApiError::internal(format!(
@@ -955,23 +981,46 @@ impl<'a> ControlPlaneTransactionService<'a> {
             ))
         })?);
 
-        let tx_write = self
-            .write_json(&path, record, WritePrecondition::None)
-            .await;
         let idem_write = self
-            .write_json(idempotency_path, &idem, WritePrecondition::None)
+            .write_json(
+                idempotency_path,
+                &idem,
+                WritePrecondition::MatchesVersion(stored_idem.version),
+            )
             .await;
-        match (tx_write, idem_write) {
-            (Ok(_), Ok(_)) => Ok(()),
-            (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
-            (Err(error), Err(cache_error)) => {
-                tracing::warn!(
-                    error = ?cache_error,
-                    tx_id = record.tx_id.as_str(),
-                    domain = %domain,
-                    "failed to persist visible transaction record to both durable locations"
-                );
-                Err(error)
+
+        match idem_write {
+            Ok(WriteOutcome::Written) => {
+                match self.write_json(&path, record, record_precondition).await? {
+                    WriteOutcome::Written => Ok(()),
+                    WriteOutcome::PreconditionFailed => Err(ApiError::conflict(format!(
+                        "{domain} transaction record changed during finalize"
+                    ))),
+                }
+            }
+            Ok(WriteOutcome::PreconditionFailed) => Err(ApiError::conflict(format!(
+                "idempotency marker changed during {domain} transaction finalize"
+            ))),
+            Err(idempotency_error) => {
+                match self.write_json(&path, record, record_precondition).await {
+                    Ok(WriteOutcome::Written) => {}
+                    Ok(WriteOutcome::PreconditionFailed) => {
+                        tracing::warn!(
+                            tx_id = record.tx_id.as_str(),
+                            domain = %domain,
+                            "transaction record changed after idempotency finalize write failed"
+                        );
+                    }
+                    Err(record_error) => {
+                        tracing::warn!(
+                            error = ?record_error,
+                            tx_id = record.tx_id.as_str(),
+                            domain = %domain,
+                            "failed to persist visible transaction record after idempotency finalize write failed"
+                        );
+                    }
+                }
+                Err(idempotency_error)
             }
         }
     }
@@ -997,13 +1046,25 @@ impl<'a> ControlPlaneTransactionService<'a> {
     where
         TResult: Serialize + DeserializeOwned + Clone,
     {
-        if let Some(record) = self.load_record(domain, existing.tx_id.as_str()).await? {
-            if record.status == ControlPlaneTxStatus::Visible {
-                if existing.visible_at != record.visible_at || existing.tx_record.is_none() {
+        let stored_record = self
+            .load_json_with_version_required::<ControlPlaneTxRecord<TResult>>(
+                &ControlPlaneTxPaths::record(domain, existing.tx_id.as_str()),
+            )
+            .await?;
+        if let Some(stored_record) = &stored_record {
+            if stored_record.value.status == ControlPlaneTxStatus::Visible {
+                if existing.visible_at != stored_record.value.visible_at
+                    || existing.tx_record.is_none()
+                {
                     // Safe as a repair write: replayers converge on the same visible receipt,
                     // and any later repair_pending flip is recovered from the canonical tx record.
                     if let Err(error) = self
-                        .persist_visible_record_and_idempotency(domain, idempotency_path, &record)
+                        .persist_visible_record_and_idempotency(
+                            domain,
+                            idempotency_path,
+                            &stored_record.value,
+                            WritePrecondition::MatchesVersion(stored_record.version.clone()),
+                        )
                         .await
                     {
                         tracing::warn!(
@@ -1014,7 +1075,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
                         );
                     }
                 }
-                return Ok(record);
+                return Ok(stored_record.value.clone());
             }
         }
 
@@ -1030,18 +1091,45 @@ impl<'a> ControlPlaneTransactionService<'a> {
                 existing.tx_id
             )));
         }
+        if record.tx_id != existing.tx_id
+            || record.kind != existing.kind
+            || record.request_hash != existing.request_hash
+            || (!existing.idempotency_key.is_empty()
+                && record.idempotency_key != existing.idempotency_key)
+        {
+            return Err(ApiError::internal(format!(
+                "{domain} idempotency cache does not match marker ownership for tx_id '{}'",
+                existing.tx_id
+            )));
+        }
 
         let path = ControlPlaneTxPaths::record(domain, existing.tx_id.as_str());
-        if let Err(error) = self
-            .write_json(&path, &record, WritePrecondition::None)
-            .await
-        {
-            tracing::warn!(
-                error = ?error,
-                tx_id = existing.tx_id.as_str(),
-                domain = %domain,
-                "failed to repair visible transaction record from idempotency cache"
-            );
+        let record_precondition = if let Some(stored_record) = stored_record {
+            if stored_record.value.tx_id != record.tx_id
+                || stored_record.value.kind != record.kind
+                || stored_record.value.request_hash != record.request_hash
+                || (!stored_record.value.idempotency_key.is_empty()
+                    && stored_record.value.idempotency_key != record.idempotency_key)
+            {
+                return Err(ApiError::internal(format!(
+                    "{domain} transaction record path is occupied by a different record for tx_id '{}'",
+                    existing.tx_id
+                )));
+            }
+            WritePrecondition::MatchesVersion(stored_record.version)
+        } else {
+            WritePrecondition::DoesNotExist
+        };
+        match self.write_json(&path, &record, record_precondition).await {
+            Ok(WriteOutcome::Written | WriteOutcome::PreconditionFailed) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = ?error,
+                    tx_id = existing.tx_id.as_str(),
+                    domain = %domain,
+                    "failed to repair visible transaction record from idempotency cache"
+                );
+            }
         }
 
         Ok(record)
@@ -1331,6 +1419,7 @@ enum RootMutation {
     Catalog(CatalogMutation),
     Orchestration(OrchestrationBatchMutation),
     Metastore(MetastoreMutation),
+    ScopedMetastore(ScopedMetastoreMutation),
 }
 
 impl RootMutation {
@@ -1350,22 +1439,58 @@ impl RootMutation {
                 }
                 Ok(Self::Metastore(mutation.clone()))
             }
-            Some(domain_mutation::Kind::ScopedMetastore(_)) => Err(ApiError::bad_request(
-                "scoped metastore root mutations are not supported by this endpoint",
-            )),
+            Some(domain_mutation::Kind::ScopedMetastore(mutation)) => {
+                if !mutation.has_contract_operation() {
+                    return Err(ApiError::bad_request(
+                        "metastore mutation operation is required",
+                    ));
+                }
+                Ok(Self::ScopedMetastore(mutation.clone()))
+            }
             None => Err(ApiError::bad_request("root mutation kind is required")),
         }
     }
 
     const fn domain(&self) -> ControlPlaneTxDomain {
         match self {
-            Self::Catalog(_) | Self::Metastore(_) => ControlPlaneTxDomain::Catalog,
+            Self::Catalog(_) | Self::Metastore(_) | Self::ScopedMetastore(_) => {
+                ControlPlaneTxDomain::Catalog
+            }
             Self::Orchestration(_) => ControlPlaneTxDomain::Orchestration,
         }
     }
 
     const fn is_metastore(&self) -> bool {
-        matches!(self, Self::Metastore(_))
+        matches!(self, Self::Metastore(_) | Self::ScopedMetastore(_))
+    }
+
+    fn validate_request_scope(&self, meta: &ResolvedRequestMetadata) -> Result<(), ApiError> {
+        let Self::ScopedMetastore(mutation) = self else {
+            return Ok(());
+        };
+        let scope = mutation
+            .scope
+            .as_ref()
+            .ok_or_else(|| ApiError::bad_request("scoped metastore scope is required"))?;
+        if scope.tenant_id != meta.tenant {
+            return Err(ApiError::bad_request(format!(
+                "scoped metastore tenant_id '{}' must match request tenant '{}'",
+                scope.tenant_id, meta.tenant
+            )));
+        }
+        if scope.workspace_id != meta.workspace {
+            return Err(ApiError::bad_request(format!(
+                "scoped metastore workspace_id '{}' must match request workspace '{}'",
+                scope.workspace_id, meta.workspace
+            )));
+        }
+        if scope.request_id != meta.request_id {
+            return Err(ApiError::bad_request(format!(
+                "scoped metastore request_id '{}' must match request_id '{}'",
+                scope.request_id, meta.request_id
+            )));
+        }
+        Ok(())
     }
 
     fn request_hash_value(
@@ -1382,6 +1507,12 @@ impl RootMutation {
                 "request": batch.request_hash_value(meta)?,
             })),
             Self::Metastore(mutation) => Ok(serde_json::json!({
+                "domain": "metastore",
+                "request": {
+                    "protoHex": hex::encode(mutation.encode_to_vec()),
+                },
+            })),
+            Self::ScopedMetastore(mutation) => Ok(serde_json::json!({
                 "domain": "metastore",
                 "request": {
                     "protoHex": hex::encode(mutation.encode_to_vec()),
@@ -1424,7 +1555,7 @@ impl CatalogMutation {
                 table: table.clone(),
                 description: description.clone(),
                 location: location.clone(),
-                format: parse_table_format(*format)?,
+                format: (*format).map(parse_table_format).transpose()?,
                 columns: columns
                     .iter()
                     .map(|column| ColumnDefinition {
@@ -1449,10 +1580,7 @@ impl CatalogMutation {
                 table: table.clone(),
                 description: description.clone().map(Some),
                 location: location.clone().map(Some),
-                format: format
-                    .as_ref()
-                    .map(|value| parse_table_format(*value))
-                    .transpose()?,
+                format: (*format).map(parse_table_format_patch).transpose()?,
             }),
             Some(catalog_ddl_operation::Op::DropTable(DropTableOp {
                 catalog,
@@ -1746,19 +1874,28 @@ struct TxRecordLifecycle {
     prepared_at: DateTime<Utc>,
 }
 
-fn table_format_string(format: ProtoTableFormat) -> Option<String> {
+fn parse_table_format(value: i32) -> Result<String, ApiError> {
+    let format = ProtoTableFormat::try_from(value)
+        .map_err(|_| ApiError::bad_request(format!("unknown table format value: {value}")))?;
     match format {
-        ProtoTableFormat::Unspecified => None,
-        ProtoTableFormat::Delta => Some("delta".to_string()),
-        ProtoTableFormat::Iceberg => Some("iceberg".to_string()),
-        ProtoTableFormat::Parquet => Some("parquet".to_string()),
+        ProtoTableFormat::Unspecified => Err(ApiError::bad_request(
+            "table format must not be TABLE_FORMAT_UNSPECIFIED",
+        )),
+        ProtoTableFormat::Delta => Ok("delta".to_string()),
+        ProtoTableFormat::Iceberg => Ok("iceberg".to_string()),
+        ProtoTableFormat::Parquet => Ok("parquet".to_string()),
     }
 }
 
-fn parse_table_format(value: i32) -> Result<Option<String>, ApiError> {
+fn parse_table_format_patch(value: i32) -> Result<Option<String>, ApiError> {
     let format = ProtoTableFormat::try_from(value)
         .map_err(|_| ApiError::bad_request(format!("unknown table format value: {value}")))?;
-    Ok(table_format_string(format))
+    match format {
+        ProtoTableFormat::Unspecified => Ok(None),
+        ProtoTableFormat::Delta => Ok(Some("delta".to_string())),
+        ProtoTableFormat::Iceberg => Ok(Some("iceberg".to_string())),
+        ProtoTableFormat::Parquet => Ok(Some("parquet".to_string())),
+    }
 }
 
 fn root_request_hash(

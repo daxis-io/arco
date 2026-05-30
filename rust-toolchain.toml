@@ -1,4 +1,4 @@
 # rust-toolchain.toml
 [toolchain]
-channel = "1.85"
+channel = "1.88"
 components = ["rustfmt", "clippy", "llvm-tools-preview"]

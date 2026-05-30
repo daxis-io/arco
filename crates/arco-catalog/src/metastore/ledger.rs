@@ -412,7 +412,7 @@ impl MetastoreLedger {
                 .map_err(CatalogError::from)?
             {
                 WriteResult::Success { .. } => return Ok(()),
-                WriteResult::PreconditionFailed { .. } => continue,
+                WriteResult::PreconditionFailed { .. } => {}
             }
         }
 

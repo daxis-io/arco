@@ -73,7 +73,9 @@ message RegisterTableOp {
   string table = 3;
   optional string description = 4;
   optional string location = 5;
-  TableFormat format = 6;
+  // Omit to use the Arco default table format, Delta Lake. Explicit
+  // TABLE_FORMAT_UNSPECIFIED is invalid on the public API.
+  optional TableFormat format = 6;
   repeated ColumnDefinition columns = 7;
 }
 

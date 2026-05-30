@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
-TAG="v1.4.0"
+TAG="v0.2.0"
 
 if [[ ! -f "release_notes/${TAG}.md" ]]; then
   echo "missing fixture release notes for ${TAG}" >&2

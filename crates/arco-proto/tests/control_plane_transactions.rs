@@ -11,11 +11,11 @@
 use prost::Message;
 
 use arco_proto::arco::catalog::v1::{
-    Catalog, CatalogControlPlaneScope, CatalogDdlOperation, ColumnDefinition, CreateCatalogOp,
-    CreateSchemaOp, DropTableOp, ExternalLocation, Function, GovernanceAttachment, Grant,
-    GrantMutation, MetastoreMutation, ModelVersion, RegisterTableOp, RegisteredModel,
-    RenameTableOp, Schema, StorageCredential, Table, TableFormat, UpdateTableOp, Volume,
-    WorkspaceBinding, catalog_ddl_operation, metastore_mutation,
+    Catalog, CatalogControlPlaneScope, CatalogDdlOperation, CatalogObjectLifecycleState,
+    ColumnDefinition, CreateCatalogOp, CreateSchemaOp, DropTableOp, ExternalLocation, Function,
+    GovernanceAttachment, Grant, GrantMutation, MetastoreMutation, ModelVersion, RegisterTableOp,
+    RegisteredModel, RenameTableOp, Schema, StorageCredential, Table, TableFormat, UpdateTableOp,
+    Volume, WorkspaceBinding, catalog_ddl_operation, metastore_mutation,
 };
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, ApplyCatalogDdlResponse, CatalogTxReceipt, CatalogTxStatus,
@@ -31,10 +31,11 @@ use arco_proto::arco::orchestration::v1::{
     BackfillTrigger, FileEntry, ManualTrigger, MaterializationTrigger, OrchestrationEventEnvelope,
     OutputVisibilityState, RunRequested, RunTriggered, ScheduleTrigger, SensorTrigger,
     TaskCallbackOutput, TaskError, TaskErrorCategory, TaskFinished, TaskOutcome, TaskOutput,
-    TriggerInfo, WebhookTrigger, orchestration_event_envelope, trigger_info,
+    TaskStarted, TriggerInfo, WebhookTrigger, orchestration_event_envelope, trigger_info,
 };
 use arco_proto::{
-    CatalogControlPlaneScopeContractError, ControlPlaneTransactionContractError,
+    CatalogControlPlaneScopeContractError, CatalogDdlContractError,
+    ControlPlaneTransactionContractError, MetastoreMutationContractError,
     OrchestrationEventContractError,
 };
 
@@ -260,7 +261,7 @@ fn catalog_ddl_surface_covers_authoritative_operations() {
             table: "events".to_string(),
             description: Some("raw events".to_string()),
             location: Some("s3://bucket/raw/events".to_string()),
-            format: TableFormat::Delta as i32,
+            format: Some(TableFormat::Delta as i32),
             columns: vec![ColumnDefinition {
                 name: "event_id".to_string(),
                 data_type: "string".to_string(),
@@ -507,6 +508,101 @@ fn apply_catalog_ddl_rejects_missing_operation() {
 }
 
 #[test]
+fn apply_catalog_ddl_rejects_empty_required_catalog_fields() {
+    let request = ApplyCatalogDdlRequest {
+        ddl: Some(CatalogDdlOperation {
+            op: Some(catalog_ddl_operation::Op::CreateCatalog(CreateCatalogOp {
+                catalog: String::new(),
+                description: None,
+            })),
+        }),
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(ControlPlaneTransactionContractError::InvalidCatalogDdl(
+            CatalogDdlContractError::EmptyField {
+                message: "create_catalog",
+                field: "catalog",
+            },
+        ))
+    );
+}
+
+#[test]
+fn apply_catalog_ddl_accepts_omitted_register_table_format() {
+    let request = ApplyCatalogDdlRequest {
+        ddl: Some(CatalogDdlOperation {
+            op: Some(catalog_ddl_operation::Op::RegisterTable(RegisterTableOp {
+                catalog: "default".to_string(),
+                schema: "raw".to_string(),
+                table: "events".to_string(),
+                description: None,
+                location: None,
+                format: None,
+                columns: vec![ColumnDefinition {
+                    name: "event_id".to_string(),
+                    data_type: "string".to_string(),
+                    is_nullable: false,
+                    ordinal: 0,
+                    description: None,
+                }],
+            })),
+        }),
+    };
+
+    assert_eq!(request.validate_contract(), Ok(()));
+}
+
+#[test]
+fn apply_catalog_ddl_rejects_explicit_unspecified_register_table_format() {
+    let request = ApplyCatalogDdlRequest {
+        ddl: Some(CatalogDdlOperation {
+            op: Some(catalog_ddl_operation::Op::RegisterTable(RegisterTableOp {
+                catalog: "default".to_string(),
+                schema: "raw".to_string(),
+                table: "events".to_string(),
+                description: None,
+                location: None,
+                format: Some(TableFormat::Unspecified as i32),
+                columns: vec![ColumnDefinition {
+                    name: "event_id".to_string(),
+                    data_type: "string".to_string(),
+                    is_nullable: false,
+                    ordinal: 0,
+                    description: None,
+                }],
+            })),
+        }),
+    };
+
+    assert_eq!(
+        request.validate_contract(),
+        Err(ControlPlaneTransactionContractError::InvalidCatalogDdl(
+            CatalogDdlContractError::UnspecifiedTableFormat("register_table")
+        ))
+    );
+}
+
+#[test]
+fn apply_catalog_ddl_accepts_explicit_unspecified_update_table_format_as_clear() {
+    let request = ApplyCatalogDdlRequest {
+        ddl: Some(CatalogDdlOperation {
+            op: Some(catalog_ddl_operation::Op::UpdateTable(UpdateTableOp {
+                catalog: "default".to_string(),
+                schema: "raw".to_string(),
+                table: "events".to_string(),
+                description: None,
+                location: None,
+                format: Some(TableFormat::Unspecified as i32),
+            })),
+        }),
+    };
+
+    assert_eq!(request.validate_contract(), Ok(()));
+}
+
+#[test]
 fn commit_orchestration_batch_rejects_empty_events() {
     let request = CommitOrchestrationBatchRequest { events: Vec::new() };
 
@@ -571,6 +667,50 @@ fn commit_orchestration_batch_rejects_empty_event_identifiers() {
             )
         )
     );
+}
+
+#[test]
+fn commit_orchestration_batch_rejects_empty_task_started_fields() {
+    let mut event = sample_run_requested_event();
+    event.event = Some(orchestration_event_envelope::Event::TaskStarted(
+        TaskStarted {
+            run_id: String::new(),
+            task_key: "extract".to_string(),
+            attempt: 1,
+            attempt_id: "attempt-01".to_string(),
+            worker_id: "worker-01".to_string(),
+        },
+    ));
+    let request = CommitOrchestrationBatchRequest {
+        events: vec![event],
+    };
+
+    assert!(matches!(
+        request.validate_contract(),
+        Err(ControlPlaneTransactionContractError::InvalidOrchestrationEvent(0, _))
+    ));
+}
+
+#[test]
+fn commit_orchestration_batch_rejects_zero_task_started_attempt() {
+    let mut event = sample_run_requested_event();
+    event.event = Some(orchestration_event_envelope::Event::TaskStarted(
+        TaskStarted {
+            run_id: "run-01".to_string(),
+            task_key: "extract".to_string(),
+            attempt: 0,
+            attempt_id: "attempt-01".to_string(),
+            worker_id: "worker-01".to_string(),
+        },
+    ));
+    let request = CommitOrchestrationBatchRequest {
+        events: vec![event],
+    };
+
+    assert!(matches!(
+        request.validate_contract(),
+        Err(ControlPlaneTransactionContractError::InvalidOrchestrationEvent(0, _))
+    ));
 }
 
 #[test]
@@ -803,6 +943,108 @@ fn commit_orchestration_batch_rejects_run_triggered_backfill_trigger() {
 }
 
 #[test]
+fn metastore_mutation_rejects_grant_without_owner() {
+    let mutation = MetastoreMutation {
+        op: Some(metastore_mutation::Op::Grant(GrantMutation {
+            op: Some(arco_proto::arco::catalog::v1::grant_mutation::Op::Grant(
+                Grant {
+                    grant_id: "grant_01".to_string(),
+                    object_id: "table_01".to_string(),
+                    object_type: "TABLE".to_string(),
+                    principal: "user:alice@example.com".to_string(),
+                    privilege: "SELECT".to_string(),
+                    granted_by: "user:admin@example.com".to_string(),
+                    owner: String::new(),
+                    lifecycle_state: CatalogObjectLifecycleState::Active as i32,
+                    ..Default::default()
+                },
+            )),
+        })),
+    };
+
+    assert_eq!(
+        mutation.validate_contract(),
+        Err(MetastoreMutationContractError::EmptyField {
+            message: "grant",
+            field: "owner",
+        })
+    );
+}
+
+#[test]
+fn metastore_mutation_rejects_workspace_binding_without_owner() {
+    let mutation = MetastoreMutation {
+        op: Some(metastore_mutation::Op::WorkspaceBinding(WorkspaceBinding {
+            binding_id: "binding_01".to_string(),
+            workspace_id: "workspace_01".to_string(),
+            object_id: "loc_01".to_string(),
+            object_type: "EXTERNAL_LOCATION".to_string(),
+            owner: String::new(),
+            lifecycle_state: CatalogObjectLifecycleState::Active as i32,
+            ..Default::default()
+        })),
+    };
+
+    assert_eq!(
+        mutation.validate_contract(),
+        Err(MetastoreMutationContractError::EmptyField {
+            message: "workspace_binding",
+            field: "owner",
+        })
+    );
+}
+
+#[test]
+fn metastore_mutation_rejects_governance_attachment_without_owner() {
+    let mutation = MetastoreMutation {
+        op: Some(metastore_mutation::Op::GovernanceAttachment(
+            GovernanceAttachment {
+                attachment_id: "attach_01".to_string(),
+                object_id: "table_01".to_string(),
+                object_type: "TABLE".to_string(),
+                attachment_type: "CLASSIFICATION".to_string(),
+                value: "restricted".to_string(),
+                created_by: "user:admin@example.com".to_string(),
+                owner: String::new(),
+                lifecycle_state: CatalogObjectLifecycleState::Active as i32,
+                ..Default::default()
+            },
+        )),
+    };
+
+    assert_eq!(
+        mutation.validate_contract(),
+        Err(MetastoreMutationContractError::EmptyField {
+            message: "governance_attachment",
+            field: "owner",
+        })
+    );
+}
+
+#[test]
+fn metastore_mutation_rejects_model_version_without_owner() {
+    let mutation = MetastoreMutation {
+        op: Some(metastore_mutation::Op::ModelVersion(ModelVersion {
+            model_version_id: "model_version_01".to_string(),
+            model_id: "model_01".to_string(),
+            version: "1".to_string(),
+            storage_location: "s3://bucket/models/churn/1".to_string(),
+            owner: String::new(),
+            lifecycle_state: CatalogObjectLifecycleState::Active as i32,
+            ..Default::default()
+        })),
+    };
+
+    assert_eq!(
+        mutation.validate_contract(),
+        Err(MetastoreMutationContractError::EmptyField {
+            message: "model_version",
+            field: "owner",
+        })
+    );
+}
+
+#[test]
 fn commit_root_transaction_rejects_empty_mutations() {
     let request = CommitRootTransactionRequest {
         mutations: Vec::new(),
@@ -853,6 +1095,7 @@ fn metastore_root_transaction_accepts_mutations() {
                         name: "lakehouse-prod".to_string(),
                         cloud: "aws".to_string(),
                         owner: "group:data-platform".to_string(),
+                        lifecycle_state: CatalogObjectLifecycleState::Active as i32,
                         created_at: None,
                         updated_at: None,
                         ..Default::default()
@@ -884,6 +1127,7 @@ fn scoped_metastore_root_transaction_carries_scope_and_stable_object_id() {
                                 name: "lakehouse-prod".to_string(),
                                 cloud: "aws".to_string(),
                                 owner: "group:data-platform".to_string(),
+                                lifecycle_state: CatalogObjectLifecycleState::Active as i32,
                                 created_at: None,
                                 updated_at: None,
                                 ..Default::default()
@@ -950,6 +1194,7 @@ fn scoped_metastore_root_transaction_rejects_missing_scope() {
                                 name: "lakehouse-prod".to_string(),
                                 cloud: "aws".to_string(),
                                 owner: "group:data-platform".to_string(),
+                                lifecycle_state: CatalogObjectLifecycleState::Active as i32,
                                 created_at: None,
                                 updated_at: None,
                                 ..Default::default()
@@ -1019,6 +1264,7 @@ fn scoped_metastore_root_transaction_rejects_empty_required_scope_fields() {
                                     name: "lakehouse-prod".to_string(),
                                     cloud: "aws".to_string(),
                                     owner: "group:data-platform".to_string(),
+                                    lifecycle_state: CatalogObjectLifecycleState::Active as i32,
                                     created_at: None,
                                     updated_at: None,
                                     ..Default::default()

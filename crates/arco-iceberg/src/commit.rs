@@ -464,6 +464,7 @@ impl<S: StorageBackend> CommitService<S> {
         u32::try_from(seconds).unwrap_or(u32::MAX)
     }
 
+    #[allow(clippy::cognitive_complexity)]
     async fn handle_pending_transaction(
         &self,
         pointer_store: &PointerStoreImpl<S>,

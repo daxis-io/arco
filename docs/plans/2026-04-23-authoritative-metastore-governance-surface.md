@@ -285,11 +285,10 @@ Add failing tests that require:
 Add minimal Arco-side grant operations and compiled read APIs keyed by stable
 object ID rather than mutable names. Renames must preserve grant bindings.
 
-**Step 3: Make the UC permissions route authoritative**
+**Step 3: Complete UC permissions mutations**
 
-Replace the scaffolded handler so:
+Build on the landed compiled-permission `GET` handler so:
 
-- `GET` reads the compiled assignments from manifest-selected state
 - `PATCH` validates the request, appends authoritative mutations, and returns
   the resulting privilege assignments
 
@@ -325,16 +324,19 @@ git commit -m "feat: add authoritative grants and permissions"
 - Create: `crates/arco-uc/tests/storage_credentials_authoritative.rs`
 - Create: `crates/arco-uc/tests/external_locations_authoritative.rs`
 
-**Step 1: Write the failing storage and temp-credential tests**
+**Step 1: Write the remaining storage and temp-credential tests**
 
-Add failing tests for:
+Add focused tests for the gaps that are not already covered by
+`storage_governance_authoritative` and `credentials_authoritative`:
 
-- create/get/list/update/delete storage credentials
-- create/get/list/update/delete external locations
+- update/delete storage credentials
+- update/delete external locations
 - workspace or storage bindings that control visibility and usage
-- truthful `temporary-table-credentials`, `temporary-volume-credentials`,
-  `temporary-model-version-credentials`, and `temporary-path-credentials`
-  responses driven by authoritative state
+- provider token material and revocation metadata for
+  `temporary-table-credentials` and `temporary-path-credentials`
+- truthful `temporary-volume-credentials` and
+  `temporary-model-version-credentials` responses once authoritative object
+  ownership exists
 
 **Step 2: Add durable object and binding state**
 
@@ -343,10 +345,11 @@ authoritative objects with stable IDs and manifest-published projections. Keep
 cloud-specific vending material derived from those objects and the current authz
 decision, not as the source of truth itself.
 
-**Step 3: Replace placeholder temporary credential behavior**
+**Step 3: Complete temporary credential provider behavior**
 
-The temporary credential endpoints should stop returning placeholder empty
-credential lists or blanket `501`s for supported cases. They should:
+The landed table/path temporary credential endpoints already use compiled
+authorization and published storage governance. The remaining supported cases
+should:
 
 - load the referenced table, volume, model, or path binding from published state
 - evaluate the authoritative allow/deny decision

@@ -22,6 +22,7 @@ use utoipa::{Modify, OpenApi};
     ),
     paths(
         crate::routes::catalogs::create_catalog,
+        crate::routes::catalogs::get_catalog_inventory,
         crate::routes::catalogs::list_catalogs,
         crate::routes::catalogs::get_catalog,
         crate::routes::catalogs::create_schema,
@@ -77,6 +78,9 @@ use utoipa::{Modify, OpenApi};
         schemas(
             crate::error::ApiErrorBody,
             crate::routes::catalogs::CreateCatalogRequest,
+            crate::routes::catalogs::CatalogInventoryCounts,
+            crate::routes::catalogs::CatalogInventoryObjectFamily,
+            crate::routes::catalogs::CatalogInventoryResponse,
             crate::routes::catalogs::CatalogResponse,
             crate::routes::catalogs::ListCatalogsResponse,
             crate::routes::catalogs::CreateSchemaRequest,

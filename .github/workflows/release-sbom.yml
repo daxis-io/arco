@@ -124,20 +124,19 @@ jobs:
                   | head -n 1
               )"
 
-              if [ "${discipline_conclusion}" = "success" ]; then
-                echo "release-tag discipline passed in CI run ${run_id}"
-                found_success="true"
-                break
-              fi
-
-              if [ "${release_tag_run_count}" -eq 0 ] && [ -z "${discipline_conclusion}" ] && [ "${run_conclusion}" = "success" ]; then
-                echo "release-tag discipline job not present in CI run ${run_id}; falling back to successful CI run conclusion"
+              if [ "${run_conclusion}" = "success" ] && [ "${discipline_conclusion}" = "success" ]; then
+                echo "release-tag CI and discipline passed in CI run ${run_id}"
                 found_success="true"
                 break
               fi
 
               if [ "${discipline_conclusion}" = "failure" ] || [ "${discipline_conclusion}" = "cancelled" ] || [ "${discipline_conclusion}" = "timed_out" ] || [ "${discipline_conclusion}" = "action_required" ]; then
                 echo "release-tag discipline failed in CI run ${run_id} (${discipline_conclusion})" >&2
+                exit 1
+              fi
+
+              if [ "${run_conclusion}" = "failure" ] || [ "${run_conclusion}" = "cancelled" ] || [ "${run_conclusion}" = "timed_out" ] || [ "${run_conclusion}" = "action_required" ]; then
+                echo "release-tag CI run ${run_id} failed before SBOM generation (${run_conclusion})" >&2
                 exit 1
               fi
             done
@@ -178,7 +177,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
-          toolchain: 1.85
+          toolchain: 1.88
 
       - name: Install cargo-sbom
         uses: taiki-e/install-action@d9be7d8cda89035c9c843f78bd44d4f72d8403d4 # v2

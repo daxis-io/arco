@@ -21,7 +21,7 @@ use arco_core::storage::{MemoryBackend, StorageBackend};
 use arco_core::{ControlPlaneTxDomain, ScopedStorage};
 use arco_proto::arco::catalog::v1::{
     CatalogDdlOperation, ColumnDefinition, CreateCatalogOp, CreateSchemaOp, RegisterTableOp,
-    RenameTableOp, TableFormat, catalog_ddl_operation,
+    RenameTableOp, catalog_ddl_operation,
 };
 use arco_proto::arco::controlplane::v1::{
     ApplyCatalogDdlRequest, CommitOrchestrationBatchRequest, CommitRootTransactionRequest,
@@ -99,7 +99,7 @@ fn catalog_register_table_request(
                 table: table_name.to_string(),
                 description: Some("grpc transaction table".to_string()),
                 location: None,
-                format: TableFormat::Unspecified as i32,
+                format: None,
                 columns: vec![ColumnDefinition {
                     name: "id".to_string(),
                     data_type: "STRING".to_string(),

@@ -541,6 +541,7 @@ async fn update_repair_backlog_metrics(
     );
 }
 
+#[allow(clippy::cognitive_complexity)]
 async fn run_repair_automation_once(state: &AppState) {
     if state.repair_automation.mode == RepairAutomationMode::Disabled {
         return;

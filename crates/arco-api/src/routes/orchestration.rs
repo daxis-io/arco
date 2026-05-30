@@ -3888,7 +3888,7 @@ fn filter_sensor_evals_by_time_range(
         ("bearerAuth" = [])
     )
 )]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 pub(crate) async fn trigger_run(
     State(state): State<Arc<AppState>>,
     ctx: RequestContext,

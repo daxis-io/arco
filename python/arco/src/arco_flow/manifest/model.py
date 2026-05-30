@@ -1,6 +1,7 @@
-"""Manifest model matching Protobuf AssetManifest schema.
+"""Legacy Python deployment manifest model.
 
-The manifest captures all asset definitions and metadata for deployment.
+The manifest captures all asset definitions and metadata for deployment. It is
+not generated from the current domain-aligned public protobuf packages.
 """
 
 from __future__ import annotations
@@ -178,7 +179,7 @@ class AssetEntry:
 class AssetManifest:
     """Complete manifest for deployment.
 
-    Matches proto/arco/v1/asset.proto AssetManifest message.
+    This is a legacy Python SDK payload, not a generated protobuf message.
     """
 
     manifest_version: str = "1.0"

@@ -41,6 +41,19 @@ projections exist:
 - `system.governance.attachments`
 - `system.delta.{tables,commits,staged_commits,reconciliation_issues}`
 
+## Deferred Tables
+
+The initial surface does not include access, storage, governance, volume,
+function, model registry, or managed Delta operational tables. Those tables
+remain planned until their authoritative native state and safe Parquet
+projections exist:
+
+- `system.access.{grants,compiled_permissions,audit,auth_denies,credential_mints}`
+- `system.storage.{credentials,external_locations,managed_roots,workspace_bindings}`
+- `system.catalog.{volumes,functions,registered_models,model_versions}`
+- `system.governance.attachments`
+- `system.delta.{tables,commits,staged_commits,reconciliation_issues}`
+
 ## Boundaries
 
 - Truth: immutable ledger + pointer-published manifests

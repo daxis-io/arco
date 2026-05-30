@@ -273,6 +273,7 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
     }
 
     /// Internal helper to list and parse markers with a prefix.
+    #[allow(clippy::cognitive_complexity)]
     async fn list_markers_with_prefix(&self, prefix: &str) -> IcebergResult<MarkerListResult> {
         let objects = self
             .storage

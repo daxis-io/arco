@@ -24,6 +24,13 @@ fn partition_key_fixture_preserves_explicit_dimension_order() {
 }
 
 #[test]
+fn legacy_partition_key_v1_protojson_fixture_is_rejected() {
+    let fixture = include_str!("../fixtures/partition_key_v1.json");
+    serde_json::from_str::<PartitionKey>(fixture)
+        .expect_err("old map-shaped partition key JSON must not parse as current contract");
+}
+
+#[test]
 fn scalar_value_variants_roundtrip() {
     let values = [
         ScalarValue {
@@ -113,4 +120,17 @@ fn metastore_mutation_protojson_field_names_are_contract() {
     assert!(json.to_string().contains("registeredModel"));
     assert!(json.to_string().contains("modelVersion"));
     assert!(json.to_string().contains("lakehouse-prod"));
+}
+
+#[test]
+fn metastore_mutation_fixture_uses_valid_public_defaults() {
+    let fixture = include_str!("../fixtures/metastore_mutation_v1.json");
+    let parsed: BTreeMap<String, MetastoreMutation> =
+        serde_json::from_str(fixture).expect("metastore mutation fixture should parse");
+
+    for (name, mutation) in parsed {
+        mutation
+            .validate_contract()
+            .unwrap_or_else(|error| panic!("{name} fixture should be valid: {error}"));
+    }
 }

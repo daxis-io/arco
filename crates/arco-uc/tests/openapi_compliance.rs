@@ -165,8 +165,8 @@ fn test_generated_openapi_describes_authoritative_boundary() -> Result<(), Strin
 }
 
 #[test]
-fn test_generated_openapi_tags_distinguish_authoritative_and_scaffolded_surfaces()
--> Result<(), String> {
+fn test_generated_openapi_tags_distinguish_authoritative_and_partial_surfaces() -> Result<(), String>
+{
     let ours =
         serde_json::to_value(openapi()).map_err(|err| format!("serialize openapi: {err}"))?;
     let tags = ours

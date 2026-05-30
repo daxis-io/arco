@@ -133,6 +133,65 @@ fn python_ci_uses_locked_uv_resolution() {
 }
 
 #[test]
+fn dependabot_version_updates_are_rate_limited() {
+    let dependabot = fs::read_to_string(repo_root().join(".github/dependabot.yml"))
+        .expect("read dependabot config");
+    let dependabot: serde_yaml::Value =
+        serde_yaml::from_str(&dependabot).expect("parse dependabot config");
+
+    let updates = dependabot
+        .get("updates")
+        .and_then(serde_yaml::Value::as_sequence)
+        .expect("dependabot config should define updates");
+
+    for update in updates {
+        let ecosystem = yaml_str(update, "package-ecosystem");
+        assert_ne!(
+            ecosystem, "pip",
+            "uv-managed Python projects should use Dependabot's uv ecosystem"
+        );
+
+        let schedule = update
+            .get("schedule")
+            .and_then(serde_yaml::Value::as_mapping)
+            .unwrap_or_else(|| panic!("{ecosystem} update should define a schedule"));
+        assert_eq!(
+            map_str(schedule, "interval"),
+            "monthly",
+            "{ecosystem} version updates should run on the monthly maintenance train"
+        );
+        assert!(
+            schedule.get(serde_yaml::Value::from("time")).is_some(),
+            "{ecosystem} update should use an explicit run time"
+        );
+        assert_eq!(
+            map_str(schedule, "timezone"),
+            "America/Indiana/Indianapolis",
+            "{ecosystem} update should use the maintainer timezone"
+        );
+
+        let open_limit = update
+            .get("open-pull-requests-limit")
+            .and_then(serde_yaml::Value::as_i64)
+            .unwrap_or_else(|| panic!("{ecosystem} update should cap open PRs"));
+        assert!(
+            open_limit <= 2,
+            "{ecosystem} update should keep the version-update queue small"
+        );
+
+        assert!(
+            update.get("cooldown").is_some(),
+            "{ecosystem} update should delay newly released versions"
+        );
+        assert_eq!(
+            yaml_str(update, "rebase-strategy"),
+            "disabled",
+            "{ecosystem} update should not churn branches on base changes"
+        );
+    }
+}
+
+#[test]
 fn release_sbom_waits_for_full_release_tag_ci_success() {
     let workflow = fs::read_to_string(repo_root().join(".github/workflows/release-sbom.yml"))
         .expect("read release SBOM workflow");
@@ -325,6 +384,19 @@ fn command_output_text(output: &std::process::Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+fn yaml_str<'a>(value: &'a serde_yaml::Value, key: &str) -> &'a str {
+    value
+        .get(key)
+        .and_then(serde_yaml::Value::as_str)
+        .unwrap_or_else(|| panic!("missing string key `{key}`"))
+}
+
+fn map_str<'a>(map: &'a serde_yaml::Mapping, key: &str) -> &'a str {
+    map.get(serde_yaml::Value::from(key))
+        .and_then(serde_yaml::Value::as_str)
+        .unwrap_or_else(|| panic!("missing string key `{key}`"))
 }
 
 #[cfg(unix)]

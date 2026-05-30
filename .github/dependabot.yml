@@ -3,9 +3,14 @@ updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
-    open-pull-requests-limit: 10
+      interval: "monthly"
+      time: "09:00"
+      timezone: "America/Indiana/Indianapolis"
+    open-pull-requests-limit: 1
+    rebase-strategy: "disabled"
+    cooldown:
+      semver-patch-days: 7
+      semver-minor-days: 21
     groups:
       rust-minor:
         patterns:
@@ -23,9 +28,13 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
-    open-pull-requests-limit: 5
+      interval: "monthly"
+      time: "09:30"
+      timezone: "America/Indiana/Indianapolis"
+    open-pull-requests-limit: 1
+    rebase-strategy: "disabled"
+    cooldown:
+      default-days: 14
     groups:
       actions:
         patterns:
@@ -33,12 +42,17 @@ updates:
     commit-message:
       prefix: "deps(actions)"
 
-  - package-ecosystem: "pip"
+  - package-ecosystem: "uv"
     directory: "/python"
     schedule:
-      interval: "weekly"
-      day: "monday"
-    open-pull-requests-limit: 5
+      interval: "monthly"
+      time: "10:00"
+      timezone: "America/Indiana/Indianapolis"
+    open-pull-requests-limit: 1
+    rebase-strategy: "disabled"
+    cooldown:
+      semver-patch-days: 7
+      semver-minor-days: 21
     groups:
       python-minor:
         patterns:
@@ -53,14 +67,19 @@ updates:
     commit-message:
       prefix: "deps(python)"
 
-  - package-ecosystem: "pip"
+  - package-ecosystem: "uv"
     directory: "/python/arco"
     schedule:
-      interval: "weekly"
-      day: "monday"
-    open-pull-requests-limit: 5
+      interval: "monthly"
+      time: "10:30"
+      timezone: "America/Indiana/Indianapolis"
+    open-pull-requests-limit: 1
+    rebase-strategy: "disabled"
+    cooldown:
+      semver-patch-days: 7
+      semver-minor-days: 21
     groups:
-      python-servo-minor:
+      python-flow-minor:
         patterns:
           - "*"
         update-types:
@@ -76,8 +95,12 @@ updates:
   - package-ecosystem: "terraform"
     directory: "/infra/terraform"
     schedule:
-      interval: "weekly"
-      day: "monday"
-    open-pull-requests-limit: 3
+      interval: "monthly"
+      time: "11:00"
+      timezone: "America/Indiana/Indianapolis"
+    open-pull-requests-limit: 1
+    rebase-strategy: "disabled"
+    cooldown:
+      default-days: 14
     commit-message:
       prefix: "deps(terraform)"

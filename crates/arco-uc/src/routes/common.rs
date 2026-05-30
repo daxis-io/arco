@@ -11,18 +11,25 @@ use serde::{Deserialize, Deserializer};
 
 use crate::context::UnityCatalogRequestContext;
 use axum::extract::OriginalUri;
-use axum::http::Method;
+use axum::http::{Method, Uri};
 
 use crate::error::UnityCatalogError;
 use crate::state::UnityCatalogState;
 
 /// Returns a standardized UC `501` for known-but-unsupported operations.
-pub(crate) fn known_but_unsupported(method: &Method, uri: &OriginalUri) -> UnityCatalogError {
-    if let Some(message) = crate::support::unsupported_message(method, uri.0.path()) {
+pub(crate) fn known_but_unsupported(
+    method: &Method,
+    uri: &Uri,
+    original_uri: &OriginalUri,
+) -> UnityCatalogError {
+    let display_path = original_uri.0.path();
+    if let Some(message) =
+        crate::support::unsupported_message_for_display(method, uri.path(), display_path)
+    {
         return UnityCatalogError::NotImplemented { message };
     }
     UnityCatalogError::NotImplemented {
-        message: format!("operation not supported: {method} {}", uri.0.path()),
+        message: format!("operation not supported: {method} {display_path}"),
     }
 }
 

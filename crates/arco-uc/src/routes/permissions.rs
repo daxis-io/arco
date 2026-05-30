@@ -5,6 +5,7 @@ use axum::Router;
 use axum::extract::{Extension, OriginalUri, Path, Query, State};
 use axum::http::Method;
 use axum::http::StatusCode;
+use axum::http::Uri;
 use axum::routing::get;
 
 use arco_catalog::authz::privileges::Privilege;
@@ -212,6 +213,10 @@ fn permission_assignment(row: &CompiledPermissionRow) -> serde_json::Value {
         (status = 501, description = "Operation not supported", body = UnityCatalogErrorResponse),
     )
 )]
-pub async fn update_permissions(method: Method, uri: OriginalUri) -> UnityCatalogError {
-    common::known_but_unsupported(&method, &uri)
+pub async fn update_permissions(
+    method: Method,
+    uri: Uri,
+    original_uri: OriginalUri,
+) -> UnityCatalogError {
+    common::known_but_unsupported(&method, &uri, &original_uri)
 }

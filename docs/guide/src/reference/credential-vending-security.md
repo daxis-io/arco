@@ -79,8 +79,12 @@ contract reserves these scope classes:
 - `model_artifact_read`
 - `model_artifact_write`
 
-Path and model-artifact scopes stay `planned` until the corresponding
-authoritative object/path ownership exists.
+Generic raw-path and model-artifact scopes stay `planned` until the
+corresponding authoritative object/path ownership exists. The UC temporary path
+credential route is only `compatible-partial`: it can make table/path decisions
+over published storage-governance ownership, but it still does not expose
+provider token material, revocation metadata, or full native product-contract
+parity.
 
 ## Provider Extensibility
 

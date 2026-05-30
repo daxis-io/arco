@@ -17,6 +17,7 @@ use axum::Router;
 use axum::extract::{Extension, OriginalUri, State};
 use axum::http::Method;
 use axum::http::StatusCode;
+use axum::http::Uri;
 use axum::routing::post;
 use serde::Deserialize;
 use serde_json::json;
@@ -89,9 +90,10 @@ pub fn routes() -> Router<UnityCatalogState> {
 )]
 pub async fn post_temporary_model_version_credentials(
     method: Method,
-    uri: OriginalUri,
+    uri: Uri,
+    original_uri: OriginalUri,
 ) -> UnityCatalogError {
-    super::common::known_but_unsupported(&method, &uri)
+    super::common::known_but_unsupported(&method, &uri, &original_uri)
 }
 
 /// Generates temporary table credential decisions.
@@ -199,9 +201,10 @@ pub(crate) async fn post_temporary_table_credentials(
 )]
 pub async fn post_temporary_volume_credentials(
     method: Method,
-    uri: OriginalUri,
+    uri: Uri,
+    original_uri: OriginalUri,
 ) -> UnityCatalogError {
-    super::common::known_but_unsupported(&method, &uri)
+    super::common::known_but_unsupported(&method, &uri, &original_uri)
 }
 
 /// Generates temporary path credentials.

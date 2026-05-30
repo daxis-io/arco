@@ -117,11 +117,12 @@ route family before the route is marked production-backed.
 
 ## Compatibility Labels
 
-Every public route group must have one documented compatibility label. Unity
-Catalog compatibility routes use the route-level `arco_uc::support` registry
-with these labels: `implemented`, `compatible-partial`,
-`known-unsupported`, and `planned`. Native Arco-only surfaces may still use
-`native` when they are not compatibility adapters.
+Every public operation must have one documented compatibility label. A public
+route group may use a single group label only when every operation in that group
+shares the same label. Unity Catalog compatibility routes use the route-level
+`arco_uc::support` registry with these labels: `implemented`,
+`compatible-partial`, `known-unsupported`, and `planned`. Native Arco-only
+surfaces may still use `native` when they are not compatibility adapters.
 
 The generated OpenAPI carries per-operation support metadata for documented UC
 operations:
@@ -132,7 +133,9 @@ operations:
 - `x-arco-known-gap` when a gap is known
 
 Known unsupported or planned UC operations must return a structured `501`
-instead of an ambiguous `404`. Unknown non-UC paths remain `404`.
+instead of an ambiguous `404`. This `501` contract applies at the configured UC
+mount prefix, while registry matching itself remains facade-relative. Unknown
+non-UC paths remain `404`.
 
 ## Versioning Gates
 
@@ -157,4 +160,4 @@ Before a new public route is merged, reviewers should be able to identify:
 | Preconditions | Mutating retries and stale writes use idempotency keys, ETags, generations, or explicit protocol tokens |
 | Errors | Responses use stable codes, request IDs, retryability, and safe messages |
 | Visibility | Sensitive fields have ordinary, owner, and admin response tests |
-| Compatibility | Route group has one compatibility label and documented unsupported behavior |
+| Compatibility | Public operations have compatibility labels; route groups use a group label only when every operation shares it; unsupported behavior is documented |

@@ -489,18 +489,21 @@ pub fn operation_support<'a>(method: &str, path: &'a str) -> Option<UcSupportMat
         })
 }
 
-pub(crate) fn unsupported_message(method: &Method, path: &str) -> Option<String> {
+pub(crate) fn unsupported_message_for_display(
+    method: &Method,
+    match_path: &str,
+    display_path: &str,
+) -> Option<String> {
     let method = method.as_str();
-    if let Some(matched) = operation_support(method, path) {
+    if let Some(matched) = operation_support(method, match_path) {
         let operation = matched.operation;
         if operation.support_level.returns_not_implemented() {
             return Some(unsupported_registry_message(
                 method,
-                matched.path,
+                display_path,
                 operation,
             ));
         }
-        return None;
     }
     None
 }

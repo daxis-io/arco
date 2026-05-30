@@ -140,16 +140,20 @@ unsupported and planned UC operations return the UC error envelope with HTTP
 operations carry `x-arco-support-level`, `x-arco-native-backing`, and
 `x-arco-authz-boundary` extensions.
 
-| Endpoint group | Arco support level | Notes |
+The `501` contract applies at the configured UC mount prefix; registry matching
+itself remains facade-relative. The table summarizes route-level registry
+entries, so mixed groups list their callable and rejected operations separately.
+
+| Endpoint group | Route-level Arco support | Notes |
 |---|---|---|
 | Catalogs | `implemented` | Backed by authoritative Arco catalog state for implemented catalog metadata fields; route-wide compiled-grant enforcement remains separate governance work. |
 | Schemas | `implemented` | Backed by authoritative Arco catalog state for implemented schema metadata fields; route-wide compiled-grant enforcement remains separate governance work. |
-| Tables | `implemented` | Table create/get/list/delete uses Arco catalog state for implemented fields. New native registrations default to Delta Lake; Iceberg and plain Parquet are explicit table-format surfaces. Managed Delta governance remains active work. |
+| Tables | Mixed: table create/get/list/delete is `implemented`; `POST /staging-tables` is `known-unsupported` | Table create/get/list/delete uses Arco catalog state for implemented fields. New native registrations default to Delta Lake; Iceberg and plain Parquet are explicit table-format surfaces. Managed Delta governance remains active work. Managed-table staging protocol remains unsupported. |
 | DeltaCommits | `compatible-partial` | Coordinator mechanics exist; stronger catalog-bound managed Delta validation is planned. |
-| Grants | `compatible-partial` | `GET /permissions` reads compiled assignments; `PATCH /permissions` and writer-backed grant persistence remain unsupported. |
-| Credentials | `compatible-partial` | Arco-native `/storage-credentials` create/list/get uses scoped metastore ledger state and redacted responses. Pinned UC `/credentials` routes are known-unsupported until the compatibility path is promoted; update/delete, service credentials, and provider secret integration remain planned. |
-| External Locations | `compatible-partial` | External location create/list/get uses scoped metastore ledger state, canonical paths, and overlap checks; update/delete and broader binding lifecycle remain planned. |
-| TemporaryCredentials | `compatible-partial` | Table/path credential routes use compiled authorization and published storage governance; volume/model credentials, provider token material, and revocation metadata remain planned. |
+| Grants | Mixed: `GET /permissions` is `compatible-partial`; `PATCH /permissions` is `known-unsupported` | GET reads injected compiled assignments. PATCH, writer-backed grant mutation/persistence, grant-option enforcement, mutation audit, and native grants store parity remain unsupported or planned. |
+| Credentials | Mixed: pinned UC `/credentials` routes are `known-unsupported`; Arco-native `/storage-credentials` create/list/get is `compatible-partial` | The Arco-native path uses scoped metastore ledger state and redacted responses. Provider credential material/secret integration, update/delete, service credentials, and system-table exposure remain planned. |
+| External Locations | Mixed: create/list/get is `compatible-partial`; update/delete is `known-unsupported` | Create/list/get uses scoped metastore ledger state, canonical paths, and overlap checks. Update/delete, broader binding lifecycle, native governance writer parity, and system-table exposure remain planned. |
+| TemporaryCredentials | Mixed: table/path credentials are `compatible-partial`; volume/model credentials are `known-unsupported` | Table/path credential routes use compiled authorization and published storage governance. Provider token material, revocation metadata, volume/model vending, and full parity remain planned or unsupported. |
 | Volumes | `planned` | Product object family is planned; do not treat route parity as authoritative behavior. |
 | Functions | `planned` | Metadata object family is planned; execution semantics are out of first-tranche scope. |
 | RegisteredModels / ModelVersions | `planned` | Metadata and artifact ownership are planned before model-version credential vending. |

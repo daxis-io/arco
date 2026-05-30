@@ -53,9 +53,9 @@ access.
 | Table | write data/commit | modify or owner plus storage authorization | Planned |
 | View | create/read/update/delete | table-like privileges on parent schema and referenced objects | Planned |
 | Volume | create/read/write/delete | volume create/read/write/manage plus storage authorization | Planned |
-| Storage credential | create/update/delete | metastore admin or credential manage | Planned |
+| Storage credential | create/update/delete | metastore admin or credential manage | Partial for Arco-native `/storage-credentials` create/list/get metadata adapter; native privilege contract, provider secret integration, update/delete, and system-table exposure remain planned |
 | Service credential | create/update/delete | metastore admin or service credential manage | Planned |
-| External location | create/update/delete | credential use plus external location manage | Planned |
+| External location | create/update/delete | credential use plus external location manage | Partial for `/external-locations` create/list/get adapter over scoped metastore storage-governance validation; update/delete, broader binding lifecycle, and native privilege contract remain planned |
 | External service connection | create/update/delete | service credential use plus connection manage | Planned |
 | Managed root | create/update/delete | metastore admin or storage manage | Planned |
 | Function | create/read/execute/delete | function create, execute, manage | Planned |
@@ -96,7 +96,7 @@ or renaming a key is a product-contract change.
 | `service.connection.manage` | External service connection | service credential use plus connection manage privilege, redacted endpoint/secret metadata, audit allow and deny |
 | `governance.attachment.list` | Governance attachment | object read/manage or governance visibility privilege, redacted policy payloads, no hidden-object leakage |
 | `governance.attachment.update` | Governance attachment | object manage or governance attach privilege, typed attachment validation, no implicit policy enforcement |
-| `credential.mint` | Table, Volume, External location, Managed root, Model version, governed path | `AuthzDecision`, TTL clamp, provider failure deny, path-prefix subset, no secret leakage |
+| `credential.mint` | Table, Volume, External location, Managed root, Model version, governed path | Partial for UC table/path credential decisions over compiled authorization and published storage governance; provider token material, revocation metadata, volume/model vending, and full native product-contract parity remain planned |
 | `system.query` | System table | explicit system-table read scope, workspace filter, schema redaction, freshness watermark |
 | `admin.explain_access` | Any securable | safe deny reason, grant evidence visibility, no hidden policy payloads |
 | `sharing.manage` | Share, provider, recipient | stable sharing object ID, owner/admin privilege, redacted recipient/provider metadata, audit allow and deny |

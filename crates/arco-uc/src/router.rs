@@ -3,7 +3,7 @@
 use axum::Router;
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::OriginalUri;
-use axum::http::{Method, StatusCode};
+use axum::http::{Method, StatusCode, Uri};
 use axum::middleware;
 use tower::ServiceBuilder;
 use tower::limit::ConcurrencyLimitLayer;
@@ -54,12 +54,15 @@ pub fn unity_catalog_router(state: UnityCatalogState) -> Router {
     router.with_state(state)
 }
 
-async fn not_found(method: Method, uri: OriginalUri) -> UnityCatalogError {
-    if let Some(message) = crate::support::unsupported_message(&method, uri.0.path()) {
+async fn not_found(method: Method, uri: Uri, original_uri: OriginalUri) -> UnityCatalogError {
+    let display_path = original_uri.0.path();
+    if let Some(message) =
+        crate::support::unsupported_message_for_display(&method, uri.path(), display_path)
+    {
         return UnityCatalogError::NotImplemented { message };
     }
     UnityCatalogError::NotFound {
-        message: format!("route not found: {}", uri.0.path()),
+        message: format!("route not found: {display_path}"),
     }
 }
 

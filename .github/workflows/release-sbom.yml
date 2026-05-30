@@ -180,7 +180,7 @@ jobs:
           toolchain: 1.88
 
       - name: Install cargo-sbom
-        uses: taiki-e/install-action@d9be7d8cda89035c9c843f78bd44d4f72d8403d4 # v2
+        uses: taiki-e/install-action@873c7452cadb7c034694a1282227095d93fbdf92 # v2
         with:
           tool: cargo-sbom@0.10.0
 

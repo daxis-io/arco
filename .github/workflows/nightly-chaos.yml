@@ -23,6 +23,13 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  disabled-placeholder:
+    name: Disabled placeholder
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Report disabled state
+        run: echo "Nightly chaos jobs are intentionally disabled until the backing suites are re-enabled."
+
   simulation:
     name: Simulation Tests
     if: false

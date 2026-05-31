@@ -158,5 +158,4 @@ entries, so mixed groups list their callable and rejected operations separately.
 | Functions | `planned` | Metadata object family is planned; execution semantics are out of first-tranche scope. |
 | RegisteredModels / ModelVersions | `planned` | Metadata and artifact ownership are planned before model-version credential vending. |
 | Metastores | `known-unsupported` | Pinned `/metastore_summary` is not mounted in this facade; Arco does not depend on a UC metastore service. |
-
 <!-- END MANUAL -->

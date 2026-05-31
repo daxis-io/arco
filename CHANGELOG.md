@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-05-28
+## [0.2.0] - 2026-05-31
 ### Added
 - Catalog control-plane release surface covering scoped metastore mutations, catalog product APIs, Unity Catalog compatibility inventory, and system-table contracts.
 - Orchestration control-plane contracts for root transactions, task-token callbacks, worker dispatch envelopes, and output visibility lifecycle coverage.

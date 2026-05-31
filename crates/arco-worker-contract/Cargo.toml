@@ -24,4 +24,3 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 utoipa = { version = "5.5.0", features = ["chrono"] }
-

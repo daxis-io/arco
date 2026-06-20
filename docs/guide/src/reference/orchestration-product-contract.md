@@ -60,12 +60,45 @@ worker-written object path.
 Every public orchestration claim should map to one of these event contracts,
 system-table evidence paths, OpenAPI/proto contracts, or a runnable test.
 
+## Run Code Version
+
+For public API run triggers planned from a deployed manifest,
+`RunTriggered.code_version` and `system.orchestration.runs.code_version`
+identify the manifest `codeVersionId` used to plan the run. This is the
+pipeline definition or user-code revision, not the API service build identifier
+from `ARCO_CODE_VERSION`.
+
+Automation-created runs need explicit source metadata before they can claim the
+same manifest-code contract. Until those paths persist that metadata, schedule,
+backfill, and sensor run-code-version behavior should be treated as path-specific
+and covered by focused tests before being used as acceptance evidence.
+
+## Callback Responses
+
+`TaskCompletedResponse.finalState` acknowledges the worker-reported outcome for
+the completed attempt. For retryable failures it remains `FAILED`; the durable
+projection in `system.orchestration.tasks` may subsequently move the task to
+retry-wait or redispatched state for the next attempt.
+
 ## Local Development Parity
 
 Local development must use the same run, task, dispatch, callback, compaction,
 and system-table lifecycle as production. A local shortcut may use an in-memory
 or local queue backend, but it must still produce the same durable events and
 published evidence.
+
+The deterministic local UAT reconciliation gate is:
+
+```bash
+scripts/run_user_acceptance_pipeline_uat.sh --deterministic
+```
+
+That command is a focused Batch 0 reconciliation gate, not a first-class
+end-to-end user-acceptance suite. It is CI-safe and does not run live GCP,
+durable-storage, or deployed API/worker gates. Local branch-readiness checks
+that combine the deterministic gate with shell smoke tests, formatting, and diff
+whitespace checks are available through
+`scripts/run_user_acceptance_pipeline_uat.sh --with-hygiene`.
 
 The current CLI exposes `arco dev --check` as a check-only workflow. It verifies
 CLI/configuration wiring and lists the missing runtime pieces, but it does not

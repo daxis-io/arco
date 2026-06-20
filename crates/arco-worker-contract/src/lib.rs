@@ -335,7 +335,9 @@ pub struct TaskCompletedRequest {
 pub struct TaskCompletedResponse {
     /// Whether the completion callback was acknowledged.
     pub acknowledged: bool,
-    /// Final task state.
+    /// Worker outcome acknowledged by the callback. For retryable failures, the
+    /// durable orchestration projection may move the task into retry state even
+    /// though this field remains `FAILED`.
     pub final_state: String,
     /// Server timestamp.
     pub server_time: DateTime<Utc>,

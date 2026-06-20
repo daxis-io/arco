@@ -5,13 +5,19 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use datafusion::catalog::memory::{MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::catalog_common::{CatalogProvider, SchemaProvider};
 use datafusion::prelude::SessionContext;
 
 use arco_catalog::{CatalogError, CatalogReader};
 use arco_core::{CatalogDomain, ScopedStorage};
-use arco_flow::orchestration::compactor::{MicroCompactor, TableArtifact};
+use arco_flow::orchestration::compactor::{
+    MicroCompactor, write_backfill_chunks, write_backfills, write_catalog_run_index,
+    write_dep_satisfaction, write_dispatch_outbox, write_partition_status, write_run_key_conflicts,
+    write_runs, write_schedule_definitions, write_schedule_state, write_schedule_ticks,
+    write_sensor_evals, write_sensor_state, write_tasks, write_timers,
+};
 
 use crate::error::ApiError;
 use crate::parquet_table::parquet_bytes_to_mem_table;
@@ -219,7 +225,7 @@ async fn register_domain_specs(
     Ok(registered)
 }
 
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn register_orchestration_tables(
     storage: &ScopedStorage,
     requested_tables: &HashSet<String>,
@@ -235,167 +241,149 @@ async fn register_orchestration_tables(
         ));
     };
 
-    let table_paths = MicroCompactor::new(storage.clone())
-        .current_base_table_paths()
+    let (_manifest, state) = MicroCompactor::new(storage.clone())
+        .load_state()
         .await
         .map_err(|err| {
             ApiError::internal(format!(
-                "failed to load orchestration base snapshot paths: {err}"
+                "failed to load orchestration system table state: {err}"
             ))
         })?;
 
     let mut registered = 0;
+    macro_rules! register_state_table {
+        ($table_name:literal, $rows:expr, $writer:expr) => {
+            if requested_tables.contains($table_name) {
+                let rows: Vec<_> = $rows;
+                let bytes = $writer(&rows).map_err(|err| {
+                    ApiError::internal(format!(
+                        "failed to encode system.orchestration.{}: {err}",
+                        $table_name
+                    ))
+                })?;
+                registered += register_table_bytes(schema_provider, $table_name, bytes)?;
+            }
+        };
+    }
+
     if requested_tables.contains("runs") {
-        registered +=
-            register_table_artifact(schema_provider, storage, "runs", table_paths.runs.as_ref())
-                .await?;
+        register_state_table!("runs", state.runs.values().cloned().collect(), write_runs);
     }
     if requested_tables.contains("tasks") {
-        registered += register_table_artifact(
-            schema_provider,
-            storage,
+        register_state_table!(
             "tasks",
-            table_paths.tasks.as_ref(),
-        )
-        .await?;
+            state.tasks.values().cloned().collect(),
+            write_tasks
+        );
     }
     if requested_tables.contains("catalog_run_index") {
-        registered += register_table_artifact(
-            schema_provider,
-            storage,
+        register_state_table!(
             "catalog_run_index",
-            table_paths
-                .catalog_run_index_by_org
-                .get(storage.tenant_id()),
-        )
-        .await?;
+            state
+                .catalog_run_index
+                .values()
+                .filter(|row| {
+                    row.org_id.as_str() == storage.tenant_id()
+                        && row.workspace_id.as_str() == storage.workspace_id()
+                })
+                .cloned()
+                .collect(),
+            write_catalog_run_index
+        );
     }
     if requested_tables.contains("dep_satisfaction") {
-        registered += register_table_artifact(
-            schema_provider,
-            storage,
+        register_state_table!(
             "dep_satisfaction",
-            table_paths.dep_satisfaction.as_ref(),
-        )
-        .await?;
+            state.dep_satisfaction.values().cloned().collect(),
+            write_dep_satisfaction
+        );
     }
     if requested_tables.contains("timers") {
-        registered += register_table_artifact(
-            schema_provider,
-            storage,
+        register_state_table!(
             "timers",
-            table_paths.timers.as_ref(),
-        )
-        .await?;
+            state.timers.values().cloned().collect(),
+            write_timers
+        );
     }
     if requested_tables.contains("dispatch_outbox") {
-        registered += register_table_artifact(
-            schema_provider,
-            storage,
+        register_state_table!(
             "dispatch_outbox",
-            table_paths.dispatch_outbox.as_ref(),
-        )
-        .await?;
+            state.dispatch_outbox.values().cloned().collect(),
+            write_dispatch_outbox
+        );
     }
     if requested_tables.contains("sensor_state") {
-        registered += register_table_artifact(
-            schema_provider,
-            storage,
+        register_state_table!(
             "sensor_state",
-            table_paths.sensor_state.as_ref(),
-        )
-        .await?;
+            state.sensor_state.values().cloned().collect(),
+            write_sensor_state
+        );
     }
     if requested_tables.contains("sensor_evals") {
-        registered += register_table_artifact(
-            schema_provider,
-            storage,
+        register_state_table!(
             "sensor_evals",
-            table_paths.sensor_evals.as_ref(),
-        )
-        .await?;
+            state.sensor_evals.values().cloned().collect(),
+            write_sensor_evals
+        );
     }
     if requested_tables.contains("partition_status") {
-        registered += register_table_artifact(
-            schema_provider,
-            storage,
+        register_state_table!(
             "partition_status",
-            table_paths.partition_status.as_ref(),
-        )
-        .await?;
+            state.partition_status.values().cloned().collect(),
+            write_partition_status
+        );
     }
     if requested_tables.contains("schedule_definitions") {
-        registered += register_table_artifact(
-            schema_provider,
-            storage,
+        register_state_table!(
             "schedule_definitions",
-            table_paths.schedule_definitions.as_ref(),
-        )
-        .await?;
+            state.schedule_definitions.values().cloned().collect(),
+            write_schedule_definitions
+        );
     }
     if requested_tables.contains("schedule_state") {
-        registered += register_table_artifact(
-            schema_provider,
-            storage,
+        register_state_table!(
             "schedule_state",
-            table_paths.schedule_state.as_ref(),
-        )
-        .await?;
+            state.schedule_state.values().cloned().collect(),
+            write_schedule_state
+        );
     }
     if requested_tables.contains("schedule_ticks") {
-        registered += register_table_artifact(
-            schema_provider,
-            storage,
+        register_state_table!(
             "schedule_ticks",
-            table_paths.schedule_ticks.as_ref(),
-        )
-        .await?;
+            state.schedule_ticks.values().cloned().collect(),
+            write_schedule_ticks
+        );
     }
     if requested_tables.contains("backfills") {
-        registered += register_table_artifact(
-            schema_provider,
-            storage,
+        register_state_table!(
             "backfills",
-            table_paths.backfills.as_ref(),
-        )
-        .await?;
+            state.backfills.values().cloned().collect(),
+            write_backfills
+        );
     }
     if requested_tables.contains("backfill_chunks") {
-        registered += register_table_artifact(
-            schema_provider,
-            storage,
+        register_state_table!(
             "backfill_chunks",
-            table_paths.backfill_chunks.as_ref(),
-        )
-        .await?;
+            state.backfill_chunks.values().cloned().collect(),
+            write_backfill_chunks
+        );
     }
     if requested_tables.contains("run_key_conflicts") {
-        registered += register_table_artifact(
-            schema_provider,
-            storage,
+        register_state_table!(
             "run_key_conflicts",
-            table_paths.run_key_conflicts.as_ref(),
-        )
-        .await?;
+            state.run_key_conflicts.values().cloned().collect(),
+            write_run_key_conflicts
+        );
     }
 
     Ok(registered)
 }
 
-async fn register_table_artifact(
+fn register_table_bytes(
     schema_provider: &Arc<MemorySchemaProvider>,
-    storage: &ScopedStorage,
     table_name: &str,
-    artifact: Option<&TableArtifact>,
+    bytes: Bytes,
 ) -> Result<usize, ApiError> {
-    let Some(artifact) = artifact else {
-        return Ok(0);
-    };
-
-    let bytes = storage
-        .get_raw(artifact.path())
-        .await
-        .map_err(ApiError::from)?;
     let table = parquet_bytes_to_mem_table(bytes)?;
     schema_provider
         .register_table(table_name.to_string(), table)

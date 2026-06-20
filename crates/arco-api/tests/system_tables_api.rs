@@ -476,19 +476,24 @@ async fn query_catalog_run_index_reads_only_request_tenant_artifact() -> Result<
 }
 
 #[tokio::test]
-async fn query_does_not_expose_system_orchestration_runs_when_state_is_only_in_l0() -> Result<()> {
+async fn query_exposes_system_orchestration_runs_when_state_is_only_in_l0() -> Result<()> {
     let router = seed_orchestration_router_with_l0_only().await?;
 
-    let request = helpers::make_request(
-        Method::POST,
+    let (status, rows): (_, Vec<serde_json::Value>) = helpers::post_json(
+        router,
         "/api/v1/query?format=json",
-        Some(serde_json::json!({
+        serde_json::json!({
             "sql": "SELECT run_id FROM system.orchestration.runs ORDER BY run_id"
-        })),
-    )?;
+        }),
+    )
+    .await?;
 
-    let response = router.oneshot(request).await.map_err(|err| match err {})?;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("run_id"),
+        Some(&serde_json::Value::String("run_01".to_string()))
+    );
     Ok(())
 }
 

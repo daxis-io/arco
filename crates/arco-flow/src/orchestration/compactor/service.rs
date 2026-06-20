@@ -2051,7 +2051,9 @@ fn event_priority(data: &OrchestrationEventData) -> u8 {
         | OrchestrationEventData::SensorEvaluated { .. }
         | OrchestrationEventData::BackfillChunkPlanned { .. } => 0,
         OrchestrationEventData::RunRequested { .. } => 1,
-        _ => 2,
+        OrchestrationEventData::RunTriggered { .. } => 2,
+        OrchestrationEventData::PlanCreated { .. } => 3,
+        _ => 4,
     }
 }
 
@@ -3540,6 +3542,14 @@ mod tests {
         };
 
         assert!(event_priority(&tick) < event_priority(&run_requested));
+    }
+
+    #[test]
+    fn event_priority_orders_run_triggered_before_plan_created() {
+        let run_triggered = make_run_triggered_event();
+        let plan_created = make_plan_created_event();
+
+        assert!(event_priority(&run_triggered.data) < event_priority(&plan_created.data));
     }
 
     #[test]

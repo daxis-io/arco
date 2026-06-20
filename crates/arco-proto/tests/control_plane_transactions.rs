@@ -1485,6 +1485,7 @@ fn sample_run_requested() -> RunRequested {
             })),
         }),
         labels: Default::default(),
+        code_version: Some("git:abc123".to_string()),
     }
 }
 

@@ -28,6 +28,31 @@ fn orchestration_and_flow_paths_are_stable() {
         FlowPaths::orchestration_base_snapshot_dir("snapshot-001"),
         "state/orchestration/base/snapshot-001"
     );
+    assert_eq!(
+        FlowPaths::orchestration_l0_inbox_bundle_path(
+            "run-001",
+            "callback-api",
+            "attempt-001",
+            "bundle-001"
+        ),
+        "_inbox/orchestration/run=run-001/producer=callback-api/attempt=attempt-001/bundle=bundle-001.parquet"
+    );
+    assert_eq!(
+        FlowPaths::orchestration_receipt_segment_path("run-001", "callback-api", "receipt-001"),
+        "receipts/orchestration/run=run-001/producer=callback-api/receipt_segment=receipt-001.json"
+    );
+    assert_eq!(
+        FlowPaths::orchestration_l1_segment_path("0007", 10, 19),
+        "ledger/orchestration/segments/shard=0007/seq=10-19.parquet"
+    );
+    assert_eq!(
+        FlowPaths::orchestration_l1_shard_current_index_path("0007"),
+        "ledger/orchestration/index/shard=0007/current.json"
+    );
+    assert_eq!(
+        FlowPaths::orchestration_l1_shard_history_index_path("0007", "01KCOMMIT"),
+        "ledger/orchestration/index/shard=0007/history/01KCOMMIT.json"
+    );
 }
 
 #[test]

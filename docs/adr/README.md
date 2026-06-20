@@ -53,3 +53,4 @@ Each ADR follows this structure:
 | [038](adr-038-catalog-threat-model.md) | Catalog Threat Model | Proposed |
 | [039](adr-039-catalog-consistency-model.md) | Catalog Consistency Model | Proposed |
 | [040](adr-040-execution-locations.md) | Execution Locations | Accepted |
+| [041](adr-041-tiered-object-storage-orchestration-event-log.md) | Tiered Object-Storage Orchestration Event Log | Accepted |

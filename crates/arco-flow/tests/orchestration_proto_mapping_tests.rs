@@ -1,6 +1,8 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 #![allow(missing_docs)]
 
+use std::collections::HashMap;
+
 use chrono::{TimeZone, Utc};
 
 use arco_flow::orchestration::callbacks::{
@@ -10,7 +12,9 @@ use arco_flow::orchestration::callbacks::{
 use arco_flow::orchestration::compactor::fold::{
     RunRow, RunState as FoldRunState, TaskRow, TaskState as FoldTaskState,
 };
-use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData, TaskOutcome};
+use arco_flow::orchestration::events::{
+    OrchestrationEvent, OrchestrationEventData, PartitionSelector, SourceRef, TaskOutcome,
+};
 use arco_flow::orchestration::proto::{
     event_from_proto_envelope, event_to_proto_envelope, fold_run_state_to_proto,
     fold_task_state_to_proto, task_row_to_proto_execution,
@@ -48,6 +52,78 @@ fn base_task_row(state: FoldTaskState) -> TaskRow {
         delta_partition: None,
         execution_lineage_ref: None,
         row_version: "01JTESTTASKROW".to_string(),
+    }
+}
+
+#[test]
+fn automation_code_versions_proto_round_trip_preserves_source_metadata() {
+    let events = [
+        OrchestrationEvent::new(
+            "tenant-01",
+            "workspace-01",
+            OrchestrationEventData::RunRequested {
+                run_key: "sched:daily-orders:1776000000".to_string(),
+                request_fingerprint: "sha256:run-request".to_string(),
+                asset_selection: vec!["analytics.daily_orders".to_string()],
+                partition_selection: Some(vec!["2026-05-31".to_string()]),
+                trigger_source_ref: SourceRef::Schedule {
+                    schedule_id: "daily-orders".to_string(),
+                    tick_id: "daily-orders:1776000000".to_string(),
+                },
+                labels: HashMap::default(),
+                code_version: Some("manifest-v1".to_string()),
+            },
+        ),
+        OrchestrationEvent::new(
+            "tenant-01",
+            "workspace-01",
+            OrchestrationEventData::ScheduleDefinitionUpserted {
+                schedule_id: "daily-orders".to_string(),
+                cron_expression: "0 0 * * *".to_string(),
+                timezone: "UTC".to_string(),
+                catchup_window_minutes: 0,
+                asset_selection: vec!["analytics.daily_orders".to_string()],
+                code_version: Some("manifest-v1".to_string()),
+                max_catchup_ticks: 1,
+                enabled: true,
+            },
+        ),
+        OrchestrationEvent::new(
+            "tenant-01",
+            "workspace-01",
+            OrchestrationEventData::BackfillCreated {
+                backfill_id: "bf-01".to_string(),
+                client_request_id: "request-01".to_string(),
+                asset_selection: vec!["analytics.daily_orders".to_string()],
+                code_version: Some("manifest-v1".to_string()),
+                partition_selector: PartitionSelector::Range {
+                    start: "2026-05-28".to_string(),
+                    end: "2026-05-31".to_string(),
+                },
+                total_partitions: 4,
+                chunk_size: 2,
+                max_concurrent_runs: 2,
+                parent_backfill_id: None,
+            },
+        ),
+    ];
+
+    for event in events {
+        let envelope = event_to_proto_envelope(&event).expect("event should map to proto");
+        envelope
+            .validate_contract()
+            .expect("mapped proto event should satisfy the orchestration contract");
+        let roundtrip = event_from_proto_envelope("tenant-01", "workspace-01", &envelope)
+            .expect("proto event should map back to runtime");
+
+        match roundtrip.data {
+            OrchestrationEventData::RunRequested { code_version, .. }
+            | OrchestrationEventData::ScheduleDefinitionUpserted { code_version, .. }
+            | OrchestrationEventData::BackfillCreated { code_version, .. } => {
+                assert_eq!(code_version.as_deref(), Some("manifest-v1"));
+            }
+            other => panic!("unexpected event after roundtrip: {other:?}"),
+        }
     }
 }
 
@@ -257,7 +333,7 @@ fn fold_state_mapping_tracks_public_proto_states_without_old_api_collapsing() {
         plan_id: "plan-01".to_string(),
         state: FoldRunState::Triggered,
         run_key: None,
-        labels: Default::default(),
+        labels: HashMap::default(),
         code_version: None,
         cancel_requested: false,
         tasks_total: 1,
@@ -278,7 +354,7 @@ fn fold_state_mapping_tracks_public_proto_states_without_old_api_collapsing() {
     let cancelling_run = RunRow {
         cancel_requested: true,
         state: FoldRunState::Running,
-        ..pending_run.clone()
+        ..pending_run
     };
     assert_eq!(
         fold_run_state_to_proto(&cancelling_run),

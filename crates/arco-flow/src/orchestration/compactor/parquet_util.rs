@@ -224,6 +224,7 @@ fn run_key_index_schema() -> Arc<Schema> {
         Field::new("run_key", DataType::Utf8, false),
         Field::new("run_id", DataType::Utf8, false),
         Field::new("request_fingerprint", DataType::Utf8, false),
+        Field::new("code_version", DataType::Utf8, true),
         Field::new("created_at", DataType::Int64, false),
         Field::new("row_version", DataType::Utf8, false),
     ]))
@@ -285,6 +286,7 @@ fn schedule_definitions_schema() -> Arc<Schema> {
         Field::new("timezone", DataType::Utf8, false),
         Field::new("catchup_window_minutes", DataType::UInt32, false),
         Field::new("asset_selection", DataType::Utf8, true),
+        Field::new("code_version", DataType::Utf8, true),
         Field::new("max_catchup_ticks", DataType::UInt32, false),
         Field::new("enabled", DataType::Boolean, false),
         Field::new("created_at", DataType::Int64, false),
@@ -328,6 +330,7 @@ fn backfills_schema() -> Arc<Schema> {
         Field::new("workspace_id", DataType::Utf8, false),
         Field::new("backfill_id", DataType::Utf8, false),
         Field::new("asset_selection", DataType::Utf8, false),
+        Field::new("code_version", DataType::Utf8, true),
         Field::new("partition_selector", DataType::Utf8, false),
         Field::new("chunk_size", DataType::UInt32, false),
         Field::new("max_concurrent_runs", DataType::UInt32, false),
@@ -1385,6 +1388,11 @@ pub(super) fn write_run_key_index(rows: &[RunKeyIndexRow]) -> Result<Bytes> {
             .map(|r| Some(r.request_fingerprint.as_str()))
             .collect::<Vec<_>>(),
     );
+    let code_versions = StringArray::from(
+        rows.iter()
+            .map(|r| r.code_version.as_deref())
+            .collect::<Vec<_>>(),
+    );
     let created_at = Int64Array::from(
         rows.iter()
             .map(|r| r.created_at.timestamp_millis())
@@ -1404,6 +1412,7 @@ pub(super) fn write_run_key_index(rows: &[RunKeyIndexRow]) -> Result<Bytes> {
             Arc::new(run_keys),
             Arc::new(run_ids),
             Arc::new(request_fingerprints),
+            Arc::new(code_versions),
             Arc::new(created_at),
             Arc::new(row_versions),
         ],
@@ -1715,6 +1724,11 @@ pub fn write_schedule_definitions(rows: &[ScheduleDefinitionRow]) -> Result<Byte
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::parquet(format!("failed to serialize asset selection: {e}")))?;
     let asset_selection = StringArray::from(asset_selection);
+    let code_versions = StringArray::from(
+        rows.iter()
+            .map(|r| r.code_version.as_deref())
+            .collect::<Vec<_>>(),
+    );
     let max_catchup_ticks =
         UInt32Array::from(rows.iter().map(|r| r.max_catchup_ticks).collect::<Vec<_>>());
     let enabled = BooleanArray::from(rows.iter().map(|r| r.enabled).collect::<Vec<_>>());
@@ -1739,6 +1753,7 @@ pub fn write_schedule_definitions(rows: &[ScheduleDefinitionRow]) -> Result<Byte
             Arc::new(timezones),
             Arc::new(catchup_window_minutes),
             Arc::new(asset_selection),
+            Arc::new(code_versions),
             Arc::new(max_catchup_ticks),
             Arc::new(enabled),
             Arc::new(created_at),
@@ -1954,6 +1969,11 @@ pub fn write_backfills(rows: &[BackfillRow]) -> Result<Bytes> {
             .map(|s| Some(s.as_str()))
             .collect::<Vec<_>>(),
     );
+    let code_versions = StringArray::from(
+        rows.iter()
+            .map(|r| r.code_version.as_deref())
+            .collect::<Vec<_>>(),
+    );
     let partition_selector = rows
         .iter()
         .map(|r| serde_json::to_string(&r.partition_selector))
@@ -2011,6 +2031,7 @@ pub fn write_backfills(rows: &[BackfillRow]) -> Result<Bytes> {
             Arc::new(workspace_ids),
             Arc::new(backfill_ids),
             Arc::new(asset_selection),
+            Arc::new(code_versions),
             Arc::new(partition_selector),
             Arc::new(chunk_size),
             Arc::new(max_concurrent_runs),
@@ -2832,6 +2853,7 @@ pub fn read_run_key_index(bytes: &Bytes) -> Result<Vec<RunKeyIndexRow>> {
         let run_key = col_string(&batch, "run_key")?;
         let run_id = col_string(&batch, "run_id")?;
         let request_fingerprint = col_string(&batch, "request_fingerprint")?;
+        let code_version = col_string_opt(&batch, "code_version");
         let created_at = col_i64(&batch, "created_at")?;
         let row_version = col_string(&batch, "row_version")?;
 
@@ -2842,6 +2864,13 @@ pub fn read_run_key_index(bytes: &Bytes) -> Result<Vec<RunKeyIndexRow>> {
                 run_key: run_key.value(row).to_string(),
                 run_id: run_id.value(row).to_string(),
                 request_fingerprint: request_fingerprint.value(row).to_string(),
+                code_version: code_version.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
                 created_at: millis_to_datetime(created_at.value(row)),
                 row_version: row_version.value(row).to_string(),
             });
@@ -3120,6 +3149,7 @@ pub fn read_schedule_definitions(bytes: &Bytes) -> Result<Vec<ScheduleDefinition
         let timezone = col_string(&batch, "timezone")?;
         let catchup_window_minutes = col_u32(&batch, "catchup_window_minutes")?;
         let asset_selection = col_string_opt(&batch, "asset_selection");
+        let code_version = col_string_opt(&batch, "code_version");
         let max_catchup_ticks = col_u32(&batch, "max_catchup_ticks")?;
         let enabled = col_bool(&batch, "enabled")?;
         let created_at = col_i64(&batch, "created_at")?;
@@ -3146,6 +3176,13 @@ pub fn read_schedule_definitions(bytes: &Bytes) -> Result<Vec<ScheduleDefinition
                 timezone: timezone.value(row).to_string(),
                 catchup_window_minutes: catchup_window_minutes.value(row),
                 asset_selection,
+                code_version: code_version.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
                 max_catchup_ticks: max_catchup_ticks.value(row),
                 enabled: enabled.value(row),
                 created_at: millis_to_datetime(created_at.value(row)),
@@ -3311,6 +3348,7 @@ pub fn read_backfills(bytes: &Bytes) -> Result<Vec<BackfillRow>> {
         let workspace_id = col_string(&batch, "workspace_id")?;
         let backfill_id = col_string(&batch, "backfill_id")?;
         let asset_selection = col_string(&batch, "asset_selection")?;
+        let code_version = col_string_opt(&batch, "code_version");
         let partition_selector = col_string(&batch, "partition_selector")?;
         let chunk_size = col_u32(&batch, "chunk_size")?;
         let max_concurrent_runs = col_u32(&batch, "max_concurrent_runs")?;
@@ -3339,6 +3377,13 @@ pub fn read_backfills(bytes: &Bytes) -> Result<Vec<BackfillRow>> {
                 workspace_id: workspace_id.value(row).to_string(),
                 backfill_id: backfill_id.value(row).to_string(),
                 asset_selection,
+                code_version: code_version.as_ref().and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
                 partition_selector,
                 chunk_size: chunk_size.value(row),
                 max_concurrent_runs: max_concurrent_runs.value(row),
@@ -3777,6 +3822,7 @@ mod tests {
             workspace_id: "workspace".to_string(),
             backfill_id: "bf_01".to_string(),
             asset_selection: vec!["asset.a".to_string()],
+            code_version: Some("manifest-v1".to_string()),
             partition_selector: PartitionSelector::Explicit {
                 partition_keys: vec!["2025-01-01".to_string(), "2025-01-02".to_string()],
             },
@@ -4157,6 +4203,7 @@ mod tests {
                 request_fingerprint: "fp_123".to_string(),
                 asset_selection: vec!["asset.a".to_string()],
                 partition_selection: None,
+                code_version: Some("manifest-v1".to_string()),
             }],
             status: SensorEvalStatus::Triggered,
             evaluated_at: Utc::now(),
@@ -4323,6 +4370,7 @@ mod tests {
             timezone: "UTC".to_string(),
             catchup_window_minutes: 60,
             asset_selection: vec!["analytics.summary".to_string()],
+            code_version: Some("manifest-v1".to_string()),
             max_catchup_ticks: 3,
             enabled: true,
             created_at: Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap(),

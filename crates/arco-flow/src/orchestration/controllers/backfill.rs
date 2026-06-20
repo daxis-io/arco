@@ -97,6 +97,25 @@ pub struct CreateBackfillRequest<'a> {
     pub client_request_id: &'a str,
 }
 
+/// Request to plan a single backfill chunk.
+#[derive(Debug, Clone, Copy)]
+pub struct PlanBackfillChunkRequest<'a> {
+    /// Backfill identifier.
+    pub backfill_id: &'a str,
+    /// Zero-based chunk index.
+    pub chunk_index: u32,
+    /// Partition keys included in the chunk.
+    pub partition_keys: &'a [String],
+    /// Assets to materialize for the chunk run.
+    pub asset_selection: &'a [String],
+    /// Code version captured when the parent backfill was created.
+    pub code_version: Option<&'a str>,
+    /// Tenant identifier.
+    pub tenant_id: &'a str,
+    /// Workspace identifier.
+    pub workspace_id: &'a str,
+}
+
 /// Error type for backfill operations.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum BackfillError {
@@ -262,6 +281,7 @@ impl BackfillController {
                 backfill_id: request.backfill_id.to_string(),
                 client_request_id: request.client_request_id.to_string(),
                 asset_selection: request.asset_selection.to_vec(),
+                code_version: None,
                 partition_selector: PartitionSelector::Range {
                     start: request.partition_start.to_string(),
                     end: request.partition_end.to_string(),
@@ -363,14 +383,15 @@ impl BackfillController {
                     break;
                 }
 
-                let chunk_events = self.plan_chunk(
+                let chunk_events = self.plan_chunk(PlanBackfillChunkRequest {
                     backfill_id,
-                    next_chunk_index,
-                    &partition_keys,
-                    &backfill.asset_selection,
-                    &backfill.tenant_id,
-                    &backfill.workspace_id,
-                );
+                    chunk_index: next_chunk_index,
+                    partition_keys: &partition_keys,
+                    asset_selection: &backfill.asset_selection,
+                    code_version: backfill.code_version.as_deref(),
+                    tenant_id: &backfill.tenant_id,
+                    workspace_id: &backfill.workspace_id,
+                });
 
                 if !chunk_events.is_empty() {
                     run_requests = run_requests.saturating_add(
@@ -411,15 +432,17 @@ impl BackfillController {
     ///
     /// Returns `BackfillChunkPlanned` and `RunRequested` events for atomic emission.
     #[must_use]
-    pub fn plan_chunk(
-        &self,
-        backfill_id: &str,
-        chunk_index: u32,
-        partition_keys: &[String],
-        asset_selection: &[String],
-        tenant_id: &str,
-        workspace_id: &str,
-    ) -> Vec<OrchestrationEvent> {
+    pub fn plan_chunk(&self, request: PlanBackfillChunkRequest<'_>) -> Vec<OrchestrationEvent> {
+        let PlanBackfillChunkRequest {
+            backfill_id,
+            chunk_index,
+            partition_keys,
+            asset_selection,
+            code_version,
+            tenant_id,
+            workspace_id,
+        } = request;
+
         if partition_keys.is_empty() {
             return Vec::new();
         }
@@ -457,6 +480,7 @@ impl BackfillController {
                         chunk_id,
                     },
                     labels: HashMap::new(),
+                    code_version: code_version.map(ToString::to_string),
                 },
                 emitted_at,
             ),
@@ -654,6 +678,7 @@ impl BackfillController {
                 backfill_id: new_backfill_id.to_string(),
                 client_request_id: retry_request_id.to_string(),
                 asset_selection: parent.asset_selection.clone(),
+                code_version: parent.code_version.clone(),
                 partition_selector: PartitionSelector::Explicit { partition_keys },
                 total_partitions,
                 chunk_size: parent.chunk_size,
@@ -977,6 +1002,7 @@ mod tests {
             workspace_id: "workspace-prod".into(),
             backfill_id: "bf_001".into(),
             asset_selection: vec!["analytics.daily".into()],
+            code_version: None,
             partition_selector: PartitionSelector::Range {
                 start: "2025-01-01".into(),
                 end: "2025-01-10".into(),
@@ -1195,14 +1221,17 @@ mod tests {
     fn test_backfill_chunk_run_key_is_deterministic() {
         let controller = BackfillController::new(test_partition_resolver());
 
-        let events = controller.plan_chunk(
-            "bf_001",
-            0,
-            &["2025-01-01".into(), "2025-01-02".into()],
-            &["analytics.daily".into()],
-            "tenant-abc",
-            "workspace-prod",
-        );
+        let partition_keys = ["2025-01-01".into(), "2025-01-02".into()];
+        let asset_selection = ["analytics.daily".into()];
+        let events = controller.plan_chunk(PlanBackfillChunkRequest {
+            backfill_id: "bf_001",
+            chunk_index: 0,
+            partition_keys: &partition_keys,
+            asset_selection: &asset_selection,
+            code_version: None,
+            tenant_id: "tenant-abc",
+            workspace_id: "workspace-prod",
+        });
 
         let chunk_event = events
             .iter()
@@ -1222,14 +1251,17 @@ mod tests {
     fn test_backfill_chunk_emits_run_requested_atomically() {
         let controller = BackfillController::new(test_partition_resolver());
 
-        let events = controller.plan_chunk(
-            "bf_001",
-            0,
-            &["2025-01-01".into()],
-            &["analytics.daily".into()],
-            "tenant-abc",
-            "workspace-prod",
-        );
+        let partition_keys = ["2025-01-01".into()];
+        let asset_selection = ["analytics.daily".into()];
+        let events = controller.plan_chunk(PlanBackfillChunkRequest {
+            backfill_id: "bf_001",
+            chunk_index: 0,
+            partition_keys: &partition_keys,
+            asset_selection: &asset_selection,
+            code_version: None,
+            tenant_id: "tenant-abc",
+            workspace_id: "workspace-prod",
+        });
 
         // Per P0-1: Both events should be in the same batch
         let has_chunk = events
@@ -1242,6 +1274,32 @@ mod tests {
         assert!(has_chunk, "Should emit BackfillChunkPlanned");
         assert!(has_run, "Should emit RunRequested atomically");
         assert_eq!(events.len(), 2, "Should emit exactly 2 events");
+    }
+
+    #[test]
+    fn test_backfill_chunk_run_requested_preserves_code_version() {
+        let controller = BackfillController::new(test_partition_resolver());
+
+        let partition_keys = ["2025-01-01".into()];
+        let asset_selection = ["analytics.daily".into()];
+        let events = controller.plan_chunk(PlanBackfillChunkRequest {
+            backfill_id: "bf_001",
+            chunk_index: 0,
+            partition_keys: &partition_keys,
+            asset_selection: &asset_selection,
+            code_version: Some("manifest-v1"),
+            tenant_id: "tenant-abc",
+            workspace_id: "workspace-prod",
+        });
+
+        let run_req = events
+            .iter()
+            .find(|e| matches!(&e.data, OrchestrationEventData::RunRequested { .. }))
+            .expect("plan_chunk should emit RunRequested");
+        let OrchestrationEventData::RunRequested { code_version, .. } = &run_req.data else {
+            panic!("expected RunRequested");
+        };
+        assert_eq!(code_version.as_deref(), Some("manifest-v1"));
     }
 
     // ========================================================================

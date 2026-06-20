@@ -7,11 +7,12 @@ trap 'rm -rf "$tmpdir"' EXIT
 cat >"$tmpdir/durable_storage_sample.json" <<'JSON'
 {
   "kind": "durable_storage",
+  "bucket": "redacted-uat-evidence-bucket",
   "scenarios": {
-    "pipeline": {"proof": {"runId": "run_1"}},
-    "schedule": {"proof": {"tickId": "tick_1"}},
-    "backfill": {"proof": {"backfillId": "bf_1"}},
-    "retry": {"proof": {"taskKey": "task_1"}}
+    "pipeline": {"proof": {"tenantId": "tenant", "workspaceId": "workspace", "runId": "run_1", "planId": "plan_1"}},
+    "schedule": {"proof": {"tenantId": "tenant", "workspaceId": "workspace", "scheduleId": "sched_1", "tickId": "tick_1", "runId": "run_sched_1", "planId": "plan_sched_1"}},
+    "backfill": {"proof": {"tenantId": "tenant", "workspaceId": "workspace", "backfillId": "bf_1", "runId": "run_bf_1", "planId": "plan_bf_1", "totalPartitions": 4, "plannedChunks": 2}},
+    "retry": {"proof": {"tenantId": "tenant", "workspaceId": "workspace", "runId": "run_retry_1", "planId": "plan_retry_1", "taskKey": "task_1", "attempt": 2}}
   }
 }
 JSON
@@ -36,6 +37,25 @@ cat >"$tmpdir/deployed_api_worker_sample.json" <<'JSON'
 JSON
 
 tools/validate_user_acceptance_evidence.sh --require-kind durable_storage --require-kind deployed_api_worker "$tmpdir"
+
+bad_durable_dir="$tmpdir/bad-durable"
+mkdir "$bad_durable_dir"
+cat >"$bad_durable_dir/durable_storage_bad.json" <<'JSON'
+{
+  "kind": "durable_storage",
+  "scenarios": {
+    "pipeline": {"proof": {"runId": "run_1"}},
+    "schedule": {"proof": {"tickId": "tick_1"}},
+    "backfill": {"proof": {"backfillId": "bf_1"}},
+    "retry": {"proof": {"taskKey": "task_1"}}
+  }
+}
+JSON
+if tools/validate_user_acceptance_evidence.sh "$bad_durable_dir" >/tmp/evidence-durable.out 2>&1; then
+  echo "expected durable evidence without redacted bucket and proof identity to fail" >&2
+  exit 1
+fi
+grep -Eq "bucket|tenantId" /tmp/evidence-durable.out
 
 bad_run_dir="$tmpdir/bad-run"
 mkdir "$bad_run_dir"

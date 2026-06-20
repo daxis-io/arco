@@ -486,6 +486,9 @@ pub enum OrchestrationEventData {
         catchup_window_minutes: u32,
         /// Asset selection snapshot stored with the definition.
         asset_selection: Vec<String>,
+        /// Code version captured when the definition was upserted.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code_version: Option<String>,
         /// Maximum number of ticks to catch up per evaluation.
         max_catchup_ticks: u32,
         /// Whether the schedule is enabled.
@@ -560,6 +563,9 @@ pub enum OrchestrationEventData {
         /// Optional labels for the run.
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         labels: HashMap<String, String>,
+        /// Code version for the run that will be materialized from this request.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code_version: Option<String>,
     },
 
     // ========================================================================
@@ -573,6 +579,9 @@ pub enum OrchestrationEventData {
         client_request_id: String,
         /// Assets to backfill.
         asset_selection: Vec<String>,
+        /// Code version captured when the backfill was created.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code_version: Option<String>,
         /// Partition selector (compact, per P0-6).
         partition_selector: PartitionSelector,
         /// Pre-computed total partition count.
@@ -707,6 +716,7 @@ impl OrchestrationEventData {
                 timezone,
                 catchup_window_minutes,
                 asset_selection,
+                code_version: _,
                 max_catchup_ticks,
                 enabled,
             } => Self::schedule_definition_idempotency_key(

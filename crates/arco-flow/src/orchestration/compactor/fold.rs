@@ -552,6 +552,9 @@ pub struct ScheduleDefinitionRow {
     pub catchup_window_minutes: u32,
     /// Assets to materialize when schedule fires.
     pub asset_selection: Vec<String>,
+    /// Code version captured when the schedule definition was upserted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_version: Option<String>,
     /// Maximum catch-up ticks to emit.
     pub max_catchup_ticks: u32,
     /// Whether the schedule is enabled.
@@ -750,6 +753,9 @@ pub struct BackfillRow {
     pub backfill_id: String,
     /// Assets to backfill.
     pub asset_selection: Vec<String>,
+    /// Code version captured when the backfill was created.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_version: Option<String>,
     /// Partition selector (compact, per P0-6).
     pub partition_selector: PartitionSelector,
     /// Number of partitions per chunk.
@@ -933,6 +939,9 @@ pub struct RunKeyIndexRow {
     pub run_id: String,
     /// Request fingerprint for conflict detection.
     pub request_fingerprint: String,
+    /// Code version to apply when materializing this run request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_version: Option<String>,
     /// When the run was created.
     pub created_at: DateTime<Utc>,
     /// ULID of last event that modified this row.
@@ -1524,6 +1533,7 @@ impl FoldState {
                 timezone,
                 catchup_window_minutes,
                 asset_selection,
+                code_version,
                 max_catchup_ticks,
                 enabled,
             } => {
@@ -1535,6 +1545,7 @@ impl FoldState {
                     timezone,
                     *catchup_window_minutes,
                     asset_selection,
+                    code_version.clone(),
                     *max_catchup_ticks,
                     *enabled,
                     event.timestamp,
@@ -1604,6 +1615,7 @@ impl FoldState {
                 partition_selection,
                 trigger_source_ref,
                 labels,
+                code_version,
             } => {
                 if !self.should_drop_run_requested_for_stale_sensor_eval(trigger_source_ref) {
                     self.fold_run_requested(
@@ -1615,6 +1627,7 @@ impl FoldState {
                         partition_selection.as_ref(),
                         trigger_source_ref,
                         labels,
+                        code_version.clone(),
                         event.timestamp,
                         &event.event_id,
                     );
@@ -1624,6 +1637,7 @@ impl FoldState {
                 backfill_id,
                 client_request_id: _,
                 asset_selection,
+                code_version,
                 partition_selector,
                 total_partitions,
                 chunk_size,
@@ -1635,6 +1649,7 @@ impl FoldState {
                     &event.workspace_id,
                     backfill_id,
                     asset_selection,
+                    code_version.clone(),
                     partition_selector,
                     *total_partitions,
                     *chunk_size,
@@ -1893,6 +1908,7 @@ impl FoldState {
         event_id: &str,
     ) -> bool {
         let key = (run_id.to_string(), task_key.to_string());
+
         if let Some(task) = self.tasks.get_mut(&key) {
             if task.state.is_terminal() {
                 return false;
@@ -1984,6 +2000,9 @@ impl FoldState {
             return false;
         }
 
+        let metadata = Self::extract_execution_metadata(materialization_id, output, partition_key);
+        let effective_partition_key = partition_key.or(metadata.delta_partition.as_deref());
+
         if let Some(task) = self.tasks.get_mut(&key) {
             let new_state = match outcome {
                 TaskOutcome::Succeeded => TaskState::Succeeded,
@@ -2004,7 +2023,7 @@ impl FoldState {
                 task.asset_key = asset_key.map(ToString::to_string);
             }
             if task.partition_key.is_none() {
-                task.partition_key = partition_key.map(ToString::to_string);
+                task.partition_key = effective_partition_key.map(ToString::to_string);
             }
             if new_state.is_terminal() {
                 task.completed_at = Some(timestamp);
@@ -2019,8 +2038,6 @@ impl FoldState {
             }
 
             if outcome == TaskOutcome::Succeeded {
-                let metadata =
-                    Self::extract_execution_metadata(materialization_id, output, partition_key);
                 let lineage_ref =
                     Self::build_execution_lineage_ref(run_id, task_key, attempt, &metadata);
 
@@ -2078,12 +2095,8 @@ impl FoldState {
                 );
 
                 // Update partition status (P0-5: only on success)
-                if let (Some(asset_key), Some(partition_key)) = (asset_key, partition_key) {
-                    let metadata = Self::extract_execution_metadata(
-                        materialization_id,
-                        output,
-                        Some(partition_key),
-                    );
+                if let (Some(asset_key), Some(partition_key)) = (asset_key, effective_partition_key)
+                {
                     let lineage_ref =
                         Self::build_execution_lineage_ref(run_id, task_key, attempt, &metadata);
                     self.update_partition_materialization(
@@ -2129,7 +2142,7 @@ impl FoldState {
             }
 
             // Always update last_attempt_* fields (P0-5: every attempt, regardless of outcome)
-            if let (Some(asset_key), Some(partition_key)) = (asset_key, partition_key) {
+            if let (Some(asset_key), Some(partition_key)) = (asset_key, effective_partition_key) {
                 self.update_partition_attempt(
                     tenant_id,
                     workspace_id,
@@ -2481,6 +2494,7 @@ impl FoldState {
         timezone: &str,
         catchup_window_minutes: u32,
         asset_selection: &[String],
+        code_version: Option<String>,
         max_catchup_ticks: u32,
         enabled: bool,
         timestamp: DateTime<Utc>,
@@ -2507,6 +2521,7 @@ impl FoldState {
                 timezone: timezone.to_string(),
                 catchup_window_minutes,
                 asset_selection: asset_selection.to_vec(),
+                code_version,
                 max_catchup_ticks,
                 enabled,
                 created_at,
@@ -2734,6 +2749,7 @@ impl FoldState {
         _partition_selection: Option<&Vec<String>>,
         trigger_source_ref: &SourceRef,
         _labels: &HashMap<String, String>,
+        code_version: Option<String>,
         timestamp: DateTime<Utc>,
         event_id: &str,
     ) {
@@ -2772,6 +2788,7 @@ impl FoldState {
                 run_key: run_key.to_string(),
                 run_id: run_id.clone(),
                 request_fingerprint: request_fingerprint.to_string(),
+                code_version,
                 created_at: timestamp,
                 row_version: event_id.to_string(),
             },
@@ -2818,6 +2835,7 @@ impl FoldState {
         workspace_id: &str,
         backfill_id: &str,
         asset_selection: &[String],
+        code_version: Option<String>,
         partition_selector: &PartitionSelector,
         total_partitions: u32,
         chunk_size: u32,
@@ -2853,6 +2871,7 @@ impl FoldState {
                 workspace_id: workspace_id.to_string(),
                 backfill_id: backfill_id.to_string(),
                 asset_selection: asset_selection.to_vec(),
+                code_version,
                 partition_selector: partition_selector.clone(),
                 chunk_size,
                 max_concurrent_runs,
@@ -5677,6 +5696,7 @@ mod tests {
                 backfill_id: backfill_id.to_string(),
                 client_request_id: "client_req_001".into(),
                 asset_selection: vec!["analytics.daily".into()],
+                code_version: None,
                 partition_selector: PartitionSelector::Range {
                     start: "2025-01-01".into(),
                     end: "2025-01-03".into(),

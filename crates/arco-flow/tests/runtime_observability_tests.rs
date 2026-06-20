@@ -22,6 +22,7 @@ fn run_key_index_row(run_key: &str, run_id: &str) -> RunKeyIndexRow {
         run_key: run_key.to_string(),
         run_id: run_id.to_string(),
         request_fingerprint: "fp-1".to_string(),
+        code_version: None,
         created_at: Utc::now(),
         row_version: "evt_01".to_string(),
     }

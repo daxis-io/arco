@@ -1960,6 +1960,7 @@ struct LegacyBackfillFingerprintPayload {
 
 struct BackfillCreateInput {
     asset_selection: Vec<String>,
+    code_version: Option<String>,
     partition_selector: PartitionSelector,
     total_partitions: u32,
     chunk_size: u32,
@@ -2230,6 +2231,7 @@ async fn append_backfill_created_event(
             backfill_id: backfill_id.clone(),
             client_request_id: idempotency_key.to_string(),
             asset_selection: input.asset_selection,
+            code_version: input.code_version,
             partition_selector: input.partition_selector,
             total_partitions: input.total_partitions,
             chunk_size: input.chunk_size,
@@ -5295,6 +5297,9 @@ pub(crate) async fn upsert_schedule(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
+    let code_version = load_latest_manifest(&storage)
+        .await?
+        .map(|manifest| manifest.code_version_id);
 
     let existed = existing.is_some();
 
@@ -5307,6 +5312,7 @@ pub(crate) async fn upsert_schedule(
             timezone: request.timezone,
             catchup_window_minutes: request.catchup_window_minutes,
             asset_selection: request.asset_selection,
+            code_version,
             max_catchup_ticks: request.max_catchup_ticks,
             enabled: request.enabled,
         },
@@ -5374,6 +5380,7 @@ pub(crate) async fn enable_schedule(
             timezone: existing.timezone.clone(),
             catchup_window_minutes: existing.catchup_window_minutes,
             asset_selection: existing.asset_selection.clone(),
+            code_version: existing.code_version.clone(),
             max_catchup_ticks: existing.max_catchup_ticks,
             enabled: true,
         },
@@ -5436,6 +5443,7 @@ pub(crate) async fn disable_schedule(
             timezone: existing.timezone.clone(),
             catchup_window_minutes: existing.catchup_window_minutes,
             asset_selection: existing.asset_selection.clone(),
+            code_version: existing.code_version.clone(),
             max_catchup_ticks: existing.max_catchup_ticks,
             enabled: false,
         },
@@ -5737,8 +5745,9 @@ pub(crate) async fn create_backfill(
         Some(0) | None => DEFAULT_BACKFILL_MAX_CONCURRENT_RUNS,
         Some(value) => value,
     };
-    let input = BackfillCreateInput {
+    let mut input = BackfillCreateInput {
         asset_selection,
+        code_version: None,
         partition_selector,
         total_partitions,
         chunk_size,
@@ -5773,6 +5782,10 @@ pub(crate) async fn create_backfill(
     {
         return Ok((StatusCode::OK, Json(existing)).into_response());
     }
+
+    input.code_version = load_latest_manifest(&storage)
+        .await?
+        .map(|manifest| manifest.code_version_id);
 
     let response = append_backfill_created_event(
         state.as_ref(),
@@ -7369,6 +7382,7 @@ mod tests {
             total_partitions: 3,
             chunk_size: 2,
             max_concurrent_runs: 1,
+            code_version: None,
         };
         let fingerprint =
             compute_backfill_fingerprint(&input.asset_selection, &partition_selector, 2, 1)

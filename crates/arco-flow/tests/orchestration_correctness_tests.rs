@@ -636,6 +636,7 @@ fn run_requested_event(run_key: &str, fingerprint: &str) -> OrchestrationEvent {
                 tick_id: "tick_01".to_string(),
             },
             labels: std::collections::HashMap::new(),
+            code_version: None,
         },
     )
 }

@@ -2917,6 +2917,7 @@ mod tests {
                 timezone: "UTC".to_string(),
                 catchup_window_minutes: 60,
                 asset_selection: vec!["asset.a".to_string()],
+                code_version: None,
                 max_catchup_ticks: 10,
                 enabled: true,
             },
@@ -2951,6 +2952,7 @@ mod tests {
                     tick_id: tick_id.clone(),
                 },
                 labels: HashMap::new(),
+                code_version: None,
             },
         );
 
@@ -2971,6 +2973,7 @@ mod tests {
                     request_fingerprint: "fp-sensor-1".to_string(),
                     asset_selection: vec!["asset.b".to_string()],
                     partition_selection: None,
+                    code_version: None,
                 }],
                 status: SensorEvalStatus::Triggered,
             },
@@ -2989,6 +2992,7 @@ mod tests {
                     eval_id: eval_id.to_string(),
                 },
                 labels: HashMap::new(),
+                code_version: None,
             },
         );
 
@@ -2999,6 +3003,7 @@ mod tests {
                 backfill_id: backfill_id.to_string(),
                 client_request_id: "req-01".to_string(),
                 asset_selection: vec!["asset.c".to_string()],
+                code_version: None,
                 partition_selector: PartitionSelector::Explicit {
                     partition_keys: vec![
                         "2025-01-01".to_string(),
@@ -3039,6 +3044,7 @@ mod tests {
                     chunk_id: chunk_id.to_string(),
                 },
                 labels: HashMap::new(),
+                code_version: None,
             },
         );
 
@@ -3539,6 +3545,7 @@ mod tests {
                 tick_id: "sched-01:1".to_string(),
             },
             labels: HashMap::new(),
+            code_version: None,
         };
 
         assert!(event_priority(&tick) < event_priority(&run_requested));

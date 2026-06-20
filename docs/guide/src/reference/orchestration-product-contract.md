@@ -31,8 +31,8 @@ token and active attempt identity. Workers heartbeat only when the selected
 runtime supports heartbeat callbacks. Workers do not write projections directly.
 
 The evidence surface is `system.orchestration.*`. It is a read-only SQL view
-over published projections, not the enforcement path for authorization,
-dispatch, or correctness decisions.
+over the current published projection plus un-compacted L0 orchestration events,
+not the enforcement path for authorization, dispatch, or correctness decisions.
 
 Catalog-facing readers that need run-backed asset metadata use the
 manifest-published `catalog_run_index` projection. It is a derived read index
@@ -68,10 +68,11 @@ identify the manifest `codeVersionId` used to plan the run. This is the
 pipeline definition or user-code revision, not the API service build identifier
 from `ARCO_CODE_VERSION`.
 
-Automation-created runs need explicit source metadata before they can claim the
-same manifest-code contract. Until those paths persist that metadata, schedule,
-backfill, and sensor run-code-version behavior should be treated as path-specific
-and covered by focused tests before being used as acceptance evidence.
+Automation-created runs preserve source metadata when schedule, backfill, or
+sensor requests carry a manifest code version. Schedule definitions and
+backfills created through the API seed that metadata from the latest deployed
+manifest; sensor evaluators must provide the code version in the emitted run
+request before the resulting run can make the same code-version claim.
 
 ## Callback Responses
 
@@ -87,18 +88,48 @@ and system-table lifecycle as production. A local shortcut may use an in-memory
 or local queue backend, but it must still produce the same durable events and
 published evidence.
 
-The deterministic local UAT reconciliation gate is:
+The deterministic local UAT gate is:
 
 ```bash
 scripts/run_user_acceptance_pipeline_uat.sh --deterministic
 ```
 
-That command is a focused Batch 0 reconciliation gate, not a first-class
-end-to-end user-acceptance suite. It is CI-safe and does not run live GCP,
-durable-storage, or deployed API/worker gates. Local branch-readiness checks
-that combine the deterministic gate with shell smoke tests, formatting, and diff
-whitespace checks are available through
-`scripts/run_user_acceptance_pipeline_uat.sh --with-hygiene`.
+That command runs the first-class local user-acceptance pipeline suite together
+with the focused Batch 0 reconciliation checks. It is CI-safe and does not run
+live GCP, durable-storage, or deployed API/worker gates. Local branch-readiness
+checks that combine the deterministic gate with shell smoke tests, formatting,
+and diff whitespace checks are available through:
+
+```bash
+scripts/run_user_acceptance_pipeline_uat.sh --with-hygiene
+```
+
+For constrained local machines or parallel worktrees, cargo subcommands can be
+serialized and pointed at an isolated target directory:
+
+```bash
+scripts/run_user_acceptance_pipeline_uat.sh --with-hygiene --serial-cargo --isolated-target /tmp/arco-uat-target
+```
+
+Clippy remains a separate CI hygiene gate. The deterministic UAT command proves
+orchestration correctness; it must not absorb repo-wide lint backlog into the
+acceptance signal.
+
+Future durable or deployed UAT output must be validated separately before it is
+accepted as evidence:
+
+```bash
+tools/validate_user_acceptance_evidence.sh --require-kind durable_storage --require-kind deployed_api_worker target/uat-evidence
+```
+
+Durable-storage evidence must use a redacted bucket identifier and include
+tenant, workspace, run, plan, schedule, backfill, partition-count, chunk-count,
+retry-task, and retry-attempt proof fields for the required scenarios. Deployed
+API/worker evidence must include tenant/workspace identity, run identity,
+successful run and task rows, satisfied dependencies, catalog-run-index rows,
+and partition-status rows for the run under test. Evidence artifacts must not
+contain secret-like keys such as tokens, passwords, credentials, or
+authorization headers.
 
 The current CLI exposes `arco dev --check` as a check-only workflow. It verifies
 CLI/configuration wiring and lists the missing runtime pieces, but it does not
@@ -120,8 +151,9 @@ Arco intentionally keeps these boundaries:
 - Kubernetes is one possible execution-location backend, not the product model.
 - Task callbacks require scoped tokens and active attempt identity.
 - Worker payloads are explicit JSON or proto-compatible contracts.
-- System tables are read-only evidence and may lag raw event ingestion until
-  compaction publishes the projection.
+- System tables are read-only evidence over published projections plus L0
+  events, so deterministic UAT can query freshly completed local runs before the
+  next compaction publishes a new base projection.
 - `catalog_run_index` is a pointer-published read index derived from
   orchestration runs and tasks. Catalog readers should consume it instead of
   listing canonical run-object prefixes.

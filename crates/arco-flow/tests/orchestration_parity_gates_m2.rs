@@ -13,7 +13,9 @@ use arco_flow::orchestration::compactor::fold::{
     BackfillChunkRow, BackfillRow, RunRow, ScheduleDefinitionRow, ScheduleStateRow, SensorStateRow,
 };
 use arco_flow::orchestration::compactor::manifest::Watermarks;
-use arco_flow::orchestration::controllers::backfill::{BackfillController, PartitionResolver};
+use arco_flow::orchestration::controllers::backfill::{
+    BackfillController, PartitionResolver, PlanBackfillChunkRequest,
+};
 use arco_flow::orchestration::controllers::schedule::ScheduleController;
 use arco_flow::orchestration::controllers::sensor::PollSensorController;
 use arco_flow::orchestration::events::{
@@ -69,6 +71,7 @@ fn schedule_definition(
         timezone: "UTC".into(),
         catchup_window_minutes,
         asset_selection: vec!["analytics.summary".into()],
+        code_version: None,
         max_catchup_ticks,
         enabled,
         created_at: Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
@@ -256,14 +259,15 @@ fn parity_m2_backfill_plan_chunk_emits_chunk_and_run_requested_with_partition_se
     let partition_keys = vec!["2025-01-01".to_string(), "2025-01-02".to_string()];
     let asset_selection = vec!["analytics.daily".to_string()];
 
-    let events = controller.plan_chunk(
-        "bf_01HQ123",
-        0,
-        &partition_keys,
-        &asset_selection,
-        "tenant-abc",
-        "workspace-prod",
-    );
+    let events = controller.plan_chunk(PlanBackfillChunkRequest {
+        backfill_id: "bf_01HQ123",
+        chunk_index: 0,
+        partition_keys: &partition_keys,
+        asset_selection: &asset_selection,
+        code_version: None,
+        tenant_id: "tenant-abc",
+        workspace_id: "workspace-prod",
+    });
 
     let planned_count = events
         .iter()
@@ -342,6 +346,7 @@ fn parity_m2_backfill_reconcile_returns_empty_when_compaction_watermarks_are_sta
             workspace_id: "workspace-prod".into(),
             backfill_id: "bf_01HQ123".into(),
             asset_selection: vec!["analytics.daily".into()],
+            code_version: None,
             partition_selector: arco_flow::orchestration::events::PartitionSelector::Range {
                 start: "2025-01-01".into(),
                 end: "2025-01-03".into(),
@@ -650,6 +655,7 @@ fn parity_m2_backfill_pause_resume_cancel_transitions_are_monotonic() {
         workspace_id: "workspace-prod".into(),
         backfill_id: "bf_001".into(),
         asset_selection: vec!["analytics.daily".into()],
+        code_version: None,
         partition_selector: arco_flow::orchestration::events::PartitionSelector::Explicit {
             partition_keys: vec!["2025-01-01".into()],
         },
@@ -728,6 +734,7 @@ fn parity_m2_retry_failed_only_targets_failed_partitions_deterministically() {
         workspace_id: "workspace-prod".into(),
         backfill_id: "bf_parent".into(),
         asset_selection: vec!["analytics.daily".into()],
+        code_version: None,
         partition_selector: arco_flow::orchestration::events::PartitionSelector::Range {
             start: "2025-01-01".into(),
             end: "2025-01-03".into(),
@@ -839,6 +846,7 @@ fn parity_m2_schedule_sensor_backfill_and_manual_reexecution_share_run_key_consi
                 partition_selection: Some(vec!["date=2025-01-15".to_string()]),
                 trigger_source_ref: source,
                 labels: HashMap::new(),
+                code_version: None,
             },
         ));
     }
@@ -862,6 +870,7 @@ fn parity_m2_schedule_sensor_backfill_and_manual_reexecution_share_run_key_consi
                 request_id: "rerun_req_2".to_string(),
             },
             labels: HashMap::new(),
+            code_version: None,
         },
     ));
 

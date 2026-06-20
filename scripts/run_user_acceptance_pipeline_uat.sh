@@ -3,18 +3,23 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/run_user_acceptance_pipeline_uat.sh [--deterministic|--with-hygiene|--status] [--dry-run]
+Usage: scripts/run_user_acceptance_pipeline_uat.sh [--deterministic|--with-hygiene|--status] [--dry-run] [--serial-cargo] [--isolated-target DIR]
 
 Modes:
   --deterministic  Run the CI-safe local reconciliation checks. This is the default.
   --with-hygiene   Run deterministic checks plus local shell/fmt/diff hygiene.
   --status         Print local/live gate readiness without running tests.
   --dry-run        Print commands instead of executing them.
+  --serial-cargo   Run cargo commands with CARGO_BUILD_JOBS=1.
+  --isolated-target DIR
+                   Run cargo commands with CARGO_TARGET_DIR=DIR.
 EOF
 }
 
 mode="deterministic"
 dry_run=0
+serial_cargo=0
+isolated_target=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -30,6 +35,17 @@ while [[ $# -gt 0 ]]; do
     --dry-run)
       dry_run=1
       ;;
+    --serial-cargo)
+      serial_cargo=1
+      ;;
+    --isolated-target)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "--isolated-target requires a directory" >&2
+        exit 2
+      fi
+      isolated_target="$2"
+      shift
+      ;;
     --help|-h)
       usage
       exit 0
@@ -44,9 +60,40 @@ while [[ $# -gt 0 ]]; do
 done
 
 run_cmd() {
-  printf '+ %s\n' "$*"
+  local cargo_env=0
+  if [[ "${1:-}" == "cargo" ]]; then
+    if [[ "$serial_cargo" -eq 1 ]]; then
+      cargo_env=1
+    fi
+    if [[ -n "$isolated_target" ]]; then
+      cargo_env=1
+    fi
+  fi
+
+  printf '+'
+  if [[ "${1:-}" == "cargo" && "$serial_cargo" -eq 1 ]]; then
+    printf ' CARGO_BUILD_JOBS=1'
+  fi
+  if [[ "${1:-}" == "cargo" && -n "$isolated_target" ]]; then
+    printf ' CARGO_TARGET_DIR=%s' "$isolated_target"
+  fi
+  for arg in "$@"; do
+    printf ' %s' "$arg"
+  done
+  printf '\n'
+
   if [[ "$dry_run" -eq 0 ]]; then
-    "$@"
+    if [[ "$cargo_env" -eq 1 ]]; then
+      if [[ "$serial_cargo" -eq 1 && -n "$isolated_target" ]]; then
+        CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR="$isolated_target" "$@"
+      elif [[ "$serial_cargo" -eq 1 ]]; then
+        CARGO_BUILD_JOBS=1 "$@"
+      else
+        CARGO_TARGET_DIR="$isolated_target" "$@"
+      fi
+    else
+      "$@"
+    fi
   fi
 }
 
@@ -71,6 +118,7 @@ run_deterministic() {
   run_cmd cargo test -p arco-api test_trigger_run_reemits_when_reservation_exists
   run_cmd cargo test -p arco-flow test_handle_task_completed_failure
   run_cmd cargo test -p arco-integration-tests --test orchestration_external_worker_e2e
+  run_cmd cargo test -p arco-integration-tests --test user_acceptance_pipeline
 }
 
 run_hygiene() {

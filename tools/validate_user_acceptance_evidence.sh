@@ -89,6 +89,12 @@ def require_mapping(path, value, key):
         fail(path, f"missing non-empty object field {key}")
     return child
 
+def require_scalar_field(path, value, key):
+    text = scalar_text(value.get(key))
+    if text is None:
+        fail(path, f"missing required field {key}")
+    return text
+
 def require_list(path, value, key):
     child = value.get(key)
     if not isinstance(child, list) or not child:
@@ -157,10 +163,30 @@ def require_successful_dependencies(path, rows):
             fail(path, f"dependencies[{index}] must be satisfied")
 
 def validate_durable(path, artifact):
+    bucket = require_scalar_field(path, artifact, "bucket")
+    if "://" in bucket or "redacted" not in bucket.lower():
+        fail(path, "bucket must be a redacted bucket identifier, not a live URI")
+
     scenarios = require_mapping(path, artifact, "scenarios")
-    for name in ("pipeline", "schedule", "backfill", "retry"):
+    required_fields = {
+        "pipeline": ("tenantId", "workspaceId", "runId", "planId"),
+        "schedule": ("tenantId", "workspaceId", "scheduleId", "tickId", "runId", "planId"),
+        "backfill": (
+            "tenantId",
+            "workspaceId",
+            "backfillId",
+            "runId",
+            "planId",
+            "totalPartitions",
+            "plannedChunks",
+        ),
+        "retry": ("tenantId", "workspaceId", "runId", "planId", "taskKey", "attempt"),
+    }
+    for name, fields in required_fields.items():
         scenario = require_mapping(path, scenarios, name)
-        require_mapping(path, scenario, "proof")
+        proof = require_mapping(path, scenario, "proof")
+        for field in fields:
+            require_scalar_field(path, proof, field)
 
 def validate_deployed(path, artifact):
     for key in ("apiBaseUrl", "tenantId", "workspaceId", "runId"):

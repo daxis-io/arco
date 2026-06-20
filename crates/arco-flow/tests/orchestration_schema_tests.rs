@@ -23,6 +23,7 @@ fn test_schedule_definition_row_schema() {
         timezone: "UTC".into(),
         catchup_window_minutes: 60 * 24,
         asset_selection: vec!["analytics.summary".into()],
+        code_version: Some("manifest-v1".into()),
         max_catchup_ticks: 3,
         enabled: true,
         created_at: Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap(),
@@ -127,6 +128,7 @@ fn test_sensor_eval_row_schema() {
             request_fingerprint: "fp_123".into(),
             asset_selection: vec!["analytics.summary".into()],
             partition_selection: None,
+            code_version: Some("manifest-v1".into()),
         }],
         status: SensorEvalStatus::Triggered,
         evaluated_at: Utc.with_ymd_and_hms(2025, 1, 15, 10, 10, 0).unwrap(),
@@ -174,6 +176,7 @@ fn test_backfill_row_schema() {
         workspace_id: "workspace-prod".into(),
         backfill_id: "bf_01HQ123".into(),
         asset_selection: vec!["analytics.summary".into()],
+        code_version: Some("manifest-v1".into()),
         partition_selector: PartitionSelector::Range {
             start: "2025-01-01".into(),
             end: "2025-12-31".into(),
@@ -282,6 +285,7 @@ fn test_run_key_index_row_schema() {
         run_key: "sched:daily-etl:1736935200".into(),
         run_id: "run_01HQ123".into(),
         request_fingerprint: "fp_abc123".into(),
+        code_version: Some("manifest-v1".into()),
         created_at: Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap(),
         row_version: "01HQ606".into(),
     };

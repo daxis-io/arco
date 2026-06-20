@@ -135,6 +135,7 @@ fn test_sensor_evaluated_push_idempotency() {
                 request_fingerprint: "fp1".into(),
                 asset_selection: vec!["raw.events".into()],
                 partition_selection: None,
+                code_version: None,
             }],
             status: SensorEvalStatus::Triggered,
         },
@@ -193,6 +194,7 @@ fn test_sensor_evaluated_poll_with_cas_version() {
                 request_fingerprint: "fp_poll".into(),
                 asset_selection: vec!["derived.metrics".into()],
                 partition_selection: None,
+                code_version: None,
             }],
             status: SensorEvalStatus::Triggered,
         },
@@ -289,6 +291,7 @@ fn test_backfill_created_uses_compact_selector() {
             backfill_id: "bf_01HQ123".into(),
             client_request_id: "req_abc123".into(),
             asset_selection: vec!["analytics.summary".into()],
+            code_version: None,
             partition_selector: PartitionSelector::Range {
                 start: "2025-01-01".into(),
                 end: "2025-12-31".into(),
@@ -315,6 +318,7 @@ fn test_backfill_events_no_run_id() {
             backfill_id: "bf_01HQ123".into(),
             client_request_id: "req_xyz".into(),
             asset_selection: vec!["test".into()],
+            code_version: None,
             partition_selector: PartitionSelector::Explicit {
                 partition_keys: vec!["p1".into()],
             },
@@ -350,6 +354,7 @@ fn test_run_requested_stable_run_key_fingerprint_in_payload() {
                 tick_id: "01HQ123SCHEDXYZ:1736935200".into(),
             },
             labels: HashMap::new(),
+            code_version: None,
         },
     );
 
@@ -379,6 +384,7 @@ fn test_run_requested_idempotency_includes_fingerprint_hash() {
                 tick_id: "01HQ123:1736935200".into(),
             },
             labels: HashMap::new(),
+            code_version: None,
         },
     );
 
@@ -409,6 +415,7 @@ fn test_run_requested_different_fingerprints_different_idempotency() {
                 tick_id: "01HQ123:1736935200".into(),
             },
             labels: HashMap::new(),
+            code_version: None,
         },
     );
 
@@ -425,6 +432,7 @@ fn test_run_requested_different_fingerprints_different_idempotency() {
                 tick_id: "01HQ123:1736935200".into(),
             },
             labels: HashMap::new(),
+            code_version: None,
         },
     );
 
@@ -463,6 +471,7 @@ fn test_run_requested_no_run_id() {
                 eval_id: "eval_xyz".into(),
             },
             labels: HashMap::new(),
+            code_version: None,
         },
     );
 
@@ -488,6 +497,7 @@ fn test_run_requested_with_backfill_source() {
                 chunk_id: "bf_01HQ123:5".into(),
             },
             labels: HashMap::new(),
+            code_version: None,
         },
     );
 
@@ -521,6 +531,7 @@ fn test_run_requested_with_manual_source() {
                 request_id: "req_abc123".into(),
             },
             labels,
+            code_version: None,
         },
     );
 

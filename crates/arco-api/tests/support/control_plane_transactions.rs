@@ -451,6 +451,7 @@ pub fn orchestration_run_requested_request(
                         })),
                     }),
                     labels: Default::default(),
+                    code_version: None,
                 },
             )),
         }],

@@ -512,6 +512,7 @@ fn event_data_to_proto(
             timezone,
             catchup_window_minutes,
             asset_selection,
+            code_version,
             max_catchup_ticks,
             enabled,
         } => orchestration_event_envelope::Event::ScheduleDefinitionUpserted(
@@ -523,6 +524,7 @@ fn event_data_to_proto(
                 asset_selection: asset_selection.clone(),
                 max_catchup_ticks: *max_catchup_ticks,
                 enabled: *enabled,
+                code_version: code_version.clone(),
             },
         ),
         OrchestrationEventData::ScheduleTicked {
@@ -584,6 +586,7 @@ fn event_data_to_proto(
             partition_selection,
             trigger_source_ref,
             labels,
+            code_version,
         } => orchestration_event_envelope::Event::RunRequested(proto::RunRequested {
             run_key: run_key.clone(),
             request_fingerprint: request_fingerprint.clone(),
@@ -591,11 +594,13 @@ fn event_data_to_proto(
             partition_selection: partition_selection.clone().unwrap_or_default(),
             trigger: Some(source_ref_to_proto(trigger_source_ref)),
             labels: hash_to_btree(labels),
+            code_version: code_version.clone(),
         }),
         OrchestrationEventData::BackfillCreated {
             backfill_id,
             client_request_id,
             asset_selection,
+            code_version,
             partition_selector,
             total_partitions,
             chunk_size,
@@ -610,6 +615,7 @@ fn event_data_to_proto(
             chunk_size: *chunk_size,
             max_concurrent_runs: *max_concurrent_runs,
             parent_backfill_id: parent_backfill_id.clone(),
+            code_version: code_version.clone(),
         }),
         OrchestrationEventData::BackfillChunkPlanned {
             backfill_id,
@@ -808,6 +814,7 @@ fn proto_event_to_runtime(
                 timezone: event.timezone.clone(),
                 catchup_window_minutes: event.catchup_window_minutes,
                 asset_selection: event.asset_selection.clone(),
+                code_version: event.code_version.clone(),
                 max_catchup_ticks: event.max_catchup_ticks,
                 enabled: event.enabled,
             }
@@ -867,6 +874,7 @@ fn proto_event_to_runtime(
                     "run_requested.trigger",
                 )?,
                 labels: btree_to_hash(&event.labels),
+                code_version: event.code_version.clone(),
             }
         }
         orchestration_event_envelope::Event::BackfillCreated(event) => {
@@ -874,6 +882,7 @@ fn proto_event_to_runtime(
                 backfill_id: event.backfill_id.clone(),
                 client_request_id: event.client_request_id.clone(),
                 asset_selection: event.asset_selection.clone(),
+                code_version: event.code_version.clone(),
                 partition_selector: partition_selector_from_proto(
                     event.partition_selector.as_ref(),
                 )?,
@@ -1440,6 +1449,7 @@ fn run_request_to_proto(request: &RunRequest) -> proto::RunRequest {
         request_fingerprint: request.request_fingerprint.clone(),
         asset_selection: request.asset_selection.clone(),
         partition_selection: request.partition_selection.clone().unwrap_or_default(),
+        code_version: request.code_version.clone(),
     }
 }
 
@@ -1450,6 +1460,7 @@ fn run_request_from_proto(request: &proto::RunRequest) -> RunRequest {
         asset_selection: request.asset_selection.clone(),
         partition_selection: (!request.partition_selection.is_empty())
             .then(|| request.partition_selection.clone()),
+        code_version: request.code_version.clone(),
     }
 }
 

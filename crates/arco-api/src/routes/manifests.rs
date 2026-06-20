@@ -455,6 +455,7 @@ async fn upsert_schedule_definitions(
     tenant_id: &str,
     workspace_id: &str,
     manifest_id: &str,
+    code_version_id: &str,
     schedules: &[ScheduleEntry],
 ) -> Result<(), ApiError> {
     if schedules.is_empty() {
@@ -507,6 +508,7 @@ async fn upsert_schedule_definitions(
                 asset_selection: schedule.assets.clone(),
                 max_catchup_ticks,
                 enabled,
+                code_version: Some(code_version_id.to_string()),
             },
         );
 
@@ -585,6 +587,7 @@ pub(crate) async fn deploy_manifest(
                     &ctx.tenant,
                     &workspace_id,
                     &existing.manifest_id,
+                    &existing.code_version_id,
                     &request.schedules,
                 )
                 .await?;
@@ -704,6 +707,7 @@ pub(crate) async fn deploy_manifest(
         &ctx.tenant,
         &workspace_id,
         &manifest_id,
+        &request.code_version_id,
         &request.schedules,
     )
     .await?;

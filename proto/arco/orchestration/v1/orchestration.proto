@@ -419,6 +419,7 @@ message RunRequest {
   string request_fingerprint = 2;
   repeated string asset_selection = 3;
   repeated string partition_selection = 4;
+  optional string code_version = 5;
 }
 
 enum BackfillState {
@@ -580,6 +581,7 @@ message ScheduleDefinitionUpserted {
   repeated string asset_selection = 5;
   uint32 max_catchup_ticks = 6;
   bool enabled = 7;
+  optional string code_version = 8;
 }
 
 message ScheduleTicked {
@@ -615,6 +617,7 @@ message RunRequested {
   repeated string partition_selection = 4;
   TriggerInfo trigger = 5;
   map<string, string> labels = 6;
+  optional string code_version = 7;
 }
 
 message BackfillCreated {
@@ -626,6 +629,7 @@ message BackfillCreated {
   uint32 chunk_size = 6;
   uint32 max_concurrent_runs = 7;
   optional string parent_backfill_id = 8;
+  optional string code_version = 9;
 }
 
 message BackfillChunkPlanned {

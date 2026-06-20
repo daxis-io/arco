@@ -160,6 +160,19 @@ resource "google_project_iam_custom_role" "storage_object_lister" {
   project     = var.project_id
 }
 
+# Object write access without list permission.
+resource "google_project_iam_custom_role" "storage_object_writer_no_list" {
+  role_id     = "storageObjectWriterNoList"
+  title       = "Storage Object Writer (No List)"
+  description = "Create, update, and delete objects without list capability"
+  permissions = [
+    "storage.objects.create",
+    "storage.objects.delete",
+    "storage.objects.update",
+  ]
+  project = var.project_id
+}
+
 # Flow dispatcher runs with the API service account and must enqueue to Cloud Tasks.
 # This enables both worker dispatch and timer callback task creation.
 resource "google_project_iam_member" "api_cloud_tasks_enqueuer" {

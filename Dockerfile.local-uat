@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1
+
+ARG RUST_VERSION=1.88
+
+FROM rust:${RUST_VERSION}-slim-bookworm
+
+WORKDIR /workspace
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    clang \
+    cmake \
+    libprotobuf-dev \
+    pkg-config \
+    protobuf-compiler \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+
+CMD ["bash", "scripts/run_local_pipeline_uat.sh"]

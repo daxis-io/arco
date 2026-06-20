@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1
+
+ARG RUST_VERSION=1.88
+
+FROM rust:${RUST_VERSION}-slim-bookworm AS builder
+WORKDIR /workspace
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    clang \
+    cmake \
+    libprotobuf-dev \
+    pkg-config \
+    protobuf-compiler \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+
+ARG BIN
+ARG FEATURES=""
+RUN test -n "${BIN}" \
+  && if [ -n "${FEATURES}" ]; then \
+    cargo build --release --locked --features "${FEATURES}" --bin "${BIN}"; \
+  else \
+    cargo build --release --locked --bin "${BIN}"; \
+  fi \
+  && cp "target/release/${BIN}" /usr/local/bin/arco-service
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/arco-service /usr/local/bin/arco-service
+
+ENV RUST_LOG=info
+ENTRYPOINT ["/usr/local/bin/arco-service"]

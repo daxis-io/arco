@@ -20,7 +20,7 @@ use crate::error::{Error, Result};
 #[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 #[cfg(any(feature = "gcp", feature = "test-utils", feature = "http-client"))]
 const METADATA_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -178,6 +178,20 @@ fn map_http_error(status: reqwest::StatusCode, body: &str) -> Error {
         _ => Error::dispatch(format!(
             "orchestration compaction failed (status={status}): {message}"
         )),
+    }
+}
+
+#[cfg(all(
+    test,
+    any(feature = "gcp", feature = "test-utils", feature = "http-client")
+))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_timeout_allows_cloud_run_compactions_over_three_seconds_but_fails_fast() {
+        assert!(REQUEST_TIMEOUT > Duration::from_secs(3));
+        assert!(REQUEST_TIMEOUT < Duration::from_secs(8));
     }
 }
 

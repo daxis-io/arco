@@ -1,0 +1,24 @@
+substitutions:
+  _BIN: "arco-api"
+  _IMAGE: "us-docker.pkg.dev/cloudrun/container/hello"
+  _FEATURES: ""
+
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "--file=Dockerfile.cloudrun"
+      - "--build-arg"
+      - "BIN=${_BIN}"
+      - "--build-arg"
+      - "FEATURES=${_FEATURES}"
+      - "--tag"
+      - "${_IMAGE}"
+      - "."
+
+images:
+  - "${_IMAGE}"
+
+options:
+  machineType: "E2_HIGHCPU_8"
+  logging: "CLOUD_LOGGING_ONLY"

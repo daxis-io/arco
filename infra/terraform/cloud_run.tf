@@ -112,6 +112,26 @@ resource "google_cloud_run_v2_service" "api" {
       }
 
       env {
+        name  = "ARCO_TASK_TOKEN_SECRET"
+        value = var.task_token_secret
+      }
+
+      env {
+        name  = "ARCO_TASK_TOKEN_ISSUER"
+        value = var.task_token_issuer
+      }
+
+      env {
+        name  = "ARCO_TASK_TOKEN_AUDIENCE"
+        value = var.task_token_audience
+      }
+
+      env {
+        name  = "ARCO_TASK_TOKEN_TTL_SECS"
+        value = tostring(var.task_token_ttl_secs)
+      }
+
+      env {
         name  = "ARCO_STORAGE_BUCKET"
         value = google_storage_bucket.catalog.name
       }
@@ -181,8 +201,7 @@ resource "google_cloud_run_v2_service" "compactor" {
   location = var.region
   project  = var.project_id
 
-  # Compactor is always internal-only
-  ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  ingress = var.compactor_ingress
 
   template {
     service_account = google_service_account.compactor.email
@@ -204,6 +223,8 @@ resource "google_cloud_run_v2_service" "compactor" {
 
     containers {
       image = var.compactor_image
+
+      args = ["serve"]
 
       resources {
         limits = {
@@ -242,6 +263,16 @@ resource "google_cloud_run_v2_service" "compactor" {
       }
 
       # Environment variables
+      env {
+        name  = "ARCO_TENANT_ID"
+        value = var.compactor_tenant_id
+      }
+
+      env {
+        name  = "ARCO_WORKSPACE_ID"
+        value = var.compactor_workspace_id
+      }
+
       env {
         name  = "ARCO_COMPACTOR_PORT"
         value = "8081"
@@ -571,6 +602,26 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
       }
 
       env {
+        name  = "ARCO_FLOW_TASK_TOKEN_SECRET"
+        value = var.task_token_secret
+      }
+
+      env {
+        name  = "ARCO_FLOW_TASK_TOKEN_ISSUER"
+        value = var.task_token_issuer
+      }
+
+      env {
+        name  = "ARCO_FLOW_TASK_TOKEN_AUDIENCE"
+        value = var.task_token_audience
+      }
+
+      env {
+        name  = "ARCO_FLOW_TASK_TOKEN_TTL_SECS"
+        value = tostring(var.task_token_ttl_secs)
+      }
+
+      env {
         name  = "ARCO_FLOW_COMPACTOR_URL"
         value = google_cloud_run_v2_service.flow_compactor.uri
       }
@@ -707,6 +758,26 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
       }
 
       env {
+        name  = "ARCO_FLOW_TASK_TOKEN_SECRET"
+        value = var.task_token_secret
+      }
+
+      env {
+        name  = "ARCO_FLOW_TASK_TOKEN_ISSUER"
+        value = var.task_token_issuer
+      }
+
+      env {
+        name  = "ARCO_FLOW_TASK_TOKEN_AUDIENCE"
+        value = var.task_token_audience
+      }
+
+      env {
+        name  = "ARCO_FLOW_TASK_TOKEN_TTL_SECS"
+        value = tostring(var.task_token_ttl_secs)
+      }
+
+      env {
         name  = "ARCO_FLOW_COMPACTOR_URL"
         value = google_cloud_run_v2_service.flow_compactor.uri
       }
@@ -798,6 +869,11 @@ resource "google_cloud_run_v2_service" "flow_worker" {
       }
 
       env {
+        name  = "ARCO_STORAGE_BUCKET"
+        value = google_storage_bucket.catalog.name
+      }
+
+      env {
         name  = "ARCO_FLOW_TENANT_ID"
         value = var.flow_tenant_id
       }
@@ -871,7 +947,7 @@ output "api_service_name" {
 }
 
 output "compactor_url" {
-  description = "URL of the Compactor service (internal only)"
+  description = "URL of the Compactor service"
   value       = google_cloud_run_v2_service.compactor.uri
 }
 

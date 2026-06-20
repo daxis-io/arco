@@ -9,7 +9,7 @@
 //! - Writers retry on CAS conflicts (e.g., if a writer bypasses the lock)
 //! - On-disk manifests are physically multi-file (root + domain manifests)
 
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use bytes::Bytes;
 use chrono::Utc;
@@ -128,6 +128,14 @@ impl Tier1Writer {
             &CatalogDomainManifest::new(),
             |manifest: &CatalogDomainManifest| manifest.manifest_id.as_str(),
             |manifest: &CatalogDomainManifest| manifest.fencing_token.unwrap_or(manifest.epoch),
+            |manifest: &mut CatalogDomainManifest, snapshot_manifest_path| {
+                sanitize_legacy_bootstrap_history(
+                    CatalogDomain::Catalog,
+                    &mut manifest.previous_manifest_path,
+                    &mut manifest.parent_hash,
+                    snapshot_manifest_path,
+                );
+            },
         )
         .await?;
         self.bootstrap_tier1_manifest(
@@ -136,6 +144,14 @@ impl Tier1Writer {
             &LineageManifest::new(),
             |manifest: &LineageManifest| manifest.manifest_id.as_str(),
             |manifest: &LineageManifest| manifest.fencing_token.unwrap_or(manifest.epoch),
+            |manifest: &mut LineageManifest, snapshot_manifest_path| {
+                sanitize_legacy_bootstrap_history(
+                    CatalogDomain::Lineage,
+                    &mut manifest.previous_manifest_path,
+                    &mut manifest.parent_hash,
+                    snapshot_manifest_path,
+                );
+            },
         )
         .await?;
         self.bootstrap_tier1_manifest(
@@ -144,6 +160,14 @@ impl Tier1Writer {
             &SearchManifest::new(),
             |manifest: &SearchManifest| manifest.manifest_id.as_str(),
             |manifest: &SearchManifest| manifest.fencing_token.unwrap_or(manifest.epoch),
+            |manifest: &mut SearchManifest, snapshot_manifest_path| {
+                sanitize_legacy_bootstrap_history(
+                    CatalogDomain::Search,
+                    &mut manifest.previous_manifest_path,
+                    &mut manifest.parent_hash,
+                    snapshot_manifest_path,
+                );
+            },
         )
         .await?;
         self.storage
@@ -154,6 +178,8 @@ impl Tier1Writer {
             )
             .await?;
         self.ensure_json_exists(&root.executions_manifest_path, &ExecutionsManifest::new())
+            .await?;
+        self.repair_legacy_catalog_manifest_history(guard.fencing_token().sequence())
             .await?;
 
         guard.release().await.map_err(CatalogError::from)
@@ -472,18 +498,20 @@ impl Tier1Writer {
         }
     }
 
-    async fn bootstrap_tier1_manifest<T, FManifestId, FEpoch>(
+    async fn bootstrap_tier1_manifest<T, FManifestId, FEpoch, FSanitize>(
         &self,
         domain: CatalogDomain,
         legacy_root_path: &str,
         default_manifest: &T,
         manifest_id: FManifestId,
         epoch: FEpoch,
+        sanitize_legacy_manifest: FSanitize,
     ) -> Result<()>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Sync,
         FManifestId: Fn(&T) -> &str,
         FEpoch: Fn(&T) -> u64,
+        FSanitize: Fn(&mut T, &str),
     {
         let pointer_path = CatalogPaths::domain_manifest_pointer(domain);
         if self.storage.head_raw(&pointer_path).await?.is_some() {
@@ -496,13 +524,16 @@ impl Tier1Writer {
                 serde_json::from_slice(&legacy_bytes).map_err(|e| CatalogError::Serialization {
                     message: format!("parse JSON at {legacy_path}: {e}"),
                 })?;
+            let mut manifest = manifest;
             let snapshot_manifest_path =
                 CatalogPaths::domain_manifest_snapshot(domain, manifest_id(&manifest));
+            sanitize_legacy_manifest(&mut manifest, &snapshot_manifest_path);
+            let manifest_bytes = json_bytes(&manifest)?;
             match self
                 .storage
                 .put_raw(
                     &snapshot_manifest_path,
-                    legacy_bytes,
+                    manifest_bytes,
                     WritePrecondition::DoesNotExist,
                 )
                 .await?
@@ -531,6 +562,106 @@ impl Tier1Writer {
         self.ensure_json_exists(&pointer_path, &DomainManifestPointer::new(domain))
             .await?;
         Ok(())
+    }
+
+    async fn repair_legacy_catalog_manifest_history(&self, writer_epoch: u64) -> Result<()> {
+        let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+        let Some(pointer_meta) = self.storage.head_raw(&pointer_path).await? else {
+            return Ok(());
+        };
+        let pointer_bytes = self.storage.get_raw(&pointer_path).await?;
+        let pointer: DomainManifestPointer =
+            serde_json::from_slice(&pointer_bytes).map_err(|e| CatalogError::Serialization {
+                message: format!("parse JSON at {pointer_path}: {e}"),
+            })?;
+        let current_bytes = self.storage.get_raw(&pointer.manifest_path).await?;
+        let current: CatalogDomainManifest =
+            serde_json::from_slice(&current_bytes).map_err(|e| CatalogError::Serialization {
+                message: format!("parse JSON at {}: {e}", pointer.manifest_path),
+            })?;
+
+        if !self
+            .catalog_history_reaches_legacy_mutable_head(&pointer.manifest_path, &current)
+            .await?
+        {
+            return Ok(());
+        }
+
+        let mut repaired = current;
+        repaired.manifest_id =
+            next_available_manifest_id(&self.storage, CatalogDomain::Catalog, &pointer.manifest_id)
+                .await?;
+        repaired.previous_manifest_path = None;
+        repaired.parent_hash = None;
+        repaired.epoch = writer_epoch;
+        repaired.fencing_token = Some(writer_epoch);
+        repaired.updated_at = Utc::now();
+
+        let repaired_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, &repaired.manifest_id);
+        let repaired_pointer = DomainManifestPointer {
+            manifest_id: repaired.manifest_id.clone(),
+            manifest_path: repaired_path.clone(),
+            epoch: writer_epoch,
+            parent_pointer_hash: Some(compute_manifest_hash(&pointer_bytes)),
+            updated_at: Utc::now(),
+        };
+        match publish_snapshot_pointer_transaction(
+            &self.storage,
+            &repaired_path,
+            json_bytes(&repaired)?,
+            &pointer_path,
+            json_bytes(&repaired_pointer)?,
+            Some(pointer_meta.version).as_deref(),
+            None,
+            SnapshotPointerDurability::Visible,
+            async { Ok(()) },
+        )
+        .await
+        {
+            Ok(SnapshotPointerPublishOutcome::Visible { .. }) => Ok(()),
+            Ok(SnapshotPointerPublishOutcome::PersistedNotVisible) => {
+                Err(CatalogError::InvariantViolation {
+                    message: "unexpected persisted-not-visible outcome in visible durability mode"
+                        .to_string(),
+                })
+            }
+            Err(e) => Err(CatalogError::from(e)),
+        }
+    }
+
+    async fn catalog_history_reaches_legacy_mutable_head(
+        &self,
+        current_manifest_path: &str,
+        current_manifest: &CatalogDomainManifest,
+    ) -> Result<bool> {
+        let mut visited = HashSet::new();
+        let mut manifest_path = current_manifest_path.to_string();
+        let mut manifest = current_manifest.clone();
+
+        visited.insert(manifest_path.clone());
+
+        while let Some(previous_path) = manifest.previous_manifest_path.clone() {
+            if is_legacy_domain_manifest_path(CatalogDomain::Catalog, &previous_path)
+                || previous_path == manifest_path
+            {
+                return Ok(true);
+            }
+
+            if !visited.insert(previous_path.clone()) {
+                return Ok(false);
+            }
+
+            let Some(bytes) = self.get_raw_if_exists(&previous_path).await? else {
+                return Ok(false);
+            };
+            manifest = serde_json::from_slice(&bytes).map_err(|e| CatalogError::Serialization {
+                message: format!("parse JSON at {previous_path}: {e}"),
+            })?;
+            manifest_path = previous_path;
+        }
+
+        Ok(false)
     }
 
     async fn read_json<T>(&self, path: &str) -> Result<T>
@@ -623,6 +754,35 @@ fn legacy_manifest_candidate_path(domain: CatalogDomain, root_path: &str) -> Str
     }
 
     CatalogPaths::domain_manifest(domain)
+}
+
+fn sanitize_legacy_bootstrap_history(
+    domain: CatalogDomain,
+    previous_manifest_path: &mut Option<String>,
+    parent_hash: &mut Option<String>,
+    snapshot_manifest_path: &str,
+) {
+    let Some(previous_path) = previous_manifest_path.as_deref() else {
+        return;
+    };
+
+    if is_legacy_domain_manifest_path(domain, previous_path)
+        || previous_path == snapshot_manifest_path
+    {
+        *previous_manifest_path = None;
+        *parent_hash = None;
+    }
+}
+
+fn is_legacy_domain_manifest_path(domain: CatalogDomain, path: &str) -> bool {
+    let Some(domain_name) = path
+        .strip_prefix("manifests/")
+        .and_then(|path| path.strip_suffix(".manifest.json"))
+    else {
+        return false;
+    };
+
+    CatalogPaths::domain_manifest_str(domain_name) == CatalogPaths::domain_manifest(domain)
 }
 
 async fn next_available_manifest_id(
@@ -937,6 +1097,161 @@ mod tests {
             migrated_search.snapshot_version,
             legacy_search.snapshot_version
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_initialize_roots_self_referential_legacy_catalog_history() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+
+        let legacy_root = RootManifest {
+            version: 1,
+            catalog_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Catalog),
+            lineage_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Lineage),
+            executions_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Executions),
+            search_manifest_path: CatalogPaths::domain_manifest(CatalogDomain::Search),
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                CatalogPaths::ROOT_MANIFEST,
+                json_bytes(&legacy_root)?,
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+
+        let legacy_catalog_path = CatalogPaths::domain_manifest(CatalogDomain::Catalog);
+        let mut legacy_catalog = CatalogDomainManifest::new();
+        legacy_catalog.manifest_id = "00000000000000000001".to_string();
+        legacy_catalog.snapshot_version = 1;
+        legacy_catalog.snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1);
+        legacy_catalog.previous_manifest_path = Some(legacy_catalog_path.clone());
+        legacy_catalog.parent_hash = Some("sha256:legacy-mutable-head".to_string());
+        storage
+            .put_raw(
+                &legacy_catalog_path,
+                json_bytes(&legacy_catalog)?,
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await?;
+
+        let pointer: DomainManifestPointer = parse_json(
+            &storage
+                .get_raw(&CatalogPaths::domain_manifest_pointer(
+                    CatalogDomain::Catalog,
+                ))
+                .await?,
+        )?;
+        let migrated: CatalogDomainManifest =
+            parse_json(&storage.get_raw(&pointer.manifest_path).await?)?;
+
+        assert_eq!(
+            pointer.manifest_path,
+            CatalogPaths::domain_manifest_snapshot(
+                CatalogDomain::Catalog,
+                &legacy_catalog.manifest_id
+            )
+        );
+        assert!(migrated.previous_manifest_path.is_none());
+        assert!(migrated.parent_hash.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_initialize_repairs_pointerized_legacy_catalog_history() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+
+        let root = RootManifest::new();
+        storage
+            .put_raw(
+                CatalogPaths::ROOT_MANIFEST,
+                json_bytes(&root)?,
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+
+        let legacy_catalog_path = CatalogPaths::domain_manifest(CatalogDomain::Catalog);
+        let first_manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, "00000000000000000001");
+        let mut first_manifest = CatalogDomainManifest::new();
+        first_manifest.manifest_id = "00000000000000000001".to_string();
+        first_manifest.snapshot_version = 1;
+        first_manifest.snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1);
+        first_manifest.previous_manifest_path = Some(legacy_catalog_path.clone());
+        first_manifest.parent_hash = Some("sha256:legacy-mutable-head".to_string());
+        let first_manifest_bytes = json_bytes(&first_manifest)?;
+        storage
+            .put_raw(
+                &first_manifest_path,
+                first_manifest_bytes.clone(),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+        storage
+            .put_raw(
+                &legacy_catalog_path,
+                first_manifest_bytes.clone(),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+
+        let second_manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, "00000000000000000002");
+        let mut second_manifest = first_manifest.clone();
+        second_manifest.manifest_id = "00000000000000000002".to_string();
+        second_manifest.snapshot_version = 2;
+        second_manifest.snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 2);
+        second_manifest.previous_manifest_path = Some(first_manifest_path);
+        second_manifest.parent_hash = Some(compute_manifest_hash(&first_manifest_bytes));
+        storage
+            .put_raw(
+                &second_manifest_path,
+                json_bytes(&second_manifest)?,
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+
+        let old_pointer = DomainManifestPointer {
+            manifest_id: second_manifest.manifest_id.clone(),
+            manifest_path: second_manifest_path,
+            epoch: second_manifest.epoch,
+            parent_pointer_hash: None,
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                &CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
+                json_bytes(&old_pointer)?,
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await?;
+
+        let pointer: DomainManifestPointer = parse_json(
+            &storage
+                .get_raw(&CatalogPaths::domain_manifest_pointer(
+                    CatalogDomain::Catalog,
+                ))
+                .await?,
+        )?;
+        let repaired: CatalogDomainManifest =
+            parse_json(&storage.get_raw(&pointer.manifest_path).await?)?;
+
+        assert_eq!(pointer.manifest_id, "00000000000000000003");
+        assert_eq!(repaired.manifest_id, pointer.manifest_id);
+        assert_eq!(repaired.snapshot_version, second_manifest.snapshot_version);
+        assert_eq!(repaired.snapshot_path, second_manifest.snapshot_path);
+        assert!(repaired.previous_manifest_path.is_none());
+        assert!(repaired.parent_hash.is_none());
 
         Ok(())
     }

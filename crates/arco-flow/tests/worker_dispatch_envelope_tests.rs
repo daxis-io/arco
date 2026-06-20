@@ -78,6 +78,7 @@ fn worker_dispatch_envelope_writes_canonical_camel_case_json() {
     assert_eq!(value["taskKey"], "analytics.daily_sales");
     assert_eq!(value["callbackBaseUrl"], "https://api.arco.dev");
     assert_eq!(value["executionLocationId"], "local-dev");
+    assert!(value.get("callbackTaskId").is_none());
     assert!(value.get("task_id").is_none());
     assert!(value.get("callback_base_url").is_none());
 }

@@ -390,6 +390,7 @@ dependencies = [
  "proptest",
  "prost-types 0.13.5",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",

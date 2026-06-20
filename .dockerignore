@@ -1,0 +1,14 @@
+target/
+.git/
+.worktrees/
+.agents/
+.co?ex/
+.terraform/
+.venv/
+__pycache__/
+*.pyc
+infra/terraform/.terraform/
+infra/terraform/terraform.tfstate
+infra/terraform/terraform.tfstate.backup
+docs/guide/book/
+docs/guide/src/api/openapi.json

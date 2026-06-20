@@ -274,7 +274,7 @@ def worker(
     host: Annotated[
         str,
         typer.Option("--host", help="Host interface to bind."),
-    ] = "0.0.0.0",
+    ] = "127.0.0.1",
     port: Annotated[
         int,
         typer.Option("--port", help="Port to bind."),

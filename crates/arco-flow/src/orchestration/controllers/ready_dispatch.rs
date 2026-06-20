@@ -102,6 +102,8 @@ pub struct ReadyDispatchController {
     worker_queue: String,
 }
 
+const DEFAULT_MAX_COMPACTION_LAG: Duration = Duration::minutes(5);
+
 impl ReadyDispatchController {
     /// Creates a new ready dispatch controller.
     #[must_use]
@@ -115,7 +117,7 @@ impl ReadyDispatchController {
     /// Creates a controller with default settings.
     #[must_use]
     pub fn with_defaults() -> Self {
-        Self::new(Duration::seconds(30))
+        Self::new(DEFAULT_MAX_COMPACTION_LAG)
     }
 
     /// Sets the default worker queue for dispatch requests.
@@ -333,7 +335,13 @@ mod tests {
 
     fn stale_manifest() -> OrchestrationManifest {
         let mut manifest = OrchestrationManifest::new("01HQXYZ123REV");
-        manifest.watermarks.last_processed_at = Utc::now() - Duration::seconds(60);
+        manifest.watermarks.last_processed_at = Utc::now() - Duration::minutes(10);
+        manifest
+    }
+
+    fn scheduler_cadence_manifest() -> OrchestrationManifest {
+        let mut manifest = OrchestrationManifest::new("01HQXYZ123REV");
+        manifest.watermarks.last_processed_at = Utc::now() - Duration::seconds(75);
         manifest
     }
 
@@ -468,6 +476,26 @@ mod tests {
             }
             _ => panic!("Expected Skip action due to compaction lag"),
         }
+    }
+
+    #[test]
+    fn test_ready_dispatch_allows_one_minute_scheduler_cadence() {
+        let controller = ReadyDispatchController::with_defaults();
+        let manifest = scheduler_cadence_manifest();
+
+        let mut state = FoldState::new();
+        state.tasks.insert(
+            ("run1".to_string(), "extract".to_string()),
+            make_task_row("run1", "extract", TaskState::Ready, 0),
+        );
+
+        let actions = controller.reconcile(&manifest, &state);
+
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            actions[0],
+            ReadyDispatchAction::EmitDispatchRequested { .. }
+        ));
     }
 
     #[test]

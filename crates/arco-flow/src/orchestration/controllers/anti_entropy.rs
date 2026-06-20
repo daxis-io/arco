@@ -80,6 +80,8 @@ pub struct AntiEntropySweeper {
     max_compaction_lag: Duration,
 }
 
+const DEFAULT_MAX_COMPACTION_LAG: Duration = Duration::minutes(5);
+
 impl AntiEntropySweeper {
     /// Creates a new anti-entropy sweeper.
     #[must_use]
@@ -100,13 +102,13 @@ impl AntiEntropySweeper {
     /// Default timeouts:
     /// - READY timeout: 5 minutes
     /// - DISPATCHED timeout: 10 minutes
-    /// - Max compaction lag: 30 seconds
+    /// - Max compaction lag: 5 minutes
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(
             Duration::minutes(5),
             Duration::minutes(10),
-            Duration::seconds(30),
+            DEFAULT_MAX_COMPACTION_LAG,
         )
     }
 
@@ -363,7 +365,17 @@ mod tests {
             last_visible_event_id: Some("01HQ123EVT".to_string()),
             events_processed_through: Some("01HQ123EVT".to_string()),
             last_processed_file: Some(orchestration_event_path("2025-01-15", "01HQ123")),
-            last_processed_at: now - Duration::seconds(60),
+            last_processed_at: now - Duration::minutes(10),
+        }
+    }
+
+    fn scheduler_cadence_watermarks(now: DateTime<Utc>) -> Watermarks {
+        Watermarks {
+            last_committed_event_id: Some("01HQ123EVT".to_string()),
+            last_visible_event_id: Some("01HQ123EVT".to_string()),
+            events_processed_through: Some("01HQ123EVT".to_string()),
+            last_processed_file: Some(orchestration_event_path("2025-01-15", "01HQ123")),
+            last_processed_at: now - Duration::seconds(75),
         }
     }
 
@@ -589,6 +601,26 @@ mod tests {
         // Should skip repairs due to compaction lag
         assert_eq!(repairs.len(), 1);
         assert!(matches!(repairs[0], Repair::SkippedDueToLag { .. }));
+    }
+
+    #[test]
+    fn test_anti_entropy_allows_one_minute_scheduler_cadence() {
+        let now = Utc::now();
+        let sweeper = AntiEntropySweeper::with_defaults();
+        let watermarks = scheduler_cadence_watermarks(now);
+
+        let tasks = vec![make_task_row(
+            "extract",
+            TaskState::Ready,
+            Some(now - Duration::minutes(10)),
+        )];
+
+        let outbox = vec![];
+
+        let repairs = sweeper.scan(&watermarks, &tasks, &outbox, now);
+
+        assert_eq!(repairs.len(), 1);
+        assert!(matches!(repairs[0], Repair::CreateDispatchOutbox { .. }));
     }
 
     #[test]

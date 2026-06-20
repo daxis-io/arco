@@ -189,6 +189,7 @@ class DispatchWorker:
         self._client.close()
 
     def handle_dispatch(self, payload: WorkerDispatchEnvelope) -> None:
+        self._validate_scope(payload)
         task_token = _select_task_token(payload.task_token, self._fallback_task_token)
         started_at = _now_iso()
         self._client.task_started(
@@ -254,6 +255,20 @@ class DispatchWorker:
                 )
             except ApiError as err:
                 err_console.print(f"[yellow]![/yellow] Log upload failed: {err}")
+
+    def _validate_scope(self, payload: WorkerDispatchEnvelope) -> None:
+        if payload.tenant_id != self.config.tenant_id:
+            msg = (
+                "tenant_id mismatch: "
+                f"envelope={payload.tenant_id} configured={self.config.tenant_id}"
+            )
+            raise ValueError(msg)
+        if payload.workspace_id != self.config.workspace_id:
+            msg = (
+                "workspace_id mismatch: "
+                f"envelope={payload.workspace_id} configured={self.config.workspace_id}"
+            )
+            raise ValueError(msg)
 
     def _execute_asset(self, payload: WorkerDispatchEnvelope) -> object:
         asset_func = self._assets.get(payload.task_key)

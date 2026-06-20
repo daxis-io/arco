@@ -135,7 +135,10 @@ impl AppState {
 
         let rate_limit = Arc::new(RateLimitState::new(config.rate_limit.clone()));
         let sync_compactor = config.compactor_url.as_ref().map(|url| {
-            let client: Arc<dyn SyncCompactor> = Arc::new(CompactorClient::new(url.clone()));
+            let client: Arc<dyn SyncCompactor> = Arc::new(CompactorClient::new_with_auth(
+                url.clone(),
+                config.compactor_auth.clone(),
+            ));
             client
         });
         let audit = audit_emitter.unwrap_or_else(|| Arc::new(AuditEmitter::with_tracing()));
@@ -170,7 +173,10 @@ impl AppState {
         }
 
         let sync_compactor = config.compactor_url.as_ref().map(|url| {
-            let client: Arc<dyn SyncCompactor> = Arc::new(CompactorClient::new(url.clone()));
+            let client: Arc<dyn SyncCompactor> = Arc::new(CompactorClient::new_with_auth(
+                url.clone(),
+                config.compactor_auth.clone(),
+            ));
             client
         });
         Self {

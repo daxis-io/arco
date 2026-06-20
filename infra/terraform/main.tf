@@ -146,6 +146,22 @@ resource "google_secret_manager_secret" "tenant_secret" {
   }
 }
 
+resource "google_secret_manager_secret" "flow_worker_dispatch_secret" {
+  count     = var.flow_worker_dispatch_secret_name != "" && local.flow_services_enabled ? 1 : 0
+  project   = var.project_id
+  secret_id = var.flow_worker_dispatch_secret_name
+
+  replication {
+    auto {}
+  }
+
+  labels = {
+    environment = var.environment
+    service     = "arco-flow"
+    component   = "worker-dispatch"
+  }
+}
+
 # ============================================================================
 # Outputs
 # ============================================================================

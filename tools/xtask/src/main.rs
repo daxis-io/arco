@@ -988,6 +988,8 @@ fn run_adr_check() -> Result<()> {
     let readme_content = std::fs::read_to_string(&readme_path)?;
     let mut errors = Vec::new();
 
+    check_duplicate_adr_ids(adr_dir, &mut errors)?;
+
     // Check each required ADR
     for (filename, title) in REQUIRED_ADRS {
         let adr_path = adr_dir.join(filename);
@@ -1030,6 +1032,60 @@ fn run_adr_check() -> Result<()> {
 
     println!("All ADRs present and indexed!");
     Ok(())
+}
+
+fn check_duplicate_adr_ids(adr_dir: &Path, errors: &mut Vec<String>) -> Result<()> {
+    let mut by_id: HashMap<String, Vec<String>> = HashMap::new();
+
+    for entry in std::fs::read_dir(adr_dir).context("read ADR directory")? {
+        let entry = entry.context("read ADR directory entry")?;
+        if !entry
+            .file_type()
+            .context("read ADR entry file type")?
+            .is_file()
+        {
+            continue;
+        }
+
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let Some(adr_id) = adr_id_from_filename(&file_name) else {
+            continue;
+        };
+        by_id.entry(adr_id).or_default().push(file_name);
+    }
+
+    let mut duplicate_ids: Vec<_> = by_id
+        .into_iter()
+        .filter_map(|(adr_id, mut files)| {
+            if files.len() < 2 {
+                return None;
+            }
+            files.sort();
+            Some((adr_id, files))
+        })
+        .collect();
+    duplicate_ids.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (adr_id, files) in duplicate_ids {
+        errors.push(format!("duplicate ADR ID {adr_id}: {}", files.join(", ")));
+    }
+
+    Ok(())
+}
+
+fn adr_id_from_filename(file_name: &str) -> Option<String> {
+    let rest = file_name.strip_prefix("adr-")?;
+    let id = rest.get(..3)?;
+    if !id.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    if !rest.get(3..)?.starts_with('-') {
+        return None;
+    }
+    if !file_name.ends_with(".md") {
+        return None;
+    }
+    Some(id.to_string())
 }
 
 fn run_engine_boundary_check() -> Result<()> {

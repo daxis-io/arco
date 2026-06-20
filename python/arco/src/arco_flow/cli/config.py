@@ -31,6 +31,7 @@ class ArcoFlowConfig(BaseSettings):
     api_url: str = "https://api.arco.dev"
     api_key: SecretStr = SecretStr("")
     task_token: SecretStr = SecretStr("")
+    worker_dispatch_secret: SecretStr = SecretStr("")
 
     # Tenant/workspace scope
     tenant_id: str = ""

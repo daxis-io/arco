@@ -2,6 +2,7 @@
 
 use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData, TriggerInfo};
 use chrono::Utc;
+use serde_json::json;
 
 #[test]
 fn test_event_envelope_serialization() {
@@ -28,6 +29,29 @@ fn test_event_envelope_serialization() {
     assert!(parsed.idempotency_key.starts_with("run:"));
     assert_eq!(parsed.tenant_id, "tenant-abc");
     assert_eq!(parsed.workspace_id, "workspace-prod");
+}
+
+#[test]
+fn unknown_event_data_tags_are_tolerated() {
+    let parsed: OrchestrationEvent = serde_json::from_value(json!({
+        "event_id": "01K0FUTUREEVENT0000000000",
+        "event_type": "FutureWriterOnlyEvent",
+        "event_version": 2,
+        "timestamp": "2026-06-20T00:00:00Z",
+        "source": "arco-flow/tenant-abc/workspace-prod",
+        "tenant_id": "tenant-abc",
+        "workspace_id": "workspace-prod",
+        "idempotency_key": "future:writer-only:1",
+        "data": {
+            "type": "future_writer_only_event",
+            "newField": "new-value"
+        }
+    }))
+    .expect("unknown event tags should not wedge readers");
+
+    assert_eq!(parsed.event_type, "FutureWriterOnlyEvent");
+    assert_eq!(parsed.data.event_type(), "Unknown");
+    assert_eq!(parsed.data.run_id(), None);
 }
 
 #[test]

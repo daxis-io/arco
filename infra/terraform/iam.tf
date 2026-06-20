@@ -56,6 +56,22 @@ resource "google_secret_manager_secret_iam_member" "compactor_tenant_secret" {
   member    = "serviceAccount:${google_service_account.compactor.email}"
 }
 
+resource "google_secret_manager_secret_iam_member" "flow_controller_worker_dispatch_secret" {
+  count     = length(google_secret_manager_secret.flow_worker_dispatch_secret) > 0 ? 1 : 0
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.flow_worker_dispatch_secret[0].secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.flow_controller.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "flow_worker_dispatch_secret" {
+  count     = length(google_secret_manager_secret.flow_worker_dispatch_secret) > 0 ? 1 : 0
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.flow_worker_dispatch_secret[0].secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.flow_worker[0].email}"
+}
+
 # ============================================================================
 # Compactor Service Accounts (Split for Gate 5 Defense-in-Depth)
 # ============================================================================
@@ -265,13 +281,6 @@ resource "google_service_account_iam_member" "flow_controller_act_as_tasks_oidc"
   service_account_id = google_service_account.flow_task_invoker.name
   role               = "roles/iam.serviceAccountUser"
   member             = "serviceAccount:${google_service_account.flow_controller.email}"
-}
-
-resource "google_storage_bucket_iam_member" "flow_timer_ingest_storage_access" {
-  count  = local.flow_services_enabled ? 1 : 0
-  bucket = google_storage_bucket.catalog.name
-  role   = "roles/storage.objectUser"
-  member = "serviceAccount:${google_service_account.flow_timer_ingest[0].email}"
 }
 
 # ============================================================================

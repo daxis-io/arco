@@ -88,6 +88,12 @@ pub enum OrchestrationProtoError {
         /// Trigger kind name.
         kind: &'static str,
     },
+    /// A runtime event kind cannot be represented in the proto contract.
+    #[error("orchestration event kind '{kind}' is not supported by the proto mapping")]
+    UnsupportedEventKind {
+        /// Event kind name.
+        kind: &'static str,
+    },
 }
 
 /// Converts a runtime orchestration event into the authoritative proto envelope.
@@ -648,6 +654,9 @@ fn event_data_to_proto(
                 state_version: *state_version,
                 changed_by: changed_by.clone(),
             })
+        }
+        OrchestrationEventData::Unknown => {
+            return Err(OrchestrationProtoError::UnsupportedEventKind { kind: "Unknown" });
         }
     })
 }

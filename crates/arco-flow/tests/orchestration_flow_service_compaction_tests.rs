@@ -9,8 +9,10 @@ use std::sync::{Arc, Mutex};
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
+use bytes::Bytes;
+use serde_json::json;
 
-use arco_core::{MemoryBackend, ScopedStorage};
+use arco_core::{MemoryBackend, ScopedStorage, WritePrecondition};
 use arco_flow::error::Result;
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::MicroCompactor;
@@ -222,5 +224,48 @@ async fn dispatcher_compacts_emitted_events_to_prevent_ledger_spam() -> Result<(
         request.lock_path,
         "locks/orchestration.compaction.lock.json"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn compactor_skips_unknown_event_data_tags() -> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+    let compactor = MicroCompactor::new(storage.clone());
+    let event_path = "ledger/orchestration/2026-06-20/01K0FUTUREEVENT0000000000.json";
+
+    storage
+        .put_raw(
+            event_path,
+            Bytes::from(
+                json!({
+                    "event_id": "01K0FUTUREEVENT0000000000",
+                    "event_type": "FutureWriterOnlyEvent",
+                    "event_version": 2,
+                    "timestamp": "2026-06-20T00:00:00Z",
+                    "source": "arco-flow/tenant/workspace",
+                    "tenant_id": "tenant",
+                    "workspace_id": "workspace",
+                    "idempotency_key": "future:writer-only:1",
+                    "data": {
+                        "type": "future_writer_only_event",
+                        "newField": "new-value"
+                    }
+                })
+                .to_string(),
+            ),
+            WritePrecondition::DoesNotExist,
+        )
+        .await?;
+
+    let result = compactor
+        .compact_events(vec![event_path.to_string()])
+        .await?;
+    let (_manifest, state) = compactor.load_state().await?;
+
+    assert_eq!(result.events_processed, 1);
+    assert!(state.runs.is_empty());
+    assert!(state.tasks.is_empty());
+
     Ok(())
 }

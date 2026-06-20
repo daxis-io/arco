@@ -224,6 +224,7 @@ impl OrchestrationEvent {
 
 /// Orchestration event payload types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 #[allow(clippy::large_enum_variant)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OrchestrationEventData {
@@ -625,6 +626,13 @@ pub enum OrchestrationEventData {
         #[serde(skip_serializing_if = "Option::is_none")]
         changed_by: Option<String>,
     },
+
+    /// Unknown future event type.
+    ///
+    /// Older readers accept and skip this variant so writer-before-reader deploy
+    /// skew cannot permanently wedge durable ledger compaction.
+    #[serde(other)]
+    Unknown,
 }
 
 impl OrchestrationEventData {
@@ -651,6 +659,7 @@ impl OrchestrationEventData {
             Self::BackfillCreated { .. } => "BackfillCreated",
             Self::BackfillChunkPlanned { .. } => "BackfillChunkPlanned",
             Self::BackfillStateChanged { .. } => "BackfillStateChanged",
+            Self::Unknown => "Unknown",
         }
     }
 
@@ -768,6 +777,8 @@ impl OrchestrationEventData {
             } => {
                 Self::backfill_state_changed_idempotency_key(backfill_id, *state_version, *to_state)
             }
+
+            Self::Unknown => "unknown".to_string(),
         }
     }
 
@@ -871,7 +882,8 @@ impl OrchestrationEventData {
             | Self::RunRequested { .. }
             | Self::BackfillCreated { .. }
             | Self::BackfillChunkPlanned { .. }
-            | Self::BackfillStateChanged { .. } => None,
+            | Self::BackfillStateChanged { .. }
+            | Self::Unknown => None,
         }
     }
 }

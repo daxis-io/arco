@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import io
 import json
 import os
@@ -15,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from rich.console import Console
 
@@ -26,6 +28,8 @@ from arco_flow.types import AssetOut, PartitionKey
 
 console = Console()
 err_console = Console(stderr=True)
+
+DISPATCH_SECRET_HEADER = "X-Arco-Dispatch-Secret"
 
 
 def _now_iso() -> str:
@@ -79,6 +83,49 @@ def _select_task_token(payload_token: str | None, fallback_token: str) -> str:
     return fallback_token
 
 
+def _secret_value(secret: Any) -> str:
+    if secret is None:
+        return ""
+    get_secret_value = getattr(secret, "get_secret_value", None)
+    if callable(get_secret_value):
+        return str(get_secret_value() or "")
+    return str(secret)
+
+
+def _extract_bearer_token(header: str | None) -> str | None:
+    if not header:
+        return None
+    scheme, separator, token = header.partition(" ")
+    if not separator or scheme.lower() != "bearer":
+        return None
+    token = token.strip()
+    return token or None
+
+
+def _dispatch_authorized(
+    config: Any,
+    dispatch_secret_header: str | None,
+    authorization_header: str | None,
+) -> bool:
+    expected = _secret_value(getattr(config, "worker_dispatch_secret", None)).strip()
+    if not expected:
+        return False
+    if dispatch_secret_header and hmac.compare_digest(dispatch_secret_header.strip(), expected):
+        return True
+    token = _extract_bearer_token(authorization_header)
+    if token is None:
+        return False
+    return hmac.compare_digest(token, expected)
+
+
+def _normalize_base_url(value: str) -> str:
+    parsed = urlsplit(value.strip())
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    path = parsed.path.rstrip("/")
+    return urlunsplit((scheme, netloc, path, "", ""))
+
+
 @dataclass
 class WorkerDispatchEnvelope:
     tenant_id: str
@@ -106,6 +153,7 @@ class WorkerDispatchEnvelope:
         workspace_id = _get_field(payload, "workspace_id", "workspaceId")
         run_id = _get_field(payload, "run_id", "runId")
         task_id = _get_field(payload, "task_id", "taskId")
+        callback_task_id = _get_field(payload, "callback_task_id", "callbackTaskId")
         task_key = _get_field(payload, "task_key", "taskKey")
         attempt = _get_field(payload, "attempt", "attempt")
         attempt_id = _get_field(payload, "attempt_id", "attemptId")
@@ -136,11 +184,16 @@ class WorkerDispatchEnvelope:
             msg = "dispatch payload missing required fields"
             raise ValueError(f"{msg}: {', '.join(missing)}")
 
+        if task_id and callback_task_id and task_id != callback_task_id:
+            msg = "dispatch payload has conflicting task_id and callback_task_id"
+            raise ValueError(msg)
+        resolved_task_id = task_id or callback_task_id
+
         return cls(
             tenant_id=str(tenant_id),
             workspace_id=str(workspace_id),
             run_id=str(run_id),
-            task_id=str(task_id) if task_id else None,
+            task_id=str(resolved_task_id) if resolved_task_id else None,
             task_key=str(task_key),
             attempt=int(attempt),
             attempt_id=str(attempt_id),
@@ -189,7 +242,7 @@ class DispatchWorker:
         self._client.close()
 
     def handle_dispatch(self, payload: WorkerDispatchEnvelope) -> None:
-        self._validate_scope(payload)
+        self._validate_dispatch_envelope(payload)
         task_token = _select_task_token(payload.task_token, self._fallback_task_token)
         started_at = _now_iso()
         self._client.task_started(
@@ -256,20 +309,6 @@ class DispatchWorker:
             except ApiError as err:
                 err_console.print(f"[yellow]![/yellow] Log upload failed: {err}")
 
-    def _validate_scope(self, payload: WorkerDispatchEnvelope) -> None:
-        if payload.tenant_id != self.config.tenant_id:
-            msg = (
-                "tenant_id mismatch: "
-                f"envelope={payload.tenant_id} configured={self.config.tenant_id}"
-            )
-            raise ValueError(msg)
-        if payload.workspace_id != self.config.workspace_id:
-            msg = (
-                "workspace_id mismatch: "
-                f"envelope={payload.workspace_id} configured={self.config.workspace_id}"
-            )
-            raise ValueError(msg)
-
     def _execute_asset(self, payload: WorkerDispatchEnvelope) -> object:
         asset_func = self._assets.get(payload.task_key)
         if asset_func is None:
@@ -296,6 +335,21 @@ class DispatchWorker:
             result = asyncio.run(result)
 
         return result
+
+    def _validate_dispatch_envelope(self, payload: WorkerDispatchEnvelope) -> None:
+        mismatches = []
+        if payload.tenant_id != self.config.tenant_id:
+            mismatches.append("tenant_id")
+        if payload.workspace_id != self.config.workspace_id:
+            mismatches.append("workspace_id")
+        configured_callback_base_url = str(getattr(self.config, "api_url", "") or "")
+        if configured_callback_base_url and _normalize_base_url(
+            payload.callback_base_url
+        ) != _normalize_base_url(configured_callback_base_url):
+            mismatches.append("callback_base_url")
+        if mismatches:
+            msg = "dispatch envelope scope mismatch: " + ", ".join(mismatches)
+            raise ValueError(msg)
 
 
 class DispatchHTTPServer(ThreadingMixIn, HTTPServer):
@@ -327,6 +381,16 @@ class DispatchHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        if not _dispatch_authorized(
+            self.server.worker.config,  # type: ignore[attr-defined]
+            self.headers.get(DISPATCH_SECRET_HEADER),
+            self.headers.get("Authorization"),
+        ):
+            self.send_response(401)
+            self.end_headers()
+            self.wfile.write(b"missing or invalid dispatch authorization")
+            return
+
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
         try:
@@ -340,6 +404,11 @@ class DispatchHandler(BaseHTTPRequestHandler):
 
         try:
             self.server.worker.handle_dispatch(dispatch)  # type: ignore[attr-defined]
+        except ValueError as exc:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(str(exc).encode("utf-8"))
+            return
         except Exception as exc:  # noqa: BLE001
             self.send_response(500)
             self.end_headers()
@@ -368,6 +437,12 @@ def run_worker(
         raise SystemExit(1)
     if not config.workspace_id:
         err_console.print("[red]✗[/red] Workspace ID not configured. Set ARCO_FLOW_WORKSPACE_ID.")
+        raise SystemExit(1)
+    if not config.worker_dispatch_secret.get_secret_value():
+        err_console.print(
+            "[red]✗[/red] Worker dispatch secret not configured. "
+            "Set ARCO_FLOW_WORKER_DISPATCH_SECRET."
+        )
         raise SystemExit(1)
     root = root_path or Path.cwd()
 

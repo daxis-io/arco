@@ -38,6 +38,19 @@ class TestArcoFlowConfig:
         assert config.workspace_id == "production"
         assert config.api_key.get_secret_value() == "secret-key"
 
+    def test_worker_dispatch_secret_from_environment(self) -> None:
+        """Worker dispatch secret is read from environment."""
+        from arco_flow.cli.config import ArcoFlowConfig
+
+        env = {
+            "ARCO_FLOW_WORKER_DISPATCH_SECRET": "dispatch-secret",
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            config = ArcoFlowConfig()
+
+        assert config.worker_dispatch_secret.get_secret_value() == "dispatch-secret"
+
     def test_validate_for_deploy_without_api_key(self) -> None:
         """Validation fails without API key for non-dry-run deploy."""
         from arco_flow.cli.config import ArcoFlowConfig

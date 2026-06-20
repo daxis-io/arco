@@ -72,7 +72,7 @@ The strongest remaining drift from the framing is that Unity Catalog-facing surf
 | Immutable metadata snapshots are the source of truth for visible control-plane state | Proven | `docs/adr/adr-032-immutable-manifest-pointers.md`, `docs/adr/adr-034-fenced-head-published-control-plane-transactions.md`, `crates/arco-catalog/src/tier1_compactor.rs`, `crates/arco-core/tests/publish_protocol_contract.rs` | Catalog, lineage, search, and orchestration all use immutable snapshot plus pointer publication |
 | The commit point is the fenced CAS move of the current head/pointer, not the immutable write | Proven | `crates/arco-catalog/src/tier1_compactor.rs`, `crates/arco-core/tests/publish_protocol_contract.rs`, `crates/arco-catalog/tests/protocol_invariants.rs`, `docs/reports/adr-034-protocol-invariant-evidence-matrix.md` | This is one of the best-proven parts of the architecture |
 | Readers are pointer-first / manifest-driven and do not rely on listing or ledger scans for correctness | Proven | `crates/arco-catalog/tests/protocol_invariants.rs`, `crates/arco-flow/tests/orchestration_protocol_invariants.rs`, `docs/reports/adr-034-protocol-invariant-evidence-matrix.md` | Includes ordinary reads and root-token reads |
-| API/control-plane services append events and trigger compaction; compactors are sole writers for materialized Parquet state | Proven | `docs/adr/adr-018-tier1-write-path.md`, `crates/arco-catalog/src/writer.rs`, `docs/adr/adr-032-engine-boundaries.md`, `crates/arco-core/tests/ui.rs`, `.github/workflows/ci.yml` | This matches the intended split-service boundary |
+| API/control-plane services append events and trigger compaction; compactors are sole writers for materialized Parquet state | Proven | `docs/adr/adr-018-tier1-write-path.md`, `crates/arco-catalog/src/writer.rs`, `docs/adr/adr-036-engine-boundaries.md`, `crates/arco-core/tests/ui.rs`, `.github/workflows/ci.yml` | This matches the intended split-service boundary |
 | The catalog is a real control-plane surface, not just per-table state | Partial | `proto/arco/catalog/v1/catalog.proto`, `proto/arco/controlplane/v1/transactions.proto`, `crates/arco-api/src/control_plane_transactions.rs`, `crates/arco-catalog/src/writer.rs` | Real for catalogs, schemas, tables, lineage, search; not real for broader governance objects |
 | There is a catalog-level snapshot boundary rather than only per-table snapshots | Proven | `crates/arco-catalog/src/tier1_compactor.rs`, `crates/arco-catalog/src/tier1_snapshot.rs`, `crates/arco-catalog/src/manifest.rs` | Catalog snapshots materialize catalogs, namespaces, tables, and columns together |
 | Cross-domain coherent reads can be pinned to an immutable multi-domain cut | Partial | `proto/arco/controlplane/v1/transactions.proto`, `crates/arco-api/src/control_plane_transactions.rs`, `crates/arco-api/tests/root_transaction_protocol.rs` | Real for `catalog` plus `orchestration`; not generalized across all control-plane domains |
@@ -115,7 +115,7 @@ This is not architectural aspiration. It is implemented behavior with tests and 
 Primary implementation and proof:
 
 - `docs/adr/adr-018-tier1-write-path.md`
-- `docs/adr/adr-032-engine-boundaries.md`
+- `docs/adr/adr-036-engine-boundaries.md`
 - `crates/arco-catalog/src/writer.rs`
 - `crates/arco-core/tests/ui.rs`
 - `.github/workflows/ci.yml`

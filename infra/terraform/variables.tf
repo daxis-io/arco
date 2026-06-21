@@ -118,6 +118,35 @@ variable "compactor_workspace_id" {
 }
 
 # ============================================================================
+# Task Callback Token Configuration
+# ============================================================================
+
+variable "task_token_secret" {
+  description = "HS256 secret used by flow dispatchers/sweepers to mint task callback tokens and by the API to validate them"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "task_token_issuer" {
+  description = "Issuer claim for task callback tokens"
+  type        = string
+  default     = ""
+}
+
+variable "task_token_audience" {
+  description = "Audience claim for task callback tokens"
+  type        = string
+  default     = ""
+}
+
+variable "task_token_ttl_secs" {
+  description = "Task callback token TTL in seconds"
+  type        = number
+  default     = 3600
+}
+
+# ============================================================================
 # Anti-Entropy Configuration
 # ============================================================================
 
@@ -347,6 +376,21 @@ variable "api_public" {
   description = "Whether API is publicly accessible (false = internal only)"
   type        = bool
   default     = false
+}
+
+variable "compactor_ingress" {
+  description = "Cloud Run ingress setting for the compactor service"
+  type        = string
+  default     = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+
+  validation {
+    condition = contains([
+      "INGRESS_TRAFFIC_ALL",
+      "INGRESS_TRAFFIC_INTERNAL_ONLY",
+      "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER",
+    ], var.compactor_ingress)
+    error_message = "compactor_ingress must be a valid Cloud Run v2 ingress enum."
+  }
 }
 
 variable "vpc_connector_name" {

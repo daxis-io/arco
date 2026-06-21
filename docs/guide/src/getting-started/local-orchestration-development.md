@@ -15,20 +15,44 @@ pieces. It does not start a run, enqueue work, invoke a worker, call back to the
 API, compact projections, or prove `system.orchestration.*` evidence. Its JSON
 output reports `ready: false` until a production-equivalent local loop exists.
 
+## Current Local Pipeline UAT
+
+Use the no-cloud local pipeline UAT when you need proof that Arco can write
+real data, catalog it, query it, commit a Delta log, and move an orchestrated
+run through dispatch and callbacks without GCP:
+
+```bash
+bash scripts/run_local_pipeline_uat.sh
+```
+
+This is an in-process UAT backed by in-memory storage. It is stronger than a
+unit-only contract check, but it is still not a shipped `arco dev` daemon loop:
+it does not start separate long-running services, Cloud Scheduler, Cloud Tasks,
+Cloud Run, or GCS.
+
+To run the same no-cloud UAT inside a Linux container:
+
+```bash
+bash scripts/run_local_pipeline_uat_container.sh
+```
+
+This requires a running Docker daemon.
+
 ## Current Local Checks
 
 Use the repository checks that exercise the existing contracts:
 
 ```bash
+cargo test -p arco-integration-tests --test local_pipeline_uat -- --nocapture
 cargo test -p arco-cli
 cargo test -p arco-flow --features test-utils --test orchestration_dispatch_tests
 cargo test -p arco-flow --features test-utils --test worker_dispatch_envelope_tests
 cargo test -p arco-flow --features test-utils --test orchestration_protocol_invariants
 ```
 
-These checks cover CLI wiring, dispatch event flow, worker dispatch envelope
-compatibility, and orchestration protocol invariants. They are not a substitute
-for a full local lifecycle.
+These checks cover the local data pipeline UAT, CLI wiring, dispatch event
+flow, worker dispatch envelope compatibility, and orchestration protocol
+invariants. They are not a substitute for a full local lifecycle.
 
 ## Required Before A Real Loop
 

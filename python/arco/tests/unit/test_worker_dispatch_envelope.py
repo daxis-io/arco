@@ -128,11 +128,46 @@ def test_dispatch_worker_uses_envelope_token_and_callback_url() -> None:
     assert fake_client.completed_calls[0]["task_id"] == "ct1_run-123_daily-sales"
     assert fake_client.started_calls[0]["task_key"] == "analytics.daily_sales"
     assert fake_client.completed_calls[0]["task_key"] == "analytics.daily_sales"
-    assert (
-        fake_client.started_calls[0]["callback_base_url"]
-        == "https://callbacks.example"
+    assert fake_client.started_calls[0]["callback_base_url"] == "https://callbacks.example"
+    assert fake_client.completed_calls[0]["callback_base_url"] == "https://callbacks.example"
+
+
+def test_dispatch_worker_rejects_envelope_outside_configured_scope() -> None:
+    class FakeClient:
+        def task_started(self, **kwargs: Any) -> None:
+            _ = kwargs
+            raise AssertionError("callback should not start for scope mismatch")
+
+        def task_completed(self, **kwargs: Any) -> None:
+            _ = kwargs
+            raise AssertionError("callback should not complete for scope mismatch")
+
+        def upload_logs(self, **kwargs: Any) -> None:
+            _ = kwargs
+
+        def close(self) -> None:
+            return
+
+    worker = object.__new__(DispatchWorker)
+    worker.config = ArcoFlowConfig(
+        debug=True,
+        api_url="https://api.example",
+        tenant_id="tenant-a",
+        workspace_id="workspace-b",
     )
-    assert (
-        fake_client.completed_calls[0]["callback_base_url"]
-        == "https://callbacks.example"
-    )
+    worker.worker_id = "worker-1"
+    worker._fallback_task_token = "fallback-token"
+    worker._client = FakeClient()
+    worker._assets = {}
+
+    payload = _sample_envelope_dict()
+    payload["tenant_id"] = "tenant-other"
+    envelope = WorkerDispatchEnvelope.from_dict(payload)
+
+    try:
+        worker.handle_dispatch(envelope)
+    except ValueError as err:
+        assert "tenant_id mismatch" in str(err)
+    else:  # pragma: no cover - defensive
+        msg = "expected ValueError for tenant scope mismatch"
+        raise AssertionError(msg)

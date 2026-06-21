@@ -1,4 +1,5 @@
 """Small immutable collection utilities for SDK types."""
+
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping

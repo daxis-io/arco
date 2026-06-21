@@ -36,6 +36,7 @@ locals {
   state_object_prefix       = "state/"
   anti_entropy_state_prefix = "state/anti_entropy/"
   l0_object_prefix          = "l0/"
+  warehouse_object_prefix   = "warehouse/"
 }
 
 # ============================================================================
@@ -90,6 +91,22 @@ resource "google_storage_bucket_iam_member" "api_write_commits" {
   }
 }
 
+# API can create Delta log objects for coordinated commits under managed table roots.
+resource "google_storage_bucket_iam_member" "api_write_warehouse_delta" {
+  bucket = google_storage_bucket.catalog.name
+  role   = "roles/storage.objectCreator"
+  member = "serviceAccount:${google_service_account.api.email}"
+
+  condition {
+    title       = "ApiWriteWarehouseDelta"
+    description = "API can create Delta log objects under managed warehouse table roots"
+    expression  = <<-EOT
+      resource.type == "storage.googleapis.com/Object" &&
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.warehouse_object_prefix}")
+    EOT
+  }
+}
+
 # API: Read all objects (no prefix restriction on reads)
 resource "google_storage_bucket_iam_member" "api_read_all" {
   bucket = google_storage_bucket.catalog.name
@@ -130,6 +147,23 @@ resource "google_storage_bucket_iam_member" "flow_controller_read_objects" {
         resource.name.extract("${local.object_path_extract_template}").startsWith("${local.ledger_object_prefix}") ||
         resource.name.extract("${local.object_path_extract_template}").startsWith("${local.state_object_prefix}")
       )
+    EOT
+  }
+}
+
+# Flow worker can write produced table data under managed warehouse roots without list access.
+resource "google_storage_bucket_iam_member" "flow_worker_write_warehouse" {
+  count  = local.flow_services_enabled ? 1 : 0
+  bucket = google_storage_bucket.catalog.name
+  role   = google_project_iam_custom_role.storage_object_writer_no_list.name
+  member = "serviceAccount:${google_service_account.flow_worker[0].email}"
+
+  condition {
+    title       = "FlowWorkerWriteWarehouse"
+    description = "Flow worker can write produced table data under warehouse/ without list"
+    expression  = <<-EOT
+      resource.type == "storage.googleapis.com/Object" &&
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.warehouse_object_prefix}")
     EOT
   }
 }
@@ -260,15 +294,6 @@ resource "google_storage_bucket_iam_member" "compactor_antientropy_read_all" {
 
 resource "google_storage_bucket_iam_member" "compactor_antientropy_write_cursor" {
   bucket = google_storage_bucket.catalog.name
-  role   = "roles/storage.objectUser"
+  role   = google_project_iam_custom_role.storage_object_writer_no_list.name
   member = "serviceAccount:${google_service_account.compactor_antientropy.email}"
-
-  condition {
-    title       = "CompactorAntiEntropyWriteCursor"
-    description = "Gate 5: Anti-entropy can update state/anti_entropy cursor"
-    expression  = <<-EOT
-      resource.type == "storage.googleapis.com/Object" &&
-      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.anti_entropy_state_prefix}")
-    EOT
-  }
 }

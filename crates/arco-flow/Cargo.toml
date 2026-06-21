@@ -20,7 +20,7 @@ default = []
 legacy-scheduler = []
 full = ["gcp", "aws", "azure"]
 http-client = ["dep:reqwest"]
-gcp = ["arco-core/gcp", "http-client", "dep:gcp_auth"]
+gcp = ["arco-core/gcp", "http-client", "dep:gcp_auth", "dep:rustls"]
 aws = ["arco-core/aws"]
 azure = ["arco-core/azure"]
 test-utils = ["arco-core/test-utils", "http-client", "dep:proptest", "dep:tempfile"]
@@ -78,6 +78,7 @@ tempfile = { workspace = true, optional = true }
 # Optional GCP Cloud Tasks support
 reqwest = { workspace = true, optional = true }
 gcp_auth = { workspace = true, optional = true }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"], optional = true }
 base64 = { workspace = true }
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 prost-types = { workspace = true }

@@ -14,6 +14,10 @@ pub struct FlowPaths;
 impl FlowPaths {
     /// Prefix for orchestration ledger events.
     pub const ORCHESTRATION_LEDGER_PREFIX: &str = "ledger/orchestration";
+    /// Prefix for ADR-041 orchestration L0 inbox bundles.
+    pub const ORCHESTRATION_INBOX_PREFIX: &str = "_inbox/orchestration";
+    /// Prefix for ADR-041 orchestration receipt segments.
+    pub const ORCHESTRATION_RECEIPT_PREFIX: &str = "receipts/orchestration";
     /// Prefix for flow execution ledgers.
     pub const FLOW_LEDGER_PREFIX: &str = "ledger/flow";
     /// Prefix for orchestration state objects.
@@ -49,6 +53,60 @@ impl FlowPaths {
     #[must_use]
     pub fn orchestration_l0_dir(delta_id: &str) -> String {
         format!("{}/l0/{delta_id}", Self::ORCHESTRATION_STATE_PREFIX)
+    }
+
+    /// Canonical path for an ADR-041 orchestration L0 inbox bundle.
+    #[must_use]
+    pub fn orchestration_l0_inbox_bundle_path(
+        run_id: &str,
+        producer_id: &str,
+        attempt_id: &str,
+        bundle_id: &str,
+    ) -> String {
+        format!(
+            "{}/run={run_id}/producer={producer_id}/attempt={attempt_id}/bundle={bundle_id}.parquet",
+            Self::ORCHESTRATION_INBOX_PREFIX
+        )
+    }
+
+    /// Canonical path for an ADR-041 orchestration receipt segment.
+    #[must_use]
+    pub fn orchestration_receipt_segment_path(
+        run_id: &str,
+        producer_id: &str,
+        receipt_id: &str,
+    ) -> String {
+        format!(
+            "{}/run={run_id}/producer={producer_id}/receipt_segment={receipt_id}.json",
+            Self::ORCHESTRATION_RECEIPT_PREFIX
+        )
+    }
+
+    /// Canonical path for an ADR-041 orchestration L1 ledger segment.
+    #[must_use]
+    pub fn orchestration_l1_segment_path(shard_id: &str, start_seq: u64, end_seq: u64) -> String {
+        format!(
+            "{}/segments/shard={shard_id}/seq={start_seq}-{end_seq}.parquet",
+            Self::ORCHESTRATION_LEDGER_PREFIX
+        )
+    }
+
+    /// Canonical path for the current ADR-041 L1 shard index.
+    #[must_use]
+    pub fn orchestration_l1_shard_current_index_path(shard_id: &str) -> String {
+        format!(
+            "{}/index/shard={shard_id}/current.json",
+            Self::ORCHESTRATION_LEDGER_PREFIX
+        )
+    }
+
+    /// Canonical path for a historical ADR-041 L1 shard-index commit.
+    #[must_use]
+    pub fn orchestration_l1_shard_history_index_path(shard_id: &str, commit_id: &str) -> String {
+        format!(
+            "{}/index/shard={shard_id}/history/{commit_id}.json",
+            Self::ORCHESTRATION_LEDGER_PREFIX
+        )
     }
 
     /// Canonical path for orchestration base snapshot directory.

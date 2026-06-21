@@ -101,6 +101,8 @@ pub struct DispatcherController {
     max_compaction_lag: chrono::Duration,
 }
 
+const DEFAULT_MAX_COMPACTION_LAG: chrono::Duration = chrono::Duration::minutes(5);
+
 impl DispatcherController {
     /// Creates a new dispatcher controller.
     #[must_use]
@@ -111,7 +113,7 @@ impl DispatcherController {
     /// Creates a dispatcher with default settings.
     #[must_use]
     pub fn with_defaults() -> Self {
-        Self::new(chrono::Duration::seconds(30))
+        Self::new(DEFAULT_MAX_COMPACTION_LAG)
     }
 
     /// Reconciles the `dispatch_outbox` and returns actions to execute.
@@ -236,7 +238,13 @@ mod tests {
 
     fn stale_manifest() -> OrchestrationManifest {
         let mut manifest = OrchestrationManifest::new("01HQXYZ123REV");
-        manifest.watermarks.last_processed_at = Utc::now() - chrono::Duration::seconds(60);
+        manifest.watermarks.last_processed_at = Utc::now() - chrono::Duration::minutes(10);
+        manifest
+    }
+
+    fn scheduler_cadence_manifest() -> OrchestrationManifest {
+        let mut manifest = OrchestrationManifest::new("01HQXYZ123REV");
+        manifest.watermarks.last_processed_at = Utc::now() - chrono::Duration::seconds(75);
         manifest
     }
 
@@ -333,6 +341,22 @@ mod tests {
             }
             _ => panic!("Expected Skip action due to compaction lag"),
         }
+    }
+
+    #[test]
+    fn test_dispatcher_allows_one_minute_scheduler_cadence() {
+        let dispatcher = DispatcherController::with_defaults();
+        let manifest = scheduler_cadence_manifest();
+
+        let outbox_rows = vec![make_outbox_row(
+            "dispatch:run1:extract:1",
+            DispatchStatus::Pending,
+        )];
+
+        let actions = dispatcher.reconcile(&manifest, &outbox_rows);
+
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], DispatchAction::CreateCloudTask { .. }));
     }
 
     #[test]

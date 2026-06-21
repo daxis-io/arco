@@ -27,6 +27,7 @@ fn run_key_index_row(run_key: &str, run_id: &str, request_fingerprint: &str) -> 
         run_key: run_key.to_string(),
         run_id: run_id.to_string(),
         request_fingerprint: request_fingerprint.to_string(),
+        code_version: None,
         created_at: Utc::now(),
         row_version: "evt_01".to_string(),
     }
@@ -77,6 +78,7 @@ fn sensor_eval_row(
             request_fingerprint: request_fingerprint.to_string(),
             asset_selection,
             partition_selection: None,
+            code_version: None,
         }],
         status: SensorEvalStatus::Triggered,
         evaluated_at: Utc::now(),
@@ -162,6 +164,31 @@ fn run_bridge_emits_run_triggered_and_plan_created_from_schedule_tick() {
         }
         _ => panic!("expected PlanCreated event"),
     }
+}
+
+#[test]
+fn run_bridge_preserves_code_version_from_run_request_index() {
+    let mut state = FoldState::new();
+    let mut index = run_key_index_row("sched:daily:1", "run_sched_1", "fp-1");
+    index.code_version = Some("manifest-v1".to_string());
+    state
+        .run_key_index
+        .insert("sched:daily:1".to_string(), index);
+    state.schedule_ticks.insert(
+        "sched-01:1736935200".to_string(),
+        schedule_tick_row("sched:daily:1", "fp-1", vec!["analytics.daily".to_string()]),
+    );
+
+    let controller = RunBridgeController::with_defaults();
+    let actions = controller.reconcile(&fresh_manifest(), &state);
+
+    let Some(RunBridgeAction::EmitRunEvents { run_triggered, .. }) = actions.first() else {
+        panic!("expected run events");
+    };
+    let OrchestrationEventData::RunTriggered { code_version, .. } = run_triggered else {
+        panic!("expected RunTriggered event");
+    };
+    assert_eq!(code_version.as_deref(), Some("manifest-v1"));
 }
 
 #[test]

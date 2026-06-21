@@ -333,6 +333,7 @@ impl ScheduleController {
                     tick_id: tick_id.clone(),
                 },
                 labels: HashMap::new(),
+                code_version: def.code_version.clone(),
             },
             tick_event.timestamp,
         ))
@@ -436,6 +437,7 @@ impl ScheduleController {
                     tick_id,
                 },
                 labels: HashMap::new(),
+                code_version: def.code_version.clone(),
             },
             emitted_at,
         );
@@ -480,6 +482,7 @@ mod tests {
             timezone: "UTC".into(),
             catchup_window_minutes: 60 * 24, // 24 hours
             asset_selection: vec!["analytics.summary".into()],
+            code_version: None,
             max_catchup_ticks: 3,
             enabled: true,
             created_at: Utc::now(),
@@ -651,6 +654,23 @@ mod tests {
             .iter()
             .any(|e| matches!(&e.data, OrchestrationEventData::RunRequested { .. }));
         assert!(has_run_req, "Should have RunRequested event");
+    }
+
+    #[test]
+    fn test_schedule_manual_trigger_preserves_code_version() {
+        let mut def = test_definition("01HQ123SCHEDXYZ");
+        def.code_version = Some("manifest-v1".to_string());
+
+        let events = ScheduleController::manual_trigger(&def, Utc::now());
+
+        let run_req = events
+            .iter()
+            .find(|e| matches!(&e.data, OrchestrationEventData::RunRequested { .. }))
+            .expect("manual trigger should emit RunRequested");
+        let OrchestrationEventData::RunRequested { code_version, .. } = &run_req.data else {
+            panic!("expected RunRequested");
+        };
+        assert_eq!(code_version.as_deref(), Some("manifest-v1"));
     }
 
     #[test]

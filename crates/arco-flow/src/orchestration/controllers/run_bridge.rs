@@ -278,7 +278,7 @@ impl RunBridgeController {
             root_assets: request.asset_selection,
             run_key: Some(run_key.to_string()),
             labels: HashMap::new(),
-            code_version: None,
+            code_version: index.code_version.clone(),
         };
 
         let plan_created = OrchestrationEventData::PlanCreated {

@@ -158,6 +158,7 @@ impl PushSensorHandler {
                         eval_id: eval_id.clone(),
                     },
                     labels: HashMap::new(),
+                    code_version: req.code_version.clone(),
                 },
                 emitted_at,
             ));
@@ -376,6 +377,7 @@ impl PollSensorController {
                         eval_id: eval_id.clone(),
                     },
                     labels: HashMap::new(),
+                    code_version: req.code_version.clone(),
                 },
                 emitted_at,
             ));
@@ -425,6 +427,36 @@ mod tests {
             data: b"test data".to_vec(),
             attributes: HashMap::new(),
             publish_time: Utc::now(),
+        }
+    }
+
+    #[derive(Debug)]
+    struct CodeVersionEvaluator;
+
+    impl SensorEvaluator for CodeVersionEvaluator {
+        fn evaluate_push(
+            &self,
+            sensor_id: &str,
+            message: &PubSubMessage,
+        ) -> Result<Vec<RunRequest>, SensorEvaluationError> {
+            Ok(vec![RunRequest {
+                run_key: format!("sensor:{sensor_id}:msg:{}", message.message_id),
+                request_fingerprint: format!("fp:{}", message.message_id),
+                asset_selection: vec!["analytics.summary".to_string()],
+                partition_selection: None,
+                code_version: Some("manifest-v1".to_string()),
+            }])
+        }
+
+        fn evaluate_poll(
+            &self,
+            _sensor_id: &str,
+            cursor_before: Option<&str>,
+        ) -> Result<PollSensorResult, SensorEvaluationError> {
+            Ok(PollSensorResult {
+                cursor_after: cursor_before.map(ToString::to_string),
+                run_requests: Vec::new(),
+            })
         }
     }
 
@@ -526,6 +558,27 @@ mod tests {
 
         // All events should be in the same batch (vector)
         // In production, the ledger appends all events atomically
+    }
+
+    #[test]
+    fn test_push_sensor_run_requested_preserves_code_version() {
+        let handler = PushSensorHandler::with_evaluator(Arc::new(CodeVersionEvaluator));
+        let events = handler.handle_message(
+            "01HQ123SENSORXYZ",
+            "tenant-abc",
+            "workspace-prod",
+            SensorStatus::Active,
+            &test_message("msg_version"),
+        );
+
+        let run_req = events
+            .iter()
+            .find(|e| matches!(&e.data, OrchestrationEventData::RunRequested { .. }))
+            .expect("push sensor should emit RunRequested");
+        let OrchestrationEventData::RunRequested { code_version, .. } = &run_req.data else {
+            panic!("expected RunRequested");
+        };
+        assert_eq!(code_version.as_deref(), Some("manifest-v1"));
     }
 
     #[test]

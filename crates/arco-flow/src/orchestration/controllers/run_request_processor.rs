@@ -90,7 +90,7 @@ impl RunRequestProcessor {
                         root_assets: resolved.asset_selection.clone(),
                         run_key: Some(key.run_key.clone()),
                         labels: resolved.labels.clone(),
-                        code_version: None,
+                        code_version: key.code_version.clone(),
                     },
                 ));
             }
@@ -293,6 +293,7 @@ mod tests {
                 run_key: run_key.to_string(),
                 run_id: run_id.to_string(),
                 request_fingerprint: fp.to_string(),
+                code_version: None,
                 created_at: Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap(),
                 row_version: "evt_runreq".to_string(),
             },
@@ -329,5 +330,54 @@ mod tests {
             events[1].data,
             OrchestrationEventData::PlanCreated { .. }
         ));
+    }
+
+    #[test]
+    fn reconcile_preserves_code_version_from_run_request_index() {
+        let mut state = FoldState::new();
+        let run_key = "sched:sched_01:1736935200";
+        let run_id = "run_sched_01";
+        let fp = "fp_sched_01";
+
+        state.run_key_index.insert(
+            run_key.to_string(),
+            RunKeyIndexRow {
+                tenant_id: "tenant-abc".to_string(),
+                workspace_id: "workspace-prod".to_string(),
+                run_key: run_key.to_string(),
+                run_id: run_id.to_string(),
+                request_fingerprint: fp.to_string(),
+                code_version: Some("manifest-v1".to_string()),
+                created_at: Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap(),
+                row_version: "evt_runreq".to_string(),
+            },
+        );
+
+        state.schedule_ticks.insert(
+            "sched_01:1736935200".to_string(),
+            ScheduleTickRow {
+                tenant_id: "tenant-abc".to_string(),
+                workspace_id: "workspace-prod".to_string(),
+                tick_id: "sched_01:1736935200".to_string(),
+                schedule_id: "sched_01".to_string(),
+                scheduled_for: Utc.with_ymd_and_hms(2025, 1, 15, 10, 0, 0).unwrap(),
+                definition_version: "def_v1".to_string(),
+                asset_selection: vec!["analytics.daily_summary".to_string()],
+                partition_selection: None,
+                status: TickStatus::Triggered,
+                run_key: Some(run_key.to_string()),
+                run_id: None,
+                request_fingerprint: Some(fp.to_string()),
+                row_version: "evt_tick".to_string(),
+            },
+        );
+
+        let processor = RunRequestProcessor::new();
+        let events = processor.reconcile(&state);
+
+        let OrchestrationEventData::RunTriggered { code_version, .. } = &events[0].data else {
+            panic!("expected RunTriggered event");
+        };
+        assert_eq!(code_version.as_deref(), Some("manifest-v1"));
     }
 }

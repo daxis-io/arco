@@ -1405,6 +1405,7 @@ struct ManifestContext {
 struct RunPlanContext {
     manifest_id: String,
     deployed_at: DateTime<Utc>,
+    code_version_id: String,
     graph: arco_flow::orchestration::AssetGraph,
     root_assets: Vec<String>,
     partitioning_spec: PartitioningSpec,
@@ -1646,6 +1647,7 @@ async fn load_run_plan_context(
     Ok(RunPlanContext {
         manifest_id: manifest_context.manifest_id,
         deployed_at: manifest_context.deployed_at,
+        code_version_id: stored.code_version_id,
         graph: manifest_context.graph,
         root_assets,
         partitioning_spec,
@@ -1958,6 +1960,7 @@ struct LegacyBackfillFingerprintPayload {
 
 struct BackfillCreateInput {
     asset_selection: Vec<String>,
+    code_version: Option<String>,
     partition_selector: PartitionSelector,
     total_partitions: u32,
     chunk_size: u32,
@@ -2078,6 +2081,18 @@ fn normalize_partition_bounds(start: &str, end: &str) -> Result<(String, String)
     ))
 }
 
+fn inclusive_partition_bound_count(start: &str, end: &str) -> Result<u32, ApiError> {
+    let start_date = parse_partition_bound_date(start)?;
+    let end_date = parse_partition_bound_date(end)?;
+    if start_date > end_date {
+        return Err(ApiError::bad_request(
+            "partition selector start must be less than or equal to end",
+        ));
+    }
+    let inclusive_days = (end_date - start_date).num_days() + 1;
+    Ok(u32::try_from(inclusive_days).unwrap_or(u32::MAX))
+}
+
 fn normalize_filter_bounds(
     filters: &HashMap<String, String>,
 ) -> Result<(String, String), ApiError> {
@@ -2149,7 +2164,8 @@ fn parse_partition_selector(
                 ));
             }
             let (start, end) = normalize_partition_bounds(start.trim(), end.trim())?;
-            Ok((PartitionSelector::Range { start, end }, 0))
+            let total_partitions = inclusive_partition_bound_count(&start, &end)?;
+            Ok((PartitionSelector::Range { start, end }, total_partitions))
         }
         PartitionSelectorRequest::Filter { filters } => {
             if filters.is_empty() {
@@ -2164,8 +2180,9 @@ fn parse_partition_selector(
                 ));
             }
             let (start, end) = normalize_filter_bounds(&filters)?;
+            let total_partitions = inclusive_partition_bound_count(&start, &end)?;
             let filters = HashMap::from([("start".to_string(), start), ("end".to_string(), end)]);
-            Ok((PartitionSelector::Filter { filters }, 0))
+            Ok((PartitionSelector::Filter { filters }, total_partitions))
         }
     }
 }
@@ -2214,6 +2231,7 @@ async fn append_backfill_created_event(
             backfill_id: backfill_id.clone(),
             client_request_id: idempotency_key.to_string(),
             asset_selection: input.asset_selection,
+            code_version: input.code_version,
             partition_selector: input.partition_selector,
             total_partitions: input.total_partitions,
             chunk_size: input.chunk_size,
@@ -4057,7 +4075,7 @@ pub(crate) async fn trigger_run(
                     &existing.plan_id,
                     Some(existing.run_key.clone()),
                     request.labels.clone(),
-                    state.config.code_version.clone(),
+                    Some(plan_context_ref.code_version_id.clone()),
                     plan_context_ref.root_assets.clone(),
                     tasks,
                     Some(RunEventOverrides {
@@ -4216,7 +4234,7 @@ pub(crate) async fn trigger_run(
                         &existing.plan_id,
                         Some(existing.run_key.clone()),
                         request.labels.clone(),
-                        state.config.code_version.clone(),
+                        Some(plan_context_ref.code_version_id.clone()),
                         plan_context_ref.root_assets.clone(),
                         tasks,
                         Some(RunEventOverrides {
@@ -4293,7 +4311,7 @@ pub(crate) async fn trigger_run(
         &plan_id,
         request.run_key.clone(),
         request.labels.clone(),
-        state.config.code_version.clone(),
+        Some(plan_context_ref.code_version_id.clone()),
         plan_context_ref.root_assets.clone(),
         tasks,
         run_event_overrides,
@@ -5279,6 +5297,9 @@ pub(crate) async fn upsert_schedule(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
+    let code_version = load_latest_manifest(&storage)
+        .await?
+        .map(|manifest| manifest.code_version_id);
 
     let existed = existing.is_some();
 
@@ -5291,6 +5312,7 @@ pub(crate) async fn upsert_schedule(
             timezone: request.timezone,
             catchup_window_minutes: request.catchup_window_minutes,
             asset_selection: request.asset_selection,
+            code_version,
             max_catchup_ticks: request.max_catchup_ticks,
             enabled: request.enabled,
         },
@@ -5358,6 +5380,7 @@ pub(crate) async fn enable_schedule(
             timezone: existing.timezone.clone(),
             catchup_window_minutes: existing.catchup_window_minutes,
             asset_selection: existing.asset_selection.clone(),
+            code_version: existing.code_version.clone(),
             max_catchup_ticks: existing.max_catchup_ticks,
             enabled: true,
         },
@@ -5420,6 +5443,7 @@ pub(crate) async fn disable_schedule(
             timezone: existing.timezone.clone(),
             catchup_window_minutes: existing.catchup_window_minutes,
             asset_selection: existing.asset_selection.clone(),
+            code_version: existing.code_version.clone(),
             max_catchup_ticks: existing.max_catchup_ticks,
             enabled: false,
         },
@@ -5721,8 +5745,9 @@ pub(crate) async fn create_backfill(
         Some(0) | None => DEFAULT_BACKFILL_MAX_CONCURRENT_RUNS,
         Some(value) => value,
     };
-    let input = BackfillCreateInput {
+    let mut input = BackfillCreateInput {
         asset_selection,
+        code_version: None,
         partition_selector,
         total_partitions,
         chunk_size,
@@ -5757,6 +5782,10 @@ pub(crate) async fn create_backfill(
     {
         return Ok((StatusCode::OK, Json(existing)).into_response());
     }
+
+    input.code_version = load_latest_manifest(&storage)
+        .await?
+        .map(|manifest| manifest.code_version_id);
 
     let response = append_backfill_created_event(
         state.as_ref(),
@@ -7090,13 +7119,34 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_partition_selector_counts_inclusive_range_partitions() -> Result<()> {
+        let (selector, total_partitions) =
+            parse_partition_selector(PartitionSelectorRequest::Range {
+                start: "2025-01-01".to_string(),
+                end: "2025-01-03".to_string(),
+            })
+            .map_err(|err| anyhow!("{err:?}"))?;
+
+        assert_eq!(
+            selector,
+            PartitionSelector::Range {
+                start: "2025-01-01".to_string(),
+                end: "2025-01-03".to_string()
+            }
+        );
+        assert_eq!(total_partitions, 3);
+        Ok(())
+    }
+
+    #[test]
     fn test_parse_partition_selector_canonicalizes_filter_alias_bounds() -> Result<()> {
         let mut filters = HashMap::new();
         filters.insert("partition_start".to_string(), "2025-01-01".to_string());
         filters.insert("partition_end".to_string(), "2025-01-03".to_string());
 
-        let (selector, _) = parse_partition_selector(PartitionSelectorRequest::Filter { filters })
-            .map_err(|err| anyhow!("{err:?}"))?;
+        let (selector, total_partitions) =
+            parse_partition_selector(PartitionSelectorRequest::Filter { filters })
+                .map_err(|err| anyhow!("{err:?}"))?;
 
         let PartitionSelector::Filter { filters } = selector else {
             panic!("expected filter selector");
@@ -7104,6 +7154,7 @@ mod tests {
         assert_eq!(filters.len(), 2);
         assert_eq!(filters.get("start"), Some(&"2025-01-01".to_string()));
         assert_eq!(filters.get("end"), Some(&"2025-01-03".to_string()));
+        assert_eq!(total_partitions, 3);
         Ok(())
     }
 
@@ -7331,6 +7382,7 @@ mod tests {
             total_partitions: 3,
             chunk_size: 2,
             max_concurrent_runs: 1,
+            code_version: None,
         };
         let fingerprint =
             compute_backfill_fingerprint(&input.asset_selection, &partition_selector, 2, 1)
@@ -7801,7 +7853,7 @@ mod tests {
                 root_assets: vec!["analytics.users".to_string()],
                 run_key: Some(reservation.run_key.clone()),
                 labels: request.labels.clone(),
-                code_version: None,
+                code_version: Some("abc123".to_string()),
             },
         );
         apply_event_metadata(
@@ -7814,6 +7866,10 @@ mod tests {
         let stored_run: OrchestrationEvent = serde_json::from_slice(&run_bytes)?;
         assert_eq!(stored_run.event_id, reservation.event_id);
         assert_eq!(stored_run.event_type, "RunTriggered");
+        let OrchestrationEventData::RunTriggered { code_version, .. } = stored_run.data else {
+            panic!("expected RunTriggered event");
+        };
+        assert_eq!(code_version.as_deref(), Some("abc123"));
 
         let plan_event_id = reservation.plan_event_id.clone().expect("plan_event_id");
         let mut plan_event = OrchestrationEvent::new(

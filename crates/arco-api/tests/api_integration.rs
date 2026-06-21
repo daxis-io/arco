@@ -1294,6 +1294,7 @@ mod orchestration {
                 request_fingerprint: "fp_manual".to_string(),
                 asset_selection: vec!["analytics.summary".to_string()],
                 partition_selection: None,
+                code_version: None,
             }])
         }
 

@@ -68,6 +68,9 @@ pub struct RunRequest {
     /// Optional partition selection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partition_selection: Option<Vec<String>>,
+    /// Code version for the run generated from this request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_version: Option<String>,
 }
 
 /// Reference to the source that triggered a run request.

@@ -7385,7 +7385,7 @@
           },
           "finalState": {
             "type": "string",
-            "description": "Final task state."
+            "description": "Worker outcome acknowledged by the callback. For retryable failures, the\ndurable orchestration projection may move the task into retry state even\nthough this field remains `FAILED`."
           },
           "serverTime": {
             "type": "string",

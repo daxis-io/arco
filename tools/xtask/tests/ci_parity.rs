@@ -56,6 +56,17 @@ fn ci_parity_command_is_registered_and_passes_static_checks() {
 }
 
 #[test]
+fn ci_runs_deterministic_user_acceptance_uat_gate() {
+    let ci =
+        fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).expect("read CI workflow");
+
+    assert!(
+        ci.contains("scripts/run_user_acceptance_pipeline_uat.sh --deterministic"),
+        "CI test job should run the deterministic local UAT gate"
+    );
+}
+
+#[test]
 fn ci_runs_proto_contract_checks() {
     let harness = ToolHarness::new().expect("create fake tool harness");
 

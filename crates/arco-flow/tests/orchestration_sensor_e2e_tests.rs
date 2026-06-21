@@ -96,6 +96,7 @@ impl SensorEvaluator for PushSingleRunEvaluator {
             request_fingerprint: format!("fp:msg:{}", message.message_id),
             asset_selection: vec!["analytics.summary".to_string()],
             partition_selection: None,
+            code_version: None,
         }])
     }
 
@@ -143,6 +144,7 @@ impl SensorEvaluator for CursorAdvancingPollEvaluator {
                 request_fingerprint: "fp:poll:v1".to_string(),
                 asset_selection: vec!["analytics.summary".to_string()],
                 partition_selection: None,
+                code_version: None,
             }],
         })
     }
@@ -194,6 +196,7 @@ impl SensorEvaluator for ConflictOnSecondCallPollEvaluator {
                 request_fingerprint,
                 asset_selection: vec!["analytics.summary".to_string()],
                 partition_selection: None,
+                code_version: None,
             }],
         })
     }
@@ -520,6 +523,7 @@ async fn run_key_idempotency_is_enforced_even_without_event_idempotency()
             partition_selection: None,
             trigger_source_ref: source.clone(),
             labels: HashMap::new(),
+            code_version: None,
         },
         "runreq_override:01",
         fixed_time() + Duration::seconds(1),
@@ -536,6 +540,7 @@ async fn run_key_idempotency_is_enforced_even_without_event_idempotency()
             partition_selection: None,
             trigger_source_ref: source,
             labels: HashMap::new(),
+            code_version: None,
         },
         "runreq_override:02",
         fixed_time() + Duration::seconds(2),
@@ -604,6 +609,7 @@ async fn run_key_conflict_is_durable_across_compactor_reload() -> arco_flow::err
             partition_selection: None,
             trigger_source_ref: source.clone(),
             labels: HashMap::new(),
+            code_version: None,
         },
         "runreq_override:conflict:01",
         fixed_time() + Duration::seconds(1),
@@ -620,6 +626,7 @@ async fn run_key_conflict_is_durable_across_compactor_reload() -> arco_flow::err
             partition_selection: None,
             trigger_source_ref: source,
             labels: HashMap::new(),
+            code_version: None,
         },
         "runreq_override:conflict:02",
         fixed_time() + Duration::seconds(2),
